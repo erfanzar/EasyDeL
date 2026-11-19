@@ -26,6 +26,7 @@ scheduler lock is the engine's own RLock, shared so the lock order contract
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -41,6 +42,34 @@ from ..logger import logger
 if typing.TYPE_CHECKING:
     from ..scheduler.output import SchedulerOutput
     from .core_driver import EngineCoreDriver
+
+
+class _BetweenStepsCall:
+    """One :meth:`EngineLoop.run_between_steps` request: the callable, its outcome and a completion event."""
+
+    __slots__ = ("_error", "_fn", "_value", "done")
+
+    def __init__(self, fn: typing.Callable[[], typing.Any]) -> None:
+        self._fn = fn
+        self._value: typing.Any = None
+        self._error: BaseException | None = None
+        self.done = threading.Event()
+
+    def run(self) -> None:
+        """Run the callable once, recording its value or exception, then signal completion."""
+        try:
+            self._value = self._fn()
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self.done.set()
+
+    def result(self) -> typing.Any:
+        """The callable's return value; re-raises the exception it raised."""
+        if self._error is not None:
+            raise self._error
+        return self._value
+
 
 # Default to fail-fast so benchmark runs don't spin for hours on fatal errors.
 # Set `EASYDEL_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
@@ -120,6 +149,49 @@ class EngineLoop:
         self._closed_error = getattr(core, "closed_error", ())
         self._running = False
         self._thread: threading.Thread | None = None
+        self._between_steps: collections.deque[_BetweenStepsCall] = collections.deque()
+        self._between_steps_lock = threading.Lock()
+
+    def run_between_steps(self, fn: typing.Callable[[], typing.Any]) -> typing.Any:
+        """Run ``fn`` on the loop thread at a point where no model step is in flight.
+
+        The loop services the call at the top of an iteration: the synchronous loop has committed every step it
+        executed, and the overlap loop first drains (commits and emits) its pending async step. Requests stay
+        scheduled, so steps after ``fn`` returns run with whatever state ``fn`` installed. When the loop is not
+        running, or exits before reaching the call, ``fn`` runs on the caller's thread instead.
+
+        Args:
+            fn: Zero-argument callable.
+
+        Returns:
+            Whatever ``fn`` returns; an exception it raises is re-raised here.
+        """
+        thread = self._thread
+        if thread is not None and threading.current_thread() is thread:
+            return fn()
+        call = _BetweenStepsCall(fn)
+        with self._between_steps_lock:
+            self._between_steps.append(call)
+        while not call.done.wait(timeout=0.05):
+            thread = self._thread
+            if thread is None or not thread.is_alive():
+                with self._between_steps_lock:
+                    claimed = call in self._between_steps
+                    if claimed:
+                        self._between_steps.remove(call)
+                if claimed:
+                    call.run()
+                    break
+        return call.result()
+
+    def _service_between_steps(self) -> None:
+        """Run every queued :meth:`run_between_steps` call (loop thread, no step in flight)."""
+        while True:
+            with self._between_steps_lock:
+                if not self._between_steps:
+                    return
+                call = self._between_steps.popleft()
+            call.run()
 
     @property
     def running(self) -> bool:
@@ -282,6 +354,8 @@ class EngineLoop:
         except BaseException as exc:
             self._on_fatal(exc)
         finally:
+            # The loop no longer runs steps: serve calls queued for a between-steps slot now.
+            self._service_between_steps()
             self._running = False
             if self._on_stopped is not None:
                 self._on_stopped()
@@ -318,6 +392,8 @@ class EngineLoop:
 
         while self._running:
             try:
+                if self._between_steps:
+                    self._service_between_steps()
                 _diag_iter += 1
                 prof_loop_t0 = time.perf_counter()
                 prof_phase = prof_loop_t0
@@ -509,6 +585,13 @@ class EngineLoop:
 
         while self._running:
             try:
+                if self._between_steps:
+                    # A between-steps call must see no step in flight: commit and emit the pending one first.
+                    if pending_execution is not None:
+                        pending = pending_execution
+                        pending_execution = None
+                        self._drain(*pending)
+                    self._service_between_steps()
                 coordinator.check_health()
                 if pending_execution is not None:
                     future, prev_sched_out = pending_execution

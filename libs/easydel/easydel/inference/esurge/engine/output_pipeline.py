@@ -79,6 +79,24 @@ def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_cach
     }
 
 
+def _record_weight_version(comp, start_token_index: int, weight_version: int) -> None:
+    """Open a ``(start_token_index, weight_version)`` segment on ``comp`` when the version changes.
+
+    Segments stay run-length encoded: consecutive steps under the same version extend the last segment
+    instead of adding one. The list is replaced rather than mutated so snapshots already handed to
+    consumers keep their own value.
+
+    Args:
+        comp: Completion output receiving tokens starting at ``start_token_index``.
+        start_token_index: Index of the first new token within the completion.
+        weight_version: Engine weight version whose forward produced the new tokens.
+    """
+    segments = comp.weight_version_segments
+    if segments and segments[-1][1] == weight_version:
+        return
+    comp.weight_version_segments = [*(segments or ()), (int(start_token_index), int(weight_version))]
+
+
 class _PrefixView(Sequence):
     """Fixed-length view over an append-only list.
 
@@ -231,7 +249,7 @@ class OutputPipeline:
         self._thread = threading.Thread(target=self._loop, name="eSurgeOutputWorker", daemon=True)
         self._thread.start()
 
-    def submit(self, engine_outputs) -> None:
+    def submit(self, engine_outputs, weight_version: int | None = None) -> None:
         """Queue a bundle for ordered processing; process inline if stopped.
 
         The inline fallback keeps lightweight harnesses (and the window
@@ -241,13 +259,16 @@ class OutputPipeline:
         Args:
             engine_outputs: Scheduler-produced output bundle from
                 ``update_from_output``. Falsy bundles are ignored.
+            weight_version: Engine weight version whose forward produced the
+                bundle's tokens; recorded on each completion's
+                ``weight_version_segments``. ``None`` records nothing.
         """
         if not engine_outputs:
             return
         if not self.running:
-            self._process_engine_outputs(engine_outputs)
+            self._process_engine_outputs(engine_outputs, weight_version=weight_version)
             return
-        self.queue.put(engine_outputs)
+        self.queue.put((engine_outputs, weight_version))
 
     def stop(self, timeout: float = 5.0) -> None:
         """Drain the queue and stop the worker via the ``None`` sentinel."""
@@ -266,11 +287,12 @@ class OutputPipeline:
     def _loop(self) -> None:
         """Drain bundles in FIFO order until the sentinel or a fatal error."""
         while True:
-            engine_outputs = self.queue.get()
+            item = self.queue.get()
             try:
-                if engine_outputs is _STOP_SENTINEL:
+                if item is _STOP_SENTINEL:
                     return
-                self._process_engine_outputs(engine_outputs)
+                engine_outputs, weight_version = item
+                self._process_engine_outputs(engine_outputs, weight_version=weight_version)
             except Exception as exc:
                 traceback.print_exc()
                 logger.error("Engine output worker failed: %s", exc)
@@ -1342,7 +1364,9 @@ class OutputPipeline:
 
         return text_changed, structured_changed
 
-    def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
+    def _process_engine_outputs(
+        self, engine_outputs: dict[int, EngineCoreOutputs], weight_version: int | None = None
+    ) -> None:
         """Process engine outputs and update request outputs (thread-safe).
 
         Decodes tokens, runs reasoning + tool parsers, updates metrics, and
@@ -1389,6 +1413,8 @@ class OutputPipeline:
 
                     if new_tokens:
                         comp = ro.outputs[sample_index]
+                        if weight_version is not None:
+                            _record_weight_version(comp, len(rd.generated_tokens), int(weight_version))
                         self._append_token_logprobs(
                             comp, new_tokens, engine_output.new_logprobs, len(rd.generated_tokens)
                         )
