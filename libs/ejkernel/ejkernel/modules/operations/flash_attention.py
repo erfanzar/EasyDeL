@@ -81,6 +81,10 @@ PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
 DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
 BlockTables = Int[Array, "batch max_blocks"]
 
+# Additive logit for keys hidden by a position-aware mask folded into the bias. Finite (so a fully
+# masked padding row stays finite) and far below any real logit even after softmax scaling.
+_POSITION_MASK_VALUE = -1e30
+
 
 class FlashAttention(Kernel[FlashAttentionConfig, Array]):
     """Flash Attention with custom optimization logic.
@@ -901,8 +905,42 @@ def flash_attention(
     attention_mask = None
     q_segment_ids = None
     kv_segment_ids = None
+    position_bias = None
+    padded_query_rows = None
 
-    if mask_info is not None:
+    if (
+        mask_info is not None
+        and block_tables is None
+        and mask_info.uses_position_causality()
+        and query.shape[1] != key.shape[1]
+        and (causal or sliding_window is not None)
+    ):
+        # Queries that continue a key/value prefix (q_len != kv_len): the kernels' causal triangle
+        # and window are index based (aligned to the wrong columns), and a dense mask is reduced to
+        # segment ids, which cannot carry ``kv_pos <= q_pos``. Fold the position-aware visibility
+        # into an additive bias that every backend accepts and disable the index-based terms.
+        if logits_soft_cap is not None:
+            raise NotImplementedError(
+                "flash_attention with explicit q/kv positions and q_len != kv_len folds the mask into an additive "
+                "bias, which logits_soft_cap would squash; use scaled_dot_product_attention or drop the soft cap."
+            )
+        visible = mask_info.get_position_aware_attention_mask(causal=causal, sliding_window=sliding_window)
+        num_heads = query.shape[2]
+        position_bias = jnp.where(visible, jnp.float32(0.0), jnp.float32(_POSITION_MASK_VALUE))
+        position_bias = jnp.broadcast_to(
+            position_bias, (query.shape[0], num_heads, query.shape[1], key.shape[1])
+        ).astype(jnp.float32)
+        bias = position_bias if bias is None else (bias.astype(jnp.float32) + position_bias)
+        causal = False
+        sliding_window = None
+        if mask_info._q_segment_ids is not None:
+            # The bias already encodes segment visibility; segment ids are not passed to the kernel
+            # (the Pallas TPU kernel with segment ids and q_len != kv_len did not finish on TPU), but
+            # padded query rows are still zeroed as the segment-id path does.
+            q_ids = jnp.asarray(mask_info._q_segment_ids, jnp.int32)
+            if q_ids.ndim == 2:
+                padded_query_rows = q_ids < 0
+    elif mask_info is not None:
         attention_mask = mask_info._attention_mask
         if mask_info._q_segment_ids is not None or mask_info._kv_segment_ids is not None:
             q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids(per_head=False)
@@ -927,6 +965,12 @@ def flash_attention(
             )
         q_spec, k_spec, v_spec, bias_spec, cu_q_spec, cu_k_spec, aux_spec = in_specs[:7]
         block_tables_spec = in_specs[7] if len(in_specs) == 8 else None
+        if position_bias is not None and bias_spec is None:
+            # The bias was built here, so the caller had no spec for it: shard it like the query
+            # (batch, heads, q sequence) and the kv sequence like the key.
+            q_axes = (*tuple(q_spec), None, None, None, None)[:4] if q_spec is not None else (None,) * 4
+            k_axes = (*tuple(k_spec), None, None, None, None)[:4] if k_spec is not None else (None,) * 4
+            bias_spec = PartitionSpec(q_axes[0], q_axes[2], q_axes[1], k_axes[1])
         if mask_info is None:
             mask_spec = q_seg_spec = kv_seg_spec = None
         else:
@@ -948,7 +992,7 @@ def flash_attention(
             kv_seg_spec,
         )
 
-    return _flash_executor(
+    out = _flash_executor(
         FlashAttention(),
         query=query,
         key=key,
@@ -977,3 +1021,6 @@ def flash_attention(
         out_specs=out_specs,
         _cfg=cfg,
     )
+    if padded_query_rows is not None:
+        out = jnp.where(padded_query_rows[:, :, None, None], jnp.zeros((), out.dtype), out)
+    return out
