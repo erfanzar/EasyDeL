@@ -1102,8 +1102,9 @@ def blocksparse_attention(
         # Queries continuing a key/value prefix (q_len != kv_len) with explicit positions: the
         # Pallas TPU kernel's default triangle/window are top-left aligned by index. Shift them by
         # ``kv_len - q_len`` (bottom-right), and poison rows whose positions do not follow that
-        # alignment instead of silently attending to the wrong keys. The XLA backend (e.g. an
-        # autotune candidate) ignores ``mask_builder`` and masks by positions directly.
+        # alignment instead of silently attending to the wrong keys. Execution is pinned to the
+        # Pallas backend so the selector cannot run an XLA config (which masks by positions and
+        # would be correct) and still have its rows poisoned.
         if isinstance(sliding_window, list):
             sliding_window = tuple(sliding_window)
         if method == "shard_map":
@@ -1116,6 +1117,7 @@ def blocksparse_attention(
                         "Pallas TPU blocksparse_attention with explicit q/kv positions and q_len != kv_len "
                         f"does not support a sharded {name} sequence axis ({spec})."
                     )
+        platform = "pallas"
         mask_builder = _cached_position_offset_mask_builder(bool(causal), sliding_window)
         position_offset_check = _position_offset_consistent(
             mask_info._q_segment_ids,

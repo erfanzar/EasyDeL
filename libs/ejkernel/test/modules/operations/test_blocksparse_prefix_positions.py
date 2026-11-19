@@ -207,3 +207,55 @@ def test_equal_lengths_with_positions_are_unchanged(causal):
     a = blocksparse_attention(q, k, v, mask_info=plain, causal=causal, cfg=CFG["pallas"])
     b = blocksparse_attention(q, k, v, mask_info=with_pos, causal=causal, cfg=CFG["pallas"])
     np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_autotuned_gated_call_runs_on_pallas_even_when_only_xla_configs_are_offered(monkeypatch):
+    """With ``cfg=None`` the selector may pick an XLA config; the gated call must still execute Pallas.
+
+    The position-offset poison is only meaningful for the Pallas kernel, so the result must be the Pallas
+    output (bit for bit), finite and correct on rows that follow the offset, and NaN on the row that does not.
+    """
+    import importlib
+
+    from ejkernel.modules.operations.blocksparse_attention import BlockSparseAttention
+    from ejkernel.ops import ConfigCache, policy_override
+
+    module = importlib.import_module("ejkernel.modules.operations.blocksparse_attention")
+    chooser = module._executor.chooser
+    monkeypatch.setattr(chooser, "cache", ConfigCache())
+    monkeypatch.setattr(chooser, "persistent", None)
+    monkeypatch.setattr(chooser, "_autotuned_keys", set())
+    monkeypatch.setattr(
+        BlockSparseAttention, "candidate_cfgs_tpu", lambda self, inv: self.candidate_cfgs_xla(inv)[:2], raising=True
+    )
+
+    q, k, v, q_seg, kv_seg, q_pos, kv_pos, _ = _inputs(256, 128, seed=13)
+    q_pos = q_pos.copy()
+    q_pos[1] += 7
+    q, k, v = (jnp.asarray(x) for x in (q, k, v))
+
+    def call(cfg):
+        # A fresh MaskInfo per call: the op caches a segment-derived dense mask on the instance it is given.
+        mask = _mask_info(q_seg, kv_seg, q_pos, kv_pos)
+        return np.asarray(blocksparse_attention(q, k, v, mask_info=mask, causal=True, cfg=cfg))
+
+    with jax.default_matmul_precision("highest"):
+        with policy_override(chooser, allow_autotune=True, cache_miss_fallback="autotune"):
+            tuned = call(None)
+        chosen = [chooser.cache.get(*key) for key in chooser.cache.keys()]
+        assert chosen and all(str(cfg.platform) == "xla" for cfg in chosen), chosen  # the selector did pick XLA
+        same_blocks = BlockSparseAttentionConfig(
+            fwd_params=chosen[0].fwd_params, bwd_params=chosen[0].bwd_params, platform="pallas", backend="tpu"
+        )
+        pallas = call(same_blocks)
+        xla = call(CFG["xla"])
+        visible = jnp.asarray(_visibility(q_seg, kv_seg, q_pos, kv_pos, None))
+        ref = np.asarray(_reference(q, k, v, visible))
+
+    rows = np.asarray(q_seg[0] >= 0)
+    assert np.isfinite(tuned[0]).all()
+    assert np.isnan(tuned[1]).all()  # the Pallas poison
+    assert np.isfinite(xla[1]).all()  # an explicit XLA call is never poisoned
+    np.testing.assert_array_equal(tuned, pallas)  # the gated call ran the Pallas kernel
+    error = float(np.max(np.abs(tuned[0][:, rows] - ref[0][:, rows])))
+    assert error <= TOL, error
