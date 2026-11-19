@@ -354,6 +354,26 @@ _SCHEDULED_LOSS_ADAPTERS: dict[tuple[str, str], ScheduledLossAdapter] = {}
 _SCHEDULED_AUXILIARY_CACHE: dict[tuple[tp.Any, ...], tp.Callable[..., tp.Any]] = {}
 _SCHEDULED_AUX_PIPELINE_EXECUTOR: dict[bool, tp.Any] = {}
 
+SCHEDULED_UPDATE_GATE_KEY = "update_gate"
+"""Aux key through which a scheduled loss gates the optimizer update.
+
+A scheduled loss built with ``ScheduledLossAdapter(has_aux=...)`` may put a 0/1 scalar under this
+key in its aux mapping, or the adapter's ``finalize_aux`` hook may add it after the per-microbatch
+reduction. The scheduled training step pops the value (it never reaches the step metrics) and:
+
+* applies the update when the reduced value is ``>= 1`` (within
+  :data:`_SCHEDULED_UPDATE_GATE_TOLERANCE`);
+* otherwise leaves parameters, optimizer state and the step counter of every pipeline stage
+  unchanged.
+
+Either way the step reports ``step_skipped`` (``0.0`` or ``1.0``). The aux value is reduced with
+the same microbatch scales as the loss, so a gate reported per microbatch only stays open when
+every weighted microbatch reports ``1``. The decision is taken once on the host from the
+host-replicated value, so all pipeline stages (and all controller processes) agree. Losses that
+do not report the key behave exactly as before.
+"""
+_SCHEDULED_UPDATE_GATE_TOLERANCE = 1e-3
+
 
 def _scheduled_aux_pipeline_executor(use_workers: bool = True) -> tp.Any:
     """Return a cached :class:`spx.MpmdPipelineExecutor` for the auxiliary (teacher/ref) forward.
@@ -532,6 +552,17 @@ class ScheduledLossAdapter:
             computed in the terminal pipeline stage. The scheduled VJP
             reduces them across microbatches with the same weights as the
             loss and threads them into the step's :class:`LossMetrics`.
+            May also be a callable ``(ScheduledStepCall) -> bool`` deciding
+            this per call (it must agree with ``make_loss`` for that call and
+            the decision must be covered by ``make_cache_key``).
+        finalize_aux (Callable | None): Optional host-side hook
+            ``(ScheduledStepCall, aux) -> aux`` applied to the reduced,
+            host-replicated aux mapping before metrics are built. It receives
+            the call as seen *before* ``prepare_batch`` (the trainer's own
+            batch, including host-only flags ``prepare_batch`` may strip from
+            the pipelined inputs). Use it to
+            turn additive per-microbatch sums into whole-batch statistics and,
+            optionally, to set :data:`SCHEDULED_UPDATE_GATE_KEY`.
         make_microbatch_weight (Callable | None): Optional factory that,
             given the call context, returns a ``(tree, batch) -> Array``
             callable yielding one microbatch's scalar loss weight (its
@@ -545,8 +576,15 @@ class ScheduledLossAdapter:
     make_loss: tp.Callable[[ScheduledStepCall], _ScheduledLossFn]
     make_cache_key: tp.Callable[[ScheduledStepCall], tuple[tp.Any, ...]]
     prepare_batch: tp.Callable[[ScheduledStepCall], collections.abc.Mapping[str, jax.Array]] | None = None
-    has_aux: bool = False
+    has_aux: bool | tp.Callable[[ScheduledStepCall], bool] = False
     make_microbatch_weight: tp.Callable[[ScheduledStepCall], tp.Callable[..., tp.Any]] | None = None
+    finalize_aux: tp.Callable[[ScheduledStepCall, dict[str, tp.Any] | None], dict[str, tp.Any] | None] | None = None
+
+    def resolve_has_aux(self, call: ScheduledStepCall) -> bool:
+        """Return whether the loss built for ``call`` returns ``(loss, aux)``."""
+        if callable(self.has_aux):
+            return bool(self.has_aux(call))
+        return bool(self.has_aux)
 
 
 @dataclasses.dataclass
@@ -656,7 +694,7 @@ class _ScheduledValueAndGradCompiler:
             static_argnums=(),
             batch_argnums=self.batch_argnums,
         )
-        has_aux = bool(self.adapter.has_aux)
+        has_aux = self.adapter.resolve_has_aux(call)
         scheduled_value_and_grad = spx.sxvalue_and_grad(
             scheduled_loss,
             argnums=0,
@@ -2289,6 +2327,36 @@ def _stage_local_gradients_finite(gradients: tp.Any) -> bool:
     return True
 
 
+def _delete_stage_local_gradients(gradients: tp.Any) -> None:
+    """Best-effort release of stage-local gradient buffers of a skipped update."""
+    for leaf in tu.tree_leaves(gradients):
+        delete = getattr(leaf, "delete", None)
+        if callable(delete):
+            try:
+                delete()
+            except Exception:
+                pass
+
+
+def _resolve_scheduled_update_gate(aux: dict[str, tp.Any] | None) -> tuple[dict[str, tp.Any] | None, bool | None]:
+    """Pop :data:`SCHEDULED_UPDATE_GATE_KEY` from host-replicated ``aux`` and decide the update.
+
+    Returns:
+        ``(aux_without_gate, gate)`` where ``gate`` is ``None`` when the loss reported no gate,
+        else a host bool that every controller computes from the same broadcast value. A
+        non-finite gate value closes the gate (fail closed).
+    """
+    if not aux or SCHEDULED_UPDATE_GATE_KEY not in aux:
+        return aux, None
+    aux = dict(aux)
+    value = aux.pop(SCHEDULED_UPDATE_GATE_KEY)
+    if value is None:
+        return aux, None
+    host = float(np.asarray(jax.device_get(value), dtype=np.float64).reshape(()))
+    gate = bool(np.isfinite(host) and host >= 1.0 - _SCHEDULED_UPDATE_GATE_TOLERANCE)
+    return aux, gate
+
+
 def _apply_stage_local_gradients(
     *,
     state: EasyDeLState,
@@ -2297,8 +2365,14 @@ def _apply_stage_local_gradients(
     loss_config: LossConfig | None,
     learning_rate_fn: tp.Any,
     aux: collections.abc.Mapping[str, tp.Any] | None = None,
+    update_gate: bool | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Apply stage-local gradients via the optimizer's PP-aware update path.
+
+    ``update_gate`` (a host bool, identical on every controller) gates the whole update:
+    ``False`` returns the unchanged state on every stage and ``step_skipped = 1.0`` is added to
+    the metrics; ``True`` adds ``step_skipped = 0.0``; ``None`` (no gate) keeps the historical
+    behaviour and metrics.
 
     Used by the scheduled training-step path so each pipeline stage updates
     only its local shard of parameters and optimizer state.  Honors a
@@ -2339,6 +2413,13 @@ def _apply_stage_local_gradients(
         step=state.step,
         gradients=None,
     )
+    if update_gate is not None:
+        other_metrics = dict(metrics.other_metrics or {})
+        other_metrics["step_skipped"] = jnp.asarray(0.0 if update_gate else 1.0, dtype=jnp.float32)
+        metrics = metrics.replace(other_metrics=other_metrics)
+        if not update_gate:
+            _delete_stage_local_gradients(gradients)
+            return state, metrics
     if loss_config is not None and bool(getattr(loss_config, "skip_nonfinite_updates", False)):
         if not bool(jax.device_get(jnp.isfinite(loss))) or not _stage_local_gradients_finite(gradients):
             return state, metrics
@@ -2534,6 +2615,7 @@ def _compile_scheduled_training_step(
             bound_arguments=bound_arguments,
             schedule=schedule,
         )
+        original_call = call
         if adapter.prepare_batch is not None:
             _t_prep = time.perf_counter()
             batch = dict(adapter.prepare_batch(call))
@@ -2563,6 +2645,9 @@ def _compile_scheduled_training_step(
         loss = _mpmd_host_replicate_scalar(loss)
         if aux is not None:
             aux = {key: _mpmd_host_replicate_scalar(value) for key, value in dict(aux).items()}
+        if adapter.finalize_aux is not None:
+            aux = adapter.finalize_aux(original_call, aux)
+        aux, update_gate = _resolve_scheduled_update_gate(aux)
         _t_opt = time.perf_counter()
         out = _apply_stage_local_gradients(
             state=state,
@@ -2571,6 +2656,7 @@ def _compile_scheduled_training_step(
             loss_config=loss_config,
             learning_rate_fn=learning_rate_fn,
             aux=aux,
+            update_gate=update_gate,
         )
         _log_sched_section("apply_stage_local_gradients (opt)", _t_opt, out)
         return out

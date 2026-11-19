@@ -849,19 +849,6 @@ class GRPOConfig(TrainingArguments):
                 )
         if self.off_policy_min_acceptance is not None and self.off_policy_min_acceptance > 1.0:
             raise ValueError(f"`off_policy_min_acceptance` must be in (0, 1]; got {self.off_policy_min_acceptance}.")
-        if getattr(self, "mpmd_scheduler", None) is not None:
-            gated = [
-                knob
-                for knob in ("off_policy_min_acceptance", "startup_behavior_k3_max")
-                if getattr(self, knob) is not None
-            ]
-            if gated:
-                raise ValueError(
-                    f"`{'`, `'.join(gated)}` gate(s) the whole optimizer update, which only the SPMD training step "
-                    "implements; the scheduled `mpmd_scheduler` step applies every update unconditionally, so the "
-                    "gate would be silently skipped. Unset `mpmd_scheduler` or the gate knob(s). "
-                    "(`off_policy_k3_threshold` row rejection is supported under `mpmd_scheduler`.)"
-                )
         if self.startup_behavior_tail_fraction_max <= 0.0:
             raise ValueError(
                 f"`startup_behavior_tail_fraction_max` must be positive; got {self.startup_behavior_tail_fraction_max}."

@@ -33,6 +33,7 @@ import math
 import typing as tp
 
 import jax
+import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -57,6 +58,7 @@ from .._shared.off_policy import (
 )
 from ..reward_protocol import RewardProtocol
 from ..training_utils import (
+    SCHEDULED_UPDATE_GATE_KEY,
     ScheduledLossAdapter,
     compact_generation_model_kwargs,
     extract_generation_model_kwargs,
@@ -1804,6 +1806,9 @@ def _make_grpo_scheduled_loss(call):
     dppo_clip_ratio_c = call.get("dppo_clip_ratio_c", 20.0)
     kl_estimator = call.get("kl_estimator", "k3")
     off_policy_k3_threshold = call.get("off_policy_k3_threshold", None)
+    # With an update gate configured the loss also returns additive gate sums as aux; the
+    # adapter's ``finalize_aux`` turns them into the scheduled update gate.
+    gated = _grpo_update_gate_active(call)
 
     def scheduled_loss(tree, batch):
         """Compute the scalar GRPO loss inside the SpectraX scheduled VJP.
@@ -1859,9 +1864,122 @@ def _make_grpo_scheduled_loss(call):
                 kl_estimator=kl_estimator,
                 off_policy_k3_threshold=off_policy_k3_threshold,
             )
-            return metrics.loss
+            if not gated:
+                return metrics.loss
+            return metrics.loss, _grpo_scheduled_gate_sums(batch, metrics, max_loss_completion_tokens, metrics.loss)
 
     return scheduled_loss
+
+
+_GRPO_GATE_AUX_PREFIX = "grpo_gate_sums/"
+"""Aux-key prefix of the additive sums the gated scheduled GRPO loss reports per microbatch."""
+
+_GRPO_GATE_SUM_KEYS = ("has_behavior", "eligible_rows", "accepted_rows", "tokens", "k3_sum", "tail_count")
+
+
+def _grpo_update_gate_active(call) -> bool:
+    """Whether the GRPO call configures a whole-update gate (acceptance or first-step parity)."""
+    return call.get("off_policy_min_acceptance") is not None or call.get("startup_behavior_k3_max") is not None
+
+
+def _grpo_scheduled_gate_sums(
+    batch,
+    metrics: LossMetrics,
+    max_loss_completion_tokens: int | None,
+    loss: jax.Array,
+) -> dict:
+    """Additive per-microbatch sums from which the whole-batch update gate is rebuilt.
+
+    ``grpo_step`` (eval mode) reports the ratio diagnostics of its microbatch; multiplying them back
+    by their denominators (eligible rows, action tokens — both recomputed from the same truncated
+    completion mask ``grpo_step`` uses) yields additive sums. The scheduled runtime reduces aux with
+    one common scale per microbatch, so the ratios of the reduced sums equal the whole-batch ratios
+    the SPMD step gates on.
+    """
+    mask = jnp.asarray(batch["completion_mask"])
+    if max_loss_completion_tokens is not None and mask.shape[1] > max_loss_completion_tokens:
+        mask = mask[:, :max_loss_completion_tokens]
+    mask_f = (mask > 0).astype(jnp.float32)
+    tokens = jnp.sum(mask_f)
+    eligible = jnp.sum((jnp.sum(mask_f, axis=-1) > 0).astype(jnp.float32))
+    other = metrics.other_metrics or {}
+    zero = jnp.zeros((), jnp.float32)
+    if "off_policy/accepted_fraction" in other:
+        sums = {
+            "has_behavior": jnp.ones((), jnp.float32),
+            "eligible_rows": eligible,
+            "accepted_rows": jnp.asarray(other["off_policy/accepted_fraction"], jnp.float32) * eligible,
+            "tokens": tokens,
+            "k3_sum": jnp.asarray(other["off_policy/behavior_k3"], jnp.float32) * tokens,
+            "tail_count": jnp.asarray(other["off_policy/tail_fraction"], jnp.float32) * tokens,
+        }
+    else:
+        sums = {key: zero for key in _GRPO_GATE_SUM_KEYS}
+    # The pipeline runtime requires every aux output to be computed in the terminal (loss) stage;
+    # values derived only from batch inputs or constants could be clustered elsewhere, so anchor
+    # each sum on the (finite-sanitised) loss with a zero coefficient.
+    anchor = 0.0 * jnp.nan_to_num(jax.lax.stop_gradient(jnp.asarray(loss, jnp.float32)))
+    return {_GRPO_GATE_AUX_PREFIX + key: jax.lax.stop_gradient(value) + anchor for key, value in sums.items()}
+
+
+def _grpo_scheduled_prepare_batch(call):
+    """Keep the host-only ``behavior_parity_gate`` flag out of the pipelined loss inputs.
+
+    The first-step parity flag is a 0-dim host decision consumed by :func:`_grpo_scheduled_finalize_aux`
+    (which receives the un-prepared call, so it still sees the flag), not by the loss.
+    """
+    if "behavior_parity_gate" not in call.batch:
+        return call.batch
+    batch = dict(call.batch)
+    batch.pop("behavior_parity_gate")
+    return batch
+
+
+def _grpo_scheduled_finalize_aux(call, aux):
+    """Turn the reduced gate sums into ``off_policy/*`` diagnostics and the scheduled update gate.
+
+    Mirrors the SPMD gate in :func:`grpo_step`: ``accepted_fraction >= off_policy_min_acceptance``
+    and, while the batch's ``behavior_parity_gate`` flag is set, the first-step parity bounds
+    ``behavior_k3 <= startup_behavior_k3_max`` and ``tail_fraction <= startup_behavior_tail_fraction_max``.
+    Without behaviour log-probs the acceptance gate fails closed and the parity-only gate skips
+    exactly the flagged step. The inputs are host-replicated, so every pipeline rank agrees.
+    """
+    if not aux or not any(key.startswith(_GRPO_GATE_AUX_PREFIX) for key in aux):
+        return aux
+    aux = dict(aux)
+    sums = {
+        key: float(np.asarray(jax.device_get(aux.pop(_GRPO_GATE_AUX_PREFIX + key)), np.float64).reshape(()))
+        for key in _GRPO_GATE_SUM_KEYS
+    }
+    min_acceptance = call.get("off_policy_min_acceptance")
+    k3_max = call.get("startup_behavior_k3_max")
+    tail_max = call.get("startup_behavior_tail_fraction_max", 0.01)
+    parity_flag = call.batch.get("behavior_parity_gate")
+    parity_pending = parity_flag is not None and int(np.asarray(jax.device_get(parity_flag))) > 0
+    if sums["has_behavior"] > 0.5:
+        eligible, tokens = sums["eligible_rows"], sums["tokens"]
+        accepted_fraction = sums["accepted_rows"] / eligible if eligible > 0 else 1.0
+        behavior_k3 = sums["k3_sum"] / tokens if tokens > 0 else 0.0
+        tail_fraction = sums["tail_count"] / tokens if tokens > 0 else 0.0
+        aux["off_policy/accepted_fraction"] = jnp.asarray(accepted_fraction, jnp.float32)
+        aux["off_policy/behavior_k3"] = jnp.asarray(behavior_k3, jnp.float32)
+        aux["off_policy/tail_fraction"] = jnp.asarray(tail_fraction, jnp.float32)
+        # Compare in float32, as the SPMD gate does on device.
+        gate = min_acceptance is None or bool(np.float32(accepted_fraction) >= np.float32(min_acceptance))
+        if k3_max is not None and parity_pending:
+            parity = bool(np.float32(behavior_k3) <= np.float32(k3_max)) and bool(
+                np.float32(tail_fraction) <= np.float32(tail_max)
+            )
+            gate = gate and parity
+    elif min_acceptance is not None:
+        gate = False
+    elif k3_max is not None and parity_flag is not None:
+        gate = not parity_pending
+    else:
+        gate = True
+    aux["off_policy/step_skipped"] = jnp.asarray(0.0 if gate else 1.0, jnp.float32)
+    aux[SCHEDULED_UPDATE_GATE_KEY] = jnp.asarray(1.0 if gate else 0.0, jnp.float32)
+    return aux
 
 
 register_scheduled_loss_adapter(
@@ -1870,5 +1988,8 @@ register_scheduled_loss_adapter(
         name="grpo",
         make_loss=_make_grpo_scheduled_loss,
         make_cache_key=_grpo_scheduled_loss_cache_key,
+        has_aux=_grpo_update_gate_active,
+        prepare_batch=_grpo_scheduled_prepare_batch,
+        finalize_aux=_grpo_scheduled_finalize_aux,
     ),
 )

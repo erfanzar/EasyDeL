@@ -259,13 +259,11 @@ def test_off_policy_config_validation():
 
 @pytest.mark.cpu_ok
 @pytest.mark.parametrize("knob", ["off_policy_min_acceptance", "startup_behavior_k3_max"])
-def test_update_gates_are_rejected_under_mpmd_scheduler(knob):
+def test_update_gates_are_accepted_under_mpmd_scheduler(knob):
     from spectrax.runtime.schedules import Std1F1B
 
-    # The scheduled step applies every update, so an update gate there would be silently skipped.
-    with pytest.raises(ValueError, match=f"{knob}.*SPMD"):
-        GRPOConfig(mpmd_scheduler=Std1F1B(microbatches=2), **{knob: 0.5})
-    # Row rejection runs inside the loss and stays supported under the scheduler.
+    # The scheduled step honours the loss's update gate, so the gate knobs are valid under the scheduler.
+    cfg = GRPOConfig(mpmd_scheduler=Std1F1B(microbatches=2), **{knob: 0.5})
+    assert getattr(cfg, knob) == 0.5
     cfg = GRPOConfig(mpmd_scheduler=Std1F1B(microbatches=2), off_policy_k3_threshold=0.5)
     assert cfg.off_policy_k3_threshold == 0.5
-    assert GRPOConfig(**{knob: 0.5}).mpmd_scheduler is None
