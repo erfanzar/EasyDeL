@@ -1016,12 +1016,17 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     epsilon: NotRequired[float]
     epsilon_high: NotRequired[float | None]
     delta: NotRequired[float | None]
-    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo"]]
+    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo", "gmpo"]]
     importance_sampling_level: NotRequired[Literal["token", "sequence", "sequence_token"]]
     num_iterations: NotRequired[int]
     num_generations: NotRequired[int | None]
     reward_weights: NotRequired[list[float] | None]
-    scale_rewards: NotRequired[Literal["group", "batch", "none"] | bool]
+    scale_rewards: NotRequired[Literal["group", "batch", "batch_advantage", "none"] | bool]
+    discard_unscorable_groups: NotRequired[bool | None]
+    off_policy_k3_threshold: NotRequired[float | None]
+    off_policy_min_acceptance: NotRequired[float | None]
+    startup_behavior_k3_max: NotRequired[float | None]
+    startup_behavior_tail_fraction_max: NotRequired[float]
     mask_truncated_completions: NotRequired[bool]
     top_entropy_quantile: NotRequired[float]
     min_p: NotRequired[float | None]
@@ -2307,6 +2312,13 @@ ELARGE_ONLY_TRAINER_KEYS: tuple[str, ...] = (
     "environment",
     "environment_backend",
     "environment_endpoints",
+)
+
+# Subset of ``ELARGE_ONLY_TRAINER_KEYS`` that some trainer-arguments classes declare as their own
+# fields (AgentFlow, AsyncGRPO). The builder forwards these keys only to argument classes whose
+# signature accepts them, so a YAML-only ``environment`` reaches those trainers.
+ELARGE_ENVIRONMENT_TRAINER_KEYS: frozenset[str] = frozenset(
+    {"environment", "environment_backend", "environment_endpoints"}
 )
 
 BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {

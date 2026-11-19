@@ -46,6 +46,15 @@ from easydel.trainers._logprob_utils import (
     resolve_lmhead_chunksize,
 )
 
+from .._shared.off_policy import (
+    SUM_PREFIX,
+    acceptance_ok,
+    add_behavior_sums,
+    behavior_parity_ok,
+    behavior_policy_terms,
+    split_behavior_sums,
+    summarize_behavior_sums,
+)
 from ..reward_protocol import RewardProtocol
 from ..training_utils import (
     ScheduledLossAdapter,
@@ -207,6 +216,7 @@ def _gmpo_sequence_ratio(
     epsilon: float,
     epsilon_high: float,
     delta: float | None = None,
+    token_is_weights: jax.Array | None = None,
 ) -> jax.Array:
     """Geometric mean of the advantage-sign-aware clipped token ratios (GMPO).
 
@@ -217,6 +227,13 @@ def _gmpo_sequence_ratio(
     Everything is computed in log space, so padded tokens with extreme
     log-ratios cannot overflow; clipped tokens receive no gradient.
 
+    Token-level rollout importance-sampling weights ``w_t`` (``token_*`` eSurge
+    correction modes) are folded *into* the geometric mean: tokens with
+    ``w_t = 0`` leave the log-mean mask entirely (so they receive no gradient
+    through the sequence ratio), and the remaining tokens add the constant
+    ``stop_gradient(log w_t)`` to their clipped log ratio:
+    ``exp(mean_{t: w_t > 0} [log clip(r_t) + log w_t])``.
+
     Args:
         per_token_logps: Current-policy log-probs ``[batch, seq]``.
         old_per_token_logps: Behaviour-policy log-probs ``[batch, seq]``.
@@ -225,11 +242,19 @@ def _gmpo_sequence_ratio(
         epsilon: Lower clip offset; must satisfy ``0 < epsilon < 1``.
         epsilon_high: Upper clip offset.
         delta: Optional absolute cap on every token ratio.
+        token_is_weights: Optional token-level rollout importance weights
+            ``[batch, seq]`` (treated as constants).
 
     Returns:
         Sequence geometric-mean ratio of shape ``[batch, 1]``.
     """
     mask = completion_mask > 0
+    is_log_weight = None
+    if token_is_weights is not None:
+        weights = jax.lax.stop_gradient(token_is_weights).astype(jnp.float32)
+        keep = jnp.isfinite(weights) & (weights > 0)
+        mask = mask & keep
+        is_log_weight = jnp.log(jnp.where(keep, weights, 1.0))
     log_ratio = jnp.where(mask, per_token_logps - old_per_token_logps, 0.0)
     clipped = jnp.where(
         advantages > 0,
@@ -239,9 +264,49 @@ def _gmpo_sequence_ratio(
     if delta is not None:
         clipped = jnp.minimum(clipped, math.log(delta))
     clipped = jnp.maximum(clipped, math.log(1e-6))
+    if is_log_weight is not None:
+        clipped = clipped + is_log_weight
     token_count = jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True).astype(jnp.float32), 1.0)
     sequence_log_ratio = jnp.sum(jnp.where(mask, clipped, 0.0), axis=-1, keepdims=True) / token_count
     return jnp.exp(sequence_log_ratio)
+
+
+def _is_token_level_ratio(ratio: jax.Array | None, per_token_logps: jax.Array) -> bool:
+    """Whether a rollout importance-sampling ratio is per token (``[batch, seq]``) rather than per sequence."""
+    return ratio is not None and ratio.ndim == 2 and int(ratio.shape[-1]) == int(per_token_logps.shape[-1])
+
+
+def _apply_rollout_is_ratio_post_hoc(loss_type: str, ratio: jax.Array | None, per_token_logps: jax.Array) -> bool:
+    """Whether the rollout IS ratio is multiplied into the per-token loss after the surrogate.
+
+    VESPO folds the ratio into its sequence weight and GMPO folds token-level ratios into its
+    geometric mean, so neither multiplies them in again.
+    """
+    if ratio is None or loss_type == "vespo":
+        return False
+    return not (loss_type == "gmpo" and _is_token_level_ratio(ratio, per_token_logps))
+
+
+def _sanitize_rollout_ratio(ratio: jax.Array, accept: jax.Array) -> jax.Array:
+    """Zero rollout IS ratios of rejected rows and non-finite entries so they cannot poison gradients."""
+    return jnp.where(jnp.isfinite(ratio) & accept, ratio, 0.0)
+
+
+def _finalize_behavior_metrics(
+    metrics: LossMetrics,
+    accumulation_steps: int,
+) -> tuple[LossMetrics, dict[str, jax.Array] | None]:
+    """Replace the additive behaviour sums in ``metrics`` with the ``off_policy/*`` diagnostics.
+
+    Returns:
+        ``(metrics, summary)``; ``summary`` is ``None`` when the batch carried no behaviour logprobs.
+    """
+    remaining, sums = split_behavior_sums(metrics.other_metrics)
+    if not sums:
+        return metrics, None
+    summary = summarize_behavior_sums(sums, accumulation_steps=accumulation_steps)
+    remaining.update(summary)
+    return metrics.replace(other_metrics=remaining), summary
 
 
 def _compute_off_policy_sequence_mask(
@@ -373,6 +438,9 @@ def _compute_grpo_policy_loss_terms(
             epsilon=epsilon,
             epsilon_high=epsilon_high,
             delta=delta,
+            token_is_weights=(
+                importance_sampling_ratio if _is_token_level_ratio(importance_sampling_ratio, per_token_logps) else None
+            ),
         )
         return jnp.broadcast_to(-advantages * sequence_ratio, per_token_logps.shape), coef_1
     if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
@@ -845,6 +913,10 @@ def grpo_step(
     dppo_divergence_type: str | None = None,
     dppo_clip_ratio_c: float = 20.0,
     kl_estimator: str = "k3",
+    off_policy_k3_threshold: float | None = None,
+    off_policy_min_acceptance: float | None = None,
+    startup_behavior_k3_max: float | None = None,
+    startup_behavior_tail_fraction_max: float = 0.01,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single GRPO training or evaluation step.
 
@@ -908,6 +980,19 @@ def grpo_step(
         dppo_clip_ratio_c: Upper cap on DPPO importance ratios.
         kl_estimator: Per-token KL estimator for the ``beta`` penalty:
             ``"k1"``, ``"k2"``, ``"k3"`` (default), or ``"l2"``.
+        off_policy_k3_threshold: Optional per-sequence mean behaviour-K3 bound. When the batch
+            carries ``behavior_per_token_logps`` (rollout-engine sampling log-probs), sequences
+            above the bound, or with a non-finite behaviour log ratio, have their loss zeroed
+            while every normaliser keeps its pre-rejection token count. Non-finite rows are
+            rejected even when this is ``None``.
+        off_policy_min_acceptance: Optional minimum ``accepted / eligible`` row fraction. Below
+            it the step leaves parameters and optimizer state unchanged and reports
+            ``off_policy/step_skipped = 1``. A batch without behaviour logprobs is skipped.
+        startup_behavior_k3_max: Optional bound on the token-mean behaviour K3 for steps whose
+            batch carries ``behavior_parity_gate > 0`` (the trainer's first step); a violation
+            skips the update.
+        startup_behavior_tail_fraction_max: Bound on the fraction of tokens with
+            ``|log ratio| > 0.25`` for the same startup gate.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
@@ -1008,6 +1093,13 @@ def grpo_step(
         elif difficulty_weights.ndim == 1:
             difficulty_weights = difficulty_weights[:, None]
         difficulty_weights = difficulty_weights.astype(jnp.float32)
+        # LUSPO averages over sequences; rows with zero weight (e.g. discarded unscorable groups)
+        # are excluded from that count. Without weights every row counts.
+        luspo_row_count = (
+            jnp.sum((difficulty_weights[:, 0] > 0).astype(jnp.float32))
+            if has_difficulty_weights
+            else jnp.asarray(completion_ids.shape[0], dtype=jnp.float32)
+        )
 
         old_per_token_logps = minibatch.get("old_per_token_logps")
         if old_per_token_logps is not None and old_per_token_logps.shape[1] != completion_ids.shape[1]:
@@ -1019,6 +1111,9 @@ def grpo_step(
             if importance_sampling_ratio.ndim == 1:
                 importance_sampling_ratio = importance_sampling_ratio[:, None]
             importance_sampling_ratio = importance_sampling_ratio[:, : completion_ids.shape[1]]
+        behavior_per_token_logps = minibatch.get("behavior_per_token_logps")
+        if behavior_per_token_logps is not None:
+            behavior_per_token_logps = behavior_per_token_logps[:, : completion_ids.shape[1]]
 
         use_chunked_completion_loss = (
             completion_chunk_size is not None
@@ -1052,6 +1147,7 @@ def grpo_step(
             off_policy_keep_num = jnp.array(0.0, dtype=jnp.float32)
             off_policy_keep_den = jnp.array(0.0, dtype=jnp.float32)
             grpo_weight_den = jnp.sum(difficulty_weights)
+            behavior_sums = None
 
             for start in range(0, completion_batch_size, completion_chunk_size):
                 end = min(start + completion_chunk_size, completion_batch_size)
@@ -1120,6 +1216,20 @@ def grpo_step(
                 chunk_importance_sampling_ratio = (
                     importance_sampling_ratio[start:end] if importance_sampling_ratio is not None else None
                 )
+                chunk_behavior_accept = None
+                if behavior_per_token_logps is not None:
+                    chunk_behavior = behavior_policy_terms(
+                        chunk_per_token_logps,
+                        behavior_per_token_logps[start:end],
+                        chunk_completion_mask,
+                        k3_threshold=off_policy_k3_threshold,
+                    )
+                    behavior_sums = add_behavior_sums(behavior_sums, chunk_behavior.sums)
+                    chunk_behavior_accept = chunk_behavior.accept
+                    if chunk_importance_sampling_ratio is not None:
+                        chunk_importance_sampling_ratio = _sanitize_rollout_ratio(
+                            chunk_importance_sampling_ratio, chunk_behavior_accept
+                        )
 
                 if dppo_divergence_type is not None:
                     chunk_sampling_per_token_logps = minibatch.get("sampling_per_token_logps")
@@ -1165,7 +1275,7 @@ def grpo_step(
                         importance_sampling_ratio=chunk_importance_sampling_ratio,
                     )
 
-                if loss_type != "vespo" and chunk_importance_sampling_ratio is not None:
+                if _apply_rollout_is_ratio_post_hoc(loss_type, chunk_importance_sampling_ratio, chunk_per_token_logps):
                     chunk_per_token_loss = chunk_per_token_loss * jax.lax.stop_gradient(chunk_importance_sampling_ratio)
 
                 if off_policy_mask_threshold is not None:
@@ -1194,6 +1304,8 @@ def grpo_step(
                 if beta != 0.0:
                     chunk_per_token_loss = chunk_per_token_loss + beta * chunk_per_token_kl
                 chunk_per_token_loss = chunk_per_token_loss * chunk_difficulty_weights
+                if chunk_behavior_accept is not None:
+                    chunk_per_token_loss = jnp.where(chunk_behavior_accept, chunk_per_token_loss, 0.0)
 
                 if loss_type in {"grpo", "sapo", "gmpo"}:
                     loss_numerator = loss_numerator + jnp.sum(
@@ -1258,7 +1370,7 @@ def grpo_step(
                 # Match the non-chunked path's ``jnp.mean(per_token_loss * completion_lengths)`` which divides
                 # by batch*seq; dividing by batch alone made the chunked loss ~seq_len larger, so the gradient
                 # magnitude depended on whether LM-head chunking was enabled.
-                loss = loss_numerator / jnp.maximum(completion_ids.shape[0] * completion_ids.shape[1], 1.0)
+                loss = loss_numerator / jnp.maximum(luspo_row_count * completion_ids.shape[1], 1.0)
             elif loss_type == "bnpo":
                 weighted_token_count = jnp.sum(completion_mask * difficulty_weights)
                 loss = loss_numerator / jnp.maximum(weighted_token_count, 1.0)
@@ -1288,6 +1400,8 @@ def grpo_step(
                 other_metrics["cispo_clip_ratio"] = cispo_clip_num / jnp.maximum(cispo_clip_den, 1.0)
             if off_policy_mask_threshold is not None:
                 other_metrics["off_policy_keep_ratio"] = off_policy_keep_num / jnp.maximum(off_policy_keep_den, 1.0)
+            if behavior_sums is not None:
+                other_metrics.update({SUM_PREFIX + key: value for key, value in behavior_sums.items()})
 
             return loss, LossMetrics(
                 loss=loss,
@@ -1346,6 +1460,17 @@ def grpo_step(
         if beta != 0.0 and use_bias_correction_kl:
             per_token_kl = per_token_kl * importance_weights
 
+        behavior_terms = None
+        if behavior_per_token_logps is not None:
+            behavior_terms = behavior_policy_terms(
+                per_token_logps,
+                behavior_per_token_logps,
+                completion_mask,
+                k3_threshold=off_policy_k3_threshold,
+            )
+            if importance_sampling_ratio is not None:
+                importance_sampling_ratio = _sanitize_rollout_ratio(importance_sampling_ratio, behavior_terms.accept)
+
         with jax.named_scope(scope_root + "/loss_fn/policy_objective"):
             dppo_divergence_mask = None
             if dppo_divergence_type is not None:
@@ -1388,7 +1513,7 @@ def grpo_step(
                     importance_sampling_ratio=importance_sampling_ratio,
                 )
 
-        if loss_type != "vespo" and importance_sampling_ratio is not None:
+        if _apply_rollout_is_ratio_post_hoc(loss_type, importance_sampling_ratio, per_token_logps):
             per_token_loss = per_token_loss * jax.lax.stop_gradient(importance_sampling_ratio)
 
         off_policy_mask = None
@@ -1416,6 +1541,9 @@ def grpo_step(
         if beta != 0.0:
             per_token_loss = per_token_loss + beta * per_token_kl
         per_token_loss = per_token_loss * difficulty_weights
+        if behavior_terms is not None:
+            # Rejected rows contribute zero; normalisers below still count their tokens.
+            per_token_loss = jnp.where(behavior_terms.accept, per_token_loss, 0.0)
 
         with jax.named_scope(scope_root + "/loss_fn/reduce_loss"):
             if loss_type in {"grpo", "sapo", "gmpo"}:
@@ -1425,7 +1553,9 @@ def grpo_step(
                 )
                 loss = jnp.sum(sequence_loss) / jnp.maximum(jnp.sum(difficulty_weights), 1.0)
             elif loss_type == "luspo":
-                loss = jnp.mean(per_token_loss * completion_lengths[:, None])
+                loss = jnp.sum(per_token_loss * completion_lengths[:, None]) / jnp.maximum(
+                    luspo_row_count * per_token_loss.shape[1], 1.0
+                )
             elif loss_type == "bnpo":
                 weighted_token_count = jnp.sum(completion_mask * difficulty_weights)
                 loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(weighted_token_count, 1.0)
@@ -1495,6 +1625,8 @@ def grpo_step(
             other_metrics["dppo_mask_ratio/overall_mean"] = masked_mean(is_masked.astype(jnp.float32))
         if off_policy_mask is not None:
             other_metrics["off_policy_keep_ratio"] = jnp.mean(off_policy_mask)
+        if behavior_terms is not None:
+            other_metrics.update({SUM_PREFIX + key: value for key, value in behavior_terms.sums.items()})
 
         return loss, LossMetrics(
             loss=loss,
@@ -1510,22 +1642,63 @@ def grpo_step(
                 minibatch_size=minibatch_size,
                 grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
             )
+        metrics, behavior_summary = _finalize_behavior_metrics(metrics, gradient_accumulation_steps)
+        contract_active = off_policy_min_acceptance is not None or startup_behavior_k3_max is not None
+        update_gate = None
+        if behavior_summary is not None and contract_active:
+            update_gate = acceptance_ok(behavior_summary["off_policy/accepted_fraction"], off_policy_min_acceptance)
+            parity_flag = batch.get("behavior_parity_gate")
+            if startup_behavior_k3_max is not None and parity_flag is not None:
+                parity = behavior_parity_ok(
+                    behavior_summary["off_policy/behavior_k3"],
+                    behavior_summary["off_policy/tail_fraction"],
+                    k3_max=startup_behavior_k3_max,
+                    tail_fraction_max=startup_behavior_tail_fraction_max,
+                )
+                update_gate = update_gate & (parity | (jnp.asarray(parity_flag) <= 0))
+        elif off_policy_min_acceptance is not None:
+            # Fail closed: the acceptance contract is configured but the batch carries no behaviour logprobs.
+            update_gate = jnp.asarray(False)
+        elif startup_behavior_k3_max is not None and batch.get("behavior_parity_gate") is not None:
+            # The first-step parity check cannot run without behaviour logprobs: skip that step only.
+            update_gate = jnp.asarray(batch["behavior_parity_gate"]) <= 0
+        metrics = update_metrics(
+            metrics=metrics,
+            learning_rate_fn=learning_rate_fn,
+            step=state.step,
+            gradients=gradients,
+        )
+        if update_gate is not None:
+            other_metrics = dict(metrics.other_metrics or {})
+            other_metrics["off_policy/step_skipped"] = 1.0 - update_gate.astype(jnp.float32)
+            metrics = metrics.replace(other_metrics=other_metrics)
         with jax.named_scope(scope_root + "/update_state"):
-            state = update_state_respectfully(
-                state=state,
-                gradients=gradients,
-                loss_config=loss_config,
-                metrics=update_metrics(
-                    metrics=metrics,
-                    learning_rate_fn=learning_rate_fn,
-                    step=state.step,
+            if update_gate is None:
+                state = update_state_respectfully(
+                    state=state,
                     gradients=gradients,
-                ),
-            )
+                    loss_config=loss_config,
+                    metrics=metrics,
+                )
+            else:
+                # Gated update: the skip branch returns the state untouched, so parameters,
+                # optimizer moments and the step counter are all preserved bit-for-bit.
+                state = jax.lax.cond(
+                    update_gate,
+                    lambda current: update_state_respectfully(
+                        state=current,
+                        gradients=gradients,
+                        loss_config=loss_config,
+                        metrics=metrics,
+                    ),
+                    lambda current: current,
+                    state,
+                )
         return state, metrics
     else:
         with jax.named_scope(scope_root + "/eval_call"):
             _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
+        metrics, _ = _finalize_behavior_metrics(metrics, 1)
         return metrics
 
 
@@ -1574,6 +1747,10 @@ def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "dppo_divergence_type",
             "dppo_clip_ratio_c",
             "kl_estimator",
+            "off_policy_k3_threshold",
+            "off_policy_min_acceptance",
+            "startup_behavior_k3_max",
+            "startup_behavior_tail_fraction_max",
         ),
         object_fields=("loss_config", "learning_rate_fn", "straight_through_emulator"),
     )
@@ -1626,6 +1803,7 @@ def _make_grpo_scheduled_loss(call):
     dppo_divergence_type = call.get("dppo_divergence_type")
     dppo_clip_ratio_c = call.get("dppo_clip_ratio_c", 20.0)
     kl_estimator = call.get("kl_estimator", "k3")
+    off_policy_k3_threshold = call.get("off_policy_k3_threshold", None)
 
     def scheduled_loss(tree, batch):
         """Compute the scalar GRPO loss inside the SpectraX scheduled VJP.
@@ -1679,6 +1857,7 @@ def _make_grpo_scheduled_loss(call):
                 dppo_divergence_type=dppo_divergence_type,
                 dppo_clip_ratio_c=dppo_clip_ratio_c,
                 kl_estimator=kl_estimator,
+                off_policy_k3_threshold=off_policy_k3_threshold,
             )
             return metrics.loss
 

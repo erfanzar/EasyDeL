@@ -29,7 +29,11 @@ from easydel.trainers.group_relative_policy_optimization._fn import (
     grpo_step,
 )
 from easydel.trainers.group_relative_policy_optimization.grpo_config import GRPOConfig
-from easydel.trainers.group_relative_policy_optimization.grpo_trainer import GRPOTrainer, _ScoredRollout
+from easydel.trainers.group_relative_policy_optimization.grpo_trainer import (
+    GRPOTrainer,
+    _compute_rewards_and_advantages,
+    _ScoredRollout,
+)
 from easydel.trainers.reinforce_plus_plus_trainer import ReinforcePlusPlusConfig, ReinforcePlusPlusTrainer
 from easydel.trainers.training_utils import ScheduledStepCall, get_scheduled_loss_adapter
 from easydel.utils import Registry
@@ -232,7 +236,8 @@ def test_kl_estimators_match_closed_forms(estimator, formula):
     policy = np.array([[-1.0, -2.5, -0.3]], dtype=np.float32)
     ref = np.array([[-1.4, -2.0, -0.3]], dtype=np.float32)
     kl = _compute_per_token_kl(jnp.asarray(policy), jnp.asarray(ref), estimator)
-    np.testing.assert_allclose(np.asarray(kl), formula(policy.astype(np.float64) - ref), rtol=1e-5, atol=1e-7)
+    # float32 exp on TPU: measured relative error ~1.4e-5.
+    np.testing.assert_allclose(np.asarray(kl), formula(policy.astype(np.float64) - ref), rtol=2e-5, atol=1e-7)
     with pytest.raises(ValueError, match="kl_estimator"):
         _compute_per_token_kl(jnp.asarray(policy), jnp.asarray(ref), "k9")
 
@@ -259,10 +264,93 @@ def test_grpo_step_kl_penalty_uses_selected_estimator(estimator, chunk_size):
 
 
 @pytest.mark.cpu_ok
-def test_static_arg_tuples_bind_kl_estimator_last():
-    names = tuple(inspect.signature(grpo_step).parameters)
-    assert names[-1] == "kl_estimator"
+@pytest.mark.parametrize("is_train", [True, False])
+def test_static_arg_tuples_bind_to_grpo_step_signature(is_train):
+    trainer = object.__new__(GRPOTrainer)
+    trainer.arguments = GRPOConfig(
+        kl_estimator="k2",
+        loss_type="gmpo",
+        epsilon=0.3,
+        off_policy_k3_threshold=0.5,
+        off_policy_min_acceptance=0.75,
+        startup_behavior_k3_max=0.02,
+        startup_behavior_tail_fraction_max=0.05,
+    )
+    trainer.scheduler = None
+    trainer.loss_type = trainer.arguments.loss_type
+    trainer.epsilon = trainer.arguments.epsilon
+    trainer.epsilon_high = trainer.arguments.epsilon_high
+    trainer.delta = trainer.arguments.delta
+    trainer.importance_sampling_level = "token"
+    trainer.top_entropy_quantile = 1.0
+    trainer.kl_estimator = "k2"
+    static_args = trainer._grpo_step_static_args(num_generations=3, is_train=is_train, straight_through_emulator=None)
+
+    bound = inspect.signature(grpo_step).bind(object(), {}, *static_args).arguments
+    assert bound["num_generations"] == 3
+    assert bound["is_training"] is is_train
+    assert bound["loss_type"] == "gmpo"
+    assert bound["epsilon"] == 0.3
+    assert bound["kl_estimator"] == "k2"
+    assert bound["off_policy_k3_threshold"] == 0.5
+    assert bound["off_policy_min_acceptance"] == 0.75
+    assert bound["startup_behavior_k3_max"] == 0.02
+    assert bound["startup_behavior_tail_fraction_max"] == 0.05
+    # Every parameter after (state, batch) is bound positionally: nothing silently falls back to a default.
+    assert len(bound) == len(inspect.signature(grpo_step).parameters)
     assert get_scheduled_loss_adapter(grpo_step) is not None
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1])
+def test_gmpo_token_is_mask_blocks_gradient_inside_geometric_mean(chunk_size):
+    bias = jnp.zeros((3, VOCAB), dtype=jnp.float32)
+    state = _State(bias, _mesh())
+    prompt_ids = np.array([[0]], dtype=np.int32)
+    completion_ids = np.array([[1, 2], [3, 4]], dtype=np.int32)
+    advantages = np.array([1.0, 2.0], dtype=np.float32)
+    # Token 0 of every row is masked by a token-level rollout IS mode; token 1 is truncated to weight 0.5.
+    is_ratio = np.array([[0.0, 0.5], [0.0, 0.5]], dtype=np.float32)
+    batch = {
+        "prompt_ids": jnp.asarray(prompt_ids),
+        "prompt_mask": jnp.ones((1, 1), dtype=jnp.int32),
+        "completion_ids": jnp.asarray(completion_ids),
+        "completion_mask": jnp.ones((2, 2), dtype=jnp.float32),
+        "advantages": jnp.asarray(advantages),
+        "importance_sampling_ratio": jnp.asarray(is_ratio),
+    }
+    loss_fn = _scheduled_loss_fn(
+        state, batch, loss_type="gmpo", epsilon=0.4, epsilon_high=0.4, completion_chunk_size=chunk_size
+    )
+    loss, grads = jax.value_and_grad(loss_fn)(bias, batch)
+
+    # On-policy (old == current): only token 1 survives the mask, its log ratio is 0 and its
+    # constant log-weight log(0.5) enters the geometric mean, so each sequence ratio is 0.5.
+    np.testing.assert_allclose(np.asarray(loss), np.mean(-advantages * 0.5), rtol=1e-5)
+    # Masked tokens (position 0) receive exactly zero gradient through the sequence ratio.
+    np.testing.assert_array_equal(np.asarray(grads[0]), np.zeros(VOCAB, dtype=np.float32))
+    assert float(jnp.max(jnp.abs(grads[1]))) > 1e-3
+
+
+def test_reinforce_plus_plus_batch_advantage_excludes_between_group_variance():
+    rewards_per_func = jnp.asarray([[10.0], [10.0], [10.0], [12.0], [0.0], [0.0], [0.0], [2.0]], dtype=jnp.float32)
+    common = {
+        "rewards_per_func": rewards_per_func,
+        "reward_weights": jnp.ones((1,), dtype=jnp.float32),
+        "generation_factor": 4,
+        "multi_objective_aggregation": "sum_then_normalize",
+        "arguments": ReinforcePlusPlusConfig(),
+    }
+    _, advantages, std, _ = _compute_rewards_and_advantages(scale_rewards="batch_advantage", **common)
+
+    # Group means are 10.5 and 0.5, so A = [-.5, -.5, -.5, 1.5] in both groups; mean(A) = 0, std(A) = sqrt(0.75).
+    centred = np.array([-0.5, -0.5, -0.5, 1.5] * 2)
+    np.testing.assert_allclose(np.asarray(advantages), centred / (np.sqrt(0.75) + 1e-4), rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(std), np.full(8, np.sqrt(0.75)), rtol=1e-5)
+
+    # The raw-reward batch std (~5.1) is dominated by between-group variance and shrinks the advantages.
+    _, batch_advantages, _, _ = _compute_rewards_and_advantages(scale_rewards="batch", **common)
+    raw = np.array([10, 10, 10, 12, 0, 0, 0, 2], dtype=np.float64)
+    np.testing.assert_allclose(np.asarray(batch_advantages), centred / (raw.std() + 1e-4), rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -334,7 +422,7 @@ def test_survey_trainer_configs_defaults_and_registry():
     assert gdpo.decouple_reward_normalization is True
     assert gdpo.multi_objective_aggregation == "normalize_then_sum"
     rpp = ReinforcePlusPlusConfig()
-    assert (rpp.scale_rewards, rpp.kl_estimator) == ("batch", "k2")
+    assert (rpp.scale_rewards, rpp.kl_estimator) == ("batch_advantage", "k2")
 
     for name, config_cls, trainer_cls in (
         ("gmpo", GMPOConfig, GMPOTrainer),

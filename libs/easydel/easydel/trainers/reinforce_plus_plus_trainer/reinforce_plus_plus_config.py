@@ -31,22 +31,24 @@ from ..group_relative_policy_optimization import GRPOConfig
 class ReinforcePlusPlusConfig(GRPOConfig):
     """Configuration class for REINFORCE++ (arXiv:2501.03262).
 
-    REINFORCE++ keeps the group-mean baseline but standardizes
-    advantages with the *global batch* standard deviation instead of the
-    per-prompt one, which removes the bias that per-group std scaling
-    introduces on easy/hard prompts. The KL penalty uses the ``k2``
+    REINFORCE++ keeps the group-mean baseline but standardizes the
+    group-centred advantages ``A = r - mean_group(r)`` over the *global
+    batch*: ``(A - mean_batch(A)) / (std_batch(A) + eps)``. Unlike dividing
+    by the std of the raw rewards, this scale excludes between-group
+    variance, and unlike per-group std scaling it does not inflate easy or
+    hard prompts. The KL penalty uses the ``k2``
     estimator (``0.5 * (log r)^2``), whose gradient is an unbiased
     estimate of the reverse-KL gradient.
 
     Compared with :class:`GRPOConfig` the defaults are:
 
-    * ``scale_rewards = "batch"``.
+    * ``scale_rewards = "batch_advantage"``.
     * ``kl_estimator = "k2"``.
 
     Attributes:
         trainer_prefix: Default prefix used for checkpoints/logs
             (``"REINFORCE++"``).
-        scale_rewards: Reward scaling strategy. Default ``"batch"``.
+        scale_rewards: Reward scaling strategy. Default ``"batch_advantage"``.
         kl_estimator: KL estimator for the ``beta`` penalty. Default
             ``"k2"``.
     """
@@ -56,8 +58,13 @@ class ReinforcePlusPlusConfig(GRPOConfig):
         metadata={"help": "default prefix name for trainer."},
     )
     scale_rewards: str | bool = field(
-        default="batch",
-        metadata={"help": "Reward scaling strategy. REINFORCE++ normalizes advantages over the batch."},
+        default="batch_advantage",
+        metadata={
+            "help": (
+                "Reward scaling strategy. REINFORCE++ standardizes group-centred advantages over the batch "
+                "('batch_advantage')."
+            )
+        },
     )
     kl_estimator: str = field(
         default="k2",

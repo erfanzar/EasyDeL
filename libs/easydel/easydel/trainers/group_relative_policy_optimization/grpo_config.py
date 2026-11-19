@@ -130,7 +130,8 @@ class GRPOConfig(TrainingArguments):
             ``multi_objective_aggregation="normalize_then_sum"``; after
             ``__post_init__`` the flag mirrors that setting.
         scale_rewards: Reward scaling strategy: ``"group"`` (default),
-            ``"batch"``, ``"none"``. ``True``/``False`` are accepted
+            ``"batch"``, ``"batch_advantage"`` (standardize group-centred
+            advantages over the batch), ``"none"``. ``True``/``False`` are accepted
             and mapped to ``"group"``/``"none"``.
         tools: Optional tool registry forwarded to the reward
             functions.
@@ -391,7 +392,10 @@ class GRPOConfig(TrainingArguments):
     scale_rewards: str | bool = field(
         default="group",
         metadata={
-            "help": "Reward scaling strategy: 'group', 'batch', 'none', or the booleans True/False for group/none."
+            "help": (
+                "Reward scaling strategy: 'group', 'batch', 'batch_advantage', 'none', or the booleans "
+                "True/False for group/none."
+            )
         },
     )
     tools: list[dict | tp.Callable] | None = field(
@@ -507,6 +511,51 @@ class GRPOConfig(TrainingArguments):
     use_bias_correction_kl: bool = field(
         default=False,
         metadata={"help": "Whether to importance-weight the KL penalty for bias correction."},
+    )
+    discard_unscorable_groups: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "What a None reward (unscorable sample: judge or infra failure) does to its prompt group. "
+                "None (default): per-function opt-in -- the whole group is dropped from the update (zero "
+                "advantages, tokens and sequences excluded from every loss normaliser) only when the None comes "
+                "from a reward function whose `discard_unscorable` attribute is True; a None from any other "
+                "function becomes NaN and is skipped by the nan-aware reward statistics. True: a None from any "
+                "function drops the group. False: never drop; every None uses the nan-aware aggregation."
+            )
+        },
+    )
+    off_policy_k3_threshold: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional per-sequence mean K3 bound between learner and eSurge behaviour log-probs. Sequences "
+                "above it are rejected (loss zeroed, normaliser unchanged). Requires "
+                "esurge_importance_sampling_correction=True."
+            )
+        },
+    )
+    off_policy_min_acceptance: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional minimum accepted/eligible sequence fraction; below it the step leaves parameters and "
+                "optimizer state unchanged. Requires esurge_importance_sampling_correction=True."
+            )
+        },
+    )
+    startup_behavior_k3_max: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional first-step parity bound on the token-mean behaviour K3. A violation skips the first "
+                "update and raises. Requires esurge_importance_sampling_correction=True."
+            )
+        },
+    )
+    startup_behavior_tail_fraction_max: float = field(
+        default=0.01,
+        metadata={"help": "First-step bound on the fraction of tokens with |log ratio| > 0.25."},
     )
     esurge_importance_sampling_correction: bool = field(
         default=True,
@@ -786,6 +835,36 @@ class GRPOConfig(TrainingArguments):
             raise ValueError(
                 "`esurge_importance_sampling_cap` must be >= 1.0 for IcePop modes when "
                 "`esurge_importance_sampling_cap_low` is None so [1/cap, cap] is non-empty."
+            )
+        for knob in ("off_policy_k3_threshold", "off_policy_min_acceptance", "startup_behavior_k3_max"):
+            value = getattr(self, knob)
+            if value is None:
+                continue
+            if value <= 0.0:
+                raise ValueError(f"`{knob}` must be positive when set; got {value}.")
+            if not self.esurge_importance_sampling_correction:
+                raise ValueError(
+                    f"`{knob}` requires behaviour log-probs from the rollout engine; set "
+                    "`esurge_importance_sampling_correction=True` (eSurge importance-sampling inputs)."
+                )
+        if self.off_policy_min_acceptance is not None and self.off_policy_min_acceptance > 1.0:
+            raise ValueError(f"`off_policy_min_acceptance` must be in (0, 1]; got {self.off_policy_min_acceptance}.")
+        if getattr(self, "mpmd_scheduler", None) is not None:
+            gated = [
+                knob
+                for knob in ("off_policy_min_acceptance", "startup_behavior_k3_max")
+                if getattr(self, knob) is not None
+            ]
+            if gated:
+                raise ValueError(
+                    f"`{'`, `'.join(gated)}` gate(s) the whole optimizer update, which only the SPMD training step "
+                    "implements; the scheduled `mpmd_scheduler` step applies every update unconditionally, so the "
+                    "gate would be silently skipped. Unset `mpmd_scheduler` or the gate knob(s). "
+                    "(`off_policy_k3_threshold` row rejection is supported under `mpmd_scheduler`.)"
+                )
+        if self.startup_behavior_tail_fraction_max <= 0.0:
+            raise ValueError(
+                f"`startup_behavior_tail_fraction_max` must be positive; got {self.startup_behavior_tail_fraction_max}."
             )
         if self.use_transformers_paged:
             raise ValueError("`use_transformers_paged=True` is unsupported; use EasyDeL eSurge generation instead.")
