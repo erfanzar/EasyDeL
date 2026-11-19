@@ -37,6 +37,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..distillation_trainer._fn import (
+    _resolve_vocab_parallel_mesh,
     chunked_distillation_loss,
     distillation_loss,
 )
@@ -48,6 +49,14 @@ from ..training_utils import (
     update_metrics,
     update_state_respectfully,
 )
+from ._streamed_divergences import (
+    build_distillation_projections,
+    streamed_distillation_loss,
+    trust_region_distillation_loss,
+)
+
+# Batch key of the per-step trust-region acceptance uniforms (``[B, L]``, sliced per microbatch).
+_TRUST_REGION_UNIFORM_KEY = "_trust_region_acceptance_uniform"
 
 
 def on_policy_distillation_step(
@@ -67,6 +76,10 @@ def on_policy_distillation_step(
     cakld_gamma: float | None = None,
     loss_top_k: int = 0,
     loss_add_tail: bool = False,
+    distillation_mode: str = "divergence",
+    trust_region_top_k: int = 64,
+    trust_region_seed: int = 0,
+    sampling_temperature: float | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Run one on-policy distillation step (forward, KL loss, optional update).
 
@@ -114,13 +127,34 @@ def on_policy_distillation_step(
         logits_chunk_size (int | None): When positive, evaluate the
             distillation loss in vocabulary chunks driven by the
             (headless) student LM head to bound peak memory; ``None``
-            disables chunking. Advanced divergence/support selectors use the
-            dense loss, matching offline distillation's objective dispatch.
+            disables chunking. Plain forward KL uses the shared chunked KL
+            kernel; the other selectors (``beta``, ``cakld_gamma``,
+            ``loss_top_k``) stream the vocabulary in ``logits_chunk_size``
+            columns (online logsumexp / running top-k) with identical
+            objectives to the dense loss.
         beta: Optional generalized Jensen-Shannon coefficient, including
             forward/reverse KL endpoints. ``None`` selects forward KL.
         cakld_gamma: Optional confidence-aware KL mixture coefficient.
         loss_top_k: Teacher top-k support size; zero selects the full vocabulary.
         loss_add_tail: Include the probability tail in top-k distillation.
+        distillation_mode: ``"divergence"`` (default) minimizes the selected
+            divergence; ``"trust_region"`` uses speculative-decoding-style
+            acceptance of sampled tokens (see
+            :func:`trust_region_distillation_loss`): accepted tokens get a
+            reverse-KL policy gradient, rejected tokens a teacher-top-k
+            forward KL. ``alpha`` and ``temperature`` are not applied in
+            this mode; all log-probs use ``sampling_temperature``.
+        trust_region_top_k: Teacher support size of the rejected-token
+            forward KL in trust-region mode.
+        trust_region_seed: Base seed of the per-step acceptance draw. One
+            ``[B, L]`` uniform is drawn per step from
+            ``fold_in(PRNGKey(seed), step)`` for the *full* batch and sliced
+            per gradient-accumulation microbatch, so every row gets an
+            independent draw and the acceptance mask does not depend on
+            ``gradient_accumulation_steps``.
+        sampling_temperature: Temperature the completions were sampled at.
+            Required in trust-region mode so the acceptance ratio compares
+            the actual sampling distributions.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: In training mode
@@ -136,11 +170,34 @@ def on_policy_distillation_step(
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True)
 
-    # Match the offline trainer: the streaming KL kernel implements forward KL
-    # only. Advanced objectives use the shared dense implementation, never silently
-    # substitute a different divergence when chunking is configured.
+    if distillation_mode not in ("divergence", "trust_region"):
+        raise ValueError(f"`distillation_mode` must be 'divergence' or 'trust_region'; got {distillation_mode!r}.")
+    use_trust_region = distillation_mode == "trust_region"
+    if use_trust_region:
+        if sampling_temperature is None or not float(sampling_temperature) > 0.0:
+            raise ValueError(
+                "trust-region distillation needs the positive `sampling_temperature` the completions were sampled "
+                f"at; got {sampling_temperature!r}."
+            )
+        # One uniform per (row, position) for the whole batch, sliced per microbatch by ``minibatch_call``.
+        input_ids_full = batch["input_ids"]
+        acceptance_key = jax.random.fold_in(
+            jax.random.PRNGKey(int(trust_region_seed)),
+            jnp.asarray(student_state.step, jnp.uint32),
+        )
+        uniform_full = jax.random.uniform(acceptance_key, input_ids_full.shape[:2], jnp.float32)
+        uniform_full = with_sharding_constraint(
+            uniform_full, partition_spec, mesh=student_state.model.mesh, ignore_mpmd=True
+        )
+        batch = {**batch, _TRUST_REGION_UNIFORM_KEY: uniform_full}
+    # Plain forward KL keeps the shared chunked KL kernel. Every other selector streams the vocabulary
+    # through ``streamed_distillation_loss`` (same objective as the dense loss), so large-vocab models never
+    # materialize ``[B, T, V]`` logits once ``logits_chunk_size`` is set.
     use_advanced_vocab_loss = beta is not None or cakld_gamma is not None or loss_top_k > 0 or loss_add_tail
-    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0 and not use_advanced_vocab_loss
+    chunking = logits_chunk_size is not None and logits_chunk_size > 0
+    use_chunked = chunking and not use_advanced_vocab_loss and not use_trust_region
+    use_streamed = use_trust_region or (chunking and use_advanced_vocab_loss)
+    use_hidden = use_chunked or use_streamed
     shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
 
     def loss_fn(tree, minibatch):
@@ -167,7 +224,7 @@ def on_policy_distillation_step(
         completion_mask = minibatch.get("completion_mask")
 
         teacher_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
-        if use_chunked:
+        if use_hidden:
             teacher_kwargs["apply_lm_head"] = False
         teacher_kwargs = filter_kwargs_for_callable(
             getattr(teacher_state.model, "forward", teacher_state.model), teacher_kwargs
@@ -204,7 +261,7 @@ def on_policy_distillation_step(
             teacher_module = teacher_state.merge(t_graphstate)
             out = teacher_module(**kw, **_teacher_static_kw)
             results = {}
-            if use_chunked:
+            if use_hidden:
                 results["h"] = jax.lax.stop_gradient(out.last_hidden_state)
             else:
                 results["l"] = jax.lax.stop_gradient(out.logits)
@@ -215,11 +272,11 @@ def on_policy_distillation_step(
                 teacher_kwargs,
                 jax.lax.stop_gradient(teacher_state.graphstate),
             )
-            teacher_hidden_for_kl = teacher_out["h"] if use_chunked else None
-            teacher_logits = teacher_out["l"] if not use_chunked else None
+            teacher_hidden_for_kl = teacher_out["h"] if use_hidden else None
+            teacher_logits = teacher_out["l"] if not use_hidden else None
 
         call_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
-        if use_chunked:
+        if use_hidden:
             call_kwargs["apply_lm_head"] = False
         call_kwargs = filter_kwargs_for_callable(getattr(module, "forward", module), call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
@@ -229,7 +286,50 @@ def on_policy_distillation_step(
         # Compute distillation loss on generated tokens only (using completion_mask).
         # No hard labels are used since completions are generated, not from a dataset.
         with jax.named_scope(scope_root + "/loss_fn/distillation_loss"):
-            if use_chunked:
+            if use_streamed:
+                vocab_parallel = _resolve_vocab_parallel_mesh(getattr(module, "partition_manager", None)) is not None
+                student_proj, teacher_proj, seq_chunk = build_distillation_projections(
+                    module,
+                    teacher_state.model,
+                    int(logits_chunk_size) if chunking else None,
+                    prefer_sequence_chunks=vocab_parallel,
+                )
+                if use_trust_region:
+                    uniform = minibatch[_TRUST_REGION_UNIFORM_KEY]
+                    if shift_tokens:
+                        uniform = uniform[:, 1:]
+                    total_loss, loss_components = trust_region_distillation_loss(
+                        student_hidden=student_outputs.last_hidden_state,
+                        teacher_hidden=teacher_hidden_for_kl,
+                        student_projection=student_proj,
+                        teacher_projection=teacher_proj,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        loss_mask=completion_mask,
+                        temperature=float(sampling_temperature),
+                        top_k=int(trust_region_top_k),
+                        acceptance_uniform=uniform,
+                        shift_tokens=shift_tokens,
+                        sequence_chunk_size=seq_chunk,
+                    )
+                else:
+                    total_loss, loss_components = streamed_distillation_loss(
+                        student_hidden=student_outputs.last_hidden_state,
+                        teacher_hidden=teacher_hidden_for_kl,
+                        student_projection=student_proj,
+                        teacher_projection=teacher_proj,
+                        attention_mask=attention_mask,
+                        loss_mask=completion_mask,
+                        temperature=temperature,
+                        alpha=alpha,
+                        beta=beta,
+                        cakld_gamma=cakld_gamma,
+                        loss_top_k=loss_top_k,
+                        loss_add_tail=loss_add_tail,
+                        shift_tokens=shift_tokens,
+                        sequence_chunk_size=seq_chunk,
+                    )
+            elif use_chunked:
                 total_loss, loss_components = chunked_distillation_loss(
                     student_hidden=student_outputs.last_hidden_state,
                     teacher_hidden=teacher_hidden_for_kl,

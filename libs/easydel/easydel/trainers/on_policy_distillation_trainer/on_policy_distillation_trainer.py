@@ -325,9 +325,13 @@ class OnPolicyDistillationTrainer(AsyncRolloutMixin, Trainer):
             self.arguments.cakld_gamma,
             self.arguments.loss_top_k,
             self.arguments.loss_add_tail,
+            self.arguments.distillation_mode,
+            self.arguments.trust_region_top_k,
+            self.arguments.trust_region_seed,
+            self.arguments.trust_region_sampling_temperature,
         )
 
-        static_argnames = tuple(range(3, 16))
+        static_argnames = tuple(range(3, 20))
 
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
@@ -356,6 +360,10 @@ class OnPolicyDistillationTrainer(AsyncRolloutMixin, Trainer):
             self.arguments.cakld_gamma,
             self.arguments.loss_top_k,
             self.arguments.loss_add_tail,
+            self.arguments.distillation_mode,
+            self.arguments.trust_region_top_k,
+            self.arguments.trust_region_seed,
+            self.arguments.trust_region_sampling_temperature,
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")

@@ -68,6 +68,15 @@ class OnPolicyDistillationConfig(DistillationConfig):
             curriculum-style distillation.
         skip_apply_chat_template: Whether to skip chat template application
             on prompts.
+        distillation_mode: ``"divergence"`` or ``"trust_region"``
+            (speculative-decoding-style acceptance of sampled tokens).
+        trust_region_top_k: Teacher top-k support of the rejected-token
+            forward KL in trust-region mode. Defaults to ``64``.
+        trust_region_seed: Base seed of the per-step acceptance draw.
+
+    In trust-region mode every log-prob (acceptance ratio, policy-gradient term and rejected-token top-k KL)
+    is computed at the *sampling* temperature (:attr:`trust_region_sampling_temperature`), not the
+    distillation ``temperature``, and no ``T**2`` factor is applied to either branch.
     """
 
     trainer_prefix: str | None = field(
@@ -128,6 +137,26 @@ class OnPolicyDistillationConfig(DistillationConfig):
         default=False,
         metadata={"help": "Whether to skip chat template application on prompts."},
     )
+    distillation_mode: str = field(
+        default="divergence",
+        metadata={
+            "help": (
+                "'divergence' (default) minimizes the selected divergence (forward KL, `beta` JSD/reverse KL, "
+                "`cakld_gamma`, `loss_top_k`). 'trust_region' applies speculative-decoding-style acceptance to "
+                "each sampled token: with P = min(exp(t_lp - s_lp), 1) and M ~ Bernoulli(P), accepted tokens get "
+                "a reverse-KL policy gradient sg(s_lp - t_lp) * s_lp and rejected tokens the teacher-top-k forward "
+                "KL (`trust_region_top_k`)."
+            )
+        },
+    )
+    trust_region_top_k: int = field(
+        default=64,
+        metadata={"help": "Teacher top-k support of the rejected-token forward KL in trust-region mode."},
+    )
+    trust_region_seed: int = field(
+        default=0,
+        metadata={"help": "Base seed of the per-step trust-region acceptance draw (folded with the step)."},
+    )
 
     def __post_init__(
         self,
@@ -153,6 +182,14 @@ class OnPolicyDistillationConfig(DistillationConfig):
                 or if ``max_prompt_length + max_completion_length`` exceeds
                 ``max_length``.
         """
+        if self.distillation_mode not in ("divergence", "trust_region"):
+            raise ValueError(
+                f"`distillation_mode` must be 'divergence' or 'trust_region'; got {self.distillation_mode!r}."
+            )
+        self.trust_region_top_k = int(self.trust_region_top_k)
+        if self.trust_region_top_k < 1:
+            raise ValueError("`trust_region_top_k` must be >= 1.")
+        self.trust_region_seed = int(self.trust_region_seed)
         default_prompt = type(self).__dataclass_fields__["max_prompt_length"].default
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_prompt_length is None:
@@ -202,5 +239,26 @@ class OnPolicyDistillationConfig(DistillationConfig):
             self.max_completion_length = on_policy_fields["max_completion_length"]
             self.top_p = on_policy_fields["top_p"]
             self.top_k = on_policy_fields["top_k"]
+
+        if self.distillation_mode == "trust_region":
+            if self.generation_do_sample is False:
+                raise ValueError(
+                    "`distillation_mode='trust_region'` scores sampled tokens; it cannot be used with "
+                    "`generation_do_sample=False`."
+                )
+            sampling_temperature = self.trust_region_sampling_temperature
+            if sampling_temperature is None or not float(sampling_temperature) > 0.0:
+                raise ValueError(
+                    "`distillation_mode='trust_region'` needs a positive sampling temperature "
+                    f"(`temperature_sampling` / `generation_temperature`); got {sampling_temperature!r}."
+                )
+
+    @property
+    def trust_region_sampling_temperature(self) -> float | None:
+        """Temperature the completions are actually sampled at (``generation_temperature`` wins when set)."""
+        value = getattr(self, "generation_temperature", None)
+        if value is None:
+            value = self.temperature_sampling
+        return None if value is None else float(value)
 
     __hash__ = hash_fn
