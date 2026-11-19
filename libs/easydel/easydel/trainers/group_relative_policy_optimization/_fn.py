@@ -37,8 +37,10 @@ import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from spectrax import with_sharding_constraint
+from spectrax import common_types, with_sharding_constraint
 
+from easydel.caching import TransformerCache
+from easydel.caching.shared_prefix import PrefixCaptureView, PrefixForkView
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.trainers._logprob_utils import (
@@ -587,6 +589,148 @@ def get_per_token_logps(
     return token_log_probs
 
 
+PREFIX_SHARED_ATTENTION_MECHANISMS = frozenset({"vanilla"})
+"""Attention operations verified on TPU (output and q/k/v gradients) for the prefix-shared fork representation."""
+
+
+def validate_prefix_shared_model(model) -> None:
+    """Raise when ``model`` cannot run the prefix-shared group forward.
+
+    Args:
+        model: The policy module (exposes ``config``).
+
+    Raises:
+        NotImplementedError: For an unverified attention operation, quantized KV, attention dropout,
+            pipeline parallelism, sliding-window or non-full-attention (hybrid/recurrent) layers.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        raise NotImplementedError("Prefix-shared forward requires a model exposing `config`.")
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    mechanism = str(getattr(config, "attn_mechanism", ""))
+    if mechanism not in PREFIX_SHARED_ATTENTION_MECHANISMS:
+        raise NotImplementedError(
+            f"Prefix-shared forward supports attn_mechanism in {sorted(PREFIX_SHARED_ATTENTION_MECHANISMS)}; "
+            f"got {mechanism!r}."
+        )
+    if getattr(config, "kv_cache_quantization_config", None) is not None:
+        raise NotImplementedError("Prefix-shared forward does not support a quantized KV cache.")
+    if float(getattr(text_config, "attention_dropout", 0.0) or 0.0) > 0.0:
+        raise NotImplementedError("Prefix-shared forward requires attention_dropout == 0.")
+    axis_dims = getattr(config, "sharding_axis_dims", None)
+    if axis_dims is not None and len(axis_dims) > 0 and int(axis_dims[0]) > 1:
+        raise NotImplementedError("Prefix-shared forward does not support pipeline parallelism (pp > 1).")
+    if getattr(text_config, "use_sliding_window", False):
+        raise NotImplementedError("Prefix-shared forward does not support sliding-window attention.")
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is not None and any(str(layer_type) != "full_attention" for layer_type in layer_types):
+        raise NotImplementedError(
+            "Prefix-shared forward supports dense full-attention models only; "
+            f"got layer_types {sorted(set(map(str, layer_types)))}."
+        )
+
+
+def get_per_token_logps_prefix_shared(
+    model,
+    prompt_ids,
+    prompt_mask,
+    completion_ids,
+    completion_attention_mask,
+    num_generations: int,
+    model_kwargs=None,
+    logprob_vocab_chunk_size: int | None = None,
+):
+    """Per-token completion log-probabilities with each prompt run once per group.
+
+    A capture pass runs the left-padded prompts at batch ``B`` and records every layer's post-RoPE
+    key/value states; a fork pass runs the completions at batch ``B * G`` against the gathered prefix
+    (row ``r`` reads prompt ``r // G``). The prompt's last column (``P - 1``) predicts completion token 0.
+    Equal, up to float rounding, to :func:`get_per_token_logps` on ``concat([prompt.repeat(G), completion])``;
+    gradients reach the prompt activations through the gather.
+
+    Args:
+        model: Policy module.
+        prompt_ids: ``[B, P]`` left-padded prompt ids; every prompt must have a valid last column.
+        prompt_mask: ``[B, P]`` prompt validity mask.
+        completion_ids: ``[B * G, C]`` completion ids, grouped by prompt.
+        completion_attention_mask: ``[B * G, C]`` completion attention mask (right padded).
+        num_generations: ``G``.
+        model_kwargs: Must be empty: prompt-aligned extra inputs (e.g. multimodal) are not supported.
+        logprob_vocab_chunk_size: Optional vocabulary chunk for the log-softmax.
+
+    Returns:
+        ``[B * G, C]`` per-token log-probabilities of ``completion_ids``.
+
+    Raises:
+        NotImplementedError: For unsupported models or extra model inputs.
+        ValueError: When the completion batch is not ``B * G``.
+    """
+    validate_prefix_shared_model(model)
+    if model_kwargs and any(value is not None for value in dict(model_kwargs).values()):
+        raise NotImplementedError(
+            f"Prefix-shared forward does not support prompt-aligned model inputs: {sorted(model_kwargs)}."
+        )
+    prompt_batch, prefix_len = prompt_ids.shape
+    fork_batch, completion_len = completion_ids.shape
+    if fork_batch != prompt_batch * num_generations:
+        raise ValueError(
+            f"completion batch {fork_batch} must equal prompt batch {prompt_batch} x num_generations {num_generations}."
+        )
+    num_layers = int(model.config.get_text_config().num_hidden_layers)
+
+    capture = model(
+        input_ids=prompt_ids,
+        attention_mask=prompt_mask,
+        past_key_values=TransformerCache(views=[PrefixCaptureView() for _ in range(num_layers)]),
+        mode=common_types.MODE_TRAIN,
+        apply_lm_head=False,
+    )
+    prompt_valid = prompt_mask.astype(jnp.bool_)
+    prefix_segment_ids = jnp.where(prompt_valid, 0, -1).astype(jnp.int32)
+    fork_views = [
+        PrefixForkView(
+            prefix_key=view.key,
+            prefix_value=view.value,
+            prefix_segment_ids=prefix_segment_ids,
+            num_generations=num_generations,
+        )
+        for view in capture.past_key_values.views
+    ]
+    rows = jnp.arange(fork_batch, dtype=jnp.int32) // num_generations
+    # RoPE positions continue from each prompt's valid length, as in the concatenated sequence.
+    prompt_lengths = jnp.sum(prompt_valid, axis=1).astype(jnp.int32)
+    position_ids = jnp.take(prompt_lengths, rows)[:, None] + jnp.arange(completion_len, dtype=jnp.int32)[None, :]
+    fork = model(
+        input_ids=completion_ids,
+        attention_mask=completion_attention_mask,
+        position_ids=position_ids,
+        past_key_values=TransformerCache(views=fork_views),
+        mode=common_types.MODE_TRAIN,
+        apply_lm_head=False,
+    )
+    last_prompt_hidden = jnp.take(capture.last_hidden_state[:, prefix_len - 1 : prefix_len, :], rows, axis=0)
+    hidden_states = jnp.concatenate([last_prompt_hidden, fork.last_hidden_state[:, :-1, :]], axis=1)
+    lmhead_chunksize = resolve_lmhead_chunksize(model)
+    if lmhead_chunksize is not None:
+        token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
+            model,
+            hidden_states,
+            completion_ids,
+            token_chunk_size=lmhead_chunksize,
+            vocab_chunk_size=logprob_vocab_chunk_size,
+            return_entropy=False,
+        )
+        return token_log_probs
+    logits = model.compute_lm_logits(model.prepare_lm_head_inputs(hidden_states))
+    token_log_probs, _ = compute_token_logps_and_entropies_chunked(
+        logits,
+        completion_ids,
+        return_entropy=False,
+        chunk_size=logprob_vocab_chunk_size,
+    )
+    return token_log_probs
+
+
 def get_per_token_logps_and_selected_logps(
     model,
     input_ids,
@@ -919,8 +1063,13 @@ def grpo_step(
     off_policy_min_acceptance: float | None = None,
     startup_behavior_k3_max: float | None = None,
     startup_behavior_tail_fraction_max: float = 0.01,
+    prefix_shared_forward: bool = False,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single GRPO training or evaluation step.
+
+    With ``prefix_shared_forward=True`` the non-chunked policy forward runs each prompt once per group
+    (see :func:`get_per_token_logps_prefix_shared`); the chunked path, top-k DPPO divergences and
+    entropy masking raise ``NotImplementedError`` under that flag.
 
     Computes the group-relative policy optimization loss on a batch of
     pre-processed data (prompt IDs, completion IDs, advantages, and
@@ -1122,6 +1271,8 @@ def grpo_step(
             and completion_ids.shape[0] > completion_chunk_size
             and top_entropy_quantile >= 1.0
         )
+        if use_chunked_completion_loss and prefix_shared_forward:
+            raise NotImplementedError("prefix_shared_forward does not support the chunked completion loss in v1.")
         if use_chunked_completion_loss:
             expanded_prompt_ids = prompt_ids.repeat(effective_num_generations, 0)
             expanded_prompt_mask = prompt_mask.repeat(effective_num_generations, 0)
@@ -1414,7 +1565,24 @@ def grpo_step(
         entropies = None
         current_topk_logps = None
         with jax.named_scope(scope_root + "/loss_fn/policy_logps"):
-            if dppo_divergence_type in {"topk_tv", "topk_kl"} and "sampling_topk_indices" in minibatch:
+            if prefix_shared_forward:
+                if (dppo_divergence_type in {"topk_tv", "topk_kl"} and "sampling_topk_indices" in minibatch) or (
+                    top_entropy_quantile < 1.0
+                ):
+                    raise NotImplementedError(
+                        "prefix_shared_forward supports neither top-k DPPO divergences nor top_entropy_quantile < 1."
+                    )
+                per_token_logps = get_per_token_logps_prefix_shared(
+                    module,
+                    prompt_ids,
+                    prompt_mask,
+                    completion_ids,
+                    completion_attention_mask,
+                    effective_num_generations,
+                    model_kwargs=completion_model_kwargs,
+                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                )
+            elif dppo_divergence_type in {"topk_tv", "topk_kl"} and "sampling_topk_indices" in minibatch:
                 per_token_logps, current_topk_logps = get_per_token_logps_and_selected_logps(
                     module,
                     input_ids,

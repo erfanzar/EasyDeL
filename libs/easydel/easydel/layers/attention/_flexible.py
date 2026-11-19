@@ -75,6 +75,7 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
     unwrap_metadata,
 )
+from easydel.caching.shared_prefix import is_shared_prefix_view
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.sharding import StageMesh, inference_mode_forces_decode, resolve_stage_mesh
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
@@ -1727,6 +1728,34 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                 cache_view,
                 cache_metadata,
             )  # pyright: ignore[reportReturnType]
+
+        if is_shared_prefix_view(cache_view):
+            # Training-time prefix-shared group forward: capture/fork views express visibility
+            # with segment ids and absolute positions. Only operations verified against a dense
+            # reference for that representation with q_len != kv_len are accepted.
+            if sliding_window is not None:
+                raise NotImplementedError("Prefix-shared forward does not support sliding-window attention.")
+            performer = getattr(self, "attention_performer", None)
+            active_impl = getattr(performer, "impl", None) if performer is not None else getattr(self, "impl", None)
+            impl_name = getattr(active_impl, "get_impl_name", lambda: None)()
+            impl_names = {str(n) for n in impl_name} if isinstance(impl_name, tuple) else {str(impl_name)}
+            if AttentionMechanisms.VANILLA.value not in impl_names:
+                raise NotImplementedError(
+                    f"Prefix-shared forward requires the 'vanilla' attention operation; got {sorted(impl_names)}."
+                )
+            key, value, mask_info, cache_view = cache_view.concatenate_to_cache(
+                key=key, value=value, mask_info=mask_info
+            )
+            shared_mask_info = mask_info
+            dtype_shared: jnp.dtype = self.dtype
+
+            def init_shared_prefix_bias() -> Array:
+                """Materialize the additive bias of the prefix-shared mask on demand."""
+                if shared_mask_info is None:
+                    return jnp.zeros((query.shape[0], 1, query_length, key.shape[1]), dtype=dtype_shared)
+                return shared_mask_info.create_bias(dtype_shared)
+
+            return key, value, mask_info, init_shared_prefix_bias, cache_view, cache_metadata
 
         if cache_view is not None and cache_view.key is not None:
             query_batch: int = query.shape[0]

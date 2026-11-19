@@ -1,0 +1,178 @@
+"""Prefix-shared attention semantics of the registered dense attention operations.
+
+A prefix-shared forward runs completion queries (length ``C``) against a key/value
+sequence that is a left-padded prompt prefix (length ``P``) followed by the completion
+itself (``kv_len = P + C``), so ``q_len != kv_len``. Visibility is expressed with
+segment ids (``-1`` = padding) and causality with absolute positions
+(``q_positions = P + arange(C)``, ``kv_positions = arange(P + C)``). Each case checks
+the operation output and its q/k/v gradients against an independent dense-mask
+reference in which a query sees exactly the keys with ``kv_pos <= q_pos`` whose
+segment id equals its own.
+"""
+
+from __future__ import annotations
+
+import jax
+import numpy as np
+import pytest
+from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.operations import OperationMetadata, OperationRegistry
+from ejkernel.types import MaskInfo
+from jax import numpy as jnp
+
+HQ, HKV, D = 2, 1, 128
+ATOL = 5e-3
+
+
+def _inputs(batch: int, prefix: int, completion: int, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    kv_len = prefix + completion
+    query = rng.standard_normal((batch, completion, HQ, D)).astype(np.float32)
+    key = rng.standard_normal((batch, kv_len, HKV, D)).astype(np.float32)
+    value = rng.standard_normal((batch, kv_len, HKV, D)).astype(np.float32)
+    # Left-padded ragged prompts and right-padded ragged completions.
+    prompt_valid = np.zeros((batch, prefix), dtype=bool)
+    completion_valid = np.zeros((batch, completion), dtype=bool)
+    for row in range(batch):
+        prompt_len = max(1, prefix - (row * 3) % max(prefix // 2, 1))
+        prompt_valid[row, prefix - prompt_len :] = True
+        completion_len = max(1, completion - (row * 2) % max(completion // 2, 1))
+        completion_valid[row, :completion_len] = True
+    q_seg = np.where(completion_valid, 0, -1).astype(np.int32)
+    kv_seg = np.concatenate([np.where(prompt_valid, 0, -1), q_seg], axis=1).astype(np.int32)
+    q_pos = np.broadcast_to(prefix + np.arange(completion), (batch, completion)).astype(np.int32)
+    kv_pos = np.broadcast_to(np.arange(kv_len), (batch, kv_len)).astype(np.int32)
+    cot = rng.standard_normal((batch, completion, HQ, D)).astype(np.float32)
+    return query, key, value, q_seg, kv_seg, q_pos, kv_pos, cot
+
+
+def _dense_visibility(q_seg, kv_seg, q_pos, kv_pos):
+    return (
+        (q_seg[:, :, None] >= 0)
+        & (kv_seg[:, None, :] >= 0)
+        & (q_seg[:, :, None] == kv_seg[:, None, :])
+        & (kv_pos[:, None, :] <= q_pos[:, :, None])
+    )
+
+
+def _reference(query, key, value, visible):
+    key = jnp.repeat(key, HQ // HKV, axis=2)
+    value = jnp.repeat(value, HQ // HKV, axis=2)
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key, precision=jax.lax.Precision.HIGHEST) / np.sqrt(D)
+    logits = jnp.where(visible[:, None], logits, -1e30)
+    weights = jax.nn.softmax(logits, axis=-1)
+    weights = jnp.where(visible[:, None], weights, 0.0)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, value, precision=jax.lax.Precision.HIGHEST)
+
+
+def _operation(name: str):
+    config = EasyDeLBaseConfig(sharding_axis_dims=(1, 1, -1, 1, 1, 1))
+    metadata = OperationMetadata(runtime_dtype=jnp.float32, runtime_softmax_dtype=jnp.float32, base_config=config)
+    return OperationRegistry.create(name, metadata)
+
+
+def _mask(representation: str, q_seg, kv_seg, q_pos, kv_pos) -> tuple[MaskInfo, bool]:
+    if representation == "segments_positions":
+        mask = MaskInfo.from_segments(
+            q_segment_ids=jnp.asarray(q_seg),
+            kv_segment_ids=jnp.asarray(kv_seg),
+            q_positions=jnp.asarray(q_pos),
+            kv_positions=jnp.asarray(kv_pos),
+        )
+        return mask, True
+    visible = _dense_visibility(q_seg, kv_seg, q_pos, kv_pos)
+    mask = MaskInfo(
+        _attention_mask=jnp.asarray(visible[:, None]),
+        q_positions=jnp.asarray(q_pos),
+        kv_positions=jnp.asarray(kv_pos),
+        causal_mask_baked_in=True,
+    )
+    return mask, True
+
+
+def _check(name: str, representation: str, prefix: int, completion: int):
+    batch = jax.device_count()
+    query, key, value, q_seg, kv_seg, q_pos, kv_pos, cot = _inputs(batch, prefix, completion)
+    visible = _dense_visibility(q_seg, kv_seg, q_pos, kv_pos)
+    q_valid = jnp.asarray(q_seg >= 0)[:, :, None, None].astype(jnp.float32)
+    op = _operation(name)
+    mask, causal = _mask(representation, q_seg, kv_seg, q_pos, kv_pos)
+
+    def op_loss(q, k, v):
+        out = op(q, k, v, mask_info=mask, causal=causal).attention_outputs
+        return jnp.sum(out * cot * q_valid), out
+
+    def ref_loss(q, k, v):
+        out = _reference(q, k, v, jnp.asarray(visible))
+        return jnp.sum(out * cot * q_valid), out
+
+    with jax.default_matmul_precision("highest"):
+        (_, out), grads = jax.value_and_grad(op_loss, argnums=(0, 1, 2), has_aux=True)(query, key, value)
+        (_, ref), ref_grads = jax.value_and_grad(ref_loss, argnums=(0, 1, 2), has_aux=True)(query, key, value)
+    rows = np.asarray(q_seg >= 0)
+    errors = {"out": float(np.max(np.abs(np.asarray(out)[rows] - np.asarray(ref)[rows])))}
+    for label, got, want in zip(("dq", "dk", "dv"), grads, ref_grads, strict=True):
+        errors[label] = float(np.max(np.abs(np.asarray(got) - np.asarray(want))))
+    print(f"[prefix-share-probe] {name} {representation} P={prefix} C={completion} errors={errors}")
+    assert all(np.isfinite(v) and v <= ATOL for v in errors.values()), errors
+
+
+# Small shapes take every kernel's unaligned path (blocksparse falls back to vanilla);
+# the 512-aligned shape drives the TPU block kernels themselves.
+SMALL, ALIGNED = (12, 8), (512, 512)
+_POSITIONS_IGNORED = (
+    "segment ids plus explicit q/kv positions with q_len != kv_len: the operation does not derive causality "
+    "from the absolute positions (output error ~4 against the dense reference on TPU)"
+)
+
+_FLASH_DENSE = (
+    "flash_attn2 turns the baked dense mask into segment ids and drops the absolute positions, so the "
+    "(kv_pos <= q_pos) term is lost (output error ~4.1 on TPU, identical to the segments case)"
+)
+_BLOCKSPARSE_ALIGNED = (
+    "blocksparse TPU kernel with q_len != kv_len (512/1024): output error ~3-4.5, dq error ~110 on TPU; "
+    "the small unaligned shape falls back to vanilla and is correct"
+)
+_RING_TOLERANCE = "ring with segments+positions: max error ~6e-3 (out) / ~9e-3 (grads) on TPU, beyond 5e-3"
+
+# Observed on TPU (fp32, highest matmul precision), recorded per mechanism:
+#   vanilla      supported for both representations and both shapes (errors <= 8e-7, incl. gradients)
+#   sdpa         dense baked mask supported; segments+positions wrong
+#   flash_attn2  wrong for both representations; the aligned segments case did not finish in 15 minutes
+#   blocksparse  small shape correct only through its vanilla fallback; the aligned TPU kernel is wrong
+#   ring         segments+positions approximately right but outside tolerance; dense_mask did not finish
+CASES = [
+    pytest.param("vanilla", "segments_positions", *SMALL),
+    pytest.param("vanilla", "segments_positions", *ALIGNED),
+    pytest.param("vanilla", "dense_mask", *SMALL),
+    pytest.param("vanilla", "dense_mask", *ALIGNED),
+    pytest.param("sdpa", "dense_mask", *SMALL),
+    pytest.param("sdpa", "dense_mask", *ALIGNED),
+    pytest.param("sdpa", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_POSITIONS_IGNORED)),
+    pytest.param(
+        "flash_attn2", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_POSITIONS_IGNORED)
+    ),
+    pytest.param("flash_attn2", "dense_mask", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_FLASH_DENSE)),
+    pytest.param("blocksparse", "segments_positions", *SMALL),
+    pytest.param(
+        "blocksparse",
+        "segments_positions",
+        *ALIGNED,
+        marks=pytest.mark.xfail(strict=True, reason=_BLOCKSPARSE_ALIGNED),
+    ),
+    pytest.param(
+        "blocksparse", "dense_mask", *ALIGNED, marks=pytest.mark.xfail(strict=True, reason=_BLOCKSPARSE_ALIGNED)
+    ),
+    pytest.param("ring", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_RING_TOLERANCE)),
+    pytest.param(
+        "ring",
+        "dense_mask",
+        *SMALL,
+        marks=pytest.mark.skip(reason="did not finish within 2 minutes on TPU; not characterised"),
+    ),
+]
+
+
+@pytest.mark.parametrize("name,representation,prefix,completion", CASES)
+def test_prefix_shared_attention_matches_dense_reference(name, representation, prefix, completion):
+    _check(name, representation, prefix, completion)

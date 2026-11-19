@@ -1682,6 +1682,7 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             self.arguments.off_policy_min_acceptance,
             self.arguments.startup_behavior_k3_max,
             self.arguments.startup_behavior_tail_fraction_max,
+            bool(getattr(self.arguments, "prefix_shared_forward", False)),
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:

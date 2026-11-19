@@ -663,6 +663,18 @@ class GRPOConfig(TrainingArguments):
         },
     )
 
+    prefix_shared_forward: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Run the policy loss forward with prompts once per group: a capture pass over the prompts records "
+                "each layer's key/value states and a fork pass scores the completions against the gathered prefix. "
+                "Dense attention models with attn_mechanism='vanilla' only; incompatible with "
+                "completion_chunk_size, top_entropy_quantile < 1 and mpmd_scheduler."
+            )
+        },
+    )
+
     def __post_init__(
         self,
         max_sequence_length: int | None,
@@ -892,6 +904,14 @@ class GRPOConfig(TrainingArguments):
         if self.logprob_vocab_chunk_size is not None:
             normalized_chunk_size = int(self.logprob_vocab_chunk_size)
             self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
+
+        if self.prefix_shared_forward:
+            if getattr(self, "mpmd_scheduler", None) is not None:
+                raise ValueError("`prefix_shared_forward=True` is not supported with `mpmd_scheduler`.")
+            if self.completion_chunk_size is not None:
+                raise ValueError("`prefix_shared_forward=True` is not supported with `completion_chunk_size`.")
+            if self.top_entropy_quantile < 1.0:
+                raise ValueError("`prefix_shared_forward=True` requires `top_entropy_quantile == 1.0`.")
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
