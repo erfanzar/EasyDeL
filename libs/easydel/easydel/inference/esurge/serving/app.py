@@ -288,7 +288,7 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
         control_host = resolve_bind_host(config.coordination.bind_host)
         _split_into_replicas(config, rank, token, ed)  # returns only when the launch stays one rank-major engine
 
-    profiles = is_leader if plan is None else plan.spawns_front
+    profiles = is_leader if plan is None else (plan.spawns_front and is_leader)
     if profiles and config.server.profiler_port is not None:
         jax.profiler.start_server(config.server.profiler_port)
         _log(rank, f"JAX profiler server on port {config.server.profiler_port}")
@@ -366,7 +366,9 @@ def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
 
     token = plan.read_token()
     _log(0, f"front of {plan.count} dp replicas (host-only); easydel {ed.__version__} from {ed.__file__}")
-    attacher = ReplicaAttacher(plan.leaders, connect=_replica_connector(config, token), log=lambda m: _log(0, m))
+    attacher = ReplicaAttacher(
+        replica_candidates(plan), connect=_replica_connector(config, token), log=lambda m: _log(0, m)
+    )
     routed = attacher.wait_for_first()
     attacher.start()
     try:
@@ -376,11 +378,33 @@ def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
         routed.close()
 
 
+def replica_candidates(plan: tp.Any) -> tuple[tuple[str, ...], ...]:
+    """Every host that may lead each replica's engine, by replica index (planned rank 0 first)."""
+    if plan.hosts:
+        return tuple(tuple(h) for h in plan.hosts)
+    return tuple((leader,) for leader in plan.leaders)
+
+
+def port_open(addr: str, port: int, timeout_s: float = 1.0) -> bool:
+    """Whether something accepts TCP connections on ``addr:port`` (a cheap check before a request-plane handshake)."""
+    import socket
+
+    try:
+        with socket.create_connection((addr, int(port)), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
 def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], tp.Any]:
     """Open a request-plane client to one replica leader; raises ``RequestPlaneUnavailable`` while it is not up."""
     from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
+    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
 
     def connect(addr: str) -> tp.Any:
+        # Only a replica's engine leader listens on the control port; skip the others without a handshake wait.
+        if not port_open(addr, config.coordination.control_port):
+            raise RequestPlaneUnavailable(f"nothing listening on {addr}:{config.coordination.control_port}")
         return RemoteEngineHandle(
             addr,
             config.coordination.control_port,
@@ -400,7 +424,8 @@ class ReplicaAttacher:
     endpoint down; a replica whose engine died is re-attached in its slot when it comes back.
 
     Args:
-        leaders: Each replica leader's address, by replica index.
+        leaders: By replica index, the address of its engine leader, or every address that may lead it (tried in
+            order; the first that answers is attached).
         connect: Opens a client to one leader; raises ``RequestPlaneUnavailable`` while it is not up.
         log: Progress logger.
         interval_s: Wait between attach rounds.
@@ -409,7 +434,7 @@ class ReplicaAttacher:
 
     def __init__(
         self,
-        leaders: tp.Sequence[str],
+        leaders: tp.Sequence[str | tp.Sequence[str]],
         *,
         connect: tp.Callable[[str], tp.Any],
         log: tp.Callable[[str], None],
@@ -418,7 +443,9 @@ class ReplicaAttacher:
     ) -> None:
         import threading
 
-        self.leaders = tuple(leaders)
+        self.candidates = tuple((entry,) if isinstance(entry, str) else tuple(entry) for entry in leaders)
+        # The address each replica was last attached at (its first candidate until then).
+        self.leaders = [c[0] for c in self.candidates]
         self._router_factory = router_factory
         self._connect = connect
         self._log = log
@@ -431,14 +458,18 @@ class ReplicaAttacher:
     def _try(self, index: int) -> tp.Any | None:
         from easydel.inference.esurge.distributed.request_plane import RequestPlaneError, RequestPlaneUnavailable
 
-        try:
-            return self._connect(self.leaders[index])
-        except RequestPlaneUnavailable:
-            return None
-        except RequestPlaneError as exc:
-            # Up but refusing (its world failed and the process has not exited yet): try again next round.
-            self._log(f"replica {index} at {self.leaders[index]} refused: {exc}")
-            return None
+        for addr in self.candidates[index]:
+            try:
+                handle = self._connect(addr)
+            except RequestPlaneUnavailable:
+                continue
+            except RequestPlaneError as exc:
+                # Up but refusing (its world failed and the process has not exited yet): try again next round.
+                self._log(f"replica {index} at {addr} refused: {exc}")
+                continue
+            self.leaders[index] = addr
+            return handle
+        return None
 
     def attach_round(self) -> int:
         """Try every replica that is not attached or whose engine died once; returns how many were attached."""

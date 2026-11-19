@@ -318,7 +318,7 @@ def _launch(ray: tp.Any, cfg: Mapping[str, tp.Any], nodes: list[dict[str, tp.Any
     from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
     from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
 
-    from .app import ReplicaAttacher
+    from .app import ReplicaAttacher, replica_candidates
 
     dims, names = mesh_of(cfg)
     port = control_port_of(cfg)
@@ -377,7 +377,9 @@ def _launch(ray: tp.Any, cfg: Mapping[str, tp.Any], nodes: list[dict[str, tp.Any
             finally:
                 stop()
 
-    attacher = ReplicaAttacher(leaders, connect=connect, log=logger.info, router_factory=RayRoutedEngine)
+    attacher = ReplicaAttacher(
+        replica_candidates(planned[0][0]), connect=connect, log=logger.info, router_factory=RayRoutedEngine
+    )
     try:
         while attacher.router is None:
             attacher.attach_round()

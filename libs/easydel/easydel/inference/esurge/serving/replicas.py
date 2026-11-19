@@ -93,9 +93,12 @@ class ReplicaPlan:
         rank: This process's index in the replica world.
         num_processes: Processes in the replica world.
         coordinator: ``host:port`` of the replica world's JAX coordination service (its rank 0).
-        leaders: Address of every replica's leader, by replica index.
+        leaders: Address of every replica's planned rank 0 (its JAX coordinator), by replica index.
         token_fd: Inherited pipe holding the shared request-plane token (never on the command line).
         role: ``"engine"`` for a replica process, ``"front"`` for the process serving the OpenAI endpoint.
+        hosts: Every replica's host addresses in plan order, by replica index. libtpu numbers a replica world's
+            processes by its own host order, which need not match the plan's, so the engine leader
+            (``jax.process_index() == 0``) can be any of these hosts; the front finds it by asking each.
     """
 
     index: int
@@ -105,6 +108,7 @@ class ReplicaPlan:
     leaders: tuple[str, ...]
     token_fd: int = -1
     role: str = "engine"
+    hosts: tuple[tuple[str, ...], ...] = ()
 
     @property
     def count(self) -> int:
@@ -117,8 +121,12 @@ class ReplicaPlan:
 
     @property
     def spawns_front(self) -> bool:
-        """Whether this process starts the front (replica 0's leader, once its engine is up)."""
-        return self.role == "engine" and self.index == 0 and self.rank == 0
+        """Whether this process is in the replica whose engine leader starts the front (replica 0).
+
+        Only the process that turns out to lead replica 0's engine starts it; which process that is is known only
+        inside the replica world (``jax.process_index() == 0``), not from :attr:`rank`.
+        """
+        return self.role == "engine" and self.index == 0
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -127,6 +135,7 @@ class ReplicaPlan:
     def from_json(cls, text: str) -> ReplicaPlan:
         data = json.loads(text)
         data["leaders"] = tuple(data["leaders"])
+        data["hosts"] = tuple(tuple(h) for h in data.get("hosts", ()))
         return cls(**data)
 
     def read_token(self) -> str:
@@ -238,6 +247,7 @@ def plan_replicas(
         num_processes=len(order),
         coordinator=f"{hostnames[0]}:{int(port)}",
         leaders=tuple(o[0][1] for o in orders),
+        hosts=tuple(tuple(addr for _, addr, _ in o) for o in orders),
     )
     return plan, layout.libtpu_env(hostnames, rank)
 

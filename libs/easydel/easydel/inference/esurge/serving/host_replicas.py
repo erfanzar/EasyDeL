@@ -379,7 +379,7 @@ def _leader_front(
     from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
     from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
 
-    from .app import ReplicaAttacher
+    from .app import ReplicaAttacher, replica_candidates
 
     jax.config.update("jax_platforms", "cpu")  # the engine child owns this host's chips
     become_single_process()
@@ -412,7 +412,9 @@ def _leader_front(
             finally:
                 stop_engine()
 
-    attacher = ReplicaAttacher(plan.leaders, connect=connect, log=logger.info, router_factory=ReplicaRoutedEngine)
+    attacher = ReplicaAttacher(
+        replica_candidates(plan), connect=connect, log=logger.info, router_factory=ReplicaRoutedEngine
+    )
     try:
         while attacher.router is None:
             attacher.attach_round()
