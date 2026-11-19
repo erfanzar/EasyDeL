@@ -800,15 +800,17 @@ def test_agent_flow_advantages_use_valid_rows_only():
 
 
 @pytest.mark.cpu_ok
-def test_agent_flow_rejects_online_dpo_inner_trainer():
+def test_agent_flow_accepts_online_dpo_inner_trainer():
     from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
 
-    with pytest.raises(ValueError, match="OnlineDPO"):
-        AgentFlowTrainer(
-            arguments=AgentFlowConfig(max_turns=1, group_size=2),
-            trainer=_stub_trainer(OnlineDPOTrainer),
-            environment_factory=lambda **kw: _MultiTurnCountingEnv(),
-        )
+    inner = _stub_trainer(OnlineDPOTrainer)
+    flow = AgentFlowTrainer(
+        arguments=AgentFlowConfig(max_turns=1, group_size=2),
+        trainer=inner,
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(),
+    )
+    assert flow.trainer is inner
+    assert flow.arguments.base_trainer_type == "online_dpo"
 
 
 @pytest.mark.cpu_ok

@@ -149,6 +149,86 @@ def _aggregate_episode_reward(step_rewards: list[float], *, reward_mode: str, ga
     return float(sum(step_rewards))
 
 
+@dataclasses.dataclass(frozen=True)
+class PreferencePairSelection:
+    """Per-group outcome of turning grouped episodes into one DPO preference pair.
+
+    Attributes:
+        pairs: One entry per group: ``(chosen_index, rejected_index)`` into the flat episode list,
+            or ``None`` when the group yields no pair.
+        skipped_ties: Groups whose valid episodes all share the same reward.
+        skipped_insufficient: Groups with fewer than two valid (finite-reward, non-``env_error``) episodes.
+    """
+
+    pairs: tuple[tuple[int, int] | None, ...]
+    skipped_ties: int
+    skipped_insufficient: int
+
+    @property
+    def num_pairs(self) -> int:
+        """Number of groups that produced a preference pair."""
+        return sum(1 for pair in self.pairs if pair is not None)
+
+
+def select_group_preference_pairs(
+    rewards: tp.Sequence[float],
+    valid: tp.Sequence[bool | float],
+    group_size: int,
+) -> PreferencePairSelection:
+    """Pick the highest- and lowest-reward valid episode of every group as a chosen/rejected pair.
+
+    Episodes are laid out group-major (``group_size`` consecutive episodes per prompt). Within a
+    group only valid episodes with a finite reward are candidates. The chosen episode is the first
+    one reaching the maximum reward and the rejected episode the first one reaching the minimum.
+    A group is skipped when it has fewer than two candidates, or when every candidate has the same
+    reward (no preference signal).
+
+    Args:
+        rewards: Episode rewards, length ``num_groups * group_size``.
+        valid: Truthy for episodes that may enter a pair (e.g. not ``env_error``), same length.
+        group_size: Episodes per group; must be positive.
+
+    Returns:
+        A :class:`PreferencePairSelection` with one entry per group.
+
+    Raises:
+        ValueError: If ``group_size`` is not positive or the lengths are inconsistent.
+    """
+    group_size = int(group_size)
+    if group_size <= 0:
+        raise ValueError(f"`group_size` must be positive; got {group_size}.")
+    rewards_list = [float(r) for r in rewards]
+    valid_list = [bool(v) for v in valid]
+    if len(rewards_list) != len(valid_list):
+        raise ValueError(f"`rewards` ({len(rewards_list)}) and `valid` ({len(valid_list)}) lengths differ.")
+    if len(rewards_list) % group_size != 0:
+        raise ValueError(f"{len(rewards_list)} episodes do not split into groups of {group_size}.")
+
+    pairs: list[tuple[int, int] | None] = []
+    skipped_ties = 0
+    skipped_insufficient = 0
+    for start in range(0, len(rewards_list), group_size):
+        candidates = [
+            idx for idx in range(start, start + group_size) if valid_list[idx] and np.isfinite(rewards_list[idx])
+        ]
+        if len(candidates) < 2:
+            pairs.append(None)
+            skipped_insufficient += 1
+            continue
+        chosen = max(candidates, key=lambda idx: (rewards_list[idx], -idx))
+        rejected = min(candidates, key=lambda idx: (rewards_list[idx], idx))
+        if rewards_list[chosen] == rewards_list[rejected]:
+            pairs.append(None)
+            skipped_ties += 1
+            continue
+        pairs.append((chosen, rejected))
+    return PreferencePairSelection(
+        pairs=tuple(pairs),
+        skipped_ties=skipped_ties,
+        skipped_insufficient=skipped_insufficient,
+    )
+
+
 def _pad_right_2d(
     rows: list[list[int]] | list[list[float]],
     *,
@@ -224,7 +304,6 @@ class AgentFlowTrainer:
         self._rollout_lock = threading.Lock()
 
         if trainer is not None:
-            self._reject_unsupported_trainer(type(trainer))
             self.trainer = trainer
             inferred = self._infer_trainer_type(trainer)
             if inferred is not None:
@@ -280,27 +359,6 @@ class AgentFlowTrainer:
         return frozenset(name for name in sig.parameters if name != "self")
 
     @staticmethod
-    def _reject_unsupported_trainer(trainer_cls: type) -> None:
-        """Refuse inner trainers whose loss cannot honour the multi-turn action mask.
-
-        OnlineDPO's preference loss masks tokens only through the completion
-        attention mask, so observation tokens inside an agentic trajectory
-        would be scored as policy actions (or hidden from attention). Until the
-        preference step accepts a separate loss mask it is rejected here.
-
-        Raises:
-            ValueError: If ``trainer_cls`` is an OnlineDPO trainer.
-        """
-        from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
-
-        if isinstance(trainer_cls, type) and issubclass(trainer_cls, OnlineDPOTrainer):
-            raise ValueError(
-                "AgentFlowTrainer does not support OnlineDPO as the inner trainer: the DPO loss derives its loss "
-                "mask from the completion attention mask and cannot exclude environment observation tokens. "
-                "Use a GRPO-family or PPO-family `base_trainer_type` instead."
-            )
-
-    @staticmethod
     def _infer_trainer_type(trainer: tp.Any) -> str | None:
         """Infer the registered trainer type name from an existing trainer instance."""
         trainer_cls = type(trainer)
@@ -322,7 +380,6 @@ class AgentFlowTrainer:
         **trainer_kwargs: tp.Any,
     ) -> tp.Any:
         trainer_cls = Registry.get_or_raise("trainer", cfg.base_trainer_type)
-        self._reject_unsupported_trainer(trainer_cls)
         base_cfg = cfg.base_config
         if base_cfg is None:
             cfg_cls = Registry.get_or_raise("trainer-arguments", cfg.base_trainer_type)
@@ -357,10 +414,11 @@ class AgentFlowTrainer:
             ctor_kwargs["model_state"] = model_state
         if reward_funcs is None:
             from easydel.trainers.group_relative_policy_optimization import GRPOTrainer
+            from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
 
-            if isinstance(trainer_cls, type) and issubclass(trainer_cls, GRPOTrainer):
-                # Environment-only setup: GRPO-family constructors require a reward, but the wrapper
-                # supplies episode rewards/advantages, so pass a placeholder that is never called.
+            if isinstance(trainer_cls, type) and issubclass(trainer_cls, (GRPOTrainer, OnlineDPOTrainer)):
+                # Environment-only setup: GRPO-family and OnlineDPO constructors require a reward, but the
+                # wrapper supplies episode rewards (and pairs), so pass a placeholder that is never called.
                 reward_funcs = agent_flow_supplied_reward
         if reward_funcs is not None:
             ctor_kwargs["reward_funcs"] = reward_funcs
@@ -857,6 +915,13 @@ class AgentFlowTrainer:
         return tasks
 
     def _resolve_group_size(self, is_train: bool) -> int:
+        if self._is_online_dpo():
+            # Preference pairs need at least two episodes per group, in training and evaluation alike.
+            if self.arguments.group_size is not None:
+                return max(2, int(self.arguments.group_size))
+            inner_args = getattr(self.trainer, "arguments", None)
+            val = getattr(inner_args, "generation_num_return_sequences", None)
+            return max(2, int(val)) if val is not None else 2
         if not is_train:
             return 1
         if self.arguments.group_size is not None:
@@ -930,6 +995,93 @@ class AgentFlowTrainer:
         for g in range(num_groups):
             _normalize(all_idx[g * group_size : (g + 1) * group_size], scale=scale_rewards != "none")
         return out.astype(np.float32)
+
+    def _is_online_dpo(self) -> bool:
+        from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
+
+        return isinstance(self.trainer, OnlineDPOTrainer)
+
+    def _build_preference_pair_batch(
+        self,
+        episodes: list[AgentFlowEpisode],
+        group_size: int,
+        *,
+        prompt_ids_np: np.ndarray,
+        prompt_mask_np: np.ndarray,
+        comp_ids_np: np.ndarray,
+        action_mask_np: np.ndarray,
+        comp_attn_np: np.ndarray,
+    ) -> tuple[dict[str, tp.Any], dict[str, float]]:
+        """Turn grouped episodes into one DPO chosen/rejected pair per group.
+
+        Each group contributes its highest-reward valid episode as ``chosen`` and its lowest-reward
+        valid episode as ``rejected`` (see :func:`select_group_preference_pairs`). Completions hold
+        the whole trajectory (actions and observations) under the attention mask, while
+        ``chosen_loss_mask`` / ``rejected_loss_mask`` equal the action masks, so only model-generated
+        tokens enter the DPO log-prob sums.
+
+        The batch always has one row per group so the compiled step keeps a static shape: a group
+        without a usable pair (ties, fewer than two valid episodes, or differing prompts) keeps a row
+        whose loss masks are all zero. Such a row contributes no gradient; it adds the constant
+        zero-log-ratio loss to the reported mean.
+
+        Returns:
+            ``(batch, metrics)`` in the DPO key layout (``prompt_*``, ``chosen_*``, ``rejected_*``,
+            with completion-only ``*_input_ids``) and ``agent_flow/dpo_*`` pair counters.
+        """
+        rewards = [float(ep.episode_reward) for ep in episodes]
+        valid = [not ep.env_error for ep in episodes]
+        selection = select_group_preference_pairs(rewards, valid, group_size)
+
+        num_groups = len(selection.pairs)
+        chosen_rows: list[int] = []
+        rejected_rows: list[int] = []
+        use_pair: list[bool] = []
+        skipped_prompt_mismatch = 0
+        for g, pair in enumerate(selection.pairs):
+            if pair is not None:
+                c, r = pair
+                if np.array_equal(prompt_ids_np[c], prompt_ids_np[r]) and np.array_equal(
+                    prompt_mask_np[c], prompt_mask_np[r]
+                ):
+                    chosen_rows.append(c)
+                    rejected_rows.append(r)
+                    use_pair.append(True)
+                    continue
+                skipped_prompt_mismatch += 1
+            filler = g * group_size
+            chosen_rows.append(filler)
+            rejected_rows.append(filler)
+            use_pair.append(False)
+
+        c_idx = np.asarray(chosen_rows, dtype=np.int64)
+        r_idx = np.asarray(rejected_rows, dtype=np.int64)
+        keep = np.asarray(use_pair, dtype=np.int32)[:, None]
+
+        batch = {
+            "prompt_input_ids": jnp.asarray(prompt_ids_np[c_idx]),
+            "prompt_attention_mask": jnp.asarray(prompt_mask_np[c_idx]),
+            "chosen_input_ids": jnp.asarray(comp_ids_np[c_idx]),
+            "chosen_attention_mask": jnp.asarray(comp_attn_np[c_idx]),
+            "chosen_loss_mask": jnp.asarray(action_mask_np[c_idx] * keep),
+            "rejected_input_ids": jnp.asarray(comp_ids_np[r_idx]),
+            "rejected_attention_mask": jnp.asarray(comp_attn_np[r_idx]),
+            "rejected_loss_mask": jnp.asarray(action_mask_np[r_idx] * keep),
+        }
+        num_pairs = int(sum(use_pair))
+        rewards_np = np.asarray(rewards, dtype=np.float64)
+        used = np.asarray(use_pair, dtype=bool)
+        metrics = {
+            "agent_flow/dpo_pairs": float(num_pairs),
+            "agent_flow/dpo_groups": float(num_groups),
+            "agent_flow/dpo_skipped_ties": float(selection.skipped_ties),
+            "agent_flow/dpo_skipped_insufficient_valid": float(selection.skipped_insufficient),
+            "agent_flow/dpo_skipped_prompt_mismatch": float(skipped_prompt_mismatch),
+            "agent_flow/dpo_reward_margin": (
+                float(np.mean(rewards_np[c_idx[used]] - rewards_np[r_idx[used]])) if num_pairs else 0.0
+            ),
+        }
+        return batch, metrics
 
     def _is_ppo_family(self) -> bool:
         from easydel.trainers.proximal_policy_optimization_trainer import PPOTrainer
@@ -1014,6 +1166,19 @@ class AgentFlowTrainer:
             if has_lps
             else None
         )
+
+        if self._is_online_dpo():
+            pair_batch, pair_metrics = self._build_preference_pair_batch(
+                episodes,
+                group_size,
+                prompt_ids_np=prompt_ids_np,
+                prompt_mask_np=prompt_mask_np,
+                comp_ids_np=comp_ids_np,
+                action_mask_np=comp_mask_np,
+                comp_attn_np=comp_attn_np,
+            )
+            metrics.update(pair_metrics)
+            return pair_batch, metrics
 
         if self._is_ppo_family():
             input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
@@ -1193,5 +1358,7 @@ __all__ = [
     "AgentFlowEpisode",
     "AgentFlowTrainer",
     "AgentFlowTurn",
+    "PreferencePairSelection",
     "agent_flow_supplied_reward",
+    "select_group_preference_pairs",
 ]

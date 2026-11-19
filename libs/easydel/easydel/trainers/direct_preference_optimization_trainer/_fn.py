@@ -734,6 +734,15 @@ def concatenated_forward(
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
     completion_input_ids = concatenated_batch["completion_input_ids"]
     completion_attention_mask = concatenated_batch["completion_attention_mask"]
+    # Optional explicit loss mask (from ``chosen_loss_mask``/``rejected_loss_mask``) selects which attended
+    # completion tokens enter the log-prob sums; without it every attended completion token is scored.
+    completion_loss_mask = concatenated_batch.get("completion_loss_mask")
+    if completion_loss_mask is None:
+        completion_scoring_mask = completion_attention_mask
+    else:
+        completion_scoring_mask = completion_attention_mask * completion_loss_mask.astype(
+            completion_attention_mask.dtype
+        )
     lmhead_chunksize = None
 
     if is_encoder_decoder:
@@ -754,7 +763,7 @@ def concatenated_forward(
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
-        loss_mask = completion_attention_mask.astype(bool)
+        loss_mask = completion_scoring_mask.astype(bool)
     else:
         # For decoder-only models, concatenate prompt and completion.
         input_ids = jnp.concatenate(
@@ -768,7 +777,7 @@ def concatenated_forward(
         loss_mask = jnp.concatenate(
             [
                 jnp.zeros_like(prompt_attention_mask),
-                completion_attention_mask,
+                completion_scoring_mask,
             ],
             axis=1,
         )
@@ -855,9 +864,37 @@ def concatenated_forward(
         output["mean_chosen_logits"] = mean_chosen_logits
         output["mean_rejected_logits"] = mean_rejected_logits
 
+    if completion_loss_mask is not None:
+        # A pair whose chosen or rejected side scores no token (e.g. a placeholder row kept to hold the
+        # batch shape fixed) carries no preference signal; the loss reductions exclude it.
+        scored_tokens = loss_mask.astype(jnp.int32).sum(-1)
+        output["pair_valid"] = ((scored_tokens[:num_examples] > 0) & (scored_tokens[num_examples:] > 0)).astype(
+            jnp.float32
+        )
     if aux_loss_enabled and hasattr(outputs, "aux_loss"):
         output["aux_loss"] = outputs.aux_loss
     return output
+
+
+def _reduce_pair_losses(losses: Array, model_output: dict) -> Array:
+    """Mean of the per-pair DPO losses.
+
+    Without explicit loss masks this is ``losses.mean()``. With them, only pairs that score at
+    least one token on both sides (``pair_valid``) enter the mean, so placeholder rows add neither
+    a constant to the reported loss nor dilute the gradient.
+
+    Args:
+        losses: Per-pair losses, shape ``[num_pairs]``.
+        model_output: Output of :func:`concatenated_forward`.
+
+    Returns:
+        Scalar loss.
+    """
+    pair_valid = model_output.get("pair_valid")
+    if pair_valid is None:
+        return losses.mean()
+    valid = pair_valid > 0
+    return jnp.sum(jnp.where(valid, losses, 0.0)) / jnp.maximum(jnp.sum(pair_valid), 1.0)
 
 
 def training_step(
@@ -1042,7 +1079,7 @@ def training_step(
                     losses += model_output["aux_loss"]
 
                 metrics = LossMetrics(
-                    loss=losses.mean(),
+                    loss=_reduce_pair_losses(losses, model_output),
                     rejected_rewards=rejected_rewards,
                     chosen_rewards=chosen_rewards,
                 )
@@ -1223,7 +1260,7 @@ def _make_dpo_scheduled_loss(call):
                 )
                 if "aux_loss" in model_output:
                     losses += model_output["aux_loss"]
-            return losses.mean()
+            return _reduce_pair_losses(losses, model_output)
 
     return scheduled_loss
 
@@ -1358,7 +1395,7 @@ def evaluation_step(
                 rejected_rewards = beta * (rejected_logps - ref_rejected_for_loss)
 
                 metrics = LossMetrics(
-                    loss=losses.mean(),
+                    loss=_reduce_pair_losses(losses, model_output),
                     rejected_rewards=rejected_rewards,
                     chosen_rewards=chosen_rewards,
                 )
