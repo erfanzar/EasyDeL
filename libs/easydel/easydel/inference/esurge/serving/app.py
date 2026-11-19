@@ -396,10 +396,27 @@ def port_open(addr: str, port: int, timeout_s: float = 1.0) -> bool:
         return False
 
 
+def _served_model_type(config: ServingConfig) -> str | None:
+    """The checkpoint's (text) ``model_type``, the parser auto-detection hint; ``None`` when it cannot be read."""
+    try:
+        import easydel as ed
+
+        return getattr(
+            ed.AutoEasyDeLConfig.from_pretrained(config.model.checkpoint).get_text_config(), "model_type", None
+        )
+    except Exception as exc:
+        _log(0, f"could not read the checkpoint's model_type for parser auto-detection: {exc!r}")
+        return None
+
+
 def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], tp.Any]:
     """Open a request-plane client to one replica leader; raises ``RequestPlaneUnavailable`` while it is not up."""
     from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
     from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
+
+    # The front renders every reply itself, so it runs the same tool/reasoning parsers the engines would.
+    parsing = dict(config.esurge.get("parsing") or {})
+    model_type = _served_model_type(config)
 
     def connect(addr: str) -> tp.Any:
         # Only a replica's engine leader listens on the control port; skip the others without a handshake wait.
@@ -411,6 +428,9 @@ def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], 
             auth_token=str(token),
             tokenizer_source=config.model.tokenizer_source,
             connect_timeout_s=10.0,
+            tool_parser=parsing.get("tool_parser"),
+            reasoning_parser=parsing.get("reasoning_parser"),
+            model_type=model_type,
         )
 
     return connect

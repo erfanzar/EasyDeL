@@ -69,6 +69,56 @@ _POLL_MS = 50
 _CLIENT_RANK = -1
 
 
+def resolve_handle_parsers(
+    *,
+    tokenizer: typing.Any,
+    tool_parser: str | None,
+    reasoning_parser: str | None,
+    model_type: str | None,
+) -> tuple[str | None, type | None, str | None, type | None]:
+    """Resolve the tool and reasoning parsers a remote handle runs, as the owner engine does.
+
+    Explicit names win; ``None`` auto-detects from ``model_type`` and the tokenizer when ``model_type`` is given (a
+    handle told nothing about the served model runs no parsers, as before). A tool parser that cannot be built
+    against this tokenizer, or an unknown name, disables that parser instead of failing the handle.
+
+    Returns:
+        ``(tool_parser_name, tool_parser_class, reasoning_parser_name, reasoning_parser_class)``.
+    """
+    from ..engine import bootstrap
+
+    if tool_parser is None and model_type is not None:
+        tool_parser = bootstrap.auto_detect_tool_parser(tokenizer=tokenizer, model_type=model_type)
+    if reasoning_parser is None and model_type is not None:
+        reasoning_parser = bootstrap.auto_detect_reasoning_parser_name(tokenizer=tokenizer, model_type=model_type)
+    tool_parser_class: type | None = None
+    reasoning_parser_class: type | None = None
+    if tool_parser:
+        from easydel.inference.tools import ToolParserManager
+        from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
+
+        try:
+            parser_class = ToolParserManager.get_tool_parser(tool_parser)
+        except KeyError:
+            logger.warning("Tool parser '%s' not found; the remote handle runs without one", tool_parser)
+            parser_class = None
+        if parser_class is not None and build_tool_parser_or_none(
+            parser_class, tokenizer, context=f"tool parser '{tool_parser}'"
+        ):
+            tool_parser_class = parser_class
+        else:
+            tool_parser = None
+    if reasoning_parser:
+        from easydel.inference.reasoning import ReasoningParserManager
+
+        try:
+            reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+        except KeyError:
+            logger.warning("Reasoning parser '%s' not found; the remote handle runs without one", reasoning_parser)
+            reasoning_parser = None
+    return tool_parser, tool_parser_class, reasoning_parser, reasoning_parser_class
+
+
 class _ClientChannel:
     """One DEALER + IO thread speaking the request plane's client role.
 
@@ -297,6 +347,10 @@ class RemoteEngineHandle:
         heartbeat_timeout_s: Owner silence tolerated before the handle dies.
         decode_interval_tokens: Streaming decode cadence (tokens).
         decode_interval_secs: Streaming decode cadence (seconds).
+        tool_parser: Tool parser name the handle runs on outputs; ``None``
+            auto-detects from ``model_type`` and the tokenizer.
+        reasoning_parser: Reasoning parser name; ``None`` auto-detects.
+        model_type: The served model's ``model_type`` (auto-detection hint).
     """
 
     def __init__(
@@ -312,6 +366,9 @@ class RemoteEngineHandle:
         heartbeat_timeout_s: float = 10.0,
         decode_interval_tokens: int = 4,
         decode_interval_secs: float = 0.05,
+        tool_parser: str | None = None,
+        reasoning_parser: str | None = None,
+        model_type: str | None = None,
     ) -> None:
         self._channel = _ClientChannel(
             leader_addr=leader_addr,
@@ -377,6 +434,10 @@ class RemoteEngineHandle:
             on_fatal=self._on_pipeline_fatal,
         )
         self._output_pipeline.start()
+        # The handle renders outputs itself, so it runs the tool/reasoning parsers the owner engine would.
+        self.tool_parser, tool_parser_class, self.reasoning_parser_name, reasoning_parser_class = resolve_handle_parsers(
+            tokenizer=self.tokenizer, tool_parser=tool_parser, reasoning_parser=reasoning_parser, model_type=model_type
+        )
         self._admission = RequestAdmission(
             registry=self._registry,
             scheduler_submit=self._plane.submit_remote,
@@ -385,8 +446,8 @@ class RemoteEngineHandle:
             context_config=eSurgeContextConfig.coerce_config(None),
             reserve_tokens=int(spec.reserve_tokens),
             max_model_len=int(spec.max_model_len),
-            tool_parser_class=None,
-            reasoning_parser_class=None,
+            tool_parser_class=tool_parser_class,
+            reasoning_parser_class=reasoning_parser_class,
             sampling_params_callback=lambda: None,
             generation_config_dict=None,
             primary_eos_token_id=(int(spec.eos_token_ids[0]) if spec.eos_token_ids else None),
@@ -485,8 +546,8 @@ class RemoteEngineHandle:
             sampling_params: Generation parameters (default ``max_tokens=128``).
             request_id: Optional explicit id(s).
             use_tqdm: Accepted for signature parity; ignored.
-            tool_parser_request: Accepted for signature parity; the handle
-                runs no tool parsers.
+            tool_parser_request: Request context (tools, tool_choice) for
+                the handle's tool parser.
 
         Returns:
             One finished ``RequestOutput`` per prompt.
@@ -495,7 +556,7 @@ class RemoteEngineHandle:
             RequestPlaneError: If the owner rejects an admission or dies
                 mid-generation.
         """
-        del use_tqdm, tool_parser_request
+        del use_tqdm
         self._raise_if_unusable()
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -515,7 +576,8 @@ class RemoteEngineHandle:
         base_params = sampling_params or SamplingParams(max_tokens=128)
         for prompt, rid in zip(prompts, request_ids, strict=True):
             params = self._admission.prepare_sampling_params_for_request(base_params, request_id=rid, prompt=prompt)
-            self._admission.add_request(rid, prompt, params)
+            extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
+            self._admission.add_request(rid, prompt, params, **extra)
 
         outputs: dict[str, RequestOutput] = {}
         while len(outputs) < len(request_ids):
@@ -546,7 +608,8 @@ class RemoteEngineHandle:
             prompts: One prompt (or single-element list).
             sampling_params: Generation parameters (default ``max_tokens=128``).
             request_id: Optional explicit id.
-            tool_parser_request: Accepted for signature parity; ignored.
+            tool_parser_request: Request context (tools, tool_choice) for
+                the handle's tool parser.
 
         Yields:
             ``RequestOutput`` snapshots as the origin-side pipeline renders
@@ -556,14 +619,14 @@ class RemoteEngineHandle:
 
         from ..esurge_engine import CompletionOutput, RequestOutput
 
-        del tool_parser_request
         self._raise_if_unusable()
         prompt = prompts[0] if isinstance(prompts, list) else prompts
         rid = request_id or self._admission.generate_request_id()
         params = self._admission.prepare_sampling_params_for_request(
             sampling_params or SamplingParams(max_tokens=128), request_id=rid, prompt=prompt
         )
-        self._admission.add_request(rid, prompt, params)
+        extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
+        self._admission.add_request(rid, prompt, params, **extra)
 
         last_update_seq = -1
         last_accumulated_text = ""
@@ -649,7 +712,7 @@ class RemoteEngineHandle:
             tools: Tool definitions rendered into the template; when
                 present, special tokens are preserved so the model can emit
                 tool calls.
-            tool_choice: Accepted for signature parity.
+            tool_choice: Passed to the tool parser with ``tools``.
             sampling_params: Generation parameters (default ``max_tokens=128``).
             request_id: Optional explicit id.
             stream: Yield incremental snapshots instead of blocking.
@@ -660,9 +723,9 @@ class RemoteEngineHandle:
             A finished ``RequestOutput`` (``stream=False``) or an iterator
             of incremental snapshots (``stream=True``).
         """
-        del tool_choice
         from ..engine.admission import clone_sampling_params
         from ..engine.chat_templating import format_chat_prompt
+        from ..esurge_engine import eSurge
 
         params = clone_sampling_params(sampling_params or SamplingParams(max_tokens=128))
         if tools:
@@ -678,9 +741,11 @@ class RemoteEngineHandle:
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
+        # The tool parser reads the request's tools and tool_choice, exactly as on the owner engine's chat path.
+        tool_request = eSurge._build_tool_parser_request(prompt=prompt, tools=tools, tool_choice=tool_choice)
         if stream:
-            return self.stream(prompt, sampling_params=params, request_id=request_id)
-        return self.generate(prompt, sampling_params=params, request_id=request_id)[0]
+            return self.stream(prompt, sampling_params=params, request_id=request_id, tool_parser_request=tool_request)
+        return self.generate(prompt, sampling_params=params, request_id=request_id, tool_parser_request=tool_request)[0]
 
     def iter_chat_completion_stream(
         self,
