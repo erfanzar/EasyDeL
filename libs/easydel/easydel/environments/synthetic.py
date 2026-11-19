@@ -22,6 +22,7 @@ import concurrent.futures
 import dataclasses
 import queue
 import threading
+import time
 import typing as tp
 
 from easydel.data.core.protocols import ShardedDataSource, ShardInfo
@@ -295,11 +296,38 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
         max_tasks: int | None = None,
         base_seed: int = 0,
         strip_reference: bool = True,
+        max_consecutive_generator_failures: int = 32,
+        generator_backoff: float = 0.05,
+        generator_backoff_max: float = 2.0,
     ):
+        """Create the stream.
+
+        Args:
+            generator_fn: ``seed -> task`` callable (``None`` skips the seed).
+            verification_gate: Optional two-phase sanity gate applied to each task.
+            difficulty_tracker: Optional tracker; retired tasks are skipped.
+            num_workers: Background producer threads.
+            buffer_size: Maximum buffered verified tasks.
+            max_tasks: Optional cap on tasks yielded per iteration.
+            base_seed: First seed handed to ``generator_fn``.
+            strip_reference: Remove ``reference_solution``/``reference_actions`` before yielding.
+            max_consecutive_generator_failures: Consecutive ``generator_fn`` exceptions (across workers) after
+                which the stream stops and re-raises the last exception from :meth:`next_task` / iteration.
+            generator_backoff: Initial sleep after a ``generator_fn`` exception; doubles per consecutive failure.
+            generator_backoff_max: Cap on the back-off sleep.
+        """
         if num_workers <= 0:
             raise ValueError("num_workers must be positive.")
         if buffer_size <= 0:
             raise ValueError("buffer_size must be positive.")
+        if max_consecutive_generator_failures <= 0:
+            raise ValueError("max_consecutive_generator_failures must be positive.")
+        self._max_generator_failures = int(max_consecutive_generator_failures)
+        self._backoff_base = max(0.0, float(generator_backoff))
+        self._backoff_max = max(self._backoff_base, float(generator_backoff_max))
+        self._failure_lock = threading.Lock()
+        self._consecutive_generator_failures = 0
+        self._last_generator_error: BaseException | None = None
         self._generator_fn = generator_fn
         self._gate = verification_gate
         self._difficulty = difficulty_tracker
@@ -348,14 +376,35 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
             self._executor.submit(self._producer_loop)
         self._started = True
 
+    def _record_generator_failure(self, exc: BaseException) -> float:
+        """Record a ``generator_fn`` failure and return the back-off delay before the next attempt.
+
+        Failures are counted across all workers; after ``max_consecutive_generator_failures`` in a row the
+        stream stops and keeps ``exc`` as its fatal error.
+        """
+        with self._failure_lock:
+            self._consecutive_generator_failures += 1
+            self._last_generator_error = exc
+            count = self._consecutive_generator_failures
+            if count >= self._max_generator_failures:
+                if self._fatal_error is None:
+                    self._fatal_error = exc
+                self._stop.set()
+        return min(self._backoff_max, self._backoff_base * (2.0 ** (count - 1)))
+
     def _producer_loop(self) -> None:
         consecutive_infra = 0
         while not self._stop.is_set():
             seed = self._claim_seed()
             try:
                 raw = self._generator_fn(seed)
-            except Exception:
+            except Exception as exc:
+                delay = self._record_generator_failure(exc)
+                if self._stop.wait(delay):
+                    return
                 continue
+            with self._failure_lock:
+                self._consecutive_generator_failures = 0
             if raw is None:
                 continue
             task = dict(raw)
@@ -397,12 +446,22 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
     def next_task(self, timeout: float = 30.0) -> dict[str, tp.Any]:
         """Return the next verified task dictionary, blocking up to ``timeout`` seconds."""
         self._ensure_started()
-        try:
-            return self._queue.get(timeout=timeout)
-        except queue.Empty as exc:
-            if self._fatal_error is not None:
-                raise self._fatal_error from exc
-            raise TimeoutError(f"SyntheticTaskStream produced no verified task within {timeout}s.") from exc
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            try:
+                return self._queue.get(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+            except queue.Empty:
+                pass
+            if self._fatal_error is not None and self._stop.is_set() and self._queue.empty():
+                raise self._fatal_error
+            if time.monotonic() >= deadline:
+                if self._fatal_error is not None:
+                    raise self._fatal_error
+                last = self._last_generator_error
+                message = f"SyntheticTaskStream produced no verified task within {timeout}s."
+                if last is not None:
+                    raise TimeoutError(f"{message} Last generator error: {last!r}") from last
+                raise TimeoutError(message)
 
     def open_shard(self, shard_name: str) -> collections.abc.Iterator[dict[str, tp.Any]]:
         if shard_name != "synthetic_stream_0":

@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import collections.abc
+import concurrent.futures
 import inspect
 import typing as tp
 
-from easydel.trainers._shared.environment import AgenticEnvironment
+from easydel.trainers._shared.environment import AgenticEnvironment, StepResult
 from easydel.utils import Registry
 
 from ._base import build_environment, list_environments, register_environment
@@ -226,6 +227,38 @@ class AutoEnvironment:
         return _factory
 
 
+def is_unscorable(result: StepResult) -> bool:
+    """Whether ``result`` carries no usable reward.
+
+    Environments flag a sample unscorable with ``info["discard"] = True`` when the grader itself failed
+    (sandbox/infra error, judge failure). Results with ``info["env_error"] = True`` are treated the same way.
+    """
+    info = result.info or {}
+    return bool(info.get("discard") or info.get("env_error"))
+
+
+def _grade_single_turn(env: AgenticEnvironment, completion: str) -> StepResult:
+    """Grade one completion terminally; environments with ``grade_single_turn`` never run tool turns."""
+    grader = getattr(env, "grade_single_turn", None)
+    if callable(grader):
+        return grader(completion)
+    return env.step(completion)
+
+
+def _grade_single_turn_batch(
+    envs: collections.abc.Sequence[AgenticEnvironment],
+    completions: collections.abc.Sequence[str],
+    *,
+    max_workers: int,
+) -> list[StepResult]:
+    if len(envs) <= 1:
+        return [_grade_single_turn(e, c) for e, c in zip(envs, completions, strict=True)]
+    workers = min(max(1, max_workers), len(envs))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="edenv-grade") as pool:
+        futs = [pool.submit(_grade_single_turn, e, c) for e, c in zip(envs, completions, strict=True)]
+        return [f.result() for f in futs]
+
+
 def make_environment_reward_fn(
     environment: str | HarnessPreset | collections.abc.Mapping[str, tp.Any] = "auto",
     *,
@@ -234,26 +267,35 @@ def make_environment_reward_fn(
     container_config: ContainerConfig | None = None,
     max_workers: int = 16,
     **defaults: tp.Any,
-) -> tp.Callable[..., list[float]]:
+) -> tp.Callable[..., list[float | None]]:
     """Build a GRPO/AsyncGRPO-compatible ``reward_funcs`` callable for environments.
 
     If the trainer already stepped environments during rollout and attached
     ``environment_rewards`` in ``kwargs``, those rewards are returned directly
     with zero duplicate execution. Otherwise (single-turn RLVR / code / math),
     completions are graded concurrently via :class:`AutoEnvironment` in ``max_workers``
-    threads.
+    threads. Every completion is graded terminally: environments exposing
+    ``grade_single_turn`` (e.g. ``python_tir``) grade the final answer without
+    executing code blocks.
+
+    A ``None`` entry means the sample is unscorable (its environment failed to
+    reset, or the grader reported ``info["discard"]``/``info["env_error"]``);
+    trainers must drop such samples rather than treat them as reward 0.
+
+    The returned callable carries ``discard_unscorable = True``. Group-relative trainers use that marker to
+    opt this reward function into dropping a group when one of its samples scores ``None``; reward functions
+    without the marker keep NaN-aware handling of missing rewards.
     """
-    from ._base import SandboxEnvironment
 
     def _reward_fn(
         *,
         prompts: collections.abc.Sequence[tp.Any] | None = None,
         completions: collections.abc.Sequence[tp.Any] | None = None,
-        environment_rewards: collections.abc.Sequence[float] | None = None,
+        environment_rewards: collections.abc.Sequence[float | None] | None = None,
         **kwargs: tp.Any,
-    ) -> list[float]:
+    ) -> list[float | None]:
         if environment_rewards is not None:
-            return [float(r) for r in environment_rewards]
+            return [None if r is None else float(r) for r in environment_rewards]
         if completions is None:
             return []
 
@@ -293,11 +335,12 @@ def make_environment_reward_fn(
                     active_indices.append(idx)
             if not active_envs and reset_errors:
                 raise SandboxInfraError(reset_errors[0])
-            scores = [0.0] * len(comp_texts)
+            # A sample whose environment could not be reset or graded is unscorable: ``None``, never 0.0.
+            scores: list[float | None] = [None] * len(comp_texts)
             if active_envs:
-                results = SandboxEnvironment.step_batch(active_envs, active_comps, max_workers=max_workers)
+                results = _grade_single_turn_batch(active_envs, active_comps, max_workers=max_workers)
                 for idx, res in zip(active_indices, results, strict=True):
-                    scores[idx] = float(res.reward)
+                    scores[idx] = None if is_unscorable(res) else float(res.reward)
             return scores
         finally:
             for env in envs:
@@ -306,10 +349,12 @@ def make_environment_reward_fn(
                 except Exception:
                     pass
 
+    _reward_fn.__dict__["discard_unscorable"] = True
     return _reward_fn
 
 
 __all__ = (
     "AutoEnvironment",
+    "is_unscorable",
     "make_environment_reward_fn",
 )

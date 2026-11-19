@@ -143,7 +143,7 @@ class SandboxReadFileTool(Tool):
         path: Workspace-relative file path to read.
         """
         try:
-            text = self._get_session().read_file(path)
+            text = self._get_session().read_file(path, max_chars=self._max_chars)
         except Exception as exc:
             return f"Error reading '{path}': {exc}"
         if len(text) > self._max_chars:

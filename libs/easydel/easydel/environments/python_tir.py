@@ -25,6 +25,7 @@ from easydel.trainers.rlvr_trainer.reward_verifiers import _extract_answer, _nor
 
 from ._base import SandboxEnvironment, register_environment
 from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool
+from .swe_repo import unscorable_step
 
 _PY_BLOCK_RE = re.compile(r"```python\s*\n(.*?)```|<code>\s*(.*?)\s*</code>", re.DOTALL)
 
@@ -129,6 +130,8 @@ class StatefulPythonEnvironment(SandboxEnvironment):
         self._parser = create_tool_call_parser(tool_caller, tokenizer=tokenizer)
         self._snippet_timeout = float(snippet_timeout)
 
+    _infra_failure_step = staticmethod(unscorable_step)
+
     def reset(self, seed: int | None = None) -> ResetResult:
         try:
             session = self._open_session(seed=seed)
@@ -153,6 +156,31 @@ class StatefulPythonEnvironment(SandboxEnvironment):
         candidate = boxed[-1].strip() if boxed else action.strip()
         return 1.0 if candidate == self._answer.strip() else 0.0
 
+    def grade_single_turn(self, action: str) -> StepResult:
+        """Grade ``action`` as a final answer without executing any code block it contains.
+
+        Used by single-turn reward adapters (:func:`make_environment_reward_fn`), where there is no next turn
+        to show tool output to: the completion is always graded terminally.
+
+        Args:
+            action: Complete model completion.
+
+        Returns:
+            A terminated :class:`StepResult` carrying the answer reward.
+        """
+        self._step_count += 1
+        try:
+            reward = self._grade_final_answer(action)
+        except Exception as exc:
+            return self._infra_failure_step(f"answer verifier failed: {type(exc).__name__}: {exc}")
+        return StepResult(
+            observation="Correct." if reward > 0.0 else "Incorrect.",
+            reward=reward,
+            terminated=True,
+            truncated=False,
+            info={"step": self._step_count, "correct": reward > 0.0, "env_error": False},
+        )
+
     def step(self, action: str) -> StepResult:
         self._step_count += 1
         snippets = _extract_python_snippets(action, self._parser)
@@ -175,7 +203,10 @@ class StatefulPythonEnvironment(SandboxEnvironment):
                 info={"step": self._step_count, "executed_blocks": len(snippets), "env_error": False},
             )
 
-        reward = self._grade_final_answer(action)
+        try:
+            reward = self._grade_final_answer(action)
+        except Exception as exc:
+            return self._infra_failure_step(f"answer verifier failed: {type(exc).__name__}: {exc}")
         truncated = bool(snippets) and self._step_count >= self._max_steps and reward == 0.0
         return StepResult(
             observation="Correct." if reward > 0.0 else "Incorrect.",

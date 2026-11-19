@@ -24,10 +24,12 @@ from __future__ import annotations
 import collections.abc
 import dataclasses
 import http.server
+import ipaddress
 import json
 import os
 import threading
 import typing as tp
+import urllib.parse
 import uuid
 
 import numpy as np
@@ -40,7 +42,21 @@ from easydel.trainers._online_rl.trajectory import (
 from easydel.trainers._shared.environment import ResetResult, StepResult
 
 from ._base import SandboxEnvironment, register_environment
-from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool
+from .runtime import (
+    ContainerConfig,
+    ContainerSandboxSession,
+    KiriRuntime,
+    SandboxInfraError,
+    SandboxPool,
+    SandboxSession,
+)
+from .swe_repo import (
+    capture_base_revision,
+    kill_agent_processes,
+    restore_grading_files,
+    unscorable_step,
+    verification_resolved,
+)
 
 ProtocolKind = tp.Literal["openai_chat", "openai_responses", "anthropic_messages"]
 SubagentTrainingMode = tp.Literal["root_only", "all_streams"]
@@ -472,7 +488,25 @@ class HarnessTITOGateway:
         model_name: str = "easydel-rl-policy",
         host: str = "127.0.0.1",
         port: int = 0,
+        advertise_host: str | None = None,
+        public_base_url: str | None = None,
     ):
+        """Create the gateway.
+
+        Args:
+            generate_fn: Policy turn generator.
+            encode_messages_fn: Chat-message tokenizer used for TITO stitching.
+            model_name: Model id reported to harnesses.
+            host: Interface the HTTP server binds to. Container sandboxes cannot reach ``127.0.0.1`` on the
+                trainer host; bind a reachable interface (e.g. ``"0.0.0.0"`` or the container bridge IP).
+            port: TCP port (``0`` picks a free port).
+            advertise_host: Host name/IP written into harness URLs instead of the bind address
+                (the bound port is kept).
+            public_base_url: Full URL (e.g. ``"http://gateway.internal:8080"``) written into harness URLs;
+                overrides ``advertise_host``.
+        """
+        self._advertise_host = advertise_host
+        self._public_base_url = public_base_url.rstrip("/") if public_base_url else None
         self._generate = generate_fn
         self._encode_messages = encode_messages_fn
         self.model_name = model_name
@@ -585,6 +619,31 @@ class HarnessTITOGateway:
     @property
     def base_url_v1(self) -> str:
         return f"{self.base_url}/v1"
+
+    @property
+    def advertised_base_url(self) -> str:
+        """URL harness processes inside the sandbox should use to reach this gateway."""
+        if self._public_base_url:
+            return self._public_base_url
+        if self._advertise_host:
+            port = self._server.server_address[1]
+            return f"http://{self._advertise_host}:{port}"
+        return self.base_url
+
+    @property
+    def advertised_base_url_v1(self) -> str:
+        return f"{self.advertised_base_url}/v1"
+
+    @property
+    def advertised_is_loopback(self) -> bool:
+        """Whether :attr:`advertised_base_url` only resolves on the trainer host itself."""
+        host = (urllib.parse.urlsplit(self.advertised_base_url).hostname or "").lower()
+        if host in {"localhost", "0.0.0.0", "::", ""}:
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return host.endswith(".localhost")
 
     def open_episode(self, *, trajectory_id: int | None = None) -> tuple[str, str]:
         """Register a new rollout episode and return ``(episode_id, api_key)``."""
@@ -972,6 +1031,9 @@ class HarnessEnvironment(SandboxEnvironment):
         self._harness_timeout = float(harness_timeout)
         self._verify_timeout = float(verify_timeout)
         self._last_trajectories: list[OnlineRLTrajectory] = []
+        self._base_sha: str | None = None
+
+    _infra_failure_step = staticmethod(unscorable_step)
 
     @property
     def last_trajectories(self) -> list[OnlineRLTrajectory]:
@@ -980,8 +1042,14 @@ class HarnessEnvironment(SandboxEnvironment):
 
     def reset(self, seed: int | None = None) -> ResetResult:
         self._last_trajectories = []
+        self._base_sha = None
         try:
             session = self._open_session(seed=seed)
+            try:
+                self._check_gateway_reachability(session)
+            except ValueError:
+                self.close()
+                raise
             if self._repo_dir is not None:
                 copied: dict[str, bytes] = {}
                 root = os.path.abspath(self._repo_dir)
@@ -996,7 +1064,8 @@ class HarnessEnvironment(SandboxEnvironment):
                     session.write_files(copied)
             if self._initial_files:
                 session.write_files(self._initial_files)
-            if self._preset.requires_git:
+            needs_base = bool(self._test_patch or self._fail_to_pass or self._pass_to_pass)
+            if self._preset.requires_git or needs_base:
                 res = session.run_bash(
                     "git rev-parse --is-inside-work-tree >/dev/null 2>&1 || "
                     "(git init -q && git config user.email 'rl@easydel.local' && "
@@ -1006,12 +1075,46 @@ class HarnessEnvironment(SandboxEnvironment):
                 )
                 if res.infra_error:
                     return ResetResult(self._prompt, info={"env_error": True, "env_error_message": res.infra_error})
+            base_sha, infra_err = capture_base_revision(session)
+            if infra_err:
+                return ResetResult(self._prompt, info={"env_error": True, "env_error_message": infra_err})
+            if needs_base and base_sha is None:
+                return ResetResult(
+                    self._prompt,
+                    info={"env_error": True, "env_error_message": "Could not record the workspace base revision."},
+                )
+            self._base_sha = base_sha
         except SandboxInfraError as exc:
             return ResetResult(self._prompt, info={"env_error": True, "env_error_message": str(exc)})
         return ResetResult(self._prompt, info={"harness": self._preset.name, "env_error": False})
 
+    def _check_gateway_reachability(self, session: SandboxSession) -> None:
+        """Fail fast when a container sandbox would be handed a loopback-only gateway URL.
+
+        Raises:
+            ValueError: If ``session`` runs in a container and the gateway advertises a loopback address.
+        """
+        if self._gateway is None or not isinstance(session, ContainerSandboxSession):
+            return
+        if self._gateway.advertised_is_loopback:
+            raise ValueError(
+                "HarnessEnvironment: the TITO gateway advertises "
+                f"{self._gateway.advertised_base_url!r}, which a container sandbox cannot reach. Bind the gateway "
+                "to a reachable interface (HarnessTITOGateway(host='0.0.0.0', ...)) and pass "
+                "`advertise_host=` (container-visible host/IP) or `public_base_url=`."
+            )
+
     def _grade_workspace(self) -> tuple[float, dict[str, tp.Any], str | None]:
         session = self.session
+        kill_err = kill_agent_processes(session)
+        if kill_err is not None:
+            return 0.0, {}, kill_err
+        if self._test_patch or self._fail_to_pass or self._pass_to_pass:
+            if self._base_sha is None:
+                return 0.0, {}, "Base revision was not recorded at reset; cannot grade safely."
+            restore_err = restore_grading_files(session, self._base_sha, self._test_patch)
+            if restore_err is not None:
+                return 0.0, {}, restore_err
         if self._test_patch:
             session.write_files({".ed_harness_eval.patch": self._test_patch})
             ap = session.exec(["git", "apply", ".ed_harness_eval.patch"], timeout=10.0)
@@ -1040,8 +1143,7 @@ class HarnessEnvironment(SandboxEnvironment):
                 return 0.0, {}, r.infra_error
             p2p.append(r.ok)
 
-        has_verifier = bool(self._verify_script or self._fail_to_pass or self._pass_to_pass)
-        ok = has_verifier and (all(f2p) and bool(f2p) if self._fail_to_pass else True) and all(p2p)
+        ok = verification_resolved(f2p, p2p, has_f2p=bool(self._fail_to_pass), has_p2p=bool(self._pass_to_pass))
         return (1.0 if ok else 0.0), {"resolved": ok, "f2p_passed": sum(f2p), "p2p_passed": sum(p2p)}, None
 
     def step(self, action: str = "") -> StepResult:
@@ -1055,8 +1157,8 @@ class HarnessEnvironment(SandboxEnvironment):
         template_vars = {
             "prompt": task_text,
             "model": self._gateway.model_name,
-            "base_url": self._gateway.base_url,
-            "base_url_v1": self._gateway.base_url_v1,
+            "base_url": self._gateway.advertised_base_url,
+            "base_url_v1": self._gateway.advertised_base_url_v1,
             "api_key": api_key,
         }
         try:

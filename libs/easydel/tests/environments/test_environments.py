@@ -190,6 +190,11 @@ class _MockKiriDaemon:
                 rec = self.execs[eid]
                 cmd = rec["spec"]["Cmd"]
                 cid = rec["cid"]
+                # exec_run wraps user commands as [sh, -c, watchdog, sh, pid_file, backstop_s, stdin_path, *cmd].
+                stdin_file = ""
+                if len(cmd) >= 7 and cmd[:2] == ["/bin/sh", "-c"] and cmd[3] == "sh":
+                    stdin_file = cmd[6]
+                    cmd = cmd[7:]
                 if self.reset_on_exec_start and cmd[:2] not in (["mkdir", "-p"], ["rm", "-f"]):
                     conn.close()
                     return
@@ -198,8 +203,7 @@ class _MockKiriDaemon:
                     self._send(conn, 200, b"")
                     return
                 cmdline = " ".join(cmd)
-                if "< " in cmdline:
-                    stdin_file = cmdline.split("< ", 1)[1].split(" && ", 1)[0].strip("'")
+                if stdin_file:
                     stdin_bytes = self.containers[cid]["files"].get(stdin_file, b"")
                     out = b"STDIN=" + stdin_bytes
                     err = b"warn-line\n"
@@ -719,7 +723,7 @@ def test_code_judge_blocks_file_and_cmdline_sentinel_inspection():
     )
     try:
         r0 = env.reset()
-        assert r0.info["in_process_test_runner"] is True
+        assert r0.info["isolated_test_runner"] is True
 
         # Reading __file__ (solution.py) and /proc/self/cmdline must NOT reveal any sentinel.
         hack_file = env.step(
@@ -741,8 +745,7 @@ def test_code_judge_blocks_file_and_cmdline_sentinel_inspection():
 
 
 def test_code_judge_container_backend_blocks_fd0_and_tmp_stdin_leak():
-    """Verify EngineSocketClient.exec_run unlinks /tmp/.ed_stdin_* and pipes stdin."""
-    import glob as _glob
+    """Verify a container-backed code judge cannot forge a pass, and exec_run's wire layout."""
     import shutil
     import subprocess
     import sys
@@ -780,23 +783,13 @@ def test_code_judge_container_backend_blocks_fd0_and_tmp_stdin_leak():
             return b""
 
         def exec_run(self, cid, cmd, *, workdir=None, env=None, stdin=None, timeout=30.0, max_output_chars=16384):
-            from easydel.environments.runtime import _sh_quote
-
-            exec_cmd = list(cmd)
-            if stdin is not None:
-                stdin_name = f".ed_stdin_{os.getpid()}_{id(stdin)}"
-                stdin_path = os.path.join(self.tmp_dir, stdin_name)
-                with open(stdin_path, "w", encoding="utf-8") as f:
-                    f.write(stdin)
-                exec_cmd = [sys.executable if part == "python3" else part for part in exec_cmd]
-                quoted = " ".join(_sh_quote(part) for part in exec_cmd)
-                q_path = _sh_quote(stdin_path)
-                exec_cmd = [
-                    "/bin/sh",
-                    "-c",
-                    f"exec 3< {q_path} && rm -f {q_path} && cat <&3 | exec 3<&- {quoted}",
-                ]
-            proc = subprocess.run(exec_cmd, cwd=self.ws_dir, capture_output=True, text=True, timeout=timeout)
+            # Stand-in for the engine: run the command locally with stdin piped straight in.
+            # The production wrapper's fd handling is covered against EngineSocketClient itself in
+            # test_runtime_sandbox.py::test_container_exec_stdin_file_is_held_only_by_the_command.
+            exec_cmd = [sys.executable if part == "python3" else part for part in cmd]
+            proc = subprocess.run(
+                exec_cmd, cwd=self.ws_dir, input=stdin, capture_output=True, text=True, timeout=timeout
+            )
             return ExecResult(
                 ok=(proc.returncode == 0), stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode
             )
@@ -863,12 +856,16 @@ def test_code_judge_container_backend_blocks_fd0_and_tmp_stdin_leak():
             "```"
         )
         assert hack.reward == 0.0
-        assert _glob.glob(os.path.join(fake_client.tmp_dir, ".ed_stdin_*")) == []
         try:
             spy.exec_run("cid", ["python3", "-I", "-"], stdin="print(1)")
         except Exception:
             pass
-        assert seen_cmds and "rm -f" in seen_cmds[0][-1] and "| exec 3<&-" in seen_cmds[0][-1]
+        # Wire contract with the engine: [sh, -c, watchdog, sh, pid_file, backstop_s, stdin_path, *cmd].
+        assert seen_cmds, "exec_run never created an exec"
+        sent = seen_cmds[0]
+        assert sent[:2] == ["/bin/sh", "-c"] and sent[3] == "sh"
+        assert sent[6].startswith("/tmp/.ed_stdin_")
+        assert sent[7:] == ["python3", "-I", "-"]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -887,10 +884,6 @@ def test_local_sandbox_close_kills_background_process_groups():
         os.kill(bg_pid, 0)
 
 
-@pytest.mark.xfail(
-    reason="Adversarial: sentinel is currently in module co_consts; needs separate-process runner.",
-    strict=True,
-)
 def test_code_judge_sentinel_file_inspection_adversarial():
     env = CodeJudgeEnvironment(
         prompt="Implement add(a, b).",
@@ -921,12 +914,20 @@ def test_code_judge_sentinel_file_inspection_adversarial():
 
 def test_unjailed_warning_and_required_jail_for_shell_envs():
     if shutil.which("bwrap") is None:
-        # CodeJudgeEnvironment uses auto by default -> emits warning and flags unjailed=True.
+        # use_jail="auto" without bwrap never runs unjailed: reset reports an infra error.
         cj = CodeJudgeEnvironment(prompt="hi", test_code="assert True", backend="local")
-        with pytest.warns(RuntimeWarning, match="UNJAILED"):
-            res = cj.reset()
-        assert res.info["unjailed"] is True
+        res = cj.reset()
+        assert res.info["env_error"] is True
+        assert "bwrap" in res.info["env_error_message"]
         cj.close()
+
+        # Only an explicit use_jail="off" runs unjailed, and the session says so.
+        cj_off = CodeJudgeEnvironment(
+            prompt="hi", test_code="assert True", backend="local", container_config=ContainerConfig(use_jail="off")
+        )
+        res_off = cj_off.reset()
+        assert res_off.info["unjailed"] is True
+        cj_off.close()
 
         # TerminalEnvironment and SWERepoEnvironment default to use_jail="required".
         term = TerminalEnvironment(task_prompt="hi", backend="local")

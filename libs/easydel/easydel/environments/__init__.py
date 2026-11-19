@@ -32,7 +32,7 @@ from .async_collector import (
     GeneratedTurn,
     GroupRolloutBatch,
 )
-from .auto import AutoEnvironment, make_environment_reward_fn
+from .auto import AutoEnvironment, is_unscorable, make_environment_reward_fn
 from .code_judge import CodeJudgeEnvironment, extract_code_block
 from .harnesses import (
     GatewayTurnOutput,
@@ -43,13 +43,36 @@ from .harnesses import (
     list_harnesses,
     register_harness,
 )
-from .kiri_installer import install_kiri
+from .judge import (
+    JudgeClient,
+    JudgeError,
+    LLMJudgeEnvironment,
+    PairwiseJudge,
+    RequestRateLimiter,
+    RubricJudge,
+    make_judge_reward_fn,
+    parse_judge_json,
+)
+from .kiri_installer import install_kiri, owned_kiri_daemons, shutdown_kiri_daemons
 from .python_tir import StatefulPythonEnvironment
+from .rewards import (
+    RewardShaper,
+    StructuralValidity,
+    compose_outcome_reward,
+    correct_answer_floor,
+    count_think_tokens,
+    gate_invalid,
+    lexicographic_blend,
+    structural_validity,
+    think_budget_penalty,
+    validate_structural_config,
+)
 from .runtime import (
     ContainerConfig,
     ContainerSandboxSession,
     EngineSocketClient,
     ExecResult,
+    KiriDaemonBudget,
     KiriRuntime,
     LocalSandboxSession,
     SandboxInfraError,
@@ -78,8 +101,16 @@ __all__ = (
     "HarnessEnvironment",
     "HarnessPreset",
     "HarnessTITOGateway",
+    "JudgeClient",
+    "JudgeError",
+    "KiriDaemonBudget",
     "KiriRuntime",
+    "LLMJudgeEnvironment",
     "LocalSandboxSession",
+    "PairwiseJudge",
+    "RequestRateLimiter",
+    "RewardShaper",
+    "RubricJudge",
     "SWERepoEnvironment",
     "SandboxBashTool",
     "SandboxEditFileTool",
@@ -91,20 +122,34 @@ __all__ = (
     "SandboxSession",
     "SandboxWriteFileTool",
     "StatefulPythonEnvironment",
+    "StructuralValidity",
     "SyntheticTaskStream",
     "SyntheticToolEnvironment",
     "TaskSanityReport",
     "TaskVerificationGate",
     "TerminalEnvironment",
     "build_environment",
+    "compose_outcome_reward",
+    "correct_answer_floor",
+    "count_think_tokens",
     "discover_engine_endpoint",
     "extract_code_block",
+    "gate_invalid",
     "get_harness_preset",
     "install_kiri",
+    "is_unscorable",
+    "lexicographic_blend",
     "list_environments",
     "list_harnesses",
     "make_environment_factory",
     "make_environment_reward_fn",
+    "make_judge_reward_fn",
+    "owned_kiri_daemons",
+    "parse_judge_json",
     "register_environment",
     "register_harness",
+    "shutdown_kiri_daemons",
+    "structural_validity",
+    "think_budget_penalty",
+    "validate_structural_config",
 )

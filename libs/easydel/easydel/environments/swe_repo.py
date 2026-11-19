@@ -19,12 +19,159 @@ from __future__ import annotations
 import collections.abc
 import json
 import os
+import posixpath
 import typing as tp
 
 from easydel.trainers._shared.environment import ResetResult, StepResult, create_tool_call_parser
 
 from ._base import SandboxEnvironment, register_environment
-from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool
+from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool, SandboxSession
+
+# Files that configure or hook test collection/interpreter start-up. Before grading, every such file is reset to
+# its base-revision content (or deleted when the agent added it) so a policy cannot rig the verification tests.
+_TEST_INFRA_BASENAMES = frozenset(
+    {
+        "conftest.py",
+        "pytest.ini",
+        ".pytest.ini",
+        "pytest.toml",
+        ".pytest.toml",
+        "tox.ini",
+        "setup.cfg",
+        "pyproject.toml",
+        "noxfile.py",
+        ".coveragerc",
+        "sitecustomize.py",
+        "usercustomize.py",
+    }
+)
+_TEST_INFRA_SUFFIXES = (".pth",)
+
+
+def kill_agent_processes(session: SandboxSession) -> str | None:
+    """Kill every process the agent left running in ``session`` before grading starts.
+
+    Background loops started by the policy (``setsid``, ``nohup``, ``&``) could otherwise re-plant
+    ``conftest.py`` or write the reward file while verification runs. The kill is mandatory: a session
+    without ``kill_sandbox_processes`` (or one whose kill fails) cannot be graded safely, so the caller
+    must treat the episode as unscorable.
+
+    Args:
+        session: Episode sandbox session about to be graded.
+
+    Returns:
+        An error message when the agent's processes could not be killed (unscorable), else ``None``.
+    """
+    killer = getattr(session, "kill_sandbox_processes", None)
+    if not callable(killer):
+        return (
+            f"{type(session).__name__} cannot kill agent background processes (no kill_sandbox_processes); "
+            "refusing to grade an episode whose processes may still be running."
+        )
+    try:
+        killer()
+    except Exception as exc:
+        return f"failed to kill agent background processes before grading: {exc}"
+    return None
+
+
+def _is_test_infra_path(path: str) -> bool:
+    base = posixpath.basename(path)
+    return base in _TEST_INFRA_BASENAMES or base.endswith(_TEST_INFRA_SUFFIXES)
+
+
+def _patch_touched_paths(patch: str) -> set[str]:
+    """Return every repository path a unified diff reads or writes (``/dev/null`` excluded)."""
+    paths: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            parts = line[len("diff --git ") :].split(" b/", 1)
+            if len(parts) == 2:
+                paths.add(parts[0][2:] if parts[0].startswith("a/") else parts[0])
+                paths.add(parts[1])
+        elif line.startswith(("--- ", "+++ ")):
+            target = line[4:].split("\t", 1)[0].strip()
+            if target == "/dev/null":
+                continue
+            if target.startswith(("a/", "b/")):
+                target = target[2:]
+            paths.add(target)
+        elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            paths.add(line.split(" ", 2)[2].strip())
+    return {p for p in paths if p and not p.startswith("/") and ".." not in p.split("/")}
+
+
+def capture_base_revision(session: SandboxSession) -> tuple[str | None, str | None]:
+    """Return ``(base_sha, infra_error)`` for the session's current ``HEAD``."""
+    res = session.exec(["git", "rev-parse", "HEAD"], timeout=10.0)
+    if res.infra_error:
+        return None, res.infra_error
+    sha = res.stdout.strip()
+    return (sha if res.ok and sha else None), None
+
+
+def restore_grading_files(session: SandboxSession, base_sha: str, test_patch: str | None) -> str | None:
+    """Reset test-patch paths and test-infrastructure files to ``base_sha`` before grading.
+
+    Paths that exist at ``base_sha`` are checked out from it (undoing edits, deletions and symlink swaps);
+    paths that do not exist there are deleted, so agent-planted ``conftest.py`` / ``sitecustomize.py`` /
+    ``*.pth`` files or pre-created copies of test-patch files cannot influence verification.
+
+    Args:
+        session: Episode sandbox session whose working directory is a git checkout.
+        base_sha: Commit recorded at reset, before the agent acted.
+        test_patch: Evaluation patch that will be applied afterwards (its paths are reset too).
+
+    Returns:
+        An error message when the restore could not run (treated as unscorable), else ``None``.
+    """
+    base_res = session.exec(["git", "ls-tree", "-r", "-z", "--name-only", base_sha], timeout=30.0)
+    if base_res.infra_error or not base_res.ok:
+        return base_res.infra_error or f"git ls-tree failed: {base_res.combined_output(1024)}"
+    base_paths = {p for p in base_res.stdout.split("\0") if p}
+
+    live_res = session.exec(["git", "ls-files", "-z", "--cached", "--others"], timeout=30.0)
+    if live_res.infra_error or not live_res.ok:
+        return live_res.infra_error or f"git ls-files failed: {live_res.combined_output(1024)}"
+    live_paths = {p for p in live_res.stdout.split("\0") if p}
+
+    protected = {p for p in base_paths | live_paths if _is_test_infra_path(p)}
+    protected |= _patch_touched_paths(test_patch or "")
+    to_restore = sorted(p for p in protected if p in base_paths)
+    to_delete = sorted(p for p in protected if p not in base_paths)
+
+    if to_delete:
+        rm_res = session.exec(["rm", "-rf", "--", *to_delete], timeout=30.0)
+        if rm_res.infra_error or not rm_res.ok:
+            return rm_res.infra_error or f"failed to remove agent-added test files: {rm_res.combined_output(1024)}"
+    if to_restore:
+        co_res = session.exec(
+            ["git", "-c", "core.hooksPath=/dev/null", "checkout", base_sha, "--", *to_restore],
+            timeout=30.0,
+        )
+        if co_res.infra_error or not co_res.ok:
+            return co_res.infra_error or f"failed to restore test files: {co_res.combined_output(1024)}"
+    return None
+
+
+def unscorable_step(error: Exception | str) -> StepResult:
+    """Terminal infra-failure result flagged unscorable.
+
+    ``info["discard"] = True`` means the grader could not produce a score (sandbox/infra error, judge failure).
+    Its ``reward`` (0.0) is a placeholder and must not be trained on; reward adapters report ``None`` instead.
+    """
+    result = SandboxEnvironment._infra_failure_step(error)
+    result.info["discard"] = True
+    return result
+
+
+def verification_resolved(f2p_results: list[bool], p2p_results: list[bool], *, has_f2p: bool, has_p2p: bool) -> bool:
+    """Resolved iff at least one test ran, every fail-to-pass test passed and no pass-to-pass test regressed."""
+    if not (has_f2p or has_p2p):
+        return False
+    f2p_ok = bool(f2p_results) and all(f2p_results) if has_f2p else True
+    p2p_ok = bool(p2p_results) and all(p2p_results) if has_p2p else True
+    return f2p_ok and p2p_ok
 
 
 @register_environment(["swe_repo", "swe"])
@@ -80,6 +227,9 @@ class SWERepoEnvironment(SandboxEnvironment):
         self._max_tool_calls_per_step = int(max_tool_calls_per_step)
         self._test_timeout = float(test_timeout)
         self._tools_map = {t.name: t for t in self.build_workspace_tools(enable_bash=True, enable_files=True)}
+        self._base_sha: str | None = None
+
+    _infra_failure_step = staticmethod(unscorable_step)
 
     def _seed_repository(self) -> str | None:
         session = self.session
@@ -121,9 +271,16 @@ class SWERepoEnvironment(SandboxEnvironment):
                 return co_res.infra_error
             if not co_res.ok:
                 return f"Failed to checkout base_commit {self._base_commit!r}: {co_res.combined_output(1024)}"
+        base_sha, infra_err = capture_base_revision(session)
+        if infra_err:
+            return infra_err
+        if base_sha is None:
+            return "Could not resolve the base revision of the seeded repository."
+        self._base_sha = base_sha
         return None
 
     def reset(self, seed: int | None = None) -> ResetResult:
+        self._base_sha = None
         try:
             self._open_session(seed=seed)
             infra_err = self._seed_repository()
@@ -144,10 +301,19 @@ class SWERepoEnvironment(SandboxEnvironment):
 
     def _grade_repository(self) -> tuple[float, dict[str, tp.Any], str | None]:
         session = self.session
+        kill_err = kill_agent_processes(session)
+        if kill_err is not None:
+            return 0.0, {}, kill_err
         diff_res = session.exec(["git", "diff"], timeout=10.0)
         if diff_res.infra_error:
             return 0.0, {}, diff_res.infra_error
         model_patch = diff_res.stdout
+
+        if self._base_sha is None:
+            return 0.0, {}, "Base revision was not recorded at reset; cannot grade safely."
+        restore_err = restore_grading_files(session, self._base_sha, self._test_patch)
+        if restore_err is not None:
+            return 0.0, {}, restore_err
 
         if self._test_patch:
             session.write_files({".ed_eval_tests.patch": self._test_patch})
@@ -175,10 +341,12 @@ class SWERepoEnvironment(SandboxEnvironment):
                 return 0.0, {}, res.infra_error
             p2p_results.append(res.ok)
 
-        has_tests = bool(self._fail_to_pass or self._pass_to_pass)
-        f2p_ok = bool(f2p_results) and all(f2p_results) if self._fail_to_pass else False
-        p2p_ok = all(p2p_results) if self._pass_to_pass else True
-        resolved = has_tests and (f2p_ok or (not self._fail_to_pass and p2p_ok))
+        resolved = verification_resolved(
+            f2p_results,
+            p2p_results,
+            has_f2p=bool(self._fail_to_pass),
+            has_p2p=bool(self._pass_to_pass),
+        )
         info = {
             "resolved": resolved,
             "f2p_passed": sum(f2p_results),

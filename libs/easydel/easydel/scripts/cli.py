@@ -28,20 +28,34 @@ import time
 from easydel.environments.kiri_installer import DEFAULT_KIRI_VERSION, install_kiri, resolve_kiri_asset_url
 from easydel.environments.runtime import EngineSocketClient
 
+_UNSAFE_REMOTE_PATH_CHARS = frozenset('"`\\$\n\r')
 
-def _validate_private_bind_host(bind_host: str) -> None:
-    """Refuse binding an unauthenticated Kiri Engine TCP socket to a public or unspecified IP."""
-    try:
-        ip = ipaddress.ip_address(bind_host)
-    except ValueError as exc:
-        raise ValueError(
-            f"--expose-tcp requires a private/loopback IP literal (not {bind_host!r}); use SSH tunnel mode instead."
-        ) from exc
-    if ip.is_unspecified or not (ip.is_private or ip.is_loopback):
-        raise ValueError(
-            f"Refusing to expose unauthenticated Kiri Engine API on {bind_host!r}. "
-            "Use the default SSH tunnel mode or bind to a specific private VPC / loopback IP."
-        )
+
+def _normalize_remote_data_dir(data_dir: str | None) -> str | None:
+    """Normalize a remote ``--data-dir`` so the remote shell resolves the home directory.
+
+    A leading ``~`` / ``~/`` becomes ``$HOME`` / ``$HOME/`` (``~`` is never expanded
+    inside the double quotes the provisioning script uses). ``~user`` paths and
+    shell metacharacters that would be interpreted inside double quotes are rejected.
+
+    Raises:
+        ValueError: For ``~user`` forms, unsafe characters, or relative paths.
+    """
+    if data_dir is None:
+        return None
+    raw = data_dir.strip()
+    if raw == "~":
+        raw = "$HOME"
+    elif raw.startswith("~/"):
+        raw = "$HOME/" + raw[2:]
+    elif raw.startswith("~"):
+        raise ValueError(f"--data-dir {data_dir!r}: '~user' paths are not supported; use an absolute path.")
+    rest = raw[len("$HOME") :] if raw == "$HOME" or raw.startswith("$HOME/") else raw
+    if any(ch in _UNSAFE_REMOTE_PATH_CHARS for ch in rest):
+        raise ValueError(f"--data-dir {data_dir!r} contains shell metacharacters.")
+    if rest is raw and not raw.startswith("/"):
+        raise ValueError(f"--data-dir {data_dir!r} must be absolute, '~/...' or '$HOME/...'.")
+    return raw.rstrip("/") or "/"
 
 
 def _format_http_endpoint(host: str, port: int) -> str:
@@ -60,13 +74,15 @@ def _build_remote_kiri_script(
     deb_sha_amd64: str,
     deb_url_arm64: str,
     deb_sha_arm64: str,
-    bind_host: str,
-    base_port: int,
     num_daemons: int,
     data_dir: str | None,
-    expose_tcp: bool,
 ) -> str:
-    """Build a self-contained bash script that installs Kiri + boots N daemons on a CPU VM."""
+    """Build a self-contained bash script that installs Kiri + boots N daemons on a CPU VM.
+
+    The daemons listen only on their Unix sockets; nothing is bound to TCP on
+    the remote host. Clients reach them through SSH-forwarded local ports.
+    """
+    data_dir = _normalize_remote_data_dir(data_dir)
     data_root = data_dir or "$HOME/.kiri-vms"
     lines = [
         "set -euo pipefail",
@@ -90,7 +106,6 @@ def _build_remote_kiri_script(
     ]
 
     for idx in range(num_daemons):
-        port = base_port + idx
         if num_daemons == 1 and data_dir is None:
             daemon_home = "$HOME"
             sock_path = "$HOME/.kiri/run/docker.sock"
@@ -111,48 +126,6 @@ def _build_remote_kiri_script(
                 "fi",
             ]
         )
-        if expose_tcp:
-            fwd_log = f"/tmp/kiri-fwd-{port}.log"
-            lines.extend(
-                [
-                    f'if ! ss -ltn 2>/dev/null | grep -q ":{port} "; then',
-                    "  if command -v socat >/dev/null 2>&1; then",
-                    f'    setsid nohup socat "TCP-LISTEN:{port},bind={bind_host},reuseaddr,fork" "UNIX-CONNECT:{sock_path}" > "{fwd_log}" 2>&1 < /dev/null &',
-                    "  else",
-                    "    PY_FWD_B64=\"$(cat << 'PYEOF' | base64 -w0\n"
-                    "import os, socket, sys, threading\n"
-                    "srv = socket.socket()\n"
-                    "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-                    "srv.bind((sys.argv[1], int(sys.argv[2])))\n"
-                    "srv.listen(128)\n"
-                    "def pipe(a, b):\n"
-                    "    try:\n"
-                    "        while True:\n"
-                    "            d = a.recv(65536)\n"
-                    "            if not d:\n"
-                    "                break\n"
-                    "            b.sendall(d)\n"
-                    "    except OSError:\n"
-                    "        pass\n"
-                    "    finally:\n"
-                    "        for s in (a, b):\n"
-                    "            try:\n"
-                    "                s.close()\n"
-                    "            except OSError:\n"
-                    "                pass\n"
-                    "while True:\n"
-                    "    c, _ = srv.accept()\n"
-                    "    u = socket.socket(socket.AF_UNIX)\n"
-                    "    u.connect(sys.argv[3])\n"
-                    "    threading.Thread(target=pipe, args=(c, u), daemon=True).start()\n"
-                    "    threading.Thread(target=pipe, args=(u, c), daemon=True).start()\n"
-                    "PYEOF\n"
-                    ')"',
-                    f'    setsid nohup python3 -c "import base64,sys; exec(base64.b64decode(sys.argv[1]))" "$PY_FWD_B64" "{bind_host}" "{port}" "{sock_path}" > "{fwd_log}" 2>&1 < /dev/null &',
-                    "  fi",
-                    "fi",
-                ]
-            )
     lines.append('echo "KIRI_CPU_VM_READY"')
     return "\n".join(lines) + "\n"
 
@@ -184,7 +157,8 @@ def _resolve_remote_sock_path(
     idx: int,
 ) -> str:
     """Resolve the absolute remote Unix socket path (expanding ``$HOME`` on the remote host)."""
-    if data_dir and not data_dir.startswith(("$HOME", "~")):
+    data_dir = _normalize_remote_data_dir(data_dir)
+    if data_dir and not data_dir.startswith("$HOME"):
         return f"{data_dir}/vm-{idx}/.kiri/run/docker.sock"
     remote_home = subprocess.check_output(
         [*_ssh_base_cmd(target=ssh_target, ssh_key=ssh_key), 'printf %s "$HOME"'],
@@ -195,11 +169,7 @@ def _resolve_remote_sock_path(
     if num_daemons == 1 and not data_dir:
         return f"{remote_home}/.kiri/run/docker.sock"
     if data_dir:
-        resolved_data_dir = (
-            data_dir.replace("$HOME", remote_home, 1)
-            if "$HOME" in data_dir
-            else (remote_home + data_dir[1:] if data_dir.startswith("~/") else remote_home)
-        )
+        resolved_data_dir = remote_home + data_dir[len("$HOME") :]
     else:
         resolved_data_dir = f"{remote_home}/.kiri-vms"
     return f"{resolved_data_dir}/vm-{idx}/.kiri/run/docker.sock"
@@ -210,7 +180,7 @@ def cmd_setup_cpu_vm(args: argparse.Namespace) -> int:
     if args.num_daemons <= 0:
         raise ValueError("--num-daemons must be positive.")
 
-    expose_tcp = bool(args.expose_tcp)
+    args.data_dir = _normalize_remote_data_dir(args.data_dir)
     if args.dry_run:
         from easydel.environments.kiri_installer import PINNED_KIRI_SHA256
 
@@ -229,32 +199,15 @@ def cmd_setup_cpu_vm(args: argparse.Namespace) -> int:
 
     endpoints: list[str] = []
     for host_idx, raw_host in enumerate(args.hosts):
-        if "@" in raw_host:
-            ssh_target = raw_host
-            host_ip = raw_host.split("@", 1)[1]
-        else:
-            ssh_target = f"{args.user}@{raw_host}" if args.user else raw_host
-            host_ip = raw_host
-
-        bind_host = (args.bind_host or host_ip) if expose_tcp else "127.0.0.1"
-        if expose_tcp:
-            _validate_private_bind_host(bind_host)
-            print(
-                f"WARNING: --expose-tcp binds an UNAUTHENTICATED Docker/Kiri Engine API on {bind_host}:{args.port}..{args.port + args.num_daemons - 1}. "
-                "Ensure your VPC firewall restricts access to trusted TPU hosts only.",
-                file=sys.stderr,
-            )
+        ssh_target = raw_host if "@" in raw_host or not args.user else f"{args.user}@{raw_host}"
 
         script = _build_remote_kiri_script(
             deb_url_amd64=deb_amd64,
             deb_sha_amd64=sha_amd64,
             deb_url_arm64=deb_arm64,
             deb_sha_arm64=sha_arm64,
-            bind_host=bind_host,
-            base_port=args.port,
             num_daemons=args.num_daemons,
             data_dir=args.data_dir,
-            expose_tcp=expose_tcp,
         )
         encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
         remote_cmd = f"echo {shlex.quote(encoded)} | base64 -d | bash"
@@ -264,44 +217,38 @@ def cmd_setup_cpu_vm(args: argparse.Namespace) -> int:
             print(f"[dry-run] {ssh_target}:")
             print(script)
             for idx in range(args.num_daemons):
-                ep_host = bind_host if expose_tcp else "127.0.0.1"
-                ep_port = (args.port + idx) if expose_tcp else (args.port + host_idx * args.num_daemons + idx)
-                endpoints.append(_format_http_endpoint(ep_host, ep_port))
+                endpoints.append(_format_http_endpoint("127.0.0.1", args.port + host_idx * args.num_daemons + idx))
             continue
 
         print(f"Provisioning Kiri on {ssh_target}...", flush=True)
         subprocess.run(ssh_cmd, check=True)
 
         for idx in range(args.num_daemons):
-            if not expose_tcp:
-                local_port = args.port + host_idx * args.num_daemons + idx
-                sock_path = _resolve_remote_sock_path(
-                    ssh_target=ssh_target,
-                    ssh_key=args.ssh_key,
-                    num_daemons=args.num_daemons,
-                    data_dir=args.data_dir,
-                    idx=idx,
-                )
-                resolved_key = _resolve_ssh_key(args.ssh_key)
-                tunnel_cmd = [
-                    "ssh",
-                    "-fN",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ExitOnForwardFailure=yes",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    *(["-i", resolved_key] if resolved_key else []),
-                    "-L",
-                    f"127.0.0.1:{local_port}:{sock_path}",
-                    ssh_target,
-                ]
-                subprocess.run(tunnel_cmd, check=True)
-                endpoint = _format_http_endpoint("127.0.0.1", local_port)
-            else:
-                endpoint = _format_http_endpoint(bind_host, args.port + idx)
-
+            local_port = args.port + host_idx * args.num_daemons + idx
+            sock_path = _resolve_remote_sock_path(
+                ssh_target=ssh_target,
+                ssh_key=args.ssh_key,
+                num_daemons=args.num_daemons,
+                data_dir=args.data_dir,
+                idx=idx,
+            )
+            resolved_key = _resolve_ssh_key(args.ssh_key)
+            tunnel_cmd = [
+                "ssh",
+                "-fN",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                *(["-i", resolved_key] if resolved_key else []),
+                "-L",
+                f"127.0.0.1:{local_port}:{sock_path}",
+                ssh_target,
+            ]
+            subprocess.run(tunnel_cmd, check=True)
+            endpoint = _format_http_endpoint("127.0.0.1", local_port)
             client = EngineSocketClient(endpoint)
             ok = False
             for _ in range(30):
@@ -336,6 +283,7 @@ def cmd_setup_kiri(args: argparse.Namespace) -> int:
             data_dir=target_dir,
             kiri_bin=path,
             auto_install=False,
+            persist=True,
         )
         print(f"endpoints = {endpoints!r}")
     return 0
@@ -348,12 +296,19 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = sub.add_parser("setup", help="Provision local or remote runtimes.")
     setup_sub = setup_parser.add_subparsers(dest="setup_target", required=True)
 
-    cpu_vm = setup_sub.add_parser("cpu-vm", help="Install & start Kiri on remote CPU VM(s) over SSH.")
+    cpu_vm = setup_sub.add_parser(
+        "cpu-vm",
+        help="Install & start Kiri on remote CPU VM(s) over SSH; endpoints are SSH tunnels (nothing listens on remote TCP).",
+    )
     cpu_vm.add_argument("hosts", nargs="+", help="Target CPU VM IP(s) or user@host.")
     cpu_vm.add_argument("--user", default=None, help="SSH username if not included in host.")
     cpu_vm.add_argument("--ssh-key", default=None, help="Path to SSH private key.")
-    cpu_vm.add_argument("--port", type=int, default=2375, help="Base TCP port for Kiri Engine API (default: 2375).")
-    cpu_vm.add_argument("--bind-host", default=None, help="Remote bind address when --expose-tcp is set.")
+    cpu_vm.add_argument(
+        "--port",
+        type=int,
+        default=2375,
+        help="Base local port for the SSH-forwarded Kiri Engine API endpoints (default: 2375).",
+    )
     cpu_vm.add_argument(
         "--num-daemons",
         type=int,
@@ -365,11 +320,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--kiri-version",
         default=DEFAULT_KIRI_VERSION,
         help=f"Pinned Kiri release tag (default: {DEFAULT_KIRI_VERSION}).",
-    )
-    cpu_vm.add_argument(
-        "--expose-tcp",
-        action="store_true",
-        help="Bind unauthenticated TCP on private VPC IP instead of using the default SSH tunnel.",
     )
     cpu_vm.add_argument("--dry-run", action="store_true", help="Print provisioning script without running SSH.")
     cpu_vm.set_defaults(func=cmd_setup_cpu_vm)

@@ -12,23 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Automatic installer and daemon bootstrapper for Kiri (``github.com/libracoder/kiri``)."""
+"""Installer, daemon lifecycle and pod bridge for the Kiri container engine (``github.com/libracoder/kiri``).
+
+Installing Kiri downloads a pinned, SHA256-verified release and only happens on
+an explicit request (``easydel setup kiri``, ``easydel-install-kiri`` or
+``auto_install=True``). Daemons booted through :func:`ensure_kiri_daemon` or
+:func:`ensure_kiri_shm_pool` are owned by this process: they are tracked in a
+module registry and stopped by :func:`shutdown_kiri_daemons` (also registered
+with :mod:`atexit`), which never signals a daemon this process did not start.
+``persist=True`` leaves a daemon running after the process exits (the CLI uses
+it).
+
+Cross-host access goes through an in-process TCP bridge. Bridging is opt-in and
+binds loopback by default. A bridge bound to a routable address requires a
+shared secret token sent as the ``X-EasyDeL-Sandbox-Token`` header, accepts
+peers only from an allow-list of host IPs, and refuses container/exec requests
+that would escape the sandbox (privileged mode, host binds or mounts, host
+namespaces, devices, added capabilities).
+"""
 
 from __future__ import annotations
 
 import argparse
+import atexit
+import dataclasses
 import hashlib
+import hmac
 import io
+import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
+import socket
 import stat
 import subprocess
 import tarfile
 import threading
 import time
+import typing as tp
+import urllib.parse
 import urllib.request
+
+from .runtime import (
+    SANDBOX_TOKEN_HEADER,
+    EngineSocketClient,
+    KiriDaemonBudget,
+    SandboxInfraError,
+    _terminate_process_groups,
+)
 
 KIRI_GITHUB_REPO = "libracoder/kiri"
 KIRI_RELEASES_API = f"https://api.github.com/repos/{KIRI_GITHUB_REPO}/releases"
@@ -44,6 +77,12 @@ PINNED_KIRI_SHA256: dict[str, dict[str, str]] = {
 }
 
 _KIRI_BOOT_LOCK = threading.Lock()
+_MISSING_KIRI_MESSAGE = (
+    "No `kiri` binary was found and automatic installation is disabled. Install it explicitly with "
+    "`easydel setup kiri` (or `easydel-install-kiri`), pass `kiri_bin=`, or pass `auto_install=True` to "
+    "download the pinned, SHA256-verified release."
+)
+_MIN_BRIDGE_TOKEN_CHARS = 16
 
 
 def _normalize_arch(machine: str | None = None) -> tuple[str, str]:
@@ -156,11 +195,13 @@ def install_kiri(
 
     Installs into ``install_dir`` (default ``~/.local/bin``) without requiring
     ``sudo``. Verifies the downloaded archive's SHA256 digest before extracting.
+    A daemon started with ``start_daemon=True`` is persistent: it keeps running
+    after this process exits.
     """
     existing = shutil.which("kiri")
     if existing and not force:
         if start_daemon:
-            ensure_kiri_daemon(kiri_bin=existing, auto_install=False)
+            ensure_kiri_daemon(kiri_bin=existing, persist=True)
         return existing
 
     target_dir = os.path.expanduser(os.fspath(install_dir) if install_dir is not None else "~/.local/bin")
@@ -168,7 +209,7 @@ def install_kiri(
     target_bin = os.path.join(target_dir, "kiri")
     if os.path.exists(target_bin) and not force:
         if start_daemon:
-            ensure_kiri_daemon(kiri_bin=target_bin, auto_install=False)
+            ensure_kiri_daemon(kiri_bin=target_bin, persist=True)
         return target_bin
 
     _tag, asset_name, url, expected_sha256 = resolve_kiri_asset_url(version=version, timeout=min(timeout, 20.0))
@@ -187,61 +228,152 @@ def install_kiri(
         installed_path = _extract_kiri_binary_from_tar(archive_bytes, target_bin)
 
     if start_daemon:
-        ensure_kiri_daemon(kiri_bin=installed_path, auto_install=False)
+        ensure_kiri_daemon(kiri_bin=installed_path, persist=True)
     return installed_path
 
 
-def ensure_kiri_daemon(
-    *,
-    kiri_bin: str | None = None,
-    auto_install: bool = True,
-    wait_seconds: float = 15.0,
-    data_dir: str | os.PathLike[str] | None = None,
-) -> str | None:
-    """Ensure the Kiri daemon is running and return its ``unix://`` socket URI.
+# ---------------------------------------------------------------------------
+# Owned-daemon registry
+# ---------------------------------------------------------------------------
 
-    When ``data_dir`` is provided (for example ``"/dev/shm/kiri"`` on TPU hosts
-    with large CPU RAM and small root SSDs), ``HOME`` and ``KIRI_DATA_DIR`` are
-    directed into ``<data_dir>`` so all container images, overlays, and sockets
-    live in RAM-backed tmpfs with zero root-SSD usage.
+
+@dataclasses.dataclass
+class _OwnedDaemon:
+    uri: str
+    proc: subprocess.Popen
+    pgid: int
+
+
+_OWNED_DAEMONS: dict[str, _OwnedDaemon] = {}
+_ENDPOINT_BUDGETS: dict[str, KiriDaemonBudget] = {}
+_REGISTRY_LOCK = threading.RLock()
+
+
+def owned_kiri_daemons() -> list[str]:
+    """Return the ``unix://`` endpoints of the daemons this process started and still owns."""
+    with _REGISTRY_LOCK:
+        return list(_OWNED_DAEMONS)
+
+
+def kiri_daemon_budget(endpoint: str) -> KiriDaemonBudget | None:
+    """Return the resource budget registered for ``endpoint`` by this process, if any."""
+    with _REGISTRY_LOCK:
+        return _ENDPOINT_BUDGETS.get(endpoint)
+
+
+def shutdown_kiri_daemons(endpoints: list[str] | tuple[str, ...] | None = None, *, grace: float = 2.0) -> list[str]:
+    """Stop Kiri daemons (and their TCP bridges) that this process started.
+
+    Each owned daemon was launched as the leader of its own process group; the
+    group is sent SIGTERM and, after ``grace`` seconds, SIGKILL. Daemons started
+    by other processes, or with ``persist=True``, are never signalled.
+
+    Args:
+        endpoints: ``unix://`` endpoints to stop; ``None`` stops every owned daemon.
+        grace: Seconds between SIGTERM and SIGKILL.
+
+    Returns:
+        The endpoints of the daemons that were stopped.
     """
-    from .runtime import EngineSocketClient
+    with _REGISTRY_LOCK:
+        wanted = None if endpoints is None else set(endpoints)
+        targets = [d for uri, d in _OWNED_DAEMONS.items() if wanted is None or uri in wanted]
+        for d in targets:
+            _OWNED_DAEMONS.pop(d.uri, None)
+            _ENDPOINT_BUDGETS.pop(d.uri, None)
+        stopped_paths = {d.uri.removeprefix("unix://") for d in targets}
+        bridges = [(key, b) for key, b in _TCP_BRIDGES.items() if wanted is None or b.sock_path in stopped_paths]
+        for key, b in bridges:
+            _TCP_BRIDGES.pop(key, None)
+            _ENDPOINT_BUDGETS.pop(b.endpoint, None)
+    for _key, b in bridges:
+        b.close()
+    live = [d.pgid for d in targets if d.proc.poll() is None]
+    _terminate_process_groups(live, grace=grace)
+    for d in targets:
+        try:
+            d.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+    return [d.uri for d in targets]
 
+
+atexit.register(shutdown_kiri_daemons)
+
+
+def _resolve_kiri_exe(kiri_bin: str | None, auto_install: bool) -> str:
+    exe = kiri_bin or shutil.which("kiri")
+    if exe is not None:
+        return exe
+    local_kiri = os.path.expanduser("~/.local/bin/kiri")
+    if os.path.exists(local_kiri):
+        return local_kiri
+    if auto_install:
+        return install_kiri()
+    raise SandboxInfraError(_MISSING_KIRI_MESSAGE)
+
+
+def _socket_candidates(data_dir: str | os.PathLike[str] | None) -> tuple[str | None, str | None, list[str]]:
     if data_dir is not None:
         base_home = os.path.abspath(os.path.expanduser(os.fspath(data_dir)))
         kiri_data = os.path.join(base_home, ".kiri")
-        candidates = [os.path.join(kiri_data, "run", "docker.sock")]
-    else:
-        base_home = None
-        kiri_data = None
-        candidates = [
+        return base_home, kiri_data, [os.path.join(kiri_data, "run", "docker.sock")]
+    return (
+        None,
+        None,
+        [
             "/dev/shm/kiri/.kiri/run/docker.sock",
             os.path.expanduser("~/.kiri/run/docker.sock"),
             "/run/kiri/docker.sock",
-        ]
+        ],
+    )
 
+
+def _ping_any(candidates: list[str]) -> str | None:
     for sock_path in candidates:
         if os.path.exists(sock_path):
             uri = f"unix://{sock_path}"
             if EngineSocketClient(uri).ping():
                 return uri
+    return None
+
+
+def _check_storage_budget(path: str, tmpfs_mb: int) -> None:
+    probe = path
+    while not os.path.exists(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    free = shutil.disk_usage(probe).free
+    need = int(tmpfs_mb) * 1024 * 1024
+    if free < need:
+        raise SandboxInfraError(
+            f"Kiri daemon storage budget is {tmpfs_mb} MiB but only {free // (1024 * 1024)} MiB is free under "
+            f"{probe!r}; lower KiriDaemonBudget.tmpfs_mb, start fewer daemons, or free space."
+        )
+
+
+def _ensure_daemon(
+    *,
+    kiri_bin: str | None = None,
+    auto_install: bool = False,
+    wait_seconds: float = 15.0,
+    data_dir: str | os.PathLike[str] | None = None,
+    budget: KiriDaemonBudget | None = None,
+    persist: bool = False,
+) -> tuple[str, bool]:
+    """Return ``(uri, started)`` where ``started`` is ``True`` when this call booted an owned daemon."""
+    base_home, kiri_data, candidates = _socket_candidates(data_dir)
+    uri = _ping_any(candidates)
+    if uri is not None:
+        return uri, False
 
     with _KIRI_BOOT_LOCK:
-        for sock_path in candidates:
-            if os.path.exists(sock_path):
-                uri = f"unix://{sock_path}"
-                if EngineSocketClient(uri).ping():
-                    return uri
+        uri = _ping_any(candidates)
+        if uri is not None:
+            return uri, False
 
-        exe = kiri_bin or shutil.which("kiri")
-        if exe is None:
-            local_kiri = os.path.expanduser("~/.local/bin/kiri")
-            if os.path.exists(local_kiri):
-                exe = local_kiri
-            elif auto_install:
-                exe = install_kiri()
-            else:
-                return None
+        exe = _resolve_kiri_exe(kiri_bin, auto_install)
+        if budget is not None and budget.tmpfs_mb > 0:
+            _check_storage_budget(base_home or os.path.expanduser("~"), budget.tmpfs_mb)
 
         daemon_env = dict(os.environ)
         if base_home is not None and kiri_data is not None:
@@ -249,7 +381,7 @@ def ensure_kiri_daemon(
             daemon_env["HOME"] = base_home
             daemon_env["KIRI_DATA_DIR"] = kiri_data
 
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [exe, "daemon"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -260,13 +392,71 @@ def ensure_kiri_daemon(
 
         deadline = time.monotonic() + max(1.0, float(wait_seconds))
         while time.monotonic() < deadline:
-            for sock_path in candidates:
-                if os.path.exists(sock_path):
-                    uri = f"unix://{sock_path}"
-                    if EngineSocketClient(uri).ping():
-                        return uri
+            uri = _ping_any(candidates)
+            if uri is not None:
+                with _REGISTRY_LOCK:
+                    if not persist:
+                        _OWNED_DAEMONS[uri] = _OwnedDaemon(uri=uri, proc=proc, pgid=proc.pid)
+                    if budget is not None:
+                        _ENDPOINT_BUDGETS[uri] = budget
+                return uri, not persist
             time.sleep(0.1)
-    return None
+
+        # The daemon never came up: it is ours, so tear its process group down.
+        pid = getattr(proc, "pid", None)
+        if isinstance(pid, int):
+            _terminate_process_groups([pid])
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+    raise SandboxInfraError(f"Kiri daemon {exe!r} did not answer /_ping within {wait_seconds}s (tried {candidates}).")
+
+
+def ensure_kiri_daemon(
+    *,
+    kiri_bin: str | None = None,
+    auto_install: bool = False,
+    wait_seconds: float = 15.0,
+    data_dir: str | os.PathLike[str] | None = None,
+    budget: KiriDaemonBudget | None = None,
+    persist: bool = False,
+) -> str:
+    """Ensure a Kiri daemon is running and return its ``unix://`` socket URI.
+
+    A reachable daemon is reused as is. Otherwise a new daemon is started as the
+    leader of its own process group and, unless ``persist=True``, registered as
+    owned by this process (stopped by :func:`shutdown_kiri_daemons` or at exit).
+
+    Args:
+        kiri_bin: Path to the ``kiri`` binary (default: ``PATH``, then ``~/.local/bin/kiri``).
+        auto_install: Download and install Kiri when no binary is found. Off by
+            default: installation is an explicit ``easydel setup kiri`` step.
+        wait_seconds: How long to wait for the new daemon to answer ``/_ping``.
+        data_dir: Optional data directory (for example ``"/dev/shm/kiri"`` on hosts
+            with large RAM and small root disks); ``HOME`` and ``KIRI_DATA_DIR``
+            of the daemon are pointed into it.
+        budget: Optional per-daemon budget. Its ``tmpfs_mb`` is checked against the
+            free space of ``data_dir`` before booting, and containers created
+            through this endpoint by this process are clamped to it.
+        persist: Leave the daemon running after this process exits.
+
+    Returns:
+        The daemon's ``unix://`` endpoint.
+
+    Raises:
+        SandboxInfraError: When no binary is available (and ``auto_install`` is
+            off), the storage budget does not fit, or the daemon does not start.
+    """
+    uri, _started = _ensure_daemon(
+        kiri_bin=kiri_bin,
+        auto_install=auto_install,
+        wait_seconds=wait_seconds,
+        data_dir=data_dir,
+        budget=budget,
+        persist=persist,
+    )
+    return uri
 
 
 def parse_shm_endpoint_spec(spec: str) -> tuple[str, int] | None:
@@ -287,8 +477,6 @@ def parse_shm_endpoint_spec(spec: str) -> tuple[str, int] | None:
 
 def _detect_private_ip() -> str:
     """Return this host's primary non-loopback IPv4 address."""
-    import socket
-
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.connect(("10.255.255.255", 1))
@@ -306,65 +494,517 @@ def _detect_private_ip() -> str:
     return "127.0.0.1"
 
 
-_TCP_BRIDGES: dict[tuple[str, int], threading.Thread] = {}
-_TCP_BRIDGE_LOCK = threading.Lock()
+# ---------------------------------------------------------------------------
+# Authenticated, policy-filtered TCP -> Unix bridge
+# ---------------------------------------------------------------------------
+
+_MAX_BRIDGE_HEAD_BYTES = 64 * 1024
+_MAX_BRIDGE_BODY_BYTES = 256 * 1024 * 1024
+_BRIDGE_REQUEST_TIMEOUT_S = 30.0
+_API_VERSION_RE = re.compile(r"^/v\d+(?:\.\d+)*(?=/)")
+_EXEC_CREATE_RE = re.compile(r"/containers/[^/]+/exec")
+_DENIED_API_PREFIXES = ("/plugins", "/swarm", "/services", "/secrets", "/configs", "/nodes", "/session", "/build")
+_HOST_NAMESPACE_KEYS = ("NetworkMode", "PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode")
+_HOP_HEADERS = ("connection", "keep-alive", "proxy-connection")
 
 
-def _start_unix_tcp_bridge(sock_path: str, bind_host: str, port: int) -> str:
-    """Start an in-process background TCP->Unix bridge for pod-wide Kiri access."""
-    import socket
+_ALLOWED_MOUNT_TYPES = ("volume", "tmpfs")
+_LOCAL_VOLUME_DRIVERS = ("", "local")
+_PATH_SAFE_CHARS = "/:@!$&'()*+,;=-._~"
 
-    endpoint = f"http://{bind_host}:{port}"
+
+class _BridgePolicyError(ValueError):
+    """A bridged request is refused by the sandbox policy (message is returned to the client)."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, tp.Any]]) -> dict[str, tp.Any]:
+    out: dict[str, tp.Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _BridgePolicyError(f"duplicate JSON key {key!r}")
+        out[key] = value
+    return out
+
+
+def _casefold_keys(value: tp.Any) -> tp.Any:
+    """Recursively case-fold every object key, refusing keys that collide case-insensitively.
+
+    Go engines match JSON object keys to struct fields case-insensitively (with
+    Unicode simple folding), so the policy must see the keys the way the engine
+    does: ``{"hostconfig": {"PRIVILEGED": true}}`` means ``HostConfig.Privileged``.
+    """
+    if isinstance(value, dict):
+        folded: dict[str, tp.Any] = {}
+        for key, item in value.items():
+            fkey = key.casefold()
+            if fkey in folded:
+                raise _BridgePolicyError(f"JSON keys collide case-insensitively: {key!r}")
+            folded[fkey] = _casefold_keys(item)
+        return folded
+    if isinstance(value, list):
+        return [_casefold_keys(item) for item in value]
+    return value
+
+
+def _normalize_bridge_target(target: str) -> tuple[str, str]:
+    """Return ``(policy_path, forwarded_target)`` for an origin-form request target.
+
+    Only origin-form targets starting with exactly one ``/`` are accepted.
+    Empty segments (repeated slashes) are collapsed and ``.``/``..`` segments
+    are refused. The policy checks the fully percent-decoded path (an encoded
+    ``%2F`` counts as a separator there); the forwarded target is rebuilt from
+    the same collapsed segments, each re-encoded canonically, with the
+    original query string.
+
+    Raises:
+        _BridgePolicyError: For absolute-form, ``//``-prefixed or traversing targets.
+    """
+    if not target.startswith("/") or target.startswith("//"):
+        raise _BridgePolicyError("request target must be an origin-form path starting with a single '/'")
+    if "#" in target:
+        raise _BridgePolicyError("request target must not carry a fragment")
+    raw_path, sep, query = target.partition("?")
+    try:
+        raw_segments = [urllib.parse.unquote(seg, errors="strict") for seg in raw_path.split("/") if seg]
+    except UnicodeDecodeError as exc:
+        raise _BridgePolicyError("request path is not valid percent-encoded UTF-8") from exc
+    decoded = "/".join(raw_segments)
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded):
+        raise _BridgePolicyError("request path contains control characters")
+    segments = [seg for seg in decoded.split("/") if seg]
+    if any(seg in (".", "..") for seg in segments):
+        raise _BridgePolicyError("request path must not contain '.' or '..' segments")
+    path = "/" + "/".join(segments)
+    segment_safe = _PATH_SAFE_CHARS.replace("/", "")
+    forwarded = "/" + "/".join(urllib.parse.quote(seg, safe=segment_safe) for seg in raw_segments)
+    return path, forwarded + (sep + query if sep else "")
+
+
+def _container_create_violations(spec: dict) -> list[str]:
+    """List the sandbox-escaping settings requested by a case-folded container-create body."""
+    host_config = spec.get("hostconfig") or {}
+    if not isinstance(host_config, dict):
+        return ["HostConfig must be an object"]
+    found: list[str] = []
+    if host_config.get("privileged"):
+        found.append("Privileged")
+    if host_config.get("binds"):
+        found.append("Binds (host bind mounts)")
+    if host_config.get("volumesfrom"):
+        found.append("VolumesFrom")
+    if str(host_config.get("volumedriver") or "").lower() not in _LOCAL_VOLUME_DRIVERS:
+        found.append("VolumeDriver (non-local volume driver)")
+    mounts = host_config.get("mounts") or []
+    if not isinstance(mounts, list):
+        found.append("Mounts must be a list")
+        mounts = []
+    for mount in mounts:
+        if not isinstance(mount, dict) or str(mount.get("type", "")).lower() not in _ALLOWED_MOUNT_TYPES:
+            found.append("Mounts (only volume and tmpfs mounts are allowed)")
+            break
+        options = mount.get("volumeoptions")
+        if options is not None and (not isinstance(options, dict) or options.get("driverconfig")):
+            found.append("Mounts (volume DriverConfig)")
+            break
+    if host_config.get("devices") or host_config.get("devicerequests") or host_config.get("devicecgrouprules"):
+        found.append("Devices")
+    if host_config.get("capadd"):
+        found.append("CapAdd")
+    for key in _HOST_NAMESPACE_KEYS:
+        value = str(host_config.get(key.casefold()) or "").lower()
+        if value == "host" or value.startswith("container:"):
+            found.append(f"{key}={value}")
+    if any("unconfined" in str(opt).lower() for opt in host_config.get("securityopt") or []):
+        found.append("SecurityOpt unconfined")
+    return found
+
+
+def _volume_create_violations(spec: dict) -> list[str]:
+    """List the host-reaching settings requested by a case-folded volume-create body."""
+    found: list[str] = []
+    if str(spec.get("driver") or "").lower() not in _LOCAL_VOLUME_DRIVERS:
+        found.append("non-local Driver")
+    if spec.get("driveropts"):
+        found.append("DriverOpts")
+    return found
+
+
+def _bridge_policy_check(method: str, target: str, body: bytes) -> tuple[str, bytes]:
+    """Apply the sandbox policy to one bridged request.
+
+    Returns:
+        ``(forwarded_target, forwarded_body)``: the normalised target and, for
+        policed JSON endpoints, the re-serialised body the policy approved.
+
+    Raises:
+        _BridgePolicyError: When the request is refused.
+    """
+    if not method.isalpha() or method != method.upper():
+        raise _BridgePolicyError("request method must be an upper-case token")
+    path, forwarded = _normalize_bridge_target(target)
+    path = _API_VERSION_RE.sub("", path, count=1)
+    if any(path == p or path.startswith(p + "/") for p in _DENIED_API_PREFIXES):
+        raise _BridgePolicyError(f"{path} is not available through the sandbox bridge")
+    if method != "POST":
+        return forwarded, body
+    kind = None
+    if path == "/containers/create":
+        kind = "container"
+    elif path == "/volumes/create":
+        kind = "volume"
+    elif _EXEC_CREATE_RE.fullmatch(path):
+        kind = "exec"
+    if kind is None:
+        return forwarded, body
+    try:
+        spec = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys) if body else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _BridgePolicyError("request body must be valid JSON") from exc
+    if not isinstance(spec, dict):
+        raise _BridgePolicyError("request body must be a JSON object")
+    folded = _casefold_keys(spec)
+    if kind == "container":
+        found = _container_create_violations(folded)
+        if found:
+            raise _BridgePolicyError("container create refused: " + ", ".join(found))
+    elif kind == "volume":
+        found = _volume_create_violations(folded)
+        if found:
+            raise _BridgePolicyError("volume create refused: " + ", ".join(found))
+    elif folded.get("privileged"):
+        raise _BridgePolicyError("privileged exec refused")
+    # Forward exactly the document that was checked, so engine-side parsing cannot diverge.
+    return forwarded, (json.dumps(spec).encode("utf-8") if body else body)
+
+
+def _bridge_policy_violation(method: str, target: str, body: bytes) -> str | None:
+    """Return why a bridged request is refused, or ``None`` when it may be forwarded."""
+    try:
+        _bridge_policy_check(method, target, body)
+    except _BridgePolicyError as exc:
+        return str(exc)
+    return None
+
+
+class _BridgeRejected(Exception):
+    def __init__(self, status: int, reason: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
+        self.message = message
+
+
+def _send_http_error(conn: socket.socket, status: int, reason: str, message: str) -> None:
+    body = json.dumps({"message": message}).encode("utf-8")
+    head = (
+        f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    try:
+        conn.sendall(head + body)
+    except OSError:
+        pass
+
+
+def _read_bridge_request(conn: socket.socket) -> tuple[str, str, str, list[tuple[str, str]], bytes]:
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > _MAX_BRIDGE_HEAD_BYTES:
+            raise _BridgeRejected(431, "Request Header Fields Too Large", "request head too large")
+        chunk = conn.recv(65536)
+        if not chunk:
+            raise _BridgeRejected(400, "Bad Request", "incomplete request head")
+        buf += chunk
+    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
+        raise _BridgeRejected(400, "Bad Request", "malformed request line")
+    method, target, version = parts
+    headers: list[tuple[str, str]] = []
+    seen: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            raise _BridgeRejected(400, "Bad Request", "malformed header line")
+        key, value = line.split(":", 1)
+        key, value = key.strip(), value.strip()
+        lowered = key.lower()
+        if lowered in seen and lowered in ("content-length", SANDBOX_TOKEN_HEADER.lower()):
+            raise _BridgeRejected(400, "Bad Request", f"duplicate {key} header")
+        seen[lowered] = value
+        headers.append((key, value))
+    if "transfer-encoding" in seen:
+        raise _BridgeRejected(411, "Length Required", "chunked request bodies are not accepted by the bridge")
+    try:
+        length = int(seen.get("content-length", "0"))
+    except ValueError as exc:
+        raise _BridgeRejected(400, "Bad Request", "invalid Content-Length") from exc
+    if length < 0:
+        raise _BridgeRejected(400, "Bad Request", "invalid Content-Length")
+    if length > _MAX_BRIDGE_BODY_BYTES:
+        raise _BridgeRejected(413, "Payload Too Large", "request body too large")
+    body = bytearray(rest)
+    while len(body) < length:
+        chunk = conn.recv(min(65536, length - len(body)))
+        if not chunk:
+            raise _BridgeRejected(400, "Bad Request", "incomplete request body")
+        body += chunk
+    return method, target, version, headers, bytes(body[:length])
+
+
+def _shutdown_on_client_close(client: socket.socket, upstream: socket.socket) -> None:
+    # Bytes sent after the single authenticated request are discarded, never forwarded.
+    try:
+        while client.recv(65536):
+            pass
+    except OSError:
+        pass
+    try:
+        upstream.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _handle_bridge_connection(client: socket.socket, sock_path: str, token: str | None) -> None:
+    upstream: socket.socket | None = None
+    try:
+        client.settimeout(_BRIDGE_REQUEST_TIMEOUT_S)
+        try:
+            method, target, version, headers, body = _read_bridge_request(client)
+            if token is not None:
+                presented = next((v for k, v in headers if k.lower() == SANDBOX_TOKEN_HEADER.lower()), None)
+                if presented is None or not hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
+                    raise _BridgeRejected(401, "Unauthorized", f"missing or invalid {SANDBOX_TOKEN_HEADER}")
+            try:
+                target, body = _bridge_policy_check(method, target, body)
+            except _BridgePolicyError as exc:
+                raise _BridgeRejected(403, "Forbidden", str(exc)) from exc
+        except _BridgeRejected as rejected:
+            _send_http_error(client, rejected.status, rejected.reason, rejected.message)
+            return
+        dropped = (*_HOP_HEADERS, SANDBOX_TOKEN_HEADER.lower(), "content-length")
+        forwarded = [f"{method} {target} {version}"]
+        forwarded += [f"{k}: {v}" for k, v in headers if k.lower() not in dropped]
+        forwarded.append(f"Content-Length: {len(body)}")
+        forwarded.append("Connection: close")
+        try:
+            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            upstream.settimeout(_BRIDGE_REQUEST_TIMEOUT_S)
+            upstream.connect(sock_path)
+            upstream.sendall(("\r\n".join(forwarded) + "\r\n\r\n").encode("latin-1") + body)
+        except OSError as exc:
+            _send_http_error(client, 502, "Bad Gateway", f"sandbox engine unreachable: {exc}")
+            return
+        upstream.settimeout(None)
+        client.settimeout(None)
+        threading.Thread(target=_shutdown_on_client_close, args=(client, upstream), daemon=True).start()
+        while True:
+            chunk = upstream.recv(65536)
+            if not chunk:
+                break
+            client.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        for s in (upstream, client):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+def _peer_allowed(host: str, allowed: frozenset | None) -> bool:
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if allowed is None:
+        return ip.is_loopback
+    return ip in allowed
+
+
+@dataclasses.dataclass
+class _Bridge:
+    endpoint: str
+    sock_path: str
+    server: socket.socket
+    token: str | None
+    allowed: frozenset | None
+    stop: threading.Event = dataclasses.field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+
+    def serve(self) -> None:
+        while not self.stop.is_set():
+            try:
+                client, addr = self.server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            if not _peer_allowed(str(addr[0]), self.allowed):
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            threading.Thread(
+                target=_handle_bridge_connection,
+                args=(client, self.sock_path, self.token),
+                daemon=True,
+            ).start()
+
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def close(self) -> None:
+        self.stop.set()
+        try:
+            self.server.close()
+        except OSError:
+            pass
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+
+_TCP_BRIDGES: dict[tuple[str, int], _Bridge] = {}
+
+
+def _format_endpoint(host: str, port: int) -> str:
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
+def _start_unix_tcp_bridge(
+    sock_path: str,
+    bind_host: str = "127.0.0.1",
+    port: int = 2375,
+    *,
+    token: str | None = None,
+    allowed_peers: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Start an in-process TCP -> Unix bridge to a Kiri daemon socket and return its ``http://`` endpoint.
+
+    The bridge handles exactly one request per connection. It rejects requests
+    lacking the shared ``token`` (sent as :data:`SANDBOX_TOKEN_HEADER`, which is
+    stripped before forwarding), and refuses container/exec creates that ask
+    for privileged mode, host binds or mounts, host namespaces, devices, or
+    added capabilities.
+
+    Args:
+        sock_path: Path of the daemon's Unix socket.
+        bind_host: IP literal to bind. Loopback (default) serves only local peers.
+        port: TCP port to bind.
+        token: Shared secret (at least 16 characters). Required for non-loopback binds.
+        allowed_peers: Peer IPs allowed to connect. Required for non-loopback
+            binds; loopback binds without it accept only loopback peers.
+
+    Returns:
+        The bridge endpoint.
+
+    Raises:
+        ValueError: For a non-IP ``bind_host``, a missing/short token or missing
+            allow-list on a routable bind, or a port already bridged to another socket.
+        SandboxInfraError: When the port cannot be bound.
+    """
+    try:
+        bind_ip = ipaddress.ip_address(bind_host)
+    except ValueError as exc:
+        raise ValueError(f"bind_host must be an IP literal, got {bind_host!r}.") from exc
+    if token is not None and len(token) < _MIN_BRIDGE_TOKEN_CHARS:
+        raise ValueError(f"Bridge token must be at least {_MIN_BRIDGE_TOKEN_CHARS} characters.")
+    if not bind_ip.is_loopback:
+        if not token:
+            raise ValueError(
+                f"Refusing to expose the sandbox engine on {bind_host} without a shared secret token; "
+                "pass token=... (and the same token to SandboxPool/KiriRuntime)."
+            )
+        if not allowed_peers:
+            raise ValueError(f"Refusing to expose the sandbox engine on {bind_host} without an allowed_peers list.")
+    allowed = frozenset(ipaddress.ip_address(p) for p in allowed_peers) if allowed_peers else None
+
+    endpoint = _format_endpoint(bind_host, int(port))
     key = (bind_host, int(port))
-    with _TCP_BRIDGE_LOCK:
+    with _REGISTRY_LOCK:
         existing = _TCP_BRIDGES.get(key)
         if existing is not None and existing.is_alive():
+            if existing.sock_path != sock_path:
+                raise ValueError(f"{endpoint} already bridges {existing.sock_path!r}, not {sock_path!r}.")
             return endpoint
 
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv = socket.socket(socket.AF_INET6 if bind_ip.version == 6 else socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             srv.bind((bind_host, int(port)))
-        except OSError:
+            srv.listen(128)
+        except OSError as exc:
             srv.close()
-            return endpoint
-        srv.listen(128)
-
-        def _pipe(src: socket.socket, dst: socket.socket) -> None:
-            try:
-                while True:
-                    chunk = src.recv(65536)
-                    if not chunk:
-                        break
-                    dst.sendall(chunk)
-            except OSError:
-                pass
-            finally:
-                for s in (src, dst):
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
-
-        def _serve() -> None:
-            while True:
-                try:
-                    client, _ = srv.accept()
-                except OSError:
-                    break
-                try:
-                    unix_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    unix_sock.connect(sock_path)
-                except OSError:
-                    client.close()
-                    continue
-                threading.Thread(target=_pipe, args=(client, unix_sock), daemon=True).start()
-                threading.Thread(target=_pipe, args=(unix_sock, client), daemon=True).start()
-
-        t = threading.Thread(target=_serve, name=f"kiri-tcp-bridge-{port}", daemon=True)
-        t.start()
-        _TCP_BRIDGES[key] = t
+            raise SandboxInfraError(f"Failed to bind sandbox bridge on {bind_host}:{port}: {exc}") from exc
+        srv.settimeout(0.25)
+        bridge = _Bridge(endpoint=endpoint, sock_path=sock_path, server=srv, token=token, allowed=allowed)
+        bridge.thread = threading.Thread(target=bridge.serve, name=f"kiri-tcp-bridge-{port}", daemon=True)
+        bridge.thread.start()
+        _TCP_BRIDGES[key] = bridge
+        budget = _ENDPOINT_BUDGETS.get(f"unix://{sock_path}")
+        if budget is not None:
+            _ENDPOINT_BUDGETS[endpoint] = budget
     return endpoint
+
+
+# ---------------------------------------------------------------------------
+# RAM-backed pools
+# ---------------------------------------------------------------------------
+
+
+def _ensure_shm_pool(
+    num_daemons: int = 4,
+    *,
+    data_dir: str | os.PathLike[str] = "/dev/shm/kiri",
+    kiri_bin: str | None = None,
+    auto_install: bool = False,
+    wait_seconds: float = 15.0,
+    budget: KiriDaemonBudget | None = None,
+    persist: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Return ``(endpoints, started_by_this_call)`` for a local ``/dev/shm`` daemon pool."""
+    import concurrent.futures
+
+    count = max(1, int(num_daemons))
+    root = os.path.abspath(os.path.expanduser(os.fspath(data_dir)))
+    budget = budget if budget is not None else KiriDaemonBudget()
+    vm_dirs = [root if count == 1 else os.path.join(root, f"vm-{idx}") for idx in range(count)]
+
+    exe = kiri_bin
+    if any(_ping_any(_socket_candidates(d)[2]) is None for d in vm_dirs):
+        exe = _resolve_kiri_exe(kiri_bin, auto_install)
+
+    def _boot_one(vm_dir: str) -> tuple[str, bool]:
+        return _ensure_daemon(
+            kiri_bin=exe,
+            auto_install=False,
+            wait_seconds=wait_seconds,
+            data_dir=vm_dir,
+            budget=budget,
+            persist=persist,
+        )
+
+    results: list[tuple[str, bool]] = []
+    errors: list[BaseException] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 16)) as pool:
+        for fut in [pool.submit(_boot_one, d) for d in vm_dirs]:
+            try:
+                results.append(fut.result())
+            except BaseException as exc:
+                errors.append(exc)
+    started = [uri for uri, was_started in results if was_started]
+    if errors:
+        shutdown_kiri_daemons(started)
+        raise errors[0]
+    with _REGISTRY_LOCK:
+        for uri, _ in results:
+            _ENDPOINT_BUDGETS.setdefault(uri, budget)
+    return [uri for uri, _ in results], started
 
 
 def ensure_kiri_shm_pool(
@@ -372,88 +1012,49 @@ def ensure_kiri_shm_pool(
     *,
     data_dir: str | os.PathLike[str] = "/dev/shm/kiri",
     kiri_bin: str | None = None,
-    auto_install: bool = True,
+    auto_install: bool = False,
     wait_seconds: float = 15.0,
+    budget: KiriDaemonBudget | None = None,
+    persist: bool = False,
 ) -> list[str]:
-    """Start or reuse ``num_daemons`` local Kiri daemons backed by ``/dev/shm`` tmpfs."""
-    import concurrent.futures
+    """Start or reuse ``num_daemons`` local Kiri daemons backed by ``/dev/shm`` tmpfs.
 
-    count = max(1, int(num_daemons))
-    root = os.path.abspath(os.path.expanduser(os.fspath(data_dir)))
+    Args:
+        num_daemons: Number of daemons (each gets ``<data_dir>/vm-<i>``).
+        data_dir: Root of the RAM-backed data directories.
+        kiri_bin: Path to the ``kiri`` binary.
+        auto_install: Download Kiri when no binary is found (off by default).
+        wait_seconds: Per-daemon boot timeout.
+        budget: Per-daemon resource budget (default :class:`KiriDaemonBudget`:
+            4 CPUs, 8 GiB memory, 1024 pids and 4 GiB of tmpfs per daemon).
+            Free space is checked before booting each daemon and containers
+            created by this process through the endpoints are clamped to it.
+        persist: Leave the daemons running after this process exits.
 
-    exe = kiri_bin or shutil.which("kiri")
-    if exe is None:
-        local_kiri = os.path.expanduser("~/.local/bin/kiri")
-        if os.path.exists(local_kiri):
-            exe = local_kiri
-        elif auto_install:
-            exe = install_kiri()
-
-    def _boot_one(idx: int) -> str:
-        vm_dir = root if count == 1 else os.path.join(root, f"vm-{idx}")
-        uri = ensure_kiri_daemon(
-            kiri_bin=exe,
-            auto_install=False,
-            wait_seconds=wait_seconds,
-            data_dir=vm_dir,
-        )
-        if uri is None:
-            raise RuntimeError(f"Failed to start Kiri daemon {idx} under {vm_dir!r}.")
-        return uri
-
-    if count == 1:
-        return [_boot_one(0)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 16)) as pool:
-        return list(pool.map(_boot_one, range(count)))
-
-
-def ensure_kiri_pod_shm_pool(
-    num_daemons_per_host: int = 8,
-    *,
-    data_dir: str | os.PathLike[str] = "/dev/shm/kiri",
-    base_port: int = 2375,
-    host_ips: list[str] | tuple[str, ...] | None = None,
-    kiri_bin: str | None = None,
-    auto_install: bool = True,
-    wait_seconds: float = 15.0,
-) -> list[str]:
-    """Start ``num_daemons_per_host`` RAM-backed Kiri daemons on this host and gather pod endpoints.
-
-    On a 4-host ``v5p-32`` pod with ``num_daemons_per_host=8``, each TPU host
-    boots 8 local Kiri daemons in ``/dev/shm/kiri/vm-0..7`` (using ~26 vCPUs and
-    RAM-backed tmpfs per daemon), bridges them on its private VPC IP, and
-    exchanges endpoints across JAX hosts when ``jax.process_count() > 1`` so all
-    32 Kiri daemons are reachable as one unified pool.
+    Returns:
+        The daemons' ``unix://`` endpoints.
     """
-    local_uris = ensure_kiri_shm_pool(
-        num_daemons=num_daemons_per_host,
+    endpoints, _started = _ensure_shm_pool(
+        num_daemons,
         data_dir=data_dir,
         kiri_bin=kiri_bin,
         auto_install=auto_install,
         wait_seconds=wait_seconds,
+        budget=budget,
+        persist=persist,
     )
-    my_ip = _detect_private_ip()
-    local_http = [
-        _start_unix_tcp_bridge(uri.removeprefix("unix://"), my_ip, base_port + idx)
-        for idx, uri in enumerate(local_uris)
-    ]
+    return endpoints
 
-    if host_ips:
-        return [
-            f"http://{ip}:{base_port + idx}"
-            for ip in host_ips
-            for idx in range(len(local_uris))
-        ]
 
+def _gather_pod_ips(my_ip: str) -> list[str]:
     try:
         import jax
 
         n_procs = jax.process_count()
     except Exception:
         n_procs = 1
-
     if n_procs <= 1:
-        return local_uris
+        return [my_ip]
 
     import numpy as np
     from jax.experimental import multihost_utils
@@ -466,13 +1067,114 @@ def ensure_kiri_pod_shm_pool(
         decoded = bytes(row.tolist()).rstrip(b"\x00").decode("utf-8", errors="ignore")
         if decoded and decoded not in all_ips:
             all_ips.append(decoded)
-    if not all_ips:
-        return local_http
-    return [
-        f"http://{ip}:{base_port + idx}"
-        for ip in all_ips
-        for idx in range(len(local_uris))
-    ]
+    return all_ips or [my_ip]
+
+
+def _ensure_pod_shm_pool(
+    num_daemons_per_host: int = 8,
+    *,
+    data_dir: str | os.PathLike[str] = "/dev/shm/kiri",
+    base_port: int = 2375,
+    host_ips: list[str] | tuple[str, ...] | None = None,
+    kiri_bin: str | None = None,
+    auto_install: bool = False,
+    wait_seconds: float = 15.0,
+    budget: KiriDaemonBudget | None = None,
+    expose_bridge: bool = False,
+    bridge_token: str | None = None,
+    allowed_peers: list[str] | tuple[str, ...] | None = None,
+) -> tuple[list[str], list[str]]:
+    if not expose_bridge and host_ips:
+        raise ValueError(
+            "host_ips requires expose_bridge=True and a bridge_token: remote hosts can only reach this host's "
+            "daemons through the authenticated bridge."
+        )
+    if expose_bridge and not bridge_token:
+        raise ValueError("expose_bridge=True requires a shared bridge_token (identical on every host).")
+    local_uris, started = _ensure_shm_pool(
+        num_daemons_per_host,
+        data_dir=data_dir,
+        kiri_bin=kiri_bin,
+        auto_install=auto_install,
+        wait_seconds=wait_seconds,
+        budget=budget,
+    )
+    if not expose_bridge:
+        return local_uris, started
+
+    try:
+        my_ip = _detect_private_ip()
+        all_ips = list(host_ips) if host_ips else _gather_pod_ips(my_ip)
+        peers = list(allowed_peers) if allowed_peers is not None else list(all_ips)
+        if my_ip not in peers:
+            peers.append(my_ip)
+        for idx, uri in enumerate(local_uris):
+            _start_unix_tcp_bridge(
+                uri.removeprefix("unix://"),
+                my_ip,
+                base_port + idx,
+                token=bridge_token,
+                allowed_peers=peers,
+            )
+    except BaseException:
+        shutdown_kiri_daemons(started)
+        raise
+    return [_format_endpoint(ip, base_port + idx) for ip in all_ips for idx in range(len(local_uris))], started
+
+
+def ensure_kiri_pod_shm_pool(
+    num_daemons_per_host: int = 8,
+    *,
+    data_dir: str | os.PathLike[str] = "/dev/shm/kiri",
+    base_port: int = 2375,
+    host_ips: list[str] | tuple[str, ...] | None = None,
+    kiri_bin: str | None = None,
+    auto_install: bool = False,
+    wait_seconds: float = 15.0,
+    budget: KiriDaemonBudget | None = None,
+    expose_bridge: bool = False,
+    bridge_token: str | None = None,
+    allowed_peers: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Start ``num_daemons_per_host`` RAM-backed Kiri daemons on this host and optionally bridge them pod-wide.
+
+    Without ``expose_bridge`` (default) nothing listens on the network and each
+    host uses only its own local daemons. With ``expose_bridge=True`` every
+    daemon is bridged on this host's private IP behind ``bridge_token`` and an
+    allow-list of peer IPs (default: the pod's host IPs, gathered across JAX
+    processes when ``host_ips`` is not given), and the endpoints of all hosts
+    are returned. Clients must send the same token (``SandboxPool(token=...)``).
+
+    Args:
+        num_daemons_per_host: Daemons booted on this host.
+        data_dir: Root of the RAM-backed data directories.
+        base_port: First bridge port; daemon ``i`` uses ``base_port + i``.
+        host_ips: Explicit pod host IPs (requires ``expose_bridge=True``).
+        kiri_bin: Path to the ``kiri`` binary.
+        auto_install: Download Kiri when no binary is found (off by default).
+        wait_seconds: Per-daemon boot timeout.
+        budget: Per-daemon resource budget (see :func:`ensure_kiri_shm_pool`).
+        expose_bridge: Bridge the daemons on the private IP for other hosts.
+        bridge_token: Shared secret required by the bridges.
+        allowed_peers: Peer IPs allowed to connect (default: the pod host IPs).
+
+    Returns:
+        Local ``unix://`` endpoints, or every host's bridge endpoints when bridging.
+    """
+    endpoints, _started = _ensure_pod_shm_pool(
+        num_daemons_per_host,
+        data_dir=data_dir,
+        base_port=base_port,
+        host_ips=host_ips,
+        kiri_bin=kiri_bin,
+        auto_install=auto_install,
+        wait_seconds=wait_seconds,
+        budget=budget,
+        expose_bridge=expose_bridge,
+        bridge_token=bridge_token,
+        allowed_peers=allowed_peers,
+    )
+    return endpoints
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -485,7 +1187,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--install-dir", default=None, help="Target directory (default: ~/.local/bin).")
     parser.add_argument("--force", action="store_true", help="Reinstall even if kiri is already present.")
-    parser.add_argument("--start", action="store_true", help="Start `kiri daemon` in the background after install.")
+    parser.add_argument(
+        "--start", action="store_true", help="Start a persistent `kiri daemon` in the background after install."
+    )
     args = parser.parse_args(argv)
 
     path = install_kiri(
@@ -503,7 +1207,12 @@ __all__ = (
     "KIRI_GITHUB_REPO",
     "PINNED_KIRI_SHA256",
     "ensure_kiri_daemon",
+    "ensure_kiri_pod_shm_pool",
+    "ensure_kiri_shm_pool",
     "install_kiri",
+    "kiri_daemon_budget",
     "main",
+    "owned_kiri_daemons",
     "resolve_kiri_asset_url",
+    "shutdown_kiri_daemons",
 )

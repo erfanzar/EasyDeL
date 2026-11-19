@@ -16,12 +16,15 @@
 
 The default ``backend="kiri"`` connects directly to Kiri's ~2.5 ms Rust
 container engine over its Unix socket via the Docker Engine v1.41 HTTP API,
-installing and booting the daemon automatically when none is running.
-``backend="docker"`` targets any Docker-compatible daemon, ``backend="auto"``
-tries Kiri, then Docker, then falls back to local execution, and
-``backend="local"`` runs each episode as child processes inside a persistent
-per-episode temporary workspace (jailed with ``bwrap`` when available) with no
-daemon or root privileges required.
+booting an already-installed daemon when none is running (installing Kiri is an
+explicit ``easydel setup kiri`` / ``easydel-install-kiri`` step). Daemons booted
+by this process are tracked and stopped by :meth:`KiriRuntime.close`,
+:meth:`SandboxPool.close`, ``kiri_installer.shutdown_kiri_daemons`` or at
+interpreter exit. ``backend="docker"`` targets any Docker-compatible daemon,
+``backend="auto"`` tries Kiri, then Docker, then falls back to local execution,
+and ``backend="local"`` runs each episode as child processes inside a
+persistent per-episode temporary workspace jailed with ``bwrap``; running local
+commands unjailed requires an explicit ``ContainerConfig(use_jail="off")``.
 """
 
 from __future__ import annotations
@@ -49,7 +52,6 @@ import time
 import typing as tp
 import urllib.parse
 import uuid
-import warnings
 from pathlib import Path
 
 from easydel.trainers._shared.sandbox import SandboxResult
@@ -60,6 +62,31 @@ _SAFE_ENV_KEYS = ("LANG", "LC_ALL", "TZ")
 _DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _IDLE_CONTAINER_CMD = ["/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"]
 _TERM_GRACE_S = 0.2
+_JAIL_POLICIES = ("auto", "required", "off")
+
+SANDBOX_TOKEN_HEADER = "X-EasyDeL-Sandbox-Token"
+"""HTTP header carrying the shared secret that authenticates clients to a cross-host sandbox bridge."""
+
+# Wraps every container exec. Arguments: pid file, backstop seconds, stdin file ("" for none), argv.
+# The command runs in a background subshell that alone opens the stdin file, unlinks it and execs the
+# command (through ``setsid`` when available, so it leads its own process group): the parent shell
+# and the backstop killer never hold the stdin file, so no other process exposes it via /proc/<pid>/fd.
+# The command pid is recorded for the client's kill path, and the SIGKILL backstop is a sibling
+# (never an ancestor) whose output is detached so it cannot hold the exec stream open.
+_EXEC_WATCHDOG_SCRIPT = (
+    "f=$1; t=$2; s=$3; shift 3; g=; if command -v setsid >/dev/null 2>&1; then g=setsid; fi; "
+    '( if [ -n "$s" ]; then exec <"$s" || exit 126; rm -f "$s" </dev/null; fi; exec $g "$@" ) & p=$!; '
+    'echo "$p" > "$f" 2>/dev/null; '
+    '( trap \'kill "$w" 2>/dev/null; exit 0\' TERM; sleep "$t" & w=$!; '
+    'wait "$w" && { kill -KILL -"$p"; kill -KILL "$p"; } ) </dev/null >/dev/null 2>&1 & k=$!; '
+    'wait "$p"; r=$?; kill "$k" 2>/dev/null; exit "$r"'
+)
+_KILL_ALL_SCRIPT = "kill -9 -1 2>/dev/null; exit 0"
+_KILL_ALL_WAIT_S = 2.0
+_EXEC_KILL_SCRIPT = (
+    'p=$(cat "$1" 2>/dev/null) || exit 0; kill -KILL -"$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; rm -f "$1"'
+)
+_TAR_READ_SLACK_BYTES = 16 * 1024
 
 
 class SandboxInfraError(RuntimeError):
@@ -157,8 +184,12 @@ class ContainerConfig:
         memory_mb: Hard memory limit in MiB (0 disables cgroup/rlimit cap).
         cpus: Fractional CPU quota per container (e.g. ``1.0`` = one core).
         pids_limit: Maximum concurrent processes inside a container.
-        network: Allow outbound network access (disabled by default for RL).
-        read_only_rootfs: Mount the container root filesystem read-only.
+        network: Allow outbound network access. ``None`` (default) disables the
+            network wherever the backend can enforce it; an explicit ``False``
+            demands isolation and makes an unjailed local session raise.
+        read_only_rootfs: Mount the container root filesystem read-only. The
+            local backend enforces it only inside the ``bwrap`` jail and raises
+            when it is requested with ``use_jail="off"``.
         tmpfs_mb: Size in MiB for ephemeral ``/tmp`` tmpfs mount (0 disables).
         workspace_tmpfs_mb: Optional tmpfs size in MiB for ``workdir`` so dense
             file writes stay in RAM and never hit host disks.
@@ -167,7 +198,13 @@ class ContainerConfig:
         env: Extra environment variables injected into every command.
         binds: Volume bind specs (``host:container:ro``) for container backends.
         pull_if_missing: Pull ``image`` automatically when absent locally.
-        use_jail: Jail policy for the local backend (``"auto"``, ``"required"``, ``"off"``).
+        use_jail: Jail policy for the local backend. ``"auto"`` and
+            ``"required"`` both jail commands with ``bwrap`` and raise
+            :class:`SandboxInfraError` when it is unavailable; only an explicit
+            ``"off"`` runs model commands unjailed.
+        max_stdin_bytes: Largest stdin payload (UTF-8 bytes) accepted per command.
+        max_file_size_mb: ``RLIMIT_FSIZE`` cap in MiB for files written by local
+            commands (0 disables the cap).
     """
 
     image: str = "python:3.11-slim"
@@ -175,7 +212,7 @@ class ContainerConfig:
     memory_mb: int = 2048
     cpus: float = 1.0
     pids_limit: int = 256
-    network: bool = False
+    network: bool | None = None
     read_only_rootfs: bool = False
     tmpfs_mb: int = 256
     workspace_tmpfs_mb: int = 0
@@ -185,6 +222,57 @@ class ContainerConfig:
     binds: list[str] = dataclasses.field(default_factory=list)
     pull_if_missing: bool = True
     use_jail: str = "auto"
+    max_stdin_bytes: int = 16 * 1024 * 1024
+    max_file_size_mb: int = 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class KiriDaemonBudget:
+    """Per-daemon resource budget for RAM-backed (``/dev/shm``) Kiri pools.
+
+    Every container created on a daemon with a budget is clamped to it, so a
+    single daemon can never hand one sandbox more than its share of the host.
+    The defaults are deliberately conservative; raise them explicitly for
+    heavyweight tasks.
+
+    Attributes:
+        cpus: Maximum CPU quota (``NanoCpus``) of any one container.
+        memory_mb: Maximum memory limit in MiB of any one container.
+        pids_limit: Maximum ``PidsLimit`` of any one container.
+        tmpfs_mb: RAM-backed storage in MiB the daemon may claim under its data
+            directory (free space is checked before the daemon boots) and the
+            largest tmpfs mount any one container may request.
+    """
+
+    cpus: float = 4.0
+    memory_mb: int = 8192
+    pids_limit: int = 1024
+    tmpfs_mb: int = 4096
+
+    def clamp_host_config(self, host_config: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Return ``host_config`` with CPU, memory, pids and tmpfs limits capped by this budget."""
+        out = dict(host_config)
+        if self.memory_mb > 0:
+            cap = int(self.memory_mb) * 1024 * 1024
+            out["Memory"] = min(int(out.get("Memory") or cap), cap)
+        if self.cpus > 0:
+            cap = int(float(self.cpus) * 1_000_000_000)
+            out["NanoCpus"] = min(int(out.get("NanoCpus") or cap), cap)
+        if self.pids_limit > 0:
+            cap = int(self.pids_limit)
+            out["PidsLimit"] = min(int(out.get("PidsLimit") or cap), cap)
+        tmpfs = out.get("Tmpfs")
+        if isinstance(tmpfs, dict) and self.tmpfs_mb > 0:
+            capped: dict[str, str] = {}
+            for mount, opts in tmpfs.items():
+                parts = [p for p in str(opts).split(",") if p and not p.startswith("size=")]
+                size_mb = self.tmpfs_mb
+                for p in str(opts).split(","):
+                    if p.startswith("size=") and p.endswith("m") and p[5:-1].isdigit():
+                        size_mb = min(int(p[5:-1]), self.tmpfs_mb)
+                capped[mount] = ",".join([*parts, f"size={size_mb}m"])
+            out["Tmpfs"] = capped
+        return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -192,6 +280,50 @@ class _HTTPResponse:
     status: int
     headers: dict[str, str]
     body: bytes
+    truncated: bool = False
+
+
+class _DeadlineReader:
+    """Buffered socket reader that enforces one monotonic deadline across every ``recv``."""
+
+    def __init__(self, sock: socket.socket, deadline: float):
+        self._sock = sock
+        self._deadline = deadline
+        self._buf = bytearray()
+        self._eof = False
+
+    def _fill(self) -> bool:
+        if self._eof:
+            return False
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("container engine response exceeded its deadline")
+        self._sock.settimeout(remaining)
+        chunk = self._sock.recv(65536)
+        if not chunk:
+            self._eof = True
+            return False
+        self._buf += chunk
+        return True
+
+    def readline(self, limit: int = 65536) -> bytes:
+        while True:
+            idx = self._buf.find(b"\n", 0, limit)
+            if idx >= 0:
+                return self._take(idx + 1)
+            if len(self._buf) >= limit or not self._fill():
+                return self._take(min(limit, len(self._buf)))
+
+    def read(self, n: int) -> bytes:
+        """Return ``n`` bytes, or fewer only at end of stream."""
+        while len(self._buf) < n and self._fill():
+            pass
+        return self._take(min(n, len(self._buf)))
+
+    def _take(self, n: int) -> bytes:
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
 
 
 def _parse_endpoint(endpoint: str) -> tuple[str, str | tuple[str, int]]:
@@ -253,15 +385,61 @@ def _demux_docker_stream(payload: bytes, max_chars: int) -> tuple[str, str]:
     return stdout, stderr
 
 
+def _first_regular_tar_member(archive: bytes, max_bytes: int | None) -> bytes | None:
+    """Return the data of the first regular-file member of a (possibly truncated) ustar/pax archive.
+
+    Parses tar headers directly so an archive cut short by a body cap still yields
+    the leading ``max_bytes`` bytes of the file, which :mod:`tarfile` would reject.
+    """
+    pos = 0
+    total = len(archive)
+    while pos + 512 <= total:
+        header = archive[pos : pos + 512]
+        if header == b"\0" * 512:
+            return None
+        size_field = header[124:136].split(b"\0", 1)[0].strip()
+        try:
+            size = int(size_field or b"0", 8)
+        except ValueError:
+            return None
+        typeflag = header[156:157]
+        data_start = pos + 512
+        if typeflag in (b"0", b"\0", b"7"):
+            keep = size if max_bytes is None else min(size, max(0, int(max_bytes)))
+            return bytes(archive[data_start : data_start + keep])
+        # Skip pax/GNU extension headers, directories, links and other non-file members.
+        pos = data_start + ((size + 511) // 512) * 512
+    return None
+
+
 class EngineSocketClient:
     """Minimal HTTP/1.1 client for Kiri and Docker Engine v1.41 sockets."""
 
     api_prefix: str = "/v1.41"
 
-    def __init__(self, endpoint: str, *, connect_timeout: float = 10.0):
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        connect_timeout: float = 10.0,
+        token: str | None = None,
+        budget: KiriDaemonBudget | None = None,
+    ):
+        """Create a client for ``endpoint``.
+
+        Args:
+            endpoint: ``unix://``, ``http://`` or ``tcp://`` engine address.
+            connect_timeout: Socket connect timeout in seconds.
+            token: Shared secret sent as :data:`SANDBOX_TOKEN_HEADER` on every
+                request (required by authenticated cross-host bridges).
+            budget: Optional per-daemon resource budget; container creates are
+                clamped to it.
+        """
         self.endpoint = endpoint
         self._kind, self._addr = _parse_endpoint(endpoint)
         self._connect_timeout = float(connect_timeout)
+        self._token = token
+        self.budget = budget
         self._present_images: set[str] = set()
         self._images_lock = threading.Lock()
 
@@ -304,22 +482,25 @@ class EngineSocketClient:
         ]
         if payload or method in ("POST", "PUT"):
             headers.append(f"Content-Type: {content_type}")
+        if self._token:
+            headers.append(f"{SANDBOX_TOKEN_HEADER}: {self._token}")
         if extra_headers:
             for k, v in extra_headers.items():
                 headers.append(f"{k}: {v}")
         raw_head = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii")
 
+        deadline = time.monotonic() + max(0.0, float(timeout))
         try:
-            sock = self._connect(min(self._connect_timeout, timeout))
+            sock = self._connect(max(0.01, min(self._connect_timeout, timeout)))
         except OSError as exc:
             raise SandboxInfraError(f"Failed to connect to container engine at {self.endpoint}: {exc}") from exc
 
         try:
-            sock.settimeout(timeout)
+            sock.settimeout(max(0.01, deadline - time.monotonic()))
             sock.sendall(raw_head)
             if payload:
                 sock.sendall(payload)
-            return self._read_response(sock, method=method, max_body_bytes=max_body_bytes)
+            return self._read_response(sock, method=method, max_body_bytes=max_body_bytes, deadline=deadline)
         except TimeoutError:
             raise
         except OSError as exc:
@@ -336,77 +517,80 @@ class EngineSocketClient:
         *,
         method: str,
         max_body_bytes: int | None = None,
+        deadline: float | None = None,
     ) -> _HTTPResponse:
-        reader = sock.makefile("rb")
-        try:
-            status_line = reader.readline(65536)
-            if not status_line:
-                raise SandboxInfraError("Empty HTTP status line from container engine.")
-            parts = status_line.decode("latin-1", errors="replace").strip().split(" ", 2)
-            if len(parts) < 2 or not parts[1].isdigit():
-                raise SandboxInfraError(f"Malformed HTTP status line: {status_line!r}")
-            status = int(parts[1])
+        """Read one HTTP response, enforcing ``deadline`` across all reads and capping the body.
 
-            resp_headers: dict[str, str] = {}
+        Reading stops as soon as ``max_body_bytes`` body bytes are collected (the
+        response is then flagged ``truncated``); the remainder is never pulled
+        off the socket, so a peer streaming forever cannot hold the caller.
+        """
+        reader = _DeadlineReader(sock, deadline if deadline is not None else time.monotonic() + 30.0)
+        status_line = reader.readline(65536)
+        if not status_line:
+            raise SandboxInfraError("Empty HTTP status line from container engine.")
+        parts = status_line.decode("latin-1", errors="replace").strip().split(" ", 2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            raise SandboxInfraError(f"Malformed HTTP status line: {status_line!r}")
+        status = int(parts[1])
+
+        resp_headers: dict[str, str] = {}
+        while True:
+            line = reader.readline(65536)
+            if not line or line in (b"\r\n", b"\n"):
+                break
+            decoded = line.decode("latin-1", errors="replace").rstrip("\r\n")
+            if ":" in decoded:
+                k, v = decoded.split(":", 1)
+                resp_headers[k.strip().lower()] = v.strip()
+
+        # Kiri keeps 204/304 connections open without a body; return immediately.
+        if status in (204, 304) or method == "HEAD":
+            return _HTTPResponse(status=status, headers=resp_headers, body=b"")
+
+        cap = max_body_bytes
+        transfer_encoding = resp_headers.get("transfer-encoding", "").lower()
+        if "chunked" in transfer_encoding:
+            chunks: list[bytes] = []
+            collected = 0
             while True:
-                line = reader.readline(65536)
-                if not line or line in (b"\r\n", b"\n"):
+                size_line = reader.readline(65536)
+                if not size_line:
                     break
-                decoded = line.decode("latin-1", errors="replace").rstrip("\r\n")
-                if ":" in decoded:
-                    k, v = decoded.split(":", 1)
-                    resp_headers[k.strip().lower()] = v.strip()
+                token = size_line.strip().split(b";", 1)[0]
+                if not token:
+                    continue
+                chunk_len = int(token, 16)
+                if chunk_len == 0:
+                    reader.readline(65536)
+                    break
+                if cap is not None and collected + chunk_len > cap:
+                    keep = reader.read(cap - collected)
+                    chunks.append(keep)
+                    return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks), truncated=True)
+                data = reader.read(chunk_len)
+                reader.read(2)
+                chunks.append(data)
+                collected += len(data)
+            return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks))
 
-            # Kiri keeps 204/304 connections open without a body; return immediately.
-            if status in (204, 304) or method == "HEAD":
-                return _HTTPResponse(status=status, headers=resp_headers, body=b"")
+        if "content-length" in resp_headers:
+            length = int(resp_headers["content-length"])
+            if cap is not None and length > cap:
+                return _HTTPResponse(status=status, headers=resp_headers, body=reader.read(cap), truncated=True)
+            return _HTTPResponse(status=status, headers=resp_headers, body=reader.read(length))
 
-            transfer_encoding = resp_headers.get("transfer-encoding", "").lower()
-            if "chunked" in transfer_encoding:
-                chunks: list[bytes] = []
-                collected = 0
-                while True:
-                    size_line = reader.readline(65536)
-                    if not size_line:
-                        break
-                    token = size_line.strip().split(b";", 1)[0]
-                    if not token:
-                        continue
-                    chunk_len = int(token, 16)
-                    if chunk_len == 0:
-                        reader.readline(65536)
-                        break
-                    data = reader.read(chunk_len)
-                    reader.read(2)
-                    if max_body_bytes is None or collected < max_body_bytes:
-                        keep = data if max_body_bytes is None else data[: max_body_bytes - collected]
-                        chunks.append(keep)
-                        collected += len(keep)
+        # Read-until-close body: stop at the cap rather than draining a stream that may never end.
+        chunks = []
+        collected = 0
+        while cap is None or collected < cap:
+            want = 65536 if cap is None else min(65536, cap - collected)
+            piece = reader.read(want)
+            if not piece:
                 return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks))
-
-            if "content-length" in resp_headers:
-                length = int(resp_headers["content-length"])
-                if max_body_bytes is not None and length > max_body_bytes:
-                    data = reader.read(max_body_bytes)
-                    return _HTTPResponse(status=status, headers=resp_headers, body=data)
-                return _HTTPResponse(status=status, headers=resp_headers, body=reader.read(length))
-
-            if max_body_bytes is not None:
-                chunks = []
-                remaining = max_body_bytes
-                while remaining > 0:
-                    piece = reader.read(min(65536, remaining))
-                    if not piece:
-                        break
-                    chunks.append(piece)
-                    remaining -= len(piece)
-                return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks))
-            return _HTTPResponse(status=status, headers=resp_headers, body=reader.read())
-        finally:
-            try:
-                reader.close()
-            except OSError:
-                pass
+            chunks.append(piece)
+            collected += len(piece)
+        return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks), truncated=True)
 
     @staticmethod
     def _error_message(resp: _HTTPResponse) -> str:
@@ -509,6 +693,8 @@ class EngineSocketClient:
             host_config["Tmpfs"] = tmpfs
         if config.binds:
             host_config["Binds"] = list(config.binds)
+        if self.budget is not None:
+            host_config = self.budget.clamp_host_config(host_config)
 
         payload: dict[str, tp.Any] = {
             "Image": config.image,
@@ -575,23 +761,36 @@ class EngineSocketClient:
         if not (200 <= resp.status < 300):
             raise SandboxInfraError(f"Archive upload failed: {self._error_message(resp)}")
 
-    def get_file(self, container_id: str, path: str) -> bytes:
-        """Download a single file from ``container_id`` via tar archive."""
+    def get_file(self, container_id: str, path: str, *, max_bytes: int | None = None) -> bytes:
+        """Download a single file from ``container_id`` via tar archive.
+
+        Args:
+            container_id: Target container.
+            path: Absolute path of the file inside the container.
+            max_bytes: When set, at most this many bytes of the file are
+                returned and the archive download itself stops after
+                ``max_bytes`` plus a small tar-header margin.
+
+        Returns:
+            The (possibly truncated) file contents.
+
+        Raises:
+            FileNotFoundError: When the path is missing or is not a regular file.
+        """
         encoded_path = urllib.parse.quote(path, safe="/")
+        body_cap = None if max_bytes is None else max(0, int(max_bytes)) + _TAR_READ_SLACK_BYTES
         resp = self._request(
             "GET",
             f"{self.api_prefix}/containers/{container_id}/archive?path={encoded_path}",
             timeout=30.0,
+            max_body_bytes=body_cap,
         )
         if not (200 <= resp.status < 300):
             raise FileNotFoundError(f"Cannot read '{path}' from container: {self._error_message(resp)}")
-        with tarfile.open(fileobj=io.BytesIO(resp.body), mode="r:*") as tf:
-            for member in tf.getmembers():
-                if member.isfile():
-                    extracted = tf.extractfile(member)
-                    if extracted is not None:
-                        return extracted.read()
-        raise FileNotFoundError(f"Archive for '{path}' contained no regular file.")
+        data = _first_regular_tar_member(resp.body, max_bytes)
+        if data is None:
+            raise FileNotFoundError(f"Archive for '{path}' contained no regular file.")
+        return data
 
     def exec_run(
         self,
@@ -603,25 +802,57 @@ class EngineSocketClient:
         stdin: str | None = None,
         timeout: float = 30.0,
         max_output_chars: int = 16384,
+        max_stdin_bytes: int = 16 * 1024 * 1024,
     ) -> ExecResult:
-        """Execute ``cmd`` inside a running container and return captured output."""
+        """Execute ``cmd`` inside a running container and return captured output.
+
+        ``timeout`` is one monotonic deadline for the whole call (not a per-read
+        idle timeout). When it expires the command's process group is SIGKILLed
+        inside the container and ``timed_out=True`` is reported. Output is read
+        only up to a byte cap derived from ``max_output_chars``; a command that
+        exceeds it is killed and reported as failed with partial output.
+
+        Args:
+            container_id: Running container to execute in.
+            cmd: Argv of the command.
+            workdir: Working directory inside the container.
+            env: Extra environment variables.
+            stdin: Optional text fed to the command's standard input.
+            timeout: Overall wall-clock budget in seconds.
+            max_output_chars: Characters kept per output stream.
+            max_stdin_bytes: Largest accepted UTF-8 ``stdin`` payload.
+
+        Returns:
+            The :class:`ExecResult` of the command.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        if stdin is not None and len(stdin.encode("utf-8", errors="replace")) > max_stdin_bytes:
+            return ExecResult(
+                ok=False,
+                stdout="",
+                stderr=f"stdin payload exceeds max_stdin_bytes={max_stdin_bytes}.",
+                returncode=None,
+            )
         stdin_path: str | None = None
-        exec_cmd = list(cmd)
+        killed = False
+        pid_path = f"/tmp/.ed_pid_{uuid.uuid4().hex}"
         if stdin is not None:
             stdin_name = f".ed_stdin_{uuid.uuid4().hex}"
             stdin_path = f"/tmp/{stdin_name}"
             self.put_files(container_id, {stdin_name: stdin}, base_dir="/tmp")
-            quoted = " ".join(_sh_quote(part) for part in exec_cmd)
-            q_path = _sh_quote(stdin_path)
-            # Unlink the temp stdin file and pipe stdin to the target command while
-            # closing fd 3 on the right-hand command (so it cannot read fd 3 directly).
-            # Note: the parent sh still holds fd 3 while feeding the pipe, and in-process
-            # Python code runners still share frame co_consts with caller code.
-            exec_cmd = [
-                "/bin/sh",
-                "-c",
-                f"exec 3< {q_path} && rm -f {q_path} && cat <&3 | exec 3<&- {quoted}",
-            ]
+        # The in-container SIGKILL backstop fires a little after the client deadline,
+        # so the client normally observes the timeout first and kills via the pid file.
+        backstop_s = max(1, math.ceil(float(timeout))) + 2
+        exec_cmd = [
+            "/bin/sh",
+            "-c",
+            _EXEC_WATCHDOG_SCRIPT,
+            "sh",
+            pid_path,
+            str(backstop_s),
+            stdin_path or "",
+            *cmd,
+        ]
 
         create_payload: dict[str, tp.Any] = {
             "AttachStdout": True,
@@ -660,15 +891,20 @@ class EngineSocketClient:
                     infra_error="exec create returned no Id.",
                 )
 
+            remaining = deadline - time.monotonic()
             try:
+                if remaining <= 0:
+                    raise TimeoutError("exec deadline expired before start")
                 started = self._request(
                     "POST",
                     f"{self.api_prefix}/exec/{exec_id}/start",
                     body={"Detach": False, "Tty": False},
-                    timeout=timeout,
+                    timeout=remaining,
                     max_body_bytes=max(max_output_chars * 8, 65536),
                 )
             except TimeoutError:
+                killed = True
+                self._kill_exec(container_id, pid_path)
                 return ExecResult(ok=False, stdout="", stderr="", returncode=None, timed_out=True)
 
             if not (200 <= started.status < 300):
@@ -681,6 +917,16 @@ class EngineSocketClient:
                 )
 
             stdout, stderr = _demux_docker_stream(started.body, max_output_chars)
+            if getattr(started, "truncated", False):
+                killed = True
+                self._kill_exec(container_id, pid_path)
+                note = "[output limit exceeded; command killed]"
+                return ExecResult(
+                    ok=False,
+                    stdout=stdout,
+                    stderr=f"{stderr}\n{note}" if stderr else note,
+                    returncode=None,
+                )
             inspected = self._request("GET", f"{self.api_prefix}/exec/{exec_id}/json", timeout=10.0)
             if not (200 <= inspected.status < 300):
                 return ExecResult(
@@ -713,28 +959,72 @@ class EngineSocketClient:
         except (SandboxInfraError, TimeoutError) as exc:
             return ExecResult(ok=False, stdout="", stderr="", returncode=None, infra_error=str(exc))
         finally:
-            if stdin_path is not None:
+            # After a kill the kill script removes the pid file itself; removing it here
+            # concurrently could race the kill and leave the command running.
+            leftovers = [p for p in (stdin_path, None if killed else pid_path) if p]
+            if leftovers:
                 try:
-                    self._cleanup_temp(container_id, stdin_path)
+                    self._cleanup_temp(container_id, *leftovers)
                 except Exception:
                     pass
 
-    def _cleanup_temp(self, container_id: str, path: str) -> None:
+    def _kill_exec(self, container_id: str, pid_path: str) -> None:
+        """SIGKILL the process group recorded in ``pid_path`` by the exec watchdog (best effort)."""
+        try:
+            self._detached_exec(container_id, ["/bin/sh", "-c", _EXEC_KILL_SCRIPT, "sh", pid_path])
+        except Exception:
+            pass
+
+    def _cleanup_temp(self, container_id: str, *paths: str) -> None:
+        self._detached_exec(container_id, ["rm", "-f", *paths])
+
+    def _detached_exec(self, container_id: str, cmd: list[str], *, user: str | None = None) -> str | None:
+        """Start ``cmd`` detached in ``container_id`` and return the exec id (``None`` if not created)."""
+        payload: dict[str, tp.Any] = {"AttachStdout": False, "AttachStderr": False, "Tty": False, "Cmd": cmd}
+        if user is not None:
+            payload["User"] = user
         created = self._request(
             "POST",
             f"{self.api_prefix}/containers/{container_id}/exec",
-            body={"AttachStdout": False, "AttachStderr": False, "Tty": False, "Cmd": ["rm", "-f", path]},
+            body=payload,
             timeout=5.0,
         )
-        if 200 <= created.status < 300:
-            exec_id = json.loads(created.body.decode("utf-8")).get("Id")
-            if exec_id:
-                self._request(
-                    "POST",
-                    f"{self.api_prefix}/exec/{exec_id}/start",
-                    body={"Detach": True, "Tty": False},
-                    timeout=5.0,
-                )
+        if not (200 <= created.status < 300):
+            return None
+        exec_id = json.loads(created.body.decode("utf-8")).get("Id")
+        if not exec_id:
+            return None
+        started = self._request(
+            "POST",
+            f"{self.api_prefix}/exec/{exec_id}/start",
+            body={"Detach": True, "Tty": False},
+            timeout=5.0,
+        )
+        return str(exec_id) if 200 <= started.status < 300 else None
+
+    def kill_all_processes(self, container_id: str, *, wait: float = _KILL_ALL_WAIT_S) -> None:
+        """SIGKILL every process in ``container_id`` except its pid 1, as root.
+
+        Runs POSIX ``kill -9 -1`` in a detached root exec (the signalling shell
+        and pid 1 are spared), then waits up to ``wait`` seconds for the exec to
+        finish. Only processes in the container's pid namespace are reachable.
+
+        Raises:
+            SandboxInfraError: When the kill exec cannot be created or started.
+        """
+        exec_id = self._detached_exec(container_id, ["/bin/sh", "-c", _KILL_ALL_SCRIPT], user="root")
+        if exec_id is None:
+            raise SandboxInfraError(f"Could not start the process-kill exec in container {container_id}.")
+        deadline = time.monotonic() + max(0.0, float(wait))
+        while time.monotonic() < deadline:
+            try:
+                resp = self._request("GET", f"{self.api_prefix}/exec/{exec_id}/json", timeout=2.0)
+                meta = json.loads(resp.body.decode("utf-8", errors="replace")) if 200 <= resp.status < 300 else {}
+            except (SandboxInfraError, TimeoutError, json.JSONDecodeError):
+                meta = {}
+            if isinstance(meta, dict) and meta.get("Running") is False:
+                return
+            time.sleep(0.05)
 
 
 _PRLIMIT_BIN: str | None = shutil.which("prlimit") if _POSIX else None
@@ -742,6 +1032,7 @@ _POST_EXEC_RLIMIT_CODE = (
     "import os, resource, signal, sys\n"
     "cpu = int(sys.argv[1])\n"
     "mem = int(sys.argv[2])\n"
+    "fsize = int(sys.argv[3])\n"
     "try:\n"
     "    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGXCPU})\n"
     "    signal.signal(signal.SIGXCPU, signal.SIG_DFL)\n"
@@ -753,7 +1044,9 @@ _POST_EXEC_RLIMIT_CODE = (
     "        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))\n"
     "    except (ValueError, OSError):\n"
     "        pass\n"
-    "os.execvp(sys.argv[3], sys.argv[3:])\n"
+    "if fsize > 0:\n"
+    "    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))\n"
+    "os.execvp(sys.argv[4], sys.argv[4:])\n"
 )
 
 
@@ -827,8 +1120,31 @@ class SandboxSession(abc.ABC):
         """Write relative or session-rooted files into the workspace."""
 
     @abc.abstractmethod
-    def read_file(self, path: str) -> str:
-        """Read a UTF-8 file from the session workspace."""
+    def read_file(self, path: str, *, max_chars: int | None = None) -> str:
+        """Read a UTF-8 file from the session workspace.
+
+        Args:
+            path: Workspace-relative or session-rooted path.
+            max_chars: When set, only enough of the file is read to return at
+                most ``max_chars + 1`` characters (the extra character lets
+                callers detect truncation); the rest is never loaded.
+
+        Returns:
+            The decoded (possibly truncated) file text.
+        """
+
+    def kill_sandbox_processes(self) -> None:
+        """SIGKILL every process running inside the sandbox, leaving the session usable.
+
+        Used before grading so background processes the policy started cannot
+        tamper with verification. Implementations must never signal processes
+        outside the sandbox.
+
+        Raises:
+            NotImplementedError: When the session type cannot enumerate its processes.
+            SandboxInfraError: When the kill could not be carried out.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement kill_sandbox_processes().")
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -884,6 +1200,13 @@ class ContainerSandboxSession(SandboxSession):
     ) -> ExecResult:
         if self._closed:
             return ExecResult(ok=False, stdout="", stderr="", returncode=None, infra_error="Session is closed.")
+        if stdin is not None and len(stdin.encode("utf-8", errors="replace")) > self._config.max_stdin_bytes:
+            return ExecResult(
+                ok=False,
+                stdout="",
+                stderr=f"stdin payload exceeds max_stdin_bytes={self._config.max_stdin_bytes}.",
+                returncode=None,
+            )
         argv = ["/bin/sh", "-c", cmd] if isinstance(cmd, str) else list(cmd)
         merged_env = dict(self._config.env)
         if env:
@@ -909,11 +1232,21 @@ class ContainerSandboxSession(SandboxSession):
             self._client.exec_run(self._container_id, ["mkdir", "-p", *mkdir_targets], workdir="/", timeout=10.0)
         self._client.put_files(self._container_id, files, base_dir=self._config.workdir)
 
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, *, max_chars: int | None = None) -> str:
         if self._closed:
             raise SandboxInfraError("Session is closed.")
         full = path if posixpath.isabs(path) else posixpath.join(self._config.workdir, path)
-        return self._client.get_file(self._container_id, full).decode("utf-8", errors="replace")
+        if max_chars is None:
+            return self._client.get_file(self._container_id, full).decode("utf-8", errors="replace")
+        limit = max(0, int(max_chars))
+        raw = self._client.get_file(self._container_id, full, max_bytes=limit * 4 + 4)
+        return raw.decode("utf-8", errors="replace")[: limit + 1]
+
+    def kill_sandbox_processes(self) -> None:
+        """SIGKILL every process in the container except pid 1 (runs ``kill -9 -1`` as root inside it)."""
+        if self._closed:
+            raise SandboxInfraError("Session is closed.")
+        self._client.kill_all_processes(self._container_id)
 
     def close(self) -> None:
         if not self._closed:
@@ -927,28 +1260,49 @@ class ContainerSandboxSession(SandboxSession):
 class LocalSandboxSession(SandboxSession):
     """Default child-process session with a persistent per-episode workspace.
 
-    When running unjailed (without ``bwrap``), :meth:`close` only kills the
-    process groups spawned and tracked by this session; any child process that
-    calls ``setsid()`` to create a new session/process group escapes cleanup.
+    When running unjailed (without ``bwrap``), :meth:`close` and
+    :meth:`kill_sandbox_processes` only kill the process groups spawned and
+    tracked by this session; any child process that calls ``setsid()`` to
+    create a new session/process group escapes cleanup.
     """
 
     def __init__(self, config: ContainerConfig):
+        """Create a session for ``config``.
+
+        Raises:
+            ValueError: For an unknown ``use_jail`` policy.
+            SandboxInfraError: When the jail is required (``"auto"`` or
+                ``"required"``) but ``bwrap`` is unavailable, or when running
+                with ``use_jail="off"`` while ``network=False`` or
+                ``read_only_rootfs=True`` are requested (they cannot be enforced
+                without the jail).
+        """
+        policy = config.use_jail
+        if policy not in _JAIL_POLICIES:
+            raise ValueError(f"use_jail must be one of {_JAIL_POLICIES}; got {policy!r}.")
+        bwrap = shutil.which("bwrap") if (policy != "off" and _POSIX) else None
+        if policy != "off" and bwrap is None:
+            raise SandboxInfraError(
+                f"use_jail={policy!r} requires `bwrap` (bubblewrap) on PATH to isolate local sandbox commands. "
+                "Install bubblewrap, use a container backend, or pass ContainerConfig(use_jail='off') to run "
+                "model commands UNJAILED explicitly."
+            )
+        if bwrap is None:
+            if config.network is False:
+                raise SandboxInfraError(
+                    "network=False was requested but cannot be enforced with use_jail='off'; "
+                    "leave network unset (None) or enable the bwrap jail."
+                )
+            if config.read_only_rootfs:
+                raise SandboxInfraError(
+                    "read_only_rootfs=True cannot be enforced with use_jail='off'; enable the bwrap jail."
+                )
         self._config = config
+        self._bwrap = bwrap
         self._root = os.path.realpath(tempfile.mkdtemp(prefix="edenv-"))
         self._closed = False
         self._pgid_lock = threading.Lock()
         self._spawned_pgids: set[int] = set()
-        self._bwrap = shutil.which("bwrap") if (config.use_jail != "off" and _POSIX) else None
-        if config.use_jail == "required" and self._bwrap is None:
-            shutil.rmtree(self._root, ignore_errors=True)
-            raise SandboxInfraError("use_jail='required' but bwrap is not installed.")
-        if config.use_jail == "auto" and self._bwrap is None:
-            warnings.warn(
-                "LocalSandboxSession is running UNJAILED because `bwrap` is not on PATH; "
-                "filesystem and network isolation are NOT enforced.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
     @property
     def workdir(self) -> str:
@@ -1022,8 +1376,19 @@ class LocalSandboxSession(SandboxSession):
         cwd = self._resolve_local_path(workdir) if workdir else self._root
         os.makedirs(cwd, exist_ok=True)
         budget = float(timeout if timeout is not None else self._config.timeout)
+        stdin_bytes: bytes | None = None
+        if stdin is not None:
+            stdin_bytes = stdin.encode("utf-8", errors="replace")
+            if len(stdin_bytes) > self._config.max_stdin_bytes:
+                return ExecResult(
+                    ok=False,
+                    stdout="",
+                    stderr=f"stdin payload exceeds max_stdin_bytes={self._config.max_stdin_bytes}.",
+                    returncode=None,
+                )
         cpu_cap = math.ceil(budget) + 1
         mem_bytes = int(self._config.memory_mb) * 1024 * 1024 if self._config.memory_mb > 0 else 0
+        fsize_bytes = int(self._config.max_file_size_mb) * 1024 * 1024 if self._config.max_file_size_mb > 0 else 0
 
         argv = ["/bin/sh", "-c", cmd] if isinstance(cmd, str) else list(cmd)
         full_argv = self._build_bwrap_argv(argv, cwd) if self._bwrap is not None else argv
@@ -1032,9 +1397,19 @@ class LocalSandboxSession(SandboxSession):
                 rlimit_prefix = [_PRLIMIT_BIN, f"--cpu={cpu_cap}:{cpu_cap + 1}"]
                 if mem_bytes > 0:
                     rlimit_prefix.append(f"--as={mem_bytes}:{mem_bytes}")
+                if fsize_bytes > 0:
+                    rlimit_prefix.append(f"--fsize={fsize_bytes}:{fsize_bytes}")
                 spawn_argv = [*rlimit_prefix, "--", *full_argv]
             else:
-                spawn_argv = [sys.executable, "-c", _POST_EXEC_RLIMIT_CODE, str(cpu_cap), str(mem_bytes), *full_argv]
+                spawn_argv = [
+                    sys.executable,
+                    "-c",
+                    _POST_EXEC_RLIMIT_CODE,
+                    str(cpu_cap),
+                    str(mem_bytes),
+                    str(fsize_bytes),
+                    *full_argv,
+                ]
         else:
             spawn_argv = full_argv
 
@@ -1052,13 +1427,11 @@ class LocalSandboxSession(SandboxSession):
         try:
             proc = subprocess.Popen(
                 spawn_argv,
-                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=cwd,
                 env=proc_env,
-                text=True,
-                errors="replace",
                 preexec_fn=None,
                 start_new_session=_POSIX,
             )
@@ -1068,41 +1441,53 @@ class LocalSandboxSession(SandboxSession):
         except OSError as exc:
             return ExecResult(ok=False, stdout="", stderr="", returncode=None, infra_error=str(exc))
 
-        out_buf: list[str] = []
-        err_buf: list[str] = []
+        out_buf: list[bytes] = []
+        err_buf: list[bytes] = []
         cap = self._config.max_output_chars
+        byte_cap = max(cap * 4, 4096)
 
-        def _drain(stream: tp.IO[str] | None, sink: list[str]) -> None:
+        def _drain(stream: tp.IO[bytes] | None, sink: list[bytes]) -> None:
             if stream is None:
                 return
             kept = 0
             try:
                 while True:
-                    chunk = stream.read(4096)
+                    chunk = stream.read1(65536) if hasattr(stream, "read1") else stream.read(65536)
                     if not chunk:
                         break
-                    if kept < cap:
-                        piece = chunk[: cap - kept]
+                    if kept < byte_cap:
+                        piece = chunk[: byte_cap - kept]
                         sink.append(piece)
                         kept += len(piece)
+            except (OSError, ValueError):
+                pass
             finally:
-                stream.close()
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        def _feed(stream: tp.IO[bytes], payload: bytes) -> None:
+            # Runs off the caller's thread so a child that never reads stdin cannot block
+            # the deadline/kill path; the write fails with EPIPE once the child is killed.
+            try:
+                stream.write(payload)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                try:
+                    stream.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
 
         t_out = threading.Thread(target=_drain, args=(proc.stdout, out_buf), daemon=True)
         t_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf), daemon=True)
         t_out.start()
         t_err.start()
-
-        if stdin is not None and proc.stdin is not None:
-            try:
-                proc.stdin.write(stdin)
-            except (BrokenPipeError, OSError):
-                pass
-            finally:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
+        t_in: threading.Thread | None = None
+        if stdin_bytes is not None and proc.stdin is not None:
+            t_in = threading.Thread(target=_feed, args=(proc.stdin, stdin_bytes), daemon=True)
+            t_in.start()
 
         timed_out = False
         try:
@@ -1118,13 +1503,15 @@ class LocalSandboxSession(SandboxSession):
                 proc.kill()
             proc.wait()
 
+        if t_in is not None:
+            t_in.join(timeout=1.0)
         t_out.join(timeout=1.0)
         t_err.join(timeout=1.0)
         timed_out |= _CPU_BUDGET_RETURNCODE is not None and proc.returncode == _CPU_BUDGET_RETURNCODE
         return ExecResult(
             ok=(proc.returncode == 0 and not timed_out),
-            stdout="".join(out_buf),
-            stderr="".join(err_buf),
+            stdout=b"".join(out_buf).decode("utf-8", errors="replace")[:cap],
+            stderr=b"".join(err_buf).decode("utf-8", errors="replace")[:cap],
             returncode=proc.returncode,
             timed_out=timed_out,
         )
@@ -1142,12 +1529,40 @@ class LocalSandboxSession(SandboxSession):
                 with open(target, "wb") as f:
                     f.write(content)
 
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, *, max_chars: int | None = None) -> str:
         if self._closed:
             raise SandboxInfraError("Session is closed.")
         target = self._resolve_local_path(path)
-        with open(target, encoding="utf-8", errors="replace") as f:
-            return f.read()
+        with open(target, "rb") as f:
+            # UTF-8 uses at most 4 bytes per character; read only what max_chars can need.
+            raw = f.read() if max_chars is None else f.read(max(0, int(max_chars)) * 4 + 4)
+        text = raw.decode("utf-8", errors="replace")
+        return text if max_chars is None else text[: max(0, int(max_chars)) + 1]
+
+    def kill_sandbox_processes(self) -> None:
+        """SIGKILL every process group this session started and wait briefly for them to exit.
+
+        Every command runs as the leader of a new process group, so its
+        background children (``&``, ``nohup``) die with the group. When jailed,
+        each command's ``bwrap`` owns a private pid namespace whose init dies
+        with it (``--die-with-parent``), taking every process in the namespace,
+        including ``setsid``'d ones. Unjailed local mode (explicit
+        ``use_jail='off'``) cannot guarantee that a process which called
+        ``setsid()`` is reaped. Processes this session did not start are never
+        signalled, and the caller's own process group is skipped.
+        """
+        if not _POSIX:
+            raise SandboxInfraError("kill_sandbox_processes requires a POSIX host.")
+        own = os.getpgrp()
+        with self._pgid_lock:
+            pgids = [g for g in self._spawned_pgids if g > 0 and g != own]
+        live = [g for g in pgids if _signal_group(g, signal.SIGKILL)]
+        deadline = time.monotonic() + _KILL_ALL_WAIT_S
+        while live and time.monotonic() < deadline:
+            time.sleep(0.01)
+            live = [g for g in live if _signal_group(g, 0)]
+        with self._pgid_lock:
+            self._spawned_pgids.difference_update(g for g in pgids if g not in live)
 
     def close(self) -> None:
         if not self._closed:
@@ -1171,54 +1586,57 @@ class LocalSandboxSession(SandboxSession):
             shutil.rmtree(self._root, ignore_errors=True)
 
 
-def discover_engine_endpoint(backend: str = "kiri") -> tuple[str | None, str]:
+def discover_engine_endpoint(backend: str = "kiri", *, auto_install: bool = False) -> tuple[str | None, str]:
     """Resolve an execution backend endpoint.
 
+    Explicit sockets are passed to :class:`KiriRuntime` / :class:`SandboxPool`
+    as ``endpoint=``; only the standard ``DOCKER_HOST`` variable is consulted.
+
     Args:
-        backend: ``"kiri"`` (default; auto-installs/boots Kiri daemon),
-            ``"docker"`` (require Docker-compatible daemon), ``"auto"``
-            (try Kiri, then Docker, then local), or ``"local"``
-            (child-process sandbox).
+        backend: ``"kiri"`` (default; boots an installed Kiri daemon when none
+            answers), ``"docker"`` (require Docker-compatible daemon), ``"auto"``
+            (try Kiri, then Docker, then the bwrap-jailed local backend), or
+            ``"local"`` (child-process sandbox).
+        auto_install: Download Kiri when no binary is installed (off by default;
+            run ``easydel setup kiri`` instead).
 
     Returns:
         ``(endpoint, resolved_backend)`` where ``endpoint`` is ``None`` for ``"local"``.
+
+    Raises:
+        SandboxInfraError: When the requested backend is unavailable.
     """
+    endpoint, kind, _started = _discover_engine_endpoint(backend, auto_install=auto_install)
+    return endpoint, kind
+
+
+def _discover_engine_endpoint(backend: str, *, auto_install: bool = False) -> tuple[str | None, str, bool]:
+    """Like :func:`discover_engine_endpoint`, also reporting whether this call booted an owned daemon."""
     mode = backend.lower()
     if mode not in {"local", "auto", "kiri", "docker"}:
         raise ValueError(f"backend must be 'local', 'auto', 'kiri', or 'docker'; got {backend!r}.")
     if mode == "local":
-        return None, "local"
+        return None, "local", False
 
     home = Path.home()
-    kiri_candidates: list[str] = []
-    kiri_env = os.environ.get("KIRI_SOCKET")
-    if kiri_env:
-        kiri_candidates.append(f"unix://{kiri_env}" if not kiri_env.startswith("unix://") else kiri_env)
-    kiri_candidates.extend(
-        [
-            "unix:///dev/shm/kiri/.kiri/run/docker.sock",
-            "unix:///dev/shm/kiri/vm-0/.kiri/run/docker.sock",
-            "unix:///run/kiri/docker.sock",
-            f"unix://{home / '.kiri' / 'run' / 'docker.sock'}",
-            f"unix://{home / 'Library' / 'Application Support' / 'Kiri' / 'run' / 'docker.sock'}",
-        ]
-    )
+    kiri_candidates = [
+        "unix:///dev/shm/kiri/.kiri/run/docker.sock",
+        "unix:///dev/shm/kiri/vm-0/.kiri/run/docker.sock",
+        "unix:///run/kiri/docker.sock",
+        f"unix://{home / '.kiri' / 'run' / 'docker.sock'}",
+        f"unix://{home / 'Library' / 'Application Support' / 'Kiri' / 'run' / 'docker.sock'}",
+    ]
 
     if mode in {"auto", "kiri"}:
         for cand in kiri_candidates:
             sock_path = cand.removeprefix("unix://")
             if os.path.exists(sock_path) and EngineSocketClient(cand).ping():
-                return cand, "kiri"
+                return cand, "kiri", False
         if mode == "kiri":
-            from .kiri_installer import ensure_kiri_daemon
+            from .kiri_installer import _ensure_daemon
 
-            booted = ensure_kiri_daemon(auto_install=True)
-            if booted is not None:
-                return booted, "kiri"
-            raise SandboxInfraError(
-                "Kiri daemon could not be started automatically. "
-                "Run `easydel-install-kiri --start` or pass an explicit `endpoint`."
-            )
+            booted, started = _ensure_daemon(auto_install=auto_install)
+            return booted, "kiri", started
 
     docker_candidates: list[str] = []
     docker_env = os.environ.get("DOCKER_HOST")
@@ -1240,19 +1658,23 @@ def discover_engine_endpoint(backend: str = "kiri") -> tuple[str | None, str]:
                 flavor = client.engine_flavor()
             except Exception:
                 flavor = "docker"
-            return cand, flavor
+            return cand, flavor, False
 
     if mode == "docker":
         raise SandboxInfraError("No reachable Docker Engine socket found.")
-    return None, "local"
+    return None, "local", False
 
 
 class KiriRuntime:
     """Factory that provisions :class:`SandboxSession` instances.
 
-    Defaults to ``backend="kiri"`` (auto-installing and starting the Kiri
-    daemon when needed); pass ``backend="local"`` or ``backend="auto"`` (or
-    an explicit ``endpoint``) to run locally or target another Engine socket.
+    Defaults to ``backend="kiri"``: an existing Kiri daemon is reused, or an
+    installed ``kiri`` binary is booted (installation itself is an explicit
+    ``easydel setup kiri`` step unless ``auto_install=True``). Daemons booted by
+    this runtime are stopped by :meth:`close`. Pass ``backend="local"`` or
+    ``backend="auto"`` (or an explicit ``endpoint``) to run locally or target
+    another Engine socket. When ``backend="auto"`` falls back to local
+    execution the session always requires the ``bwrap`` jail.
     """
 
     def __init__(
@@ -1261,15 +1683,35 @@ class KiriRuntime:
         backend: str = "kiri",
         endpoint: str | None = None,
         config: ContainerConfig | None = None,
+        auto_install: bool = False,
+        token: str | None = None,
     ):
+        """Create a runtime.
+
+        Args:
+            backend: ``"kiri"``, ``"docker"``, ``"auto"`` or ``"local"``.
+            endpoint: Explicit engine endpoint (skips discovery).
+            config: Default :class:`ContainerConfig` for sessions.
+            auto_install: Download Kiri when no binary is installed.
+            token: Shared secret sent to authenticated sandbox bridges.
+        """
         self._requested_backend = backend.lower()
         self._explicit_endpoint = endpoint
         self._default_config = config or ContainerConfig()
+        self._auto_install = bool(auto_install)
+        self._token = token
+        self._owned_lock = threading.Lock()
+        self._owned_daemons: list[str] = []
+
+    def _client(self, endpoint: str) -> EngineSocketClient:
+        from .kiri_installer import kiri_daemon_budget
+
+        return EngineSocketClient(endpoint, token=self._token, budget=kiri_daemon_budget(endpoint))
 
     def resolve(self) -> tuple[str | None, str]:
         """Return ``(endpoint, resolved_backend)`` for this runtime."""
         if self._explicit_endpoint is not None:
-            client = EngineSocketClient(self._explicit_endpoint)
+            client = self._client(self._explicit_endpoint)
             if not client.ping():
                 raise SandboxInfraError(f"Container engine at '{self._explicit_endpoint}' did not answer /_ping.")
             try:
@@ -1277,19 +1719,42 @@ class KiriRuntime:
             except Exception:
                 flavor = "kiri" if self._requested_backend == "kiri" else "docker"
             return self._explicit_endpoint, flavor
-        return discover_engine_endpoint(self._requested_backend)
+        endpoint, kind, started = _discover_engine_endpoint(self._requested_backend, auto_install=self._auto_install)
+        if started and endpoint is not None:
+            with self._owned_lock:
+                self._owned_daemons.append(endpoint)
+        return endpoint, kind
 
     def create_session(self, config: ContainerConfig | None = None) -> SandboxSession:
         """Start and return one isolated :class:`SandboxSession`."""
         cfg = config or self._default_config
         endpoint, backend_kind = self.resolve()
         if endpoint is None or backend_kind == "local":
+            if self._requested_backend == "auto" and cfg.use_jail == "auto":
+                # Reached by fallback: never silently downgrade to unjailed execution.
+                cfg = dataclasses.replace(cfg, use_jail="required")
             return LocalSandboxSession(cfg)
-        return ContainerSandboxSession(EngineSocketClient(endpoint), cfg)
+        return ContainerSandboxSession(self._client(endpoint), cfg)
 
     async def create_session_async(self, config: ContainerConfig | None = None) -> SandboxSession:
         """Non-blocking :meth:`create_session` for async RL rollout workers."""
         return await asyncio.to_thread(self.create_session, config)
+
+    def close(self) -> None:
+        """Stop the Kiri daemons this runtime booted (daemons it merely reused are left running)."""
+        with self._owned_lock:
+            owned = list(self._owned_daemons)
+            self._owned_daemons.clear()
+        if owned:
+            from .kiri_installer import shutdown_kiri_daemons
+
+            shutdown_kiri_daemons(owned)
+
+    def __enter__(self) -> KiriRuntime:
+        return self
+
+    def __exit__(self, exc_type: tp.Any, exc: tp.Any, tb: tp.Any) -> None:
+        self.close()
 
 
 class SandboxPool:
@@ -1298,6 +1763,7 @@ class SandboxPool:
     Routes ``acquire(affinity_key=...)`` deterministically by ``affinity_key``
     (e.g. ``rollout_id``) so multi-turn steps of an asynchronous trajectory
     land on the same sandbox node while balancing episodes across CPU hosts.
+    Daemons booted while building the pool are stopped by :meth:`close`.
     """
 
     def __init__(
@@ -1306,8 +1772,24 @@ class SandboxPool:
         *,
         backend: str = "kiri",
         config: ContainerConfig | None = None,
+        token: str | None = None,
+        auto_install: bool = False,
     ):
+        """Create a pool.
+
+        Args:
+            endpoints: Engine endpoints, or ``"shm:N"`` / ``"pod-shm:N"`` specs that
+                boot local RAM-backed daemons (pod specs stay host-local; use
+                :meth:`from_pod_shm` with ``expose_bridge=True`` for cross-host pools).
+            backend: Backend used when no endpoints are given.
+            config: Default :class:`ContainerConfig`.
+            token: Shared secret sent to authenticated sandbox bridges.
+            auto_install: Download Kiri when booting daemons and none is installed.
+        """
         self._config = config or ContainerConfig()
+        self._token = token
+        self._auto_install = bool(auto_install)
+        self._owned_daemons: list[str] = []
         resolved_endpoints: list[str] | None = None
         if isinstance(endpoints, str):
             resolved_endpoints = self._expand_endpoint_specs([endpoints])
@@ -1320,29 +1802,34 @@ class SandboxPool:
                     backend="kiri" if backend == "local" else backend,
                     endpoint=ep,
                     config=self._config,
+                    token=token,
                 )
                 for ep in resolved_endpoints
             ]
         else:
-            self._runtimes = [KiriRuntime(backend=backend, config=self._config)]
+            self._runtimes = [
+                KiriRuntime(backend=backend, config=self._config, token=token, auto_install=self._auto_install)
+            ]
         self._rr_lock = threading.Lock()
         self._rr_counter = 0
 
-    @staticmethod
-    def _expand_endpoint_specs(specs: list[str]) -> list[str]:
-        from .kiri_installer import ensure_kiri_pod_shm_pool, ensure_kiri_shm_pool, parse_shm_endpoint_spec
+    def _expand_endpoint_specs(self, specs: list[str]) -> list[str]:
+        from .kiri_installer import _ensure_shm_pool, parse_shm_endpoint_spec
 
         expanded: list[str] = []
-        for spec in specs:
-            parsed = parse_shm_endpoint_spec(spec)
-            if parsed is None:
-                expanded.append(spec)
-                continue
-            scope, count = parsed
-            if scope == "pod":
-                expanded.extend(ensure_kiri_pod_shm_pool(num_daemons_per_host=count))
-            else:
-                expanded.extend(ensure_kiri_shm_pool(num_daemons=count))
+        try:
+            for spec in specs:
+                parsed = parse_shm_endpoint_spec(spec)
+                if parsed is None:
+                    expanded.append(spec)
+                    continue
+                _scope, count = parsed
+                uris, started = _ensure_shm_pool(num_daemons=count, auto_install=self._auto_install)
+                self._owned_daemons.extend(started)
+                expanded.extend(uris)
+        except BaseException:
+            self.close()
+            raise
         return expanded
 
     @classmethod
@@ -1353,20 +1840,34 @@ class SandboxPool:
         data_dir: str = "/dev/shm/kiri",
         base_port: int = 2375,
         host_ips: collections.abc.Sequence[str] | None = None,
-        auto_install: bool = True,
+        auto_install: bool = False,
         config: ContainerConfig | None = None,
+        budget: KiriDaemonBudget | None = None,
+        expose_bridge: bool = False,
+        bridge_token: str | None = None,
+        allowed_peers: collections.abc.Sequence[str] | None = None,
     ) -> SandboxPool:
-        """Create a pod-wide RAM-backed Kiri pool across all TPU hosts (e.g. 4x8 = 32 daemons)."""
-        from .kiri_installer import ensure_kiri_pod_shm_pool
+        """Create a RAM-backed Kiri pool, optionally spanning every TPU host (e.g. 4x8 = 32 daemons).
 
-        endpoints = ensure_kiri_pod_shm_pool(
-            num_daemons_per_host=num_daemons_per_host,
+        Cross-host pools require ``expose_bridge=True`` and a ``bridge_token``
+        shared by every host; see ``kiri_installer.ensure_kiri_pod_shm_pool``.
+        """
+        from .kiri_installer import _ensure_pod_shm_pool
+
+        endpoints, started = _ensure_pod_shm_pool(
+            num_daemons_per_host,
             data_dir=data_dir,
             base_port=base_port,
             host_ips=list(host_ips) if host_ips is not None else None,
             auto_install=auto_install,
+            budget=budget,
+            expose_bridge=expose_bridge,
+            bridge_token=bridge_token,
+            allowed_peers=list(allowed_peers) if allowed_peers is not None else None,
         )
-        return cls(endpoints=endpoints, backend="kiri", config=config)
+        pool = cls(endpoints=endpoints, backend="kiri", config=config, token=bridge_token)
+        pool._owned_daemons.extend(started)
+        return pool
 
     @classmethod
     def from_local_shm(
@@ -1374,18 +1875,24 @@ class SandboxPool:
         num_daemons: int = 4,
         *,
         data_dir: str = "/dev/shm/kiri",
-        auto_install: bool = True,
+        auto_install: bool = False,
         config: ContainerConfig | None = None,
+        budget: KiriDaemonBudget | None = None,
+        kiri_bin: str | None = None,
     ) -> SandboxPool:
         """Create a local RAM-backed Kiri pool in ``/dev/shm`` with zero external CPU VMs."""
-        from .kiri_installer import ensure_kiri_shm_pool
+        from .kiri_installer import _ensure_shm_pool
 
-        endpoints = ensure_kiri_shm_pool(
-            num_daemons=num_daemons,
+        endpoints, started = _ensure_shm_pool(
+            num_daemons,
             data_dir=data_dir,
+            kiri_bin=kiri_bin,
             auto_install=auto_install,
+            budget=budget,
         )
-        return cls(endpoints=endpoints, backend="kiri", config=config)
+        pool = cls(endpoints=endpoints, backend="kiri", config=config)
+        pool._owned_daemons.extend(started)
+        return pool
 
     @property
     def size(self) -> int:
@@ -1422,3 +1929,20 @@ class SandboxPool:
         """Non-blocking :meth:`acquire` for async RL rollout workers."""
         idx = self.select_index(affinity_key)
         return await self._runtimes[idx].create_session_async(config=config or self._config)
+
+    def close(self) -> None:
+        """Stop the daemons this pool (or its runtimes) booted; reused daemons keep running."""
+        for rt in getattr(self, "_runtimes", []):
+            rt.close()
+        owned = list(self._owned_daemons)
+        self._owned_daemons.clear()
+        if owned:
+            from .kiri_installer import shutdown_kiri_daemons
+
+            shutdown_kiri_daemons(owned)
+
+    def __enter__(self) -> SandboxPool:
+        return self
+
+    def __exit__(self, exc_type: tp.Any, exc: tp.Any, tb: tp.Any) -> None:
+        self.close()

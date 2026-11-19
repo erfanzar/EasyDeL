@@ -43,9 +43,12 @@ import numpy as np
 
 from easydel.trainers._online_rl.async_rollout import (
     AsyncRolloutCancelled,
+    AsyncRolloutError,
     AsyncRolloutWorkerError,
     BoundedAsyncRolloutCoordinator,
+    CompletedRollout,
     PolicySnapshot,
+    RolloutTicket,
 )
 from easydel.trainers._online_rl.trajectory import (
     OnlineRLTrajectory,
@@ -104,7 +107,12 @@ class EpisodeRecord:
 
 @dataclasses.dataclass(frozen=True)
 class GroupRolloutBatch:
-    """Filtered and group-balanced episodes ready for group-relative RL."""
+    """Filtered and group-balanced episodes ready for group-relative RL.
+
+    ``episodes[i].trajectory is trajectories[i]`` for every ``i``. With ``drop_env_errors=False`` the
+    infra-failed episodes are reported in ``env_error_episodes`` instead: they never count toward a group's
+    ``min_valid`` threshold, are never used for padding and never appear in ``episodes``.
+    """
 
     episodes: list[EpisodeRecord]
     trajectories: list[OnlineRLTrajectory]
@@ -112,6 +120,7 @@ class GroupRolloutBatch:
     dropped_env_error: int
     dropped_groups: int
     padded_samples: int
+    env_error_episodes: list[EpisodeRecord] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,8 +170,11 @@ class AsyncEnvironmentRolloutCollector:
         self._max_turns = int(max_turns)
         self._max_staleness = max_staleness
         self._drop_env_errors = bool(drop_env_errors)
+        self._max_outstanding = int(max_outstanding)
         self._next_trajectory_id = 0
         self._traj_id_lock = threading.Lock()
+        self._aside_lock = threading.Lock()
+        self._aside: collections.deque[CompletedRollout[EpisodeRecord] | AsyncRolloutError] = collections.deque()
 
         self._snapshot_lock = threading.Lock()
         self._latest_snapshot: PolicySnapshot[tp.Any] | None = None
@@ -178,6 +190,44 @@ class AsyncEnvironmentRolloutCollector:
     @property
     def coordinator(self) -> BoundedAsyncRolloutCoordinator[tp.Any, _EpisodeTask, EpisodeRecord]:
         return self._coordinator
+
+    def _free_capacity(self) -> int:
+        """Submissions that fit right now without blocking ``submit`` (may be ``0``; all callers counted)."""
+        return max(0, self._max_outstanding - self._coordinator.outstanding_count)
+
+    def _set_aside(self, outcome: CompletedRollout[EpisodeRecord] | AsyncRolloutError) -> None:
+        """Keep a completion of a submission that the current ``collect_groups`` call did not make.
+
+        Foreign completions are never counted toward the group batch; :meth:`collect_episodes` consumes them
+        first, in the order they were set aside.
+        """
+        with self._aside_lock:
+            self._aside.append(outcome)
+
+    def _pop_aside(self) -> CompletedRollout[EpisodeRecord] | AsyncRolloutError | None:
+        with self._aside_lock:
+            return self._aside.popleft() if self._aside else None
+
+    @property
+    def set_aside_count(self) -> int:
+        """Foreign completions drained by :meth:`collect_groups` and waiting for :meth:`collect_episodes`."""
+        with self._aside_lock:
+            return len(self._aside)
+
+    def _classify(self, ep: EpisodeRecord, current_policy_version: int) -> str:
+        """Return ``"keep"``, ``"env_error"`` (dropped) or ``"stale"`` for a completed episode.
+
+        With ``drop_env_errors=False`` env-error episodes are kept as zero-reward records whose
+        ``env_error`` flag is set (their ``trajectory`` is ``None``); consumers must check the flag.
+        """
+        if ep.env_error:
+            if self._drop_env_errors:
+                return "env_error"
+        elif ep.trajectory is None:
+            return "env_error"
+        if self._max_staleness is not None and ep.staleness(current_policy_version) > self._max_staleness:
+            return "stale"
+        return "keep"
 
     def publish_policy(
         self,
@@ -205,8 +255,8 @@ class AsyncEnvironmentRolloutCollector:
         env_kwargs: collections.abc.Mapping[str, tp.Any] | None = None,
         snapshot: PolicySnapshot[tp.Any] | None = None,
         timeout: float | None = None,
-    ) -> None:
-        """Enqueue one multi-turn environment episode for background execution."""
+    ) -> RolloutTicket:
+        """Enqueue one multi-turn environment episode for background execution and return its ticket."""
         with self._snapshot_lock:
             active_snap = snapshot or self._latest_snapshot
         if active_snap is None:
@@ -217,7 +267,7 @@ class AsyncEnvironmentRolloutCollector:
             seed=seed,
             env_kwargs=dict(env_kwargs or {}),
         )
-        self._coordinator.submit(task, snapshot=active_snap, timeout=timeout)
+        return self._coordinator.submit(task, snapshot=active_snap, timeout=timeout)
 
     def _run_episode(self, initial_snapshot: PolicySnapshot[tp.Any], task: _EpisodeTask) -> EpisodeRecord:
         env = self._env_factory(**task.env_kwargs)
@@ -383,9 +433,13 @@ class AsyncEnvironmentRolloutCollector:
         valid: list[EpisodeRecord] = []
         stats = {"dropped_stale": 0, "dropped_env_error": 0, "worker_errors": 0}
 
-        while len(valid) < count and self._coordinator.outstanding_count > 0:
+        while len(valid) < count and (self.set_aside_count > 0 or self._coordinator.outstanding_count > 0):
+            # Completions set aside by ``collect_groups`` (submissions it did not make) are consumed first.
+            aside = self._pop_aside()
             try:
-                completed = self._coordinator.next_completed(timeout=timeout_per_episode)
+                if isinstance(aside, AsyncRolloutError):
+                    raise aside
+                completed = aside if aside is not None else self._coordinator.next_completed(timeout=timeout_per_episode)
             except AsyncRolloutCancelled:
                 continue
             except AsyncRolloutWorkerError:
@@ -393,13 +447,11 @@ class AsyncEnvironmentRolloutCollector:
                 continue
 
             ep = completed.value
-            if ep.env_error and self._drop_env_errors:
+            verdict = self._classify(ep, current_policy_version)
+            if verdict == "env_error":
                 stats["dropped_env_error"] += 1
                 continue
-            if ep.trajectory is None:
-                stats["dropped_env_error"] += 1
-                continue
-            if self._max_staleness is not None and ep.staleness(current_policy_version) > self._max_staleness:
+            if verdict == "stale":
                 stats["dropped_stale"] += 1
                 continue
             valid.append(ep)
@@ -460,40 +512,55 @@ class AsyncEnvironmentRolloutCollector:
         if env_kwargs_per_group is not None and len(env_kwargs_per_group) != num_groups:
             raise ValueError("env_kwargs_per_group length must match num_groups.")
 
-        total_submitted = num_groups * group_size
-        for g in range(num_groups):
-            kw = env_kwargs_per_group[g] if env_kwargs_per_group is not None else None
-            for k in range(group_size):
-                self.submit_episode(
-                    prompt_index=g,
-                    group_id=g,
-                    seed=base_seed + g * group_size + k,
-                    env_kwargs=kw,
-                )
-
+        pending = [
+            (g, base_seed + g * group_size + k, env_kwargs_per_group[g] if env_kwargs_per_group is not None else None)
+            for g in range(num_groups)
+            for k in range(group_size)
+        ]
         by_group: dict[int, list[EpisodeRecord]] = {g: [] for g in range(num_groups)}
+        env_error_episodes: list[EpisodeRecord] = []
         dropped_stale = 0
         dropped_env_error = 0
+        ours: set[int] = set()
+        next_idx = 0
 
-        for _ in range(total_submitted):
+        # Interleave submission and draining: the coordinator only frees capacity in ``next_completed``, so
+        # submitting everything up front deadlocks when ``num_groups * group_size > max_outstanding``. Only this
+        # call's own submission ids count as in flight; capacity is recomputed from the live coordinator count
+        # each iteration (other callers may hold credits), and at zero capacity the loop drains instead of
+        # blocking in ``submit``. Completions of foreign submissions are set aside for ``collect_episodes``.
+        while next_idx < len(pending) or ours:
+            while next_idx < len(pending) and self._free_capacity() > 0:
+                g, seed, kw = pending[next_idx]
+                ticket = self.submit_episode(prompt_index=g, group_id=g, seed=seed, env_kwargs=kw)
+                ours.add(ticket.submission_id)
+                next_idx += 1
             if self._coordinator.outstanding_count == 0:
                 break
             try:
                 completed = self._coordinator.next_completed(timeout=timeout_per_episode)
-            except (AsyncRolloutCancelled, AsyncRolloutWorkerError):
-                dropped_env_error += 1
+            except (AsyncRolloutCancelled, AsyncRolloutWorkerError) as exc:
+                if exc.ticket.submission_id in ours:
+                    ours.discard(exc.ticket.submission_id)
+                    dropped_env_error += 1
+                else:
+                    self._set_aside(exc)
                 continue
+            if completed.ticket.submission_id not in ours:
+                self._set_aside(completed)
+                continue
+            ours.discard(completed.ticket.submission_id)
             ep = completed.value
-            if ep.env_error and self._drop_env_errors:
+            verdict = self._classify(ep, current_policy_version)
+            if verdict == "env_error":
                 dropped_env_error += 1
-                continue
-            if ep.trajectory is None:
-                dropped_env_error += 1
-                continue
-            if self._max_staleness is not None and ep.staleness(current_policy_version) > self._max_staleness:
+            elif verdict == "stale":
                 dropped_stale += 1
-                continue
-            by_group.setdefault(ep.group_id, []).append(ep)
+            elif ep.env_error:
+                # Kept (drop_env_errors=False) but reported separately: never a valid member or padding source.
+                env_error_episodes.append(ep)
+            else:
+                by_group.setdefault(ep.group_id, []).append(ep)
 
         min_valid = max(1, math.ceil(group_size / 2)) if group_size > 1 else 1
         final_episodes: list[EpisodeRecord] = []
@@ -501,7 +568,7 @@ class AsyncEnvironmentRolloutCollector:
         padded_samples = 0
 
         for g in range(num_groups):
-            members = by_group.get(g, [])
+            members = [ep for ep in by_group.get(g, []) if ep.trajectory is not None]
             if len(members) < min_valid:
                 dropped_groups += 1
                 continue
@@ -512,6 +579,7 @@ class AsyncEnvironmentRolloutCollector:
                 padded_samples += need
             final_episodes.extend(members[:group_size])
 
+        # Every final member carries a trajectory, so this keeps ``episodes[i]`` aligned with ``trajectories[i]``.
         trajectories = [ep.trajectory for ep in final_episodes if ep.trajectory is not None]
         return GroupRolloutBatch(
             episodes=final_episodes,
@@ -520,6 +588,7 @@ class AsyncEnvironmentRolloutCollector:
             dropped_env_error=dropped_env_error,
             dropped_groups=dropped_groups,
             padded_samples=padded_samples,
+            env_error_episodes=env_error_episodes,
         )
 
     def close(self) -> None:
