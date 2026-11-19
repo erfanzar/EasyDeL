@@ -62,7 +62,8 @@ A reward function returning `None` marks a sample unscorable (judge or sandbox f
 
 With `gradient_accumulation_steps > 1`, a batch carrying `difficulty_weights` (dataset weights or discarded groups)
 normalises every microbatch by the full-batch weighted count, so a fully or mostly discarded microbatch does not
-dilute the gradient. Under `environment_factory`, a `reset` or `step` whose `info` sets `env_error` or `discard`
+dilute the gradient. Under a pipeline schedule (`mpmd_scheduler`) each pipeline and accumulation microbatch is
+weighted by its share of that count instead, which gives the same full-batch objective. Under `environment_factory`, a `reset` or `step` whose `info` sets `env_error` or `discard`
 reports a NaN environment reward (never the placeholder `0.0`), so the opted-in environment column drops the group.
 Dynamic sampling gives resampled groups weight `1`, never the zero weight of the discarded group they replace.
 

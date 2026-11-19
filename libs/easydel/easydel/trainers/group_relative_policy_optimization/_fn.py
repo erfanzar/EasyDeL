@@ -1942,7 +1942,7 @@ def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         A tuple suitable for use as a SpectraX scheduled-loss cache key.
     """
 
-    return scheduled_loss_cache_key(
+    key = scheduled_loss_cache_key(
         call,
         value_fields=(
             "num_generations",
@@ -1976,6 +1976,54 @@ def _grpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         ),
         object_fields=("loss_config", "learning_rate_fn", "straight_through_emulator"),
     )
+    # The microbatch weight callable (and the weighted loss/gate-sum closure) is built only on a
+    # cache miss, so whether the batch carries ``difficulty_weights`` must be part of the key.
+    return (*key, ("difficulty_weights", _grpo_scheduled_weighted(call)))
+
+
+def _grpo_scheduled_weighted(call) -> bool:
+    """Whether the scheduled GRPO call weights its microbatches (the batch carries ``difficulty_weights``)."""
+    return "difficulty_weights" in call.batch
+
+
+def _grpo_local_denominator_correction(denominator: jax.Array) -> jax.Array:
+    """Factor turning a microbatch loss ``num / max(d, 1)`` into ``num / d`` (``1`` when ``d <= 0``).
+
+    ``grpo_step`` clamps its loss denominator at ``1``; the weighted scheduled reduction
+    ``sum_i (d_i / D) * loss_i`` needs the unclamped ``num_i / d_i`` to equal ``num / D``. The factor is
+    ``1`` whenever ``d >= 1`` and only differs for fractional weights.
+    """
+    denominator = jnp.asarray(denominator, jnp.float32)
+    positive = denominator > 0
+    return jnp.where(positive, jnp.maximum(denominator, 1.0) / jnp.where(positive, denominator, 1.0), 1.0)
+
+
+def _make_grpo_scheduled_weight(call):
+    """Per-microbatch loss weight of a scheduled GRPO step whose batch carries ``difficulty_weights``.
+
+    The weight of a microbatch is its own loss denominator ``d_i``
+    (:func:`_grpo_weighted_loss_denominator`): ``sum(w)``, ``sum(w) * T``, ``#{w > 0} * T`` or
+    ``sum(mask * w)`` depending on ``loss_type``. The scheduled runtime scales each microbatch by
+    ``d_i / D``, so ``sum_i (d_i / D) * (num_i / d_i) = num / D``: the full-batch objective the SPMD
+    step uses, and a fully discarded microbatch (``d_i = 0``) contributes no gradient. Unweighted
+    batches return ``None`` and keep the uniform microbatch mean unchanged.
+
+    Args:
+        call: The :class:`ScheduledStepCall` being compiled.
+
+    Returns:
+        ``(tree, batch) -> scalar`` weight callable, or ``None`` for unweighted batches.
+    """
+    if not _grpo_scheduled_weighted(call):
+        return None
+    loss_type = call.get("loss_type")
+    max_loss_completion_tokens = call.get("max_loss_completion_tokens")
+
+    def microbatch_weight(tree, batch):
+        del tree
+        return _grpo_weighted_loss_denominator(batch, loss_type, max_loss_completion_tokens)
+
+    return microbatch_weight
 
 
 def _make_grpo_scheduled_loss(call):
@@ -2029,6 +2077,9 @@ def _make_grpo_scheduled_loss(call):
     # With an update gate configured the loss also returns additive gate sums as aux; the
     # adapter's ``finalize_aux`` turns them into the scheduled update gate.
     gated = _grpo_update_gate_active(call)
+    # With ``difficulty_weights`` the runtime weights microbatches by their loss denominators
+    # (:func:`_make_grpo_scheduled_weight`); the loss and gate sums are adjusted to match.
+    weighted = _grpo_scheduled_weighted(call)
 
     def scheduled_loss(tree, batch):
         """Compute the scalar GRPO loss inside the SpectraX scheduled VJP.
@@ -2084,9 +2135,16 @@ def _make_grpo_scheduled_loss(call):
                 kl_estimator=kl_estimator,
                 off_policy_k3_threshold=off_policy_k3_threshold,
             )
+            loss = metrics.loss
+            denominator = None
+            if weighted:
+                denominator = _grpo_weighted_loss_denominator(batch, loss_type, max_loss_completion_tokens)
+                loss = loss * _grpo_local_denominator_correction(denominator).astype(loss.dtype)
             if not gated:
-                return metrics.loss
-            return metrics.loss, _grpo_scheduled_gate_sums(batch, metrics, max_loss_completion_tokens, metrics.loss)
+                return loss
+            return loss, _grpo_scheduled_gate_sums(
+                batch, metrics, max_loss_completion_tokens, loss, microbatch_weight=denominator
+            )
 
     return scheduled_loss
 
@@ -2107,14 +2165,30 @@ def _grpo_scheduled_gate_sums(
     metrics: LossMetrics,
     max_loss_completion_tokens: int | None,
     loss: jax.Array,
+    microbatch_weight: jax.Array | None = None,
 ) -> dict:
     """Additive per-microbatch sums from which the whole-batch update gate is rebuilt.
 
     ``grpo_step`` (eval mode) reports the ratio diagnostics of its microbatch; multiplying them back
     by their denominators (eligible rows, action tokens — both recomputed from the same truncated
-    completion mask ``grpo_step`` uses) yields additive sums. The scheduled runtime reduces aux with
-    one common scale per microbatch, so the ratios of the reduced sums equal the whole-batch ratios
-    the SPMD step gates on.
+    completion mask ``grpo_step`` uses) yields additive sums. Without microbatch weights the scheduled
+    runtime reduces aux with one common scale per microbatch, so the ratios of the reduced sums equal
+    the whole-batch ratios the SPMD step gates on.
+
+    With ``microbatch_weight = d_i`` the runtime (pipeline and outer accumulation alike) scales aux by
+    ``d_i / D`` instead. Each sum is then divided by ``d_i`` so its reduced value is ``sum / D``: the
+    common ``1 / D`` cancels in every ratio. ``has_behavior`` is left undivided (it reduces to ``1``)
+    and a microbatch with ``d_i = 0`` is left as is (its scale is ``0``, or uniform when ``D = 0``).
+
+    Args:
+        batch: Scheduled microbatch.
+        metrics: ``grpo_step`` eval-mode metrics of the microbatch.
+        max_loss_completion_tokens: Completion-token cap used by the loss.
+        loss: Scalar microbatch loss the sums are anchored on.
+        microbatch_weight: Optional scalar weight ``d_i`` the runtime reduces this microbatch with.
+
+    Returns:
+        Mapping of ``grpo_gate_sums/*`` aux keys to scalars.
     """
     mask = jnp.asarray(batch["completion_mask"])
     if max_loss_completion_tokens is not None and mask.shape[1] > max_loss_completion_tokens:
@@ -2135,6 +2209,10 @@ def _grpo_scheduled_gate_sums(
         }
     else:
         sums = {key: zero for key in _GRPO_GATE_SUM_KEYS}
+    if microbatch_weight is not None:
+        weight = jnp.asarray(microbatch_weight, jnp.float32)
+        inverse = jnp.where(weight > 0, 1.0 / jnp.where(weight > 0, weight, 1.0), 1.0)
+        sums = {key: value if key == "has_behavior" else value * inverse for key, value in sums.items()}
     # The pipeline runtime requires every aux output to be computed in the terminal (loss) stage;
     # values derived only from batch inputs or constants could be clustered elsewhere, so anchor
     # each sum on the (finite-sanitised) loss with a zero coefficient.
@@ -2210,6 +2288,7 @@ register_scheduled_loss_adapter(
         make_cache_key=_grpo_scheduled_loss_cache_key,
         has_aux=_grpo_update_gate_active,
         prepare_batch=_grpo_scheduled_prepare_batch,
+        make_microbatch_weight=_make_grpo_scheduled_weight,
         finalize_aux=_grpo_scheduled_finalize_aux,
     ),
 )
