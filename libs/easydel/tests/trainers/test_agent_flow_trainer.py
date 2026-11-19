@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for AgentFlowTrainer multi-turn composition wrapper."""
+"""Tests for the AgentFlowTrainer multi-turn composition wrapper and AsyncGRPO environment rewards.
+
+Tests marked ``cpu_ok`` do no array computation; the rest build JAX arrays and run on an accelerator.
+"""
 
 from __future__ import annotations
 
@@ -110,6 +113,7 @@ def _stub_trainer(cls, args=None):
     return inst
 
 
+@pytest.mark.cpu_ok
 def test_agent_flow_registry_and_config_validation():
     assert Registry.get_or_raise("trainer", "agent_flow") is AgentFlowTrainer
     assert Registry.get_or_raise("trainer-arguments", "agent_flow") is AgentFlowConfig
@@ -177,8 +181,8 @@ def test_agent_flow_wraps_grpo_family_with_tito_ids_and_masks(trainer_cls):
     assert "ref_per_token_logps" in out
     assert out["old_per_token_logps"].shape == (2, 48)
 
-    # TITO check: turn 1 prompt_ids == turn 0 prompt_ids + "a0" + "\n<user>obs1<assistant>".
-    obs_wrapped = "\n<user>obs1<assistant>"
+    # TITO check: turn 1 prompt_ids == turn 0 prompt_ids + "a0" + the template delta "<user>obs1<assistant>".
+    obs_wrapped = "<user>obs1<assistant>"
     expected_turn1_prefix = [ord(c) for c in "<user>hello<assistant>a0" + obs_wrapped]
     assert expected_turn1_prefix in seen_prompt_ids
 
@@ -365,8 +369,8 @@ def test_agent_flow_icepop_masks_out_of_band_ratios_and_handles_reset_error_and_
     inner = _stub_trainer(GRPOTrainer, args=cfg)
     # Token 0: diff = 0.0 -> exp(0) = 1.0 (kept); Token 1: diff = +2.0 -> exp(2) ~ 7.39 > 2.0 (masked to 0.0);
     # Token 2: diff = -2.0 -> exp(-2) ~ 0.135 < 0.5 (masked to 0.0).
-    inner.compute_state_logps = lambda *a, **kw: jnp.zeros((2, 16), dtype=jnp.float32).at[:, :3].set(
-        jnp.asarray([-0.1, 1.9, -2.1], dtype=jnp.float32)
+    inner.compute_state_logps = lambda *a, **kw: (
+        jnp.zeros((2, 16), dtype=jnp.float32).at[:, :3].set(jnp.asarray([-0.1, 1.9, -2.1], dtype=jnp.float32))
     )
     AgentFlowTrainer(
         arguments=AgentFlowConfig(
@@ -655,7 +659,23 @@ def test_agent_flow_async_mode_train_executes_wrapped_env_factory():
     assert env_calls == ["hi"]
 
 
-def test_agent_flow_real_grpo_step_numerics_on_cpu():
+def _numpy_grpo_reference(scale: float, *, advantages, action_rows, old_lp: float, ref_lp: float, beta: float):
+    """Independent numpy GRPO ('grpo' loss, token-level clip 0.2) for the _TinyLM below."""
+    vocab = 256
+    log_z = np.log((vocab - 4) + 4 * np.exp(scale))
+    action_lp = scale - log_z
+    total = 0.0
+    for adv, n_act in zip(advantages, action_rows, strict=True):
+        coef = np.exp(action_lp - old_lp)
+        surrogate = min(coef * adv, np.clip(coef, 0.8, 1.2) * adv)
+        d = ref_lp - action_lp
+        kl = np.exp(d) - d - 1.0
+        per_token = -surrogate + beta * kl
+        total += per_token * n_act / n_act
+    return total / len(advantages)
+
+
+def test_agent_flow_real_grpo_step_numerics_match_numpy_reference():
     inner = _stub_trainer(GRPOTrainer)
     AgentFlowTrainer(
         arguments=AgentFlowConfig(
@@ -675,6 +695,8 @@ def test_agent_flow_real_grpo_step_numerics_on_cpu():
     )
     batch, _ = inner._preprocess_batch_input(SimpleNamespace(step=0), {"prompts": ["p"]}, True)
     batch["advantages"] = jnp.asarray([1.0, -1.0], dtype=jnp.float32)
+    # Observation tokens are excluded from the loss: exactly the 4 action tokens per row are active.
+    assert np.asarray(batch["completion_mask"]).sum(axis=1).tolist() == [4, 4]
 
     class _TinyLM:
         mesh = None
@@ -686,18 +708,6 @@ def test_agent_flow_real_grpo_step_numerics_on_cpu():
             b, s = input_ids.shape
             logits = jnp.zeros((b, s, 256), dtype=jnp.float32).at[:, :, 1:5].set(self.scale)
             return SimpleNamespace(logits=logits)
-
-    state = SimpleNamespace(
-        model=_TinyLM(jnp.array(0.5, dtype=jnp.float32)),
-        graphdef=None,
-        graphstate={"scale": jnp.array(0.5, dtype=jnp.float32)},
-        graphother=None,
-        apply_loss_fn=None,
-        step=jnp.array(0),
-        tx=SimpleNamespace(update=lambda g, opt_state, params: (g, opt_state)),
-        opt_state=None,
-        merge=lambda tree: _TinyLM(tree["scale"]),
-    )
 
     def _loss(tree):
         metrics = grpo_step(
@@ -721,10 +731,16 @@ def test_agent_flow_real_grpo_step_numerics_on_cpu():
         )
         return metrics.loss
 
-    loss_val, grads = jax.value_and_grad(_loss)(state.graphstate)
-    assert jnp.isfinite(loss_val)
-    assert jnp.isfinite(grads["scale"])
-    assert float(jnp.abs(grads["scale"])) > 0.0
+    scale = 0.5
+    loss_val, grads = jax.value_and_grad(_loss)({"scale": jnp.array(scale, dtype=jnp.float32)})
+
+    def ref(s):
+        return _numpy_grpo_reference(s, advantages=[1.0, -1.0], action_rows=[4, 4], old_lp=-0.5, ref_lp=-0.5, beta=0.04)
+
+    eps = 1e-4
+    ref_grad = (ref(scale + eps) - ref(scale - eps)) / (2 * eps)
+    np.testing.assert_allclose(float(loss_val), ref(scale), rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(float(grads["scale"]), ref_grad, rtol=1e-3, atol=1e-6)
 
 
 def test_agent_flow_adapts_distillation_and_sliding_window_context():
@@ -758,3 +774,239 @@ def test_agent_flow_adapts_distillation_and_sliding_window_context():
     assert "obs2" in seen_prompts[2]
     assert metrics["agent_flow/mean_reward"] == 0.25
     assert flow.arguments.context_mode == "sliding_window"
+
+
+@pytest.mark.cpu_ok
+def test_agent_flow_advantages_use_valid_rows_only():
+    holder = SimpleNamespace(trainer=SimpleNamespace(arguments=SimpleNamespace(scale_rewards="group")))
+    rewards = np.asarray([1.0, 3.0, 0.0, 5.0, 2.0, 0.0], dtype=np.float32)
+    valid = np.asarray([1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    adv = AgentFlowTrainer._compute_advantages(holder, rewards, valid, 3)
+    # Group 0: valid rewards [1, 3] -> mean 2, std 1; failed row gets 0 and never enters the stats.
+    expected = np.asarray([-1.0 / 1.0001, 1.0 / 1.0001, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    # Group 1 has a single valid row -> zero advantage for the whole group.
+    np.testing.assert_allclose(adv, expected, rtol=1e-6, atol=1e-7)
+
+    holder.trainer.arguments.scale_rewards = "batch"
+    adv_b = AgentFlowTrainer._compute_advantages(holder, rewards, valid, 3)
+    vals = np.asarray([1.0, 3.0, 5.0])
+    ref = (vals - vals.mean()) / (vals.std() + 1e-4)
+    np.testing.assert_allclose(adv_b[[0, 1, 3]], ref, rtol=1e-6)
+    assert adv_b[[2, 4, 5]].tolist() == [0.0, 0.0, 0.0]
+
+    holder.trainer.arguments.scale_rewards = "none"
+    adv_n = AgentFlowTrainer._compute_advantages(holder, rewards, valid, 3)
+    np.testing.assert_allclose(adv_n, [-1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+
+
+@pytest.mark.cpu_ok
+def test_agent_flow_rejects_online_dpo_inner_trainer():
+    from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
+
+    with pytest.raises(ValueError, match="OnlineDPO"):
+        AgentFlowTrainer(
+            arguments=AgentFlowConfig(max_turns=1, group_size=2),
+            trainer=_stub_trainer(OnlineDPOTrainer),
+            environment_factory=lambda **kw: _MultiTurnCountingEnv(),
+        )
+
+
+@pytest.mark.cpu_ok
+def test_agent_flow_environment_only_grpo_gets_uncallable_placeholder_reward(monkeypatch):
+    from easydel.trainers.agent_flow_trainer.agent_flow_trainer import agent_flow_supplied_reward
+
+    captured: dict = {}
+
+    class _CapturingGRPO(GRPOTrainer):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.arguments = kwargs["arguments"]
+            self.processing_class = _DummyTokenizer()
+            self._preprocess_batch_input = lambda state, batch, is_train: ({}, {})
+
+    original = Registry.get_or_raise
+
+    def _get_or_raise(category, impl_name, wakeup=True):
+        if category == "trainer" and impl_name == "grpo":
+            return _CapturingGRPO
+        return original(category, impl_name, wakeup)
+
+    monkeypatch.setattr(Registry, "get_or_raise", _get_or_raise)
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(max_turns=1, base_config=GRPOConfig(num_generations=2)),
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(),
+    )
+    assert captured["reward_funcs"] is agent_flow_supplied_reward
+    with pytest.raises(RuntimeError, match="supplies episode rewards"):
+        agent_flow_supplied_reward(prompts=["p"], completions=["c"])
+
+
+def test_agent_flow_ppo_without_sampling_logprobs_scores_old_logps_with_policy():
+    inner = _stub_trainer(PPOTrainer)
+    inner.arguments.positive_reward_threshold = 0.0
+    seen: dict = {}
+
+    def _score(state, input_ids, attention_mask):
+        seen["state"] = state
+        b, s = input_ids.shape
+        comp = s - 24  # completion width = full width minus the stub's max_prompt_length
+        lps = np.tile(-0.25 * np.arange(1, comp + 1, dtype=np.float32), (b, 1))
+        return jnp.asarray(lps), jnp.full((b, comp), 0.75, dtype=jnp.float32)
+
+    inner._score_rollout_policy_and_values = _score
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(max_turns=1, group_size=1, max_prompt_length=24, max_completion_length=32),
+        trainer=inner,
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(target_turns=1, step_reward=1.0),
+        generate_turn_fn=lambda st, ids, txt, t: ([ord("x")], "x", None),
+    )
+    state = SimpleNamespace(step=3)
+    out, _ = inner._preprocess_batch_input(state, {"prompts": ["hi"]}, True)
+    assert seen["state"] is state
+    assert out["old_logps"].shape == out["completion_mask"].shape == (1, 48)
+    np.testing.assert_allclose(np.asarray(out["old_logps"])[0], -0.25 * np.arange(1, 49, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(out["old_values"]), 0.75)
+
+
+def test_agent_flow_tokenized_prompt_is_not_templated_twice():
+    inner = _stub_trainer(
+        GRPOTrainer, args=GRPOConfig(num_generations=1, max_prompt_length=32, max_completion_length=16)
+    )
+    seen: list[list[int]] = []
+
+    def gen_turn(state, prompt_ids, prompt_text, turn_idx):
+        seen.append(list(prompt_ids))
+        return [ord("y")], "y", [-0.1]
+
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(max_turns=1, group_size=1, max_prompt_length=32, max_completion_length=16),
+        trainer=inner,
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(prompt="", target_turns=1),
+        generate_turn_fn=gen_turn,
+    )
+    templated = "<user>hello<assistant>"
+    ids = [0] * (32 - len(templated)) + [ord(c) for c in templated]
+    mask = [0] * (32 - len(templated)) + [1] * len(templated)
+    inner._preprocess_batch_input(
+        SimpleNamespace(step=0),
+        {"input_ids": np.asarray([ids], dtype=np.int32), "attention_mask": np.asarray([mask], dtype=np.int32)},
+        True,
+    )
+    assert seen == [[ord(c) for c in templated]]
+
+
+def test_agent_flow_observation_is_rendered_as_template_delta_without_system_reinjection():
+    class _SystemTok(_DummyTokenizer):
+        eos_token = "<E>"
+        eos_token_id = 3
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            parts = [] if messages and messages[0]["role"] == "system" else ["<system>default<E>"]
+            parts += [f"<{m['role']}>{m['content']}<E>" for m in messages]
+            if add_generation_prompt:
+                parts.append("<assistant>")
+            return "".join(parts)
+
+    tok = _SystemTok()
+    inner = _stub_trainer(
+        GRPOTrainer, args=GRPOConfig(num_generations=1, max_prompt_length=64, max_completion_length=96)
+    )
+    inner.processing_class = tok
+    seen: list[str] = []
+
+    def gen_turn(state, prompt_ids, prompt_text, turn_idx):
+        seen.append("".join(chr(i) for i in prompt_ids))
+        return [ord("a")], "a", [-0.1]
+
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(max_turns=2, group_size=1, max_prompt_length=64, max_completion_length=96),
+        trainer=inner,
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(prompt="P", target_turns=2),
+        generate_turn_fn=gen_turn,
+    )
+    inner._preprocess_batch_input(SimpleNamespace(step=0), {"prompts": ["P"]}, True)
+    expected_turn1 = tok.apply_chat_template(
+        [
+            {"role": "user", "content": "P"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "obs1"},
+        ],
+        add_generation_prompt=True,
+    )
+    assert seen[1] == expected_turn1
+    assert seen[1].count("<system>") == 1
+
+
+def test_agent_flow_conversational_prompt_is_rendered_once_and_seeds_chat_history():
+    tok = _DummyTokenizer()
+    inner = _stub_trainer(
+        GRPOTrainer, args=GRPOConfig(num_generations=1, max_prompt_length=64, max_completion_length=96)
+    )
+    inner.processing_class = tok
+    seen: list[str] = []
+
+    def gen_turn(state, prompt_ids, prompt_text, turn_idx):
+        seen.append("".join(chr(i) for i in prompt_ids))
+        return [ord("a")], "a", [-0.1]
+
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(
+            max_turns=2,
+            group_size=1,
+            max_prompt_length=64,
+            max_completion_length=96,
+            skip_apply_chat_template=False,
+        ),
+        trainer=inner,
+        # Empty reset observation: the episode prompt comes from the batch's message list.
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(prompt="", target_turns=2),
+        generate_turn_fn=gen_turn,
+    )
+    messages = [{"role": "system", "content": "S"}, {"role": "user", "content": "Q"}]
+    inner._preprocess_batch_input(SimpleNamespace(step=0), {"prompt": [messages]}, True)
+
+    assert seen[0] == tok.apply_chat_template(messages, add_generation_prompt=True)
+    assert "'role'" not in seen[0]
+    # The observation delta is rendered against a history seeded with the original messages.
+    assert seen[1] == tok.apply_chat_template(
+        [*messages, {"role": "assistant", "content": "a"}, {"role": "user", "content": "obs1"}],
+        add_generation_prompt=True,
+    )
+
+
+def test_async_grpo_environment_only_counts_environment_reward_once(monkeypatch):
+    from easydel.trainers.async_grpo_trainer import AsyncGRPOConfig, AsyncGRPOTrainer, environment_reward_placeholder
+    from easydel.trainers.group_relative_policy_optimization.grpo_trainer import _compute_rewards_and_advantages
+    from easydel.trainers.trainer.trainer import Trainer
+
+    # Run the real AsyncGRPOTrainer -> GRPOTrainer.__init__ reward setup; only the generic Trainer base
+    # (model compilation, dataloaders) is skipped.
+    monkeypatch.setattr(Trainer, "__init__", lambda self, **kw: None)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("dp",))
+    fake_state = SimpleNamespace(model=SimpleNamespace(mesh=mesh))
+    fake_model = SimpleNamespace(to_state=lambda **kw: fake_state)
+    args = AsyncGRPOConfig(num_generations=2, beta=0.0, disable_dropout=False)
+    factory = lambda **kw: _MultiTurnCountingEnv()  # noqa: E731
+    trainer = AsyncGRPOTrainer(
+        arguments=args, model=fake_model, processing_class=_DummyTokenizer(), environment_factory=factory
+    )
+
+    assert trainer.reward_funcs == [environment_reward_placeholder]
+    assert trainer.environment_factory is factory
+    np.testing.assert_array_equal(np.asarray(trainer.reward_weights), np.asarray([0.0], dtype=np.float32))
+
+    env_rewards = np.asarray([0.0, 1.0, 0.5, 2.0], dtype=np.float32)
+    placeholder_col = np.asarray(trainer.reward_funcs[0](prompts=["p"] * 4, completions=["c"] * 4), dtype=np.float32)
+    rewards_per_func = jnp.asarray(np.stack([placeholder_col, env_rewards], axis=1))
+    # GRPO appends the environment column after the reward_funcs columns with weight 1.0.
+    reward_weights = jnp.concatenate([trainer.reward_weights, jnp.ones((1,), dtype=trainer.reward_weights.dtype)])
+    rewards, *_ = _compute_rewards_and_advantages(
+        rewards_per_func=rewards_per_func,
+        reward_weights=reward_weights,
+        generation_factor=2,
+        scale_rewards=trainer.scale_rewards,
+        multi_objective_aggregation=trainer.multi_objective_aggregation,
+        arguments=trainer.arguments,
+        group_reduction=trainer._group_reduction,
+    )
+    np.testing.assert_allclose(np.asarray(rewards), env_rewards, rtol=1e-6)

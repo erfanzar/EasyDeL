@@ -78,6 +78,37 @@ EpisodeRunnerFn = tp.Callable[
 ]
 
 
+_TEMPLATE_PROBE = "\u2063agent-flow-template-probe\u2063"
+
+
+def agent_flow_supplied_reward(**_kwargs: tp.Any) -> list[float]:
+    """Placeholder ``reward_funcs`` entry for GRPO-family trainers built inside :class:`AgentFlowTrainer`.
+
+    GRPO-family trainers require at least one reward function at construction.
+    Under ``AgentFlowTrainer`` the wrapper replaces the inner trainer's
+    ``_preprocess_batch_input`` and supplies episode rewards and advantages
+    itself, so the inner reward path never runs. This function only satisfies
+    the constructor contract and raises if it is ever invoked.
+
+    Raises:
+        RuntimeError: Always; reaching it means rewards were requested from
+            the inner trainer instead of the AgentFlow episode loop.
+    """
+    raise RuntimeError(
+        "agent_flow_supplied_reward was called: AgentFlowTrainer supplies episode rewards itself, so the inner "
+        "trainer's reward path must not run. Pass real `reward_funcs` if the inner trainer scores completions."
+    )
+
+
+def _is_message_list(value: tp.Any) -> bool:
+    """Whether ``value`` is a non-empty conversational message list (``{"role", "content"}`` mappings)."""
+    return (
+        isinstance(value, (list, tuple))
+        and bool(value)
+        and all(isinstance(m, collections.abc.Mapping) and "role" in m and "content" in m for m in value)
+    )
+
+
 def _default_context_manager(
     initial_prompt: str,
     history: list[AgentFlowTurn],
@@ -193,6 +224,7 @@ class AgentFlowTrainer:
         self._rollout_lock = threading.Lock()
 
         if trainer is not None:
+            self._reject_unsupported_trainer(type(trainer))
             self.trainer = trainer
             inferred = self._infer_trainer_type(trainer)
             if inferred is not None:
@@ -248,6 +280,27 @@ class AgentFlowTrainer:
         return frozenset(name for name in sig.parameters if name != "self")
 
     @staticmethod
+    def _reject_unsupported_trainer(trainer_cls: type) -> None:
+        """Refuse inner trainers whose loss cannot honour the multi-turn action mask.
+
+        OnlineDPO's preference loss masks tokens only through the completion
+        attention mask, so observation tokens inside an agentic trajectory
+        would be scored as policy actions (or hidden from attention). Until the
+        preference step accepts a separate loss mask it is rejected here.
+
+        Raises:
+            ValueError: If ``trainer_cls`` is an OnlineDPO trainer.
+        """
+        from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
+
+        if isinstance(trainer_cls, type) and issubclass(trainer_cls, OnlineDPOTrainer):
+            raise ValueError(
+                "AgentFlowTrainer does not support OnlineDPO as the inner trainer: the DPO loss derives its loss "
+                "mask from the completion attention mask and cannot exclude environment observation tokens. "
+                "Use a GRPO-family or PPO-family `base_trainer_type` instead."
+            )
+
+    @staticmethod
     def _infer_trainer_type(trainer: tp.Any) -> str | None:
         """Infer the registered trainer type name from an existing trainer instance."""
         trainer_cls = type(trainer)
@@ -269,6 +322,7 @@ class AgentFlowTrainer:
         **trainer_kwargs: tp.Any,
     ) -> tp.Any:
         trainer_cls = Registry.get_or_raise("trainer", cfg.base_trainer_type)
+        self._reject_unsupported_trainer(trainer_cls)
         base_cfg = cfg.base_config
         if base_cfg is None:
             cfg_cls = Registry.get_or_raise("trainer-arguments", cfg.base_trainer_type)
@@ -301,6 +355,13 @@ class AgentFlowTrainer:
             ctor_kwargs["model"] = model
         if model_state is not None:
             ctor_kwargs["model_state"] = model_state
+        if reward_funcs is None:
+            from easydel.trainers.group_relative_policy_optimization import GRPOTrainer
+
+            if isinstance(trainer_cls, type) and issubclass(trainer_cls, GRPOTrainer):
+                # Environment-only setup: GRPO-family constructors require a reward, but the wrapper
+                # supplies episode rewards/advantages, so pass a placeholder that is never called.
+                reward_funcs = agent_flow_supplied_reward
         if reward_funcs is not None:
             ctor_kwargs["reward_funcs"] = reward_funcs
         return trainer_cls(**ctor_kwargs)
@@ -327,8 +388,41 @@ class AgentFlowTrainer:
             return make_environment_factory(merged)
         return lambda **_kw: spec
 
+    def _generation_prompt_suffix(self) -> str | None:
+        """Return the text the chat template emits after a user message's content (with generation prompt).
+
+        Used to recognise prompts that were already templated upstream (e.g. decoded from a tokenized
+        GRPO batch), so the template is not applied twice. ``None`` when no template is available.
+        """
+        if "_cached_generation_suffix" in self.__dict__:
+            return self.__dict__["_cached_generation_suffix"]
+        suffix: str | None = None
+        tok = getattr(self.trainer, "processing_class", None)
+        apply_fn = getattr(tok, "apply_chat_template", None)
+        if callable(apply_fn):
+            try:
+                rendered = str(
+                    apply_fn([{"role": "user", "content": _TEMPLATE_PROBE}], tokenize=False, add_generation_prompt=True)
+                )
+                pos = rendered.find(_TEMPLATE_PROBE)
+                if pos >= 0:
+                    tail = rendered[pos + len(_TEMPLATE_PROBE) :].rstrip()
+                    suffix = tail or None
+            except Exception:
+                suffix = None
+        self.__dict__["_cached_generation_suffix"] = suffix
+        return suffix
+
+    def _is_chat_templated(self, prompt: str) -> bool:
+        """Whether ``prompt`` already ends with the chat template's generation-prompt markup."""
+        suffix = self._generation_prompt_suffix()
+        return bool(suffix) and prompt.rstrip().endswith(suffix)
+
     def _format_initial_prompt(self, prompt: str) -> str:
         if self.arguments.skip_apply_chat_template:
+            return prompt
+        if self._is_chat_templated(prompt):
+            # Prompt recovered from a tokenized batch is already templated; templating again would nest it.
             return prompt
         tok = getattr(self.trainer, "processing_class", None)
         apply_fn = getattr(tok, "apply_chat_template", None)
@@ -344,9 +438,103 @@ class AgentFlowTrainer:
                 return prompt
         return prompt
 
-    def _format_observation_turn(self, raw_obs: str, *, ends_with_eos: bool) -> str:
+    def _format_initial_messages(self, messages: list[dict[str, str]]) -> str:
+        """Render a conversational prompt with the chat template (generation prompt appended).
+
+        Falls back to newline-joined message contents when templating is skipped or unavailable.
+        """
+        plain = "\n".join(m["content"] for m in messages)
+        if self.arguments.skip_apply_chat_template:
+            return plain
+        tok = getattr(self.trainer, "processing_class", None)
+        apply_fn = getattr(tok, "apply_chat_template", None)
+        if callable(apply_fn):
+            try:
+                return str(apply_fn(list(messages), tokenize=False, add_generation_prompt=True))
+            except Exception:
+                return plain
+        return plain
+
+    def _render_observation_delta(
+        self,
+        raw_obs: str,
+        *,
+        history: list[dict[str, str]],
+        ends_with_eos: bool,
+    ) -> str | None:
+        """Render an observation as the chat-template delta appended to the running conversation.
+
+        Computes ``render(history + [obs as user], add_generation_prompt=True)`` minus ``render(history)``
+        as a string-prefix difference, so template-level preambles (default system blocks, BOS) are never
+        re-emitted mid-trajectory. ``history`` ends with the assistant turn that was just generated; the
+        template's closing markup for that turn (everything rendered after the action text) is prepended
+        to the delta, minus the EOS token when the generated action already ended with it.
+
+        Args:
+            raw_obs: Observation text from the environment.
+            history: Conversation so far as ``{"role", "content"}`` messages, ending with the assistant turn.
+            ends_with_eos: Whether the generated action token ids ended with the tokenizer EOS id.
+
+        Returns:
+            The text to append after the action tokens, or ``None`` when the template cannot be rendered
+            or the prefix check fails (callers then fall back to standalone rendering).
+        """
+        tok = getattr(self.trainer, "processing_class", None)
+        apply_fn = getattr(tok, "apply_chat_template", None)
+        if not callable(apply_fn) or not history or history[-1].get("role") != "assistant":
+            return None
+        try:
+            base = str(apply_fn(list(history), tokenize=False, add_generation_prompt=False))
+            full = str(
+                apply_fn(
+                    [*history, {"role": "user", "content": raw_obs}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+        except Exception:
+            return None
+        if not full.startswith(base):
+            return None
+        delta = full[len(base) :]
+        eos = getattr(tok, "eos_token", None) or ""
+        # Locate the assistant turn's closing markup with a probe so short action texts that also occur
+        # inside template markup cannot be mistaken for the action.
+        closing: str | None = None
+        try:
+            probed = str(
+                apply_fn(
+                    [*history[:-1], {"role": "assistant", "content": _TEMPLATE_PROBE}],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+            pos = probed.find(_TEMPLATE_PROBE)
+            if pos >= 0:
+                closing = probed[pos + len(_TEMPLATE_PROBE) :]
+        except Exception:
+            closing = None
+        if closing is not None:
+            if ends_with_eos and eos and closing.startswith(eos):
+                closing = closing[len(eos) :]
+        else:
+            # The template rewrote the action (e.g. stripped reasoning); only close the turn with EOS.
+            closing = "" if ends_with_eos else eos
+        return f"{closing}{delta}"
+
+    def _format_observation_turn(
+        self,
+        raw_obs: str,
+        *,
+        ends_with_eos: bool,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
         if self.arguments.skip_apply_chat_template:
             return f"\n[Observation]: {raw_obs}\n"
+        if history is not None:
+            delta = self._render_observation_delta(raw_obs, history=history, ends_with_eos=ends_with_eos)
+            if delta is not None:
+                return delta
         tok = getattr(self.trainer, "processing_class", None)
         apply_fn = getattr(tok, "apply_chat_template", None)
         if callable(apply_fn):
@@ -460,8 +648,15 @@ class AgentFlowTrainer:
                 )
 
             reset_res = env.reset()
-            raw_prompt = str(reset_res.observation or task.get("prompt", ""))
-            initial_prompt = self._format_initial_prompt(raw_prompt)
+            prompt_source = reset_res.observation or task.get("prompt", "")
+            if _is_message_list(prompt_source):
+                # Conversational prompt: render the messages once and mirror them in the chat history.
+                prompt_messages = [{"role": str(m["role"]), "content": str(m["content"])} for m in prompt_source]
+                initial_prompt = self._format_initial_messages(prompt_messages)
+            else:
+                raw_prompt = str(prompt_source)
+                prompt_messages = [{"role": "user", "content": raw_prompt}]
+                initial_prompt = self._format_initial_prompt(raw_prompt)
             initial_prompt_ids = self._encode_text(initial_prompt)
 
             if reset_res.info.get("env_error"):
@@ -486,6 +681,8 @@ class AgentFlowTrainer:
             has_logprobs = True
             step_rewards: list[float] = []
             env_failed = False
+            # Message-level mirror of the trajectory, used to render observations as chat-template deltas.
+            chat_history: list[dict[str, str]] = list(prompt_messages)
 
             for turn_idx in range(self.arguments.max_turns):
                 if self._context_manager is not None:
@@ -530,11 +727,14 @@ class AgentFlowTrainer:
 
                 eos_id = getattr(getattr(self.trainer, "processing_class", None), "eos_token_id", None)
                 ends_with_eos = bool(act_ids and eos_id is not None and int(act_ids[-1]) == int(eos_id))
+                chat_history.append({"role": "assistant", "content": act_text})
                 obs_text = (
                     ""
                     if (step_res.terminated or step_res.truncated or is_last_turn or not raw_obs)
-                    else self._format_observation_turn(raw_obs, ends_with_eos=ends_with_eos)
+                    else self._format_observation_turn(raw_obs, ends_with_eos=ends_with_eos, history=chat_history)
                 )
+                if obs_text:
+                    chat_history.append({"role": "user", "content": raw_obs})
                 obs_ids = self._encode_text(obs_text) if obs_text else []
                 if obs_cap is not None and len(obs_ids) > obs_cap and self.arguments.skip_apply_chat_template:
                     obs_ids = obs_ids[:obs_cap]
@@ -605,17 +805,42 @@ class AgentFlowTrainer:
             if callable(close_fn):
                 close_fn()
 
+    def _decode_prompt_rows(self, ids: tp.Any, mask: tp.Any) -> list[str]:
+        """Decode tokenized prompt rows back to text, keeping template special tokens.
+
+        Padding is removed through ``mask`` (when given) instead of ``skip_special_tokens``, so chat-template
+        markers survive decoding and :meth:`_format_initial_prompt` can recognise an already-templated prompt.
+        """
+        arr = np.asarray(ids)
+        mask_arr = None if mask is None else np.asarray(mask)
+        tok = getattr(self.trainer, "processing_class", None)
+        rows: list[str] = []
+        for r, row in enumerate(arr):
+            kept = [int(t) for c, t in enumerate(row.tolist()) if mask_arr is None or int(mask_arr[r, c])]
+            if tok is None:
+                rows.append(self._decode_ids(kept))
+                continue
+            try:
+                rows.append(str(tok.decode(kept, skip_special_tokens=False)))
+            except TypeError:
+                rows.append(str(tok.decode(kept)))
+        return rows
+
     def _extract_tasks(self, batch: collections.abc.Mapping[str, tp.Any]) -> list[dict[str, tp.Any]]:
         if "tasks" in batch and isinstance(batch["tasks"], list):
             return [dict(t) if isinstance(t, collections.abc.Mapping) else {"prompt": str(t)} for t in batch["tasks"]]
 
         prompts = batch.get("prompts")
+        raw_prompts = batch.get("prompt")
+        if prompts is None and isinstance(raw_prompts, (list, tuple)) and raw_prompts:
+            # Raw prompt text / conversational messages kept through preprocessing take priority over
+            # decoding token ids; anything else (e.g. arrays) falls through to the tokenized columns.
+            if all(isinstance(p, str) for p in raw_prompts) or all(_is_message_list(p) for p in raw_prompts):
+                prompts = list(raw_prompts)
         if prompts is None and "prompt_ids" in batch:
-            p_arr = np.asarray(batch["prompt_ids"])
-            prompts = [self._decode_ids(row.tolist()) for row in p_arr]
+            prompts = self._decode_prompt_rows(batch["prompt_ids"], batch.get("prompt_mask"))
         if prompts is None and "input_ids" in batch:
-            i_arr = np.asarray(batch["input_ids"])
-            prompts = [self._decode_ids(row.tolist()) for row in i_arr]
+            prompts = self._decode_prompt_rows(batch["input_ids"], batch.get("attention_mask"))
         if prompts is None:
             prompts = [""]
 
@@ -624,7 +849,7 @@ class AgentFlowTrainer:
         for idx in range(n):
             task: dict[str, tp.Any] = {"prompt": prompts[idx]}
             for k, v in batch.items():
-                if k in {"prompts", "prompt_ids", "prompt_mask", "input_ids", "attention_mask"}:
+                if k in {"prompts", "prompt", "prompt_ids", "prompt_mask", "input_ids", "attention_mask"}:
                     continue
                 if isinstance(v, (list, tuple)) and len(v) == n:
                     task[k] = v[idx]
@@ -659,28 +884,52 @@ class AgentFlowTrainer:
         return None
 
     def _compute_advantages(self, rewards: np.ndarray, valid_mask: np.ndarray, group_size: int) -> np.ndarray:
-        masked = rewards * valid_mask
+        """Compute per-episode advantages with statistics taken over valid (non-``env_error``) rows only.
+
+        Failed episodes never enter a mean or standard deviation and always receive a zero advantage.
+        With ``group_size > 1`` each group is centred (and, unless ``scale_rewards == "none"``, scaled)
+        by the mean/std of its valid rows; a group with fewer than two valid rows gets zero advantage.
+        ``scale_rewards == "batch"`` uses the valid rows of the whole batch instead (zero if fewer than
+        two). With ``group_size <= 1`` (PPO/VAPO, single rollouts) raw rewards are kept unless batch
+        scaling is requested.
+
+        Args:
+            rewards: Episode rewards, shape ``[num_episodes]``.
+            valid_mask: ``1.0`` for valid episodes and ``0.0`` for failed ones, same shape.
+            group_size: Episodes per prompt group.
+
+        Returns:
+            Float32 advantages of shape ``[num_episodes]``.
+        """
+        rewards = np.asarray(rewards, dtype=np.float64)
+        valid = np.asarray(valid_mask, dtype=np.float64) > 0.0
+        out = np.zeros(rewards.shape, dtype=np.float64)
         scale_rewards = str(getattr(getattr(self.trainer, "arguments", None), "scale_rewards", "group")).lower()
+
+        def _normalize(idx: np.ndarray, *, scale: bool) -> None:
+            sel = idx[valid[idx]]
+            if sel.size < 2:
+                return
+            vals = rewards[sel]
+            centred = vals - vals.mean()
+            out[sel] = centred / (vals.std() + 1e-4) if scale else centred
+
+        all_idx = np.arange(rewards.shape[0])
         # With group_size == 1 (e.g. PPO/VAPO or single-rollout), group-centering would zero all rows.
         if group_size <= 1:
-            if len(masked) > 1 and scale_rewards == "batch":
-                mean = float(np.mean(masked))
-                std = float(np.std(masked))
-                return ((masked - mean) / (std + 1e-4)).astype(np.float32) * valid_mask
-            return masked.astype(np.float32)
+            if scale_rewards == "batch":
+                _normalize(all_idx, scale=True)
+                return out.astype(np.float32)
+            return np.where(valid, rewards, 0.0).astype(np.float32)
 
         if scale_rewards == "batch":
-            mean = float(np.mean(masked))
-            std = float(np.std(masked))
-            return ((masked - mean) / (std + 1e-4)).astype(np.float32) * valid_mask
+            _normalize(all_idx, scale=True)
+            return out.astype(np.float32)
 
-        num_groups = max(1, len(masked) // max(1, group_size))
-        grouped = masked.reshape(num_groups, group_size)
-        g_mean = np.mean(grouped, axis=1, keepdims=True)
-        if scale_rewards == "none":
-            return (grouped - g_mean).reshape(-1).astype(np.float32) * valid_mask
-        g_std = np.std(grouped, axis=1, keepdims=True)
-        return ((grouped - g_mean) / (g_std + 1e-4)).reshape(-1).astype(np.float32) * valid_mask
+        num_groups = max(1, rewards.shape[0] // max(1, group_size))
+        for g in range(num_groups):
+            _normalize(all_idx[g * group_size : (g + 1) * group_size], scale=scale_rewards != "none")
+        return out.astype(np.float32)
 
     def _is_ppo_family(self) -> bool:
         from easydel.trainers.proximal_policy_optimization_trainer import PPOTrainer
@@ -690,7 +939,6 @@ class AgentFlowTrainer:
     def _is_distillation_or_preference_family(self) -> bool:
         from easydel.trainers.generalized_knowledge_distillation_trainer import GKDTrainer
         from easydel.trainers.on_policy_distillation_trainer import OnPolicyDistillationTrainer
-        from easydel.trainers.online_dpo_trainer import OnlineDPOTrainer
         from easydel.trainers.sdft_trainer import SDFTTrainer
         from easydel.trainers.self_distillation_policy_optimization import SDPOTrainer
         from easydel.trainers.seq_kd_trainer import SeqKDTrainer
@@ -701,7 +949,6 @@ class AgentFlowTrainer:
             (
                 GKDTrainer,
                 OnPolicyDistillationTrainer,
-                OnlineDPOTrainer,
                 SDFTTrainer,
                 SDPOTrainer,
                 SeqKDTrainer,
@@ -775,6 +1022,23 @@ class AgentFlowTrainer:
             ret_2d = jnp.broadcast_to(jnp.asarray(rewards_np)[:, None], completion_ids.shape)
             pos_thresh = float(getattr(getattr(self.trainer, "arguments", None), "positive_reward_threshold", 0.0))
             positive_mask = jnp.asarray((rewards_np > pos_thresh) & (valid_np > 0.0), dtype=jnp.float32)
+            old_values = jnp.zeros_like(ret_2d)
+            if lp_arr is not None:
+                old_logps = lp_arr
+            else:
+                # No sampling logprobs: score the trajectory under the current policy (as PPOTrainer does)
+                # so the clipped ratio starts at 1 instead of exp(new_logps - 0).
+                score_fn = getattr(self.trainer, "_score_rollout_policy_and_values", None)
+                if not callable(score_fn) or state is None:
+                    raise RuntimeError(
+                        "AgentFlowTrainer with a PPO-family trainer needs per-token sampling logprobs from "
+                        "`generate_turn_fn`/rollout, or a trainer that can score rollouts "
+                        "(`_score_rollout_policy_and_values`) and a policy state."
+                    )
+                old_logps, scored_values = score_fn(state, input_ids, attention_mask)
+                old_logps = jnp.asarray(old_logps)[:, -completion_ids.shape[1] :]
+                if scored_values is not None:
+                    old_values = jnp.asarray(scored_values)[:, -completion_ids.shape[1] :]
             out: dict[str, tp.Any] = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -782,8 +1046,8 @@ class AgentFlowTrainer:
                 "rewards": jnp.asarray(rewards_np),
                 "returns": ret_2d,
                 "advantages": adv_2d,
-                "old_values": jnp.zeros_like(ret_2d),
-                "old_logps": lp_arr if lp_arr is not None else jnp.zeros_like(ret_2d),
+                "old_values": old_values,
+                "old_logps": old_logps,
                 "positive_mask": positive_mask,
             }
             if lp_arr is not None:
@@ -822,7 +1086,9 @@ class AgentFlowTrainer:
             out["old_per_token_logps"] = lp_arr
 
         inner_args = getattr(self.trainer, "arguments", None)
-        needs_esurge_is = bool(getattr(inner_args, "esurge_importance_sampling_correction", False)) and lp_arr is not None
+        needs_esurge_is = (
+            bool(getattr(inner_args, "esurge_importance_sampling_correction", False)) and lp_arr is not None
+        )
         if is_train and needs_esurge_is:
             compute_state_logps = getattr(self.trainer, "compute_state_logps", None)
             if callable(compute_state_logps) and state is not None:
@@ -927,4 +1193,5 @@ __all__ = [
     "AgentFlowEpisode",
     "AgentFlowTrainer",
     "AgentFlowTurn",
+    "agent_flow_supplied_reward",
 ]

@@ -28,15 +28,50 @@ from ..group_relative_policy_optimization import GRPOTrainer
 from .async_grpo_config import AsyncGRPOConfig
 
 
+def environment_reward_placeholder(
+    *,
+    prompts: tp.Sequence[tp.Any] | None = None,
+    completions: tp.Sequence[tp.Any] | None = None,
+    **_kwargs: tp.Any,
+) -> list[float]:
+    """Zero-weight ``reward_funcs`` entry for environment-only GRPO runs.
+
+    When a GRPO-family trainer has an ``environment_factory``, it steps the
+    environments itself and appends their rewards as an extra reward column
+    with weight ``1.0``. GRPO still requires at least one reward function, and
+    a function that echoed ``environment_rewards`` would count the environment
+    reward a second time. This placeholder returns ``0.0`` per completion and
+    carries ``weight = 0.0``, so the aggregated reward equals the environment
+    reward exactly once. An explicit ``reward_weights`` in the trainer config
+    overrides the attribute weight; its first entry should then be ``0.0``.
+
+    Args:
+        prompts: Prompt records (used only for the output length fallback).
+        completions: Completion records; one zero is returned per entry.
+
+    Returns:
+        A list of zeros, one per completion.
+    """
+    count = len(completions) if completions is not None else len(prompts or ())
+    return [0.0] * count
+
+
+environment_reward_placeholder.weight = 0.0
+
+
 @Registry.register("trainer", "async_grpo")
 class AsyncGRPOTrainer(GRPOTrainer):
     """AsyncGRPO trainer using GRPO updates with eSurge async rollouts.
 
     Thin convenience wrapper over :class:`GRPOTrainer` with
     ``arguments.async_mode=True`` and plug-and-play ``environment`` support.
+    With an environment and no ``reward_funcs``, the trainer installs
+    :func:`environment_reward_placeholder` so the environment reward column is
+    the only reward source.
     """
 
     arguments: AsyncGRPOConfig
+    emit_legacy_async_grpo_metrics: tp.ClassVar[bool] = True
 
     def __init__(
         self,
@@ -73,13 +108,10 @@ class AsyncGRPOTrainer(GRPOTrainer):
                 environment_factory = AutoEnvironment.as_factory(env_spec, runtime=resolved_runtime)
 
         if reward_funcs is None:
-            if environment_factory is not None or env_spec is not None:
-                from easydel.environments import make_environment_reward_fn
-
-                reward_funcs = make_environment_reward_fn(
-                    env_spec if (env_spec is not None and not callable(env_spec)) else "auto",
-                    runtime=resolved_runtime,
-                )
+            if environment_factory is not None:
+                # GRPO appends the stepped environment rewards as their own column; a reward fn that
+                # echoed them would double-count, so install a zero-weight placeholder instead.
+                reward_funcs = environment_reward_placeholder
             else:
                 raise ValueError("AsyncGRPOTrainer requires `reward_funcs` unless `environment` is provided.")
 

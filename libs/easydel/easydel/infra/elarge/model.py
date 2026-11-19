@@ -85,6 +85,7 @@ from .types import (
     get_training_arguments_class,
     normalize_trainer_config,
 )
+from .types.training import ELARGE_ENVIRONMENT_TRAINER_KEYS
 
 if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -1617,12 +1618,15 @@ class eLargeModel:
         Constructor errors propagate without a retry. ``explicit_keys`` remains
         accepted for compatibility but does not change option filtering.
         """
+        params = inspect.signature(args_class).parameters
+        # Environment keys are eLarge-only for most trainers, but argument classes that declare them
+        # (AgentFlow, AsyncGRPO) read the environment from their own config, so forward them there.
         config_for_args = {
             key: value
             for key, value in trainer_cfg.items()
-            if key != "trainer_type" and key not in ELARGE_ONLY_TRAINER_KEYS
+            if key != "trainer_type"
+            and (key not in ELARGE_ONLY_TRAINER_KEYS or (key in ELARGE_ENVIRONMENT_TRAINER_KEYS and key in params))
         }
-        params = inspect.signature(args_class).parameters
         if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
             config_for_args = {key: value for key, value in config_for_args.items() if key in params}
         return args_class(**config_for_args)
@@ -2705,12 +2709,8 @@ class eLargeModel:
             env_factory = kwargs.get("environment_factory", kwargs.get("env_factory", None))
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
             if env_spec is not None and (env_factory is None or resolved_reward is None):
-                from easydel.environments import (
-                    AutoEnvironment,
-                    KiriRuntime,
-                    SandboxPool,
-                    make_environment_reward_fn,
-                )
+                from easydel.environments import AutoEnvironment, KiriRuntime, SandboxPool
+                from easydel.trainers.async_grpo_trainer import environment_reward_placeholder
 
                 tcfg = self.config.get("trainer", {})
                 env_backend = str(tcfg.get("environment_backend", "kiri"))
@@ -2723,7 +2723,9 @@ class eLargeModel:
                 if env_factory is None:
                     env_factory = AutoEnvironment.as_factory(env_spec, runtime=env_runtime)
                 if resolved_reward is None:
-                    resolved_reward = make_environment_reward_fn(env_spec, runtime=env_runtime)
+                    # GRPO appends the stepped environment rewards as their own column; a zero-weight
+                    # placeholder keeps the environment reward counted exactly once.
+                    resolved_reward = environment_reward_placeholder
 
             if resolved_reward is None:
                 raise ValueError(
