@@ -31,6 +31,7 @@ Key Features:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import os
@@ -1631,6 +1632,68 @@ class eLargeModel:
             config_for_args = {key: value for key, value in config_for_args.items() if key in params}
         return args_class(**config_for_args)
 
+    @staticmethod
+    def _agent_flow_inner_trainer_params(base_type: str) -> Mapping[str, inspect.Parameter] | None:
+        """Constructor parameters of AgentFlow's inner trainer, or ``None`` when it accepts ``**kwargs``."""
+        try:
+            params = inspect.signature(get_trainer_class(base_type)).parameters
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return None
+        return params
+
+    def _agent_flow_base_config(self, training_args: Any, raw_trainer_cfg: Mapping[str, Any]) -> Any | None:
+        """Build the inner trainer's arguments for an ``agent_flow`` run from the same YAML section.
+
+        Without this, ``AgentFlowTrainer`` would build the inner config from a fixed handful of fields and
+        drop every algorithm hyperparameter (``beta``, ``loss_type``, ``max_new_tokens``, ...). The inner
+        config is seeded with the fields AgentFlow has always forwarded, then receives every key the user
+        set explicitly in the trainer section; keys the inner argument class does not declare are dropped,
+        and unset keys keep that class's own dataclass defaults. AgentFlow-only fields (environment,
+        episode controls, ``trainer_prefix``) stay on the wrapper.
+
+        Returns:
+            The constructed inner ``TrainingArguments``, or ``None`` when the user already supplied
+            ``base_config`` (AgentFlow then uses it as given).
+        """
+        if getattr(training_args, "base_config", None) is not None:
+            return None
+        from easydel.trainers.agent_flow_trainer import AgentFlowConfig
+        from easydel.trainers.training_configurations import TrainingArguments
+
+        base_type = str(training_args.base_trainer_type)
+        wrapper_only = (
+            {f.name for f in dataclasses.fields(AgentFlowConfig)}
+            - {f.name for f in dataclasses.fields(TrainingArguments)}
+        ) - {"max_prompt_length", "max_completion_length", "num_generations", "skip_apply_chat_template"}
+        wrapper_only |= {"trainer_type", "trainer_prefix", *ELARGE_ONLY_TRAINER_KEYS}
+
+        cfg: dict[str, Any] = {}
+        for key in (
+            "learning_rate",
+            "max_training_steps",
+            "save_directory",
+            "async_mode",
+            "max_prompt_length",
+            "max_completion_length",
+            "total_batch_size",
+            "gradient_accumulation_steps",
+            "num_generations",
+        ):
+            value = getattr(training_args, key, None)
+            if value is not None:
+                cfg[key] = value
+        normalized = normalize_trainer_config(dict(raw_trainer_cfg))
+        for key in raw_trainer_cfg:
+            if key not in wrapper_only and key in normalized:
+                cfg[key] = normalized[key]
+
+        args_class = get_training_arguments_class(base_type)
+        params = inspect.signature(args_class).parameters
+        cfg = {key: value for key, value in cfg.items() if key in params}
+        return args_class(**cfg)
+
     def _build_pre_tokenize_transform(
         self,
         trainer_type: str | None = None,
@@ -2678,11 +2741,28 @@ class eLargeModel:
                 reward_model = self.build_reward_model()
                 if reward_model is not None:
                     trainer_kwargs["reward_funcs"] = reward_model
+            base_params = self._agent_flow_inner_trainer_params(base_type)
             if base_type not in {"ppo", "vapo", "gkd", "on_policy_distillation", "seq_kd", "sdft", "ssd"}:
-                if kwargs.get("reward_processing_classes") is not None:
-                    trainer_kwargs["reward_processing_classes"] = kwargs["reward_processing_classes"]
-                if kwargs.get("data_tokenize_fn") is not None:
-                    trainer_kwargs["data_tokenize_fn"] = kwargs["data_tokenize_fn"]
+                # Only forward runtime options the inner trainer's constructor declares (OnlineDPO, for
+                # example, takes reward_processing_classes but not data_tokenize_fn).
+                for key in ("reward_processing_classes", "data_tokenize_fn"):
+                    if kwargs.get(key) is not None and (base_params is None or key in base_params):
+                        trainer_kwargs[key] = kwargs[key]
+            base_config = self._agent_flow_base_config(
+                training_args,
+                {**dict(self._config.get("trainer", {})), **argument_overrides},
+            )
+            if base_config is not None:
+                training_args.base_config = base_config
+            if base_params is not None and "reference_model" in base_params:
+                # Preference inners (OnlineDPO) take a frozen reference; build it from YAML when configured,
+                # otherwise the inner trainer falls back to a frozen copy of the policy.
+                if reference_model is None:
+                    reference_model = self.build_reference_model()
+                if reference_model is not None and base_state_class is not None:
+                    reference_model = reference_model.to_state(base_state_class)
+                if reference_model is not None:
+                    trainer_kwargs["reference_model"] = reference_model
             if kwargs.get("environment") is not None:
                 trainer_kwargs["environment"] = kwargs["environment"]
             if kwargs.get("environment_factory") is not None:

@@ -172,8 +172,90 @@ class AgentFlowConfig(TrainingArguments):
                 f"`environment_backend` must be 'local', 'kiri', 'docker', or 'auto'; got {self.environment_backend!r}."
             )
         self.base_trainer_type = str(self.base_trainer_type).strip().lower()
-        if self.base_trainer_type == "agent_flow":
+        if self.base_trainer_type in {"agent_flow", "agent-flow"}:
             raise ValueError("`base_trainer_type` cannot be 'agent_flow' (recursive wrapping is disallowed).")
+        if not _is_supported_base_trainer_type(self.base_trainer_type):
+            raise ValueError(
+                f"`base_trainer_type` {self.base_trainer_type!r} is not supported by AgentFlowTrainer. "
+                "AgentFlow adapts episodes for the GRPO family, the PPO family, online DPO, and the on-policy "
+                f"distillation family; supported values: {sorted(AGENT_FLOW_BASE_TRAINER_TYPES)} "
+                "(or any registered subclass of those trainers)."
+            )
 
 
-__all__ = ["AgentFlowConfig"]
+# Registered trainer names whose classes ``AgentFlowTrainer._adapt_episodes_to_trainer`` knows how to feed:
+# OnlineDPOTrainer (preference pairs), PPOTrainer subclasses (returns/advantages/values), the on-policy
+# distillation family (GKD / OnPolicyDistillation / SDFT / SDPO / SeqKD / SSD), and GRPOTrainer subclasses
+# (the default advantage layout). Offline trainers (sft, dpo, kto, ...) would receive a batch they cannot use.
+AGENT_FLOW_BASE_TRAINER_TYPES: frozenset[str] = frozenset(
+    {
+        # GRPO family.
+        "agentic-moshpit",
+        "async_grpo",
+        "dppo",
+        "gdpo",
+        "gfpo",
+        "gmpo",
+        "grpo",
+        "grpo_replay_buffer",
+        "grpo_with_replay_buffer",
+        "gspo",
+        "gspo_token",
+        "minillm",
+        "nash-md",
+        "nash_md",
+        "nemo_gym",
+        "papo",
+        "reinforce_plus_plus",
+        "rloo",
+        "rlvr",
+        "xpo",
+        # PPO family.
+        "compaction-rl",
+        "compaction_reinforcement_learning",
+        "compaction_rl",
+        "ppo",
+        "sao",
+        "single-rollout-asynchronous-optimization",
+        "single_rollout_asynchronous_optimization",
+        "vapo",
+        # Preference pairs.
+        "online_dpo",
+        # On-policy distillation family.
+        "gkd",
+        "on_policy_distillation",
+        "sdft",
+        "sdpo",
+        "self_distillation",
+        "seq_kd",
+        "ssd",
+    }
+)
+
+
+def _is_supported_base_trainer_type(name: str) -> bool:
+    """Return whether AgentFlow can adapt episodes for the trainer registered as ``name``.
+
+    Built-in names are checked against :data:`AGENT_FLOW_BASE_TRAINER_TYPES`. Any other name is accepted
+    only when it is registered as a trainer whose class subclasses one of the supported families, so
+    user-registered GRPO/PPO/OnlineDPO/distillation variants keep working.
+    """
+    if name in AGENT_FLOW_BASE_TRAINER_TYPES:
+        return True
+    trainer_cls = Registry.get("trainer", name)
+    if not isinstance(trainer_cls, type):
+        return False
+    from ..generalized_knowledge_distillation_trainer import GKDTrainer
+    from ..group_relative_policy_optimization import GRPOTrainer
+    from ..on_policy_distillation_trainer import OnPolicyDistillationTrainer
+    from ..online_dpo_trainer import OnlineDPOTrainer
+    from ..proximal_policy_optimization_trainer import PPOTrainer
+    from ..seq_kd_trainer import SeqKDTrainer
+
+    return issubclass(
+        trainer_cls,
+        (GRPOTrainer, PPOTrainer, OnlineDPOTrainer, GKDTrainer, OnPolicyDistillationTrainer, SeqKDTrainer),
+    )
+
+
+__all__ = ["AGENT_FLOW_BASE_TRAINER_TYPES", "AgentFlowConfig"]
