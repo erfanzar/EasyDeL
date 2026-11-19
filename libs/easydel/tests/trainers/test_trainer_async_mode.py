@@ -165,13 +165,50 @@ def test_all_rollout_trainers_enable_async_rollout_capability(trainer_cls):
     assert issubclass(trainer_cls, AsyncRolloutMixin)
 
 
+@pytest.mark.parametrize("trainer_cls", [PPOTrainer, GKDTrainer, SeqKDTrainer, GRPOTrainer])
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_train_epoch_dispatches_on_async_mode(monkeypatch, trainer_cls, async_mode):
+    """``async_mode=False`` reaches the base epoch loop; ``async_mode=True`` reaches the async loop."""
+    from easydel.trainers.trainer.trainer import Trainer
+
+    reached = []
+
+    def base_epoch(self, **kwargs):
+        reached.append(("base", kwargs["epoch"], kwargs["epoch_start_step"], kwargs["epoch_end_step"]))
+        return "base-state", None, "base-iter"
+
+    def async_epoch(self, **kwargs):
+        reached.append(("async", kwargs["epoch"], kwargs["epoch_start_step"], kwargs["epoch_end_step"]))
+        return "async-state", None, "async-iter"
+
+    monkeypatch.setattr(Trainer, "_train_epoch", base_epoch)
+    monkeypatch.setattr(AsyncRolloutMixin, "_train_epoch_async", async_epoch)
+    inst = object.__new__(trainer_cls)
+    inst.arguments = SimpleNamespace(async_mode=async_mode)
+
+    result = inst._train_epoch(
+        state="state",
+        train_dataset=None,
+        train_iter=iter(()),
+        metrics_tracker=None,
+        step_metrics=None,
+        pbar=None,
+        epoch=3,
+        epoch_start_step=10,
+        epoch_end_step=20,
+    )
+
+    expected = "async" if async_mode else "base"
+    assert reached == [(expected, 3, 10, 20)]
+    assert result == (f"{expected}-state", None, f"{expected}-iter")
+
+
 @pytest.mark.parametrize(
     "trainer_cls", [SFTTrainer, DPOTrainer, RewardTrainer, EmbeddingTrainer, SAOTrainer, CompactionRLTrainer]
 )
 def test_non_rollout_and_dedicated_actor_critic_trainers_reject_async_mode(trainer_cls):
     from easydel.trainers import BaseTrainer
 
-    assert BaseTrainer.__doc__ is not None
     assert trainer_cls.supports_async_rollout is False
     dummy_state = SimpleNamespace(model=SimpleNamespace(_model_type="llama"))
     # BaseTrainer.__init__ enforces supports_async_rollout before any model/dataloader setup.

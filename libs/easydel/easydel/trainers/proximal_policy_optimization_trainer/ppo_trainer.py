@@ -713,6 +713,10 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _optimizer_steps_per_rollout(self) -> int:
+        """Each rollout is replayed for ``num_ppo_epochs`` optimizer steps."""
+        return max(1, int(self.arguments.num_ppo_epochs))
+
     def _execute_train_step(
         self,
         state: EasyDeLState,
@@ -721,7 +725,42 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
         """Execute one PPO update, including multiple PPO epochs when configured."""
         if self.arguments.num_ppo_epochs == 1:
             return super()._execute_train_step(state=state, batch=batch)
+        return self._run_ppo_epochs(state=state, batch=batch, informations=None)
 
+    def _execute_preprocessed_train_step(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        informations: dict[str, float | int | str],
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
+        """Run ``num_ppo_epochs`` updates on a rollout preprocessed by the async rollout worker.
+
+        Async mode hands over a batch that is already scored and carries advantages, so
+        preprocessing is skipped; the epoch loop is the one :meth:`_execute_train_step` uses.
+        """
+        return self._run_ppo_epochs(state=state, batch=batch, informations=informations)
+
+    def _run_ppo_epochs(
+        self,
+        state: EasyDeLState,
+        batch,
+        informations: dict[str, tp.Any] | None,
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
+        """Replay one rollout batch for ``num_ppo_epochs`` compiled PPO updates.
+
+        PPO supports a single minibatch per rollout batch (``num_mini_batches=1``), so each
+        epoch is one compiled call over the whole batch in its original order.
+
+        Args:
+            state: Current training state.
+            batch: Raw batch when ``informations`` is ``None`` (it is preprocessed here, as in
+                the synchronous path); otherwise an already-preprocessed rollout batch.
+            informations: Rollout metrics produced by an earlier preprocessing step, or
+                ``None`` to run :meth:`_preprocess_batch_input` first.
+
+        Returns:
+            ``(state, metrics, exception)`` with the same contract as :meth:`_execute_train_step`.
+        """
         if self.pruning_module is not None:
             state = state.replace(
                 graphstate=self.pruning_module.pre_forward_update(
@@ -731,17 +770,19 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
             )
         metrics = LossMetrics()
         try:
-            self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
-            batch, informations = self._preprocess_batch_input(
-                state=state,
-                batch=batch,
-                is_train=True,
-            )
-            self._runtime_trace(
-                "execute_train_step.preprocess.end",
-                batch=self._runtime_batch_summary(batch),
-                information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
-            )
+            if informations is None:
+                self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
+                batch, informations = self._preprocess_batch_input(
+                    state=state,
+                    batch=batch,
+                    is_train=True,
+                )
+                self._runtime_trace(
+                    "execute_train_step.preprocess.end",
+                    batch=self._runtime_batch_summary(batch),
+                    information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
+                )
+            informations = dict(informations)
 
             for ppo_epoch in range(self.arguments.num_ppo_epochs):
                 self._runtime_trace("execute_train_step.compiled_call.begin", ppo_epoch=ppo_epoch)

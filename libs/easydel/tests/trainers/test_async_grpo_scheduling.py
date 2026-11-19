@@ -19,6 +19,7 @@ def test_async_loop_honors_queue_bound_preserves_prompts_and_survives_hooks(
     ahead = []
     snapshots = []
     consumed_versions = []
+    consumed_infos = []
 
     def get_batch(iterator, dataset):
         batch = next(iterator)
@@ -42,6 +43,7 @@ def test_async_loop_honors_queue_bound_preserves_prompts_and_survives_hooks(
     def execute(*, state, batch, informations):
         consumed.append(batch["index"])
         consumed_versions.append(informations["version"])
+        consumed_infos.append(dict(informations))
         ahead.append(len(fetched) - len(consumed))
         return (
             SimpleNamespace(step=state.step + 1, esurge_cache_scope_key="test"),
@@ -109,11 +111,21 @@ def test_async_loop_honors_queue_bound_preserves_prompts_and_survives_hooks(
     assert state.step == 5
     assert consumed == [0, 1, 2, 3, 4]
     assert fetched == consumed
-    assert max(ahead) == expected_ahead
     assert all(snapshot.released for snapshot in snapshots)
+    # Deadline admission means no rollout is ever generated and then discarded as stale.
+    assert all(info["async_rollout/stale_dropped"] == 0 for info in consumed_infos)
+    assert all(step - version <= trainer.arguments.max_staleness for step, version in enumerate(consumed_versions))
     if sync_steps == 1:
+        assert max(ahead) == expected_ahead
         assert consumed_versions == [0, 1, 2, 3, 4]
         assert [snapshot.policy_step for snapshot in snapshots] == [0, 1, 2, 3, 4]
+        assert consumed_infos[-1]["async_rollout/admission_deferred"] == 0
+    else:
+        # max_staleness=1 with a stale-prone sync interval: a rollout anchored at v is only admitted when it
+        # can be consumed by v + 1, so lookahead is capped at one and the rest is deferred, not wasted.
+        assert max(ahead) == 1
+        assert consumed_versions == [0, 0, 2, 2, 4]
+        assert consumed_infos[-1]["async_rollout/admission_deferred"] >= 1
 
 
 class _Context:

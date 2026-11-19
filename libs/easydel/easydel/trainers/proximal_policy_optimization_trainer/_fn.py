@@ -359,6 +359,67 @@ def get_per_token_logps_values_entropies(
     return token_log_probs, values, entropies
 
 
+VALUE_HEAD_MODULE_NAME = "value_head"
+
+
+def _is_value_head_path(path: tuple[tp.Any, ...]) -> bool:
+    """Return whether a pytree key path addresses a leaf of the ``value_head`` module."""
+    return VALUE_HEAD_MODULE_NAME in jax.tree_util.keystr(path)
+
+
+def freeze_policy_during_value_pretrain(
+    old_state: EasyDeLState,
+    new_state: EasyDeLState,
+    in_value_pretrain: jax.Array,
+) -> EasyDeLState:
+    """Keep every non-value-head parameter (and its optimiser moments) at its pre-step value.
+
+    Zeroing the policy gradient is not enough to freeze the policy: decoupled weight decay
+    (e.g. AdamW) still shrinks the parameters and momentum keeps moving them. While
+    ``in_value_pretrain`` is true this selects, per leaf, the pre-step value for every
+    parameter outside the ``value_head`` module and for every optimiser-state leaf that mirrors
+    such a parameter (moment trees share the parameter's key path as a suffix). Value-head
+    leaves, the step counter and shared optimiser scalars (e.g. Adam's ``count``) advance.
+
+    Args:
+        old_state: State before the optimiser update.
+        new_state: State after the optimiser update.
+        in_value_pretrain: Traced scalar bool; when false ``new_state`` is returned unchanged
+            (as values).
+
+    Returns:
+        ``new_state`` with policy parameters and their optimiser moments restored during
+        value pretraining.
+    """
+
+    def select(path, old, new):
+        if _is_value_head_path(path):
+            return new
+        return jnp.where(in_value_pretrain, old, new)
+
+    graphstate = jax.tree_util.tree_map_with_path(select, old_state.graphstate, new_state.graphstate)
+
+    policy_paths = {
+        tuple(path)
+        for path, _ in jax.tree_util.tree_leaves_with_path(old_state.graphstate)
+        if not _is_value_head_path(path)
+    }
+
+    def mirrors_policy_param(path) -> bool:
+        path = tuple(path)
+        return any(path[len(path) - n :] in policy_paths for n in range(1, len(path) + 1))
+
+    def select_opt(path, old, new):
+        if not mirrors_policy_param(path):
+            return new
+        return jnp.where(in_value_pretrain, old, new)
+
+    opt_state = new_state.opt_state
+    if opt_state is not None and old_state.opt_state is not None:
+        opt_state = jax.tree_util.tree_map_with_path(select_opt, old_state.opt_state, opt_state)
+    return new_state.replace(graphstate=graphstate, opt_state=opt_state)
+
+
 def ppo_step(
     state: EasyDeLState,
     batch: collections.abc.Mapping[str, jax.Array],
@@ -594,6 +655,7 @@ def ppo_step(
                 minibatch_size=minibatch_size,
                 grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
             )
+        pre_update_state = state
         with jax.named_scope(scope_root + "/update_state"):
             state = update_state_respectfully(
                 state=state,
@@ -606,6 +668,13 @@ def ppo_step(
                     gradients=gradients,
                 ),
             )
+        if value_pretrain_steps > 0:
+            with jax.named_scope(scope_root + "/freeze_policy_during_value_pretrain"):
+                state = freeze_policy_during_value_pretrain(
+                    pre_update_state,
+                    state,
+                    jnp.asarray(pre_update_state.step) < value_pretrain_steps,
+                )
         return state, metrics
 
     with jax.named_scope(scope_root + "/eval_call"):

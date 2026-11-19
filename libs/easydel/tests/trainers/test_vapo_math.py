@@ -1,5 +1,6 @@
 """Numerical checks for the VAPO extensions of the PPO trainer (arXiv:2504.05118)."""
 
+import inspect
 from types import SimpleNamespace
 
 import jax
@@ -86,6 +87,21 @@ def test_decoupled_length_adaptive_gae_uses_separate_policy_and_critic_lambdas()
     np.testing.assert_allclose(advantages[1, 0], delta0 + 0.5 * advantages[1, 1], atol=1e-5)
 
 
+def _numpy_gae(rewards, values, mask, gamma, lam):
+    """Independent float64 GAE recursion over right-padded rows (zero bootstrap past the last valid token)."""
+    rewards, values, mask = (np.asarray(x, dtype=np.float64) for x in (rewards, values, mask))
+    advantages = np.zeros_like(rewards)
+    for row in range(rewards.shape[0]):
+        length = int(mask[row].sum())
+        next_adv, next_value = 0.0, 0.0
+        for t in reversed(range(length)):
+            delta = rewards[row, t] + gamma * next_value - values[row, t]
+            next_adv = delta + gamma * lam * next_adv
+            next_value = values[row, t]
+            advantages[row, t] = next_adv
+    return advantages, advantages + values
+
+
 def test_default_config_keeps_classic_gae():
     rng = np.random.default_rng(1)
     rewards = rng.normal(size=(3, 6)).astype(np.float32)
@@ -93,9 +109,10 @@ def test_default_config_keeps_classic_gae():
     mask = np.array([[1] * 6, [1] * 4 + [0] * 2, [1] + [0] * 5], dtype=np.float32)
     trainer = _trainer(PPOConfig(gamma=0.97, lam=0.9))
     advantages, returns, lambdas = trainer._compute_advantages_and_returns(rewards, values, mask)
-    classic_adv, classic_ret = trainer._compute_gae(rewards, values, mask)
-    np.testing.assert_array_equal(advantages, classic_adv)
-    np.testing.assert_array_equal(returns, classic_ret)
+    expected_adv, expected_ret = _numpy_gae(rewards, values, mask, gamma=0.97, lam=0.9)
+    np.testing.assert_allclose(advantages, expected_adv, rtol=1e-5, atol=1e-5)
+    valid = mask.astype(bool)
+    np.testing.assert_allclose(np.asarray(returns)[valid], expected_ret[valid], rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(lambdas, 0.9)
 
 
@@ -226,14 +243,16 @@ def test_ppo_step_vapo_loss_matches_numpy_reference():
     state = _make_state()
     ratios = np.array([[1.25, 0.7, 1.0], [1.4, 1.0, 1.0], [0.9, 1.1, 1.0], [0.75, 1.3, 1.05]])
     batch = _make_batch(state, ratios, positive=[1, 0, 1, 0])
-    metrics = _step(
-        state,
-        batch,
-        is_training=False,
-        cliprange_high=0.28,
-        token_level_loss=True,
-        positive_nll_coef=0.1,
-    )
+    # Compare against a float64 reference, so keep TPU f32 matmuls at full precision.
+    with jax.default_matmul_precision("highest"):
+        metrics = _step(
+            state,
+            batch,
+            is_training=False,
+            cliprange_high=0.28,
+            token_level_loss=True,
+            positive_nll_coef=0.1,
+        )
 
     logps, values, entropies = _numpy_forward(state, batch["input_ids"])
     m = np.asarray(batch["completion_mask"], dtype=np.float64)
@@ -314,6 +333,39 @@ def test_value_pretraining_updates_only_the_value_head():
     assert any(not np.allclose(joint_after[key], before[key]) for key in before if "value_head" not in key)
 
 
+def test_value_pretraining_freezes_policy_under_weight_decay():
+    ratios = np.array([[1.25, 0.7, 1.0], [1.4, 1.0, 1.0], [0.9, 1.1, 1.0], [0.75, 1.3, 1.05]])
+    state = _make_state(tx=optax.adamw(1e-2, weight_decay=0.1))
+    batch = _make_batch(state, ratios, positive=[1, 0, 1, 0])
+    vapo = {"value_pretrain_steps": 2}
+    before = _leaves_by_path(state.graphstate)
+    opt_before = _leaves_by_path(state.opt_state)
+
+    pretrained, _ = _step(state, batch, is_training=True, **vapo)
+    assert int(pretrained.step) == 1
+    after = _leaves_by_path(pretrained.graphstate)
+    for key, value in before.items():
+        if "value_head" in key:
+            assert not np.allclose(after[key], value), key
+        else:
+            np.testing.assert_array_equal(after[key], value, err_msg=key)
+    opt_after = _leaves_by_path(pretrained.opt_state)
+    value_head_moment_moved = False
+    for key, value in opt_before.items():
+        if "value_head" in key:
+            value_head_moment_moved |= not np.array_equal(opt_after[key], value)
+        elif ("embed" in key or "'head'" in key) and "value_head" not in key:
+            np.testing.assert_array_equal(opt_after[key], value, err_msg=key)
+    assert value_head_moment_moved
+
+    # Once pretraining ends, decay and the policy gradient move the policy again.
+    joint, _ = _step(pretrained.replace(step=jnp.asarray(2, dtype=jnp.int32)), batch, is_training=True, **vapo)
+    joint_after = _leaves_by_path(joint.graphstate)
+    for key in before:
+        if "value_head" not in key:
+            assert not np.allclose(joint_after[key], before[key]), key
+
+
 def test_vapo_config_defaults_registry_and_static_args():
     config = VAPOConfig()
     assert config.trainer_prefix == "VAPO"
@@ -327,8 +379,21 @@ def test_vapo_config_defaults_registry_and_static_args():
     assert issubclass(VAPOTrainer, PPOTrainer)
     assert Registry.get_or_raise("trainer-arguments", "vapo", wakeup=False) is VAPOConfig
     assert Registry.get_or_raise("trainer", "vapo", wakeup=False) is VAPOTrainer
-    assert _trainer(config)._vapo_static_args() == (0.28, True, 0.1, 0)
-    assert _trainer(PPOConfig())._vapo_static_args() == (None, False, 0.0, 0)
+    # The trailing static args are spliced positionally after the 14 fixed ppo_step arguments, so
+    # bind them to the real signature and check every value lands on the parameter it configures.
+    fixed_args = tuple(f"fixed{i}" for i in range(14))
+    signature = inspect.signature(ppo_step)
+    for cfg, expected in (
+        (config, {"cliprange_high": 0.28, "token_level_loss": True, "positive_nll_coef": 0.1}),
+        (PPOConfig(), {"cliprange_high": None, "token_level_loss": False, "positive_nll_coef": 0.0}),
+        (PPOConfig(value_pretrain_steps=7), {"value_pretrain_steps": 7}),
+    ):
+        bound = signature.bind(*fixed_args, *_trainer(cfg)._vapo_static_args()).arguments
+        assert bound["straight_through_emulator"] == "fixed13"
+        assert set(bound) == set(signature.parameters)
+        for name, value in expected.items():
+            assert bound[name] == value, name
+            assert type(bound[name]) is type(value), name
 
 
 @pytest.mark.parametrize(
