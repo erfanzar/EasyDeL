@@ -85,6 +85,30 @@ IcePop modes with `cap_low=None` require `cap >= 1`; an explicit `cap_low` must 
   `True` / `False` map to `"group"` / `"none"`.
 - **REINFORCE++** (`ReinforcePlusPlusConfig`) defaults to `scale_rewards="batch_advantage"` and `kl_estimator="k2"`.
 
+## Prefix-shared forward (`GRPOConfig.prefix_shared_forward`, default `False`)
+
+With the flag on, the policy loss forward runs each prompt once per group instead of once per completion. A capture
+pass records every layer's key/value states for the prompts. A fork pass then scores the `G` completions against the
+gathered prefix, with visibility from segment ids and causality from absolute positions.
+
+- **Supported:** dense full-attention models with `attn_mechanism` in `PREFIX_SHARED_ATTENTION_MECHANISMS`
+  (`easydel/caching/shared_prefix`), currently `vanilla` and `sdpa`.
+- **Rejected:** `completion_chunk_size`, `top_entropy_quantile < 1`, `mpmd_scheduler`, sliding-window or
+  non-full-attention layers, quantized KV, attention dropout, and other attention operations.
+- **When it pays off:** the saving tracks `(G-1)·P / (G·(P+C))` for prompt length `P` and completion length `C`.
+  Measured on 4 TPU v5p chips, 697M-parameter dense model, `vanilla` attention, bf16, 8 prompts per step:
+
+| P | C | G | step time off → on | activation temps off → on |
+|---|---|---|---|---|
+| 1024 | 256 | 8 | 0.316 s → 0.142 s | 31.1 → 14.2 GiB |
+| 2048 | 512 | 8 | 0.805 s → 0.301 s | 90.9 → 41.8 GiB |
+| 256 | 1024 | 4 | 0.173 s → 0.170 s | 17.0 → 19.7 GiB |
+| 512 | 2048 | 8 (4 prompts) | 0.378 s → 0.382 s | 51.3 → 59.2 GiB |
+
+  Turn it on when prompts are at least as long as completions. When completions are much longer than prompts
+  (`C ≥ 4P`) it gave no speedup, roughly doubled compile time and, without rematerialization, used more memory (at
+  P=512, C=2048, G=8 with 8 prompts it ran out of HBM where the default path fits).
+
 ## Async rollouts (`TrainingArguments`)
 
 | field                 | default | meaning                                                         |

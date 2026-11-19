@@ -75,7 +75,7 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
     unwrap_metadata,
 )
-from easydel.caching.shared_prefix import is_shared_prefix_view
+from easydel.caching.shared_prefix import PREFIX_SHARED_ATTENTION_MECHANISMS, is_shared_prefix_view
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.sharding import StageMesh, inference_mode_forces_decode, resolve_stage_mesh
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
@@ -1739,9 +1739,10 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
             active_impl = getattr(performer, "impl", None) if performer is not None else getattr(self, "impl", None)
             impl_name = getattr(active_impl, "get_impl_name", lambda: None)()
             impl_names = {str(n) for n in impl_name} if isinstance(impl_name, tuple) else {str(impl_name)}
-            if AttentionMechanisms.VANILLA.value not in impl_names:
+            if not impl_names & PREFIX_SHARED_ATTENTION_MECHANISMS:
                 raise NotImplementedError(
-                    f"Prefix-shared forward requires the 'vanilla' attention operation; got {sorted(impl_names)}."
+                    f"Prefix-shared forward requires an attention operation in "
+                    f"{sorted(PREFIX_SHARED_ATTENTION_MECHANISMS)}; got {sorted(impl_names)}."
                 )
             key, value, mask_info, cache_view = cache_view.concatenate_to_cache(
                 key=key, value=value, mask_info=mask_info

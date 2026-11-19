@@ -120,25 +120,28 @@ def _check(name: str, representation: str, prefix: int, completion: int):
 # Small shapes take every kernel's unaligned path (blocksparse falls back to vanilla);
 # the 512-aligned shape drives the TPU block kernels themselves.
 SMALL, ALIGNED = (12, 8), (512, 512)
-_POSITIONS_IGNORED = (
-    "segment ids plus explicit q/kv positions with q_len != kv_len: the operation does not derive causality "
-    "from the absolute positions (output error ~4 against the dense reference on TPU)"
-)
-
-_FLASH_DENSE = (
-    "flash_attn2 turns the baked dense mask into segment ids and drops the absolute positions, so the "
-    "(kv_pos <= q_pos) term is lost (output error ~4.1 on TPU, identical to the segments case)"
-)
 _BLOCKSPARSE_ALIGNED = (
     "blocksparse TPU kernel with q_len != kv_len (512/1024): output error ~3-4.5, dq error ~110 on TPU; "
     "the small unaligned shape falls back to vanilla and is correct"
+)
+_FLASH_PREC = (
+    "flash_attn2 masks correctly now (positions folded into a bias), but the operation runs its matmuls at "
+    "DEFAULT precision: max error ~6e-3 (out) / ~9e-3 (grads) at the small shape on TPU, beyond 5e-3"
+)
+_FLASH_DENSE = (
+    "flash_attn2 with a stored dense mask keeps the pre-existing path (only segments+positions without a dense "
+    "mask derives causality from positions): the mask becomes segment ids and kv_pos <= q_pos is lost "
+    "(output error ~4.1 on TPU)"
 )
 _RING_TOLERANCE = "ring with segments+positions: max error ~6e-3 (out) / ~9e-3 (grads) on TPU, beyond 5e-3"
 
 # Observed on TPU (fp32, highest matmul precision), recorded per mechanism:
 #   vanilla      supported for both representations and both shapes (errors <= 8e-7, incl. gradients)
-#   sdpa         dense baked mask supported; segments+positions wrong
-#   flash_attn2  wrong for both representations; the aligned segments case did not finish in 15 minutes
+#   sdpa         both representations supported (dense: causality is baked in; segments+positions: the
+#                operation derives causality from positions)
+#   flash_attn2  segments+positions masks correctly (folded into a bias); within 5e-3 only at the aligned
+#                shape. A stored dense mask keeps the old (wrong for q_len != kv_len) path; its aligned case
+#                is not run because that old path previously did not finish on TPU.
 #   blocksparse  small shape correct only through its vanilla fallback; the aligned TPU kernel is wrong
 #   ring         segments+positions approximately right but outside tolerance; dense_mask did not finish
 CASES = [
@@ -148,10 +151,9 @@ CASES = [
     pytest.param("vanilla", "dense_mask", *ALIGNED),
     pytest.param("sdpa", "dense_mask", *SMALL),
     pytest.param("sdpa", "dense_mask", *ALIGNED),
-    pytest.param("sdpa", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_POSITIONS_IGNORED)),
-    pytest.param(
-        "flash_attn2", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_POSITIONS_IGNORED)
-    ),
+    pytest.param("sdpa", "segments_positions", *SMALL),
+    pytest.param("sdpa", "segments_positions", *ALIGNED),
+    pytest.param("flash_attn2", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_FLASH_PREC)),
     pytest.param("flash_attn2", "dense_mask", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_FLASH_DENSE)),
     pytest.param("blocksparse", "segments_positions", *SMALL),
     pytest.param(
@@ -170,6 +172,8 @@ CASES = [
         *SMALL,
         marks=pytest.mark.skip(reason="did not finish within 2 minutes on TPU; not characterised"),
     ),
+    # Last so that a hang cannot hide the results above; finishes in well under 2 minutes on TPU now.
+    pytest.param("flash_attn2", "segments_positions", *ALIGNED),
 ]
 
 

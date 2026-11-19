@@ -37,7 +37,10 @@ from eformer.pytree import auto_pytree, field
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
-__all__ = ("PrefixCaptureView", "PrefixForkView", "is_shared_prefix_view")
+__all__ = ("PREFIX_SHARED_ATTENTION_MECHANISMS", "PrefixCaptureView", "PrefixForkView", "is_shared_prefix_view")
+
+PREFIX_SHARED_ATTENTION_MECHANISMS = frozenset({"vanilla", "sdpa"})
+"""Attention operations verified on TPU (output and q/k/v gradients) for the prefix-shared fork representation."""
 
 
 @auto_pytree

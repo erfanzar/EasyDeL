@@ -40,7 +40,7 @@ from jax.sharding import PartitionSpec
 from spectrax import common_types, with_sharding_constraint
 
 from easydel.caching import TransformerCache
-from easydel.caching.shared_prefix import PrefixCaptureView, PrefixForkView
+from easydel.caching.shared_prefix import PREFIX_SHARED_ATTENTION_MECHANISMS, PrefixCaptureView, PrefixForkView
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.trainers._logprob_utils import (
@@ -587,10 +587,6 @@ def get_per_token_logps(
         chunk_size=logprob_vocab_chunk_size,
     )
     return token_log_probs
-
-
-PREFIX_SHARED_ATTENTION_MECHANISMS = frozenset({"vanilla"})
-"""Attention operations verified on TPU (output and q/k/v gradients) for the prefix-shared fork representation."""
 
 
 def validate_prefix_shared_model(model) -> None:

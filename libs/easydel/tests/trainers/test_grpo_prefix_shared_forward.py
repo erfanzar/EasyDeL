@@ -22,7 +22,7 @@ from jax.sharding import PartitionSpec
 PROMPTS, PROMPT_LEN, COMPLETION_LEN = 2, 6, 5
 
 
-def _config():
+def _config(attn_mechanism="vanilla"):
     return ed.LlamaConfig(
         vocab_size=128,
         hidden_size=64,
@@ -34,7 +34,7 @@ def _config():
         max_position_embeddings=64,
         mlp_bias=False,
         sharding_axis_dims=(1, 1, 1, 1, 1, 1),
-        attn_mechanism="vanilla",
+        attn_mechanism=attn_mechanism,
         attn_dtype=jnp.float32,
     )
 
@@ -56,9 +56,10 @@ def _batch(num_generations):
     return prompt_ids, prompt_mask, completion_ids, completion_mask, advantages
 
 
+@pytest.mark.parametrize("attn_mechanism", ["vanilla", "sdpa"])
 @pytest.mark.parametrize("num_generations", [1, 2, 4])
-def test_shared_per_token_logps_match_repeated_prompt_forward(num_generations):
-    cfg = _config()
+def test_shared_per_token_logps_match_repeated_prompt_forward(num_generations, attn_mechanism):
+    cfg = _config(attn_mechanism)
     prompt_ids, prompt_mask, completion_ids, completion_mask, _ = _batch(num_generations)
     with jax.default_matmul_precision("highest"), cfg.mesh:
         model = _model(cfg)
@@ -92,9 +93,10 @@ def _grpo(state, batch, num_generations, prefix_shared, **kwargs):
     )
 
 
+@pytest.mark.parametrize("attn_mechanism", ["vanilla", "sdpa"])
 @pytest.mark.parametrize("num_generations", [1, 2, 4])
-def test_grpo_step_loss_and_gradients_match_repeated_prompt_forward(num_generations):
-    cfg = _config()
+def test_grpo_step_loss_and_gradients_match_repeated_prompt_forward(num_generations, attn_mechanism):
+    cfg = _config(attn_mechanism)
     prompt_ids, prompt_mask, completion_ids, completion_mask, advantages = _batch(num_generations)
     batch = {
         "prompt_ids": jnp.asarray(prompt_ids),
@@ -143,7 +145,6 @@ def _stub(**overrides):
     "overrides,match",
     [
         (dict(attn_mechanism="flash_attn2"), "attn_mechanism"),
-        (dict(attn_mechanism="sdpa"), "attn_mechanism"),
         (dict(kv_cache_quantization_config=object()), "quantized"),
         (dict(attention_dropout=0.1), "dropout"),
         (dict(sharding_axis_dims=(2, 1, -1, 1, 1, 1)), "pipeline"),
