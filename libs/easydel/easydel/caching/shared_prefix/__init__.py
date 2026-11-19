@@ -39,7 +39,7 @@ from jax import numpy as jnp
 
 __all__ = ("PREFIX_SHARED_ATTENTION_MECHANISMS", "PrefixCaptureView", "PrefixForkView", "is_shared_prefix_view")
 
-PREFIX_SHARED_ATTENTION_MECHANISMS = frozenset({"vanilla", "sdpa"})
+PREFIX_SHARED_ATTENTION_MECHANISMS = frozenset({"vanilla", "sdpa", "flash_attn2", "blocksparse"})
 """Attention operations verified on TPU (output and q/k/v gradients) for the prefix-shared fork representation."""
 
 

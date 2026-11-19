@@ -92,7 +92,11 @@ pass records every layer's key/value states for the prompts. A fork pass then sc
 gathered prefix, with visibility from segment ids and causality from absolute positions.
 
 - **Supported:** dense full-attention models with `attn_mechanism` in `PREFIX_SHARED_ATTENTION_MECHANISMS`
-  (`easydel/caching/shared_prefix`), currently `vanilla` and `sdpa`.
+  (`easydel/caching/shared_prefix`): `vanilla`, `sdpa`, `flash_attn2` and `blocksparse`. All four match the
+  repeated-prompt forward on TPU for log-probs and every parameter update. `flash_attn2` was checked with fp32 matmul
+  precision pinned (XLA kernel at `HIGHEST`, or the Pallas kernel). At the default precision the XLA flash kernel uses
+  bf16 passes on TPU, about 6e-3 off for output and 9e-3 for gradients, with masking unchanged. `blocksparse` was
+  checked at 512-token prompts and completions, where the TPU kernel itself runs; shorter inputs use its fallback.
 - **Rejected:** `completion_chunk_size`, `top_entropy_quantile < 1`, `mpmd_scheduler`, sliding-window or
   non-full-attention layers, quantized KV, attention dropout, and other attention operations.
 - **When it pays off:** the saving tracks `(G-1)·P / (G·(P+C))` for prompt length `P` and completion length `C`.

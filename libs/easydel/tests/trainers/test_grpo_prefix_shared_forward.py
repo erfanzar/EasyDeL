@@ -16,13 +16,24 @@ from easydel.trainers.group_relative_policy_optimization._fn import (
     validate_prefix_shared_model,
 )
 from easydel.trainers.group_relative_policy_optimization.grpo_config import GRPOConfig
+from ejkernel.modules.operations.configs import FlashAttentionConfig
+from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 PROMPTS, PROMPT_LEN, COMPLETION_LEN = 2, 6, 5
 
 
-def _config(attn_mechanism="vanilla"):
+# flash_attn2 runs pinned to the XLA flash kernel with an explicit HIGHEST precision: the operation
+# forwards an explicit precision (default DEFAULT = bf16 passes on TPU) that overrides the ambient
+# ``jax.default_matmul_precision("highest")``, and the Pallas TPU kernel neither accepts HIGHEST nor
+# runs these tiny shapes. See tests/operations/test_prefix_share_kernel_semantics.py.
+_FLASH_OPERATION_CONFIGS = {"flash_attn2": FlashAttentionConfig(platform="xla", backend="any")}
+MECHANISMS = ["vanilla", "sdpa", "flash_attn2"]
+
+
+def _config(attn_mechanism="vanilla", max_position_embeddings=64):
+    extra = {"operation_configs": _FLASH_OPERATION_CONFIGS} if attn_mechanism == "flash_attn2" else {}
     return ed.LlamaConfig(
         vocab_size=128,
         hidden_size=64,
@@ -31,16 +42,20 @@ def _config(attn_mechanism="vanilla"):
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
-        max_position_embeddings=64,
+        max_position_embeddings=max_position_embeddings,
         mlp_bias=False,
         sharding_axis_dims=(1, 1, 1, 1, 1, 1),
         attn_mechanism=attn_mechanism,
         attn_dtype=jnp.float32,
+        **extra,
     )
 
 
 def _model(cfg):
-    return ed.LlamaForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+    precision = lax.Precision.HIGHEST if cfg.attn_mechanism == "flash_attn2" else None
+    return ed.LlamaForCausalLM(
+        config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )
 
 
 def _batch(num_generations):
@@ -56,7 +71,7 @@ def _batch(num_generations):
     return prompt_ids, prompt_mask, completion_ids, completion_mask, advantages
 
 
-@pytest.mark.parametrize("attn_mechanism", ["vanilla", "sdpa"])
+@pytest.mark.parametrize("attn_mechanism", MECHANISMS)
 @pytest.mark.parametrize("num_generations", [1, 2, 4])
 def test_shared_per_token_logps_match_repeated_prompt_forward(num_generations, attn_mechanism):
     cfg = _config(attn_mechanism)
@@ -93,7 +108,7 @@ def _grpo(state, batch, num_generations, prefix_shared, **kwargs):
     )
 
 
-@pytest.mark.parametrize("attn_mechanism", ["vanilla", "sdpa"])
+@pytest.mark.parametrize("attn_mechanism", MECHANISMS)
 @pytest.mark.parametrize("num_generations", [1, 2, 4])
 def test_grpo_step_loss_and_gradients_match_repeated_prompt_forward(num_generations, attn_mechanism):
     cfg = _config(attn_mechanism)
@@ -117,6 +132,39 @@ def test_grpo_step_loss_and_gradients_match_repeated_prompt_forward(num_generati
     assert any(np.max(np.abs(b - a)) > 0 for b, a in zip(before, ref_after, strict=True))
     for b, ref, shared in zip(before, ref_after, shared_after, strict=True):
         np.testing.assert_allclose(b - shared, b - ref, rtol=1e-4, atol=1e-6)
+
+
+@pytest.mark.parametrize("num_generations", [1, 2])
+def test_blocksparse_grpo_step_matches_repeated_prompt_forward_at_aligned_lengths(num_generations):
+    """512-token prompts and completions drive the TPU blocksparse kernel itself (short ones use its fallback)."""
+    prompt_len = completion_len = 512
+    cfg = _config("blocksparse", max_position_embeddings=prompt_len + completion_len)
+    rng = np.random.default_rng(7 + num_generations)
+    prompt_mask = np.ones((PROMPTS, prompt_len), np.int32)
+    prompt_mask[0, :37] = 0  # left-padded ragged prompt
+    prompt_ids = np.where(prompt_mask > 0, rng.integers(1, 120, (PROMPTS, prompt_len)), 0).astype(np.int32)
+    rows = PROMPTS * num_generations
+    lengths = rng.integers(1, completion_len + 1, rows)
+    completion_mask = (np.arange(completion_len)[None, :] < lengths[:, None]).astype(np.int32)
+    completion_ids = np.where(completion_mask > 0, rng.integers(1, 120, (rows, completion_len)), 0).astype(np.int32)
+    batch = {
+        "prompt_ids": jnp.asarray(prompt_ids),
+        "prompt_mask": jnp.asarray(prompt_mask),
+        "completion_ids": jnp.asarray(completion_ids),
+        "completion_mask": jnp.asarray(completion_mask, jnp.float32),
+        "advantages": jnp.asarray(rng.standard_normal(rows).astype(np.float32)),
+    }
+    with jax.default_matmul_precision("highest"), cfg.mesh:
+        state = EasyDeLState.create(model=_model(cfg), tx=optax.sgd(1.0), init_opt_state=True)
+        before = [np.asarray(x) for x in jax.tree_util.tree_leaves(state.graphstate)]
+        ref_state, ref_metrics = _grpo(state, batch, num_generations, False)
+        shared_state, shared_metrics = _grpo(state, batch, num_generations, True)
+        ref_after = [np.asarray(x) for x in jax.tree_util.tree_leaves(ref_state.graphstate)]
+        shared_after = [np.asarray(x) for x in jax.tree_util.tree_leaves(shared_state.graphstate)]
+    np.testing.assert_allclose(float(shared_metrics.loss), float(ref_metrics.loss), rtol=1e-4, atol=1e-6)
+    assert any(np.max(np.abs(b - a)) > 0 for b, a in zip(before, ref_after, strict=True))
+    for b, ref, shared in zip(before, ref_after, shared_after, strict=True):
+        np.testing.assert_allclose(b - shared, b - ref, rtol=1e-4, atol=1e-5)
 
 
 def test_grpo_step_chunked_loss_raises_under_prefix_shared():
@@ -144,7 +192,7 @@ def _stub(**overrides):
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        (dict(attn_mechanism="flash_attn2"), "attn_mechanism"),
+        (dict(attn_mechanism="ring"), "attn_mechanism"),
         (dict(kv_cache_quantization_config=object()), "quantized"),
         (dict(attention_dropout=0.1), "dropout"),
         (dict(sharding_axis_dims=(2, 1, -1, 1, 1, 1)), "pipeline"),

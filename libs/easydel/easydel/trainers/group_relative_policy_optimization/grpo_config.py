@@ -669,7 +669,9 @@ class GRPOConfig(TrainingArguments):
             "help": (
                 "Run the policy loss forward with prompts once per group: a capture pass over the prompts records "
                 "each layer's key/value states and a fork pass scores the completions against the gathered prefix. "
-                "Dense attention models with attn_mechanism 'vanilla' or 'sdpa' only; incompatible with "
+                "Dense attention models with attn_mechanism 'vanilla', 'sdpa', 'flash_attn2' or 'blocksparse' only "
+                "(flash_attn2 at the model's default matmul precision is bf16-pass accurate, about 6e-3, on TPU); "
+                "incompatible with "
                 "completion_chunk_size, top_entropy_quantile < 1 and mpmd_scheduler. Pays off when prompts are at "
                 "least as long as completions; with completions much longer than prompts it gives no speedup, "
                 "compiles slower and can use more memory."
