@@ -228,8 +228,19 @@ def test_bitmap_kernel_rejects_more_tail_keys_than_it_carries():
     assert no_tail.dsa_pool_bitmap_tail_error() is None
 
 
-def test_packed_documents_keep_the_dense_path(monkeypatch):
-    """A packed-document mask (``padding_only`` False) is not taken by the pool path: same output as the dense layer."""
+def _packed_segments():
+    """Two rows of packed documents with lengths that are not multiples of KPOOL, padding between and after."""
+    seg = np.full((2, SEQ), -1, np.int32)
+    for b, lengths in enumerate(([30, 7, 41, 18], [13, 2, 5, 50, 9])):
+        pos = 0
+        for d, n in enumerate(lengths):
+            seg[b, pos : pos + n] = d
+            pos += n + (1 if b == 1 else 0)
+    return seg
+
+
+def test_packed_documents_keep_the_dense_path_on_the_bitmap_kernel(monkeypatch):
+    """The bitmap kernel reads a key grid as long as the sequence, so packed documents stay on the dense layer."""
     calls = {"n": 0}
     real = modeling_glm5_next.Glm5NextDSAAttention._forward_dsa_pool_training
 
@@ -239,18 +250,92 @@ def test_packed_documents_keep_the_dense_path(monkeypatch):
 
     monkeypatch.setattr(modeling_glm5_next.Glm5NextDSAAttention, "_forward_dsa_pool_training", counting)
     _ref_config, _ref_model, ref_layer = _build(pool=False)
-    config, _model, layer = _build(pool=True)
+    config, _model, layer = _build(pool=True, kernel="bitmap")
     h, _ = _inputs("none")
-    segments = np.zeros((2, SEQ), np.int32)
-    segments[:, SEQ // 2 :] = 1
-    mask_info = MaskInfo.from_segments(jnp.asarray(segments))
+    mask_info = MaskInfo.from_segments(jnp.asarray(_packed_segments()))
     assert not mask_info.padding_only
     positions = jnp.broadcast_to(jnp.arange(SEQ)[None, :], (2, SEQ))
     with jax.default_matmul_precision("highest"), config.mesh:
         out = layer.forward_mla(h, mask_info, positions, common_types.MODE_TRAIN).attention_output
         ref = ref_layer.forward_mla(h, mask_info, positions, common_types.MODE_TRAIN).attention_output
-    assert calls["n"] == 0, "the pool path must not run on packed documents"
+    assert calls["n"] == 0, "the bitmap pool path must not run on packed documents"
     np.testing.assert_allclose(np.asarray(out), np.asarray(ref), rtol=1e-6, atol=1e-6)
+
+
+def test_packed_documents_on_the_gather_kernel_match_dense_forward_and_input_grad(monkeypatch):
+    """Packed documents run on the gather pool path and equal the dense layer, which pools per document."""
+    calls = {"gather": 0}
+    real_gather = modeling_glm5_next.Glm5NextDSAAttention._forward_dsa_pool_gather
+
+    def counting_gather(self, *args, **kwargs):
+        calls["gather"] += 1
+        assert kwargs.get("segments") is not None, "packed documents reached the gather path without segments"
+        return real_gather(self, *args, **kwargs)
+
+    monkeypatch.setattr(modeling_glm5_next.Glm5NextDSAAttention, "_forward_dsa_pool_gather", counting_gather)
+    _ref_config, _ref_model, ref_layer = _build(pool=False)
+    config, _model, layer = _build(pool=True, kernel="gather")
+    h, _ = _inputs("none")
+    seg = _packed_segments()
+    valid = seg >= 0
+    mask_info = MaskInfo.from_segments(jnp.asarray(seg))
+    positions = jnp.broadcast_to(jnp.arange(SEQ)[None, :], (2, SEQ))
+    ct = (
+        jnp.asarray(np.random.default_rng(3).standard_normal((2, SEQ, HID)), jnp.float32)
+        * jnp.asarray(valid, jnp.float32)[..., None]
+    )
+
+    def run(lay, x):
+        return lay.forward_mla(x, mask_info, positions, common_types.MODE_TRAIN).attention_output
+
+    with jax.default_matmul_precision("highest"), config.mesh:
+        ref_out = run(ref_layer, h)
+        out = run(layer, h)
+        assert calls["gather"] == 1, "packed documents did not take the gather pool path"
+        ref_grad = jax.grad(lambda x: jnp.sum(run(ref_layer, x) * ct))(h)
+        grad = jax.grad(lambda x: jnp.sum(run(layer, x) * ct))(h)
+
+    v = valid[..., None]
+    assert np.isfinite(np.asarray(out)).all() and np.isfinite(np.asarray(grad)).all()
+    assert _rel(np.asarray(out) * v, np.asarray(ref_out) * v) < 1e-3
+    assert _rel(np.asarray(grad) * v, np.asarray(ref_grad) * v) < 1e-3
+
+    # Changing one document's tokens leaves every other document's output unchanged (no cross-document leak).
+    h2 = jnp.where(jnp.asarray(seg == 2)[..., None], h + 1.0, h)
+    with jax.default_matmul_precision("highest"), config.mesh:
+        out2 = run(layer, h2)
+    others = (valid & (seg != 2))[..., None]
+    np.testing.assert_allclose(np.asarray(out2) * others, np.asarray(out) * others, rtol=1e-5, atol=1e-5)
+
+
+def test_packed_selection_never_crosses_a_document():
+    """Every selected pool and tail key of a packed-document selection belongs to the query's own document."""
+    from easydel.layers.indexer import segment_pool_layout
+
+    config, _model, layer = _build(pool=True, kernel="gather")
+    h, _ = _inputs("none")
+    seg = _packed_segments()
+    with jax.default_matmul_precision("highest"), config.mesh:
+        q_resid = layer.mla_q_a_layernorm(layer.mla_q_a_proj(h))
+        lay = segment_pool_layout(jnp.asarray(seg), KPOOL)
+        ids, tails = layer.indexer.select_pools_chunked(
+            h, q_resid, None, query_chunk_size=32, as_indices=True, segment_layout=lay
+        )
+    ids, tails = np.asarray(ids), np.asarray(tails)
+    kseg, rank = np.asarray(lay.key_segments), np.asarray(lay.rank)
+    picked_any = False
+    for b in range(2):
+        for s in range(SEQ):
+            if seg[b, s] < 0:
+                assert (ids[b, s] < 0).all() and (tails[b, s] < 0).all()
+                continue
+            for p in ids[b, s][ids[b, s] >= 0]:
+                picked_any = True
+                assert set(kseg[b, p * KPOOL : (p + 1) * KPOOL].tolist()) == {seg[b, s]}
+                assert p * KPOOL + KPOOL - 1 <= rank[b, s], "a selected pool is not causal"
+            for t in tails[b, s][tails[b, s] >= 0]:
+                assert kseg[b, t] == seg[b, s]
+    assert picked_any, "the selection is empty; the test checks nothing"
 
 
 @pytest.mark.parametrize("kernel", ["bitmap", "gather"])
