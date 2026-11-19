@@ -213,6 +213,23 @@ def _unscorable_group_rows(
     return jnp.repeat(group_bad, generation_factor, axis=0)
 
 
+def _feedback_unscorable(result: object | None) -> bool:
+    """Whether an environment ``reset``/``step`` result carries no usable reward.
+
+    Applies :func:`easydel.environments.auto.is_unscorable` (``info["discard"]`` or
+    ``info["env_error"]``) to any result object exposing an ``info`` mapping; ``None`` and results
+    without ``info`` are scorable.
+    """
+    if result is None:
+        return False
+    info = getattr(result, "info", None)
+    if not isinstance(info, dict):
+        return False
+    from easydel.environments.auto import is_unscorable  # lazy: environments imports trainer modules
+
+    return is_unscorable(result)  # type: ignore[arg-type]
+
+
 def _resolve_discard_columns(
     discard_unscorable_groups: bool | None,
     reward_funcs: tp.Sequence[object],
@@ -1105,8 +1122,16 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
 
             try:
                 reset = getattr(env, "reset", None)
-                if callable(reset):
-                    reset()
+                reset_result = reset() if callable(reset) else None
+                if _feedback_unscorable(reset_result):
+                    # The episode never started (sandbox/infra failure): report NaN, never a 0.0 reward,
+                    # so the environment column (a discarding column) drops the prompt group.
+                    observations.append(getattr(reset_result, "observation", ""))
+                    rewards.append(float("nan"))
+                    terminated.append(True)
+                    truncated.append(False)
+                    infos.append(dict(getattr(reset_result, "info", None) or {}))
+                    continue
 
                 step_with_tool_calls = getattr(env, "step_with_tool_calls", None)
                 if callable(step_with_tool_calls):
@@ -1124,7 +1149,9 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
                     step_result = step(action_text)
 
                 observations.append(getattr(step_result, "observation", ""))
-                rewards.append(float(getattr(step_result, "reward", 0.0)))
+                rewards.append(
+                    float("nan") if _feedback_unscorable(step_result) else float(getattr(step_result, "reward", 0.0))
+                )
                 terminated.append(bool(getattr(step_result, "terminated", False)))
                 truncated.append(bool(getattr(step_result, "truncated", False)))
                 infos.append(getattr(step_result, "info", {}))
@@ -2093,6 +2120,11 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             for key in _COMPLETION_ALIGNED_BATCH_KEYS:
                 current = model_batch.get(key)
                 replacement = candidate.model_batch.get(key)
+                if key == "difficulty_weights" and current is not None and replacement is None:
+                    # A candidate without weights discarded nothing and carries no dataset weights, so
+                    # every row it contributes has the implicit weight 1. Keeping ``current`` would let a
+                    # resampled group inherit the zero weight of the discarded group it replaces.
+                    replacement = jnp.ones_like(current)
                 if current is None or replacement is None or current.shape != replacement.shape:
                     continue
                 selector = row_take.reshape((num_rows,) + (1,) * (current.ndim - 1))

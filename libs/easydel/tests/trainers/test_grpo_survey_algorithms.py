@@ -609,3 +609,66 @@ def test_dapo_dynamic_sampling_stops_once_every_group_is_informative():
     assert metrics["dynamic_sampling/filtered_group_frac"] == 0.0
     np.testing.assert_array_equal(np.asarray(model_batch["completion_mask"]).sum(-1), [2, 2, 2, 2])
     np.testing.assert_array_equal(np.asarray(model_batch["completion_ids"][:, 0]), [2, 2, 1, 1])
+
+
+def test_dynamic_sampling_resampled_group_does_not_inherit_discard_weight():
+    trainer = object.__new__(GRPOTrainer)
+    trainer.arguments = GRPOConfig(
+        num_generations=2, dynamic_sampling=True, dynamic_sampling_max_attempts=3, discard_unscorable_groups=True
+    )
+    trainer.scale_rewards = "group"
+    trainer.multi_objective_aggregation = "sum_then_normalize"
+    trainer.steps_per_generation = 1
+    trainer.num_iterations = 1
+    trainer._buffered_grpo_batch = None
+    trainer._buffered_grpo_remaining = 0
+    trainer.reward_funcs = []
+    # First rollout: group 0 is unscorable (discarded, weight 0, mask 0); the candidate discards nothing.
+    first = _scored(1, [np.nan, 1, 0, 1])
+    first.model_batch["difficulty_weights"] = jnp.asarray([0.0, 0.0, 1.0, 1.0])
+    first.model_batch["completion_mask"] = jnp.asarray([[0, 0], [0, 0], [1, 1], [1, 1]], dtype=jnp.int32)
+    attempts = iter([first, _scored(2, [0, 1, 5, 5])])
+    trainer._generate_and_score_batch = lambda state, batch, is_train: next(attempts)
+
+    model_batch, metrics = trainer._preprocess_batch_input(None, {}, True)
+
+    assert metrics["dynamic_sampling/resampled_group_frac"] == pytest.approx(0.5)
+    np.testing.assert_array_equal(np.asarray(model_batch["completion_ids"][:, 0]), [2, 2, 1, 1])
+    np.testing.assert_array_equal(np.asarray(model_batch["completion_mask"]).sum(-1), [2, 2, 2, 2])
+    # The resampled, scorable group trains with weight 1 instead of the discarded group's 0.
+    np.testing.assert_array_equal(np.asarray(model_batch["difficulty_weights"]), [1.0, 1.0, 1.0, 1.0])
+    assert float(jnp.abs(model_batch["advantages"][:2]).min()) > 0.5
+
+
+@pytest.mark.cpu_ok
+def test_elarge_reinforce_plus_plus_preset_uses_batch_advantage_scaling():
+    from easydel.infra.elarge.types.training import get_trainer_defaults
+
+    assert get_trainer_defaults("reinforce_plus_plus")["scale_rewards"] == ReinforcePlusPlusConfig().scale_rewards
+    assert get_trainer_defaults("reinforce_plus_plus")["scale_rewards"] == "batch_advantage"
+
+
+def test_gmpo_row_without_kept_tokens_has_zero_loss():
+    per_token_logps = jnp.asarray([[0.3, -0.4], [-0.6, 0.2]], dtype=jnp.float32)
+    loss, _ = _compute_grpo_policy_loss_terms(
+        per_token_logps=per_token_logps,
+        old_per_token_logps=jnp.zeros_like(per_token_logps),
+        advantages=jnp.asarray([[2.0], [-1.0]], dtype=jnp.float32),
+        completion_mask=jnp.ones((2, 2), dtype=jnp.float32),
+        loss_type="gmpo",
+        epsilon=0.4,
+        epsilon_high=0.4,
+        delta=None,
+        importance_sampling_level="token",
+        sapo_temperature_pos=1.0,
+        sapo_temperature_neg=1.05,
+        vespo_k_pos=2.0,
+        vespo_lambda_pos=3.0,
+        vespo_k_neg=3.0,
+        vespo_lambda_neg=2.0,
+        # Row 0: every token IS-masked; row 1: one token kept with weight 1.
+        importance_sampling_ratio=jnp.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=jnp.float32),
+    )
+    np.testing.assert_array_equal(np.asarray(loss[0]), [0.0, 0.0])
+    # Row 1: A = -1, the kept token's log ratio -0.6 is clipped up to log(0.6), so the loss is -A * 0.6.
+    np.testing.assert_allclose(np.asarray(loss[1]), [0.6, 0.6], rtol=1e-5)

@@ -776,27 +776,56 @@ def test_agent_flow_adapts_distillation_and_sliding_window_context():
     assert flow.arguments.context_mode == "sliding_window"
 
 
+def _advantage_holder(scale_rewards):
+    return SimpleNamespace(trainer=SimpleNamespace(arguments=SimpleNamespace(scale_rewards=scale_rewards)))
+
+
+_ADV_REWARDS = np.asarray([1.0, 3.0, 0.0, 5.0, 2.0, 0.0], dtype=np.float32)
+_ADV_VALID = np.asarray([1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+_SQRT_2_3 = float(np.sqrt(2.0 / 3.0))
+_BATCH_REF = (np.asarray([1.0, 3.0, 5.0]) - 3.0) / (np.std([1.0, 3.0, 5.0]) + 1e-4)
+
+
 @pytest.mark.cpu_ok
-def test_agent_flow_advantages_use_valid_rows_only():
-    holder = SimpleNamespace(trainer=SimpleNamespace(arguments=SimpleNamespace(scale_rewards="group")))
-    rewards = np.asarray([1.0, 3.0, 0.0, 5.0, 2.0, 0.0], dtype=np.float32)
-    valid = np.asarray([1.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
-    adv = AgentFlowTrainer._compute_advantages(holder, rewards, valid, 3)
-    # Group 0: valid rewards [1, 3] -> mean 2, std 1; failed row gets 0 and never enters the stats.
-    expected = np.asarray([-1.0 / 1.0001, 1.0 / 1.0001, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    # Group 1 has a single valid row -> zero advantage for the whole group.
-    np.testing.assert_allclose(adv, expected, rtol=1e-6, atol=1e-7)
+@pytest.mark.parametrize(
+    ("scale_rewards", "expected"),
+    [
+        # Group 0: valid rewards [1, 3] -> mean 2, std 1; failed row gets 0 and never enters the stats.
+        # Group 1 has a single valid row -> zero advantage for the whole group.
+        ("group", [-1.0 / 1.0001, 1.0 / 1.0001, 0.0, 0.0, 0.0, 0.0]),
+        (True, [-1.0 / 1.0001, 1.0 / 1.0001, 0.0, 0.0, 0.0, 0.0]),
+        ("batch", [_BATCH_REF[0], _BATCH_REF[1], 0.0, _BATCH_REF[2], 0.0, 0.0]),
+        # Group-centred valid rows [-1, 1, 0] (row 3 alone in its group) -> batch mean 0, std sqrt(2/3).
+        ("batch_advantage", [-1.0 / (_SQRT_2_3 + 1e-4), 1.0 / (_SQRT_2_3 + 1e-4), 0.0, 0.0, 0.0, 0.0]),
+        ("none", [-1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        (False, [-1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+    ],
+)
+def test_agent_flow_advantages_use_valid_rows_only(scale_rewards, expected):
+    adv = AgentFlowTrainer._compute_advantages(_advantage_holder(scale_rewards), _ADV_REWARDS, _ADV_VALID, 3)
+    assert adv.dtype == np.float32
+    np.testing.assert_allclose(adv, np.asarray(expected, dtype=np.float32), rtol=1e-6, atol=1e-7)
 
-    holder.trainer.arguments.scale_rewards = "batch"
-    adv_b = AgentFlowTrainer._compute_advantages(holder, rewards, valid, 3)
-    vals = np.asarray([1.0, 3.0, 5.0])
-    ref = (vals - vals.mean()) / (vals.std() + 1e-4)
-    np.testing.assert_allclose(adv_b[[0, 1, 3]], ref, rtol=1e-6)
-    assert adv_b[[2, 4, 5]].tolist() == [0.0, 0.0, 0.0]
 
-    holder.trainer.arguments.scale_rewards = "none"
-    adv_n = AgentFlowTrainer._compute_advantages(holder, rewards, valid, 3)
-    np.testing.assert_allclose(adv_n, [-1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+@pytest.mark.cpu_ok
+def test_agent_flow_batch_advantage_matches_inner_trainer_normalisation():
+    holder = _advantage_holder("batch_advantage")
+    rewards = np.asarray([0.0, 1.0, 0.0, 3.0, 5.0, 5.0, 5.0, 6.0], dtype=np.float32)
+    adv = AgentFlowTrainer._compute_advantages(holder, rewards, np.ones_like(rewards), 4)
+    # Independent reference: A = r - group mean, then (A - mean(A)) / (std(A) + 1e-4) over the batch.
+    centred = (rewards.reshape(2, 4) - rewards.reshape(2, 4).mean(axis=1, keepdims=True)).reshape(-1)
+    ref = (centred - centred.mean()) / (centred.std() + 1e-4)
+    np.testing.assert_allclose(adv, ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(adv, [-1.089, 0.0, -1.089, 2.177, -0.272, -0.272, -0.272, 0.816], atol=2e-3)
+    # Groups of one centre to zero, exactly as the inner trainer would.
+    single = AgentFlowTrainer._compute_advantages(holder, rewards, np.ones_like(rewards), 1)
+    assert single.tolist() == [0.0] * 8
+
+
+@pytest.mark.cpu_ok
+def test_agent_flow_advantages_reject_unknown_scale_rewards():
+    with pytest.raises(ValueError, match="scale_rewards"):
+        AgentFlowTrainer._compute_advantages(_advantage_holder("per_token"), _ADV_REWARDS, _ADV_VALID, 3)
 
 
 @pytest.mark.cpu_ok
@@ -895,6 +924,69 @@ def test_agent_flow_tokenized_prompt_is_not_templated_twice():
         True,
     )
     assert seen == [[ord(c) for c in templated]]
+
+
+class _BosTokenizer(_DummyTokenizer):
+    """Char tokenizer with a ``<s>`` BOS special token that, like HF tokenizers, is matched inside text."""
+
+    bos_token = "<s>"
+    bos_token_id = 2
+
+    def __call__(self, text: str, add_special_tokens: bool = False, **kwargs):
+        ids: list[int] = [self.bos_token_id] if add_special_tokens else []
+        pos = 0
+        while pos < len(text):
+            if text.startswith(self.bos_token, pos):
+                ids.append(self.bos_token_id)
+                pos += len(self.bos_token)
+            else:
+                ids.append(ord(text[pos]))
+                pos += 1
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+    def decode(self, ids, skip_special_tokens: bool = True) -> str:
+        parts = []
+        for i in ids:
+            i = int(i)
+            if i == self.bos_token_id:
+                if not skip_special_tokens:
+                    parts.append(self.bos_token)
+            elif i > 0:
+                parts.append(chr(i))
+        return "".join(parts)
+
+    def apply_chat_template(self, messages, tokenize: bool = False, add_generation_prompt: bool = True) -> str:
+        return self.bos_token + super().apply_chat_template(messages, tokenize, add_generation_prompt)
+
+
+@pytest.mark.cpu_ok
+def test_agent_flow_bos_prefixed_plain_prompt_is_templated_without_inner_bos():
+    tok = _BosTokenizer()
+    inner = _stub_trainer(
+        GRPOTrainer, args=GRPOConfig(num_generations=1, max_prompt_length=32, max_completion_length=16)
+    )
+    inner.processing_class = tok
+    flow = AgentFlowTrainer(
+        arguments=AgentFlowConfig(max_turns=1, group_size=1, max_prompt_length=32, max_completion_length=16),
+        trainer=inner,
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(prompt="", target_turns=1),
+        generate_turn_fn=lambda *a: ([ord("y")], "y", [-0.1]),
+    )
+    plain = tok("hello", add_special_tokens=True)["input_ids"]
+    templated = tok(tok.apply_chat_template([{"role": "user", "content": "hi"}]))["input_ids"]
+    width = 32
+    rows = [[0] * (width - len(r)) + r for r in (plain, templated)]
+    masks = [[0] * (width - len(r)) + [1] * len(r) for r in (plain, templated)]
+    tasks = flow._extract_tasks({"input_ids": np.asarray(rows), "attention_mask": np.asarray(masks)})
+
+    # Plain row: BOS text is dropped before templating, so only the template's own BOS reaches the ids.
+    assert tasks[0]["prompt"] == "hello"
+    plain_ids = flow._encode_text(flow._format_initial_prompt(tasks[0]["prompt"]))
+    assert plain_ids.count(tok.bos_token_id) == 1
+    assert plain_ids == tok(tok.apply_chat_template([{"role": "user", "content": "hello"}]))["input_ids"]
+    # Already-templated row keeps its special-token markup and is not templated again.
+    assert tasks[1]["prompt"] == "<s><user>hi<assistant>"
+    assert flow._encode_text(flow._format_initial_prompt(tasks[1]["prompt"])) == templated
 
 
 def test_agent_flow_observation_is_rendered_as_template_delta_without_system_reinjection():

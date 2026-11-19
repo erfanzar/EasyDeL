@@ -74,6 +74,12 @@ class OnPolicyDistillationConfig(DistillationConfig):
             forward KL in trust-region mode. Defaults to ``64``.
         trust_region_seed: Base seed of the per-step acceptance draw.
 
+    In trust-region mode the completions must be sampled by the student from the untruncated, unpenalised
+    ``softmax(logits / T)``: the ``top_k=50`` / ``top_p=0.95`` defaults are not inherited into
+    ``generation_top_k`` / ``generation_top_p`` (they become ``0`` / ``1.0``), and any explicit truncation
+    (top-k, top-p, min-p), non-neutral presence/frequency/repetition penalty or ``generate_with_teacher=True``
+    raises ``ValueError``.
+
     In trust-region mode every log-prob (acceptance ratio, policy-gradient term and rejected-token top-k KL)
     is computed at the *sampling* temperature (:attr:`trust_region_sampling_temperature`), not the
     distillation ``temperature``, and no ``T**2`` factor is applied to either branch.
@@ -219,11 +225,17 @@ class OnPolicyDistillationConfig(DistillationConfig):
             "top_p": self.top_p,
             "top_k": self.top_k,
         }
-        # Inherit sampling defaults before offline validation neutralizes them.
+        # Inherit sampling defaults before offline validation neutralizes them. Trust-region mode scores tokens
+        # against the untruncated student distribution, so the on-policy truncation defaults are not inherited
+        # there (explicit truncation is refused below).
+        trust_region = self.distillation_mode == "trust_region"
+        fields = type(self).__dataclass_fields__
         if self.generation_top_p is None:
-            self.generation_top_p = self.top_p
+            keep_default = trust_region and self.top_p == fields["top_p"].default
+            self.generation_top_p = 1.0 if keep_default else self.top_p
         if self.generation_top_k is None:
-            self.generation_top_k = self.top_k
+            keep_default = trust_region and self.top_k == fields["top_k"].default
+            self.generation_top_k = 0 if keep_default else self.top_k
         self.max_prompt_length = None  # type: ignore[assignment]
         self.max_completion_length = None  # type: ignore[assignment]
         self.top_p = 1.0
@@ -251,6 +263,40 @@ class OnPolicyDistillationConfig(DistillationConfig):
                 raise ValueError(
                     "`distillation_mode='trust_region'` needs a positive sampling temperature "
                     f"(`temperature_sampling` / `generation_temperature`); got {sampling_temperature!r}."
+                )
+            if self.generate_with_teacher:
+                raise ValueError(
+                    "`distillation_mode='trust_region'` scores tokens the student proposed; it cannot be used with "
+                    "`generate_with_teacher=True`."
+                )
+            self._check_trust_region_proposal_is_untruncated()
+
+    def _check_trust_region_proposal_is_untruncated(self) -> None:
+        """Refuse sampler settings that make the proposal differ from ``softmax(student_logits / T)``.
+
+        Raises:
+            ValueError: If top-k / top-p / min-p truncation or a presence, frequency or repetition penalty is
+                active in the generation arguments, ``generation_extra_kwargs`` or ``generation_config_overrides``.
+        """
+        neutral = {
+            "top_k": lambda v: v in (None, 0),
+            "top_p": lambda v: v is None or float(v) >= 1.0,
+            "min_p": lambda v: v is None or float(v) == 0.0,
+            "presence_penalty": lambda v: v is None or float(v) == 0.0,
+            "frequency_penalty": lambda v: v is None or float(v) == 0.0,
+            "repetition_penalty": lambda v: v is None or float(v) == 1.0,
+        }
+        sources = [("generation_" + name, getattr(self, "generation_" + name, None), name) for name in neutral]
+        for container in ("generation_extra_kwargs", "generation_config_overrides"):
+            mapping = getattr(self, container, None) or {}
+            sources.extend((f"{container}[{name!r}]", mapping[name], name) for name in neutral if name in mapping)
+        for label, value, name in sources:
+            if not neutral[name](value):
+                raise ValueError(
+                    "`distillation_mode='trust_region'` computes the acceptance ratio from the untruncated, "
+                    f"unpenalised student distribution, so the sampler must use it too; got `{label}={value!r}`. "
+                    "Disable top-k (0), top-p (1.0), min-p (0.0) and the presence/frequency (0.0) and repetition "
+                    "(1.0) penalties."
                 )
 
     @property

@@ -166,6 +166,73 @@ def test_between_steps_call_runs_inline_and_propagates_errors_when_loop_is_not_r
         loop.run_between_steps(boom)
 
 
+def _host_only_engine(runner_update):
+    """An eSurge shell with just the host state the ``keep_requests`` install path touches (no model, no loop)."""
+    engine = object.__new__(esurge_engine.eSurge)
+    engine.close = lambda: None
+    engine.cache_config = SimpleNamespace(enable_prefix_caching=False)
+    engine._step_coordinator = None
+    engine._request_plane = None
+    engine._engine_loop = None
+    engine._scheduler_running = False
+    engine._scheduler_lock = threading.RLock()
+    engine._weight_version = 0
+    engine._info = lambda *args, **kwargs: None
+    engine._resolve_weight_update_components = lambda model, gd, gs, go: (model, gs, go)
+    engine.runner = SimpleNamespace(
+        executor_manager=SimpleNamespace(has_compiled_variants=lambda: True),
+        update_model_weights=runner_update,
+    )
+    return engine
+
+
+@pytest.mark.cpu_ok
+def test_concurrent_updates_never_lower_or_reuse_the_version():
+    in_first_update = threading.Event()
+    release_first = threading.Event()
+    installed: list[str] = []
+
+    def runner_update(*, graphdef, graphstate, graphother, reset_state):
+        installed.append(graphdef)
+        if graphdef == "v7":
+            in_first_update.set()
+            assert release_first.wait(timeout=30)
+
+    engine = _host_only_engine(runner_update)
+    results: dict = {}
+
+    def call(name, version):
+        try:
+            results[name] = engine.update_model_weights(name, keep_requests=True, version=version)
+        except Exception as exc:
+            results[name] = exc
+
+    first = threading.Thread(target=call, args=("v7", 7), daemon=True)
+    first.start()
+    assert in_first_update.wait(timeout=30)
+    # A lower explicit version requested while the version-7 install is still in progress.
+    second = threading.Thread(target=call, args=("v5", 5), daemon=True)
+    second.start()
+    second.join(timeout=0.3)
+    release_first.set()
+    first.join(timeout=30)
+    second.join(timeout=30)
+
+    assert results["v7"] == 7
+    assert isinstance(results["v5"], ValueError) and "must increase" in str(results["v5"])
+    assert engine.weight_version == 7
+    assert installed == ["v7"]
+
+    # Implicit versions from concurrent callers are distinct and strictly increasing.
+    threads = [threading.Thread(target=call, args=(f"n{i}", None), daemon=True) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert sorted(results[f"n{i}"] for i in range(4)) == [8, 9, 10, 11]
+    assert engine.weight_version == 11
+
+
 # ------------------------------------------------------------------------------------------- engine (TPU)
 
 

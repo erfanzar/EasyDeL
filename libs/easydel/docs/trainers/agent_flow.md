@@ -79,17 +79,24 @@ counted once.
   top-k forward KL on rejected tokens (`trust_region_top_k`, default `64`; `trust_region_seed`). All log-probs use the
   **sampling** temperature (`trust_region_sampling_temperature`: `generation_temperature` if set, else
   `temperature_sampling`), not the distillation `temperature`, and **no `T**2` factor** is applied. A non-positive
-  sampling temperature raises.
+  sampling temperature raises. The acceptance ratio is exact only for an untruncated, unpenalised student proposal,
+  so in this mode generation top-k/top-p default to off (`0` / `1.0`), and the config refuses
+  `generate_with_teacher=True`, any top-k/top-p/min-p truncation, and presence/frequency/repetition penalties.
 
 ## eSurge weight-version provenance
 
 - `CompletionOutput.weight_version_segments`: `[(start_token_index, version), ...]`; token `i` was sampled with the
   version of the last segment starting at or before `i`. `oldest_weight_version` / `newest_weight_version` summarise
-  it; `None` when not recorded. Trainers expand it per token (`expand_weight_version_segments`).
+  it; `None` when not recorded. Trainers expand it per token (`expand_weight_version_segments`). The segments record
+  the weights each token was **sampled** with only; the version of the KV a token attends to is not recorded.
 - `eSurge.update_model_weights(..., version=None, keep_requests=False)` installs a strictly increasing version
-  (`None` = current + 1). By default the engine must be idle (it raises instead of draining). With
-  `keep_requests=True` the swap happens between two model steps and in-flight requests continue (tokens after the swap
-  carry the new version; earlier KV entries are kept). Limits: requires `enable_prefix_caching=False`, single-host
-  engines, and a graph whose compiled programs the runner already holds.
+  (`None` = current + 1); concurrent calls are serialised, so the version never decreases and is never reused. By
+  default the engine must be idle (it raises instead of draining). With `keep_requests=True` the swap happens between
+  two model steps and in-flight requests continue (tokens after the swap carry the new version; earlier KV entries are
+  kept and **not tracked**, so a prompt prefilled, fully or partly, under the old weights and sampled under the new
+  ones reports only the new version). Limits: requires `enable_prefix_caching=False`, single-host engines, and a graph
+  whose compiled programs the runner already holds.
 - `eSurge.abort_requests_before_version(min_version)` aborts unfinished requests that emitted any token with a version
-  below `min_version`; requests without tokens yet are kept. Returns the aborted parent request ids.
+  below `min_version`; requests without tokens yet are kept (even if their prompt KV was computed under older weights).
+  Returns the aborted parent request ids. It is a sampling-version fence, **not** a bound on KV staleness: after a
+  `keep_requests=True` swap, kept requests may still attend to KV computed under older weights.

@@ -864,10 +864,13 @@ class AgentFlowTrainer:
                 close_fn()
 
     def _decode_prompt_rows(self, ids: tp.Any, mask: tp.Any) -> list[str]:
-        """Decode tokenized prompt rows back to text, keeping template special tokens.
+        """Decode tokenized prompt rows back to text, keeping template special tokens only where needed.
 
-        Padding is removed through ``mask`` (when given) instead of ``skip_special_tokens``, so chat-template
-        markers survive decoding and :meth:`_format_initial_prompt` can recognise an already-templated prompt.
+        Padding is removed through ``mask`` (when given). Each row is first decoded with
+        ``skip_special_tokens=False`` so chat-template markers survive and :meth:`_format_initial_prompt` can
+        recognise an already-templated prompt. A row that is not templated and will be templated here is
+        decoded again with ``skip_special_tokens=True``, so tokenizer specials such as BOS are not re-encoded
+        inside the user turn. With ``skip_apply_chat_template`` the special-token text is kept.
         """
         arr = np.asarray(ids)
         mask_arr = None if mask is None else np.asarray(mask)
@@ -879,9 +882,13 @@ class AgentFlowTrainer:
                 rows.append(self._decode_ids(kept))
                 continue
             try:
-                rows.append(str(tok.decode(kept, skip_special_tokens=False)))
+                raw = str(tok.decode(kept, skip_special_tokens=False))
             except TypeError:
-                rows.append(str(tok.decode(kept)))
+                raw = str(tok.decode(kept))
+            if self.arguments.skip_apply_chat_template or self._is_chat_templated(raw):
+                rows.append(raw)
+            else:
+                rows.append(self._decode_ids(kept))
         return rows
 
     def _extract_tasks(self, batch: collections.abc.Mapping[str, tp.Any]) -> list[dict[str, tp.Any]]:
@@ -955,8 +962,11 @@ class AgentFlowTrainer:
         With ``group_size > 1`` each group is centred (and, unless ``scale_rewards == "none"``, scaled)
         by the mean/std of its valid rows; a group with fewer than two valid rows gets zero advantage.
         ``scale_rewards == "batch"`` uses the valid rows of the whole batch instead (zero if fewer than
-        two). With ``group_size <= 1`` (PPO/VAPO, single rollouts) raw rewards are kept unless batch
-        scaling is requested.
+        two). ``scale_rewards == "batch_advantage"`` (the REINFORCE++ default) mirrors the inner GRPO-family
+        trainer: each group is centred by the mean of its valid rows, then the centred valid rows of the
+        whole batch are standardised by their own mean and std (zero if fewer than two); with
+        ``group_size <= 1`` every centred row is zero. With ``group_size <= 1`` (PPO/VAPO, single
+        rollouts) and ``"group"``/``"none"``, raw rewards are kept.
 
         Args:
             rewards: Episode rewards, shape ``[num_episodes]``.
@@ -965,11 +975,23 @@ class AgentFlowTrainer:
 
         Returns:
             Float32 advantages of shape ``[num_episodes]``.
+
+        Raises:
+            ValueError: If the inner trainer's ``scale_rewards`` is not ``"group"``, ``"batch"``,
+                ``"batch_advantage"`` or ``"none"``.
         """
         rewards = np.asarray(rewards, dtype=np.float64)
         valid = np.asarray(valid_mask, dtype=np.float64) > 0.0
         out = np.zeros(rewards.shape, dtype=np.float64)
-        scale_rewards = str(getattr(getattr(self.trainer, "arguments", None), "scale_rewards", "group")).lower()
+        scale_rewards = getattr(getattr(self.trainer, "arguments", None), "scale_rewards", "group")
+        if isinstance(scale_rewards, bool):
+            scale_rewards = "group" if scale_rewards else "none"
+        scale_rewards = str(scale_rewards).lower()
+        if scale_rewards not in {"group", "batch", "batch_advantage", "none"}:
+            raise ValueError(
+                f"Invalid value for scale_rewards: {scale_rewards}. "
+                "Must be 'batch', 'batch_advantage', 'group', or 'none'."
+            )
 
         def _normalize(idx: np.ndarray, *, scale: bool) -> None:
             sel = idx[valid[idx]]
@@ -980,6 +1002,21 @@ class AgentFlowTrainer:
             out[sel] = centred / (vals.std() + 1e-4) if scale else centred
 
         all_idx = np.arange(rewards.shape[0])
+        if scale_rewards == "batch_advantage":
+            size = max(1, int(group_size))
+            centred = np.zeros(rewards.shape, dtype=np.float64)
+            in_stats = np.zeros(rewards.shape, dtype=bool)
+            for g in range(max(1, rewards.shape[0] // size)):
+                idx = all_idx[g * size : (g + 1) * size]
+                sel = idx[valid[idx]]
+                if sel.size:
+                    centred[sel] = rewards[sel] - rewards[sel].mean()
+                    in_stats[sel] = True
+            vals = centred[in_stats]
+            if vals.size >= 2:
+                out[in_stats] = (vals - vals.mean()) / (vals.std() + 1e-4)
+            return out.astype(np.float32)
+
         # With group_size == 1 (e.g. PPO/VAPO or single-rollout), group-centering would zero all rows.
         if group_size <= 1:
             if scale_rewards == "batch":

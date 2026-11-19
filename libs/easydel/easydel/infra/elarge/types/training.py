@@ -2973,7 +2973,7 @@ TRAINER_SPECIFIC_DEFAULTS.update(
         "reinforce_plus_plus": {
             **TRAINER_SPECIFIC_DEFAULTS["grpo"],
             "trainer_prefix": "ReinforcePlusPlus",
-            "scale_rewards": "batch",
+            "scale_rewards": "batch_advantage",
             "kl_estimator": "k2",
         },
         "vapo": {

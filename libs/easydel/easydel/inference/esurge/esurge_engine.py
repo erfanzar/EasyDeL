@@ -2870,9 +2870,15 @@ class eSurge:
         With ``keep_requests=True`` the swap runs on the scheduler thread between two model steps and nothing else is
         reset: in-flight and queued requests continue, and the tokens they sample after the swap carry the new
         version in ``CompletionOutput.weight_version_segments``. Their KV entries computed before the swap stay as
-        they are. Because a live prefix cache cannot be flushed while requests hold its pages, this mode requires
+        they are and are not tracked: the segments record only the weights each token was *sampled* with, so a
+        request whose prompt was (partly) prefilled, or whose earlier tokens were decoded, under the old weights
+        reports only the new version for tokens sampled after the swap even though they attend to old-weight KV.
+        Because a live prefix cache cannot be flushed while requests hold its pages, this mode requires
         ``enable_prefix_caching=False``; it is also limited to single-host engines and to a graph whose compiled
         programs the runner already holds (same structure and shapes).
+
+        Concurrent calls are serialised: version validation and installation happen under one per-engine lock, so
+        the installed version never decreases and two updates never share a version.
 
         Args:
             model: Optional EasyDeLBaseModule carrying the new weights.
@@ -2892,6 +2898,18 @@ class eSurge:
             ValueError: If no model/graph data is provided, ``version`` does not increase, or ``keep_requests`` is
                 requested on an engine with prefix caching or multi-host coordination.
         """
+        # One update at a time per engine: the version is validated and installed inside the same critical
+        # section, so concurrent callers can never install a duplicate or a lower version.
+        update_lock = self.__dict__.setdefault("_weight_update_lock", threading.Lock())
+        with update_lock:
+            return self._update_model_weights_locked(
+                model, graphdef, graphstate, graphother, restart_scheduler, version, keep_requests
+            )
+
+    def _update_model_weights_locked(
+        self, model, graphdef, graphstate, graphother, restart_scheduler, version, keep_requests
+    ) -> int:
+        """Body of :meth:`update_model_weights`; the caller holds the engine's weight-update lock."""
         new_version = self._next_weight_version(version)
         if model is None and graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No new model or graph components provided for update")
@@ -3055,6 +3073,11 @@ class eSurge:
         A request is in flight once it has emitted at least one token; its oldest version is the minimum over its
         samples' ``weight_version_segments``. Requests that have not emitted a token yet (queued, or still in
         prefill) are kept: every token they produce will carry the current version. Finished requests are untouched.
+
+        This filters on *sampling-step* versions only and does not bound KV staleness. After a
+        ``update_model_weights(keep_requests=True)`` swap, a request whose prompt KV (or part of it) was computed
+        under the old weights but which has not emitted a token yet is kept, and its tokens report only the new
+        version; tokens of any kept request may also attend to KV computed under older weights.
 
         Args:
             min_version: Oldest weight version a kept request may contain.

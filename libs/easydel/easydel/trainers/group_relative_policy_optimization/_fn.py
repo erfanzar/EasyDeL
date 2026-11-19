@@ -135,6 +135,42 @@ def _global_token_normalizer(
     return num_items_in_batch / max(int(gradient_accumulation_steps), 1)
 
 
+def _grpo_weighted_loss_denominator(
+    batch: tp.Mapping[str, jax.Array],
+    loss_type: str,
+    max_loss_completion_tokens: int | None,
+) -> jax.Array:
+    """Full-batch loss denominator of a batch carrying ``difficulty_weights``.
+
+    It is the same quantity each loss type computes per minibatch (``sum(w)`` for
+    ``grpo``/``sapo``/``gmpo``, ``sum(w) * T`` for ``dr_grpo``, ``#{w > 0} * T`` for ``luspo`` and
+    ``sum(mask * w)`` for the token-mean losses), taken over every row, with ``T`` and the mask
+    truncated to ``max_loss_completion_tokens`` as in the loss.
+
+    Args:
+        batch: Full step batch with ``completion_mask`` and ``difficulty_weights``.
+        loss_type: GRPO loss variant.
+        max_loss_completion_tokens: Optional completion-token cap used by the loss.
+
+    Returns:
+        A 0-dim float32 denominator.
+    """
+    mask = jnp.asarray(batch["completion_mask"])
+    if max_loss_completion_tokens is not None and mask.shape[1] > max_loss_completion_tokens:
+        mask = mask[:, :max_loss_completion_tokens]
+    mask = mask.astype(jnp.float32)
+    weights = jnp.asarray(batch["difficulty_weights"]).astype(jnp.float32)
+    if weights.ndim == 1:
+        weights = weights[:, None]
+    if loss_type in {"grpo", "sapo", "gmpo"}:
+        return jnp.sum(weights)
+    if loss_type == "dr_grpo":
+        return jnp.sum(weights) * mask.shape[1]
+    if loss_type == "luspo":
+        return jnp.sum((weights[:, 0] > 0).astype(jnp.float32)) * mask.shape[1]
+    return jnp.sum(mask * weights)
+
+
 def _compute_log_importance_weights(
     *,
     per_token_logps: jax.Array,
@@ -270,9 +306,11 @@ def _gmpo_sequence_ratio(
     clipped = jnp.maximum(clipped, math.log(1e-6))
     if is_log_weight is not None:
         clipped = clipped + is_log_weight
-    token_count = jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True).astype(jnp.float32), 1.0)
+    kept = jnp.sum(mask, axis=-1, keepdims=True).astype(jnp.float32)
+    token_count = jnp.maximum(kept, 1.0)
     sequence_log_ratio = jnp.sum(jnp.where(mask, clipped, 0.0), axis=-1, keepdims=True) / token_count
-    return jnp.exp(sequence_log_ratio)
+    # A row with no kept token (every IS weight zero/non-finite) leaves the objective: ratio 0, not exp(0) = 1.
+    return jnp.where(kept > 0, jnp.exp(sequence_log_ratio), 0.0)
 
 
 def _is_token_level_ratio(ratio: jax.Array | None, per_token_logps: jax.Array) -> bool:
@@ -1154,6 +1192,15 @@ def grpo_step(
             batch_partition_spec=partition_spec,
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
+        # With ``difficulty_weights`` (dataset weights or discarded unscorable groups) every loss type
+        # normalises by a weighted count. Under gradient accumulation a minibatch-local count would give a
+        # fully or mostly discarded microbatch a full ``1/K`` share of the averaged gradient, so each
+        # microbatch divides by the full-batch count instead, scaled by ``1/K`` to undo the uniform average.
+        accumulated_weighted_denominator = None
+        if is_training and int(gradient_accumulation_steps) > 1 and "difficulty_weights" in batch:
+            accumulated_weighted_denominator = jnp.maximum(
+                _grpo_weighted_loss_denominator(batch, loss_type, max_loss_completion_tokens), 1.0
+            ) / float(gradient_accumulation_steps)
 
     def loss_fn(tree, minibatch):
         """Compute the GRPO surrogate loss for one minibatch.
@@ -1247,6 +1294,12 @@ def grpo_step(
             if has_difficulty_weights
             else jnp.asarray(completion_ids.shape[0], dtype=jnp.float32)
         )
+
+        def weighted_denominator(local_denominator: jax.Array) -> jax.Array:
+            """Loss denominator of a weighted batch: global under accumulation, else this minibatch's own."""
+            if accumulated_weighted_denominator is not None:
+                return accumulated_weighted_denominator
+            return jnp.maximum(local_denominator, 1.0)
 
         old_per_token_logps = minibatch.get("old_per_token_logps")
         if old_per_token_logps is not None and old_per_token_logps.shape[1] != completion_ids.shape[1]:
@@ -1514,20 +1567,22 @@ def grpo_step(
                     cispo_clip_den = cispo_clip_den + chunk_cispo_den
 
             if loss_type in {"grpo", "sapo", "gmpo"}:
-                loss = loss_numerator / jnp.maximum(grpo_weight_den, 1.0)
+                loss = loss_numerator / weighted_denominator(grpo_weight_den)
             elif loss_type == "luspo":
                 # Match the non-chunked path's ``jnp.mean(per_token_loss * completion_lengths)`` which divides
                 # by batch*seq; dividing by batch alone made the chunked loss ~seq_len larger, so the gradient
                 # magnitude depended on whether LM-head chunking was enabled.
-                loss = loss_numerator / jnp.maximum(luspo_row_count * completion_ids.shape[1], 1.0)
+                loss = loss_numerator / weighted_denominator(luspo_row_count * completion_ids.shape[1])
             elif loss_type == "bnpo":
                 weighted_token_count = jnp.sum(completion_mask * difficulty_weights)
-                loss = loss_numerator / jnp.maximum(weighted_token_count, 1.0)
+                loss = loss_numerator / weighted_denominator(weighted_token_count)
             elif loss_type == "dr_grpo":
-                loss = loss_numerator / jnp.maximum(jnp.sum(difficulty_weights) * completion_ids.shape[1], 1.0)
+                loss = loss_numerator / weighted_denominator(jnp.sum(difficulty_weights) * completion_ids.shape[1])
             elif loss_type in ["cispo", "dapo", "vespo", "dppo"]:
-                normalizer = jnp.sum(completion_mask * difficulty_weights) if has_difficulty_weights else normalizer
-                loss = loss_numerator / jnp.maximum(normalizer, 1.0)
+                if has_difficulty_weights:
+                    loss = loss_numerator / weighted_denominator(jnp.sum(completion_mask * difficulty_weights))
+                else:
+                    loss = loss_numerator / jnp.maximum(normalizer, 1.0)
             else:
                 raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -1717,22 +1772,23 @@ def grpo_step(
                     completion_lengths,
                     1.0,
                 )
-                loss = jnp.sum(sequence_loss) / jnp.maximum(jnp.sum(difficulty_weights), 1.0)
+                loss = jnp.sum(sequence_loss) / weighted_denominator(jnp.sum(difficulty_weights))
             elif loss_type == "luspo":
-                loss = jnp.sum(per_token_loss * completion_lengths[:, None]) / jnp.maximum(
-                    luspo_row_count * per_token_loss.shape[1], 1.0
+                loss = jnp.sum(per_token_loss * completion_lengths[:, None]) / weighted_denominator(
+                    luspo_row_count * per_token_loss.shape[1]
                 )
             elif loss_type == "bnpo":
                 weighted_token_count = jnp.sum(completion_mask * difficulty_weights)
-                loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(weighted_token_count, 1.0)
+                loss = jnp.sum(per_token_loss * completion_mask) / weighted_denominator(weighted_token_count)
             elif loss_type == "dr_grpo":
-                loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(
-                    jnp.sum(difficulty_weights) * per_token_loss.shape[1],
-                    1.0,
+                loss = jnp.sum(per_token_loss * completion_mask) / weighted_denominator(
+                    jnp.sum(difficulty_weights) * per_token_loss.shape[1]
                 )
             elif loss_type in ["cispo", "dapo", "vespo", "dppo"]:
                 if has_difficulty_weights:
-                    normalizer = jnp.sum(completion_mask * difficulty_weights)
+                    loss = jnp.sum(per_token_loss * completion_mask) / weighted_denominator(
+                        jnp.sum(completion_mask * difficulty_weights)
+                    )
                 else:
                     normalizer = _global_token_normalizer(
                         minibatch.get("num_items_in_batch"),
@@ -1740,7 +1796,7 @@ def grpo_step(
                         completion_was_truncated,
                         gradient_accumulation_steps,
                     )
-                loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
+                    loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
             else:
                 raise ValueError(f"Unknown loss type: {loss_type}")
 

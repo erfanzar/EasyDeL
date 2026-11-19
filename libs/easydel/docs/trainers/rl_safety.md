@@ -60,6 +60,12 @@ A reward function returning `None` marks a sample unscorable (judge or sandbox f
 
 `make_environment_reward_fn` sets `discard_unscorable = True`; see [RL environments](environments.md).
 
+With `gradient_accumulation_steps > 1`, a batch carrying `difficulty_weights` (dataset weights or discarded groups)
+normalises every microbatch by the full-batch weighted count, so a fully or mostly discarded microbatch does not
+dilute the gradient. Under `environment_factory`, a `reset` or `step` whose `info` sets `env_error` or `discard`
+reports a NaN environment reward (never the placeholder `0.0`), so the opted-in environment column drops the group.
+Dynamic sampling gives resampled groups weight `1`, never the zero weight of the discarded group they replace.
+
 ## eSurge importance sampling
 
 `esurge_importance_sampling_correction` (default `True`) corrects the learner/rollout mismatch.
@@ -79,7 +85,8 @@ IcePop modes with `cap_low=None` require `cap >= 1`; an explicit `cap_low` must 
 
 - **GMPO** (`GMPOConfig`, `loss_type="gmpo"`, `epsilon = epsilon_high = 0.4`): the sequence ratio is the geometric
   mean `exp(mean_t log clip(r_t))` of advantage-sign-aware clipped token ratios, computed in log space. Token-level IS
-  weights `w_t` fold into the mean: tokens with `w_t = 0` leave it, others add `stop_gradient(log w_t)`.
+  weights `w_t` fold into the mean: tokens with `w_t = 0` leave it, others add `stop_gradient(log w_t)`. A row
+  whose tokens all have `w_t = 0` gets sequence ratio `0` (zero loss).
 - **`scale_rewards`**: `"group"` (default) `A / (std_group(r) + eps)`, `"batch"` `A / (std_batch(r) + eps)`,
   `"batch_advantage"` `(A - mean_batch(A)) / (std_batch(A) + eps)` over group-centred `A = r - baseline`, `"none"`.
   `True` / `False` map to `"group"` / `"none"`.

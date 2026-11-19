@@ -612,10 +612,13 @@ def trust_region_distillation_loss(
       ``sum_{v in topk(p)} p_v (log p_v - log q_v)`` with ``p``/``q`` normalized over the full
       vocabulary, pulling the student toward the teacher where it strayed outside the teacher's trust region.
 
-    The loss is ``sum(mask * per_token) / max(sum(mask), 1)``. All log-probs use ``logits / temperature``, where
-    ``temperature`` must be the temperature the tokens were *sampled* at, so ``P`` is the true
-    target/proposal ratio of the sampling distributions. Neither branch carries a ``T**2`` factor: both are
-    per-token divergence estimates of the same pair of distributions, so they share one scale (the ``T**2``
+    The loss is ``sum(mask * per_token) / max(sum(mask), 1)``. All log-probs use the full-vocabulary
+    ``softmax(logits / temperature)``, where ``temperature`` must be the temperature the tokens were *sampled* at.
+    ``P`` is the target/proposal ratio of the sampling distributions only when the student itself sampled the
+    tokens from that untruncated, unpenalised distribution: no top-k / top-p / min-p truncation, no presence,
+    frequency or repetition penalty, and no teacher-generated completions
+    (:class:`OnPolicyDistillationConfig` refuses those settings in trust-region mode). Neither branch carries a
+    ``T**2`` factor: both are per-token divergence estimates of the same pair of distributions, so they share one scale (the ``T**2``
     Hinton correction only compensates for softening by a separate distillation temperature, which this mode
     does not use).
 
