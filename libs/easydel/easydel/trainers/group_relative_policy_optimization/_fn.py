@@ -40,7 +40,14 @@ from jax.sharding import PartitionSpec
 from spectrax import common_types, with_sharding_constraint
 
 from easydel.caching import TransformerCache
-from easydel.caching.shared_prefix import PREFIX_SHARED_ATTENTION_MECHANISMS, PrefixCaptureView, PrefixForkView
+from easydel.caching.shared_prefix import (
+    PREFIX_SHARED_ATTENTION_MECHANISMS,
+    PREFIX_SHARED_RECURRENT_MODEL_TYPES,
+    PrefixCaptureView,
+    PrefixForkView,
+    PrefixRecurrentCaptureView,
+    PrefixRecurrentForkView,
+)
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.trainers._logprob_utils import (
@@ -635,7 +642,8 @@ def validate_prefix_shared_model(model) -> None:
 
     Raises:
         NotImplementedError: For an unverified attention operation, quantized KV, attention dropout,
-            pipeline parallelism, sliding-window or non-full-attention (hybrid/recurrent) layers.
+            pipeline parallelism, sliding-window layers, or layer types other than full attention (plus
+            gated-delta ``linear_attention`` for model types in ``PREFIX_SHARED_RECURRENT_MODEL_TYPES``).
     """
     config = getattr(model, "config", None)
     if config is None:
@@ -657,11 +665,26 @@ def validate_prefix_shared_model(model) -> None:
     if getattr(text_config, "use_sliding_window", False):
         raise NotImplementedError("Prefix-shared forward does not support sliding-window attention.")
     layer_types = getattr(text_config, "layer_types", None)
-    if layer_types is not None and any(str(layer_type) != "full_attention" for layer_type in layer_types):
-        raise NotImplementedError(
-            "Prefix-shared forward supports dense full-attention models only; "
-            f"got layer_types {sorted(set(map(str, layer_types)))}."
-        )
+    if layer_types is not None:
+        model_type = str(getattr(text_config, "model_type", ""))
+        allowed = {"full_attention"}
+        if model_type in PREFIX_SHARED_RECURRENT_MODEL_TYPES:
+            allowed.add("linear_attention")
+        kinds = set(map(str, layer_types))
+        if not kinds <= allowed:
+            raise NotImplementedError(
+                "Prefix-shared forward supports full-attention layers, plus gated-delta `linear_attention` layers "
+                f"for model types {sorted(PREFIX_SHARED_RECURRENT_MODEL_TYPES)}; got model_type {model_type!r} "
+                f"with layer_types {sorted(kinds)}."
+            )
+
+
+def _prefix_shared_linear_layers(model, num_layers: int) -> list[bool]:
+    """Per layer, whether it is a gated-delta ``linear_attention`` layer (recurrent prefix views)."""
+    layer_types = getattr(model.config.get_text_config(), "layer_types", None)
+    if layer_types is None:
+        return [False] * num_layers
+    return [str(layer_type) == "linear_attention" for layer_type in layer_types]
 
 
 def get_per_token_logps_prefix_shared(
@@ -676,15 +699,18 @@ def get_per_token_logps_prefix_shared(
 ):
     """Per-token completion log-probabilities with each prompt run once per group.
 
-    A capture pass runs the left-padded prompts at batch ``B`` and records every layer's post-RoPE
-    key/value states; a fork pass runs the completions at batch ``B * G`` against the gathered prefix
-    (row ``r`` reads prompt ``r // G``). The prompt's last column (``P - 1``) predicts completion token 0.
+    A capture pass runs the left-padded prompts at batch ``B`` and records every full-attention layer's
+    post-RoPE key/value states and every gated-delta linear-attention layer's end-of-prompt conv window
+    and recurrent state; a fork pass runs the completions at batch ``B * G`` against the gathered prefix
+    or starting from the gathered state (row ``r`` reads prompt ``r // G``). The prompt's last column
+    (``P - 1``) predicts completion token 0.
     Equal, up to float rounding, to :func:`get_per_token_logps` on ``concat([prompt.repeat(G), completion])``;
     gradients reach the prompt activations through the gather.
 
     Args:
         model: Policy module.
-        prompt_ids: ``[B, P]`` left-padded prompt ids; every prompt must have a valid last column.
+        prompt_ids: ``[B, P]`` left-padded prompt ids; every prompt must have a valid last column. With
+            linear-attention layers ``P`` and ``C`` must both be at least 2.
         prompt_mask: ``[B, P]`` prompt validity mask.
         completion_ids: ``[B * G, C]`` completion ids, grouped by prompt.
         completion_attention_mask: ``[B * G, C]`` completion attention mask (right padded).
@@ -711,25 +737,44 @@ def get_per_token_logps_prefix_shared(
             f"completion batch {fork_batch} must equal prompt batch {prompt_batch} x num_generations {num_generations}."
         )
     num_layers = int(model.config.get_text_config().num_hidden_layers)
+    linear_layers = _prefix_shared_linear_layers(model, num_layers)
+    if any(linear_layers) and (prefix_len < 2 or completion_len < 2):
+        raise NotImplementedError(
+            "Prefix-shared forward with linear-attention layers requires prompt and completion lengths >= 2 "
+            f"(single-token gated-delta steps are not supported); got {prefix_len} and {completion_len}."
+        )
 
+    capture_views = [PrefixRecurrentCaptureView() if linear else PrefixCaptureView() for linear in linear_layers]
     capture = model(
         input_ids=prompt_ids,
         attention_mask=prompt_mask,
-        past_key_values=TransformerCache(views=[PrefixCaptureView() for _ in range(num_layers)]),
+        past_key_values=TransformerCache(views=capture_views),
         mode=common_types.MODE_TRAIN,
         apply_lm_head=False,
     )
     prompt_valid = prompt_mask.astype(jnp.bool_)
     prefix_segment_ids = jnp.where(prompt_valid, 0, -1).astype(jnp.int32)
-    fork_views = [
-        PrefixForkView(
-            prefix_key=view.key,
-            prefix_value=view.value,
-            prefix_segment_ids=prefix_segment_ids,
-            num_generations=num_generations,
-        )
-        for view in capture.past_key_values.views
-    ]
+    fork_views = []
+    for view in capture.past_key_values.views:
+        if isinstance(view, PrefixRecurrentCaptureView):
+            if view.conv_state is None or view.recurrent_state is None:
+                raise RuntimeError("A linear-attention layer did not record its prefix state.")
+            fork_views.append(
+                PrefixRecurrentForkView(
+                    prefix_conv_state=view.conv_state,
+                    prefix_recurrent_state=view.recurrent_state,
+                    num_generations=num_generations,
+                )
+            )
+        else:
+            fork_views.append(
+                PrefixForkView(
+                    prefix_key=view.key,
+                    prefix_value=view.value,
+                    prefix_segment_ids=prefix_segment_ids,
+                    num_generations=num_generations,
+                )
+            )
     rows = jnp.arange(fork_batch, dtype=jnp.int32) // num_generations
     # RoPE positions continue from each prompt's valid length, as in the concatenated sequence.
     prompt_lengths = jnp.sum(prompt_valid, axis=1).astype(jnp.int32)

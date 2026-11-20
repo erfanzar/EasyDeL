@@ -109,8 +109,19 @@ gathered prefix, with visibility from segment ids and causality from absolute po
   precision pinned (XLA kernel at `HIGHEST`, or the Pallas kernel). At the default precision the XLA flash kernel uses
   bf16 passes on TPU, about 6e-3 off for output and 9e-3 for gradients, with masking unchanged. `blocksparse` was
   checked at 512-token prompts and completions, where the TPU kernel itself runs; shorter inputs use its fallback.
-- **Rejected:** `completion_chunk_size`, `top_entropy_quantile < 1`, `mpmd_scheduler`, sliding-window or
-  non-full-attention layers, quantized KV, attention dropout, and other attention operations.
+- **Hybrid `qwen3_next`:** its gated-delta `linear_attention` layers use the recurrent views in
+  `easydel/caching/shared_prefix/recurrent.py`. The capture pass records each layer's end-of-prompt conv window and
+  recurrent state (left padding is zeroed before the projections, so it contributes nothing), and the fork pass starts
+  every completion row from its prompt's state. Prompt and completion lengths must both be at least 2. On TPU, with the
+  gated-delta rule pinned to the XLA kernel (`HIGHEST` matmuls), log-probs match the repeated-prompt forward to 4.8e-7
+  and every SGD parameter update to 1.2e-7 for `G` in {1, 2, 3}, dense and MoE MLPs, ragged left-padded prompts
+  (including one shorter than the conv kernel) and right-padded completions. The default TPU Pallas gated-delta kernel
+  runs its matmuls at `DEFAULT` precision (bf16 passes): there the two forwards differ by about 2.6e-4 in log-probs and
+  5.7e-4 in updates. That is below the kernel's own gap to the `HIGHEST` reference (4.0e-4 and 1.8e-3).
+- **Rejected:** `completion_chunk_size`, `top_entropy_quantile < 1`, `mpmd_scheduler`, sliding-window layers, layer
+  types other than full attention (plus `linear_attention` for `qwen3_next` only, so KDA families such as
+  `kimi_linear` and `glm5_next` are rejected), single-token prompts or completions on hybrid models, quantized KV,
+  attention dropout, and other attention operations.
 - **When it pays off:** the saving tracks `(G-1)·P / (G·(P+C))` for prompt length `P` and completion length `C`.
   Measured on 4 TPU v5p chips, 697M-parameter dense model, `vanilla` attention, bf16, 8 prompts per step:
 

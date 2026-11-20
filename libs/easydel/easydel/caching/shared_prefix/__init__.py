@@ -28,6 +28,9 @@ Visibility in the fork pass is expressed with segment ids (``-1`` marks
 padding) and causality with absolute column positions
 (``q_positions = P + arange(C)``, ``kv_positions = arange(P + C)``), which the
 dense attention operations consume directly instead of a dense mask.
+
+Gated-delta linear-attention layers carry state instead of key/value history;
+their capture/fork views live in :mod:`.recurrent`.
 """
 
 from __future__ import annotations
@@ -37,7 +40,23 @@ from eformer.pytree import auto_pytree, field
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
-__all__ = ("PREFIX_SHARED_ATTENTION_MECHANISMS", "PrefixCaptureView", "PrefixForkView", "is_shared_prefix_view")
+from .recurrent import (
+    PREFIX_SHARED_RECURRENT_MODEL_TYPES,
+    PrefixRecurrentCaptureView,
+    PrefixRecurrentForkView,
+    is_shared_prefix_recurrent_view,
+)
+
+__all__ = (
+    "PREFIX_SHARED_ATTENTION_MECHANISMS",
+    "PREFIX_SHARED_RECURRENT_MODEL_TYPES",
+    "PrefixCaptureView",
+    "PrefixForkView",
+    "PrefixRecurrentCaptureView",
+    "PrefixRecurrentForkView",
+    "is_shared_prefix_recurrent_view",
+    "is_shared_prefix_view",
+)
 
 PREFIX_SHARED_ATTENTION_MECHANISMS = frozenset({"vanilla", "sdpa", "flash_attn2", "blocksparse"})
 """Attention operations verified on TPU (output and q/k/v gradients) for the prefix-shared fork representation."""
