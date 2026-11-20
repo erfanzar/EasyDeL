@@ -149,6 +149,10 @@ class ServerSpec:
         profiler_port: When set, the leader starts a JAX profiler server on this port (off by default). Capture
             from the leader host with ``python -m jax.collect_profile <port> <duration_ms>``; keep the port off
             any public firewall rule, it is unauthenticated.
+        dashboard: Start ``esurge-dashboard`` next to the endpoint (on by default; ``false`` turns it off). The
+            process serving the endpoint keeps it running and restarts it when it exits; with dp replicas it is
+            replica 0's leader, and the dashboard reads ``/metrics`` merged over every front.
+        dashboard_port: Port the dashboard listens on, on the same address as the endpoint.
     """
 
     host: str = INTERNAL_ADDRESS
@@ -158,9 +162,19 @@ class ServerSpec:
     log_level: str = "info"
     max_concurrent_generations: int | None = None
     profiler_port: int | None = None
+    dashboard: bool = True
+    dashboard_port: int = 9090
 
     def __post_init__(self) -> None:
         _port(self.port, "`server.port`")
+        if not isinstance(self.dashboard, bool):
+            raise ServingConfigError(f"`server.dashboard` must be true or false, got {self.dashboard!r}")
+        _port(self.dashboard_port, "`server.dashboard_port`")
+        if self.dashboard and self.dashboard_port in {self.port, self.profiler_port}:
+            raise ServingConfigError(
+                "`server.dashboard_port` must differ from `server.port` and `server.profiler_port` "
+                "(or set `server.dashboard: false`)"
+            )
         if self.profiler_port is not None:
             _port(self.profiler_port, "`server.profiler_port`")
             if self.profiler_port == self.port:
@@ -221,6 +235,14 @@ class ServingConfig:
     _TOP_LEVEL: tp.ClassVar[frozenset[str]] = frozenset(
         {"model", "esurge", "server", "coordination", "compilation_cache_dir"}
     )
+
+    def __post_init__(self) -> None:
+        control = self.coordination.control_port
+        if self.server.dashboard and self.server.dashboard_port in {control, control + 1}:
+            raise ServingConfigError(
+                "`server.dashboard_port` must differ from `coordination.control_port` and the port after it "
+                "(or set `server.dashboard: false`)"
+            )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, tp.Any]) -> ServingConfig:

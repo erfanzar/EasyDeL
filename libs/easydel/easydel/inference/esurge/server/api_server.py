@@ -3181,25 +3181,24 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             embedded ``auth_stats`` block reported by the auth manager.
         """
         self._authorize_request(raw_request, endpoint="/v1/metrics")
+        return JSONResponse(self.metrics_payload())
+
+    def metrics_payload(self) -> dict[str, tp.Any]:
+        """The ``/metrics`` body, without an authorization check (callers must have authorized already)."""
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
-
-        auth_stats = self.auth_manager.get_statistics()
-
-        return JSONResponse(
-            {
-                "uptime_seconds": self.metrics.uptime_seconds,
-                "total_requests": self.metrics.total_requests,
-                "successful_requests": self.metrics.successful_requests,
-                "failed_requests": self.metrics.failed_requests,
-                "total_tokens_generated": self.metrics.total_tokens_generated,
-                "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
-                "active_requests": len(self._active_requests),
-                "models_loaded": len(self.adapters),
-                "status": self.status.value,
-                "auth_stats": auth_stats,
-                "engine_metrics": self._engine_metrics_snapshot(),
-            }
-        )
+        return {
+            "uptime_seconds": self.metrics.uptime_seconds,
+            "total_requests": self.metrics.total_requests,
+            "successful_requests": self.metrics.successful_requests,
+            "failed_requests": self.metrics.failed_requests,
+            "total_tokens_generated": self.metrics.total_tokens_generated,
+            "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
+            "active_requests": len(self._active_requests),
+            "models_loaded": len(self.adapters),
+            "status": self.status.value,
+            "auth_stats": self.auth_manager.get_statistics(),
+            "engine_metrics": self._engine_metrics_snapshot(),
+        }
 
     async def list_models(self, raw_request: Request) -> JSONResponse:
         """List available models.

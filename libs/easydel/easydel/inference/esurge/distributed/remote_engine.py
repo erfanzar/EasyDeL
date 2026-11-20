@@ -466,6 +466,9 @@ class RemoteEngineHandle:
             ignore_stop_strings_in_reasoning=False,
             on_activity=lambda: None,
             info=logger.debug,
+            # Tag requests with the served engine name: ``/metrics`` summarizes the collector per engine name, so
+            # untagged requests never show up in it.
+            model_name=spec.esurge_name,
         )
         self._fatal: tuple[BaseException, str] | None = None
 

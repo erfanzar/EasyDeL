@@ -317,6 +317,8 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
         if table:
             steps = {t: round(ms, 3) for t, ms in table.items()}
             _log(rank, f"replica {plan.index} model-step ms per token bucket: {steps}")
+    dashboard = None
+    front_socket_dir = ""
     try:
         if plan is not None and engine.is_coordination_leader:
             # A replica leader: the front's router reaches its engine over its request plane.
@@ -325,23 +327,32 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
             started_at: dict[int, float] = {}
             restarts: dict[int, int] = {}
             due: dict[int, float] = {}
+            front_plan = plan
             if plan.spawns_front:
+                import dataclasses
+
+                from .dashboard import create_front_socket_dir
                 from .replicas import spawn_front
 
+                # The fronts' private metrics sockets: a fresh owner-only directory, handed to them in their plan.
+                front_socket_dir = create_front_socket_dir()
+                front_plan = dataclasses.replace(plan, front_socket_dir=front_socket_dir)
                 for index in range(FRONT_PROCESSES):
-                    fronts[index] = spawn_front(plan, str(token), index=index)
+                    fronts[index] = spawn_front(front_plan, str(token), index=index)
                     started_at[index], restarts[index] = time.monotonic(), 0
                 pids = [f.pid for f in fronts.values()]
                 _log(
                     rank,
                     f"started {len(fronts)} fronts (pids {pids}) for the OpenAI endpoint over {plan.count} replicas",
                 )
+                # The fronts share this host and port; the dashboard reads their merged /metrics.
+                dashboard = start_dashboard(config, resolve_bind_host(config.server.host), rank)
             while True:
                 now = time.monotonic()
                 for index, front in list(fronts.items()):
                     if front is None:
                         if now >= due[index]:
-                            fronts[index] = spawn_front(plan, str(token), index=index)
+                            fronts[index] = spawn_front(front_plan, str(token), index=index)
                             started_at[index] = time.monotonic()
                             _log(rank, f"restarted front {index} (pid {fronts[index].pid})")
                         continue
@@ -370,6 +381,12 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
             return
         _serve_http(config, engine, rank, ed)
     finally:
+        if dashboard is not None:
+            dashboard.stop()
+        if front_socket_dir:
+            import shutil
+
+            shutil.rmtree(front_socket_dir, ignore_errors=True)
         engine.close()
 
 
@@ -389,7 +406,7 @@ def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
     routed = attacher.wait_for_first()
     attacher.start()
     try:
-        _serve_http(config, routed, 0, ed, shared_port=True)
+        _serve_http(config, routed, 0, ed, front=(plan.front_index, FRONT_PROCESSES, plan.front_socket_dir))
     finally:
         attacher.stop()
         routed.close()
@@ -583,7 +600,20 @@ def reuse_port_socket(host: str, port: int) -> tp.Any:
     return sock
 
 
-def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any, *, shared_port: bool = False) -> None:
+def _serve_http(
+    config: ServingConfig,
+    engine: tp.Any,
+    rank: int,
+    ed: tp.Any,
+    *,
+    front: tuple[int, int, str] | None = None,
+) -> None:
+    """Serve the OpenAI endpoint over ``engine``.
+
+    ``front=(index, count, socket_dir)`` marks dp front ``index`` of ``count``: it shares the port with the others,
+    answers its peers on a private unix socket in ``socket_dir``, and its ``/metrics`` covers every front. Otherwise
+    this process owns the endpoint alone and also keeps the dashboard running (``server.dashboard``).
+    """
     key, created = load_or_create_api_key(config.server.api_key_path)
     name = config.model.served_name or engine.esurge_name
     server = ed.eSurgeApiServer(
@@ -601,16 +631,49 @@ def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any, *,
         f"READY model={name} key_id={metadata.key_id} key_file={config.server.api_key_path} "
         f"({'created' if created else 'existing'}) urls={urls}",
     )
-    if not shared_port:
-        server.run(host=host, port=config.server.port, workers=1, log_level=config.server.log_level, reload=False)
+    if front is None:
+        dashboard = start_dashboard(config, host, rank)
+        try:
+            server.run(host=host, port=config.server.port, workers=1, log_level=config.server.log_level, reload=False)
+        finally:
+            if dashboard is not None:
+                dashboard.stop()
         return
     import asyncio
 
     import uvicorn
 
+    from easydel.inference.esurge.metrics import get_metrics_collector
+    from easydel.inference.esurge.server.api_server import _METRICS_WINDOW_S
     from easydel.inference.inference_engine_interface import TIMEOUT_KEEP_ALIVE
 
+    from .dashboard import FrontMetricsMiddleware, bind_unix_socket, front_socket_path
+
+    index, count, socket_dir = front
     sock = reuse_port_socket(host, config.server.port)
+    listeners = [sock]
+    if socket_dir:
+        own_socket = front_socket_path(socket_dir, index)
+        listeners.append(bind_unix_socket(own_socket))
+        peers = [front_socket_path(socket_dir, i) for i in range(count)]
+    else:
+        # A leader that handed over no socket directory: serve, with /metrics covering this front only.
+        _log(0, f"front {index}: no private socket directory in the plan; /metrics covers this front only")
+        own_socket, peers = "", []
+    engine_name = engine.esurge_name
+
+    def request_rows(_served_name: str) -> list[dict]:
+        collector = get_metrics_collector()
+        return [] if collector is None else collector.request_rows(engine_name, window_seconds=_METRICS_WINDOW_S)
+
+    app = FrontMetricsMiddleware(
+        server.app,
+        own_socket=own_socket,
+        sockets=peers,
+        local_metrics=server.metrics_payload,
+        request_rows=request_rows,
+        window_seconds=_METRICS_WINDOW_S,
+    )
     try:
         import uvloop
 
@@ -618,10 +681,24 @@ def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any, *,
     except ImportError:
         pass
     uv_config = uvicorn.Config(
-        server.app,
+        app,
         log_level=config.server.log_level,
         timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
         server_header=False,
         date_header=True,
     )
-    uvicorn.Server(uv_config).run(sockets=[sock])
+    uvicorn.Server(uv_config).run(sockets=listeners)
+
+
+def start_dashboard(config: ServingConfig, host: str, rank: int) -> tp.Any:
+    """Start the dashboard supervisor unless ``server.dashboard`` is false; returns it (or ``None``)."""
+    if not config.server.dashboard:
+        return None
+    from .dashboard import DashboardSupervisor
+
+    return DashboardSupervisor(
+        host=host,
+        port=config.server.dashboard_port,
+        endpoint_port=config.server.port,
+        log=lambda message: _log(rank, message),
+    ).start()

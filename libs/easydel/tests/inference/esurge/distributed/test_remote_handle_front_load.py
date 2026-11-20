@@ -139,6 +139,20 @@ def test_finished_requests_do_not_stay_in_the_handle(monkeypatch):
         handle.close()
 
 
+def test_front_requests_are_tagged_with_the_served_engine_name(monkeypatch):
+    """/metrics summarizes the collector per engine name; untagged front requests never showed up in it."""
+    from easydel.inference.esurge import metrics
+
+    collector = metrics.MetricsCollector(enable_detailed_logging=False)
+    monkeypatch.setattr(metrics, "_global_metrics_collector", collector)
+    handle = _offline_handle(monkeypatch)
+    try:
+        handle.generate(["a"], SamplingParams(max_tokens=1), request_id=["t1"])
+        assert collector.request_metrics["t1"].model_name == handle.esurge_name == "m"
+    finally:
+        handle.close()
+
+
 def test_queued_owner_heartbeats_keep_a_busy_client_alive():
     """A client whose IO thread was busy longer than the timeout must read queued heartbeats before judging."""
     import zmq

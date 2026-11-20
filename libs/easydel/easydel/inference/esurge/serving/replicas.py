@@ -110,6 +110,7 @@ class ReplicaPlan:
     role: str = "engine"
     hosts: tuple[tuple[str, ...], ...] = ()
     front_index: int = 0
+    front_socket_dir: str = ""
 
     @property
     def count(self) -> int:
