@@ -100,3 +100,23 @@ counted once.
   below `min_version`; requests without tokens yet are kept (even if their prompt KV was computed under older weights).
   Returns the aborted parent request ids. It is a sampling-version fence, **not** a bound on KV staleness: after a
   `keep_requests=True` swap, kept requests may still attend to KV computed under older weights.
+
+## Disaggregated weight transport (opt-in)
+
+When the learner and eSurge share chips, `update_model_weights` swaps weights in place and nothing else is needed.
+When they run on different hosts, `easydel.trainers._online_rl.weight_transport` moves versioned weights from the
+learner to samplers. Nothing in the default trainer path imports it.
+
+- `WeightPublisher.publish(version, snapshot)` stages at most one snapshot and offers it only to subscribers that
+  asked (`request()`), so a busy sampler never receives weights it did not ask for. Each offer names its predecessor
+  version, so a sampler detects divergence (`WeightVersionChainError`). Every offer is settled exactly once (acked,
+  declined, superseded, stalled or closed), and a pull that does not finish within `pull_timeout` raises
+  `WeightTransferStalled`.
+- `InProcessWeightTransport` serves samplers in the learner process. `JaxTransferServerBackend` and
+  `JaxTransferClient` move device arrays between processes with `jax.experimental.transfer`, one leaf at a time.
+- Control messages travel over a `SocketMessageChannel` between a `RemoteSubscriberBridge` (learner) and a
+  `RemoteWeightSubscriber` (sampler). Both ends take `auth_token`: a role-bound HMAC challenge-response with fresh
+  nonces, capped pre-authentication frames and a handshake deadline. Without a token only Unix-domain or loopback
+  peers are accepted. There is no default token.
+- The data plane (`jax.experimental.transfer`) is **not** authenticated or encrypted and its pull ids follow the
+  offer id: anyone who can reach those addresses can pull the weights. Bind them only on a trusted network.
