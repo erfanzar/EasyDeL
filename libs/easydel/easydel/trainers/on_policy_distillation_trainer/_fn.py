@@ -29,6 +29,7 @@ import typing as tp
 
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
+import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from spectrax import with_sharding_constraint
@@ -57,6 +58,25 @@ from ._streamed_divergences import (
 
 # Batch key of the per-step trust-region acceptance uniforms (``[B, L]``, sliced per microbatch).
 _TRUST_REGION_UNIFORM_KEY = "_trust_region_acceptance_uniform"
+
+
+def _vocab_parallel_partition_manager(module: tp.Any) -> tp.Any:
+    """Return a ``PartitionManager`` for the student when its stage mesh has a real (>1) ``tp`` axis.
+
+    ``partition_manager`` lives on the model config, not on the module, so it cannot be read with
+    ``getattr(module, ...)``. Mirrors the offline distillation step: build one from
+    ``module.config.partition_axis`` only for genuine tensor parallelism.
+
+    Args:
+        module: The merged student module.
+
+    Returns:
+        A ``spx.PartitionManager`` when the stage-local mesh has ``tp > 1``, otherwise ``None``.
+    """
+    stage_mesh = spx.get_current_stage_mesh(getattr(module, "mesh", None), raise_error=False)
+    if stage_mesh is not None and "tp" in stage_mesh.axis_names and stage_mesh.shape["tp"] > 1:
+        return spx.PartitionManager(paxis=module.config.partition_axis)
+    return None
 
 
 def on_policy_distillation_step(
@@ -287,7 +307,7 @@ def on_policy_distillation_step(
         # No hard labels are used since completions are generated, not from a dataset.
         with jax.named_scope(scope_root + "/loss_fn/distillation_loss"):
             if use_streamed:
-                vocab_parallel = _resolve_vocab_parallel_mesh(getattr(module, "partition_manager", None)) is not None
+                vocab_parallel = _resolve_vocab_parallel_mesh(_vocab_parallel_partition_manager(module)) is not None
                 student_proj, teacher_proj, seq_chunk = build_distillation_projections(
                     module,
                     teacher_state.model,
@@ -359,7 +379,7 @@ def on_policy_distillation_step(
                     loss_top_k=loss_top_k,
                     loss_add_tail=loss_add_tail,
                     shift_tokens=shift_tokens,
-                    partition_manager=getattr(module, "partition_manager", None),
+                    partition_manager=_vocab_parallel_partition_manager(module),
                 )
 
         metrics = LossMetrics(
