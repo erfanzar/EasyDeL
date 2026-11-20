@@ -109,6 +109,7 @@ class ReplicaPlan:
     token_fd: int = -1
     role: str = "engine"
     hosts: tuple[tuple[str, ...], ...] = ()
+    front_index: int = 0
 
     @property
     def count(self) -> int:
@@ -275,7 +276,7 @@ def reexec_into_replica(plan: ReplicaPlan, env: tp.Mapping[str, str], token: str
     os.execve(sys.executable, argv, child_env)
 
 
-def spawn_front(plan: ReplicaPlan, token: str) -> subprocess.Popen:
+def spawn_front(plan: ReplicaPlan, token: str, index: int = 0) -> subprocess.Popen:
     """Start the front: the same command, as a host-only process serving the OpenAI endpoint over every replica.
 
     The front runs JAX on the host CPU with no distributed world, so HTTP handling, routing and per-request
@@ -291,7 +292,7 @@ def spawn_front(plan: ReplicaPlan, token: str) -> subprocess.Popen:
         The front's process.
     """
     read_fd = _token_pipe(token)
-    front = dataclasses.replace(plan, role="front", token_fd=read_fd)
+    front = dataclasses.replace(plan, role="front", token_fd=read_fd, front_index=int(index))
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "ENABLE_DISTRIBUTED_INIT": "0"}
     sys.stdout.flush()
     sys.stderr.flush()

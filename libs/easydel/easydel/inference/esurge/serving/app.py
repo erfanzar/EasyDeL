@@ -38,6 +38,9 @@ FRONT_STABLE_S = 300.0
 """A front that ran this long before exiting is restarted without backoff growth."""
 FRONT_MAX_BACKOFF_S = 60.0
 """Longest wait between restarts of a front that keeps exiting."""
+FRONT_PROCESSES = 8
+"""Front processes replica 0's leader starts. They share the endpoint port (SO_REUSEPORT, the kernel spreads
+connections) and each routes over every replica, so HTTP, routing and streaming are not bound to one interpreter."""
 REPLICA_ATTACH_INTERVAL_S = 5.0
 """How often the front retries replicas it has not attached yet (or whose engine died)."""
 
@@ -318,29 +321,42 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
         if plan is not None and engine.is_coordination_leader:
             # A replica leader: the front's router reaches its engine over its request plane.
             _log(rank, f"replica {plan.index} leader serving its request plane on {control_host}")
-            front = None
-            front_started = time.monotonic()
-            restarts = 0
+            fronts: dict[int, tp.Any] = {}
+            started_at: dict[int, float] = {}
+            restarts: dict[int, int] = {}
+            due: dict[int, float] = {}
             if plan.spawns_front:
                 from .replicas import spawn_front
 
-                front = spawn_front(plan, str(token))
-                _log(rank, f"started the front (pid {front.pid}) for the OpenAI endpoint over {plan.count} replicas")
+                for index in range(FRONT_PROCESSES):
+                    fronts[index] = spawn_front(plan, str(token), index=index)
+                    started_at[index], restarts[index] = time.monotonic(), 0
+                pids = [f.pid for f in fronts.values()]
+                _log(
+                    rank,
+                    f"started {len(fronts)} fronts (pids {pids}) for the OpenAI endpoint over {plan.count} replicas",
+                )
             while True:
-                if front is not None and front.poll() is not None:
-                    # The front holds no engine state: restart it instead of taking this replica down with it.
-                    lived = time.monotonic() - front_started
-                    restarts = 0 if lived > FRONT_STABLE_S else restarts + 1
-                    wait = min(FRONT_MAX_BACKOFF_S, 2.0**restarts)
+                now = time.monotonic()
+                for index, front in list(fronts.items()):
+                    if front is None:
+                        if now >= due[index]:
+                            fronts[index] = spawn_front(plan, str(token), index=index)
+                            started_at[index] = time.monotonic()
+                            _log(rank, f"restarted front {index} (pid {fronts[index].pid})")
+                        continue
+                    if front.poll() is None:
+                        continue
+                    # A front holds no engine state: restart it instead of taking this replica down with it.
+                    lived = now - started_at[index]
+                    restarts[index] = 0 if lived > FRONT_STABLE_S else restarts[index] + 1
+                    wait = min(FRONT_MAX_BACKOFF_S, 2.0 ** restarts[index])
                     _log(
                         rank,
-                        f"the front (pid {front.pid}) exited with code {front.returncode} after {lived:.0f}s; "
+                        f"front {index} (pid {front.pid}) exited with code {front.returncode} after {lived:.0f}s; "
                         f"restarting it in {wait:.0f}s",
                     )
-                    time.sleep(wait)
-                    front = spawn_front(plan, str(token))
-                    front_started = time.monotonic()
-                    _log(rank, f"restarted the front (pid {front.pid})")
+                    fronts[index], due[index] = None, now + wait
                 time.sleep(1.0)
         if not engine.is_coordination_leader:
             try:
@@ -365,14 +381,15 @@ def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
     import easydel as ed
 
     token = plan.read_token()
-    _log(0, f"front of {plan.count} dp replicas (host-only); easydel {ed.__version__} from {ed.__file__}")
+    tag = f"front {plan.front_index}"
+    _log(0, f"{tag} of {plan.count} dp replicas (host-only); easydel {ed.__version__} from {ed.__file__}")
     attacher = ReplicaAttacher(
-        replica_candidates(plan), connect=_replica_connector(config, token), log=lambda m: _log(0, m)
+        replica_candidates(plan), connect=_replica_connector(config, token), log=lambda m: _log(0, f"{tag}: {m}")
     )
     routed = attacher.wait_for_first()
     attacher.start()
     try:
-        _serve_http(config, routed, 0, ed)
+        _serve_http(config, routed, 0, ed, shared_port=True)
     finally:
         attacher.stop()
         routed.close()
@@ -553,7 +570,20 @@ class ReplicaAttacher:
             self._thread.join(timeout=30.0)
 
 
-def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any) -> None:
+def reuse_port_socket(host: str, port: int) -> tp.Any:
+    """A listening TCP socket on ``host:port`` that other processes may bind too (SO_REUSEPORT)."""
+    import socket
+
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind((host, int(port)))
+    sock.listen(2048)
+    return sock
+
+
+def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any, *, shared_port: bool = False) -> None:
     key, created = load_or_create_api_key(config.server.api_key_path)
     name = config.model.served_name or engine.esurge_name
     server = ed.eSurgeApiServer(
@@ -571,4 +601,27 @@ def _serve_http(config: ServingConfig, engine: tp.Any, rank: int, ed: tp.Any) ->
         f"READY model={name} key_id={metadata.key_id} key_file={config.server.api_key_path} "
         f"({'created' if created else 'existing'}) urls={urls}",
     )
-    server.run(host=host, port=config.server.port, workers=1, log_level=config.server.log_level, reload=False)
+    if not shared_port:
+        server.run(host=host, port=config.server.port, workers=1, log_level=config.server.log_level, reload=False)
+        return
+    import asyncio
+
+    import uvicorn
+
+    from easydel.inference.inference_engine_interface import TIMEOUT_KEEP_ALIVE
+
+    sock = reuse_port_socket(host, config.server.port)
+    try:
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
+    uv_config = uvicorn.Config(
+        server.app,
+        log_level=config.server.log_level,
+        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+        server_header=False,
+        date_header=True,
+    )
+    uvicorn.Server(uv_config).run(sockets=[sock])

@@ -65,6 +65,9 @@ if typing.TYPE_CHECKING:
 
 _POLL_MS = 50
 
+#: Inbound frames handled per IO round before outbound traffic and heartbeats get a turn again.
+_MAX_FRAMES_PER_ROUND = 256
+
 #: Client identities never coalesce; the rank field only labels logs/ids.
 _CLIENT_RANK = -1
 
@@ -284,46 +287,53 @@ class _ClientChannel:
                 if now - last_beat_sent >= self._heartbeat_interval_s:
                     sock.send_multipart([wire.encode_message(wire.Heartbeat(rank=_CLIENT_RANK, ts=time.time()))])
                     last_beat_sent = now
-                if now - last_owner_beat > self._heartbeat_timeout_s:
-                    self._mark_dead(f"engine owner silent for more than {self._heartbeat_timeout_s}s")
-                    return
 
                 events = dict(poller.poll(_POLL_MS))
                 if wake_pull in events:
                     while wake_pull.poll(0):
                         wake_pull.recv()
-                if sock not in events:
-                    continue
-                frames = sock.recv_multipart()
-                try:
-                    message = wire.decode_message(frames[0])
-                except Exception:
-                    logger.warning("Remote engine handle: dropping undecodable frame")
-                    continue
-                if isinstance(message, wire.Heartbeat):
+                # Drain everything already queued before judging liveness: a busy process that reaches this loop late
+                # must not declare a healthy owner dead while its heartbeats sit unread in the socket.
+                received = 0
+                while sock.poll(0) and received < _MAX_FRAMES_PER_ROUND:
+                    frames = sock.recv_multipart()
+                    received += 1
                     last_owner_beat = time.monotonic()
-                    continue
-                if isinstance(message, wire.QueueStats):
-                    last_owner_beat = time.monotonic()
-                    self.queue_stats = message
-                    continue
-                if isinstance(message, wire.Shutdown):
-                    self._mark_dead(f"engine owner shut down ({message.reason})")
+                    if self._handle_inbound(frames):
+                        return
+                if not received and time.monotonic() - last_owner_beat > self._heartbeat_timeout_s:
+                    self._mark_dead(f"engine owner silent for more than {self._heartbeat_timeout_s}s")
                     return
-                last_owner_beat = time.monotonic()
-                handler = self._plane_handler
-                if handler is not None:
-                    payload = frames[1] if len(frames) > 1 else None
-                    try:
-                        handler(message, payload)
-                    except Exception:
-                        logger.exception("Remote engine handle: plane handler failed")
         finally:
             with self._wake_lock:
                 if self._wake_push is not None:
                     self._wake_push.close(linger=0)
                     self._wake_push = None
             wake_pull.close(linger=0)
+
+    def _handle_inbound(self, frames: list[bytes]) -> bool:
+        """Dispatch one inbound frame set; returns ``True`` when the link is over (owner shut down)."""
+        try:
+            message = wire.decode_message(frames[0])
+        except Exception:
+            logger.warning("Remote engine handle: dropping undecodable frame")
+            return False
+        if isinstance(message, wire.Heartbeat):
+            return False
+        if isinstance(message, wire.QueueStats):
+            self.queue_stats = message
+            return False
+        if isinstance(message, wire.Shutdown):
+            self._mark_dead(f"engine owner shut down ({message.reason})")
+            return True
+        handler = self._plane_handler
+        if handler is not None:
+            payload = frames[1] if len(frames) > 1 else None
+            try:
+                handler(message, payload)
+            except Exception:
+                logger.exception("Remote engine handle: plane handler failed")
+        return False
 
 
 class RemoteEngineHandle:
@@ -580,20 +590,28 @@ class RemoteEngineHandle:
             self._admission.add_request(rid, prompt, params, **extra)
 
         outputs: dict[str, RequestOutput] = {}
-        while len(outputs) < len(request_ids):
-            self._registry.wait_any(timeout=0.5)
-            self._raise_if_unusable()
-            with self._registry.output_lock:
-                for rid in request_ids:
-                    if rid in outputs:
-                        continue
-                    output = self._registry.outputs.get(rid)
-                    if output is not None and output.finished:
-                        outputs[rid] = output
-        with self._registry.request_lock:
+        try:
+            for rid in request_ids:
+                # Wait on this request's own event: a shared wakeup would rouse every waiting caller on every
+                # token update of any request, which at hundreds in flight costs the front a core by itself.
+                while True:
+                    with self._registry.output_lock:
+                        output = self._registry.outputs.get(rid)
+                        if output is not None and output.finished:
+                            outputs[rid] = output
+                            break
+                    self._raise_if_unusable()
+                    self._registry.wait_request(rid, timeout=0.5)
+        finally:
+            self._forget(request_ids)
+        return [outputs[rid] for rid in request_ids]
+
+    def _forget(self, request_ids: typing.Iterable[str]) -> None:
+        """Drop a caller's finished (or abandoned) requests from the handle: nothing else ever reads them again."""
+        with self._registry.request_lock, self._registry.output_lock:
             for rid in request_ids:
                 self._registry.events.pop(rid, None)
-        return [outputs[rid] for rid in request_ids]
+                self._registry.outputs.pop(rid, None)
 
     def stream(
         self,
@@ -630,6 +648,8 @@ class RemoteEngineHandle:
 
         last_update_seq = -1
         last_accumulated_text = ""
+        last_raw_accumulated_text = ""
+        last_accumulated_reasoning = ""
         try:
             while True:
                 self._registry.wait_request(rid, timeout=0.5)
@@ -639,13 +659,23 @@ class RemoteEngineHandle:
                     output = self._registry.outputs.get(rid)
                     if output is not None and output.update_seq != last_update_seq:
                         last_update_seq = output.update_seq
-                        # Snapshot-diff the delta against the last *yielded*
-                        # text: pipeline updates between wakeups must not
-                        # drop stream chunks.
+                        # Snapshot-diff every delta against the last *yielded*
+                        # snapshot: pipeline updates between wakeups must not
+                        # drop stream chunks (text, raw text or reasoning).
                         snapshot_delta = compute_stream_delta_text(
                             output.accumulated_text, last_accumulated_text, output.delta_text
                         )
+                        snapshot_raw_delta = compute_stream_delta_text(
+                            output.raw_accumulated_text, last_raw_accumulated_text, output.raw_delta_text or ""
+                        )
+                        snapshot_reasoning_delta = compute_stream_delta_text(
+                            output.reasoning_content or "",
+                            last_accumulated_reasoning,
+                            output.delta_reasoning_content or "",
+                        )
                         last_accumulated_text = output.accumulated_text
+                        last_raw_accumulated_text = output.raw_accumulated_text
+                        last_accumulated_reasoning = output.reasoning_content or ""
                         snapshot = RequestOutput(
                             request_id=output.request_id,
                             prompt=output.prompt,
@@ -658,6 +688,8 @@ class RemoteEngineHandle:
                                     logprobs=copy.deepcopy(completion.logprobs),
                                     cumulative_logprob=completion.cumulative_logprob,
                                     finish_reason=completion.finish_reason,
+                                    tool_calls=completion.tool_calls,
+                                    reasoning_content=completion.reasoning_content,
                                     raw_text=completion.raw_text,
                                 )
                                 for completion in output.outputs
@@ -666,6 +698,7 @@ class RemoteEngineHandle:
                             accumulated_text=output.accumulated_text,
                             delta_text=snapshot_delta,
                             raw_accumulated_text=output.raw_accumulated_text,
+                            raw_delta_text=snapshot_raw_delta,
                             tokens_per_second=output.tokens_per_second,
                             num_generated_tokens=output.num_generated_tokens,
                             time_spent_generating=output.time_spent_generating,
@@ -673,9 +706,20 @@ class RemoteEngineHandle:
                             processing_time=output.processing_time,
                             update_seq=output.update_seq,
                             delta_seq=output.delta_seq,
+                            tool_calls=output.tool_calls,
+                            delta_tool_calls=output.delta_tool_calls,
+                            reasoning_content=output.reasoning_content,
+                            delta_reasoning_content=snapshot_reasoning_delta or None,
                         )
                 if snapshot is not None:
-                    if not snapshot.finished and snapshot.num_generated_tokens == 0 and not snapshot.delta_text:
+                    if (
+                        not snapshot.finished
+                        and snapshot.num_generated_tokens == 0
+                        and not snapshot.delta_text
+                        and not snapshot.raw_delta_text
+                        and not snapshot.delta_reasoning_content
+                        and not snapshot.delta_tool_calls
+                    ):
                         continue
                     yield snapshot
                     if snapshot.finished:
@@ -686,8 +730,7 @@ class RemoteEngineHandle:
                 unfinished = output is not None and not output.finished
             if unfinished:
                 self.abort_request(rid)
-            with self._registry.request_lock:
-                self._registry.events.pop(rid, None)
+            self._forget([rid])
 
     def chat(
         self,
