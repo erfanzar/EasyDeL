@@ -677,9 +677,12 @@ class GRPOConfig(TrainingArguments):
                 "about 2.6e-4 from the repeated-prompt forward). Other hybrid/recurrent families (KDA, MLA, Mamba) "
                 "are rejected; "
                 "incompatible with "
-                "completion_chunk_size, top_entropy_quantile < 1 and mpmd_scheduler. Pays off when prompts are at "
-                "least as long as completions; with completions much longer than prompts it gives no speedup, "
-                "compiles slower and can use more memory."
+                "completion_chunk_size, top_entropy_quantile < 1 and mpmd_scheduler. With 'vanilla'/'sdpa' the "
+                "completions attend the shared prefix without a per-completion copy (exact log-sum-exp merge); on "
+                "TPU (697M dense model, G=8) it beat the default forward at every measured prompt/completion ratio, "
+                "e.g. 0.119 s vs 0.316 s per step at P=1024/C=256 and 0.325 s vs 0.378 s at P=512/C=2048. "
+                "'flash_attn2'/'blocksparse' still copy the prefix per completion and only pay off when prompts are "
+                "at least as long as completions."
             )
         },
     )

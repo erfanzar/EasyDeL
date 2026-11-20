@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import easydel as ed
+import easydel.caching.shared_prefix as shared_prefix
 import jax
 import numpy as np
 import optax  # pyright: ignore[reportMissingTypeStubs]
@@ -165,6 +166,57 @@ def test_blocksparse_grpo_step_matches_repeated_prompt_forward_at_aligned_length
     assert any(np.max(np.abs(b - a)) > 0 for b, a in zip(before, ref_after, strict=True))
     for b, ref, shared in zip(before, ref_after, shared_after, strict=True):
         np.testing.assert_allclose(b - shared, b - ref, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("attn_mechanism", ["vanilla", "sdpa"])
+def test_dense_mechanisms_take_the_grouped_fork_path_with_causal_query_blocks(monkeypatch, attn_mechanism):
+    """vanilla/sdpa never materialize the per-completion prefix copy; 2-row query blocks cover block skipping."""
+
+    def forbid_copy(self, **kwargs):
+        raise AssertionError("the per-completion prefix copy must not run for dense mechanisms")
+
+    monkeypatch.setattr(shared_prefix.PrefixForkView, "concatenate_to_cache", forbid_copy)
+    monkeypatch.setattr(shared_prefix, "GROUPED_FORK_QUERY_BLOCK", 2)
+    num_generations = 4
+    cfg = _config(attn_mechanism)
+    prompt_ids, prompt_mask, completion_ids, completion_mask, advantages = _batch(num_generations)
+    batch = {
+        "prompt_ids": jnp.asarray(prompt_ids),
+        "prompt_mask": jnp.asarray(prompt_mask),
+        "completion_ids": jnp.asarray(completion_ids),
+        "completion_mask": jnp.asarray(completion_mask, jnp.float32),
+        "advantages": jnp.asarray(advantages),
+    }
+    with jax.default_matmul_precision("highest"), cfg.mesh:
+        model = _model(cfg)
+        shared = get_per_token_logps_prefix_shared(
+            model,
+            batch["prompt_ids"],
+            batch["prompt_mask"],
+            batch["completion_ids"],
+            jnp.asarray(completion_mask),
+            num_generations,
+        )
+        input_ids = np.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
+        attention_mask = np.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
+        reference = get_per_token_logps(model, jnp.asarray(input_ids), jnp.asarray(attention_mask), PROMPT_LEN)
+        state = EasyDeLState.create(model=model, tx=optax.sgd(1.0), init_opt_state=True)
+        before = [np.asarray(x) for x in jax.tree_util.tree_leaves(state.graphstate)]
+        ref_state, ref_metrics = _grpo(state, batch, num_generations, False)
+        shared_state, shared_metrics = _grpo(state, batch, num_generations, True)
+        ref_after = [np.asarray(x) for x in jax.tree_util.tree_leaves(ref_state.graphstate)]
+        shared_after = [np.asarray(x) for x in jax.tree_util.tree_leaves(shared_state.graphstate)]
+    valid = completion_mask > 0
+    error = np.max(np.abs(np.asarray(shared)[valid] - np.asarray(reference)[valid]))
+    print(
+        f"MEASURE grouped-fork {attn_mechanism} logps {error:.3e} loss "
+        f"{abs(float(shared_metrics.loss) - float(ref_metrics.loss)):.3e} update "
+        f"{max(float(np.max(np.abs(s - r))) for s, r in zip(shared_after, ref_after, strict=True)):.3e}"
+    )
+    assert error <= 1e-5, error
+    np.testing.assert_allclose(float(shared_metrics.loss), float(ref_metrics.loss), rtol=1e-4, atol=1e-6)
+    for b, ref, shared_param in zip(before, ref_after, shared_after, strict=True):
+        np.testing.assert_allclose(b - shared_param, b - ref, rtol=1e-4, atol=1e-6)
 
 
 def test_grpo_step_chunked_loss_raises_under_prefix_shared():

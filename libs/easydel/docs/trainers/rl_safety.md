@@ -117,24 +117,41 @@ gathered prefix, with visibility from segment ids and causality from absolute po
   and every SGD parameter update to 1.2e-7 for `G` in {1, 2, 3}, dense and MoE MLPs, ragged left-padded prompts
   (including one shorter than the conv kernel) and right-padded completions. The default TPU Pallas gated-delta kernel
   runs its matmuls at `DEFAULT` precision (bf16 passes): there the two forwards differ by about 2.6e-4 in log-probs and
-  5.7e-4 in updates. That is below the kernel's own gap to the `HIGHEST` reference (4.0e-4 and 1.8e-3).
+  5.7e-4 in updates. That is below the kernel's own gap to the `HIGHEST` reference (4.0e-4 and 1.8e-3), and it is
+  rounding, not a state-handoff error: the fork pass restarts the chunked recurrence from the injected state, so its
+  chunks are aligned differently. At kernel level the split-vs-full gap is exactly 0 when the split falls on a chunk
+  boundary, and at most 9e-8 with the kernel's matmuls forced to `HIGHEST`. The XLA kernel's gradient with respect to
+  the injected state matches finite differences to 1e-5 relative. Tests bound the Pallas log-prob gap at 1e-3. Also
+  covered: `tp` 2 and 4 (captured conv and recurrent states stay sharded on `tp`; log-probs within 4.8e-7, updates
+  within 2.4e-7), both linear-attention projection variants (`linear_attention_separate_proj`,
+  `linear_attention_merged_split_proj`), and bf16 (shared vs repeated log-probs within 2.6e-3 and updates within
+  3.9e-3, about the size of the bf16-vs-fp32 gap of the repeated forward: 3.0e-3 and 4.6e-3).
 - **Rejected:** `completion_chunk_size`, `top_entropy_quantile < 1`, `mpmd_scheduler`, sliding-window layers, layer
   types other than full attention (plus `linear_attention` for `qwen3_next` only, so KDA families such as
   `kimi_linear` and `glm5_next` are rejected), single-token prompts or completions on hybrid models, quantized KV,
   attention dropout, and other attention operations.
-- **When it pays off:** the saving tracks `(G-1)·P / (G·(P+C))` for prompt length `P` and completion length `C`.
-  Measured on 4 TPU v5p chips, 697M-parameter dense model, `vanilla` attention, bf16, 8 prompts per step:
+- **Grouped fork attention (`vanilla`, `sdpa`):** the fork pass does not copy the prefix per completion. The queries
+  of all `G` completions of a prompt attend that prompt's `B`-row prefix in one matmul, and each completion attends its
+  own keys causally in 256-query blocks; blocks above the diagonal are skipped. One shared row maximum and denominator
+  make the merge an exact log-sum-exp combination, and prefix key/value gradients sum over the group inside the matmul.
+  `flash_attn2` and `blocksparse` still receive the concatenated `[P + C]` keys with a G-fold prefix copy. On TPU
+  (fp32, `HIGHEST`) log-probs match the repeated-prompt forward to 4.8e-7, the loss exactly, and every SGD update to
+  6e-8, including on `tp4` and `fsdp2×tp2` meshes.
+- **When it pays off:** measured on 4 TPU v5p chips, 697M-parameter dense Llama (hidden 2048, 12 layers, 16/8 heads),
+  `vanilla` attention, bf16, fsdp mesh; median step time and compiled temp memory:
 
-| P | C | G | step time off → on | activation temps off → on |
-|---|---|---|---|---|
-| 1024 | 256 | 8 | 0.316 s → 0.142 s | 31.1 → 14.2 GiB |
-| 2048 | 512 | 8 | 0.805 s → 0.301 s | 90.9 → 41.8 GiB |
-| 256 | 1024 | 4 | 0.173 s → 0.170 s | 17.0 → 19.7 GiB |
-| 512 | 2048 | 8 (4 prompts) | 0.378 s → 0.382 s | 51.3 → 59.2 GiB |
+| P | C | G | prompts | off | copy path (previous) | grouped (vanilla) |
+|---|---|---|---|---|---|---|
+| 1024 | 256 | 8 | 8 | 0.316 s, 31.1 GiB | 0.143 s, 14.2 GiB | 0.119 s, 10.7 GiB |
+| 512 | 512 | 8 | 8 | 0.250 s, 22.4 GiB | 0.181 s, 18.4 GiB | 0.160 s, 15.0 GiB |
+| 256 | 1024 | 8 | 8 | 0.322 s, 32.5 GiB | 0.303 s, 38.2 GiB | 0.278 s, 29.6 GiB |
+| 512 | 2048 | 8 | 4 | 0.378 s, 51.3 GiB | 0.384 s, 59.2 GiB | 0.325 s, 44.2 GiB |
+| 512 | 1024 | 16 | 4 | 0.387 s, 42.9 GiB | 0.324 s, 43.0 GiB | 0.291 s, 35.1 GiB |
 
-  Turn it on when prompts are at least as long as completions. When completions are much longer than prompts
-  (`C ≥ 4P`) it gave no speedup, roughly doubled compile time and, without rematerialization, used more memory (at
-  P=512, C=2048, G=8 with 8 prompts it ran out of HBM where the default path fits).
+  With grouped attention it was faster and used less temp memory than the default path in every measured shape,
+  including completions 4× longer than prompts. The copy path (still used by `flash_attn2` and `blocksparse`) pays
+  off only when prompts are at least as long as completions; with `C ≥ 4P` it was slower and used more memory than
+  the default path.
 
 ## Async rollouts (`TrainingArguments`)
 
