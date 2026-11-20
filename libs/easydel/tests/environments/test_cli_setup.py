@@ -70,6 +70,54 @@ def test_cpu_vm_data_dir_rejects_unsafe_forms(data_dir):
         cli.main(["setup", "cpu-vm", "10.0.0.11", "--data-dir", data_dir, "--dry-run"])
 
 
+@pytest.mark.parametrize(
+    "repo", ["org", "x/y/z", "/kiri", "org/", "../kiri", "org/..", "./kiri", "org/.", "x/é", "x/y\n", "x/y?z", "x/a%2Fb"]
+)
+def test_invalid_release_repo_rejected_before_lookup(repo, monkeypatch):
+    from easydel.environments import kiri_installer
+
+    monkeypatch.setattr(kiri_installer.shutil, "which", lambda *_: pytest.fail("binary lookup before validation"))
+    monkeypatch.setattr(kiri_installer.urllib.request, "urlopen", lambda *a, **kw: pytest.fail("network lookup"))
+    for entry in (kiri_installer.install_kiri, kiri_installer.resolve_kiri_asset_url):
+        with pytest.raises(ValueError, match="repository slug"):
+            entry(repo=repo)
+
+
+@pytest.mark.parametrize("command", [[], ["setup", "kiri"], ["setup", "cpu-vm", "host", "--dry-run"]])
+def test_cli_rejects_invalid_repo(command, monkeypatch, capsys):
+    from easydel.environments import kiri_installer
+
+    entry = cli if command else kiri_installer
+    monkeypatch.setattr(entry, "install_kiri", lambda **kw: pytest.fail("unexpected install"))
+    with pytest.raises(SystemExit) as exc:
+        entry.main([*command, "--repo", "org/.."])
+    assert exc.value.code == 2
+    assert "argument --repo" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [[], ["setup", "kiri"]])
+def test_local_repo_forwarding(command, monkeypatch):
+    from easydel.environments import kiri_installer
+
+    entry = cli if command else kiri_installer
+    received = {}
+
+    def install(**kwargs):
+        received.update(kwargs)
+        return "/mock/kiri"
+
+    monkeypatch.setattr(entry, "install_kiri", install)
+    assert entry.main([*command, "--repo", "Other.Org/kiri_fork-2", "--sha256", "a" * 64]) == 0
+    assert received["repo"] == "Other.Org/kiri_fork-2" and received["expected_sha256"] == "a" * 64
+
+
+def test_cpu_vm_repo_dry_run(capsys):
+    assert cli.main(["setup", "cpu-vm", "host", "--repo", "mirror/kiri", "--dry-run"]) == 0
+    script = capsys.readouterr().out
+    for arch in ("amd64", "arm64"):
+        assert f"https://github.com/mirror/kiri/releases/download/v0.2.1/kiri-lite_0.2.1_{arch}.deb" in script
+
+
 def test_cpu_vm_tunnel_resolves_tilde_data_dir_on_remote(monkeypatch):
     monkeypatch.setattr(cli.subprocess, "check_output", lambda cmd, text=True: "/home/remoteuser\n")
     path = cli._resolve_remote_sock_path(ssh_target="u@10.0.0.1", ssh_key=None, num_daemons=2, data_dir="~/pool", idx=1)
@@ -90,7 +138,29 @@ def test_easydel_setup_cpu_vm_tunnel_resolves_remote_home(monkeypatch, capsys):
     monkeypatch.setattr(cli.subprocess, "run", _fake_run)
     monkeypatch.setattr(cli.EngineSocketClient, "ping", lambda self: True)
 
-    rc = cli.main(["setup", "cpu-vm", "user@10.0.0.20", "--port", "2400"])
+    resolved = []
+
+    def fake_resolve(*, repo, version, machine, system, expected_sha256):
+        resolved.append((repo, machine, expected_sha256))
+        return version, "asset.deb", "https://example.invalid/asset.deb", expected_sha256
+
+    monkeypatch.setattr(cli, "resolve_kiri_asset_url", fake_resolve)
+    rc = cli.main(
+        [
+            "setup",
+            "cpu-vm",
+            "host",
+            "--port",
+            "2400",
+            "--repo",
+            "org/kiri",
+            "--sha256-amd64",
+            "a" * 64,
+            "--sha256-arm64",
+            "b" * 64,
+        ]
+    )
+    assert resolved == [("org/kiri", "x86_64", "a" * 64), ("org/kiri", "arm64", "b" * 64)]
     assert rc == 0
     tunnel_cmds = [c for c in calls if "-L" in c]
     assert len(tunnel_cmds) == 1

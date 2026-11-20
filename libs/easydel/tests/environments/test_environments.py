@@ -1097,9 +1097,11 @@ def test_local_sandbox_avoids_preexec_fn_and_enforces_rlimits(monkeypatch):
         sess.close()
 
 
-def test_kiri_installer_mock_release_tarball(monkeypatch, tmp_path):
+@pytest.mark.parametrize("repo_kwargs", [{}, {"repo": "A.b-1/kiri_2"}])
+def test_kiri_installer_mock_release_tarball(monkeypatch, tmp_path, repo_kwargs):
     from easydel.environments import install_kiri, kiri_installer
 
+    slug = repo_kwargs.get("repo", kiri_installer.KIRI_GITHUB_REPO)
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         payload = b"#!/bin/sh\necho kiri-0.2.1\n"
@@ -1124,6 +1126,7 @@ def test_kiri_installer_mock_release_tarball(monkeypatch, tmp_path):
     def _fake_urlopen(req, timeout=20.0):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         if "api.github.com" in url:
+            assert url == f"https://api.github.com/repos/{slug}/releases/tags/v0.2.1"
             meta = {
                 "tag_name": "v0.2.1",
                 "assets": [
@@ -1156,7 +1159,7 @@ def test_kiri_installer_mock_release_tarball(monkeypatch, tmp_path):
     monkeypatch.setattr(kiri_installer.urllib.request, "urlopen", _fake_urlopen)
     monkeypatch.setattr(kiri_installer.shutil, "which", lambda _name: None)
 
-    installed = install_kiri(install_dir=tmp_path, force=True)
+    installed = install_kiri(install_dir=tmp_path, force=True, **repo_kwargs)
     assert installed == str(tmp_path / "kiri")
     assert os.access(installed, os.X_OK)
     assert b"kiri-0.2.1" in open(installed, "rb").read()
@@ -1168,7 +1171,7 @@ def test_kiri_installer_mock_release_tarball(monkeypatch, tmp_path):
         {"v0.2.1": {"Kiri-0.2.1-x86_64.tar.gz": "0" * 64, "Kiri-0.2.1-arm64.tar.gz": "0" * 64}},
     )
     with pytest.raises(RuntimeError, match="SHA256 mismatch"):
-        install_kiri(install_dir=tmp_path, force=True)
+        install_kiri(install_dir=tmp_path, force=True, **repo_kwargs)
 
     # Also test pure-Python .deb `ar` extraction (Linux default asset).
     ar_header = b"data.tar.gz     0           0     0     100644  " + f"{len(tar_bytes):<10}".encode("ascii") + b"`\n"

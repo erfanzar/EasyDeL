@@ -27,9 +27,10 @@ import time
 
 from easydel.environments.kiri_installer import (
     DEFAULT_KIRI_VERSION,
-    KIRI_GITHUB_REPO,
+    add_kiri_repo_argument,
     install_kiri,
     resolve_kiri_asset_url,
+    validate_kiri_repo,
 )
 from easydel.environments.runtime import EngineSocketClient
 
@@ -93,8 +94,8 @@ def _build_remote_kiri_script(
         "set -euo pipefail",
         'ARCH="$(uname -m)"',
         'case "$ARCH" in',
-        f'  x86_64|amd64) URL="{deb_url_amd64}"; SHA="{deb_sha_amd64}" ;;',
-        f'  aarch64|arm64) URL="{deb_url_arm64}"; SHA="{deb_sha_arm64}" ;;',
+        f"  x86_64|amd64) URL={shlex.quote(deb_url_amd64)}; SHA={shlex.quote(deb_sha_amd64)} ;;",
+        f"  aarch64|arm64) URL={shlex.quote(deb_url_arm64)}; SHA={shlex.quote(deb_sha_arm64)} ;;",
         '  *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;',
         "esac",
         'mkdir -p "$HOME/.local/bin"',
@@ -185,6 +186,7 @@ def cmd_setup_cpu_vm(args: argparse.Namespace) -> int:
     if args.num_daemons <= 0:
         raise ValueError("--num-daemons must be positive.")
 
+    repo = validate_kiri_repo(args.repo)
     args.data_dir = _normalize_remote_data_dir(args.data_dir)
     if args.dry_run:
         from easydel.environments.kiri_installer import PINNED_KIRI_SHA256
@@ -194,16 +196,17 @@ def cmd_setup_cpu_vm(args: argparse.Namespace) -> int:
         pinned = PINNED_KIRI_SHA256.get(ver, {})
         amd64_name = f"kiri-lite_{ver_num}_amd64.deb"
         arm64_name = f"kiri-lite_{ver_num}_arm64.deb"
-        deb_amd64 = f"https://github.com/{KIRI_GITHUB_REPO}/releases/download/{ver}/{amd64_name}"
+        release_url = f"https://github.com/{repo}/releases/download/{ver}"
+        deb_amd64 = f"{release_url}/{amd64_name}"
         sha_amd64 = pinned.get(amd64_name, args.sha256_amd64 or "<sha256-unavailable>")
-        deb_arm64 = f"https://github.com/{KIRI_GITHUB_REPO}/releases/download/{ver}/{arm64_name}"
+        deb_arm64 = f"{release_url}/{arm64_name}"
         sha_arm64 = pinned.get(arm64_name, args.sha256_arm64 or "<sha256-unavailable>")
     else:
         _, _, deb_amd64, sha_amd64 = resolve_kiri_asset_url(
-            version=args.kiri_version, machine="x86_64", system="linux", expected_sha256=args.sha256_amd64
+            repo=repo, version=args.kiri_version, machine="x86_64", system="linux", expected_sha256=args.sha256_amd64
         )
         _, _, deb_arm64, sha_arm64 = resolve_kiri_asset_url(
-            version=args.kiri_version, machine="arm64", system="linux", expected_sha256=args.sha256_arm64
+            repo=repo, version=args.kiri_version, machine="arm64", system="linux", expected_sha256=args.sha256_arm64
         )
 
     endpoints: list[str] = []
@@ -280,6 +283,7 @@ def cmd_setup_kiri(args: argparse.Namespace) -> int:
 
     path = install_kiri(
         version=args.version,
+        repo=args.repo,
         install_dir=args.install_dir,
         force=args.force,
         start_daemon=bool(args.start and args.data_dir is None and args.num_daemons == 1),
@@ -310,6 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         "cpu-vm",
         help="Install & start Kiri on remote CPU VM(s) over SSH; endpoints are SSH tunnels (nothing listens on remote TCP).",
     )
+    add_kiri_repo_argument(cpu_vm)
     cpu_vm.add_argument("hosts", nargs="+", help="Target CPU VM IP(s) or user@host.")
     cpu_vm.add_argument("--user", default=None, help="SSH username if not included in host.")
     cpu_vm.add_argument("--ssh-key", default=None, help="Path to SSH private key.")
@@ -342,6 +347,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_KIRI_VERSION,
         help=f"Kiri release tag (default: {DEFAULT_KIRI_VERSION}); unpinned tags also need --sha256.",
     )
+    add_kiri_repo_argument(kiri_local)
     kiri_local.add_argument("--sha256", default=None, help="Expected SHA256 of the release asset (unpinned tags).")
     kiri_local.add_argument("--install-dir", default=None, help="Target directory (default: ~/.local/bin).")
     kiri_local.add_argument("--data-dir", default=None, help="Optional RAM-backed data dir (e.g. /dev/shm/kiri).")

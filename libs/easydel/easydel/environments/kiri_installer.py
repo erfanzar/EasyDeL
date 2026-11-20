@@ -84,6 +84,39 @@ _MISSING_KIRI_MESSAGE = (
     f"download the pinned, SHA256-verified {DEFAULT_KIRI_VERSION} release."
 )
 _MIN_BRIDGE_TOKEN_CHARS = 16
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def validate_kiri_repo(repo: str) -> str:
+    """Validate that ``repo`` is a strict ``owner/name`` GitHub repository slug.
+
+    Args:
+        repo: Repository slug to validate.
+
+    Returns:
+        The validated ``owner/name`` slug.
+
+    Raises:
+        ValueError: If ``repo`` is not a two-segment ``owner/name`` matching
+            ``^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$``, or if either component is ``.`` or ``..``.
+    """
+    if not isinstance(repo, str) or not _GITHUB_REPO_RE.fullmatch(repo):
+        raise ValueError(
+            f"Invalid GitHub repository slug {repo!r}: expected 'owner/name' matching "
+            "'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'."
+        )
+    owner, name = repo.split("/", 1)
+    if owner in {".", ".."} or name in {".", ".."}:
+        raise ValueError(f"Invalid GitHub repository slug {repo!r}: components must not be '.' or '..'.")
+    return repo
+
+
+def _kiri_releases_api(repo: str = KIRI_GITHUB_REPO) -> str:
+    """Build the GitHub Releases API base URL for ``repo`` after validating the slug."""
+    validated = validate_kiri_repo(repo)
+    if validated == KIRI_GITHUB_REPO:
+        return KIRI_RELEASES_API
+    return f"https://api.github.com/repos/{validated}/releases"
 
 
 def _normalize_arch(machine: str | None = None) -> tuple[str, str]:
@@ -116,12 +149,13 @@ def _extract_ar_data_tar(deb_bytes: bytes) -> bytes:
 def resolve_kiri_asset_url(
     *,
     version: str = DEFAULT_KIRI_VERSION,
+    repo: str = KIRI_GITHUB_REPO,
     machine: str | None = None,
     system: str | None = None,
     timeout: float = 20.0,
     expected_sha256: str | None = None,
 ) -> tuple[str, str, str, str]:
-    """Resolve ``(tag_name, asset_name, download_url, sha256_hex)`` for a :data:`KIRI_GITHUB_REPO` release.
+    """Resolve ``(tag_name, asset_name, download_url, sha256_hex)`` for a release from ``repo``.
 
     Only the tags in :data:`PINNED_KIRI_SHA256` are pinned: their digest is part of this source tree. The
     release API's own ``digest`` field comes from the same place as the download, so it is never trusted; any
@@ -129,6 +163,7 @@ def resolve_kiri_asset_url(
 
     Args:
         version: Release tag (``""``/``"latest"`` mean :data:`DEFAULT_KIRI_VERSION`).
+        repo: GitHub ``owner/name`` release repository (defaults to :data:`KIRI_GITHUB_REPO`).
         machine: Machine architecture (defaults to this host's).
         system: Operating system name (defaults to this host's).
         timeout: Release-API request timeout in seconds.
@@ -139,10 +174,11 @@ def resolve_kiri_asset_url(
         RuntimeError: When no asset matches, or the tag has no pinned digest and ``expected_sha256`` is missing,
             or ``expected_sha256`` contradicts the pinned digest.
     """
+    releases_api = _kiri_releases_api(repo)
     resolved_ver = DEFAULT_KIRI_VERSION if version in ("", "latest") else version
     arch_tar, arch_deb = _normalize_arch(machine)
     sys_name = (system or platform.system()).lower()
-    api_url = f"{KIRI_RELEASES_API}/tags/{resolved_ver}"
+    api_url = f"{releases_api}/tags/{resolved_ver}"
     req = urllib.request.Request(
         api_url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "easydel-kiri-installer"},
@@ -214,13 +250,14 @@ def _extract_kiri_binary_from_tar(tar_stream: bytes, target_bin: str) -> str:
 def install_kiri(
     *,
     version: str = DEFAULT_KIRI_VERSION,
+    repo: str = KIRI_GITHUB_REPO,
     install_dir: str | os.PathLike[str] | None = None,
     force: bool = False,
     start_daemon: bool = False,
     timeout: float = 60.0,
     expected_sha256: str | None = None,
 ) -> str:
-    """Download, SHA256-verify, and install the ``kiri`` binary from a :data:`KIRI_GITHUB_REPO` release.
+    """Download, SHA256-verify, and install ``kiri`` from the GitHub ``owner/name`` given by ``repo``.
 
     Installs into ``install_dir`` (default ``~/.local/bin``) without requiring
     ``sudo``. Verifies the downloaded archive's SHA256 digest before extracting:
@@ -229,6 +266,7 @@ def install_kiri(
     started with ``start_daemon=True`` is persistent: it keeps running after
     this process exits.
     """
+    validate_kiri_repo(repo)
     existing = shutil.which("kiri")
     if existing and not force:
         if start_daemon:
@@ -244,7 +282,7 @@ def install_kiri(
         return target_bin
 
     _tag, asset_name, url, expected_sha256 = resolve_kiri_asset_url(
-        version=version, timeout=min(timeout, 20.0), expected_sha256=expected_sha256
+        repo=repo, version=version, timeout=min(timeout, 20.0), expected_sha256=expected_sha256
     )
     req = urllib.request.Request(url, headers={"User-Agent": "easydel-kiri-installer"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1280,6 +1318,17 @@ def ensure_kiri_pod_shm_pool(
     return endpoints
 
 
+def add_kiri_repo_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the release repository option shared by the Kiri setup commands."""
+    parser.add_argument(
+        "--repo",
+        type=validate_kiri_repo,
+        default=KIRI_GITHUB_REPO,
+        metavar="OWNER/NAME",
+        help=f"GitHub release repository (default: {KIRI_GITHUB_REPO}).",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for ``easydel-install-kiri``."""
     parser = argparse.ArgumentParser(description=f"Install the Kiri container runtime ({KIRI_GITHUB_REPO}).")
@@ -1291,6 +1340,7 @@ def main(argv: list[str] | None = None) -> int:
             "any other tag also needs --sha256."
         ),
     )
+    add_kiri_repo_argument(parser)
     parser.add_argument("--sha256", default=None, help="Expected SHA256 of the release asset (unpinned tags).")
     parser.add_argument("--install-dir", default=None, help="Target directory (default: ~/.local/bin).")
     parser.add_argument("--force", action="store_true", help="Reinstall even if kiri is already present.")
@@ -1301,6 +1351,7 @@ def main(argv: list[str] | None = None) -> int:
 
     path = install_kiri(
         version=args.version,
+        repo=args.repo,
         install_dir=args.install_dir,
         force=args.force,
         start_daemon=args.start,
