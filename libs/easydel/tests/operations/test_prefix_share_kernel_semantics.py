@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.operations import OperationMetadata, OperationRegistry
-from ejkernel.modules.operations.configs import FlashAttentionConfig
+from ejkernel.modules.operations.configs import FlashAttentionConfig, RingAttentionConfig
 from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
@@ -81,6 +81,11 @@ _FLASH_PINS = {
     None: (None, None),
     "xla_highest": (FlashAttentionConfig(platform="xla", backend="any"), lax.Precision.HIGHEST),
     "pallas": (FlashAttentionConfig(platform="pallas", backend="tpu"), None),
+    # Ring is pinned to its registered XLA kernel so that no autotune runs and the kernel under test is fixed.
+    # No explicit precision: the operation honours the ambient ``jax.default_matmul_precision("highest")``.
+    # At an explicit DEFAULT it measures ~6.2e-3 (out) / ~9.1e-3 (grads) on TPU (bf16 passes), with
+    # the visibility pattern exact (one-hot values: 0 mismatching query/key pairs).
+    "ring_xla": (RingAttentionConfig(platform="xla", backend="any"), None),
 }
 
 
@@ -156,7 +161,6 @@ _FLASH_DENSE = (
     "mask derives causality from positions): the mask becomes segment ids and kv_pos <= q_pos is lost "
     "(output error ~4.1 on TPU)"
 )
-_RING_TOLERANCE = "ring with segments+positions: max error ~6e-3 (out) / ~9e-3 (grads) on TPU, beyond 5e-3"
 
 # Observed on TPU (fp32, highest matmul precision), recorded per mechanism:
 #   vanilla      supported for both representations and both shapes (errors <= 8e-7, incl. gradients)
@@ -169,7 +173,9 @@ _RING_TOLERANCE = "ring with segments+positions: max error ~6e-3 (out) / ~9e-3 (
 #   blocksparse  small shape runs the vanilla fallback; at the aligned shape the operation shifts the TPU
 #                kernel's causal mask by kv_len - q_len for segments+positions; a stored dense mask keeps
 #                the old index-aligned (wrong) path
-#   ring         segments+positions approximately right but outside tolerance; dense_mask did not finish
+#   ring         both representations mask exactly; pinned to the XLA ring kernel (see _FLASH_PINS). The
+#                earlier ~6e-3 / ~9e-3 error was bf16 matmul passes from an explicit DEFAULT precision,
+#                not masking; the earlier dense_mask "did not finish" was an unpinned ring autotune.
 CASES = [
     pytest.param("vanilla", "segments_positions", *SMALL),
     pytest.param("vanilla", "segments_positions", *ALIGNED),
@@ -185,13 +191,8 @@ CASES = [
     pytest.param("blocksparse", "segments_positions", *SMALL),
     pytest.param("blocksparse", "segments_positions", *ALIGNED),
     pytest.param("blocksparse", "dense_mask", *ALIGNED, marks=pytest.mark.xfail(strict=True, reason=_BLOCKSPARSE_DENSE)),
-    pytest.param("ring", "segments_positions", *SMALL, marks=pytest.mark.xfail(strict=True, reason=_RING_TOLERANCE)),
-    pytest.param(
-        "ring",
-        "dense_mask",
-        *SMALL,
-        marks=pytest.mark.skip(reason="did not finish within 2 minutes on TPU; not characterised"),
-    ),
+    pytest.param("ring", "segments_positions", *SMALL, "ring_xla"),
+    pytest.param("ring", "dense_mask", *SMALL, "ring_xla"),
     # Last so that a hang cannot hide the results above; finishes in well under 2 minutes on TPU now.
     pytest.param("flash_attn2", "segments_positions", *ALIGNED, "pallas"),
     pytest.param("flash_attn2", "segments_positions", *ALIGNED),
