@@ -38,6 +38,7 @@ import time
 import traceback
 import typing
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from easydel.inference.stream_protocol import compute_stream_delta_text
 from easydel.workers.esurge.pipeline import DetokenizerResult
@@ -95,6 +96,25 @@ def _record_weight_version(comp, start_token_index: int, weight_version: int) ->
     if segments and segments[-1][1] == weight_version:
         return
     comp.weight_version_segments = [*(segments or ()), (int(start_token_index), int(weight_version))]
+
+
+def _record_kv_weight_version(comp, weight_version: int) -> None:
+    """Lower ``comp.oldest_kv_weight_version`` to ``weight_version`` (set it when unset).
+
+    Args:
+        comp: Completion output of the request whose KV was computed with ``weight_version``.
+        weight_version: Engine weight version that computed some of the request's KV.
+    """
+    current = comp.oldest_kv_weight_version
+    if current is None or int(weight_version) < current:
+        comp.oldest_kv_weight_version = int(weight_version)
+
+
+@dataclass(frozen=True)
+class _KVVersionUpdate:
+    """Queue item: requests whose live KV was computed with an older weight version (see ``submit_kv_versions``)."""
+
+    versions: dict[str, int]
 
 
 class _PrefixView(Sequence):
@@ -270,6 +290,36 @@ class OutputPipeline:
             return
         self.queue.put((engine_outputs, weight_version))
 
+    def submit_kv_versions(self, versions: dict[str, int]) -> None:
+        """Queue KV weight versions for requests, in order with the token bundles; apply inline if stopped.
+
+        Each request's completion lowers ``oldest_kv_weight_version`` to the given version. Queued with the bundles,
+        the update lands after every token sampled before it and before every token sampled after it.
+
+        Args:
+            versions: Engine request id (an ``n>1`` child id for samples) -> weight version that computed some of
+                its live KV. Unknown ids are ignored; an empty mapping does nothing.
+        """
+        if not versions:
+            return
+        item = _KVVersionUpdate(dict(versions))
+        if not self.running:
+            self._apply_kv_versions(item)
+            return
+        self.queue.put(item)
+
+    def _apply_kv_versions(self, item: _KVVersionUpdate) -> None:
+        with self._request_lock, self._output_lock:
+            for request_id, version in item.versions.items():
+                rd = self._active_requests.get(request_id)
+                if rd is None:
+                    continue
+                ro = self._request_outputs.get(rd.parent_request_id or request_id)
+                if ro is None or not 0 <= rd.sample_index < len(ro.outputs):
+                    continue
+                _record_kv_weight_version(ro.outputs[rd.sample_index], int(version))
+                ro.update_seq += 1
+
     def stop(self, timeout: float = 5.0) -> None:
         """Drain the queue and stop the worker via the ``None`` sentinel."""
         thread = self._thread
@@ -291,6 +341,9 @@ class OutputPipeline:
             try:
                 if item is _STOP_SENTINEL:
                     return
+                if isinstance(item, _KVVersionUpdate):
+                    self._apply_kv_versions(item)
+                    continue
                 engine_outputs, weight_version = item
                 self._process_engine_outputs(engine_outputs, weight_version=weight_version)
             except Exception as exc:
@@ -1415,6 +1468,9 @@ class OutputPipeline:
                         comp = ro.outputs[sample_index]
                         if weight_version is not None:
                             _record_weight_version(comp, len(rd.generated_tokens), int(weight_version))
+                            if comp.oldest_kv_weight_version is None:
+                                # No swap reported older KV, so the weights that sampled this token computed it all.
+                                comp.oldest_kv_weight_version = int(weight_version)
                         self._append_token_logprobs(
                             comp, new_tokens, engine_output.new_logprobs, len(rd.generated_tokens)
                         )

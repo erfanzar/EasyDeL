@@ -260,6 +260,11 @@ class CompletionOutput:
         weight_version_segments: Policy-version provenance of ``token_ids`` as ``(start_token_index, version)``
             pairs in token order: token ``i`` was sampled from logits computed with the engine weight version of the
             last segment whose start is ``<= i``. ``None`` when the producer did not record versions.
+        oldest_kv_weight_version: Oldest engine weight version that computed any KV entry this completion attended to
+            (prompt prefill, earlier decode steps): set to the sampling version at the first token, and lowered to
+            the outgoing version when an ``update_model_weights(keep_requests=True)`` swap happens while the request
+            holds KV. KV freed by preemption and recomputed counts as new. ``None`` before any KV or token was
+            recorded, or when the producer did not record versions.
     """
 
     index: int
@@ -272,6 +277,7 @@ class CompletionOutput:
     reasoning_content: str | None = None
     raw_text: str | None = None
     weight_version_segments: list[tuple[int, int]] | None = None
+    oldest_kv_weight_version: int | None = None
 
     @property
     def oldest_weight_version(self) -> int | None:
@@ -350,6 +356,13 @@ class RequestOutput:
         versions = [comp.newest_weight_version for comp in self.outputs]
         versions = [version for version in versions if version is not None]
         return max(versions) if versions else None
+
+    @property
+    def oldest_kv_weight_version(self) -> int | None:
+        """Oldest engine weight version behind any KV entry of any sample, or ``None`` when none was recorded."""
+        versions = [comp.oldest_kv_weight_version for comp in self.outputs]
+        versions = [version for version in versions if version is not None]
+        return min(versions) if versions else None
 
     def get_text(self) -> str:
         """Get the generated text from the first completion output.
@@ -2869,10 +2882,12 @@ class eSurge:
 
         With ``keep_requests=True`` the swap runs on the scheduler thread between two model steps and nothing else is
         reset: in-flight and queued requests continue, and the tokens they sample after the swap carry the new
-        version in ``CompletionOutput.weight_version_segments``. Their KV entries computed before the swap stay as
-        they are and are not tracked: the segments record only the weights each token was *sampled* with, so a
-        request whose prompt was (partly) prefilled, or whose earlier tokens were decoded, under the old weights
-        reports only the new version for tokens sampled after the swap even though they attend to old-weight KV.
+        version in ``CompletionOutput.weight_version_segments``. Their KV entries computed before the swap are kept
+        (not recomputed); every request holding computed KV at the swap records the outgoing version in
+        ``CompletionOutput.oldest_kv_weight_version`` (a request already carrying an older one keeps it), so a
+        request prefilled, fully or partly, under the old weights and sampled under the new ones reports the old
+        version there, and :meth:`abort_requests_before_version` aborts it. Requests not yet scheduled, or preempted
+        (their KV freed) and not resumed, record nothing: all their KV will be computed with the new weights.
         Because a live prefix cache cannot be flushed while requests hold its pages, this mode requires
         ``enable_prefix_caching=False``; it is also limited to single-host engines and to a graph whose compiled
         programs the runner already holds (same structure and shapes).
@@ -3050,6 +3065,10 @@ class eSurge:
 
         def _swap() -> None:
             with self._scheduler_lock:
+                # No step is in flight: every KV entry held now was computed with the outgoing weights. The pipeline
+                # update is queued behind the tokens already emitted, so it lands before any new-weight token.
+                marked = self.core.mark_kv_weight_version(self._weight_version)
+                self._output_pipeline.submit_kv_versions(marked)
                 # reset_state=False keeps the runner's sequence buffer and page tables for the live requests.
                 self.runner.update_model_weights(
                     graphdef=graphdef,
@@ -3068,16 +3087,14 @@ class eSurge:
         return new_version
 
     def abort_requests_before_version(self, min_version: int) -> list[str]:
-        """Abort in-flight requests that sampled any token with weights older than ``min_version``.
+        """Abort unfinished requests that sampled a token, or hold KV, from weights older than ``min_version``.
 
-        A request is in flight once it has emitted at least one token; its oldest version is the minimum over its
-        samples' ``weight_version_segments``. Requests that have not emitted a token yet (queued, or still in
-        prefill) are kept: every token they produce will carry the current version. Finished requests are untouched.
-
-        This filters on *sampling-step* versions only and does not bound KV staleness. After a
-        ``update_model_weights(keep_requests=True)`` swap, a request whose prompt KV (or part of it) was computed
-        under the old weights but which has not emitted a token yet is kept, and its tokens report only the new
-        version; tokens of any kept request may also attend to KV computed under older weights.
+        Two filters, unioned: a request that emitted a token whose ``weight_version_segments`` version is below
+        ``min_version``, and a live request whose currently held KV (prompt prefill or decode, fully or partly) was
+        computed with a version below ``min_version``, as tracked across ``update_model_weights(keep_requests=True)``
+        swaps. Kept requests therefore sample and attend only to weights ``>= min_version`` from here on. Requests
+        holding no KV (never scheduled, or preempted and not resumed: their KV was freed and will be recomputed) are
+        kept. Finished requests are untouched.
 
         Args:
             min_version: Oldest weight version a kept request may contain.
@@ -3093,6 +3110,9 @@ class eSurge:
                 oldest = output.oldest_weight_version
                 if oldest is not None and oldest < int(min_version):
                     stale.append(request_id)
+        with self._scheduler_lock:
+            stale_kv = self.core.stale_kv_parent_ids(int(min_version), int(self._weight_version))
+        stale.extend(request_id for request_id in stale_kv if request_id not in stale)
         for request_id in stale:
             self.abort_request(request_id)
         return stale
@@ -4185,6 +4205,7 @@ class eSurge:
                                     reasoning_content=comp.reasoning_content,
                                     raw_text=comp.raw_text,
                                     weight_version_segments=comp.weight_version_segments,
+                                    oldest_kv_weight_version=comp.oldest_kv_weight_version,
                                 )
                             )
 

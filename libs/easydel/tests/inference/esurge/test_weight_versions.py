@@ -21,6 +21,7 @@ engine and are computation tests (the suite's conftest refuses them on a CPU bac
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import jax
@@ -28,11 +29,15 @@ import numpy as np
 import pytest
 import spectrax as spx
 from easydel.inference.esurge import esurge_engine
+from easydel.inference.esurge.core.interface import CacheGroupSpec, FullAttentionSpec
+from easydel.inference.esurge.engine.core_driver import FINISH_ABORT, EngineCoreDriver
 from easydel.inference.esurge.engine.loop import EngineLoop
 from easydel.inference.esurge.engine.output_pipeline import OutputPipeline
 from easydel.inference.esurge.engine.registry import RequestRecord, RequestRegistry
 from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
+from easydel.inference.esurge.outputs import ModelRunnerOutput
+from easydel.inference.esurge.request import AdmissionRecord
 from easydel.inference.sampling_params import SamplingParams
 from easydel.trainers._shared import esurge_generation
 from easydel.workers.esurge.pipeline import Detokenizer
@@ -118,6 +123,124 @@ def test_pipeline_without_versions_keeps_outputs_unversioned():
     comp = output.outputs[0]
     assert comp.weight_version_segments is None
     assert comp.oldest_weight_version is None and output.newest_weight_version is None
+    assert comp.oldest_kv_weight_version is None and output.oldest_kv_weight_version is None
+
+
+@pytest.mark.cpu_ok
+def test_pipeline_kv_version_is_the_first_sampling_version_without_a_swap():
+    pipeline, output = _pipeline_with_request()
+    pipeline.submit(_bundle([65]), weight_version=3)
+    pipeline.submit(_bundle([66], t=2.0), weight_version=4)
+    assert output.outputs[0].oldest_kv_weight_version == 3
+    assert output.oldest_kv_weight_version == 3
+
+
+@pytest.mark.cpu_ok
+def test_pipeline_kv_version_from_a_swap_precedes_the_first_token():
+    pipeline, output = _pipeline_with_request(n_samples=2)
+    # A swap while the request held KV (prefilled, no token yet) reports the outgoing version.
+    pipeline.submit_kv_versions({"r": 0, "unknown": 0})
+    comp = output.outputs[0]
+    assert comp.oldest_kv_weight_version == 0
+    pipeline.submit(_bundle([65, 66]), weight_version=1)
+    assert comp.weight_version_segments == [(0, 1)]
+    assert (comp.oldest_weight_version, comp.oldest_kv_weight_version) == (1, 0)
+    # A later swap never raises the recorded version; samples without KV stay unset.
+    pipeline.submit_kv_versions({"r": 2})
+    assert comp.oldest_kv_weight_version == 0
+    assert output.outputs[1].oldest_kv_weight_version is None
+    assert output.oldest_kv_weight_version == 0
+
+
+def _driver_record(request_id: str, prompt_len: int, parent: str | None = None) -> AdmissionRecord:
+    return AdmissionRecord(
+        request_id=request_id,
+        prompt_token_ids=list(range(1, prompt_len + 1)),
+        sampling_params=SamplingParams(max_tokens=32, ignore_eos=True),
+        eos_token_id=0,
+        parent_request_id=parent,
+    )
+
+
+def _driver_step(core: EngineCoreDriver):
+    """Schedule and commit one step, sampling token 5 for every row whose prefill completes; returns the output."""
+    so = core.schedule()
+    rids = list(so.num_scheduled_tokens)
+    sampled = []
+    for rid in rids:
+        _status, computed, num_tokens, _drafts = core.request_state(rid)
+        sampled.append([5] if computed >= num_tokens else [])
+    core.commit(
+        so,
+        ModelRunnerOutput(
+            req_ids=rids,
+            req_id_to_index={rid: i for i, rid in enumerate(rids)},
+            sampled_token_ids=sampled,
+            spec_token_ids=None,
+            logprobs=None,
+            prompt_logprobs_dict={},
+        ),
+    )
+    return so
+
+
+@pytest.mark.cpu_ok
+def test_driver_tracks_kv_versions_across_swaps_preemption_and_finish():
+    spec = FullAttentionSpec(page_size=4, num_kv_heads=1, head_size=4, dtype=np.float32, use_mla=False)
+    # 6 pages of 4 tokens: two decoding requests soon outgrow the pool and get preempted.
+    core = EngineCoreDriver(
+        kv_cache_groups=[CacheGroupSpec(kv_cache_spec=spec, layer_names=None)],
+        max_num_seqs=2,
+        max_num_batched_tokens=16,
+        max_model_len=64,
+        num_pages=6,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        chunked_prefill_enabled=True,
+    )
+    try:
+        core.add_requests([_driver_record("p", 10, parent="par"), _driver_record("q", 6)])
+        # Nothing computed yet: a swap marks nobody and untracked requests hold no KV.
+        assert core.mark_kv_weight_version(0) == {}
+        assert core.oldest_kv_weight_version("p", 0) is None
+        _driver_step(core)
+        # No swap: the installed weights computed all of it.
+        assert core.oldest_kv_weight_version("p", 0) == 0
+        assert core.stale_kv_parent_ids(1, 0) == ["par", "q"]
+
+        assert core.mark_kv_weight_version(0) == {"p": 0, "q": 0}
+        # A second swap keeps the older version.
+        assert core.mark_kv_weight_version(1) == {}
+        assert core.oldest_kv_weight_version("q", 2) == 0
+        assert core.stale_kv_parent_ids(1, 2) == ["par", "q"]
+
+        preempted: set[str] = set()
+        for _ in range(40):
+            preempted |= _driver_step(core).preempted_req_ids
+            if "q" in preempted:
+                break
+        assert "q" in preempted, "the small pool never preempted q"
+        assert core.request_state("q")[1] == 0
+        # Preempted: its KV was freed, so it holds none and is not stale.
+        assert core.oldest_kv_weight_version("q", 2) is None
+        assert core.stale_kv_parent_ids(1, 2) == ["par"]
+
+        for _ in range(40):
+            preempted |= _driver_step(core).preempted_req_ids
+            state = core.request_state("p")
+            if "p" in preempted and state is not None and state[1] > 0:
+                break
+        assert "p" in preempted, "p was never preempted"
+        # Resumed after preemption: its KV was recomputed with the installed weights.
+        assert core.oldest_kv_weight_version("p", 2) == 2
+        assert core.stale_kv_parent_ids(1, 2) == []
+
+        assert core.mark_kv_weight_version(2) == {"p": 2}
+        assert sorted(core.finish_requests(["p", "q"], FINISH_ABORT)) == ["p", "q"]
+        assert core.oldest_kv_weight_version("p", 3) is None
+        assert core.stale_kv_parent_ids(3, 3) == []
+    finally:
+        core.shutdown()
 
 
 @pytest.mark.cpu_ok
@@ -177,6 +300,8 @@ def _host_only_engine(runner_update):
     engine._scheduler_running = False
     engine._scheduler_lock = threading.RLock()
     engine._weight_version = 0
+    engine.core = SimpleNamespace(mark_kv_weight_version=lambda version: {})
+    engine._output_pipeline = SimpleNamespace(submit_kv_versions=lambda versions: None)
     engine._info = lambda *args, **kwargs: None
     engine._resolve_weight_update_components = lambda model, gd, gs, go: (model, gs, go)
     engine.runner = SimpleNamespace(
@@ -273,11 +398,11 @@ def models():
     return model_a, model_b, tokenizer
 
 
-def _engine(model, tokenizer, *, prefix_caching: bool, max_num_seqs: int = 2):
+def _engine(model, tokenizer, *, prefix_caching: bool, max_num_seqs: int = 2, **runtime):
     return esurge_engine.eSurge(
         model=model,
         processor=tokenizer,
-        runtime={"max_model_len": MAX_MODEL_LEN, "max_num_seqs": max_num_seqs},
+        runtime={"max_model_len": MAX_MODEL_LEN, "max_num_seqs": max_num_seqs, **runtime},
         cache={
             "page_size": 16,
             "hbm_utilization": 0.05,
@@ -299,6 +424,8 @@ def test_weight_versions_increase_and_tag_generated_tokens(models):
         assert engine.weight_version == 0
         out = engine.generate("hello world", _greedy(8), use_tqdm=False)[0]
         assert out.outputs[0].weight_version_segments == [(0, 0)]
+        # No swap during the request: its KV comes from the weights that sampled it.
+        assert out.outputs[0].oldest_kv_weight_version == 0
         assert engine.update_model_weights(model_b) == 1
         assert engine.update_model_weights(model_a, version=5) == 5
         with pytest.raises(ValueError, match="must increase"):
@@ -307,6 +434,7 @@ def test_weight_versions_increase_and_tag_generated_tokens(models):
         out = engine.generate("hello world", _greedy(8), use_tqdm=False)[0]
         assert out.outputs[0].weight_version_segments == [(0, 5)]
         assert (out.oldest_weight_version, out.newest_weight_version) == (5, 5)
+        assert out.oldest_kv_weight_version == 5
     finally:
         engine.terminate()
 
@@ -400,5 +528,76 @@ def test_fence_aborts_only_requests_with_older_tokens(models):
         assert kept.finish_reason == "length"
         assert kept.weight_version_segments == [(0, 1)]
         assert engine.abort_requests_before_version(2) == []
+    finally:
+        engine.terminate()
+
+
+def _long_prompt(tokenizer, min_tokens: int) -> str:
+    prompt = ""
+    while len(tokenizer.encode(prompt)) < min_tokens:
+        prompt += "The quick brown fox jumps over the lazy dog. "
+    return prompt
+
+
+def test_swap_mid_prefill_records_old_kv_and_the_fence_aborts_it(models):
+    model_a, model_b, tokenizer = models
+    prompt = _long_prompt(tokenizer, 240)
+    # 16-token chunks: the prompt takes many steps to prefill, so a between-steps check can swap mid-prefill.
+    engine = _engine(
+        model_a,
+        tokenizer,
+        prefix_caching=False,
+        max_num_seqs=2,
+        max_num_batched_tokens=16,
+        chunked_prefill_enabled=True,
+    )
+    try:
+        loop = engine._engine_loop
+        assert loop is not None and engine._scheduler_running
+        swap: dict = {}
+
+        def swap_mid_prefill() -> str:
+            record = engine.core.record_of("pre")
+            state = engine.core.request_state("pre")
+            if record is None or state is None:
+                return "waiting"
+            computed = state[1]
+            if computed >= len(record.prompt_token_ids):
+                return "missed"
+            if computed == 0:
+                return "waiting"
+            swap["computed"], swap["prompt"] = computed, len(record.prompt_token_ids)
+            swap["version"] = engine.update_model_weights(model_b, keep_requests=True)
+            return "swapped"
+
+        pre_thread, _, pre = _stream_in_thread(engine, prompt, _greedy(100), "pre")
+        deadline = time.monotonic() + 120
+        status = "waiting"
+        while status == "waiting":
+            assert time.monotonic() < deadline, "the long prompt was never scheduled"
+            status = loop.run_between_steps(swap_mid_prefill)
+        assert status == "swapped", "the prompt finished prefill before the swap"
+        assert swap["version"] == 1 and 0 < swap["computed"] < swap["prompt"]
+
+        post_thread, post_started, post = _stream_in_thread(engine, "a short prompt", _greedy(100), "post")
+        assert post_started.wait(timeout=120)
+        # "pre" sampled every token with version 1 but attends to prompt KV from version 0; "post" holds only
+        # version-1 KV and is still running.
+        assert engine.abort_requests_before_version(1) == ["pre"]
+        assert engine.abort_requests_before_version(1) == []
+        pre_thread.join(timeout=120)
+        post_thread.join(timeout=300)
+        assert "error" not in pre and "error" not in post
+
+        aborted = pre["final"].outputs[0]
+        assert aborted.finish_reason == "abort"
+        assert aborted.oldest_kv_weight_version == 0
+        assert aborted.weight_version_segments in (None, [(0, 1)])
+        assert pre["final"].oldest_kv_weight_version == 0
+
+        kept = post["final"].outputs[0]
+        assert kept.finish_reason == "length" and len(kept.token_ids) == 100
+        assert kept.weight_version_segments == [(0, 1)]
+        assert kept.oldest_kv_weight_version == 1
     finally:
         engine.terminate()

@@ -88,18 +88,25 @@ counted once.
 - `CompletionOutput.weight_version_segments`: `[(start_token_index, version), ...]`; token `i` was sampled with the
   version of the last segment starting at or before `i`. `oldest_weight_version` / `newest_weight_version` summarise
   it; `None` when not recorded. Trainers expand it per token (`expand_weight_version_segments`). The segments record
-  the weights each token was **sampled** with only; the version of the KV a token attends to is not recorded.
+  the weights each token was **sampled** with.
+- `CompletionOutput.oldest_kv_weight_version` (and `RequestOutput.oldest_kv_weight_version`, the minimum over
+  samples): the oldest version that computed any KV entry the completion attended to. It is the sampling version of
+  the first token unless a `keep_requests=True` swap happened while the request held computed KV, in which case it is
+  the outgoing version of the first such swap. KV freed by preemption and recomputed is new KV. `None` before any KV
+  or token was recorded.
 - `eSurge.update_model_weights(..., version=None, keep_requests=False)` installs a strictly increasing version
   (`None` = current + 1); concurrent calls are serialised, so the version never decreases and is never reused. By
   default the engine must be idle (it raises instead of draining). With `keep_requests=True` the swap happens between
   two model steps and in-flight requests continue (tokens after the swap carry the new version; earlier KV entries are
-  kept and **not tracked**, so a prompt prefilled, fully or partly, under the old weights and sampled under the new
-  ones reports only the new version). Limits: requires `enable_prefix_caching=False`, single-host engines, and a graph
+  kept, not recomputed, and every request holding computed KV records the outgoing version in
+  `oldest_kv_weight_version`, so a prompt prefilled, fully or partly, under the old weights and sampled under the new
+  ones reports the old version there). Limits: requires `enable_prefix_caching=False`, single-host engines, and a graph
   whose compiled programs the runner already holds.
 - `eSurge.abort_requests_before_version(min_version)` aborts unfinished requests that emitted any token with a version
-  below `min_version`; requests without tokens yet are kept (even if their prompt KV was computed under older weights).
-  Returns the aborted parent request ids. It is a sampling-version fence, **not** a bound on KV staleness: after a
-  `keep_requests=True` swap, kept requests may still attend to KV computed under older weights.
+  below `min_version`, and live requests whose currently held KV (prefill or decode) was computed with a version below
+  `min_version`. Returns the aborted parent request ids. Kept requests therefore sample and attend only to weights
+  `>= min_version` from then on. Requests holding no KV (not yet scheduled, or preempted and not resumed: their KV was
+  freed and is recomputed with the installed weights) are kept.
 
 ## Disaggregated weight transport (opt-in)
 
