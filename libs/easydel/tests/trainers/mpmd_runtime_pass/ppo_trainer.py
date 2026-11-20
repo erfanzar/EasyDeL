@@ -70,7 +70,6 @@ def main() -> None:
             **mpmd_generation_length_overrides(prompt=64, completion=32),
             "num_return_sequences": 2,
             "generation_num_return_sequences": 2,
-            "use_esurge_generation": False,
             "esurge_max_num_seqs": 2,
             "esurge_max_num_seq_buckets": [1, 2],
             "esurge_min_input_pad": 1,

@@ -50,6 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import MutableHeaders
 
 from .openai_api_modules import (
     ChatCompletionRequest,
@@ -116,9 +117,75 @@ class ServerStatus(StrEnum):
     SHUTTING_DOWN = "shutting_down"
 
 
+MONITORING_PATHS = frozenset({"/metrics", "/health"})
+"""Paths excluded from the request counters and the active-request set: polling them is not traffic."""
+
+
+class RequestTrackingMiddleware:
+    """Pure ASGI middleware: request id, ``X-Request-ID`` header, active-request set and request counters.
+
+    Replaces two ``@app.middleware("http")`` functions. Starlette runs those through ``BaseHTTPMiddleware``,
+    which pushes every streamed body chunk through an anyio memory stream and task group per middleware; at 128
+    concurrent SSE streams that per-chunk event-loop work competed for the GIL with the engine's scheduler thread.
+    Here body messages pass straight through; only ``http.response.start`` is touched.
+
+    Every HTTP request gets ``scope["state"]["request_id"]`` (``request.state.request_id``) and an
+    ``X-Request-ID`` response header carrying it. Requests outside :data:`MONITORING_PATHS` are also counted on the
+    server's ``metrics`` (success below status 400, failure from 400 or on an exception before the response starts)
+    and kept in its ``_active_requests`` set until the whole response, streamed body included, has been sent.
+
+    Args:
+        app: The wrapped ASGI app.
+        server: Object exposing ``metrics`` (:class:`ServerMetrics`) and ``_active_requests`` (``set[str]``).
+    """
+
+    def __init__(self, app: tp.Any, *, server: tp.Any) -> None:
+        self.app = app
+        self.server = server
+
+    async def __call__(self, scope: dict[str, tp.Any], receive: tp.Any, send: tp.Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        server = self.server
+        request_id = f"req_{int(time.time() * 1000000)}"
+        scope.setdefault("state", {})["request_id"] = request_id
+        tracked = scope.get("path") not in MONITORING_PATHS
+        status: int | None = None
+
+        async def send_with_request_id(message: dict[str, tp.Any]) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = int(message["status"])
+                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+                if tracked:
+                    if status < 400:
+                        server.metrics.successful_requests += 1
+                    else:
+                        server.metrics.failed_requests += 1
+            await send(message)
+
+        if not tracked:
+            await self.app(scope, receive, send_with_request_id)
+            return
+        server.metrics.total_requests += 1
+        server._active_requests.add(request_id)
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        except BaseException:
+            if status is None:
+                server.metrics.failed_requests += 1
+            raise
+        finally:
+            server._active_requests.discard(request_id)
+            server.metrics.uptime_seconds = time.time() - server.metrics.start_time
+
+
 @dataclass
 class ServerMetrics:
     """Aggregate per-server counters surfaced through ``/metrics``.
+
+    Requests to :data:`MONITORING_PATHS` are not counted.
 
     Mutated by the request-tracking middleware in
     :meth:`BaseInferenceApiServer._setup_middleware` (``total_requests``,
@@ -369,7 +436,6 @@ class BaseInferenceApiServer(ABC):
         self.status = ServerStatus.STARTING
         self.metrics = ServerMetrics()
         self._active_requests: set[str] = set()
-        self._request_lock = asyncio.Lock()
         self.enable_function_calling = enable_function_calling
         self.default_function_format = default_function_format
         self._overload_message = overload_message
@@ -540,48 +606,8 @@ class BaseInferenceApiServer(ABC):
         )
 
     def _setup_middleware(self) -> None:
-        """Setup request middleware.
-
-        Configures middleware for request tracking, metrics collection,
-        and request ID generation. This method adds two middleware layers:
-        1. Request ID assignment for tracking
-        2. Metrics collection for monitoring
-        """
-
-        @self.app.middleware("http")
-        async def add_request_id(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
-            """Add unique request ID to each request."""
-            request_id = f"req_{int(time.time() * 1000000)}"
-            request.state.request_id = request_id
-
-            async with self._request_lock:
-                self._active_requests.add(request_id)
-
-            try:
-                response = await call_next(request)
-                response.headers["X-Request-ID"] = request_id
-                return response
-            finally:
-                async with self._request_lock:
-                    self._active_requests.discard(request_id)
-
-        @self.app.middleware("http")
-        async def track_metrics(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
-            """Track request metrics."""
-            self.metrics.total_requests += 1
-
-            try:
-                response = await call_next(request)
-                if response.status_code < 400:
-                    self.metrics.successful_requests += 1
-                else:
-                    self.metrics.failed_requests += 1
-                return response
-            except Exception:
-                self.metrics.failed_requests += 1
-                raise
-            finally:
-                self.metrics.uptime_seconds = time.time() - self.metrics.start_time
+        """Install :class:`RequestTrackingMiddleware` (request id, ``X-Request-ID``, active set, counters)."""
+        self.app.add_middleware(RequestTrackingMiddleware, server=self)
 
     @property
     def _endpoints(self) -> list[EndpointConfig]:
@@ -870,6 +896,52 @@ class BaseInferenceApiServer(ABC):
         """
         return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
+    def _check_generation_slot_capacity(
+        self,
+        *,
+        endpoint: str | None = None,
+        request_id: str | None = None,
+        model: str | None = None,
+        raw_request: Request | None = None,
+        stream: bool | None = None,
+    ) -> None:
+        """Reject an overloaded server with HTTP 503 without consuming a slot.
+
+        Streaming handlers call this *before* returning their
+        ``StreamingResponse``. Raising from inside the body iterator instead
+        would reach the client as an empty, aborted stream, because the SSE
+        response has already started; the slot itself is still taken inside the
+        generator, so this is only a pre-flight check.
+
+        Args:
+            endpoint: Endpoint name (diagnostics only).
+            request_id: Request identifier (diagnostics only).
+            model: Requested model name (diagnostics only).
+            raw_request: Raw FastAPI request, used for client attribution.
+            stream: Whether the request streams (diagnostics only).
+
+        Raises:
+            HTTPException: With ``503`` when every generation slot is taken.
+        """
+
+        queue = getattr(self, "_generation_slots", None)
+        if queue is None or queue.qsize() > 0:
+            return
+        max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+        logger.warning(
+            "Rejecting request with HTTP 503 before streaming because all generation slots are busy. "
+            "endpoint=%s request_id=%s model=%s stream=%s max_generation_slots=%s "
+            "active_http_requests=%s overload_message=%s",
+            endpoint,
+            request_id,
+            model,
+            stream,
+            max_generation_slots,
+            len(getattr(self, "_active_requests", ()) or ()),
+            self._overload_message,
+        )
+        raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=self._overload_message)
+
     @asynccontextmanager
     async def _acquire_generation_slot(
         self,
@@ -1033,6 +1105,20 @@ class BaseInferenceApiServer(ABC):
         started = False
         exhausted = False  # the engine stream ended normally; nothing left to abort
         aborted_on_close = False
+        # The consumer's event loop and the event it parks on; the producer thread sets it after every enqueue.
+        waiter_lock = threading.Lock()
+        waiter: list[tuple[asyncio.AbstractEventLoop, asyncio.Event] | None] = [None]
+
+        def _wake_consumer() -> None:
+            with waiter_lock:
+                registered = waiter[0]
+            if registered is None:
+                return  # no consumer parked yet; its first get() finds the item without waiting
+            loop, event = registered
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:  # the consumer's loop is already closed
+                pass
 
         def _notify_abandon() -> None:
             if on_abandon is not None:
@@ -1050,15 +1136,33 @@ class BaseInferenceApiServer(ABC):
             async def get(self) -> tuple[str, tp.Any]:
                 """Block until a tagged payload is available and return it.
 
+                Parks on an event the producer sets after each enqueue instead of polling: a 1 ms poll per open
+                stream woke the event loop (and took the GIL) ~1000 times a second per stream, which at 128
+                concurrent streams starved the engine's scheduler thread and cut decode throughput by ~40%.
+
                 Returns:
                     Tuple ``(kind, payload)`` where ``kind`` is one of
                     ``"data"``, ``"error"``, or ``"end"``.
                 """
+                loop = asyncio.get_running_loop()
+                with waiter_lock:
+                    registered = waiter[0]
+                    if registered is None or registered[0] is not loop:
+                        registered = (loop, asyncio.Event())
+                        waiter[0] = registered
+                event = registered[1]
                 while True:
+                    # Clear before checking: an enqueue after this point sets the event again, so no wakeup is lost.
+                    event.clear()
                     try:
                         return queue.get_nowait()
                     except queue_lib.Empty:
-                        await asyncio.sleep(0.001)
+                        pass
+                    try:
+                        # The timeout is only a safety net; every enqueue wakes the waiter directly.
+                        await asyncio.wait_for(event.wait(), timeout=1.0)
+                    except TimeoutError:
+                        continue
 
             def close(self) -> None:
                 """Stop the producer: pending and future payloads are discarded.
@@ -1086,9 +1190,10 @@ class BaseInferenceApiServer(ABC):
             while not closed.is_set():
                 try:
                     queue.put((kind, payload), timeout=0.05)
-                    return True
                 except queue_lib.Full:
                     continue
+                _wake_consumer()
+                return True
             return False
 
         def _producer() -> None:

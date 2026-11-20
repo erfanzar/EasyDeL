@@ -19,7 +19,8 @@ Pins, on TPU:
 * ``permute`` / ``unpermute`` with ``row_gather_kernel=True`` route every token copy to the right expert row and
   combine it with the right weight (float64 reference), give the default path's values and gradients, and lower to
   the kernels;
-* shapes the kernels cannot take fall back to exactly the default result;
+* shapes the kernels cannot take fall back to exactly the default result, and ``row_gather_kernel=None`` (the
+  fused MoE's default) gives the kernel result where the kernels apply and the default result elsewhere;
 * the fused MoE block with ``moe_row_gather_kernel`` matches the flag-off block in outputs and input gradients
   (fsdp-only, and tp with the deferred TP reduce, where the combine sees full-width rows).
 """
@@ -113,6 +114,22 @@ def test_unsupported_shapes_fall_back_to_the_default_result():
     g_def = jax.jit(jax.grad(_loss(False, ct)))(x, logits)
     g_ker = jax.jit(jax.grad(_loss(True, ct)))(x, logits)
     np.testing.assert_array_equal(np.asarray(g_ker, np.float32), np.asarray(g_def, np.float32))
+
+
+def test_automatic_setting_is_the_kernel_path_where_the_kernels_apply():
+    """``row_gather_kernel=None`` (the fused MoE's default) equals ``True`` on supported shapes, ``False`` elsewhere."""
+    x, logits, ct = _inputs()
+    out_auto = jax.jit(lambda a, b: _moe(a, b, None))(x, logits)
+    out_kernel = jax.jit(lambda a, b: _moe(a, b, True))(x, logits)
+    np.testing.assert_array_equal(np.asarray(out_auto, np.float32), np.asarray(out_kernel, np.float32))
+    g_auto = jax.jit(jax.grad(_loss(None, ct), argnums=(0, 1)))(x, logits)
+    g_kernel = jax.jit(jax.grad(_loss(True, ct), argnums=(0, 1)))(x, logits)
+    for a, b in zip(g_auto, g_kernel, strict=True):
+        np.testing.assert_array_equal(np.asarray(a, np.float32), np.asarray(b, np.float32))
+    x, logits, _ = _inputs(hidden=384)
+    out_auto = jax.jit(lambda a, b: _moe(a, b, None))(x, logits)
+    out_default = jax.jit(lambda a, b: _moe(a, b, False))(x, logits)
+    np.testing.assert_array_equal(np.asarray(out_auto, np.float32), np.asarray(out_default, np.float32))
 
 
 # --------------------------------------------------------------------------------------------- fused MoE block

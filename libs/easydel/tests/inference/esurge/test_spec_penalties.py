@@ -37,7 +37,6 @@ import numpy as np
 import pytest
 import spectrax as spx
 from easydel.inference.esurge.core.sampler import apply_history_penalties_from_counts
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.penalties import (
     HistoryCountCache,
@@ -47,15 +46,14 @@ from easydel.inference.esurge.runners.spec.penalties import (
     penalized_verify_argmax,
 )
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DraftStep
 from easydel.modules.llama import LlamaConfig, LlamaForCausalLM
 
 try:
-    from ._common import make_tiny_qwen35
+    from ._common import make_core_for_runner, make_tiny_qwen35, served_request
 except ImportError:  # standalone `python test_x.py`
-    from _common import make_tiny_qwen35
+    from _common import make_core_for_runner, make_tiny_qwen35, served_request
 
 _VOCAB = 256
 _PRESETS = [
@@ -441,7 +439,7 @@ def _serve(model, requests: dict[str, tuple[list[int], dict]], *, drafter=None, 
     if backoff:
         runner.spec_decode_reject_backoff_steps = backoff
     runner.compile(max_num_batched_tokens=64)
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner,
         max_num_batched_tokens=64,
         enable_prefix_caching=False,
@@ -450,7 +448,7 @@ def _serve(model, requests: dict[str, tuple[list[int], dict]], *, drafter=None, 
     )
     engine_requests = []
     for rid, (prompt, penalties) in requests.items():
-        request = EngineRequest(
+        request = served_request(
             request_id=rid,
             prompt_token_ids=list(prompt),
             sampling_params=SamplingParams(max_tokens=max_new, temperature=0.0, ignore_eos=True, **penalties),
@@ -461,7 +459,7 @@ def _serve(model, requests: dict[str, tuple[list[int], dict]], *, drafter=None, 
     for _ in range(400):
         scheduler_output = scheduler.schedule()
         output = runner.execute_model(scheduler_output)
-        scheduler.update_from_output(scheduler_output, output)
+        scheduler.commit(scheduler_output, output)
         if all(r.is_finished() for r in engine_requests):
             break
     else:

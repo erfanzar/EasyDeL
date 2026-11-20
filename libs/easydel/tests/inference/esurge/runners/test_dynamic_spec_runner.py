@@ -14,7 +14,7 @@
 
 """Runner-level dynamic speculative-token scheduling (end-to-end, tiny model).
 
-Contract under test: a real ``eSurgeRunner`` + ``Scheduler`` serving loop
+Contract under test: a real ``eSurgeRunner`` + engine core serving loop
 resolves the per-step draft budget from the live concurrency —
 
 * above the schedule's off-threshold the drafter is NEVER invoked and the
@@ -36,12 +36,15 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import pytest
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.model_runner import derive_spec_token_buckets
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
+
+try:
+    from .._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 try:
     from .._common import make_tiny_qwen35 as make_tiny_model
@@ -85,7 +88,7 @@ def _make_runner(model, *, n_seqs: int, drafter) -> eSurgeRunner:
 
 def _serve(runner: eSurgeRunner, prompts, *, max_new: int = 10) -> dict[str, list[int]]:
     """Drive all prompts concurrently through scheduler + runner to completion."""
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner,
         max_num_batched_tokens=64,
         enable_prefix_caching=False,
@@ -94,7 +97,7 @@ def _serve(runner: eSurgeRunner, prompts, *, max_new: int = 10) -> dict[str, lis
     )
     reqs = []
     for i, prompt in enumerate(prompts):
-        r = EngineRequest(
+        r = served_request(
             request_id=f"r-{i}",
             prompt_token_ids=list(prompt),
             sampling_params=SamplingParams(max_tokens=max_new, temperature=0.0, ignore_eos=True),
@@ -105,7 +108,7 @@ def _serve(runner: eSurgeRunner, prompts, *, max_new: int = 10) -> dict[str, lis
     for _ in range(4000):
         so = scheduler.schedule()
         out = runner.execute_model(so)
-        scheduler.update_from_output(so, out)
+        scheduler.commit(so, out)
         if all(r.is_finished() for r in reqs):
             break
     else:

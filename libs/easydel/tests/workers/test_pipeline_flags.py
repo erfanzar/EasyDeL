@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Check registered settings through the actual CPU-only pipeline worker readers."""
+"""Check registered settings through the actual CPU-only tokenizer worker readers."""
 
 import os
 import subprocess
@@ -30,40 +30,18 @@ pytestmark = pytest.mark.cpu_ok
 
 
 class _CharacterTokenizer:
-    def __init__(self):
-        self.decoded_tokens = []
-
     def __call__(self, prompt, **kwargs):
         return {"input_ids": [ord(char) for char in prompt]}
-
-    def decode(self, tokens, **kwargs):
-        self.decoded_tokens.append(list(tokens))
-        return "".join(chr(token) for token in tokens)
 
 
 @pytest.fixture
 def run_worker(monkeypatch):
-    """Replace only tokenizer loading and transport; execute real dispatch/decoding."""
+    """Replace only tokenizer loading and transport; execute real dispatch."""
 
-    def run(mode, tokenizer_kwargs=None):
-        tokenizer = _CharacterTokenizer()
+    def run(tokenizer_kwargs=None):
         loaded_kwargs = {}
         replies = []
-        messages = iter(
-            [
-                {"cmd": "tokenize", "prompt": "e"}
-                if mode == "tokenizer"
-                else {
-                    "cmd": "decode",
-                    "request_id": "r",
-                    "tokens": [101],
-                    "prompt_context": [97, 98, 99, 100],
-                    "finished": False,
-                    "skip_special_tokens": True,
-                },
-                {"cmd": "shutdown"},
-            ]
-        )
+        messages = iter([{"cmd": "tokenize", "prompt": "e"}, {"cmd": "shutdown"}])
 
         class Socket:
             def bind(self, endpoint):
@@ -87,25 +65,18 @@ def run_worker(monkeypatch):
 
         def load(path, **kwargs):
             loaded_kwargs.update(kwargs)
-            return tokenizer
+            return _CharacterTokenizer()
 
         monkeypatch.setattr(worker_main.AutoTokenizer, "from_pretrained", load)
         monkeypatch.setattr(worker_main.zmq, "Context", Context)
         kwargs = {} if tokenizer_kwargs is None else tokenizer_kwargs.copy()
-        if mode == "tokenizer":
-            worker_main._tokenizer_worker("unused", "unused", kwargs)
-            assert replies[0] == {"status": "ok", "tokens": [101]}
-        else:
-            worker_main._detokenizer_worker("unused", "unused", kwargs, 8)
-            assert replies[0]["status"] == "ok"
-            assert replies[0]["result"]["delta_text"] == "e"
-        assert replies[-1] == {"status": "ok"}
-        return loaded_kwargs, tokenizer.decoded_tokens
+        worker_main._tokenizer_worker("unused", "unused", kwargs)
+        assert replies == [{"status": "ok", "tokens": [101]}, {"status": "ok"}]
+        return loaded_kwargs
 
     return run
 
 
-@pytest.mark.parametrize("mode", ["tokenizer", "detokenizer"])
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -121,61 +92,31 @@ def run_worker(monkeypatch):
         (" on ", False),
     ],
 )
-def test_worker_trust_flag_preserves_legacy_values(monkeypatch, run_worker, mode, raw, expected):
+def test_worker_trust_flag_preserves_legacy_values(monkeypatch, run_worker, raw, expected):
     if raw is None:
         monkeypatch.delenv(flags.ESURGE_WORKER_TRUST_REMOTE_CODE, raising=False)
     else:
         monkeypatch.setenv(flags.ESURGE_WORKER_TRUST_REMOTE_CODE, raw)
-    loaded, _ = run_worker(mode)
+    loaded = run_worker()
     assert loaded["trust_remote_code"] is expected
 
 
-@pytest.mark.parametrize("mode", ["tokenizer", "detokenizer"])
 @pytest.mark.parametrize(("raw", "override"), [("1", False), ("0", True), ("1", None)])
-def test_worker_explicit_trust_override_wins(monkeypatch, run_worker, mode, raw, override):
+def test_worker_explicit_trust_override_wins(monkeypatch, run_worker, raw, override):
     monkeypatch.setenv(flags.ESURGE_WORKER_TRUST_REMOTE_CODE, raw)
-    loaded, _ = run_worker(mode, {"trust_remote_code": override})
+    loaded = run_worker({"trust_remote_code": override})
     assert loaded["trust_remote_code"] is override
 
 
-@pytest.mark.parametrize("mode", ["tokenizer", "detokenizer"])
-def test_worker_reads_trust_from_registered_getter(monkeypatch, run_worker, mode):
+def test_worker_reads_trust_from_registered_getter(monkeypatch, run_worker):
     monkeypatch.setenv(flags.ESURGE_WORKER_TRUST_REMOTE_CODE, "1")
     monkeypatch.setattr(flags, "get_bool", lambda name: False)
-    loaded, _ = run_worker(mode)
+    loaded = run_worker()
     assert loaded["trust_remote_code"] is False
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected_tokens"),
-    [
-        (None, [97, 98, 99, 100, 101]),
-        ("invalid", [97, 98, 99, 100, 101]),
-        ("", [97, 98, 99, 100, 101]),
-        ("2", [99, 100, 101]),
-        ("0", [101]),
-        ("-1", [101]),
-    ],
-)
-def test_detokenizer_context_flag_controls_decoded_context(monkeypatch, run_worker, raw, expected_tokens):
-    if raw is None:
-        monkeypatch.delenv(flags.ESURGE_DETOKENIZER_CONTEXT_WINDOW, raising=False)
-    else:
-        monkeypatch.setenv(flags.ESURGE_DETOKENIZER_CONTEXT_WINDOW, raw)
-    _, decoded_tokens = run_worker("detokenizer")
-    assert decoded_tokens[0] == expected_tokens
-
-
-def test_detokenizer_reads_context_from_registered_getter(monkeypatch, run_worker):
-    monkeypatch.setenv(flags.ESURGE_DETOKENIZER_CONTEXT_WINDOW, "4")
-    monkeypatch.setattr(flags, "get_int", lambda name: 2)
-    _, decoded_tokens = run_worker("detokenizer")
-    assert decoded_tokens[0] == [99, 100, 101]
-
-
-@pytest.mark.parametrize("mode", ["tokenizer", "detokenizer"])
-def test_spawn_overrides_model_environment_without_mutating_parent(monkeypatch, mode):
-    """Intercept Popen: inherited accelerator settings must never reach a child."""
+def test_spawn_overrides_model_environment_without_mutating_parent(monkeypatch):
+    """Intercept Popen: inherited accelerator settings must never reach the tokenizer child."""
     inherited = {
         "JAX_PLATFORMS": "cuda",
         "JAX_PLATFORM_NAME": "gpu",
@@ -190,18 +131,18 @@ def test_spawn_overrides_model_environment_without_mutating_parent(monkeypatch, 
         assert env["JAX_PLATFORM_NAME"] == "cpu"
         assert env["ENABLE_DISTRIBUTED_INIT"] == "0"
         assert env["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
-        assert command[2] == mode
+        assert command[2] == "tokenizer"
         return object()
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     manager = WorkerManager("unused")
-    manager._spawn_worker(mode, "unused", detokenizer_max_states=8)
+    manager._spawn_worker("unused")
     assert {name: os.environ[name] for name in inherited} == inherited
 
 
-@pytest.mark.parametrize("mode", ["tokenizer", "detokenizer"])
-def test_script_worker_serves_with_inherited_distributed_initialization(tmp_path, mode):
-    """Run the real CLI/registry/ZMQ loop, guarding JAX imports before dispatch."""
+def test_script_worker_serves_with_inherited_distributed_initialization(tmp_path, monkeypatch):
+    """Run the real CLI/registry/ZMQ loop, guarding JAX imports before dispatch; batched tokenization through the
+    client keeps prompt order across its size-bounded requests."""
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
@@ -211,9 +152,6 @@ def test_script_worker_serves_with_inherited_distributed_initialization(tmp_path
         unk_token="[UNK]",
     )
     tokenizer.save_pretrained(tmp_path)
-    # A direct script launch has no parent manager to sanitize its environment.
-    # Guard every JAX import *before* allowing it, so even a failing regression
-    # cannot initialize a distributed runtime or an accelerator.
     bootstrap = """
 import importlib.abc
 import os
@@ -247,7 +185,7 @@ runpy.run_path(worker_path, run_name='__main__')
             "-c",
             bootstrap,
             str(Path(worker_main.__file__)),
-            mode,
+            "tokenizer",
             "--endpoint",
             endpoint,
             "--tokenizer-path",
@@ -261,22 +199,17 @@ runpy.run_path(worker_path, run_name='__main__')
         socket.connect(endpoint)
         process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            if mode == "tokenizer":
-                socket.send_pyobj({"cmd": "tokenize", "prompt": "hello"})
-                assert socket.recv_pyobj() == {"status": "ok", "tokens": [1]}
-            else:
-                socket.send_pyobj(
-                    {
-                        "cmd": "decode",
-                        "request_id": "r",
-                        "tokens": [1],
-                        "finished": True,
-                        "skip_special_tokens": True,
-                    }
-                )
-                reply = socket.recv_pyobj()
-                assert reply["status"] == "ok"
-                assert reply["result"]["accumulated_text"] == "hello"
+            socket.send_pyobj({"cmd": "tokenize", "prompt": "hello"})
+            assert socket.recv_pyobj() == {"status": "ok", "tokens": [1]}
+            from easydel.workers.esurge.pipeline import zmq_workers
+
+            # Two prompts per request: three prompts take two round trips and come back in prompt order.
+            monkeypatch.setattr(zmq_workers, "_BATCH_MAX_PROMPTS", 2)
+            client = zmq_workers.TokenizerWorkerClient(endpoint, request_timeout=45.0)
+            try:
+                assert client.tokenize_batch(["hello", "bye", "hello"]) == [[1], [0], [1]]
+            finally:
+                client.close()
             socket.send_pyobj({"cmd": "shutdown"})
             assert socket.recv_pyobj() == {"status": "ok"}
             stdout, stderr = process.communicate(timeout=15)

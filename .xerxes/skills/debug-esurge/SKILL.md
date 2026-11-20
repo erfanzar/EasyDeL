@@ -26,8 +26,10 @@ For runner/executor failures, open:
 - `libs/easydel/easydel/inference/esurge/runners/model_runner.py`
 - `libs/easydel/easydel/inference/esurge/runners/execution_manager.py`
 - `libs/easydel/easydel/inference/esurge/runners/executors/model_executor.py`
-- `libs/easydel/easydel/inference/esurge/scheduler/`
-- `libs/easydel/easydel/inference/esurge/core/`
+- `libs/easydel/easydel/inference/esurge/engine/core_driver.py` and `libs/surgecore/src/engine/` (the scheduler is
+  surgecore's Rust `EngineCore`)
+- `libs/easydel/easydel/inference/esurge/core/` and `libs/surgecore/src/kv/` (the page pool and prefix cache are
+  surgecore's `KvCore`; `core/manager.py` is its binding)
 
 ## Symptom Routes
 
@@ -104,5 +106,5 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/easydel/tests/inference/esurge/test_engine_api_authoritative.py
 ```
 
-Set `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy; it adds a device round trip and can
+Set `EASYDEL_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy; it adds a device round trip and can
 reduce throughput.

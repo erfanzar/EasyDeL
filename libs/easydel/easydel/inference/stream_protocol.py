@@ -747,6 +747,7 @@ def iter_chat_completion_stream_responses(
             tokens_per_second=tokens_per_second,
             processing_time=generation_time,
             first_token_time=last_output.first_token_time,
+            **UsageInfo.cache_fields(last_output),
         ),
     )
 

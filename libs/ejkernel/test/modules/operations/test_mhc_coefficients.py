@@ -78,6 +78,37 @@ def test_public_forward_and_nonuniform_gradients(platform, shape, hc, iters, eps
         np.testing.assert_allclose(value, want, rtol=2e-5, atol=3e-6)
 
 
+@pytest.mark.parametrize("tokens", [1, 7, 8, 16, 31, 32, 33, 64, 127])
+def test_pallas_short_inputs_equal_their_rows_of_a_long_input(tokens):
+    """Under 128 tokens the kernel runs one unpadded block; each token's coefficients stay bit-equal to its row of a
+    256-token call (padded blocks), since no token's result depends on another token."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("physical TPU required")
+    rng = np.random.default_rng(tokens)
+    logits = jnp.asarray(3 * rng.normal(size=(256, 24)), jnp.float32)
+    base = jnp.asarray(rng.normal(size=24), jnp.float32)
+    scale = jnp.array([0.7, 1.3, -0.4], jnp.float32)
+    fn = jax.jit(partial(mhc_coefficients, hc_mult=4, n_iters=20, eps=1e-6, platform="pallas"))
+
+    short = fn(logits[:tokens], base, scale)
+    long = fn(logits, base, scale)
+    for got, want in zip(short, long, strict=True):
+        assert got.shape == (tokens, *want.shape[1:]) and got.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want)[:tokens])
+
+    # Reverse mode through the custom VJP: the logit cotangent is per token too, so the short call's gradient equals
+    # the long call's rows when the long call's extra rows carry no cotangent.
+    weights = tuple(jnp.asarray(rng.normal(size=x.shape), jnp.float32) for x in long)
+
+    def loss(z, w):
+        return sum(jnp.sum(a * b) for a, b in zip(fn(z, base, scale), w, strict=True))
+
+    short_grad = jax.jit(jax.grad(loss))(logits[:tokens], tuple(w[:tokens] for w in weights))
+    long_grad = jax.jit(jax.grad(loss))(logits, tuple(w.at[tokens:].set(0) for w in weights))
+    assert np.isfinite(np.asarray(short_grad)).all()
+    np.testing.assert_array_equal(np.asarray(short_grad), np.asarray(long_grad)[:tokens])
+
+
 @pytest.mark.parametrize("setting,value", [("hc_mult", 0), ("n_iters", 0), ("eps", 0.0), ("eps", float("nan"))])
 def test_invalid_settings(setting, value):
     with pytest.raises(ValueError):

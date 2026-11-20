@@ -159,6 +159,23 @@ repos:
         types: [python]
         files: ^libs/eray/
         stages: [pre-commit]
+      - id: ruff-surgecore
+        name: ruff lint+fix (libs/surgecore)
+        description: Lints and auto-fixes libs/surgecore with its own ruff config
+        entry: ruff check --fix --config libs/surgecore/pyproject.toml
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/surgecore/
+        stages: [pre-commit]
+      - id: cargo-fmt-surgecore
+        name: cargo fmt --check (libs/surgecore)
+        description: Checks that the Rust sources of libs/surgecore are rustfmt-clean (needs cargo on PATH)
+        entry: cargo fmt --check --manifest-path libs/surgecore/Cargo.toml
+        language: system
+        files: ^libs/surgecore/.*\.rs$
+        pass_filenames: false
+        stages: [pre-commit]
       - id: uv-lock-easydel
         name: uv.lock fresh for libs/easydel
         description: Pushing changes to libs/easydel/pyproject.toml requires a refreshed workspace uv.lock
@@ -199,9 +216,17 @@ repos:
         files: ^libs/eray/pyproject\.toml$
         pass_filenames: false
         stages: [pre-push]
+      - id: uv-lock-surgecore
+        name: uv.lock fresh for libs/surgecore
+        description: Pushing changes to libs/surgecore/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/surgecore/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
       - id: subtree-mirror-sync
         name: Push libs/* updates to standalone mirrors
-        description: Pushes spectrax/ejkernel/eformer/eray subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
+        description: Pushes spectrax/ejkernel/eformer/eray/surgecore subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
         entry: scripts/subtree-sync.sh auto
         language: system
         pass_filenames: false

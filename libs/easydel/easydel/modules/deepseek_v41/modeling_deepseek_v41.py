@@ -109,6 +109,7 @@ from easydel.layers.indexer import (
     SharedKeyIndexer,
     SharedKeyIndexerConfig,
     indexer_distillation_loss,
+    resolve_index_scoring_kernel,
     select_candidate_blocks,
     selection_bias,
 )
@@ -313,7 +314,7 @@ class DeepseekV41Indexer(SharedKeyIndexer):
                 candidate_block_size=config.candidate_block_size,
                 rms_norm_eps=config.rms_norm_eps,
                 initializer_range=config.initializer_range,
-                scoring_kernel=config.index_scoring_kernel,
+                scoring_kernel=resolve_index_scoring_kernel(config.index_scoring_kernel),
             ),
             dtype=dtype,
             param_dtype=param_dtype,

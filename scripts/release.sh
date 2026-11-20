@@ -3,7 +3,7 @@
 # Keeps easydel's pins on the sibling libraries in sync and refreshes the lock.
 # Publishing to GitHub/PyPI is a separate, explicit step: scripts/publish.sh.
 #
-#   scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray> <new-version> [--dry-run]
+#   scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore> <new-version> [--dry-run]
 #
 # Examples:
 #   scripts/release.sh ejkernel 0.0.82          # bump + sync easydel pins + commit
@@ -15,8 +15,8 @@ lib="${1:?usage: release.sh <lib> <version> [--dry-run]}"
 version="${2:?usage: release.sh <lib> <version> [--dry-run]}"
 dry="${3:-}"
 
-declare -A DIST=([easydel]=easydel [spectrax]=spectrax-lib [ejkernel]=ejkernel [eformer]=eformer [eray]=eray)
-dist="${DIST[$lib]:?unknown lib: $lib (easydel|spectrax|ejkernel|eformer|eray)}"
+declare -A DIST=([easydel]=easydel [spectrax]=spectrax-lib [ejkernel]=ejkernel [eformer]=eformer [eray]=eray [surgecore]=surgecore)
+dist="${DIST[$lib]:?unknown lib: $lib (easydel|spectrax|ejkernel|eformer|eray|surgecore)}"
 pp="libs/$lib/pyproject.toml"
 [ -f "$pp" ] || { echo "missing $pp" >&2; exit 1; }
 
@@ -31,6 +31,9 @@ if [ "$dry" = "--dry-run" ]; then
     else
         echo "[dry-run] would refresh libs/easydel/README.md from root README.md"
     fi
+    if [ -f "libs/$lib/Cargo.toml" ]; then
+        echo "[dry-run] would bump [package] version in libs/$lib/Cargo.toml and the crate's entry in libs/$lib/Cargo.lock"
+    fi
     echo "[dry-run] would: uv lock && git commit"
     exit 0
 fi
@@ -39,6 +42,25 @@ fi
 
 # 1. bump the package version
 sed -i "0,/^version = \"$current\"/s//version = \"$version\"/" "$pp"
+
+# 1b. a Rust lib (one with libs/<lib>/Cargo.toml, e.g. surgecore) also carries its version in the crate's
+# [package] table and in the crate's own entry of its Cargo.lock: bump both with sed, so no cargo is needed.
+cargo_toml="libs/$lib/Cargo.toml"
+cargo_lock="libs/$lib/Cargo.lock"
+if [ -f "$cargo_toml" ]; then
+    crate=$(sed -n '/^\[package\]/,/^\[/ s/^name = "\(.*\)"$/\1/p' "$cargo_toml" | head -n1)
+    [ -n "$crate" ] || { echo "no [package] name in $cargo_toml" >&2; exit 1; }
+    sed -i "/^\[package\]/,/^\[/ s/^version = \".*\"\$/version = \"$version\"/" "$cargo_toml"
+    grep -qx "version = \"$version\"" "$cargo_toml" || { echo "failed to bump $cargo_toml" >&2; exit 1; }
+    if [ -f "$cargo_lock" ]; then
+        sed -i "/^name = \"$crate\"\$/{n;s/^version = \".*\"\$/version = \"$version\"/}" "$cargo_lock"
+        grep -A1 -x "name = \"$crate\"" "$cargo_lock" | grep -x "version = \"$version\"" >/dev/null \
+            || { echo "failed to bump $crate in $cargo_lock" >&2; exit 1; }
+        echo "bumped crate $crate to $version in $cargo_toml and $cargo_lock"
+    else
+        echo "bumped crate $crate to $version in $cargo_toml (no $cargo_lock)"
+    fi
+fi
 
 # 2. keep easydel's pins on the sibling libraries in lockstep with the release
 if [ "$lib" != "easydel" ]; then
@@ -56,6 +78,9 @@ fi
 # 3. refresh the workspace lock and record the release locally
 uv lock
 git add "$pp" libs/easydel/pyproject.toml libs/easydel/README.md uv.lock 2>/dev/null || true
+for f in "$cargo_toml" "$cargo_lock"; do
+    if [ -f "$f" ]; then git add "$f"; fi
+done
 git commit -m "release: $dist v$version"
 
 echo

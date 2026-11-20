@@ -82,24 +82,35 @@ class BaseThinkingReasoningParser(ReasoningParser):
         return text
 
     def _channel_snapshot(self, text: str, *, final: bool = False) -> tuple[str, str]:
-        """Return stable channel text, retaining whitespace and withholding incomplete delimiters."""
-        before, found, after = text.partition(self.start_token)
+        """Return stable channel text, retaining whitespace and withholding incomplete delimiters.
+
+        Reasoning opens only at the start of the generation (after leading whitespace), or in the prompt; it closes at
+        the first closing marker. Markers anywhere else are ordinary text: an answer that writes ``<think>...</think>``
+        keeps them verbatim in content, and reasoning that mentions the opener keeps it.
+        """
+        stripped = text.lstrip()
+        leading = text[: len(text) - len(stripped)]
         if self._is_prompt_reasoning_active():
-            reasoning_text, content = text, ""
-        elif found:
-            reasoning_text = after
-            content = before
+            content = ""
+            if stripped.startswith(self.start_token):
+                # The model may repeat the opener the prompt already emitted.
+                reasoning_text = stripped[len(self.start_token) :]
+            elif not final and stripped and self.start_token.startswith(stripped):
+                return "", ""
+            else:
+                reasoning_text = text
+        elif stripped.startswith(self.start_token):
+            content = leading
+            reasoning_text = stripped[len(self.start_token) :]
+        elif not final and stripped and self.start_token.startswith(stripped):
+            return "", leading  # may still become the opener
         else:
-            return "", text if final else self._without_marker_prefix(text, self.start_token)
+            return "", text
         reasoning, ended, after_end = reasoning_text.partition(self.end_token)
-        if self._is_prompt_reasoning_active():
-            reasoning = reasoning.replace(self.start_token, "")
         if ended:
             return reasoning, content + after_end
         if not final:
             reasoning = self._without_marker_prefix(reasoning, self.end_token)
-            if self._is_prompt_reasoning_active():
-                reasoning = self._without_marker_prefix(reasoning, self.start_token)
         return reasoning, content
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
@@ -111,7 +122,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
         """Return lossless terminal channel snapshots for streaming catch-up."""
         reasoning, content = self._channel_snapshot(model_output, final=True)
         openers = getattr(self, "reasoning_start_tokens", (self.start_token,))
-        recognized = self._is_prompt_reasoning_active() or any(marker in model_output for marker in openers)
+        recognized = self._is_prompt_reasoning_active() or any(
+            model_output.lstrip().startswith(marker) for marker in openers
+        )
         return reasoning if recognized or reasoning else None, content or None
 
     def extract_reasoning_streaming(

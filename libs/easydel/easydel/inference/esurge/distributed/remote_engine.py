@@ -17,8 +17,8 @@
 :class:`RemoteEngineHandle` speaks to a remote eSurge engine's request
 plane exactly like an in-group origin rank does — admissions forward as
 ``Admit`` messages, raw token deltas come back, and a private local
-rendering stack (request registry, tokenizer/detokenizer workers, output
-pipeline) turns them into ``RequestOutput`` objects — except it lives in a
+rendering stack (request registry, tokenizer worker, native detokenizer and
+output pipeline) turns them into ``RequestOutput`` objects — except it lives in a
 process that is *not* part of the engine's JAX world. It authenticates
 with the client role from the P0 handshake, bootstraps its admission
 limits from the ``HelloOk`` engine spec, and exposes the engine-adapter
@@ -65,8 +65,61 @@ if typing.TYPE_CHECKING:
 
 _POLL_MS = 50
 
+#: Inbound frames handled per IO round before outbound traffic and heartbeats get a turn again.
+_MAX_FRAMES_PER_ROUND = 256
+
 #: Client identities never coalesce; the rank field only labels logs/ids.
 _CLIENT_RANK = -1
+
+
+def resolve_handle_parsers(
+    *,
+    tokenizer: typing.Any,
+    tool_parser: str | None,
+    reasoning_parser: str | None,
+    model_type: str | None,
+) -> tuple[str | None, type | None, str | None, type | None]:
+    """Resolve the tool and reasoning parsers a remote handle runs, as the owner engine does.
+
+    Explicit names win; ``None`` auto-detects from ``model_type`` and the tokenizer when ``model_type`` is given (a
+    handle told nothing about the served model runs no parsers, as before). A tool parser that cannot be built
+    against this tokenizer, or an unknown name, disables that parser instead of failing the handle.
+
+    Returns:
+        ``(tool_parser_name, tool_parser_class, reasoning_parser_name, reasoning_parser_class)``.
+    """
+    from ..engine import bootstrap
+
+    if tool_parser is None and model_type is not None:
+        tool_parser = bootstrap.auto_detect_tool_parser(tokenizer=tokenizer, model_type=model_type)
+    if reasoning_parser is None and model_type is not None:
+        reasoning_parser = bootstrap.auto_detect_reasoning_parser_name(tokenizer=tokenizer, model_type=model_type)
+    tool_parser_class: type | None = None
+    reasoning_parser_class: type | None = None
+    if tool_parser:
+        from easydel.inference.tools import ToolParserManager
+        from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
+
+        try:
+            parser_class = ToolParserManager.get_tool_parser(tool_parser)
+        except KeyError:
+            logger.warning("Tool parser '%s' not found; the remote handle runs without one", tool_parser)
+            parser_class = None
+        if parser_class is not None and build_tool_parser_or_none(
+            parser_class, tokenizer, context=f"tool parser '{tool_parser}'"
+        ):
+            tool_parser_class = parser_class
+        else:
+            tool_parser = None
+    if reasoning_parser:
+        from easydel.inference.reasoning import ReasoningParserManager
+
+        try:
+            reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+        except KeyError:
+            logger.warning("Reasoning parser '%s' not found; the remote handle runs without one", reasoning_parser)
+            reasoning_parser = None
+    return tool_parser, tool_parser_class, reasoning_parser, reasoning_parser_class
 
 
 class _ClientChannel:
@@ -234,46 +287,53 @@ class _ClientChannel:
                 if now - last_beat_sent >= self._heartbeat_interval_s:
                     sock.send_multipart([wire.encode_message(wire.Heartbeat(rank=_CLIENT_RANK, ts=time.time()))])
                     last_beat_sent = now
-                if now - last_owner_beat > self._heartbeat_timeout_s:
-                    self._mark_dead(f"engine owner silent for more than {self._heartbeat_timeout_s}s")
-                    return
 
                 events = dict(poller.poll(_POLL_MS))
                 if wake_pull in events:
                     while wake_pull.poll(0):
                         wake_pull.recv()
-                if sock not in events:
-                    continue
-                frames = sock.recv_multipart()
-                try:
-                    message = wire.decode_message(frames[0])
-                except Exception:
-                    logger.warning("Remote engine handle: dropping undecodable frame")
-                    continue
-                if isinstance(message, wire.Heartbeat):
+                # Drain everything already queued before judging liveness: a busy process that reaches this loop late
+                # must not declare a healthy owner dead while its heartbeats sit unread in the socket.
+                received = 0
+                while sock.poll(0) and received < _MAX_FRAMES_PER_ROUND:
+                    frames = sock.recv_multipart()
+                    received += 1
                     last_owner_beat = time.monotonic()
-                    continue
-                if isinstance(message, wire.QueueStats):
-                    last_owner_beat = time.monotonic()
-                    self.queue_stats = message
-                    continue
-                if isinstance(message, wire.Shutdown):
-                    self._mark_dead(f"engine owner shut down ({message.reason})")
+                    if self._handle_inbound(frames):
+                        return
+                if not received and time.monotonic() - last_owner_beat > self._heartbeat_timeout_s:
+                    self._mark_dead(f"engine owner silent for more than {self._heartbeat_timeout_s}s")
                     return
-                last_owner_beat = time.monotonic()
-                handler = self._plane_handler
-                if handler is not None:
-                    payload = frames[1] if len(frames) > 1 else None
-                    try:
-                        handler(message, payload)
-                    except Exception:
-                        logger.exception("Remote engine handle: plane handler failed")
         finally:
             with self._wake_lock:
                 if self._wake_push is not None:
                     self._wake_push.close(linger=0)
                     self._wake_push = None
             wake_pull.close(linger=0)
+
+    def _handle_inbound(self, frames: list[bytes]) -> bool:
+        """Dispatch one inbound frame set; returns ``True`` when the link is over (owner shut down)."""
+        try:
+            message = wire.decode_message(frames[0])
+        except Exception:
+            logger.warning("Remote engine handle: dropping undecodable frame")
+            return False
+        if isinstance(message, wire.Heartbeat):
+            return False
+        if isinstance(message, wire.QueueStats):
+            self.queue_stats = message
+            return False
+        if isinstance(message, wire.Shutdown):
+            self._mark_dead(f"engine owner shut down ({message.reason})")
+            return True
+        handler = self._plane_handler
+        if handler is not None:
+            payload = frames[1] if len(frames) > 1 else None
+            try:
+                handler(message, payload)
+            except Exception:
+                logger.exception("Remote engine handle: plane handler failed")
+        return False
 
 
 class RemoteEngineHandle:
@@ -297,6 +357,10 @@ class RemoteEngineHandle:
         heartbeat_timeout_s: Owner silence tolerated before the handle dies.
         decode_interval_tokens: Streaming decode cadence (tokens).
         decode_interval_secs: Streaming decode cadence (seconds).
+        tool_parser: Tool parser name the handle runs on outputs; ``None``
+            auto-detects from ``model_type`` and the tokenizer.
+        reasoning_parser: Reasoning parser name; ``None`` auto-detects.
+        model_type: The served model's ``model_type`` (auto-detection hint).
     """
 
     def __init__(
@@ -312,6 +376,9 @@ class RemoteEngineHandle:
         heartbeat_timeout_s: float = 10.0,
         decode_interval_tokens: int = 4,
         decode_interval_secs: float = 0.05,
+        tool_parser: str | None = None,
+        reasoning_parser: str | None = None,
+        model_type: str | None = None,
     ) -> None:
         self._channel = _ClientChannel(
             leader_addr=leader_addr,
@@ -341,7 +408,6 @@ class RemoteEngineHandle:
             self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
                 detokenizer_max_states=max(64, int(spec.max_num_seqs) * 4),
                 tokenizer_endpoint=None,
-                detokenizer_endpoint=None,
             )
             from transformers import AutoTokenizer
 
@@ -378,6 +444,10 @@ class RemoteEngineHandle:
             on_fatal=self._on_pipeline_fatal,
         )
         self._output_pipeline.start()
+        # The handle renders outputs itself, so it runs the tool/reasoning parsers the owner engine would.
+        self.tool_parser, tool_parser_class, self.reasoning_parser_name, reasoning_parser_class = resolve_handle_parsers(
+            tokenizer=self.tokenizer, tool_parser=tool_parser, reasoning_parser=reasoning_parser, model_type=model_type
+        )
         self._admission = RequestAdmission(
             registry=self._registry,
             scheduler_submit=self._plane.submit_remote,
@@ -386,8 +456,8 @@ class RemoteEngineHandle:
             context_config=eSurgeContextConfig.coerce_config(None),
             reserve_tokens=int(spec.reserve_tokens),
             max_model_len=int(spec.max_model_len),
-            tool_parser_class=None,
-            reasoning_parser_class=None,
+            tool_parser_class=tool_parser_class,
+            reasoning_parser_class=reasoning_parser_class,
             sampling_params_callback=lambda: None,
             generation_config_dict=None,
             primary_eos_token_id=(int(spec.eos_token_ids[0]) if spec.eos_token_ids else None),
@@ -396,6 +466,9 @@ class RemoteEngineHandle:
             ignore_stop_strings_in_reasoning=False,
             on_activity=lambda: None,
             info=logger.debug,
+            # Tag requests with the served engine name: ``/metrics`` summarizes the collector per engine name, so
+            # untagged requests never show up in it.
+            model_name=spec.esurge_name,
         )
         self._fatal: tuple[BaseException, str] | None = None
 
@@ -486,8 +559,8 @@ class RemoteEngineHandle:
             sampling_params: Generation parameters (default ``max_tokens=128``).
             request_id: Optional explicit id(s).
             use_tqdm: Accepted for signature parity; ignored.
-            tool_parser_request: Accepted for signature parity; the handle
-                runs no tool parsers.
+            tool_parser_request: Request context (tools, tool_choice) for
+                the handle's tool parser.
 
         Returns:
             One finished ``RequestOutput`` per prompt.
@@ -496,7 +569,7 @@ class RemoteEngineHandle:
             RequestPlaneError: If the owner rejects an admission or dies
                 mid-generation.
         """
-        del use_tqdm, tool_parser_request
+        del use_tqdm
         self._raise_if_unusable()
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -516,23 +589,32 @@ class RemoteEngineHandle:
         base_params = sampling_params or SamplingParams(max_tokens=128)
         for prompt, rid in zip(prompts, request_ids, strict=True):
             params = self._admission.prepare_sampling_params_for_request(base_params, request_id=rid, prompt=prompt)
-            self._admission.add_request(rid, prompt, params)
+            extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
+            self._admission.add_request(rid, prompt, params, **extra)
 
         outputs: dict[str, RequestOutput] = {}
-        while len(outputs) < len(request_ids):
-            self._registry.wait_any(timeout=0.5)
-            self._raise_if_unusable()
-            with self._registry.output_lock:
-                for rid in request_ids:
-                    if rid in outputs:
-                        continue
-                    output = self._registry.outputs.get(rid)
-                    if output is not None and output.finished:
-                        outputs[rid] = output
-        with self._registry.request_lock:
+        try:
+            for rid in request_ids:
+                # Wait on this request's own event: a shared wakeup would rouse every waiting caller on every
+                # token update of any request, which at hundreds in flight costs the front a core by itself.
+                while True:
+                    with self._registry.output_lock:
+                        output = self._registry.outputs.get(rid)
+                        if output is not None and output.finished:
+                            outputs[rid] = output
+                            break
+                    self._raise_if_unusable()
+                    self._registry.wait_request(rid, timeout=0.5)
+        finally:
+            self._forget(request_ids)
+        return [outputs[rid] for rid in request_ids]
+
+    def _forget(self, request_ids: typing.Iterable[str]) -> None:
+        """Drop a caller's finished (or abandoned) requests from the handle: nothing else ever reads them again."""
+        with self._registry.request_lock, self._registry.output_lock:
             for rid in request_ids:
                 self._registry.events.pop(rid, None)
-        return [outputs[rid] for rid in request_ids]
+                self._registry.outputs.pop(rid, None)
 
     def stream(
         self,
@@ -547,7 +629,8 @@ class RemoteEngineHandle:
             prompts: One prompt (or single-element list).
             sampling_params: Generation parameters (default ``max_tokens=128``).
             request_id: Optional explicit id.
-            tool_parser_request: Accepted for signature parity; ignored.
+            tool_parser_request: Request context (tools, tool_choice) for
+                the handle's tool parser.
 
         Yields:
             ``RequestOutput`` snapshots as the origin-side pipeline renders
@@ -557,17 +640,19 @@ class RemoteEngineHandle:
 
         from ..esurge_engine import CompletionOutput, RequestOutput
 
-        del tool_parser_request
         self._raise_if_unusable()
         prompt = prompts[0] if isinstance(prompts, list) else prompts
         rid = request_id or self._admission.generate_request_id()
         params = self._admission.prepare_sampling_params_for_request(
             sampling_params or SamplingParams(max_tokens=128), request_id=rid, prompt=prompt
         )
-        self._admission.add_request(rid, prompt, params)
+        extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
+        self._admission.add_request(rid, prompt, params, **extra)
 
         last_update_seq = -1
         last_accumulated_text = ""
+        last_raw_accumulated_text = ""
+        last_accumulated_reasoning = ""
         try:
             while True:
                 self._registry.wait_request(rid, timeout=0.5)
@@ -577,13 +662,23 @@ class RemoteEngineHandle:
                     output = self._registry.outputs.get(rid)
                     if output is not None and output.update_seq != last_update_seq:
                         last_update_seq = output.update_seq
-                        # Snapshot-diff the delta against the last *yielded*
-                        # text: pipeline updates between wakeups must not
-                        # drop stream chunks.
+                        # Snapshot-diff every delta against the last *yielded*
+                        # snapshot: pipeline updates between wakeups must not
+                        # drop stream chunks (text, raw text or reasoning).
                         snapshot_delta = compute_stream_delta_text(
                             output.accumulated_text, last_accumulated_text, output.delta_text
                         )
+                        snapshot_raw_delta = compute_stream_delta_text(
+                            output.raw_accumulated_text, last_raw_accumulated_text, output.raw_delta_text or ""
+                        )
+                        snapshot_reasoning_delta = compute_stream_delta_text(
+                            output.reasoning_content or "",
+                            last_accumulated_reasoning,
+                            output.delta_reasoning_content or "",
+                        )
                         last_accumulated_text = output.accumulated_text
+                        last_raw_accumulated_text = output.raw_accumulated_text
+                        last_accumulated_reasoning = output.reasoning_content or ""
                         snapshot = RequestOutput(
                             request_id=output.request_id,
                             prompt=output.prompt,
@@ -596,6 +691,8 @@ class RemoteEngineHandle:
                                     logprobs=copy.deepcopy(completion.logprobs),
                                     cumulative_logprob=completion.cumulative_logprob,
                                     finish_reason=completion.finish_reason,
+                                    tool_calls=completion.tool_calls,
+                                    reasoning_content=completion.reasoning_content,
                                     raw_text=completion.raw_text,
                                 )
                                 for completion in output.outputs
@@ -604,6 +701,7 @@ class RemoteEngineHandle:
                             accumulated_text=output.accumulated_text,
                             delta_text=snapshot_delta,
                             raw_accumulated_text=output.raw_accumulated_text,
+                            raw_delta_text=snapshot_raw_delta,
                             tokens_per_second=output.tokens_per_second,
                             num_generated_tokens=output.num_generated_tokens,
                             time_spent_generating=output.time_spent_generating,
@@ -611,9 +709,20 @@ class RemoteEngineHandle:
                             processing_time=output.processing_time,
                             update_seq=output.update_seq,
                             delta_seq=output.delta_seq,
+                            tool_calls=output.tool_calls,
+                            delta_tool_calls=output.delta_tool_calls,
+                            reasoning_content=output.reasoning_content,
+                            delta_reasoning_content=snapshot_reasoning_delta or None,
                         )
                 if snapshot is not None:
-                    if not snapshot.finished and snapshot.num_generated_tokens == 0 and not snapshot.delta_text:
+                    if (
+                        not snapshot.finished
+                        and snapshot.num_generated_tokens == 0
+                        and not snapshot.delta_text
+                        and not snapshot.raw_delta_text
+                        and not snapshot.delta_reasoning_content
+                        and not snapshot.delta_tool_calls
+                    ):
                         continue
                     yield snapshot
                     if snapshot.finished:
@@ -624,8 +733,7 @@ class RemoteEngineHandle:
                 unfinished = output is not None and not output.finished
             if unfinished:
                 self.abort_request(rid)
-            with self._registry.request_lock:
-                self._registry.events.pop(rid, None)
+            self._forget([rid])
 
     def chat(
         self,
@@ -650,7 +758,7 @@ class RemoteEngineHandle:
             tools: Tool definitions rendered into the template; when
                 present, special tokens are preserved so the model can emit
                 tool calls.
-            tool_choice: Accepted for signature parity.
+            tool_choice: Passed to the tool parser with ``tools``.
             sampling_params: Generation parameters (default ``max_tokens=128``).
             request_id: Optional explicit id.
             stream: Yield incremental snapshots instead of blocking.
@@ -661,9 +769,9 @@ class RemoteEngineHandle:
             A finished ``RequestOutput`` (``stream=False``) or an iterator
             of incremental snapshots (``stream=True``).
         """
-        del tool_choice
         from ..engine.admission import clone_sampling_params
         from ..engine.chat_templating import format_chat_prompt
+        from ..esurge_engine import eSurge
 
         params = clone_sampling_params(sampling_params or SamplingParams(max_tokens=128))
         if tools:
@@ -679,9 +787,11 @@ class RemoteEngineHandle:
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
+        # The tool parser reads the request's tools and tool_choice, exactly as on the owner engine's chat path.
+        tool_request = eSurge._build_tool_parser_request(prompt=prompt, tools=tools, tool_choice=tool_choice)
         if stream:
-            return self.stream(prompt, sampling_params=params, request_id=request_id)
-        return self.generate(prompt, sampling_params=params, request_id=request_id)[0]
+            return self.stream(prompt, sampling_params=params, request_id=request_id, tool_parser_request=tool_request)
+        return self.generate(prompt, sampling_params=params, request_id=request_id, tool_parser_request=tool_request)[0]
 
     def iter_chat_completion_stream(
         self,

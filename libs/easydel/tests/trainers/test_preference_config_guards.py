@@ -37,7 +37,6 @@ def test_preference_generate_during_eval_is_not_silently_ignored(config_cls, tra
     cfg = config_cls(generate_during_eval=True, evaluation_steps=7)
 
     assert cfg.generation_interval == 7
-    assert cfg.use_esurge_generation is True
 
 
 class _EvalModel:

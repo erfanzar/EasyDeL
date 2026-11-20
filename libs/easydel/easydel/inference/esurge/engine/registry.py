@@ -51,10 +51,14 @@ class RequestRecord:
         decodable_tokens: Incrementally-filtered tokens for detokenization.
         reported_generated_count: Last generated-count reported to metrics.
         last_decoded_index: Index into decodable tokens of the last decode.
+        detokenizer_token_count: Tokens already submitted to native detokenization.
+        detokenized_text: Raw text reconstructed from bounded native deltas.
         start_time: ``perf_counter`` timestamp at admission.
         first_token_time: Seconds from admission to the first token, once known.
         last_decode_time: ``perf_counter`` timestamp of the last decode flush.
         decoder_visible_text: Client-visible accumulated text (stop-trimmed).
+        stop_scan_chars: Length of the text already searched for stop strings without a match.
+        stop_scan_tail: That text's last (longest stop - 1) characters, to detect a rewritten text.
         truncated: Whether the prompt was truncated at admission.
         tokens_dropped: Number of prompt tokens dropped by truncation.
         requested_new_tokens_original: ``max_tokens`` as requested.
@@ -75,10 +79,14 @@ class RequestRecord:
     decodable_tokens: list[int] = field(default_factory=list)
     reported_generated_count: int = 0
     last_decoded_index: int = 0
+    detokenizer_token_count: int = 0
+    detokenized_text: str = ""
     start_time: float = 0.0
     first_token_time: float | None = None
     last_decode_time: float = 0.0
     decoder_visible_text: str = ""
+    stop_scan_chars: int = 0
+    stop_scan_tail: str = ""
     truncated: bool = False
     tokens_dropped: int = 0
     requested_new_tokens_original: int | None = None

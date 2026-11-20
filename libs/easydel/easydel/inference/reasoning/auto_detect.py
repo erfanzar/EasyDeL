@@ -74,6 +74,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, ReasoningParserName] = {
     "phimoe": "deepseek_r1",
     "phi3": "deepseek_r1",
     "phi": "deepseek_r1",
+    "glm5_next": "glm45",
     "glm_moe_dsa": "glm45",
     "glm4_moe_lite": "glm45",
     "glm4_moe": "glm45",
@@ -266,13 +267,18 @@ def make_reasoning_stripper(
             openers = getattr(parser, "reasoning_start_tokens", (start,))
             if isinstance(openers, str):
                 openers = (openers,)
-            # Strip repeated reasoning blocks, not just the first.
-            while result and any(marker and marker in result for marker in openers):
-                _, following = parser.extract_reasoning(result)
-                following = following or ""
-                if following == result:
+            # Strip repeated reasoning blocks, not just the first. The parser treats only a leading opener as
+            # reasoning (a live generation's later markers are content), so hand it each block from its opener on.
+            while result:
+                positions = [result.find(marker) for marker in openers if marker and marker in result]
+                if not positions:
                     break
-                result = following
+                at = min(positions)
+                _, following = parser.extract_reasoning(result[at:])
+                stripped = result[:at] + (following or "")
+                if stripped == result:
+                    break
+                result = stripped
             return result.strip()
 
         return strip_registered_reasoning

@@ -66,7 +66,6 @@ def test_rollout_matches_prompt_ids():
             "max_completion_length": 512,
             "max_length": 1024,
             "num_return_sequences": 8,
-            "use_esurge_generation": True,
             "generation_max_new_tokens": 16,
             "generation_top_p": 0.9,
             "generation_temperature": 0.7,
@@ -86,7 +85,6 @@ def test_rollout_matches_prompt_ids():
         input_ids=input_ids,
         attention_mask=attention_mask,
         state=trainer.model_state,
-        use_esurge=args.use_esurge_generation,  # exercise eSurge path by default
         shard_inputs=False,
     )
 

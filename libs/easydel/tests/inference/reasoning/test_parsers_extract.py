@@ -525,6 +525,14 @@ def test_detect_reasoning_parser_maps_gemma4_text_to_gemma4():
     assert detect_reasoning_parser(model_type="gemma4_text") == "gemma4"
 
 
+@pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
+def test_glm5_next_detects_glm47_tools_and_glm45_reasoning(model_type):
+    from easydel.inference.tools.auto_detect import detect_tool_parser
+
+    assert detect_tool_parser(model_type=model_type) == "glm47"
+    assert detect_reasoning_parser(model_type=model_type) == "glm45"
+
+
 def test_gemma4_is_reexported_from_reasoning_package():
     assert PublicGemma4ReasoningParser is Gemma4ReasoningParser
 

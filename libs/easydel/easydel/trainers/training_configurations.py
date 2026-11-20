@@ -183,11 +183,19 @@ def _parse_partition_spec(value: tp.Any) -> PartitionSpec:
     return PartitionSpec(_normalize_partition_spec_entry(parsed))
 
 
+_REMOVED_TRAINING_ARGS: dict[str, str] = {
+    "use_esurge_generation": "trainers always generate through eSurge",
+}
+"""Fields that saved configs may still carry, with why each was removed; loading drops them."""
+
+
 def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp.Any]:
     """Rewrite deprecated field names in a config dict to their current equivalents.
 
     Translates ``quantization_block`` to ``quantization_group_size`` when the
-    new name is not already present, then removes the deprecated key.
+    new name is not already present, then removes the deprecated key. Keys of
+    removed fields (:data:`_REMOVED_TRAINING_ARGS`) are dropped with one
+    warning each.
 
     Args:
         data: A configuration dictionary, typically from deserialized JSON.
@@ -201,6 +209,10 @@ def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp
             data["quantization_group_size"] = data["quantization_block"]
         # Drop deprecated alias for constructor calls built from serialized configs.
         data.pop("quantization_block", None)
+    for key, reason in _REMOVED_TRAINING_ARGS.items():
+        if key in data:
+            value = data.pop(key)
+            logger.warning(f"Ignoring removed training argument `{key}={value!r}` from a saved config: {reason}.")
     return data
 
 
@@ -876,10 +888,6 @@ class TrainingArguments:
     benchmarks: list[BenchmarkConfig] | BenchmarkConfig | None = field(
         default_factory=list,
         metadata={"help": "Benchmark suite definitions executed during training when benchmark_interval is set."},
-    )
-    use_esurge_generation: bool = field(
-        default=True,
-        metadata={"help": "Whether to use eSurge engine for preview generation instead of compiled functions."},
     )
     esurge_use_tqdm: bool = field(
         default=True,

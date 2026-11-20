@@ -15,7 +15,7 @@
 """Parity tests for the serving packed-row KDA scan.
 
 ``_chunked_scan_per_channel_rows`` is the row-layout reference for GLM-5.3's
-KDA layers (eSurge serving now goes through ``_packed_segment_kda_per_channel``):
+KDA layers (eSurge serving goes through the flat ``ragged_kda`` path):
 it processes a packed multi-row batch chunk-by-chunk under
 ``lax.scan`` with per-row validity masks. These tests pin it against the
 sequential recurrent reference (the ground truth) for ragged rows — including

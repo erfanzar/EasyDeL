@@ -158,6 +158,7 @@ from easydel.layers.indexer import (
     CompressedIndexerConfig,
     indexer_distillation_loss,
     is_vacuous_selection,
+    resolve_index_scoring_kernel,
     selection_bias,
 )
 from easydel.layers.moe import moe_group_topk_select, normalize_topk_weights
@@ -551,7 +552,7 @@ def _compressed_indexer_config(config: DeepseekV4Config) -> CompressedIndexerCon
         compress_rate=config.compress_rates["compressed_sparse_attention"],
         rms_norm_eps=config.rms_norm_eps,
         initializer_range=config.initializer_range,
-        scoring_kernel=config.index_scoring_kernel,
+        scoring_kernel=resolve_index_scoring_kernel(config.index_scoring_kernel),
     )
 
 

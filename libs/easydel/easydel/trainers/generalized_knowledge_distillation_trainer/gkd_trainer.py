@@ -41,10 +41,8 @@ import typing as tp
 
 import jax
 import numpy as np
-from eformer import common_types
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from transformers import GenerationConfig
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -148,7 +146,6 @@ class GKDTrainer(SFTTrainer):
         self.seq_kd = bool(arguments.seq_kd)
         self._on_policy_rng = random.Random(getattr(arguments, "seed", None))
         self._warned_missing_prompt = False
-        self.gkd_generate_function = None
 
         teacher_model = self._resolve_teacher_model(
             teacher_model=teacher_model,
@@ -192,59 +189,23 @@ class GKDTrainer(SFTTrainer):
         if self.pad_token_id is None:
             raise ValueError("GKDTrainer requires a tokenizer with a defined `pad_token_id`.")
 
-        self.generation_config = GenerationConfig(
-            max_new_tokens=self.arguments.max_new_tokens,
-            temperature=self.arguments.temperature,
-            do_sample=True,
-            top_k=0,
-            pad_token_id=self.pad_token_id,
-        )
-        shard_inputs = getattr(self.arguments, "generation_shard_inputs", True)
-        try:
-            self.gkd_generate_function = self.create_generate_function(
-                generation_config=self.generation_config,
-                shard_inputs=shard_inputs,
-            )
-        except Exception as exc:  # pragma: no cover - generation is optional
-            self.gkd_generate_function = None
-            logger.warning("Failed to initialize GKD generation function, on-policy sampling disabled: %s", exc)
-        self.gkd_teacher_generate_function = (
-            self._create_teacher_generate_function(shard_inputs=shard_inputs) if self.seq_kd else None
-        )
+    def _generation_overrides(self) -> dict[str, tp.Any]:
+        """Sampling of GKD rollouts: ``temperature``, at most ``max_new_tokens``, no top-k/top-p, no penalties.
 
-    def _create_teacher_generate_function(self, *, shard_inputs: bool):
-        """Compile sequence-KD generation against the optimizer-free teacher.
-
-        Teacher architecture and optimizer metadata need not match the student,
-        so the student's compiled generation callable cannot accept this state.
+        Every key is set explicitly so the trainer-wide ``generation_*`` fallbacks (top-p 0.95, top-k 64) do
+        not apply.
         """
-        config = self._prepare_generation_config(self.generation_config)
-        mesh = self.teacher_state.model.mesh
-        empty_sharding = replicated_named_sharding(mesh)
-
-        def generate(state, input_ids, attention_mask):
-            module = state.model
-            with module.mesh:
-                if shard_inputs:
-                    resolver = getattr(module.config, "runtime_sharding_resolver", None)
-                    if resolver is not None:
-                        axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
-                        input_ids = resolver.shard(input_ids, axes=axes, mode=common_types.MODE_PREFILL)
-                        attention_mask = resolver.shard(attention_mask, axes=axes, mode=common_types.MODE_PREFILL)
-                outputs = module.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    generation_config=config,
-                )
-                sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs
-                return sequences, input_ids, attention_mask
-
-        return compile_trainer_step(
-            generate,
-            mesh=mesh,
-            in_shardings=(self.teacher_state.shardings, empty_sharding, empty_sharding),
-            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
-        )
+        return {
+            "max_new_tokens": int(self.arguments.max_new_tokens),
+            "temperature": float(self.arguments.temperature),
+            "do_sample": True,
+            "top_k": 0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "num_return_sequences": 1,
+        }
 
     @staticmethod
     def _resolve_teacher_model(
@@ -413,7 +374,7 @@ class GKDTrainer(SFTTrainer):
                 batch_copy = generated
                 info.update(meta)
 
-        if self.gkd_generate_function is not None and self._should_use_student_sampling():
+        if self._should_use_student_sampling():
             generated, meta = self._apply_generation(state, batch_copy, source="student")
             if generated is not None:
                 batch_copy = generated
@@ -440,6 +401,8 @@ class GKDTrainer(SFTTrainer):
     ) -> tuple[dict[str, jax.Array] | None, dict[str, float]]:
         """Generate completions using the specified model.
 
+        The prompt rows go to eSurge as token ids through :meth:`rollout`, on ``generator_state``'s engine.
+
         Args:
             generator_state: Model state to use for generation.
             batch: Input batch containing prompts.
@@ -461,9 +424,15 @@ class GKDTrainer(SFTTrainer):
         prompt_ids, prompt_mask, prompt_lengths = prompts
         prompt_seq_len = int(prompt_ids.shape[1])
 
-        generate = self.gkd_teacher_generate_function if source == "teacher" else self.gkd_generate_function
         try:
-            sequences, _, _ = jax.block_until_ready(generate(generator_state, prompt_ids, prompt_mask))
+            results = self.rollout(
+                input_ids=prompt_ids,
+                attention_mask=prompt_mask,
+                state=generator_state,
+                apply_chat_template=False,
+                config_overrides=self._generation_overrides(),
+            )
+            sequences = jax.block_until_ready(results.sequences)
         except Exception as exc:  # pragma: no cover - generation failures are rare
             if source == "teacher":
                 raise RuntimeError("Sequence-KD teacher generation failed.") from exc

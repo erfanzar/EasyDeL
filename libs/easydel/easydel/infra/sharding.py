@@ -1068,6 +1068,72 @@ def inference_mode_forces_decode() -> bool:
 _inference_mode_forces_decode = inference_mode_forces_decode
 
 
+_single_token_rows_var: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "easydel_single_token_rows", default=False
+)
+
+
+@dataclasses.dataclass(slots=True)
+class SingleTokenRowsQueries:
+    """Whether code traced inside :func:`record_single_token_rows_queries` read the single-token promise."""
+
+    asked: bool = False
+
+
+_single_token_rows_queries_var: "contextvars.ContextVar[SingleTokenRowsQueries | None]" = contextvars.ContextVar(
+    "easydel_single_token_rows_queries", default=None
+)
+
+
+@contextmanager
+def single_token_rows(enabled: bool = True) -> tp.Iterator[bool]:
+    """Scope promising that every request row of the traced step schedules at most one token.
+
+    eSurge traces the program it runs only on pure-decode windows inside this scope (every row the batch builder packs
+    holds at most one token; ``ExecutionManager._is_decode_only_window``). A layer that otherwise chooses its decode
+    path at run time (a ``lax.cond`` on the row lengths) can take it statically there, without the conditional and the
+    copies of the state it carries. Outside the scope :func:`inference_mode_single_token_rows` is ``False``.
+
+    Args:
+        enabled: Whether the promise holds inside the block.
+
+    Yields:
+        The ``enabled`` value.
+    """
+    token = _single_token_rows_var.set(bool(enabled))
+    try:
+        yield bool(enabled)
+    finally:
+        _single_token_rows_var.reset(token)
+
+
+def inference_mode_single_token_rows() -> bool:
+    """Whether an enclosing :func:`single_token_rows` scope promises at most one token per row.
+
+    Ask only where the answer changes the traced program: an enclosing :func:`record_single_token_rows_queries` notes
+    the question, and eSurge compiles a single-token program only for bucket pairs whose trace asked it.
+    """
+    queries = _single_token_rows_queries_var.get()
+    if queries is not None:
+        queries.asked = True
+    return _single_token_rows_var.get()
+
+
+@contextmanager
+def record_single_token_rows_queries() -> tp.Iterator[SingleTokenRowsQueries]:
+    """Scope recording whether code traced inside it asked :func:`inference_mode_single_token_rows`.
+
+    Yields:
+        A :class:`SingleTokenRowsQueries` whose ``asked`` turns ``True`` once code inside the block asks.
+    """
+    queries = SingleTokenRowsQueries()
+    token = _single_token_rows_queries_var.set(queries)
+    try:
+        yield queries
+    finally:
+        _single_token_rows_queries_var.reset(token)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class AxisPolicy:
     """Immutable wrapper around a :class:`PartitionAxis` that exposes EasyDeL's logical axis vocabulary.
@@ -2088,6 +2154,7 @@ __all__ = [
     "OptionalMesh",
     "PipelineStageRankResolver",
     "RuntimeShardingResolver",
+    "SingleTokenRowsQueries",
     "StageMesh",
     "StageRankResolver",
     "TensorLayout",
@@ -2098,6 +2165,7 @@ __all__ = [
     "decode_mode_specs",
     "final_stage_replicated_sharding",
     "inference_mode_forces_decode",
+    "inference_mode_single_token_rows",
     "is_mpmd_mesh",
     "is_valid_mesh",
     "logical_axis_rules",
@@ -2109,6 +2177,7 @@ __all__ = [
     "partition_spec_for_mesh",
     "pick_array_mesh",
     "pick_mesh",
+    "record_single_token_rows_queries",
     "replicate_on_array_mesh",
     "replicated_named_sharding",
     "resolve_array_mesh",
@@ -2119,5 +2188,6 @@ __all__ = [
     "sanitize_partition_specs_for_shape_tree",
     "sanitize_sharding_axes_for_shape",
     "sharding_for_layout",
+    "single_token_rows",
     "specs_to_named_sharding",
 ]

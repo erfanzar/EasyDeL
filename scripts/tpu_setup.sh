@@ -781,6 +781,22 @@ install_workspace_on_tpu() {
       echo \"[\${host}] missing \${src_dir}/pyproject.toml\"
       exit 1
     }
+    # libs/surgecore is a Rust (PyO3) extension that uv sync builds from source through maturin, so every host needs
+    # cargo: hosts without it get a minimal stable toolchain from rustup (non-interactive, bounded by timeouts).
+    export PATH=\"\${HOME}/.cargo/bin:\${PATH}\"
+    if ! command -v cargo >/dev/null 2>&1; then
+      echo \"[\${host}] cargo not found; installing a minimal stable Rust toolchain with rustup...\"
+      rustup_init=\$(mktemp /tmp/easydel-rustup-init.XXXXXX)
+      curl --proto '=https' --tlsv1.2 -fsSL --max-time 120 https://sh.rustup.rs -o \"\${rustup_init}\"
+      if ! timeout 900 sh \"\${rustup_init}\" -y --profile minimal --default-toolchain stable --no-modify-path >/tmp/easydel-rustup.log 2>&1; then
+        echo \"[\${host}] rustup install failed; log tail follows\"
+        tail -n 40 /tmp/easydel-rustup.log || true
+        rm -f \"\${rustup_init}\"
+        exit 1
+      fi
+      rm -f \"\${rustup_init}\"
+    fi
+    echo \"[\${host}] \$(cargo --version)\"
     echo \"[\${host}] syncing full EasyDeL foundation workspace...\"
     cd \"\${src_dir}\"
     VIRTUAL_ENV=${REMOTE_VENV_PATH} PATH=${REMOTE_VENV_PATH}/bin:\$PATH \"\${remote_python}\" - <<'PY'
@@ -875,6 +891,7 @@ packages = [
     ('ejkernel', 'ejkernel'),
     ('spectrax-lib', 'spectrax'),
     ('eray', 'eray'),
+    ('surgecore', 'surgecore'),
 ]
 versions = []
 for dist_name, module_name in packages:

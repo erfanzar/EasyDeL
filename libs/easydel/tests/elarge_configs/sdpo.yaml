@@ -51,7 +51,6 @@ trainer:
   num_return_sequences: 1
   num_generations: 1
   generation_num_return_sequences: 1
-  use_esurge_generation: false
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1

@@ -37,7 +37,13 @@ from ._conv_state import (
     shift_conv_state_left,
 )
 from ._depthwise_conv import ChannelMajorConv1D
-from ._kda import KDALayerSpec, KernelDeltaAttention, kda_layer_spec, unnest_legacy_kda_forget_gate
+from ._kda import (
+    KDALayerSpec,
+    KernelDeltaAttention,
+    kda_layer_spec,
+    resolve_kda_chunk_impl,
+    unnest_legacy_kda_forget_gate,
+)
 from ._masking import apply_mask_to_padding_states
 
 __all__ = (
@@ -48,6 +54,7 @@ __all__ = (
     "apply_manual_depthwise_conv",
     "apply_mask_to_padding_states",
     "kda_layer_spec",
+    "resolve_kda_chunk_impl",
     "shift_conv_state_left",
     "unnest_legacy_kda_forget_gate",
 )

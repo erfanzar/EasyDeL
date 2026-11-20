@@ -170,10 +170,13 @@ if not all(device.platform == "tpu" for device in jax.devices()):
 
 import easydel as ed  # noqa: E402
 from easydel.inference.esurge.benchmarking import zero_schedule_needs_update  # noqa: E402
-from easydel.inference.esurge.request import EngineRequest  # noqa: E402
 from easydel.inference.esurge.runners import eSurgeRunner  # noqa: E402
-from easydel.inference.esurge.scheduler import Scheduler  # noqa: E402
 from easydel.inference.sampling_params import SamplingParams  # noqa: E402
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python bench_specdecode.py`
+    from _common import make_core_for_runner, served_request
 
 
 def assert_tpu_backend() -> None:
@@ -331,18 +334,18 @@ def generate_once(
     top_p: float,
     max_new_tokens=MAX_NEW,
 ):
-    """Drive scheduler+runner for one request; return (tokens, wallclock_s)."""
+    """Drive engine core + runner for one request; return (tokens, wallclock_s)."""
     assert_tpu_backend()
     reset_runner_for_request(runner)
     async_scheduling = bool(getattr(runner, "async_scheduling", False))
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner,
         max_num_batched_tokens=MAX_BATCHED,
         enable_prefix_caching=False,
         async_scheduling=async_scheduling,
         num_draft_tokens=runner.num_draft_tokens,
     )
-    request = EngineRequest(
+    request = served_request(
         request_id=f"bench-{run_id}",
         prompt_token_ids=list(PROMPT),
         sampling_params=make_sampling_params(
@@ -357,7 +360,7 @@ def generate_once(
     def _drain_async(pending) -> None:
         future, pending_scheduler_output = pending
         model_output = runner.wait_for_execution(future)
-        scheduler.update_from_output(pending_scheduler_output, model_output)
+        scheduler.commit(pending_scheduler_output, model_output)
 
     def _execute_positive(scheduler_output):
         if (
@@ -369,18 +372,18 @@ def generate_once(
                 return runner.execute_model_async(scheduler_output), scheduler_output
         with jax.profiler.TraceAnnotation("easydel.execute_model"):
             output = runner.execute_model(scheduler_output)
-        scheduler.update_from_output(scheduler_output, output)
+        scheduler.commit(scheduler_output, output)
         return None
 
     t0 = time.time()
     if not async_scheduling:
         for _ in range(max_new_tokens + 8):
-            with jax.profiler.TraceAnnotation("easydel.scheduler.schedule"):
+            with jax.profiler.TraceAnnotation("easydel.core.schedule"):
                 scheduler_output = scheduler.schedule()
             with jax.profiler.TraceAnnotation("easydel.execute_model"):
                 output = runner.execute_model(scheduler_output)
-            with jax.profiler.TraceAnnotation("easydel.scheduler.update_from_output"):
-                scheduler.update_from_output(scheduler_output, output)
+            with jax.profiler.TraceAnnotation("easydel.core.commit"):
+                scheduler.commit(scheduler_output, output)
             if request.is_finished():
                 break
     else:
@@ -389,7 +392,7 @@ def generate_once(
             if pending is not None:
                 future, prev_scheduler_output = pending
                 if runner.can_dispatch_next_before_async_drain(prev_scheduler_output):
-                    with jax.profiler.TraceAnnotation("easydel.scheduler.schedule"):
+                    with jax.profiler.TraceAnnotation("easydel.core.schedule"):
                         scheduler_output = scheduler.schedule()
                     if scheduler_output.total_num_scheduled_tokens > 0:
                         next_pending = None
@@ -408,8 +411,8 @@ def generate_once(
                     if zero_schedule_needs_update(scheduler_output):
                         with jax.profiler.TraceAnnotation("easydel.execute_model"):
                             output = runner.execute_model(scheduler_output)
-                        with jax.profiler.TraceAnnotation("easydel.scheduler.update_from_output"):
-                            scheduler.update_from_output(scheduler_output, output)
+                        with jax.profiler.TraceAnnotation("easydel.core.commit"):
+                            scheduler.commit(scheduler_output, output)
                     if request.is_finished():
                         break
                     continue
@@ -419,14 +422,14 @@ def generate_once(
                 if request.is_finished():
                     break
 
-            with jax.profiler.TraceAnnotation("easydel.scheduler.schedule"):
+            with jax.profiler.TraceAnnotation("easydel.core.schedule"):
                 scheduler_output = scheduler.schedule()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 if zero_schedule_needs_update(scheduler_output):
                     with jax.profiler.TraceAnnotation("easydel.execute_model"):
                         output = runner.execute_model(scheduler_output)
-                    with jax.profiler.TraceAnnotation("easydel.scheduler.update_from_output"):
-                        scheduler.update_from_output(scheduler_output, output)
+                    with jax.profiler.TraceAnnotation("easydel.core.commit"):
+                        scheduler.commit(scheduler_output, output)
                 if request.is_finished():
                     break
                 continue

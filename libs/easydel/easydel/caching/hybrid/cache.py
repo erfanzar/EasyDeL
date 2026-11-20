@@ -495,9 +495,11 @@ class HybridCacheView(BaseCacheView):
             key_dim = metadata.num_attention_heads * metadata.head_dim
             value_dim = metadata.d_state  # In KDA, value has different dimension
 
+            # Conv windows split by feature over the head axis, like the recurrent state's heads (the conv is
+            # depthwise; the eSurge ragged conv reads and writes the windows feature-sharded).
             conv_sharding = PartitionSpec(
                 metadata.partition_axis.batch_axis,
-                None,
+                metadata.partition_axis.head_axis,
                 None,
             )
             q_conv_state = with_sharding_constraint(
@@ -612,7 +614,11 @@ class HybridCacheView(BaseCacheView):
             q_conv_state=q_conv_state,
             k_conv_state=k_conv_state,
             v_conv_state=v_conv_state,
-            positions=jnp.zeros((metadata.batch_size,), dtype="i4"),
+            # Committed replicated over the mesh, the layout the model step returns (see the KDA cache).
+            positions=with_sharding_constraint(
+                arr=jnp.zeros((metadata.batch_size,), dtype="i4"),
+                sharding=PartitionSpec(),
+            ),
             metadata=metadata,
             layer_index=layer_index,
             layer_type=layer_type,

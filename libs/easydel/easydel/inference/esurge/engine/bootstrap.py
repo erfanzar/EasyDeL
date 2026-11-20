@@ -310,7 +310,7 @@ class EngineAssets:
         model: The loaded (and MLA-compat-adjusted) EasyDeL module.
         processor: Unified text/multimodal processor object.
         tokenizer: The resolved tokenizer.
-        tokenizer_source: Id/path used to spawn tokenizer/detokenizer workers.
+        tokenizer_source: Id/path used by the tokenizer worker and native detokenizer.
         drafter: Constructed speculative-decoding drafter, or ``None``.
         tool_parser_name: Resolved tool-parser name (possibly auto-detected),
             or ``None`` when function calling is disabled.
@@ -690,6 +690,8 @@ def _build_drafter(
             assistant_loading.pop("processor", None)
             assistant_loading.pop("tokenizer", None)
             assistant_loading.pop("config_kwargs", None)
+            # The target's converted-checkpoint destination must not receive (and be overwritten by) the drafter.
+            assistant_loading.pop("converted_save_directory", None)
             assistant_model = AutoEasyDeLModelForCausalLM.from_pretrained(**assistant_loading)
         drafter = model.drafter(
             method=drafter_config.method or "auto",

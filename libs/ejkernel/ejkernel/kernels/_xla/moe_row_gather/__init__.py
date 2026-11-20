@@ -14,7 +14,25 @@
 
 """XLA backend for the MoE row gathers (gather reference and mandatory fallback)."""
 
-from ._interface import moe_row_gather, moe_row_gather_sum
-from ._xla_impl import moe_row_gather_sum_xla, moe_row_gather_xla
+from ._interface import moe_row_gather, moe_row_gather_quantized, moe_row_gather_sum, moe_row_gather_sum_packed
+from ._xla_impl import (
+    moe_row_gather_quantized_xla,
+    moe_row_gather_sum_packed_xla,
+    moe_row_gather_sum_xla,
+    moe_row_gather_xla,
+    pack_rows_paired,
+    unpack_rows_paired,
+)
 
-__all__ = ("moe_row_gather", "moe_row_gather_sum", "moe_row_gather_sum_xla", "moe_row_gather_xla")
+__all__ = (
+    "moe_row_gather",
+    "moe_row_gather_quantized",
+    "moe_row_gather_quantized_xla",
+    "moe_row_gather_sum",
+    "moe_row_gather_sum_packed",
+    "moe_row_gather_sum_packed_xla",
+    "moe_row_gather_sum_xla",
+    "moe_row_gather_xla",
+    "pack_rows_paired",
+    "unpack_rows_paired",
+)

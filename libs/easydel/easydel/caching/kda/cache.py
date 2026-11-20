@@ -58,6 +58,17 @@ from spectrax import PartitionAxis, with_sharding_constraint
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 
+def _without_axes(entry, drop: tuple[str, ...]):
+    """A partition-spec entry (mesh axis name, tuple of names or ``None``) without the names in ``drop``."""
+    if entry is None:
+        return None
+    names = (entry,) if isinstance(entry, str) else tuple(entry)
+    kept = tuple(name for name in names if name not in drop)
+    if not kept:
+        return None
+    return kept[0] if isinstance(entry, str) else kept
+
+
 @auto_pytree
 class KDACacheConfig(BaseCacheConfig):
     """Configuration for KDA (Key-Driven Attention) cache.
@@ -80,6 +91,11 @@ class KDACacheConfig(BaseCacheConfig):
         recurrent_state_shape (tuple): Shape of the recurrent state tensor
             excluding the batch dimension. Typically (num_heads, head_dim)
             or similar.
+        head_shard_axes (tuple | None): Mesh axes the heads (recurrent state)
+            and conv features are split over, or ``None`` for
+            ``partition_axis.head_axis``. eSurge serving with
+            ``kda_serving_ep_split`` sets (head axis, expert-parallel axis); the
+            KDA layer then splits its heads the same way on serving steps.
 
     Example:
         >>> config = KDACacheConfig.create(
@@ -100,6 +116,7 @@ class KDACacheConfig(BaseCacheConfig):
     value_dim: int = field(pytree_node=False)
     d_conv: int = field(pytree_node=False)
     recurrent_state_shape: tuple[int, ...] = field(pytree_node=False)
+    head_shard_axes: tuple[str, ...] | None = field(pytree_node=False, default=None)
 
     @classmethod
     def create(
@@ -111,6 +128,7 @@ class KDACacheConfig(BaseCacheConfig):
         value_dim: int,
         d_conv: int,
         recurrent_state_shape: tuple[int, ...],
+        head_shard_axes: tuple[str, ...] | str | None = None,
     ) -> KDACacheConfig:
         """Create and validate a KDACacheConfig.
 
@@ -124,6 +142,8 @@ class KDACacheConfig(BaseCacheConfig):
             value_dim: Value projection dimension.
             d_conv: Convolution kernel size.
             recurrent_state_shape: Shape of recurrent state (excluding batch).
+            head_shard_axes: Mesh axes the heads and conv features split over, or ``None`` (the partition axis's
+                head axis).
 
         Returns:
             KDACacheConfig: Validated configuration instance.
@@ -150,6 +170,11 @@ class KDACacheConfig(BaseCacheConfig):
             value_dim=value_dim,
             d_conv=d_conv,
             recurrent_state_shape=recurrent_state_shape,
+            head_shard_axes=(
+                None
+                if head_shard_axes is None
+                else ((head_shard_axes,) if isinstance(head_shard_axes, str) else tuple(head_shard_axes))
+            ),
         )
 
 
@@ -201,7 +226,16 @@ class KDACacheView(BaseCacheView):
             KDACacheView: Initialized cache view.
         """
         paxis = config.partition_axis
-        conv_specs = PartitionSpec(paxis.batch_axis, None, None)
+        head_axis, batch_axis = paxis.head_axis, paxis.batch_axis
+        if config.head_shard_axes is not None:
+            # ``kda_serving_ep_split``: heads over (head axis, expert-parallel axis), and the slot axis keeps only mesh
+            # axes the heads do not use (``moe_ep_carries_batch`` appends the expert axis to the batch axis).
+            head_axis = tuple(config.head_shard_axes)
+            batch_axis = _without_axes(batch_axis, head_axis)
+        # Split the conv windows by feature over the head axis, like the recurrent state's heads. The conv is depthwise
+        # and q / k / v come from column-parallel projections, so the eSurge ragged conv reads and writes the windows
+        # feature-sharded; a replicated pool made XLA all-gather all three windows back on every step.
+        conv_specs = PartitionSpec(batch_axis, head_axis, None)
 
         q_conv_state = with_sharding_constraint(
             arr=jnp.zeros(shape=(config.batch_size, config.key_dim, config.d_conv), dtype=dtype),
@@ -219,9 +253,7 @@ class KDACacheView(BaseCacheView):
         recurrent_state_shape = (config.batch_size, *config.recurrent_state_shape)
         # Shard the recurrent state's head axis (``[batch, heads, head_dim, d_state]``) like the hybrid cache's KDA /
         # GDN views do: replicating it over the head axis makes every device hold (and rewrite) all heads each step.
-        recurrent_specs = PartitionSpec(
-            paxis.batch_axis, *((paxis.head_axis,) + (None,) * (len(recurrent_state_shape) - 2))
-        )
+        recurrent_specs = PartitionSpec(batch_axis, *((head_axis,) + (None,) * (len(recurrent_state_shape) - 2)))
         recurrent_state = with_sharding_constraint(
             arr=jnp.zeros(shape=recurrent_state_shape, dtype=dtype),
             sharding=recurrent_specs,
@@ -232,7 +264,13 @@ class KDACacheView(BaseCacheView):
             k_conv_state=k_conv_state,
             v_conv_state=v_conv_state,
             recurrent_state=recurrent_state,
-            positions=jnp.zeros((config.batch_size,), dtype=jnp.int32),
+            # Committed replicated over the mesh, the layout the model step returns: an uncommitted single-device
+            # array changes layout after the first step, so every program keyed on its sharding (slot maintenance,
+            # prefix snapshots) compiled again mid-serving.
+            positions=with_sharding_constraint(
+                arr=jnp.zeros((config.batch_size,), dtype=jnp.int32),
+                sharding=PartitionSpec(),
+            ),
             metadata=config,
             layer_index=layer_index,
         )

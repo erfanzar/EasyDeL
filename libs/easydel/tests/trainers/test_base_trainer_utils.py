@@ -1332,7 +1332,6 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
     trainer.arguments = SimpleNamespace(
         generation_interval=2,
         generation_num_return_sequences=2,
-        use_esurge_generation=True,
         generation_shard_inputs=False,
         use_wandb=False,
         can_log_metrics=False,
@@ -1366,7 +1365,6 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
         input_ids,
         attention_mask,
         state,
-        use_esurge,
         apply_chat_template,
         shard_inputs,
         all_gather,
@@ -1376,7 +1374,6 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
                 "input_ids": np.asarray(input_ids),
                 "attention_mask": np.asarray(attention_mask),
                 "state": state,
-                "use_esurge": use_esurge,
                 "apply_chat_template": apply_chat_template,
                 "shard_inputs": shard_inputs,
                 "all_gather": all_gather,
@@ -1416,7 +1413,6 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
 
     assert len(generate_calls) == 1
     call = generate_calls[0]
-    assert call["use_esurge"] is True
     assert call["apply_chat_template"] is False
     assert call["all_gather"] is False
     assert call["shard_inputs"] is False
@@ -1447,7 +1443,6 @@ def test_maybe_generate_skips_malformed_prompt_when_batching():
     trainer.arguments = SimpleNamespace(
         generation_interval=1,
         generation_num_return_sequences=1,
-        use_esurge_generation=True,
         generation_shard_inputs=False,
         use_wandb=False,
         can_log_metrics=False,
@@ -1481,7 +1476,6 @@ def test_maybe_generate_skips_malformed_prompt_when_batching():
         input_ids,
         attention_mask,
         state,
-        use_esurge,
         apply_chat_template,
         shard_inputs,
         all_gather,
@@ -1491,7 +1485,6 @@ def test_maybe_generate_skips_malformed_prompt_when_batching():
                 "input_ids": np.asarray(input_ids),
                 "attention_mask": np.asarray(attention_mask),
                 "state": state,
-                "use_esurge": use_esurge,
                 "apply_chat_template": apply_chat_template,
                 "shard_inputs": shard_inputs,
                 "all_gather": all_gather,
@@ -1537,7 +1530,6 @@ def test_maybe_generate_prefers_completion_aligned_text_field():
     trainer.arguments = SimpleNamespace(
         generation_interval=1,
         generation_num_return_sequences=1,
-        use_esurge_generation=True,
         generation_shard_inputs=False,
         use_wandb=False,
         can_log_metrics=False,
@@ -1560,12 +1552,11 @@ def test_maybe_generate_prefers_completion_aligned_text_field():
         input_ids,
         attention_mask,
         state,
-        use_esurge,
         apply_chat_template,
         shard_inputs,
         all_gather,
     ):
-        del state, use_esurge, apply_chat_template, shard_inputs, all_gather
+        del state, apply_chat_template, shard_inputs, all_gather
         return GenerationResults(
             generation_results=["legacy-sequence-text"],
             prompt_ids=jnp.asarray(input_ids, dtype=jnp.int32),
@@ -1604,7 +1595,6 @@ def test_maybe_generate_ignores_rollout_metrics_and_still_runs_preview():
     trainer.arguments = SimpleNamespace(
         generation_interval=1,
         generation_num_return_sequences=1,
-        use_esurge_generation=True,
         generation_shard_inputs=False,
         use_wandb=False,
         can_log_metrics=False,
@@ -1653,6 +1643,20 @@ def test_maybe_generate_ignores_rollout_metrics_and_still_runs_preview():
     assert generate_calls >= 1
 
 
+def test_maybe_generate_skips_encoder_decoder_models():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(generation_interval=1)
+    trainer.latest_generation_samples = []
+    trainer._collect_generation_prompts = lambda: ["prompt-1"]
+    calls = []
+    trainer.rollout = lambda **kwargs: calls.append(kwargs)
+
+    state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(is_encoder_decoder=True)))
+    assert trainer.maybe_generate(state=state, step=1) is None
+    assert calls == []
+    assert trainer.latest_generation_samples == []
+
+
 def test_rollout_esurge_releases_all_generation_runtimes():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
@@ -1675,7 +1679,6 @@ def test_rollout_esurge_releases_all_generation_runtimes():
         total_batch_size=1,
         max_length=8,
         esurge_use_tqdm=False,
-        use_esurge_generation=True,
     )
     trainer._pad_token_id = 0
     trainer.processing_class = "tok"
@@ -1785,7 +1788,6 @@ def test_rollout_esurge_ignores_cleanup_failures_after_success():
         total_batch_size=1,
         max_length=8,
         esurge_use_tqdm=False,
-        use_esurge_generation=True,
     )
     trainer._pad_token_id = 0
     trainer.processing_class = "tok"
@@ -1876,7 +1878,6 @@ def test_rollout_esurge_can_keep_runtime_alive():
         total_batch_size=1,
         max_length=8,
         esurge_use_tqdm=False,
-        use_esurge_generation=True,
     )
     trainer._pad_token_id = 0
     trainer.processing_class = "tok"
@@ -1963,7 +1964,6 @@ def test_rollout_esurge_cleans_up_after_post_generation_failure():
         total_batch_size=1,
         max_length=8,
         esurge_use_tqdm=False,
-        use_esurge_generation=True,
     )
     trainer._pad_token_id = 0
     trainer.processing_class = "tok"
@@ -2046,7 +2046,6 @@ def test_rollout_esurge_propagates_generation_penalties():
         total_batch_size=1,
         max_length=8,
         esurge_use_tqdm=False,
-        use_esurge_generation=True,
     )
     trainer._pad_token_id = 0
     trainer.processing_class = "tok"
@@ -2125,7 +2124,6 @@ def test_rollout_compiled_populates_completion_aligned_text_fields():
         generation_frequency_penalty=0.0,
         generation_repetition_penalty=1.0,
         generation_num_return_sequences=1,
-        use_esurge_generation=False,
     )
     trainer._pad_token_id = 0
     trainer.generate_function = None
@@ -2206,7 +2204,6 @@ def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():
     trainer.arguments = SimpleNamespace(
         generation_interval=1,
         generation_num_return_sequences=1,
-        use_esurge_generation=True,
         generation_shard_inputs=False,
         use_wandb=False,
         can_log_metrics=False,
@@ -2240,12 +2237,11 @@ def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():
         input_ids,
         attention_mask,
         state,
-        use_esurge,
         apply_chat_template,
         shard_inputs,
         all_gather,
     ):
-        del state, use_esurge, apply_chat_template, shard_inputs, all_gather
+        del state, apply_chat_template, shard_inputs, all_gather
         input_np = np.asarray(input_ids)
         mask_np = np.asarray(attention_mask)
         call_shapes.append((int(input_np.shape[0]), int(input_np.shape[1])))

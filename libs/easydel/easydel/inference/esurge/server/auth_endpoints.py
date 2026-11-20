@@ -45,6 +45,7 @@ from easydel.workers.esurge.auth.auth_models import (
     QuotaConfig,
     RateLimitConfig,
 )
+from easydel.workers.esurge.auth.credentials import api_key_from_headers
 
 
 class CreateApiKeyRequest(BaseModel):
@@ -158,18 +159,9 @@ class AuthEndpointsMixin:
         # First, try to get API key from request state (if _authorize_request was already called)
         api_key = getattr(raw_request.state, "api_key", None)
 
-        # If not set in state, extract it manually
+        # If not set in state, read it from the headers (never the query string).
         if not api_key:
-            # Try Authorization header (Bearer token)
-            auth_header = raw_request.headers.get("Authorization")
-            if auth_header and auth_header.lower().startswith("bearer "):
-                api_key = auth_header.split(" ", 1)[1].strip()
-
-            if not api_key:
-                api_key = raw_request.headers.get("X-API-Key")
-
-            if not api_key:
-                api_key = raw_request.query_params.get("api_key")
+            api_key = api_key_from_headers(raw_request.headers)
 
         if not api_key:
             raise HTTPException(status_code=401, detail="API key required for this endpoint")

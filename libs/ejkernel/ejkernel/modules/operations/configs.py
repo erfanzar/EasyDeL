@@ -541,6 +541,34 @@ class RaggedGatherConfig(BaseOperationConfig):
 
 
 @dataclass
+class SharedExpertW8A8Config(BaseOperationConfig):
+    """Configuration for the W8A8 gated MLP on a few decode rows (``shared_expert_w8a8``).
+
+    Tiles of the Pallas TPU kernel come from the VMEM capacity, so only the platform is configurable.
+
+    Args:
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MoeDecodeFusedW8A8Config(BaseOperationConfig):
+    """Configuration for the fused decode MoE segment (``moe_decode_fused_w8a8``).
+
+    The Pallas TPU kernel sizes its weight ring from the VMEM capacity, so only the platform is configurable.
+
+    Args:
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedGatherReduceConfig(BaseOperationConfig):
     """Configuration for the weighted grouped gather-sum (MoE top-k combine).
 
@@ -1003,8 +1031,10 @@ class KdaChunkConfig(BaseOperationConfig):
     """Configuration for the fused chunked per-channel-decay KDA (``kda_chunk``).
 
     Args:
-        block_h: Heads per Pallas grid step (``num_heads`` must be a multiple; 1 keeps the
-            ``[cs, cs, K]`` temporaries at one head).
+        block_h: Heads per Pallas grid step. ``num_heads`` must be a multiple, otherwise the call runs the XLA
+            implementation; 1 keeps the ``[cs, cs, K]`` temporaries at one head. ``None`` (default) picks the
+            heads per step from the call's shapes and pairwise form (see
+            :func:`ejkernel.modules.operations.kda_chunk.auto_block_h`).
         backward: ``"pallas"`` (fused reverse-sweep kernel) or ``"xla"`` (reversed-scan recompute).
         bwd_reduce: ``"vpu"`` or ``"mxu"`` evaluation of the backward's weighted reductions (both exact).
         pairwise: ``"auto"`` (factored MXU pairwise decay whenever the call passes a ``decay_lower_bound`` that
@@ -1013,10 +1043,62 @@ class KdaChunkConfig(BaseOperationConfig):
         backend: Backend specification (default: "any").
     """
 
-    block_h: int = 1
+    block_h: int | None = None
     backward: str = "pallas"
     bwd_reduce: str = "vpu"
     pairwise: str = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedKDAConfig(BaseOperationConfig):
+    """Configuration for ragged (flat-token) per-channel-decay KDA over a state pool (``ragged_kda``).
+
+    Args:
+        inverse: Chunk inverse of the multi-token path: ``"auto"`` (block-recursive ``"masked"`` inverse for
+            power-of-two chunks of at least 8 tokens, else ``"solve"``), ``"masked"`` (matmul-only) or ``"solve"``
+            (exact batched triangular solve).
+        pairwise: ``"auto"`` (factored MXU pairwise decay whenever the call passes a ``decay_lower_bound`` that
+            allows it) or ``"dense"`` (always the ``[cs, cs, K]`` form).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    inverse: str = "auto"
+    pairwise: str = "auto"
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedKDADecodeConfig(BaseOperationConfig):
+    """Configuration for the per-row KDA decode step over a state pool (``ragged_kda_decode``).
+
+    Args:
+        block_rows: Rows per grid step of the Pallas TPU kernel (``0``: automatic; must divide the row count).
+        block_h: Heads per inner step of the Pallas TPU kernel (``0``: automatic; must divide the local head count).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_rows: int = 0
+    block_h: int = 0
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedKDAConvDecodeConfig(BaseOperationConfig):
+    """Configuration for the fused KDA decode step with its causal convs (``ragged_kda_conv_decode``).
+
+    Args:
+        block_tokens: Tokens per grid step of the Pallas TPU kernel (``0``: from the VMEM capacity).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    block_tokens: int = 0
 
     __hash__ = hash_fn
 
@@ -1540,6 +1622,27 @@ class MHCCoefficientsConfig(BaseOperationConfig):
 
     Inherited ``platform`` and ``backend`` select the implementation. The packed
     TPU path has fixed 128-token tiles and supports first-order reverse AD only.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MHCDecodeFusedConfig(BaseOperationConfig):
+    """Dispatch settings of the decode-size mHC read / write (``mhc_decode_read`` / ``mhc_decode_write``).
+
+    Tiles come from the TPU info, so only the inherited ``platform`` and ``backend`` select the implementation.
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MHCPrefillFusedConfig(BaseOperationConfig):
+    """Dispatch settings of the prefill-size mHC project / read / write (``mhc_prefill_*``).
+
+    Tiles come from a VMEM rule inside the kernels, so only the inherited ``platform`` and ``backend`` select the
+    implementation.
     """
 
     __hash__ = hash_fn

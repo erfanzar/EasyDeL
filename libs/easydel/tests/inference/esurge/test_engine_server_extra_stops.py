@@ -17,6 +17,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
 from easydel.inference.esurge.server.api_server import eSurgeApiServer
 from easydel.inference.inference_engine_interface import BaseInferenceApiServer, ServerStatus
@@ -73,6 +74,9 @@ def _make_handler_server() -> eSurgeApiServer:
     server._generation_slots = asyncio.Queue(maxsize=1)
     server._generation_slots.put_nowait(0)
     server._max_generation_slots = 128
+    # These handlers are exercised with a stubbed slot queue (stale state on purpose), so the
+    # pre-flight overload check is disabled here; it has its own test file.
+    server._check_generation_slot_capacity = lambda **kwargs: None
     server._overload_message = "Server is busy, please try again later"
     server._record_api_key_usage = lambda *_args, **_kwargs: None
     server._default_store_responses = False
@@ -154,6 +158,21 @@ def test_create_sampling_params_honors_special_token_flags():
 
     assert sampling_params.skip_special_tokens is True
     assert sampling_params.spaces_between_special_tokens is False
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize(
+    ("request_cls", "body"),
+    [
+        (ChatCompletionRequest, {"model": "dummy-model", "messages": [{"role": "user", "content": "hi"}]}),
+        (CompletionRequest, {"model": "dummy-model", "prompt": "hi"}),
+    ],
+)
+@pytest.mark.parametrize(("sent", "expected"), [(None, False), (False, False), (True, True)])
+def test_create_sampling_params_passes_ignore_eos_through(request_cls, body, sent, expected):
+    payload = dict(body) if sent is None else {**body, "ignore_eos": sent}
+    sampling_params = _make_server(None)._create_sampling_params(request_cls.model_validate(payload))
+    assert sampling_params.ignore_eos is expected
 
 
 def test_api_server_defaults_generation_slots_to_runtime_request_cap(monkeypatch):
@@ -485,7 +504,6 @@ def test_responses_handler_ignores_stale_slot_state():
             assert kwargs["request_id"].startswith("resp_")
             return output
 
-    server._extract_payload_api_keys = lambda request: []
     server._get_adapter = lambda model: SimpleNamespace(esurge=FakeSurge())
     server._parse_responses_max_tokens = lambda payload, esurge: (8, 8)
     server._authorize_request = lambda *args, **kwargs: None

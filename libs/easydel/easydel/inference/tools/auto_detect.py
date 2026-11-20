@@ -75,6 +75,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "phimoe": "hermes",
     "phi3": "hermes",
     "phi": "hermes",
+    "glm5_next": "glm47",
     "glm_moe_dsa": "glm47",
     "glm4_moe_lite": "glm47",
     "glm4_moe": "glm47",

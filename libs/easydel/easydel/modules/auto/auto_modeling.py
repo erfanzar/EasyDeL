@@ -114,6 +114,7 @@ def _normalize_pretrained_loading(self) -> None:
         "checkpoint_load_progress": None,
         "from_torch": None,
         "subfolder": "",
+        "converted_save_directory": None,
     },
     post_init=_normalize_pretrained_loading,
 )
@@ -166,6 +167,8 @@ class PreTrainedLoading(TypedDict, total=False):
     torch_load_mode: NotRequired[str]
     torch_streaming_cache: NotRequired[str]
     torch_streaming_tmp_dir: NotRequired[str | os.PathLike | None]
+    # Where the PyTorch-import loader also writes its converted EasyDeL checkpoint.
+    converted_save_directory: NotRequired[str | os.PathLike | None]
     allow_missing_mtp_init: NotRequired[bool]
     # Hugging Face Hub options forwarded to ``EasyDeLBaseModule.from_pretrained``.
     trust_remote_code: NotRequired[bool]
@@ -197,6 +200,35 @@ class PreTrainedLoading(TypedDict, total=False):
             PreTrainedLoading: A fully populated config instance.
         """
         ...
+
+
+# Default of the positional-only location of ``from_pretrained``: ``None`` is a value the
+# loaders accept, so "not passed positionally" needs its own marker.
+_NO_POSITIONAL_LOCATION: Any = object()
+
+
+def _with_positional_location(location: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Fold a positionally passed checkpoint location into the ``from_pretrained`` kwargs.
+
+    Args:
+        location: The positional argument, or ``_NO_POSITIONAL_LOCATION`` when none was given.
+        kwargs: Keyword loading options; not mutated.
+
+    Returns:
+        dict[str, Any]: ``kwargs``, plus ``pretrained_model_name_or_path`` when a location
+        was passed positionally.
+
+    Raises:
+        TypeError: If the location is given both positionally and as
+            ``pretrained_model_name_or_path=``.
+    """
+    if location is _NO_POSITIONAL_LOCATION:
+        return kwargs
+    if "pretrained_model_name_or_path" in kwargs:
+        raise TypeError(
+            "from_pretrained() got the checkpoint location both positionally and as pretrained_model_name_or_path=."
+        )
+    return {"pretrained_model_name_or_path": location, **kwargs}
 
 
 class BaseAutoEasyModel:
@@ -238,7 +270,12 @@ class BaseAutoEasyModel:
         return model.wire_distributed_matmul()
 
     @classmethod
-    def from_pretrained(cls, **kwargs: Unpack[PreTrainedLoading]) -> EasyDeLBaseModule:
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Any = _NO_POSITIONAL_LOCATION,
+        /,
+        **kwargs: Unpack[PreTrainedLoading],
+    ) -> EasyDeLBaseModule:
         """Load and shard a pretrained model into an EasyDeL-compatible module.
 
         Routes between the EasyDeL-native loader and the PyTorch-import loader
@@ -246,11 +283,21 @@ class BaseAutoEasyModel:
         the module under an optional JAX default-device context.
 
         Args:
+            pretrained_model_name_or_path: Optional positional-only spelling of
+                the ``pretrained_model_name_or_path`` field below, so
+                ``from_pretrained("org/model", dtype=...)`` equals
+                ``from_pretrained(pretrained_model_name_or_path="org/model", dtype=...)``.
             **kwargs: Loading options forwarded to :class:`PreTrainedLoading`.
                 Accepted fields:
 
                 - ``pretrained_model_name_or_path`` (Any, required): Model name,
-                  local path, or already-loaded module.
+                  local path, ``gs://`` URI, or already-loaded module. A
+                  Hugging Face-format checkpoint under a ``gs://`` URI is
+                  converted in streaming mode (an explicit
+                  ``torch_load_mode="full"`` warns and switches to streaming):
+                  its shards are staged under ``torch_streaming_tmp_dir`` (the
+                  system temp dir otherwise), at most two at a time, and
+                  deleted after use; every JAX process stages its own copies.
                 - ``tokenizer`` (Any | None): Optional tokenizer bundled with
                   the loader; popped before forwarding to the underlying
                   loader. Defaults to ``None``.
@@ -300,11 +347,32 @@ class BaseAutoEasyModel:
                 - ``revision`` (str): HF Hub revision/branch.
                 - ``subfolder`` (str): Checkpoint subdirectory, used for format
                   detection and forwarded to either bridge loader. Defaults to ``""``.
+                - ``converted_save_directory`` (str | os.PathLike | None): Only
+                  for Hugging Face-format sources (local, Hub or ``gs://``).
+                  When set, the converted model is also written there (local
+                  path or ``gs://`` URI) with ``save_pretrained`` as a native
+                  EasyDeL checkpoint, so a later
+                  ``from_pretrained(pretrained_model_name_or_path=converted_save_directory)``
+                  takes the native loader. The save follows conversion, merging,
+                  materialization and layer re-stacking but precedes runtime
+                  quantization (``quantization_config`` /
+                  ``apply_quantization``), so it holds the plain converted
+                  weights. Tokenizer, processor and chat-template files present
+                  at the source are copied next to it. The save is collective:
+                  every JAX process must make this call; only process 0 copies
+                  the tokenizer files. Defaults to ``None``.
 
         Returns:
             EasyDeLBaseModule: The loaded EasyDeL model module.
+
+        Raises:
+            TypeError: If the location is passed both positionally and as
+                ``pretrained_model_name_or_path=``.
+            ValueError: If ``converted_save_directory`` is set but the source
+                loads through the native EasyDeL loader (it is already an
+                EasyDeL checkpoint, or ``from_torch=False`` was passed).
         """
-        config = PreTrainedLoading.coerce_config(kwargs)
+        config = PreTrainedLoading.coerce_config(_with_positional_location(pretrained_model_name_or_path, kwargs))
 
         if config.from_torch is None:
             try:
@@ -322,6 +390,15 @@ class BaseAutoEasyModel:
 
         if config.from_torch:
             return cls._from_torch_pretrained(config)
+
+        converted_save_directory = config.get("converted_save_directory")
+        if converted_save_directory is not None:
+            raise ValueError(
+                f"converted_save_directory={converted_save_directory!r} only applies when converting a Hugging "
+                f"Face checkpoint, but {config.pretrained_model_name_or_path!r} loads through the native EasyDeL "
+                "loader (it is already an EasyDeL checkpoint, or from_torch=False was passed). Load it without "
+                "converted_save_directory and call model.save_pretrained(...) to write a copy."
+            )
 
         cmg = jax.default_device(config.device) if config.device is not None else contextlib.nullcontext()
         with cmg:
@@ -349,6 +426,11 @@ class BaseAutoEasyModel:
         "checkpoint_load_tensorstore_metadata_workers",
         "checkpoint_load_progress",
     )
+    # Fields only the PyTorch-import loader understands: ``converted_save_directory``
+    # asks it to persist its conversion. ``from_pretrained`` rejects the field for
+    # native sources, so its ``None`` default is dropped before the native loader,
+    # whose residual ``**kwargs`` reach Hub/transformers helpers.
+    _NATIVE_LOADER_DROP: tuple[str, ...] = ("converted_save_directory",)
 
     @classmethod
     def _loader_kwargs(cls, config: PreTrainedLoading) -> dict[str, Any]:
@@ -398,7 +480,10 @@ class BaseAutoEasyModel:
 
             _model_task = cls.model_task
 
-        return Base.from_pretrained(**cls._loader_kwargs(config))
+        loader_kwargs = cls._loader_kwargs(config)
+        for key in cls._NATIVE_LOADER_DROP:
+            loader_kwargs.pop(key, None)
+        return Base.from_pretrained(**loader_kwargs)
 
     @classmethod
     def _from_torch_pretrained(cls, config: PreTrainedLoading) -> EasyDeLBaseModule:
@@ -523,7 +608,12 @@ class BaseAutoEasyState:
         ).to_state()
 
     @classmethod
-    def from_pretrained(cls, **kwargs: Unpack[PreTrainedLoading]) -> EasyDeLState:
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Any = _NO_POSITIONAL_LOCATION,
+        /,
+        **kwargs: Unpack[PreTrainedLoading],
+    ) -> EasyDeLState:
         """Load a pretrained model and wrap it in an :class:`EasyDeLState`.
 
         Forwards all kwargs to :meth:`BaseAutoEasyModel.from_pretrained`, then
@@ -531,14 +621,20 @@ class BaseAutoEasyState:
         optimizer and ``step=0``.
 
         Args:
+            pretrained_model_name_or_path: Optional positional-only spelling of
+                the ``pretrained_model_name_or_path`` loading field.
             **kwargs: Loading options forwarded to
                 :meth:`BaseAutoEasyModel.from_pretrained`. See
                 :class:`PreTrainedLoading` for the full field list.
 
         Returns:
             EasyDeLState: A state wrapping the freshly loaded module.
+
+        Raises:
+            TypeError: If the location is passed both positionally and as
+                ``pretrained_model_name_or_path=``.
         """
-        model = cls._base.from_pretrained(**kwargs)
+        model = cls._base.from_pretrained(**_with_positional_location(pretrained_model_name_or_path, kwargs))
         return EasyDeLState.create(
             model=model,
             tx=None,

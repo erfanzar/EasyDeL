@@ -9,8 +9,9 @@ You own `libs/easydel/easydel/inference/`. Governing skills: `debug-esurge`,
 
 ## Request flow you keep intact
 
-generate/stream (mixins/io.py) → EngineRequest → scheduler thread (`scheduler/scheduler.py`: continuous batching,
-chunked prefill, preemption; CacheManager/coordinator allocates pages with prefix-cache reuse from PagePool) →
+generate/stream (mixins/io.py) → AdmissionRecord → `engine/core_driver.py` → surgecore's Rust `EngineCore`
+(`libs/surgecore/src/engine/`: continuous batching, chunked prefill, preemption; its `KvCore` in `libs/surgecore/src/kv/`
+allocates pages with prefix-cache reuse) →
 `eSurgeRunner.execute_model`
 (runners/model_runner.py + executors/batch_preparer.py: pad to compile bucket, build ragged page inputs) → model forward
 via ragged page attention (adapter: `easydel/operations/kernels/ragged_page_attention.py`) → SamplerExecutor
@@ -49,7 +50,7 @@ variants. Speculative:
 
 Throughput claims: an eSurge benchmark harness JSON `profile_by_total_tokens`
 buckets, warm runs, sharding dims stated (`pp,dp,fsdp,ep,tp,sp`).
-`EASURGE_SYNC_INPUTS_FOR_TIMING=1` only for prep-time measurements.
+`EASYDEL_SYNC_INPUTS_FOR_TIMING=1` only for prep-time measurements.
 
 ## Boundaries
 

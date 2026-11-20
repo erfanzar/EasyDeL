@@ -39,6 +39,7 @@ so the auto-save callback can re-enter the lock) guards every mutating path.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import threading
 import time
@@ -107,6 +108,15 @@ class PermissionDenied(Exception):
     pass
 
 
+class InvalidApiKey(PermissionDenied):
+    """Raised when the presented key is missing, unknown, revoked, suspended or expired.
+
+    An authentication failure (HTTP 401), as opposed to the other :class:`PermissionDenied` cases, where a
+    valid key lacks permission (HTTP 403). Subclasses :class:`PermissionDenied` so existing handlers still
+    catch it.
+    """
+
+
 class EnhancedApiKeyManager:
     """In-process API key manager with RBAC, rate limiting, and audit logging.
 
@@ -119,8 +129,6 @@ class EnhancedApiKeyManager:
 
     * The hashed-key store (``_keys`` mapping ``hashed_key -> ApiKeyMetadata``)
       and the ``key_id -> hashed_key`` index used for O(1) lookup by id.
-    * A raw-key cache (``_raw_to_hash_cache``) so :meth:`validate_key`
-      avoids hashing the same secret on every request.
     * Per-key sliding-window deques in ``_rate_limit_windows`` (request
       counts) and ``_token_usage_windows`` (token counts) used by
       :meth:`_check_rate_limits`.
@@ -192,8 +200,6 @@ class EnhancedApiKeyManager:
         self._keys: dict[str, ApiKeyMetadata] = {}
         # Key lookup: key_id -> hashed_key for faster lookups
         self._key_id_to_hash: dict[str, str] = {}
-        # Reverse lookup: raw_key -> hashed_key (only used during validation)
-        self._raw_to_hash_cache: dict[str, str] = {}
 
         # Auto-save routines call back into helper methods that also grab this lock,
         # so we need a re-entrant lock to prevent deadlocks when the same thread
@@ -344,7 +350,6 @@ class EnhancedApiKeyManager:
         hashed = self._hash_key(key)
         if hashed in self._keys:
             logger.info("Admin key already exists in storage, skipping creation")
-            self._raw_to_hash_cache[key] = hashed
             return
 
         self.create_api_key(
@@ -538,7 +543,6 @@ class EnhancedApiKeyManager:
 
             self._keys[hashed_key] = key_metadata
             self._key_id_to_hash[key_id] = hashed_key
-            self._raw_to_hash_cache[raw_key] = hashed_key
 
             self._log_audit(
                 action="key_created",
@@ -557,9 +561,9 @@ class EnhancedApiKeyManager:
     def validate_key(self, raw_key: str | None) -> ApiKeyMetadata | None:
         """Resolve a raw API key string to its live metadata, or reject it.
 
-        Hashes ``raw_key`` (caching the digest in
-        ``_raw_to_hash_cache`` for subsequent lookups), then verifies
-        that the corresponding key exists *and* satisfies
+        Hashes ``raw_key`` with SHA-256, looks the digest up, confirms it
+        with a constant-time comparison, then verifies that the key
+        satisfies
         :meth:`ApiKeyMetadata.is_active`, i.e. status is ``ACTIVE`` and
         the expiration timestamp has not passed. Returns ``None`` for
         any of: missing input, unknown key, revoked / suspended /
@@ -577,16 +581,11 @@ class EnhancedApiKeyManager:
         if not raw_key:
             return None
 
-        hashed_key = self._raw_to_hash_cache.get(raw_key)
-        if hashed_key is None:
-            hashed_key = self._hash_key(raw_key)
-            if hashed_key in self._keys:
-                # Cache only secrets that belong to a registered key: caching arbitrary presented
-                # tokens would grow this dict without bound and keep unauthenticated secrets in memory.
-                self._raw_to_hash_cache[raw_key] = hashed_key
-
+        # Look up by digest only: no structure is keyed by a raw secret, so lookup time does not depend on
+        # how many leading characters of a guess match a real key.
+        hashed_key = self._hash_key(raw_key)
         metadata = self._keys.get(hashed_key)
-        if metadata is None:
+        if metadata is None or not hmac.compare_digest(metadata.hashed_key, hashed_key):
             return None
 
         if not metadata.is_active():
@@ -656,7 +655,7 @@ class EnhancedApiKeyManager:
                     ip_address=ip_address,
                     success=False,
                 )
-                raise PermissionDenied("Invalid or inactive API key")
+                raise InvalidApiKey("Invalid or inactive API key")
 
             metadata.update_last_used()
 
@@ -1233,10 +1232,6 @@ class EnhancedApiKeyManager:
             self._reservations.pop(key_id, None)
             self._forget_retired_hashes(key_id)
 
-            for raw_key, cached_hash in list(self._raw_to_hash_cache.items()):
-                if cached_hash == hashed_key:
-                    del self._raw_to_hash_cache[raw_key]
-
             if key_id in self._rate_limit_windows:
                 del self._rate_limit_windows[key_id]
             if key_id in self._token_usage_windows:
@@ -1437,9 +1432,6 @@ class EnhancedApiKeyManager:
                 if self._reservations.get(key_id):
                     self._retired_key_hashes[old_hashed_key] = key_id
                 del self._keys[old_hashed_key]
-                for cached_raw, cached_hash in list(self._raw_to_hash_cache.items()):
-                    if cached_hash == old_hashed_key:
-                        del self._raw_to_hash_cache[cached_raw]
 
             old_metadata.hashed_key = new_hashed_key
             old_metadata.key_prefix = new_raw_key[:12] + "..."
@@ -1447,7 +1439,6 @@ class EnhancedApiKeyManager:
 
             self._keys[new_hashed_key] = old_metadata
             self._key_id_to_hash[key_id] = new_hashed_key
-            self._raw_to_hash_cache[new_raw_key] = new_hashed_key
 
             self._log_audit(
                 action="key_rotated",

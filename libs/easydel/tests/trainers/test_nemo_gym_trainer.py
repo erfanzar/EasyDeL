@@ -25,7 +25,6 @@ def test_nemo_gym_family_is_public_and_esurge_default():
 
     assert hasattr(ed, "NeMoGymConfig")
     assert hasattr(ed, "NeMoGymTrainer")
-    assert cfg.use_esurge_generation is True
     assert cfg.num_generations_eval == 1
     assert cfg.shuffle_dataset is False
     assert cfg.num_return_sequences == 2

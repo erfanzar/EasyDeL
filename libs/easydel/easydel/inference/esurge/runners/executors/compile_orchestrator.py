@@ -47,6 +47,7 @@ from eformer.pytree import key_path_to_str
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
 from ..execution_types import StepFunctionInputs
+from .model_executor import traces_decode_layout
 from .sampler_executor import _get_padded_num_reqs_with_upper_limit
 
 if tp.TYPE_CHECKING:
@@ -172,6 +173,42 @@ class CompileOrchestrator:
                     continue
                 feasible_pairs.append((int(num_tokens), int(reqs_padd)))
         return feasible_pairs
+
+    @staticmethod
+    def _decode_layout_pairs(
+        model_compile_pairs: list[tuple[int, int]],
+        reqs_padds: list[int],
+        single_token_pairs: frozenset[tuple[int, int]] = frozenset(),
+    ) -> list[tuple[int, int]]:
+        """Return the pure-decode pairs: at most one per request bucket, where its general program does not serve.
+
+        A pure-decode window of ``r`` requests runs the smallest token bucket ``t >= r``. When ``(t, r)`` is within
+        ``DECODE_LAYOUT_MAX_TOKENS_PER_REQ`` (:func:`traces_decode_layout`) and its general trace never asked for the
+        single-token promise, its one program already serves those windows. Otherwise (a token-bucket floor far above
+        the request bucket, or a model whose layers take a cheaper path when every row holds at most one token,
+        ``single_token_pairs``) ``(t, r)`` gets a pure-decode twin of its general program. This adds at most one
+        program per request bucket instead of doubling the grid.
+
+        Args:
+            model_compile_pairs: The general ``(num_tokens, padded_num_reqs)`` pairs being compiled.
+            reqs_padds: Request buckets.
+            single_token_pairs: Pairs whose general trace asked for the single-token promise
+                (``ModelStepExecutor.single_token_pairs``).
+
+        Returns:
+            ``(num_tokens, padded_num_reqs)`` pairs needing a separate pure-decode program.
+        """
+        compiled = set(model_compile_pairs)
+        token_buckets = sorted({int(t) for t, _ in model_compile_pairs})
+        pairs: list[tuple[int, int]] = []
+        for reqs_padd in sorted({int(r) for r in reqs_padds}):
+            num_tokens = next((t for t in token_buckets if t >= reqs_padd), None)
+            if num_tokens is None or (num_tokens, reqs_padd) not in compiled:
+                continue
+            if traces_decode_layout(num_tokens, reqs_padd) and (num_tokens, reqs_padd) not in single_token_pairs:
+                continue
+            pairs.append((num_tokens, reqs_padd))
+        return pairs
 
     def compile(
         self,
@@ -338,6 +375,21 @@ class CompileOrchestrator:
                     metadata=metadata,
                 )
             model_step_progress.complete(f"All {len(model_compile_pairs)} fused model-step compilations completed")
+            # The general programs are compiled above, so the executor knows which pairs asked for the promise.
+            executor = getattr(self._manager, "_model_executor", None)
+            decode_pairs = self._decode_layout_pairs(
+                model_compile_pairs, reqs_padds, getattr(executor, "single_token_pairs", frozenset())
+            )
+            for num_tokens, reqs_padd in decode_pairs:
+                self._manager._compile_model_step_variant(
+                    num_tokens=num_tokens,
+                    padded_num_reqs=reqs_padd,
+                    max_num_reqs=max_num_reqs,
+                    metadata=metadata,
+                    decode_layout=True,
+                )
+            if decode_pairs:
+                logger.info(f"Compiled {len(decode_pairs)} decode-layout model-step variants: {decode_pairs}")
 
             lm_head_progress = ProgressLogger("eSurge-sampler", logger)
             total_phase2 = len(sampler_reqs_padds_to_compile)
@@ -361,6 +413,14 @@ class CompileOrchestrator:
             lm_head_progress.complete(f"All {total_phase2} lm_head/sampler compilations completed")
         else:
             lm_head_progress.complete(f"All {total_phase2} sampler compilations completed")
+        # Logits rows follow the model request buckets; a fused PP step may size them to a sampler bucket instead.
+        logits_buckets = sorted({int(r) for r in reqs_padds})
+        if self._manager.model.mesh.is_mpmd:
+            logits_buckets = sorted({*logits_buckets, *(int(r) for r in sampler_reqs_padds_to_compile)})
+        self._manager._warm_step_programs(
+            logits_buckets=logits_buckets,
+            sampler_buckets=[int(r) for r in sampler_reqs_padds_to_compile],
+        )
 
     def _compile_model_step_variant(
         self,
@@ -369,9 +429,17 @@ class CompileOrchestrator:
         padded_num_reqs: int,
         max_num_reqs: int,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
+        decode_layout: bool = False,
     ) -> None:
-        """Compile the fused SPMD model step for one token/request bucket pair."""
-        if self._manager._model_executor.has_model_step(num_tokens, padded_num_reqs):
+        """Compile the fused SPMD model step for one token/request bucket pair.
+
+        ``decode_layout=True`` compiles the pair's decode-layout variant for pure-decode windows.
+        """
+        executor = self._manager._model_executor
+        if decode_layout:
+            if executor.has_decode_model_step(num_tokens, padded_num_reqs):
+                return
+        elif executor.has_model_step(num_tokens, padded_num_reqs):
             return
 
         compargs = self._manager.get_compile_configurations(
@@ -390,6 +458,7 @@ class CompileOrchestrator:
             graphstate=graphstate,
             graphother=graphother,
             inputs=inputs,
+            decode_layout=decode_layout,
         )
         if model_out is not None and not self._manager.model.mesh.is_mpmd:
             self._manager.kv_pages = model_out.kv_pages
@@ -485,7 +554,7 @@ class CompileOrchestrator:
             warm_args = (graphstate, graphother, inputs)
             self._manager._debug_baselines[f"{num_tokens}_hash_in_backbone"] = _tree_hash(warm_args)
 
-    def _reset_kv_pages_after_compile_warmup(self) -> None:
+    def _reset_kv_pages_after_compile_warmup(self, *, force: bool = False) -> None:
         """Replace compile warm-up cache pages with fresh runtime pages.
 
         Upfront MPMD compilation executes the same donated backbone functions
@@ -494,8 +563,12 @@ class CompileOrchestrator:
         deleted donated buffers and dummy KV writes from leaking into the first
         user request while preserving the compiled executables in the executor
         caches.
+
+        Args:
+            force: Rebuild on any mesh, not only MPMD: a warm-up or timing step that raised may have consumed the
+                donated cache, so the live pages can no longer be trusted.
         """
-        if not self._manager.model.mesh.is_mpmd:
+        if not force and not self._manager.model.mesh.is_mpmd:
             return
         if not hasattr(self._manager, "_cache_quantizer") or not hasattr(self._manager, "_cache_masking_details"):
             return

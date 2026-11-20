@@ -17,7 +17,7 @@
 :class:`RoutedEngine` presents the engine-adapter surface while fanning
 requests across N members — local ``eSurge`` instances and/or
 :class:`RemoteEngineHandle` clients — with the routing policy lifted from
-the DP scheduler: **prefix affinity first, then join-shortest-queue**.
+the in-core DP routing: **prefix affinity first, then join-shortest-queue**.
 Affinity is tracked router-side in a :class:`PrefixAffinityMap` (LRU of
 block-aligned prompt-prefix hashes → member) instead of synchronously
 probing every replica's prefix cache; the JSQ signal is
@@ -126,20 +126,15 @@ def _member_alive(member) -> bool:
 
 
 def _member_pending_prefill_tokens(member) -> int:
-    """JSQ cost signal for a member (remote stats or a local scheduler read)."""
+    """JSQ cost signal for a member (remote stats or a local engine-core count)."""
     remote = getattr(member, "pending_prefill_tokens", None)
     if remote is not None:
         return int(remote)
-    scheduler = getattr(member, "scheduler", None)
-    if scheduler is None:
+    core = getattr(member, "core", None)
+    if core is None:
         return 0
     try:
-        total = 0
-        for request in scheduler.running:
-            total += max(0, int(request.num_prompt_tokens) - int(request.num_computed_tokens))
-        for request in scheduler.waiting:
-            total += int(request.num_prompt_tokens)
-        return total
+        return int(core.pending_prefill_tokens)
     except Exception:
         return 0
 
@@ -154,12 +149,30 @@ class RoutedEngine:
         affinity_block_chars: Prefix block width for the affinity map;
             defaults to a page-size-derived estimate when a member reports
             one (≈4 characters per token), else ``512`` characters.
+        affinity_max_imbalance: How many more router-local in-flight requests
+            the prefix-pinned member may hold than the least-loaded live member
+            before affinity yields to join-shortest-queue. A prefix shared by a
+            burst (one system prompt, one benchmark prompt) otherwise lands
+            every request on one member while the others idle.
     """
 
-    def __init__(self, members: list, *, affinity_block_chars: int | None = None) -> None:
+    def __init__(
+        self,
+        members: list,
+        *,
+        affinity_block_chars: int | None = None,
+        affinity_max_imbalance: int = 4,
+        planned_members: int | None = None,
+    ) -> None:
         if not members:
             raise ValueError("RoutedEngine needs at least one member")
+        if int(affinity_max_imbalance) < 0:
+            raise ValueError(f"affinity_max_imbalance must be >= 0, got {affinity_max_imbalance}")
+        if planned_members is not None and int(planned_members) < len(members):
+            raise ValueError(f"planned_members={planned_members} is below the {len(members)} members given")
         self.members = list(members)
+        self.planned_members = None if planned_members is None else int(planned_members)
+        self.affinity_max_imbalance = int(affinity_max_imbalance)
         if affinity_block_chars is None:
             page_size = next((int(getattr(m, "page_size", 0) or 0) for m in self.members), 0)
             affinity_block_chars = page_size * 4 if page_size > 0 else _DEFAULT_BLOCK_CHARS
@@ -169,6 +182,25 @@ class RoutedEngine:
         # QueueStats ride 1s heartbeats, so a burst arriving between beats
         # would otherwise dump entirely on the lowest-indexed member.
         self._inflight = [0] * len(self.members)
+
+    def add_member(self, member) -> int:
+        """Attach a member that came up after the router started serving (a late replica).
+
+        Returns:
+            The new member's index.
+        """
+        with self._route_lock:
+            # In-flight first: a reader that sees the member under the lock also sees its counter.
+            self._inflight.append(0)
+            self.members.append(member)
+            return len(self.members) - 1
+
+    def replace_member(self, index: int, member) -> None:
+        """Put a fresh member in a dead member's slot (a replica that came back on the same address)."""
+        with self._route_lock:
+            self.members[index] = member
+            self._inflight[index] = 0
+        self.affinity.drop_member(index)
 
     def _alive_indices(self) -> list[int]:
         alive = []
@@ -197,11 +229,15 @@ class RoutedEngine:
             self._release(member_index)
 
     def select_member(self, prompt: str) -> int:
-        """Pick the member for one prompt: prefix affinity, then JSQ.
+        """Pick the member for one prompt: bounded prefix affinity, then JSQ.
 
-        The queue key is (router-local in-flight, owner-reported pending
-        prefill tokens, index): the local count is instantaneous, the
-        remote signal covers load from other clients.
+        The prefix-pinned member wins while its router-local in-flight count
+        is at most ``affinity_max_imbalance`` above the least-loaded live
+        member's; beyond that the request joins the shortest queue (the
+        caller then re-pins the prefix there). The queue key is (router-local
+        in-flight, owner-reported pending prefill tokens, index): the local
+        count is instantaneous, the remote signal covers load from other
+        clients.
 
         Args:
             prompt: The incoming prompt text.
@@ -211,10 +247,12 @@ class RoutedEngine:
         """
         alive = self._alive_indices()
         pinned, _depth = self.affinity.lookup(prompt)
-        if pinned is not None and pinned in alive:
-            return pinned
         with self._route_lock:
             inflight = list(self._inflight)
+        if pinned is not None and pinned in alive:
+            least = min(inflight[index] for index in alive)
+            if inflight[pinned] - least <= self.affinity_max_imbalance:
+                return pinned
         return min(
             alive,
             key=lambda index: (inflight[index], _member_pending_prefill_tokens(self.members[index]), index),
@@ -232,8 +270,15 @@ class RoutedEngine:
 
     @property
     def max_num_seqs(self) -> int:
-        """Aggregate concurrency limit (sum across members)."""
-        return sum(int(member.max_num_seqs) for member in self.members)
+        """Aggregate concurrency limit: the sum across members, or the planned total while members attach late.
+
+        A server sizes its generation slots from this once, at start-up; a router that starts with the first ready
+        replica of ``planned_members`` reports the full deployment so late replicas are not capped away.
+        """
+        attached = sum(int(member.max_num_seqs) for member in self.members)
+        if self.planned_members is None or len(self.members) >= self.planned_members:
+            return attached
+        return max(attached, max(int(member.max_num_seqs) for member in self.members) * self.planned_members)
 
     @property
     def tokenizer(self):

@@ -98,9 +98,7 @@ def test_engine_inherits_runtime_and_preserves_explicit_overrides(monkeypatch, r
     monkeypatch.setattr(
         esurge_engine,
         "WorkerManager",
-        lambda *args, **kwargs: SimpleNamespace(
-            start=lambda **kwargs: (None, None), tokenizer_endpoint=None, detokenizer_endpoint=None
-        ),
+        lambda *args, **kwargs: SimpleNamespace(start=lambda **kwargs: (None, None), tokenizer_endpoint=None),
     )
 
     def runner(**kwargs):

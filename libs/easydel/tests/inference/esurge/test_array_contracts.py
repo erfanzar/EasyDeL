@@ -121,7 +121,8 @@ def test_explicit_adaptive_drafting_and_registered_persistence_override(
             return jnp.asarray([3, 4, 0]), jnp.asarray(2)
 
     drafter = AdaptiveDrafter()
-    runner = SimpleNamespace(max_num_reqs=1)
+    # The adaptive path records its draft at the request's buffer row, so the runner needs a sequence buffer.
+    runner = SimpleNamespace(max_num_reqs=1, sequence_buffer=SimpleNamespace(req_id_to_index={"a": 0}))
     spec = DrafterSpeculation(runner=runner, drafter=drafter, num_draft_tokens=3, adaptive_conf_threshold=0.8)
     request = CachedRequestState("a", [1], SamplingParams(temperature=0), None, ([],), 0, [])
     actual = spec.draft_next(req_id="a", seed_token=1, seed_position=0, seed_hidden=jnp.zeros((2,)), req_state=request)

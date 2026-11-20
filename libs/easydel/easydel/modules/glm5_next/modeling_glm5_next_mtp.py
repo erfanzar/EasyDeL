@@ -53,10 +53,17 @@ from .modeling_glm5_next import Glm5NextDSAAttention, Glm5NextTextMoE
 DEFAULT_MTP_CACHE_LENGTH = 8192
 
 
-def glm5_next_mtp_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
+def glm5_next_mtp_config(config: Glm5NextTextConfig, *, paged_pool: bool = False) -> Glm5NextTextConfig:
     """One-layer draft config: index 0 is a DSA/MLA attention + sparse-MoE block with a full indexer.
 
-    Dense (non-paged) attention is forced: the head keeps its own transformer cache, not the backbone's pages.
+    Args:
+        config: The target model's text config.
+        paged_pool: Run the block with the target's attention mechanism, writing its KV into the target's paged MLA
+            pool. Otherwise the block uses dense attention on the drafter-local cache, which every drafter program
+            (warm-up, batched draft, fused verify) can run.
+
+    Returns:
+        The draft config.
     """
     # Shallow copy (as the Qwen3.5 MTP head does): the config carries the mesh / sharding resolver, which must be
     # shared, and every schedule below is reassigned rather than mutated.
@@ -65,8 +72,12 @@ def glm5_next_mtp_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
     draft.layer_types = [DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE]
     draft.mlp_layer_types = ["sparse"]
     draft.indexer_types = ["full"]
-    draft.attn_mechanism = "vanilla"
-    draft.decode_attn_mechanism = None
+    if paged_pool:
+        draft.attn_mechanism = getattr(config, "attn_mechanism", "vanilla")
+        draft.decode_attn_mechanism = getattr(config, "decode_attn_mechanism", None) or draft.attn_mechanism
+    else:
+        draft.attn_mechanism = "vanilla"
+        draft.decode_attn_mechanism = None
     return draft
 
 
@@ -136,9 +147,12 @@ class Glm5NextMTPHead(spx.Module):
         *,
         rngs: spx.Rngs,
         max_cache_length: int = DEFAULT_MTP_CACHE_LENGTH,
+        paged_pool: bool = False,
     ):
-        draft = glm5_next_mtp_config(config)
+        draft = glm5_next_mtp_config(config, paged_pool=paged_pool)
         self.config = draft
+        #: Whether the block writes into the target's paged MLA pool (see :func:`glm5_next_mtp_config`).
+        self.paged_pool = bool(paged_pool)
         self.num_stages = 1
         self.max_cache_length = int(max_cache_length)
         norm_kwargs = dict(eps=draft.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
@@ -180,7 +194,10 @@ class Glm5NextMTPHead(spx.Module):
         next_token_embeds: Float[Array, "batch seq hidden"],
         position_ids: Int[Array, "batch seq"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
-    ) -> Float[Array, "batch seq hidden"]:
+        cache_view: tp.Any = None,
+        cache_metadata: tp.Any = None,
+        return_cache: bool = False,
+    ) -> Float[Array, "batch seq hidden"] | tuple[Float[Array, "batch seq hidden"], tp.Any]:
         """Stateless forward (no cache): normed nextn hidden states for the shared LM head."""
         h = self.fc(
             jnp.concatenate(
@@ -192,9 +209,11 @@ class Glm5NextMTPHead(spx.Module):
         if position_ids is None:
             position_ids = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None], (batch, seq))
         mode = common_types.MODE_TRAIN if mode is None else mode
+        new_cache = None
         for layer in self.layers:
-            h, _ = layer(h, mask_info, position_ids, mode, None, None, None)
-        return self.norm(h)
+            h, new_cache = layer(h, mask_info, position_ids, mode, cache_view, cache_metadata, None)
+        hidden = self.norm(h)
+        return (hidden, new_cache) if return_cache else hidden
 
 
 def attach_glm5_next_mtp(model: tp.Any, head: Glm5NextMTPHead) -> tp.Any:
@@ -297,13 +316,108 @@ def load_glm5_next_mtp(
     return head
 
 
+def glm5_next_mtp_checkpoint_files(
+    checkpoint: str, nextn_layer_index: int
+) -> tuple[list[str], dict[str, tp.Any] | None]:
+    """The shards of a Hugging Face checkpoint that hold its nextn layer, and the checkpoint's quantization config.
+
+    Reads ``model.safetensors.index.json`` (and ``config.json`` when present) through ``ePath``, so local and
+    remote (``gs://``) checkpoints both work; no shard is opened.
+
+    Args:
+        checkpoint: The checkpoint directory.
+        nextn_layer_index: Index of the nextn layer (the backbone's ``num_hidden_layers``).
+
+    Returns:
+        ``(shard_names, quantization_config)``: sorted shard file names relative to ``checkpoint``, and the top-level
+        or ``text_config`` ``quantization_config`` (``None`` when absent).
+
+    Raises:
+        ValueError: If the index maps no key of the nextn layer.
+    """
+    import json
+
+    from eformer.paths import ePath
+
+    root = ePath(str(checkpoint))
+    weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+    rules = glm5_next_mtp_key_rules(nextn_layer_index)
+    files = sorted({str(name) for key, name in weight_map.items() if rules(key) is not None})
+    if not files:
+        raise ValueError(f"{checkpoint}: the index maps no key of nextn layer {int(nextn_layer_index)}.")
+    quantization_config = None
+    config_path = root / "config.json"
+    if config_path.exists():
+        raw = json.loads(config_path.read_text())
+        quantization_config = raw.get("quantization_config") or (raw.get("text_config") or {}).get("quantization_config")
+    return files, quantization_config
+
+
+def load_glm5_next_mtp_checkpoint(
+    model: tp.Any,
+    checkpoint: str,
+    *,
+    param_dtype: jnp.dtype = jnp.bfloat16,
+    precision: jax.lax.PrecisionLike = None,
+    max_cache_length: int = DEFAULT_MTP_CACHE_LENGTH,
+) -> Glm5NextMTPHead:
+    """Load the nextn layer of a Hugging Face GLM-5-Next checkpoint directory and attach it to ``model``.
+
+    The shards holding ``layers.{num_hidden_layers}.*`` are found through the checkpoint's index
+    (:func:`glm5_next_mtp_checkpoint_files`); block-fp8 weights are dequantized with the checkpoint's own
+    ``quantization_config``. A remote checkpoint's shards are copied to a temporary directory one at a time.
+
+    Args:
+        model: The loaded GLM-5-Next causal LM.
+        checkpoint: Checkpoint directory (any path ``ePath`` reads, ``gs://`` included).
+        param_dtype: Parameter storage dtype of the head.
+        precision: Matmul precision of the head.
+        max_cache_length: Token capacity of the drafter-local MTP cache.
+
+    Returns:
+        The loaded head (also attached as ``model.mtp``).
+    """
+    import contextlib
+    import os
+    import tempfile
+
+    from eformer.paths import ePath, is_local_path
+
+    files, quantization_config = glm5_next_mtp_checkpoint_files(checkpoint, int(model.config.num_hidden_layers))
+    root = ePath(str(checkpoint))
+    kwargs = dict(
+        quantization_config=quantization_config,
+        param_dtype=param_dtype,
+        precision=precision,
+        max_cache_length=max_cache_length,
+    )
+    if is_local_path(str(checkpoint)):
+        return load_glm5_next_mtp(model, [str(root / name) for name in files], **kwargs)
+
+    @contextlib.contextmanager
+    def staged(stage: int) -> tp.Iterator[list[str]]:
+        del stage  # one draft stage: every nextn shard
+        with tempfile.TemporaryDirectory() as tmp:
+            local = []
+            for name in files:
+                path = os.path.join(tmp, name)
+                with open(path, "wb") as handle:
+                    handle.write((root / name).read_bytes())
+                local.append(path)
+            yield local
+
+    return load_glm5_next_mtp(model, stage_shards=staged, **kwargs)
+
+
 __all__ = [
     "DEFAULT_MTP_CACHE_LENGTH",
     "Glm5NextMTPHead",
     "Glm5NextMTPLayer",
     "attach_glm5_next_mtp",
+    "glm5_next_mtp_checkpoint_files",
     "glm5_next_mtp_config",
     "glm5_next_mtp_key_rules",
     "load_glm5_next_mtp",
+    "load_glm5_next_mtp_checkpoint",
     "scan_glm5_next_mtp_keys",
 ]

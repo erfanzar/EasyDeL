@@ -32,8 +32,11 @@ for correctness.
 
 from __future__ import annotations
 
+import socket
 import typing
 from dataclasses import dataclass
+
+from ..logger import logger
 
 if typing.TYPE_CHECKING:
     import threading
@@ -157,21 +160,125 @@ class LocalCoordinator:
         """No control plane to tear down."""
 
 
-def _default_leader_addr() -> str | None:
-    """Best-effort leader address from the JAX distributed runtime.
+_LEADER_ADDR_KEY = "easydel/esurge/zmq_leader_addr/{port}"
+_WILDCARD_BIND_HOSTS = frozenset({"", "*", "0.0.0.0", "::", "[::]"})
 
-    In standard pod launches process 0 hosts the JAX coordinator, so its
-    address is a correct default for the eSurge control-plane leader.
-    """
+
+def _jax_distributed_state():
+    """Return JAX's distributed ``global_state``, or ``None`` if JAX's internals are unavailable."""
     try:
         from jax._src.distributed import global_state
-
-        addr = getattr(global_state, "coordinator_address", None)
-        if addr:
-            return str(addr).rsplit(":", 1)[0]
     except Exception:
         return None
+    return global_state
+
+
+def _split_host_port(address: str) -> tuple[str, int | None]:
+    """Split ``host:port`` (an IPv6 host may be bracketed); the port is ``None`` when absent or not numeric."""
+    host, sep, port = str(address).rpartition(":")
+    if not sep or not port.isdigit():
+        return str(address).strip("[]"), None
+    return host.strip("[]"), int(port)
+
+
+def _default_leader_addr() -> str | None:
+    """Fallback leader address: the host of the JAX distributed coordinator.
+
+    Correct only when the coordinator runs on the process that becomes the eSurge leader
+    (``jax.process_index() == 0``). That does not hold on every TPU slice: the TPU runtime numbers processes by
+    chip position, while the coordinator is distributed process id 0 (the TPU worker id), so the two can be
+    different hosts. Workers therefore read the address the leader publishes (:func:`_published_leader_addr`)
+    first and use this only when nothing was published.
+    """
+    state = _jax_distributed_state()
+    addr = getattr(state, "coordinator_address", None) if state is not None else None
+    return _split_host_port(addr)[0] if addr else None
+
+
+def _local_ip_towards(host: str, port: int | None, family: int = socket.AF_UNSPEC) -> str | None:
+    """Source IP this host uses to reach ``host`` over ``family`` (a UDP connect only selects the route)."""
+    try:
+        infos = socket.getaddrinfo(host, port or 9, family=family, type=socket.SOCK_DGRAM)
+    except OSError:
+        return None
+    for family, socktype, proto, _canonname, sockaddr in infos:
+        try:
+            with socket.socket(family, socktype, proto) as probe:
+                probe.connect(sockaddr)
+                return str(probe.getsockname()[0])
+        except OSError:
+            continue
     return None
+
+
+def _advertised_leader_addr(bind_host: str, configured: str | None) -> str | None:
+    """Address workers should dial to reach this process's control plane.
+
+    Preference: an explicitly configured leader address, a concrete bind host, the interface this host uses to
+    reach the JAX coordinator (reachable by every process of the same JAX world), then the hostname's address.
+    """
+    if configured:
+        return str(configured)
+    if str(bind_host) not in _WILDCARD_BIND_HOSTS:
+        return str(bind_host)
+    state = _jax_distributed_state()
+    coordinator = getattr(state, "coordinator_address", None) if state is not None else None
+    if coordinator:
+        # Advertise an address of the family the control socket listens on: the default wildcard bind is IPv4, and
+        # a hostname coordinator on a dual-stack host can also resolve to IPv6.
+        family = socket.AF_INET6 if str(bind_host) in {"::", "[::]"} else socket.AF_INET
+        addr = _local_ip_towards(*_split_host_port(coordinator), family=family)
+        if addr:
+            return addr
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
+
+
+def _publish_leader_addr(control_port: int, bind_host: str, configured: str | None) -> str | None:
+    """Publish the leader's control-plane address in the ``jax.distributed`` key-value store.
+
+    Args:
+        control_port: Control-plane port (part of the key, so engines on different ports do not collide).
+        bind_host: Interface the leader binds on.
+        configured: The configured ``distributed_leader_addr``, if any.
+
+    Returns:
+        The published address, or ``None`` without a distributed client or when no address could be derived.
+    """
+    state = _jax_distributed_state()
+    client = getattr(state, "client", None) if state is not None else None
+    if client is None:
+        return None
+    addr = _advertised_leader_addr(bind_host, configured)
+    if not addr:
+        logger.warning("eSurge coordinator: could not derive an address to advertise for the leader control plane.")
+        return None
+    client.key_value_set(_LEADER_ADDR_KEY.format(port=int(control_port)), addr, allow_overwrite=True)
+    return addr
+
+
+def _published_leader_addr(control_port: int, timeout_s: float) -> str | None:
+    """Read the address the leader published in the ``jax.distributed`` key-value store.
+
+    Args:
+        control_port: Control-plane port the leader published under.
+        timeout_s: Seconds to wait for the leader to publish.
+
+    Returns:
+        The address, or ``None`` without a distributed client or when nothing was published in time.
+    """
+    state = _jax_distributed_state()
+    client = getattr(state, "client", None) if state is not None else None
+    if client is None:
+        return None
+    key = _LEADER_ADDR_KEY.format(port=int(control_port))
+    try:
+        return str(client.blocking_key_value_get(key, max(1, int(float(timeout_s) * 1000))))
+    except Exception as exc:  # deadline or a dead coordination service: fall back to the older defaults
+        logger.warning("eSurge coordinator: no leader address was published within %.0fs (%s).", timeout_s, exc)
+        return None
 
 
 def create_step_coordinator(
@@ -235,7 +342,7 @@ def create_step_coordinator(
         heartbeat_timeout_s=float(distributed_config.distributed_heartbeat_timeout_s),
     )
     if rank == 0:
-        return ZmqLeaderCoordinator(
+        leader = ZmqLeaderCoordinator(
             runner,
             world_size=world_size,
             bind_host=str(distributed_config.distributed_control_bind_host),
@@ -247,8 +354,21 @@ def create_step_coordinator(
             engine_spec=engine_spec,
             **common,
         )
+        if world_size > 1:
+            advertised = _publish_leader_addr(
+                control_port,
+                str(distributed_config.distributed_control_bind_host),
+                distributed_config.distributed_leader_addr,
+            )
+            if advertised:
+                logger.info("eSurge coordinator: leader control plane advertised at %s:%d.", advertised, control_port)
+        return leader
 
-    leader_addr = distributed_config.distributed_leader_addr or _default_leader_addr()
+    # Explicit address, then the one the leader published, then the coordinator's host, then DNS discovery.
+    leader_addr = distributed_config.distributed_leader_addr or _published_leader_addr(
+        control_port, float(distributed_config.distributed_connect_timeout_s)
+    )
+    leader_addr = leader_addr or _default_leader_addr()
     if not leader_addr and distributed_config.distributed_service_name:
         from .discovery import resolve_service_hosts
 

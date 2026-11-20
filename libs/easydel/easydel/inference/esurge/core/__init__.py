@@ -14,37 +14,14 @@
 
 """Core cache management components for the eSurge engine.
 
-This module provides the core infrastructure for managing KV-cache and
-attention mechanisms in the eSurge engine. It includes cache coordinators,
-page pools, and various attention pattern managers.
+The KV core (page pool, prefix cache, cache-group managers and coordinators) lives in surgecore's Rust crate;
+:class:`CacheManager` is its binding. Cache specifications (:class:`FullAttentionSpec`, :class:`SlidingWindowSpec`,
+:class:`ChunkedLocalAttentionSpec`) and :func:`create_kv_cache_specs_from_config` stay in Python.
 
-Classes:
-    CacheCoordinator: Main cache coordination
-    CacheManager: Cache allocation and management
-    PagePool: Pool of available cache pages
-    FullAttentionManager: Standard attention cache
-    SlidingWindowManager: Sliding window attention cache
-    ChunkedLocalAttentionManager: Chunked local attention
-
-Specifications:
-    AttentionSpec: Base attention specification
-    FullAttentionSpec: Full attention pattern
-    SlidingWindowSpec: Sliding window pattern
-    ChunkedLocalAttentionSpec: Chunked local pattern
-
-Example:
-    >>> from easydel.inference.esurge.core import CacheCoordinator, CacheGroupsConfig
-    >>>
-    >>> config = CacheGroupsConfig(groups=[...])
-    >>> coordinator = CacheCoordinator(
-    ...     config=config,
-    ...     max_num_reqs=32,
-    ...     page_pool=page_pool
-    ... )
-    >>> pages = coordinator.allocate(num_tokens=100)
+The former Python KV-core classes (``PagePool``, the cache coordinators and the single-type managers) are kept as
+names only: using one raises :class:`RuntimeError` that points to :class:`CacheManager`.
 """
 
-from .coordinator import CacheCoordinator, CacheCoordinatorNoPrefixCache, HybridCacheCoordinator, UnitaryCacheCoordinator
 from .interface import (
     AttentionSpec,
     CacheGroupsConfig,
@@ -56,13 +33,39 @@ from .interface import (
     create_kv_cache_specs_from_config,
 )
 from .manager import CacheManager, CachePages
-from .page_pool import PagePool
-from .single_type_cache_manager import (
-    ChunkedLocalAttentionManager,
-    FullAttentionManager,
-    SingleTypeCacheManager,
-    SlidingWindowManager,
-)
+
+
+class _RemovedMeta(type):
+    """Metaclass of a removed name: any attribute access raises, as instantiation does."""
+
+    def __getattr__(cls, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise RuntimeError(cls.__doc__)
+
+
+def _removed(name: str) -> type:
+    """A placeholder class for a KV-core name that moved into surgecore's Rust KV core."""
+    message = (
+        f"easydel.inference.esurge.core.{name} was removed: the KV core is now surgecore's Rust KvCore. "
+        "Use easydel.inference.esurge.core.CacheManager (same methods as before) instead."
+    )
+
+    def __new__(cls, *args, **kwargs):
+        raise RuntimeError(message)
+
+    return _RemovedMeta(name, (), {"__new__": __new__, "__doc__": message})
+
+
+CacheCoordinator = _removed("CacheCoordinator")
+CacheCoordinatorNoPrefixCache = _removed("CacheCoordinatorNoPrefixCache")
+UnitaryCacheCoordinator = _removed("UnitaryCacheCoordinator")
+HybridCacheCoordinator = _removed("HybridCacheCoordinator")
+PagePool = _removed("PagePool")
+SingleTypeCacheManager = _removed("SingleTypeCacheManager")
+FullAttentionManager = _removed("FullAttentionManager")
+SlidingWindowManager = _removed("SlidingWindowManager")
+ChunkedLocalAttentionManager = _removed("ChunkedLocalAttentionManager")
 
 __all__ = (
     "AttentionSpec",

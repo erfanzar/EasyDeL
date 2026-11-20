@@ -47,8 +47,9 @@ from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
-from spectrax import common_types
+from spectrax import common_types, with_sharding_constraint
 
+from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
     MLARaggedPagesCacheView,
     OperationsMetadata,
@@ -60,16 +61,21 @@ from easydel.caching import (
 )
 from easydel.infra.modeling_outputs import SparseAttentionLayerOutput
 from easydel.infra.sequence_packing import document_segment_ids, pairwise_attention_mask_from_mask_info
+from easydel.infra.sharding import inference_mode_forces_decode, mesh_axis_size, normalize_axis_names
 from easydel.layers.indexer import (
     IndexerSelection,
     ScoreRowSplit,
     compact_valid_layout,
     pool_bitmap_tail_error,
+    resolve_dsa_pool_kernel,
+    segment_pool_layout,
     use_sparse_training_attention,
 )
 from easydel.operations.kernels import DsaGatherAttn, DsaPoolSparseAttn
 from easydel.operations.kernels.dsa_sparse_attention import sparse_selected_training_attention
+from easydel.operations.kernels.multi_latent_ragged_page_attention import restore_ep_split_token_order
 
+from ..linears import gather_shared_input, resolve_gather_shared_projection_input
 from ..rotary import apply_mla_rope
 from ._unified import UnifiedAttention
 
@@ -249,6 +255,12 @@ class DeepSeekSparseAttention(UnifiedAttention):
             ``[B, S, kv_lora_rank]`` and ``k_pe [B, 1, S, qk_rope]``.
         """
         bsz, q_len, _ = hidden_states.shape
+        if resolve_gather_shared_projection_input(self.config, hidden_states):
+            # The query and KV-latent projections both contract the whole hidden axis. Gathered over tensor
+            # parallelism once (eSurge prefill / mixed steps under the automatic rule), each projection contracts
+            # locally; left feature-sharded, the partitioner moves the contraction onto another mesh axis and
+            # all-reduces the partial sums (int32 for W8A8 projections) across it.
+            hidden_states = gather_shared_input(hidden_states, self.config)
         q_resid = None
         if self.use_mla_lora:
             q_resid = self.mla_q_a_layernorm(checkpoint_name(self.mla_q_a_proj(hidden_states), name="attn_query_a"))
@@ -341,18 +353,108 @@ class DeepSeekSparseAttention(UnifiedAttention):
             frequencies=frequencies,
         )
 
-    def _project_output(self, attn_output: Array) -> Array:
+    @staticmethod
+    def _restore_token_order(projected: Array, token_order: dict | None) -> Array:
+        """Token order of the projected output when the sparse attention used a balanced expert-parallel split.
+
+        The output projection is row-independent, so it runs on the reordered tokens; the reorder is undone here,
+        after the hidden-state constraint has gathered the tokens (a local take).
+
+        Args:
+            projected: ``[batch, seq, hidden]`` from :meth:`_project_output`.
+            token_order: The holder the op filled (``{"shards": n}``), or ``None`` / empty when no reorder ran.
+
+        Returns:
+            ``projected`` in token order.
+        """
+        shards = (token_order or {}).get("shards")
+        return projected if not shards else restore_ep_split_token_order(projected, int(shards))
+
+    def _project_output(self, attn_output: Array, token_split: PartitionSpec | None = None) -> Array:
         """Output projection between the hidden-state sharding constraints.
+
+        Args:
+            attn_output: Merged heads ``[batch, seq, heads * v_head_dim]``.
+            token_split: Layout of the projection's input from :meth:`_serving_token_split_spec`: the hidden-state
+                layout with the tokens also split over the expert-parallel axis. The projection then runs on each
+                shard's tokens only and the hidden-state constraint after it gathers the projected output.
+                ``None`` constrains the input to the hidden-state layout.
+
+        Returns:
+            The projected output ``[batch, seq, hidden]``.
+        """
+        if token_split is None:
+            attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
+        else:
+            attn_output = with_sharding_constraint(attn_output, token_split, mesh=self.config.mesh)
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+        return self.shard_attention_prod(attn_output)
+
+    def _serving_token_split_spec(self, attn_output: Array) -> PartitionSpec | None:
+        """Layout keeping a serving step's attention output split over the expert-parallel axis through ``o_proj``.
+
+        The expert-parallel axis only replicates attention. With ``dsa_serving_ep_split`` the sparse attention already
+        returns its output token-sharded over it; constraining that output to the hidden-state layout before the output
+        projection all-gathered every token's heads and ran the projection (and, for W8A8 projections, its int32
+        reductions) for all tokens on every shard. Kept split, each shard projects its own tokens and only the
+        ``[tokens, hidden]`` output is gathered by the constraint after the projection. A replicated attention output
+        is sliced locally, so the projection still runs on ``1 / ep`` of the tokens.
+
+        Applies to MLA ragged-pages (serving) calls outside eSurge's decode layout (``decode_mode_specs``), unless
+        ``dsa_serving_ep_split`` is ``False``, on an expert-parallel axis of more than one device that the hidden-state
+        layout does not use, without data-parallel KV pages, and when the axes divide the token count.
 
         Args:
             attn_output: Merged heads ``[batch, seq, heads * v_head_dim]``.
 
         Returns:
-            The projected output ``[batch, seq, hidden]``.
+            The hidden-state spec with the expert-parallel axes added to the token entry, or ``None``.
         """
-        attn_output = self.shard_attention_prod(attn_output, pre_projection=True)
-        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-        return self.shard_attention_prod(attn_output)
+        if getattr(self.config, "dsa_serving_ep_split", None) is False or inference_mode_forces_decode():
+            return None
+        mesh = getattr(self.config, "mesh", None)
+        resolver = getattr(self.config, "runtime_sharding_resolver", None)
+        partition_axis = getattr(self.config, "partition_axis", None)
+        if mesh is None or resolver is None or partition_axis is None or getattr(mesh, "is_mpmd", False):
+            return None
+        if attn_output.ndim != 3 or mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_axis)) > 1:
+            return None
+        names = normalize_axis_names(getattr(partition_axis, "expert_parallel_axis", None))
+        names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
+        if not names:
+            return None
+        spec = tuple(resolver.resolve(dynamic_axes=common_types.HiddenStateSharding, shape=tuple(attn_output.shape)))
+        spec = spec + (None,) * (3 - len(spec))
+        if {axis for entry in spec for axis in normalize_axis_names(entry)}.intersection(names):
+            return None
+        tokens = (*normalize_axis_names(spec[1]), *names)
+        if int(attn_output.shape[1]) % mesh_axis_size(mesh, tokens):
+            return None
+        return PartitionSpec(spec[0], tokens[0] if len(tokens) == 1 else tokens, spec[2])
+
+    def _resolved_pool_kernel(self) -> str:
+        """``dsa_pool_kernel`` with ``None`` resolved for this layer (see :func:`resolve_dsa_pool_kernel`)."""
+        return resolve_dsa_pool_kernel(
+            self.config.dsa_pool_kernel,
+            self.indexer.config.kpool_size,
+            latent_dim=self.kv_lora_rank,
+            latent_dtype=self.attention_performer.metadata.runtime_dtype,
+        )
+
+    def _pool_takes_packed_documents(self, mask_info: MaskInfo) -> bool:
+        """Packed documents run on the pool path when they come as explicit segment ids and the gather kernel runs.
+
+        The documents are laid out on a pool-aligned key grid (:func:`segment_pool_layout`) that is longer than the
+        sequence; the gather kernel reads any key grid length, the bitmap kernel assumes keys == queries. Segment ids
+        derived from an arbitrary pairwise mask are not taken: the pairwise structure need not be block-diagonal.
+        """
+        if getattr(mask_info, "_q_segment_ids", None) is None:
+            return False
+        if getattr(mask_info, "_kv_segment_ids", None) is not None and (
+            mask_info._kv_segment_ids.shape != mask_info._q_segment_ids.shape
+        ):
+            return False
+        return self._resolved_pool_kernel() == "gather"
 
     def _use_dsa_pool_training(
         self,
@@ -386,10 +488,10 @@ class DeepSeekSparseAttention(UnifiedAttention):
         reasons = []
         if cache_view is not None:
             reasons.append("a cache is attached")
-        if not mask_info.padding_only:
+        if not mask_info.padding_only and not self._pool_takes_packed_documents(mask_info):
             reasons.append(
-                "the mask carries packed documents or a custom pairwise mask (MaskInfo.padding_only is False; "
-                "the pool path supports per-row padding only)"
+                "the mask carries packed documents without explicit segment ids, or a custom pairwise mask, or "
+                "the bitmap pool kernel is selected (packed documents need explicit segment ids and the gather kernel)"
             )
         if shared_indexer:
             reasons.append("the layer reuses a shared indexer selection")
@@ -434,6 +536,7 @@ class DeepSeekSparseAttention(UnifiedAttention):
         query_states: Array,
         compressed_kv: Array,
         q_mask: Array | None,
+        segments: Array | None = None,
     ) -> SparseAttentionLayerOutput:
         """No-cache DSA forward without ``O(seq^2)`` tensors.
 
@@ -461,9 +564,13 @@ class DeepSeekSparseAttention(UnifiedAttention):
             ValueError: If the bitmap kernel cannot take the indexer's tail keys
                 (:func:`~easydel.layers.indexer.pool_bitmap_tail_error`).
         """
-        if self.config.dsa_pool_kernel == "gather":
-            return self._forward_dsa_pool_gather(hidden_states, q_resid, query_states, compressed_kv, q_mask)
         kpool = self.indexer.config.kpool_size
+        if self._resolved_pool_kernel() == "gather":
+            return self._forward_dsa_pool_gather(
+                hidden_states, q_resid, query_states, compressed_kv, q_mask, segments=segments
+            )
+        if segments is not None:
+            raise ValueError("packed documents on the DSA pool path need dsa_pool_kernel='gather'.")
         tail_error = pool_bitmap_tail_error(kpool, self.indexer.config.select_tail)
         if tail_error is not None:
             raise ValueError(tail_error)
@@ -512,6 +619,7 @@ class DeepSeekSparseAttention(UnifiedAttention):
         query_states: Array,
         compressed_kv: Array,
         q_mask: Array | None,
+        segments: Array | None = None,
     ) -> SparseAttentionLayerOutput:
         """``dsa_pool_kernel="gather"`` variant of :meth:`_forward_dsa_pool_training`.
 
@@ -543,16 +651,25 @@ class DeepSeekSparseAttention(UnifiedAttention):
         # Split the indexer's per-chunk score rows like the attention's queries; the activation layout replicates
         # them over the tensor axes, so every tensor-parallel device would repeat the whole selection.
         row_split = ScoreRowSplit(mesh=layout.mesh, rows=layout.query_row_entries) if split else None
-        key_layout = None if q_mask is None else compact_valid_layout(q_mask)
         kpool = self.indexer.config.kpool_size
+        seg_layout = None
+        key_layout = None
+        if segments is not None:
+            # Packed documents: every document starts a pool on the key grid, so neither a selected pool nor the tail
+            # crosses a document boundary, and the indexer only offers a query pools of its own document.
+            seg_layout = segment_pool_layout(segments, kpool)
+            key_layout = seg_layout
+        elif q_mask is not None:
+            key_layout = compact_valid_layout(q_mask)
         pool_ids, _ = self.indexer.select_pools_chunked(
             hidden_states,
             q_resid,
-            q_mask,
+            None if seg_layout is not None else q_mask,
             query_chunk_size=int(self.config.dsa_pool_query_chunk),
             as_indices=True,
             row_split=row_split,
-            layout=key_layout,
+            layout=None if seg_layout is not None else key_layout,
+            segment_layout=seg_layout,
         )
         if key_layout is None:
             positions = jnp.broadcast_to(jnp.arange(q_len, dtype=jnp.int32)[None, :], (bsz, q_len))
@@ -661,12 +778,19 @@ class DeepSeekSparseAttention(UnifiedAttention):
             return_topk_indices=return_topk_indices,
             mode=mode,
         ):
+            segments = None
+            if not mask_info.padding_only:
+                segments = mask_info._q_segment_ids
+                if segments.ndim == 3:
+                    segments = segments[:, 0]
+                segments = segments[:, :q_len].astype(jnp.int32)
             return self._forward_dsa_pool_training(
                 hidden_states,
                 q_resid,
                 q_nope.transpose(0, 2, 1, 3),
                 compressed_kv,
                 mask_info.q_attention_mask[:, :q_len].astype(jnp.bool_),
+                segments=segments,
             )
 
         if attention_view is None:
@@ -774,9 +898,21 @@ class DeepSeekSparseAttention(UnifiedAttention):
         )
 
         combined_mask = None
+        token_order = None
         if selection is not None and ragged:
             mla_kwargs["sparse_selected"] = selection.indices.reshape(bsz * q_len, -1)
             mla_kwargs["sparse_chunk_size"] = self.indexer.selection_chunk_size
+            # Serving only (an MLA ragged-pages view): the op resolves ``dsa_serving_ep_split`` (``None`` = automatic,
+            # ``True`` = on, ``False`` = off) against its mesh and cache layout, and where it applies splits the
+            # sparse attention's query tokens over the expert-parallel axis (``resolve_dsa_serving_ep_split``).
+            mla_kwargs["sparse_ep_split"] = getattr(self.config, "dsa_serving_ep_split", None)
+            from easydel.utils.inference_mode import is_inference_mode  # lazy: utils imports layers
+
+            if getattr(self.config, "dsa_serving_ep_balance", False) and is_inference_mode():
+                # Opt-in (dsa_serving_ep_balance, approximate): the expert-parallel split gives each shard an early and a late token window; the op records
+                # its token order here and the projected output is put back in token order below.
+                token_order = {}
+                mla_kwargs["sparse_token_order"] = token_order
         elif selection is not None:
             kv_len = key_states.shape[1]
             topk_mask = selection.to_mask(kv_len)
@@ -861,7 +997,10 @@ class DeepSeekSparseAttention(UnifiedAttention):
             attn_output = self._merge_heads(attentions.attention_outputs)
 
         result = SparseAttentionLayerOutput(
-            attention_output=self._project_output(attn_output),
+            attention_output=self._restore_token_order(
+                self._project_output(attn_output, self._serving_token_split_spec(attn_output) if ragged else None),
+                token_order,
+            ),
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
             indexer_aux_loss=indexer_aux_loss,

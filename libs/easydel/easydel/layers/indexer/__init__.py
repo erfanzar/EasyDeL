@@ -51,10 +51,13 @@ from ._paged import (
 from ._paged_block_topk import paged_block_topk
 from ._primitives import (
     CompactLayout,
+    SegmentPoolLayout,
     compact_valid_layout,
     indices_to_bool_mask,
     is_vacuous_selection,
     permute_tokens,
+    segment_pool_layout,
+    segment_pool_max_documents,
     ste_score_proxy,
     topk_select,
     topk_selection_mask,
@@ -65,13 +68,19 @@ from ._shared_key import (
     IndexerScoreInputs,
     SharedKeyIndexer,
     SharedKeyIndexerConfig,
+    resolve_index_scoring_kernel,
     select_candidate_blocks,
     selection_bias,
     shared_key_scores,
     warn_unsupported_scoring_kernel,
 )
 from ._token import TokenIndexer, TokenIndexerConfig
-from ._training import AUTO_SPARSE_MIN_SEQ, pool_bitmap_tail_error, use_sparse_training_attention
+from ._training import (
+    AUTO_SPARSE_MIN_SEQ,
+    pool_bitmap_tail_error,
+    resolve_dsa_pool_kernel,
+    use_sparse_training_attention,
+)
 
 __all__ = (
     "AUTO_SPARSE_MIN_SEQ",
@@ -91,6 +100,7 @@ __all__ = (
     "IndexerScoreInputs",
     "IndexerSelection",
     "ScoreRowSplit",
+    "SegmentPoolLayout",
     "SelectionSpec",
     "SharedKeyIndexer",
     "SharedKeyIndexerConfig",
@@ -112,7 +122,11 @@ __all__ = (
     "paged_token_select",
     "permute_tokens",
     "pool_bitmap_tail_error",
+    "resolve_dsa_pool_kernel",
+    "resolve_index_scoring_kernel",
     "running_entry_topk",
+    "segment_pool_layout",
+    "segment_pool_max_documents",
     "select_candidate_blocks",
     "selection_bias",
     "shared_key_scores",

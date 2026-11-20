@@ -35,6 +35,7 @@ members = [
     "ejkernel",
     "eray",
     "spectrax-lib",
+    "surgecore",
 ]
 
 [[package]]
@@ -778,6 +779,7 @@ dependencies = [
     { name = "ray", extra = ["default"], marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "sentencepiece", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "spectrax-lib", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+    { name = "surgecore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "transformers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
     { name = "uvloop", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
@@ -851,6 +853,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "spectrax-lib", editable = "libs/spectrax" },
+    { name = "surgecore", editable = "libs/surgecore" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tensorflow", marker = "extra == 'tensorflow'", specifier = "~=2.19.0" },
     { name = "tensorflow-datasets", marker = "extra == 'tensorflow'", specifier = "~=4.9.9" },
@@ -5034,6 +5037,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/c4/68/79977123bb7be889a
 wheels = [
     { url = "https://files.pythonhosted.org/packages/81/0d/13d1d239a25cbfb19e740db83143e95c772a1fe10202dda4b76792b114dd/starlette-0.52.1-py3-none-any.whl", hash = "sha256:0029d43eb3d273bc4f83a08720b4912ea4b071087a3b48db01b7c839f7954d74", size = 74272, upload-time = "2026-01-18T13:34:09.188Z" },
 ]
+
+[[package]]
+name = "surgecore"
+version = "0.0.1"
+source = { editable = "libs/surgecore" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-12-spectrax-lib-cuda' and extra == 'extra-12-spectrax-lib-tpu') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu') or (extra == 'extra-7-easydel-profile' and extra == 'extra-7-easydel-tensorflow')" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy" }]
 
 [[package]]
 name = "sympy"

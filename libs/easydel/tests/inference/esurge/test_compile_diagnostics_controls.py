@@ -123,7 +123,7 @@ def test_dp_local_page_configuration_preserves_default_and_overrides(monkeypatch
         monkeypatch.delenv(name, raising=False)
     else:
         monkeypatch.setenv(name, setting)
-    # Construction normally transfers placeholders. Keep this test host-only.
+    # Construction and step preparation normally transfer to the device. Keep this test host-only.
     monkeypatch.setattr(batch_preparer.jax, "device_put", lambda value, sharding: value)
     preparer = batch_preparer.BatchMetadataPreparer(
         metadata=SimpleNamespace(
@@ -141,14 +141,30 @@ def test_dp_local_page_configuration_preserves_default_and_overrides(monkeypatch
         min_input_pad=1,
     )
     # Request row 0 belongs to shard 0 (pages 1..3), not shard 1's page 4.
-    kwargs = dict(
-        num_requests=1,
-        scheduled=np.array([1]),
-        num_computed_tokens_cpu=np.array([0]),
-        page_table_cpu=np.array([[4, 0]], dtype=np.int32),
+    page_table = np.zeros((4, 2), dtype=np.int32)
+    page_table[0, 0] = 4
+    step = dict(
+        num_tokens_static=8,
+        scheduled_full_cpu=np.array([1, 0, 0, 0], dtype=np.int32),
+        active_mask_full_cpu=np.array([True, False, False, False]),
+        input_ids_buf=None,
+        position_ids_buf=None,
+        token_ids_cpu=np.zeros((4, 16), dtype=np.int32),
+        num_computed_tokens_cpu=np.zeros((4,), dtype=np.int32),
+        temperature_cpu=np.zeros((4,), dtype=np.float32),
+        top_p_cpu=np.ones((4,), dtype=np.float32),
+        top_k_cpu=np.zeros((4,), dtype=np.int32),
+        min_p_cpu=np.zeros((4,), dtype=np.float32),
+        frequency_penalties_cpu=np.zeros((4,), dtype=np.float32),
+        presence_penalties_cpu=np.zeros((4,), dtype=np.float32),
+        repetition_penalties_cpu=np.ones((4,), dtype=np.float32),
+        page_table_cpu=page_table,
+        padded_num_reqs_in=4,
     )
     if enabled:
         with pytest.raises(ValueError, match="Non-DP-local page IDs"):
-            preparer._enforce_dp_local_page_tables(**kwargs)
+            preparer.prepare_batch_metadata(**step)
     else:
-        preparer._enforce_dp_local_page_tables(**kwargs)
+        metadata, *_ = preparer.prepare_batch_metadata(**step)
+        # Unchecked, the foreign page reaches the request's rank-major page-table row unchanged.
+        np.testing.assert_array_equal(np.asarray(metadata.pages_tables)[0], [4, 0])

@@ -37,12 +37,15 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import jax.numpy as jnp
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec import NullSpeculation
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.modules.llama import LlamaConfig, LlamaForCausalLM
+
+try:
+    from .._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 PROMPT_TOKEN_IDS = [3, 1, 4, 1, 5, 9]
 OUTPUT_LEN = 8
@@ -68,14 +71,14 @@ def _make_tiny_model() -> LlamaForCausalLM:
 def _generate_tokens(runner: eSurgeRunner) -> list[int]:
     """Run one full greedy generation through scheduler + runner; return tokens."""
     runner.reset_state()
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner,
         max_num_batched_tokens=16,
         enable_prefix_caching=False,
         async_scheduling=False,
         num_draft_tokens=runner.num_draft_tokens,
     )
-    request = EngineRequest(
+    request = served_request(
         request_id="null-spec-0",
         prompt_token_ids=list(PROMPT_TOKEN_IDS),
         sampling_params=SamplingParams(max_tokens=OUTPUT_LEN, temperature=0.0, ignore_eos=True),
@@ -86,7 +89,7 @@ def _generate_tokens(runner: eSurgeRunner) -> list[int]:
     for _ in range(64):
         scheduler_output = scheduler.schedule()
         output = runner.execute_model(scheduler_output)
-        scheduler.update_from_output(scheduler_output, output)
+        scheduler.commit(scheduler_output, output)
         if request.is_finished():
             break
     else:

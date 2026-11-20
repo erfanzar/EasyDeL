@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ...sampling_params import SamplingParams
     from ..multimodal import MultiModalFeature
-    from ..request import EngineRequest
+    from ..request import AdmissionRecord
 
 
 @dataclass
@@ -115,32 +115,35 @@ class NewRequestData:
     @classmethod
     def from_request(
         cls,
-        request: EngineRequest,
+        request: AdmissionRecord,
         page_ids: tuple[list[int], ...],
+        num_computed_tokens: int = 0,
         dp_rank: int | None = None,
     ) -> NewRequestData:
-        """Create a NewRequestData instance from an EngineRequest.
+        """Create a NewRequestData instance from an admission record.
 
-        This factory method extracts all necessary data from an EngineRequest
+        This factory method extracts all necessary data from an AdmissionRecord
         to create a NewRequestData instance for scheduling.
 
         Args:
-            request: The engine request to extract data from.
+            request: The admission record of the request.
             page_ids: The allocated KV cache page IDs for this request.
+            num_computed_tokens: Tokens already computed (the prefix hit), as the engine core planned them.
+            dp_rank: Data-parallel rank of the request, if any.
 
         Returns:
             NewRequestData: A new instance containing the request data.
 
         Example:
             >>> page_ids = ([0, 1, 2],)  # Single cache group
-            >>> new_data = NewRequestData.from_request(request, page_ids)
+            >>> new_data = NewRequestData.from_request(record, page_ids, num_computed_tokens=0)
         """
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
             sampling_params=request.sampling_params,
             page_ids=page_ids,
-            num_computed_tokens=request.num_computed_tokens,
+            num_computed_tokens=int(num_computed_tokens),
             dp_rank=dp_rank,
             # Vision-language model data
             pixel_values=request.pixel_values,
@@ -369,10 +372,27 @@ class SchedulerOutput:
     """Scheduled request IDs grouped by their owning DP rank."""
 
     pending_structured_output_tokens: bool = False
-    """True when a structured-output request still has unresolved async placeholders (set by ``AsyncScheduler``)."""
+    """True when a structured-output request still has unresolved async placeholders (set by the engine core)."""
 
     recurrent_snapshot_restores: dict[str, int] = field(default_factory=dict)
     """Request id -> recurrent snapshot slot to copy into the request's state row before this step's forward."""
 
     recurrent_snapshot_saves: dict[str, int] = field(default_factory=dict)
     """Request id -> recurrent snapshot slot to fill from the request's state row after this step's forward."""
+
+    num_draft_tokens_next: int = -1
+    """Drafts the runner produces for the next step: 0 skips the drafter, -1 (not set by an engine core) is the
+    runner's configured count. The engine core sets the configured count, or its verification budget's choice."""
+
+    spec_slots: dict[str, int] = field(default_factory=dict)
+    """Request id -> output slots of a request that samples this step: 1 + the drafts it verifies. Under async
+    scheduling the engine core counts every one of them as accepted until the step's commit."""
+
+    inflight_drafts: dict[str, int] = field(default_factory=dict)
+    """Drafts of earlier uncommitted steps counted as accepted by an optimistic start; entries starting from
+    committed state are absent. Zero means the earlier step verified no drafts."""
+
+    async_safe: bool = False
+    """The engine core's ``PLAN_ASYNC_SAFE``: the next step may be dispatched before this one's tokens reach the host.
+    With speculation, every entry is a running decode window of 1 + k (or 1 without drafts) and the device corrects
+    the next step's starts by this step's rejected drafts."""

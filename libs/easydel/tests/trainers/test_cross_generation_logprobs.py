@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from easydel.inference import SamplingParams
 from easydel.trainers import base_trainer as module
+from easydel.trainers._shared import esurge_generation
 from easydel.trainers.base_trainer import GenerationResults
 from easydel.trainers.trainer.trainer import Trainer
 
@@ -23,8 +24,8 @@ def request(prompt, completions):
 def reconstruct(monkeypatch, outputs, **kwargs):
     # Only the host-to-device conversion at the end is replaced: parsing,
     # sampled-token selection, padding/truncation, and sorting are production code.
-    monkeypatch.setattr(module, "jnp", np)
-    return object.__new__(Trainer)._esurge_outputs_to_arrays(
+    monkeypatch.setattr(esurge_generation, "jnp", np)
+    return esurge_generation.outputs_to_arrays(
         outputs,
         input_ids=kwargs.pop("input_ids", None),
         attention_mask=None,
@@ -37,7 +38,9 @@ def reconstruct(monkeypatch, outputs, **kwargs):
 
 
 def test_logprobs_follow_sampled_token_not_top_candidate_and_align_n_sampling(monkeypatch):
+    # Outputs arrive in request order, one per caller row.
     outputs = [
+        request(10, [completion([5, 6], [{5: -0.5}, {6: SimpleNamespace(logprob=-0.75)}]), completion([], [])]),
         request(
             20,
             [
@@ -45,7 +48,6 @@ def test_logprobs_follow_sampled_token_not_top_candidate_and_align_n_sampling(mo
                 completion([8, 9, 10, 11], [{8: -3.0}, {9: -4.0}, {10: -5.0}, {11: -6.0}]),
             ],
         ),
-        request(10, [completion([5, 6], [{5: -0.5}, {6: SimpleNamespace(logprob=-0.75)}]), completion([], [])]),
     ]
     arrays = reconstruct(monkeypatch, outputs, input_ids=np.array([[0, 10], [0, 20]]))
     assert arrays.completion_ids.tolist() == [[5, 6, 0], [0, 0, 0], [7, 0, 0], [8, 9, 10]]
@@ -79,31 +81,36 @@ def test_mixed_present_and_missing_payload_is_rejected(monkeypatch):
 
 
 def test_backend_requests_and_returns_logprobs_without_mutating_params(monkeypatch):
-    monkeypatch.setattr(module, "jnp", np)
+    monkeypatch.setattr(esurge_generation, "jnp", np)
+    monkeypatch.setattr(module, "esurge_generation", esurge_generation)
+    monkeypatch.setattr(esurge_generation, "engine_kwargs", lambda args, **kwargs: {"max_num_seqs": 1})
     trainer = object.__new__(Trainer)
     trainer.arguments = SimpleNamespace(max_length=2, esurge_use_tqdm=False)
     trainer._normalize_esurge_prompts = lambda prompts, apply_chat_template: prompts
-    trainer._esurge_init_kwargs = lambda: {"reserve_tokens": 0}
     trainer.maybe_release_generation_runtime = lambda results, **kwargs: results
     received = []
+    received_ids = []
     gathered = []
 
-    def call_engine(engine, **kwargs):
-        received.append(kwargs["sampling_params"])
-        return [request(10, [completion([5], [{5: -0.5}])])]
+    class Engine:
+        def generate(self, *, prompts, sampling_params, use_tqdm, prompt_token_ids):
+            del prompts, use_tqdm
+            received.append(sampling_params)
+            received_ids.append(prompt_token_ids)
+            return [request(10, [completion([5], [{5: -0.5}])])]
 
     def gather(value):
         gathered.append(value)
         return value
 
     trainer._all_gather = gather
-    state = SimpleNamespace(model=SimpleNamespace(get_esurge=lambda **kwargs: object(), _call_esurge_engine=call_engine))
+    state = SimpleNamespace(model=SimpleNamespace(get_esurge=lambda **kwargs: Engine()))
     params = SamplingParams(max_tokens=3)
     for _ in range(2):  # Initial and follow-up tool rollouts use the same entry point.
         result = trainer._generate_via_esurge(
             input_ids=np.array([[0, 10]]),
             attention_mask=np.array([[0, 1]]),
-            prompts=[10],
+            prompts=["ten"],
             processor=None,
             pad_token_id=0,
             sampling_params=params,
@@ -114,6 +121,11 @@ def test_backend_requests_and_returns_logprobs_without_mutating_params(monkeypat
             clear_esurge_compiled_cache_after_generation=False,
         )
         assert result.sampling_per_token_logps.tolist() == [[-0.5, 0.0, 0.0]]
+        # The caller's prompt row is returned unchanged and starts every sequence row.
+        assert result.prompt_ids.tolist() == [[0, 10]]
+        assert result.sequences.tolist() == [[0, 10, 5, 0, 0]]
+    # Pretokenized rows reach the engine as their mask-selected ids, without re-tokenization.
+    assert received_ids == [[[10]], [[10]]]
     assert params.logprobs is None
     assert all(sampling.logprobs == 0 and sampling is not params for sampling in received)
     assert len(gathered) == 12  # Includes sampled logprobs, aligned with the five token/mask arrays.

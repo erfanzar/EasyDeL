@@ -72,7 +72,6 @@ def main() -> None:
             "max_length": 1024,
             "num_return_sequences": 2,
             "generation_num_return_sequences": 2,
-            "use_esurge_generation": True,
             "generation_top_p": 0.9,
             "generation_temperature": 0.7,
             "use_wandb": False,

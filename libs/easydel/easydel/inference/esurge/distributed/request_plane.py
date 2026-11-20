@@ -27,7 +27,7 @@ Two halves:
 
 * :class:`OwnerRequestPlane` — leader side. Receives ``Admit`` messages
   (handed off from the coordinator IO thread), renames the origin-built
-  ``EngineRequest`` objects into the owner id space, enqueues them on the
+  ``AdmissionRecord`` objects into the owner id space, enqueues them on the
   scheduler, and tees each step's engine outputs back to the origins as
   ``OutputUpdate`` deltas. All engine-touching work runs on a dedicated
   ingest thread — never on the socket IO thread.
@@ -77,7 +77,7 @@ from ..logger import logger
 from . import wire
 
 if typing.TYPE_CHECKING:
-    from ..request import EngineRequest
+    from ..request import AdmissionRecord
     from .zmq_coordinator import ZmqLeaderCoordinator, ZmqWorkerCoordinator
 
 _STOP = object()
@@ -116,7 +116,7 @@ def _is_coalescable_id(request_id: str) -> bool:
     return _AUTO_ID_PATTERN.match(request_id) is not None
 
 
-def _group_by_parent(scheduler_requests: list[EngineRequest]) -> list[tuple[str, list[EngineRequest]]]:
+def _group_by_parent(scheduler_requests: list[AdmissionRecord]) -> list[tuple[str, list[AdmissionRecord]]]:
     """Group admission-built requests by parent id, preserving order.
 
     Args:
@@ -126,7 +126,7 @@ def _group_by_parent(scheduler_requests: list[EngineRequest]) -> list[tuple[str,
     Returns:
         ``[(parent_id, [requests...]), ...]`` in first-seen order.
     """
-    groups: dict[str, list[EngineRequest]] = {}
+    groups: dict[str, list[AdmissionRecord]] = {}
     for request in scheduler_requests:
         parent_id = request.parent_request_id or request.request_id
         groups.setdefault(parent_id, []).append(request)
@@ -223,7 +223,7 @@ class OwnerRequestPlane:
     Args:
         coordinator: The leader step coordinator (targeted sends).
         scheduler_submit: Engine callable enqueueing a batch of
-            ``EngineRequest`` directly under the scheduler lock.
+            ``AdmissionRecord`` directly under the scheduler lock.
         abort_request: Engine callable cancelling one request id.
         apply_stop_strings: Engine callable routing
             ``{request_id: stop_string}`` to the scheduler-safe stop queue.
@@ -243,7 +243,7 @@ class OwnerRequestPlane:
         self,
         *,
         coordinator: ZmqLeaderCoordinator,
-        scheduler_submit: typing.Callable[[list[EngineRequest]], None],
+        scheduler_submit: typing.Callable[[list[AdmissionRecord]], None],
         abort_request: typing.Callable[[str], None],
         apply_stop_strings: typing.Callable[[dict[str, str]], None],
         submit_local_outputs: typing.Callable[[dict[int, EngineCoreOutputs]], None],
@@ -348,7 +348,7 @@ class OwnerRequestPlane:
         """
         self._queue.put(("outputs", None, engine_outputs, None))
 
-    def admit_local(self, scheduler_requests: list[EngineRequest]) -> None:
+    def admit_local(self, scheduler_requests: list[AdmissionRecord]) -> None:
         """Route the owner's own admissions through the coalescing table.
 
         Non-coalescable parents (explicit caller ids) schedule directly,
@@ -372,7 +372,7 @@ class OwnerRequestPlane:
         """
         from ..engine.admission import compute_admission_key
 
-        to_schedule: list[EngineRequest] = []
+        to_schedule: list[AdmissionRecord] = []
         created_entries: list[_CoalesceEntry] = []
         with self._lock:
             for parent_id, requests in _group_by_parent(scheduler_requests):
@@ -584,7 +584,7 @@ class OwnerRequestPlane:
         try:
             if payload is None:
                 raise RequestPlaneError("Admit carried no request payload")
-            requests: list[EngineRequest] = wire.decode_payload(payload)
+            requests: list[AdmissionRecord] = wire.decode_payload(payload)
             origin_parent = admit.request_id
             if admit.n_samples != len(requests):
                 raise RequestPlaneError(
@@ -611,7 +611,7 @@ class OwnerRequestPlane:
             return
         self._coordinator.send_to_peer(identity, ack, ack_payload)
 
-    def _admit_remote_distinct(self, identity: bytes, admit: wire.Admit, requests: list[EngineRequest]) -> None:
+    def _admit_remote_distinct(self, identity: bytes, admit: wire.Admit, requests: list[AdmissionRecord]) -> None:
         """Distinct path: schedule a non-coalescable remote group under ``r...`` ids.
 
         Workers retain their compact identity digest: their rank and
@@ -654,12 +654,12 @@ class OwnerRequestPlane:
             raise
 
     def _admit_remote_coalescable(
-        self, identity: bytes, admit: wire.Admit, requests: list[EngineRequest]
+        self, identity: bytes, admit: wire.Admit, requests: list[AdmissionRecord]
     ) -> tuple[wire.AdmitAck, bytes | None]:
         """Coalescing path: create the group or attach as a subscriber."""
         origin_parent = admit.request_id
         key = (admit.coalesce_counter, admit.content_hash)
-        to_schedule: list[EngineRequest] | None = None
+        to_schedule: list[AdmissionRecord] | None = None
         ack_payload: bytes | None = None
         already_finished = False
         with self._lock:
@@ -955,7 +955,7 @@ class OriginRequestPlane:
 
         coordinator.set_plane_handler(self._handle_inbound)
 
-    def submit_remote(self, scheduler_requests: list[EngineRequest]) -> None:
+    def submit_remote(self, scheduler_requests: list[AdmissionRecord]) -> None:
         """Forward admission-built requests to the owner and await its acks.
 
         Called on the admitting caller's thread with no engine locks held.

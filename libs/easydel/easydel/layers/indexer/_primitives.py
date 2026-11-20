@@ -275,18 +275,118 @@ def compact_valid_layout(valid: Bool[Array, "batch seq"]) -> CompactLayout:
     before_pad = pad_through - is_pad
     num_valid = valid_through[:, -1:]
     inverse = jnp.where(is_valid > 0, before_valid, num_valid + before_pad).astype(jnp.int32)
-    # Compact slot j holds the (j)-th valid token (j < num_valid) or the (j - num_valid)-th padding token: the first
-    # index whose running count exceeds it. A binary search per slot instead of an argsort of ``inverse``.
     slots = jnp.arange(seq_len, dtype=jnp.int32)
-    # ``method="scan"``: log2(seq) vectorised steps, never the [seq, seq] comparison of ``"compare_all"``.
-    first_valid = jax.vmap(lambda c: jnp.searchsorted(c, slots, side="right", method="scan"))(valid_through)
-    first_pad = jax.vmap(lambda c, n: jnp.searchsorted(c, slots - n, side="right", method="scan"))(
-        pad_through, num_valid[:, 0]
-    )
-    order = jnp.clip(jnp.where(slots[None, :] < num_valid, first_valid, first_pad), 0, seq_len - 1).astype(jnp.int32)
+    # A permutation is the identity exactly when its inverse is, so unpadded and right-padded batches are recognised
+    # from ``inverse`` and skip the searches. On TPU v5p the searches took 0.55 s per training step of a 45-layer
+    # GLM-5.3-Flash at 131072 tokens per sequence.
+    identity = jnp.all(inverse == slots[None, :])
+
+    def search(counts):
+        # Compact slot j holds the (j)-th valid token (j < num_valid) or the (j - num_valid)-th padding token: the
+        # first index whose running count exceeds it. A binary search per slot instead of an argsort of ``inverse``.
+        # ``method="scan"``: log2(seq) vectorised steps, never the [seq, seq] comparison of ``"compare_all"``.
+        valid_counts, pad_counts, n_valid = counts
+        first_valid = jax.vmap(lambda c: jnp.searchsorted(c, slots, side="right", method="scan"))(valid_counts)
+        first_pad = jax.vmap(lambda c, n: jnp.searchsorted(c, slots - n, side="right", method="scan"))(
+            pad_counts, n_valid[:, 0]
+        )
+        order = jnp.where(slots[None, :] < n_valid, first_valid, first_pad)
+        return jnp.clip(order, 0, seq_len - 1).astype(jnp.int32)
+
+    def unchanged(counts):
+        return jnp.broadcast_to(slots[None, :], counts[0].shape)
+
+    order = jax.lax.cond(identity, unchanged, search, (valid_through, pad_through, num_valid))
     rank = jnp.where(is_valid > 0, before_valid, -1).astype(jnp.int32)
-    identity = jnp.all(order == slots[None, :])
     return CompactLayout(order=order, inverse=inverse, rank=rank, identity=identity)
+
+
+def segment_pool_max_documents(seq_len: int) -> int:
+    """Documents per row a :func:`segment_pool_layout` key grid holds: one per 128 tokens, at least 64."""
+    return max(int(seq_len) // 128, 64)
+
+
+class SegmentPoolLayout(tp.NamedTuple):
+    """Packed documents on a pool-aligned key grid (see :func:`segment_pool_layout`).
+
+    Attributes:
+        order: ``[batch, grid]`` int32 physical token in each grid slot, ``-1`` for an empty slot.
+        rank: ``[batch, seq]`` int32 grid slot of every valid token, ``-1`` for padding and for tokens past the grid.
+        key_segments: ``[batch, grid]`` int32 document of each grid slot, ``-1`` for an empty slot.
+        query_segments: ``[batch, seq]`` int32 document of every token with a grid slot, ``-1`` otherwise.
+        overflow: ``[batch]`` int32 valid tokens that did not fit the grid (their queries attend to nothing).
+    """
+
+    order: Array
+    rank: Array
+    key_segments: Array
+    query_segments: Array
+    overflow: Array
+
+    def gather(self, x: Array) -> Array:
+        """``x[b, order[b, g]]`` along the sequence axis of ``x [batch, seq, ...]``, zeros in empty slots."""
+        idx = jnp.maximum(self.order, 0)
+        out = jax.vmap(lambda row, i: jnp.take(row, i, axis=0))(x, idx)
+        filled = (self.order >= 0).reshape(self.order.shape + (1,) * (x.ndim - 2))
+        return jnp.where(filled, out, jnp.zeros((), out.dtype))
+
+
+def segment_pool_layout(
+    segment_ids: Int[Array, "batch seq"],
+    kpool: int,
+    max_documents: int | None = None,
+) -> SegmentPoolLayout:
+    """Lay packed documents out on a key grid where every document starts on a pool boundary.
+
+    Valid tokens keep their order (padding removed, as in :func:`compact_valid_layout`); after each document the grid
+    skips to the next multiple of ``kpool``. A pool therefore never holds keys of two documents, pools restart at every
+    document start (the dense strategy's ``_pooled_states`` rule), and a query's incomplete tail pool
+    ``kpool * (pos // kpool) .. pos`` lies inside its own document. A new document starts wherever the segment id
+    changes between consecutive valid tokens.
+
+    Args:
+        segment_ids: Document ids ``[batch, seq]``, negative for padding.
+        kpool: Tokens per pool.
+        max_documents: Documents per row the grid has room for; ``None`` = :func:`segment_pool_max_documents`. The
+            grid holds ``seq + (kpool - 1) * (max_documents - 1)`` slots rounded up to a pool. Tokens past it are
+            dropped and counted in ``overflow``.
+
+    Returns:
+        The :class:`SegmentPoolLayout` of every row.
+    """
+    segment_ids = jnp.asarray(segment_ids, jnp.int32)
+    batch, seq = segment_ids.shape
+    kpool = int(kpool)
+    if max_documents is None:
+        max_documents = segment_pool_max_documents(seq)
+    grid = -(-(seq + (kpool - 1) * max(int(max_documents) - 1, 0)) // kpool) * kpool
+    valid = segment_ids >= 0
+    base = compact_valid_layout(valid)
+    cseg = jnp.take_along_axis(segment_ids, base.order, axis=1)
+    slots = jnp.arange(seq, dtype=jnp.int32)[None, :]
+    num_valid = jnp.sum(valid, axis=1, keepdims=True, dtype=jnp.int32)
+    cvalid = slots < num_valid
+    edge = jnp.full((batch, 1), -2, jnp.int32)
+    prev = jnp.concatenate([edge, cseg[:, :-1]], axis=1)
+    nxt = jnp.concatenate([cseg[:, 1:], edge], axis=1)
+    nxt_valid = jnp.concatenate([cvalid[:, 1:], jnp.zeros((batch, 1), jnp.bool_)], axis=1)
+    start = cvalid & (cseg != prev)
+    end = cvalid & (~nxt_valid | (nxt != cseg))
+    doc_start = jax.lax.cummax(jnp.where(start, slots, 0), axis=1)
+    pad = jnp.where(end, (-(slots - doc_start + 1)) % kpool, 0).astype(jnp.int32)
+    gpos = slots + jnp.cumsum(pad, axis=1, dtype=jnp.int32) - pad
+    fits = cvalid & (gpos < grid)
+    target = jnp.where(fits, gpos, grid)
+    rows = jnp.arange(batch, dtype=jnp.int32)[:, None]
+    order = jnp.full((batch, grid), -1, jnp.int32).at[rows, target].set(base.order, mode="drop")
+    key_segments = jnp.full((batch, grid), -1, jnp.int32).at[rows, target].set(cseg, mode="drop")
+    rank = jnp.take_along_axis(jnp.where(fits, gpos, -1), base.inverse, axis=1)
+    rank = jnp.where(valid, rank, -1).astype(jnp.int32)
+    query_segments = jnp.where(rank >= 0, segment_ids, -1)
+    overflow = jnp.sum(cvalid & ~fits, axis=1, dtype=jnp.int32)
+    return SegmentPoolLayout(
+        order=order, rank=rank, key_segments=key_segments, query_segments=query_segments, overflow=overflow
+    )
 
 
 def permute_tokens(x: Array, order: Int[Array, "batch seq"], inverse: Int[Array, "batch seq"]) -> Array:

@@ -14,7 +14,7 @@
 
 """eSurge image serving of ``DeepseekV41ForConditionalGeneration`` (computation test).
 
-A request carries a ``uint8 [H, W, 3]`` image (``EngineRequest(..., images=[img])``) and a prompt holding one
+A request carries a ``uint8 [H, W, 3]`` image (``served_request(..., images=[img])``) and a prompt holding one
 ``image_token_id`` placeholder. The scheduler expands it into the image span, the runner encodes the image eagerly and
 streams the merged embeddings through ``prefill_embeds``, and feeds ``token_types`` (``bias_vl`` routing) plus engram
 hash ids (image positions dead). The 70x56 px image gives a 5x4 ViT patch grid, so the aligner pads both sides to a
@@ -35,13 +35,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.layers.engram import EngramHasher
 from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41ForConditionalGeneration
 from easydel.modules.deepseek_v41.processing_deepseek_v41 import DeepseekV41ImageExpander
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 try:
     from tests.modules import _deepseek_v41_reference as ref
@@ -145,7 +148,7 @@ class _ServingHarness:
             enable_sampler_metrics=False,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=True,  # the compressed-window guard must force this off
@@ -155,10 +158,10 @@ class _ServingHarness:
         self._req_counter = 0
         self.scheduled: dict[str, list[int]] = {}
 
-    def generate_greedy(self, request_specs: list[dict]) -> tuple[list[list[int]], list[EngineRequest]]:
+    def generate_greedy(self, request_specs: list[dict]) -> tuple[list[list[int]], list]:
         requests = []
         for spec in request_specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=f"req-{self._req_counter}",
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(
@@ -175,7 +178,7 @@ class _ServingHarness:
             for rid, n in scheduler_output.num_scheduled_tokens.items():
                 self.scheduled.setdefault(rid, []).append(int(n))
             output = self.runner.execute_model(scheduler_output)
-            self.scheduler.update_from_output(scheduler_output, output)
+            self.scheduler.commit(scheduler_output, output)
             if all(r.is_finished() for r in requests):
                 break
         else:
@@ -298,7 +301,7 @@ def test_image_span_longer_than_token_budget_is_rejected(tiny_vl_model):
     harness = _ServingHarness(tiny_vl_model)
     try:
         harness.scheduler.max_num_scheduled_tokens = 6  # the span has 8 tokens
-        req = EngineRequest(
+        req = served_request(
             request_id="too-big",
             prompt_token_ids=list(IMAGE_PROMPT),
             sampling_params=SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True),

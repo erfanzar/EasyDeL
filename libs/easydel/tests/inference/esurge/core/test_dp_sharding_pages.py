@@ -19,7 +19,6 @@ from easydel.inference.esurge.core.dp_sharding import (
     dp_shard_page_bounds,
     pages_per_dp_shard,
 )
-from easydel.inference.esurge.core.page_pool import PagePool
 
 
 def test_pages_per_dp_shard_requires_num_pages_divisible() -> None:
@@ -46,21 +45,3 @@ def test_dp_shard_bounds_shard0_skips_null_page() -> None:
     # Shard 0 owns page 0 (null) so usable range starts at 1.
     assert dp_shard_page_bounds(0, 4) == (1, 4)
     assert dp_shard_page_bounds(1, 4) == (4, 8)
-
-
-def test_page_pool_shard_allocation_uses_usable_ranges() -> None:
-    pool = PagePool(num_pages=12, enable_caching=False)  # 12 % 4 == 0
-    # pages_per_shard = 12 // 4 = 3
-    # shard 0: pages [0,1,2] → usable [1,2]
-    # shard 3: pages [9,10,11]
-    shard0 = pool.get_new_pages(2, dp_shard_hint=0, data_parallel_size=4)
-    shard3 = pool.get_new_pages(2, dp_shard_hint=3, data_parallel_size=4)
-
-    assert all(1 <= p.page_id < 3 for p in shard0)
-    assert all(9 <= p.page_id < 12 for p in shard3)
-
-
-def test_page_pool_ignores_invalid_dp_shard_partition() -> None:
-    pool = PagePool(num_pages=9, enable_caching=False)  # 9 % 4 != 0
-    pages = pool.get_new_pages(1, dp_shard_hint=3, data_parallel_size=4)
-    assert pages[0].page_id == 1

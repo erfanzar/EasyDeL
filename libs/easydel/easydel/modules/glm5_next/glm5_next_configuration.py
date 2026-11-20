@@ -182,9 +182,11 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             Numerical floor used by mHC Sinkhorn normalisation.
         hc_sinkhorn_iters (`int`, *optional*, defaults to 20):
             Sinkhorn iterations used by mHC stream routing.
-        hc_use_fused_coefficients (`bool`, *optional*, defaults to ``False``):
-            Opt into packed TPU mHC coefficients with first-order reverse AD.
-            Leave disabled when forward-mode or higher derivatives are needed.
+        hc_use_fused_coefficients (`bool`, *optional*):
+            Packed TPU mHC coefficient kernels, first-order reverse AD only.
+            ``None`` (default) uses them on TPU; set ``False`` when
+            forward-mode or higher derivatives are needed. A saved ``false``
+            loads as ``None``.
         output_router_logits (`bool`, *optional*, defaults to ``False``):
             Whether MoE layers should return router logits for aux losses.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
@@ -259,7 +261,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
-        hc_use_fused_coefficients: bool = False,
+        hc_use_fused_coefficients: bool | None = None,
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.001,
         linear_attn_config: dict[str, typing.Any] | None = None,
@@ -573,10 +575,15 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             )
         if self.index_topk % self.index_kpool != 0:
             raise ValueError(f"index_topk ({self.index_topk}) must be divisible by index_kpool ({self.index_kpool}).")
-        if self.dsa_pool_training and self.dsa_pool_kernel == "bitmap":
-            tail_error = self.dsa_pool_bitmap_tail_error()
-            if tail_error is not None:
-                raise ValueError(tail_error)
+        if self.dsa_pool_training:
+            # ``None`` runs the bitmap kernel for an odd pool size or a latent width that is not a multiple of 128. For
+            # other configs the attention picks the kernel when it is called, and the bitmap kernel checks the tail
+            # keys there.
+            default_bitmap = self.dsa_pool_kernel is None and bool(self.index_kpool % 2 or self.kv_lora_rank % 128)
+            if self.dsa_pool_kernel == "bitmap" or default_bitmap:
+                tail_error = self.dsa_pool_bitmap_tail_error()
+                if tail_error is not None:
+                    raise ValueError(tail_error)
         if self.q_lora_rank is None:
             raise ValueError("For DSA usage in the attention layers, the `q_lora_rank` is strictly required!")
         if self.qk_rope_head_dim > 0:
@@ -623,6 +630,31 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
             True for ``"deepseek_sparse_attention"`` layers, False otherwise.
         """
         return self.layer_types[layer_idx] == DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE
+
+    def default_quantization_pattern(self, dtype: str) -> str:
+        """Parameter-path regex for load-time weight/activation quantization of this model.
+
+        Covers the routed, shared and dense MLP projections and the ``q_a``/``q_b``/``kv_a``/``o`` projections of
+        the DSA layers. KDA layers, the DSA indexer, ``kv_b_proj`` (its absorbed layout is not quantizable),
+        embeddings and the LM head stay in the activation dtype. Validated for ``w8a8`` serving of GLM-5.3-Flash.
+
+        Args:
+            dtype: Quantization dtype the pattern will be used with (kept for a uniform model API).
+
+        Returns:
+            A regex for :class:`~easydel.layers.quantization.QuantizationConfig` ``pattern``.
+        """
+        del dtype
+        mlp = r"(?:\.mlp\.(?:experts\.|shared_experts\.)?(?:gate_up_proj|gate_proj|up_proj|down_proj)$)"
+        dsa_layers = [str(idx) for idx in range(self.num_hidden_layers) if self.is_dsa_layer(idx)]
+        if not dsa_layers:
+            return mlp
+        attention = (
+            r"(?:\.layers\.(?:"
+            + "|".join(dsa_layers)
+            + r")\.self_attn\.(?:q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)$)"
+        )
+        return mlp + "|" + attention
 
     def get_layer_types(self) -> tuple[str, ...]:
         """Get the per-layer cache schedule for :class:`HybridCache` init.

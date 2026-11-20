@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared fixtures for the eSurge spec-decode / MTP tests.
+"""Shared fixtures for the eSurge serving, spec-decode and MTP tests.
 
 ``make_tiny_qwen35`` builds the tiny Qwen3.5 + MTP model that every
-spec-decode / MTP test used to define its own byte-identical copy of. Import it
+spec-decode / MTP test used to define its own byte-identical copy of.
+``make_core_for_runner`` and ``served_request`` drive a runner through the
+engine core (surgecore ``EngineCore``) the way the engine loop does:
+``schedule() -> runner.execute_model() -> commit()``. Import them
 with the standard sibling-helper fallback::
 
     try:
@@ -83,4 +86,156 @@ def make_tiny_qwen35(mtp_layers: int = 1, *, precision: jax.lax.PrecisionLike = 
     )
     return Qwen3_5ForCausalLM(
         config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32, precision=precision
+    )
+
+
+class ServedRequest:
+    """A test's view of one request served through the engine core.
+
+    Holds the :class:`AdmissionRecord` it was admitted with (its attributes read through) and what the commits
+    reported for it: ``output_token_ids`` (stop truncation applied), ``finish_reason``, ``stop_reason`` and
+    ``num_cached_tokens`` (prefix-hit tokens of its admission, -1 before its first output).
+    """
+
+    def __init__(self, record) -> None:
+        self.record = record
+        self.output_token_ids: list[int] = []
+        self.finish_reason = None
+        self.stop_reason = None
+        self.num_cached_tokens = -1
+
+    def __getattr__(self, name: str):
+        if name == "record":
+            raise AttributeError(name)
+        return getattr(self.record, name)
+
+    @property
+    def num_output_tokens(self) -> int:
+        """Tokens emitted so far."""
+        return len(self.output_token_ids)
+
+    def is_finished(self) -> bool:
+        """Whether the engine core reported a finish reason."""
+        return self.finish_reason is not None
+
+
+def served_request(request_id: str, prompt_token_ids, sampling_params, eos_token_id=None, **kwargs) -> ServedRequest:
+    """A :class:`ServedRequest` over a fresh ``AdmissionRecord`` (the engine core's admission currency)."""
+    from easydel.inference.esurge.request import AdmissionRecord
+
+    return ServedRequest(
+        AdmissionRecord(
+            request_id=request_id,
+            prompt_token_ids=list(prompt_token_ids),
+            sampling_params=sampling_params,
+            eos_token_id=eos_token_id,
+            **kwargs,
+        )
+    )
+
+
+class CoreDrive:
+    """An ``EngineCoreDriver`` plus the :class:`ServedRequest` handles of the requests a test admitted.
+
+    ``schedule()`` and ``commit()`` are the engine core's; ``commit`` also applies the returned outputs to the
+    handles. Every other attribute reads through to the driver.
+    """
+
+    def __init__(self, core) -> None:
+        self.core = core
+        self.requests: dict[str, ServedRequest] = {}
+
+    def __getattr__(self, name: str):
+        if name in ("core", "requests"):
+            raise AttributeError(name)
+        return getattr(self.core, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in ("core", "requests"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.core, name, value)
+
+    def add_requests(self, requests: list[ServedRequest]) -> None:
+        """Admit requests in one call (``n>1`` siblings together)."""
+        self.core.add_requests([r.record for r in requests])
+        for r in requests:
+            self.requests[r.request_id] = r
+
+    def add_request(self, request: ServedRequest) -> None:
+        """Admit one request."""
+        self.add_requests([request])
+
+    def schedule(self):
+        """The engine core's next step (a ``SchedulerOutput``)."""
+        return self.core.schedule()
+
+    def commit(self, scheduler_output, model_output):
+        """Commit a step's runner output; updates the handles and returns the engine outputs."""
+        result = self.core.commit(scheduler_output, model_output)
+        for engine_outputs in result.values():
+            for out in engine_outputs.outputs:
+                handle = self.requests.get(out.request_id)
+                if handle is None:
+                    continue
+                handle.output_token_ids.extend(int(t) for t in out.new_token_ids)
+                handle.num_cached_tokens = int(out.num_cached_tokens)
+                if out.finish_reason is not None:
+                    handle.finish_reason = out.finish_reason
+                    handle.stop_reason = out.stop_reason
+        return result
+
+    def step(self, runner) -> bool:
+        """One ``schedule -> runner.execute_model -> commit``; ``False`` for an idle step the loop would skip."""
+        from easydel.inference.esurge.benchmarking import zero_schedule_needs_update
+
+        scheduler_output = self.schedule()
+        if scheduler_output.total_num_scheduled_tokens == 0 and not zero_schedule_needs_update(scheduler_output):
+            return False
+        self.commit(scheduler_output, runner.execute_model(scheduler_output))
+        return True
+
+    def run(self, runner, requests: list[ServedRequest], *, max_steps: int = 64) -> list[ServedRequest]:
+        """Admit ``requests`` and step until every one finishes.
+
+        Raises:
+            AssertionError: When they do not finish within ``max_steps`` steps.
+        """
+        self.add_requests(list(requests))
+        for _ in range(max_steps):
+            if all(r.is_finished() for r in requests):
+                return requests
+            self.step(runner)
+        if all(r.is_finished() for r in requests):
+            return requests
+        raise AssertionError(f"generation did not finish within {max_steps} steps")
+
+
+def make_core_for_runner(
+    runner,
+    *,
+    max_num_batched_tokens: int | None = None,
+    enable_prefix_caching: bool = True,
+    async_scheduling: bool = True,
+    long_prefill_token_threshold: int | None = None,
+    num_draft_tokens: int = 0,
+    **kwargs,
+) -> CoreDrive:
+    """The engine core a test drives a runner with, built as the engine builds it (``EngineCoreDriver.from_runner``).
+
+    Defaults are the engine's: prefix caching on (the core turns it off for models that cannot use it), async
+    scheduling on, no speculative drafts.
+    """
+    from easydel.inference.esurge.engine.core_driver import EngineCoreDriver
+
+    return CoreDrive(
+        EngineCoreDriver.from_runner(
+            runner,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_prefix_caching=enable_prefix_caching,
+            async_scheduling=async_scheduling,
+            long_prefill_token_threshold=long_prefill_token_threshold,
+            num_draft_tokens=int(num_draft_tokens),
+            **kwargs,
+        )
     )

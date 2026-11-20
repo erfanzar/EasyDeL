@@ -420,7 +420,6 @@ class BaseTrainerCfg(TypedDict, total=False):
         log_training_generations_to_wandb: Whether to log rollout/training generations to WandB.
         benchmark_interval: Run benchmark suites every N training steps.
         benchmarks: List of named benchmark configs to execute during training.
-        use_esurge_generation: Whether to use eSurge for optimized generation.
         esurge_use_tqdm: Whether to show tqdm progress for eSurge generation.
         esurge_hbm_utilization: HBM utilization target for eSurge.
         esurge_max_num_seqs: Maximum concurrent sequences for eSurge.
@@ -672,7 +671,6 @@ class BaseTrainerCfg(TypedDict, total=False):
     benchmark_interval: NotRequired[int | None]
     benchmarks: NotRequired[list[BenchmarkConfig] | BenchmarkConfig | None]
 
-    use_esurge_generation: NotRequired[bool]
     esurge_use_tqdm: NotRequired[bool]
     esurge_hbm_utilization: NotRequired[float | None]
     esurge_max_cache_tokens: NotRequired[int | None]
@@ -2340,7 +2338,6 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "log_training_generations_to_wandb": True,
     "benchmark_interval": None,
     "benchmarks": [],
-    "use_esurge_generation": True,
     # Both KV-cache sizing knobs default to None: when neither is set the trainer
     # auto-computes a tight token budget from the rollout shape (see
     # TrainingArguments.esurge_hbm_utilization). Must mirror the dataclass default

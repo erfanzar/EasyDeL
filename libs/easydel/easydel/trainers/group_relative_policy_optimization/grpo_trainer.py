@@ -1180,6 +1180,18 @@ class GRPOTrainer(Trainer):
         if len(completion_prompts) < target_len:
             completion_prompts = [*completion_prompts, *([None] * (target_len - len(completion_prompts)))]
 
+        # Follow-up requests condition on exact tokens: the prompt row's real ids, then the completion so far.
+        host_prompt_ids = np.asarray(jax.device_get(results.prompt_ids), dtype=np.int32)
+        host_prompt_mask = np.asarray(jax.device_get(results.prompt_mask), dtype=np.int32)
+        if host_prompt_ids.ndim == 1:
+            host_prompt_ids = host_prompt_ids[None, :]
+            host_prompt_mask = host_prompt_mask[None, :]
+        rows_per_prompt = max(target_len // max(host_prompt_ids.shape[0], 1), 1)
+        prompt_token_rows = [
+            [int(token) for token in ids[keep.astype(bool)]]
+            for ids, keep in zip(host_prompt_ids, host_prompt_mask, strict=True)
+        ]
+
         active_indices = [idx for idx, calls in enumerate(tool_call_records) if calls]
         max_iterations = self.arguments.max_tool_calling_iterations
         if max_iterations is None:
@@ -1218,7 +1230,17 @@ class GRPOTrainer(Trainer):
                 break
 
             max_new_tokens = max(max_completion_length - len(completion_rows[idx]) for idx in loop_indices)
+            loop_token_rows = [prompt_token_rows[idx // rows_per_prompt] + completion_rows[idx] for idx in loop_indices]
+            loop_width = max(len(row) for row in loop_token_rows)
+            loop_input_ids = np.asarray(
+                [[pad_token_id] * (loop_width - len(row)) + row for row in loop_token_rows], dtype=np.int32
+            )
+            loop_attention_mask = np.asarray(
+                [[0] * (loop_width - len(row)) + [1] * len(row) for row in loop_token_rows], dtype=np.int32
+            )
             followup_results = self.rollout(
+                input_ids=loop_input_ids,
+                attention_mask=loop_attention_mask,
                 prompts=loop_prompts,
                 state=state,
                 apply_chat_template=False,

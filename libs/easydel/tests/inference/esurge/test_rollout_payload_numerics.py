@@ -6,7 +6,7 @@ Deliberately not cpu_ok. The host-only pipeline tests live beside it.
 import numpy as np
 import pytest
 from easydel.inference.esurge.engine_types import EngineCoreOutput, FinishReason
-from easydel.trainers.base_trainer import BaseTrainer
+from easydel.trainers._shared.esurge_generation import outputs_to_arrays
 from jax import numpy as jnp
 
 from .test_output_logprobs import pipeline_factory as pipeline_factory
@@ -28,8 +28,7 @@ def test_pipeline_payload_reconstructs_rollout_sampled_logps_on_accelerator(pipe
             ),
         )
     assert output.finished
-    arrays = BaseTrainer._esurge_outputs_to_arrays(
-        None,
+    arrays = outputs_to_arrays(
         [output],
         input_ids=None,
         attention_mask=None,

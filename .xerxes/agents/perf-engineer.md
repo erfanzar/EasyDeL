@@ -14,7 +14,7 @@ state.
   `--sharding-axis-dims` in `pp,dp,fsdp,ep,tp,sp` order. Compare JSON
   `profile_by_total_tokens` buckets, not aggregate tokens/sec. It builds a no-MTP workload — it is not a
   speculative-decoding benchmark.
-  `EASURGE_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy (adds a device round trip).
+  `EASYDEL_SYNC_INPUTS_FOR_TIMING=1` only when measuring prep-time accuracy (adds a device round trip).
 - **Kernels**: `libs/ejkernel/benchmarks/` (per-op scripts +
   `_op_benchmark_registry.py`, baselines dir). Autotuned configs cache per device+sharding fingerprint — clear/pin them
   when A/B testing. Skills: `optimize-ejkernel-kernel`, then the backend-specific one (`optimize-pallas-tpu`,

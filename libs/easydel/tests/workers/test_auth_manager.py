@@ -43,11 +43,16 @@ def test_valid_admin_key_is_created():
     assert mgr.validate_key("sk-admin-secret-long-enough") is not None
 
 
-def test_unknown_keys_are_not_cached():
+def test_only_the_exact_key_validates():
     mgr = _manager()
+    raw, meta = mgr.generate_api_key(name="k")
+    assert mgr.validate_key(raw).key_id == meta.key_id
+    for wrong in (raw.upper(), raw.lower(), raw[:-1], raw + "x", " " + raw, "", None):
+        if wrong != raw:
+            assert mgr.validate_key(wrong) is None
     for i in range(50):
         assert mgr.validate_key(f"sk-unknown-token-{i:04d}-xxxxxxxx") is None
-    assert len(mgr._raw_to_hash_cache) == 0
+    assert mgr.validate_key(raw).key_id == meta.key_id
 
 
 def test_rotated_key_invalidates_old_secret():
