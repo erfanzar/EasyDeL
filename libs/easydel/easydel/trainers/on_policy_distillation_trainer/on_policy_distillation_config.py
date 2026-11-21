@@ -68,6 +68,21 @@ class OnPolicyDistillationConfig(DistillationConfig):
             curriculum-style distillation.
         skip_apply_chat_template: Whether to skip chat template application
             on prompts.
+        distillation_mode: ``"divergence"`` or ``"trust_region"``
+            (speculative-decoding-style acceptance of sampled tokens).
+        trust_region_top_k: Teacher top-k support of the rejected-token
+            forward KL in trust-region mode. Defaults to ``64``.
+        trust_region_seed: Base seed of the per-step acceptance draw.
+
+    In trust-region mode the completions must be sampled by the student from the untruncated, unpenalised
+    ``softmax(logits / T)``: the ``top_k=50`` / ``top_p=0.95`` defaults are not inherited into
+    ``generation_top_k`` / ``generation_top_p`` (they become ``0`` / ``1.0``), and any explicit truncation
+    (top-k, top-p, min-p), non-neutral presence/frequency/repetition penalty or ``generate_with_teacher=True``
+    raises ``ValueError``.
+
+    In trust-region mode every log-prob (acceptance ratio, policy-gradient term and rejected-token top-k KL)
+    is computed at the *sampling* temperature (:attr:`trust_region_sampling_temperature`), not the
+    distillation ``temperature``, and no ``T**2`` factor is applied to either branch.
     """
 
     trainer_prefix: str | None = field(
@@ -128,6 +143,26 @@ class OnPolicyDistillationConfig(DistillationConfig):
         default=False,
         metadata={"help": "Whether to skip chat template application on prompts."},
     )
+    distillation_mode: str = field(
+        default="divergence",
+        metadata={
+            "help": (
+                "'divergence' (default) minimizes the selected divergence (forward KL, `beta` JSD/reverse KL, "
+                "`cakld_gamma`, `loss_top_k`). 'trust_region' applies speculative-decoding-style acceptance to "
+                "each sampled token: with P = min(exp(t_lp - s_lp), 1) and M ~ Bernoulli(P), accepted tokens get "
+                "a reverse-KL policy gradient sg(s_lp - t_lp) * s_lp and rejected tokens the teacher-top-k forward "
+                "KL (`trust_region_top_k`)."
+            )
+        },
+    )
+    trust_region_top_k: int = field(
+        default=64,
+        metadata={"help": "Teacher top-k support of the rejected-token forward KL in trust-region mode."},
+    )
+    trust_region_seed: int = field(
+        default=0,
+        metadata={"help": "Base seed of the per-step trust-region acceptance draw (folded with the step)."},
+    )
 
     def __post_init__(
         self,
@@ -153,6 +188,14 @@ class OnPolicyDistillationConfig(DistillationConfig):
                 or if ``max_prompt_length + max_completion_length`` exceeds
                 ``max_length``.
         """
+        if self.distillation_mode not in ("divergence", "trust_region"):
+            raise ValueError(
+                f"`distillation_mode` must be 'divergence' or 'trust_region'; got {self.distillation_mode!r}."
+            )
+        self.trust_region_top_k = int(self.trust_region_top_k)
+        if self.trust_region_top_k < 1:
+            raise ValueError("`trust_region_top_k` must be >= 1.")
+        self.trust_region_seed = int(self.trust_region_seed)
         default_prompt = type(self).__dataclass_fields__["max_prompt_length"].default
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_prompt_length is None:
@@ -182,11 +225,17 @@ class OnPolicyDistillationConfig(DistillationConfig):
             "top_p": self.top_p,
             "top_k": self.top_k,
         }
-        # Inherit sampling defaults before offline validation neutralizes them.
+        # Inherit sampling defaults before offline validation neutralizes them. Trust-region mode scores tokens
+        # against the untruncated student distribution, so the on-policy truncation defaults are not inherited
+        # there (explicit truncation is refused below).
+        trust_region = self.distillation_mode == "trust_region"
+        fields = type(self).__dataclass_fields__
         if self.generation_top_p is None:
-            self.generation_top_p = self.top_p
+            keep_default = trust_region and self.top_p == fields["top_p"].default
+            self.generation_top_p = 1.0 if keep_default else self.top_p
         if self.generation_top_k is None:
-            self.generation_top_k = self.top_k
+            keep_default = trust_region and self.top_k == fields["top_k"].default
+            self.generation_top_k = 0 if keep_default else self.top_k
         self.max_prompt_length = None  # type: ignore[assignment]
         self.max_completion_length = None  # type: ignore[assignment]
         self.top_p = 1.0
@@ -202,5 +251,60 @@ class OnPolicyDistillationConfig(DistillationConfig):
             self.max_completion_length = on_policy_fields["max_completion_length"]
             self.top_p = on_policy_fields["top_p"]
             self.top_k = on_policy_fields["top_k"]
+
+        if self.distillation_mode == "trust_region":
+            if self.generation_do_sample is False:
+                raise ValueError(
+                    "`distillation_mode='trust_region'` scores sampled tokens; it cannot be used with "
+                    "`generation_do_sample=False`."
+                )
+            sampling_temperature = self.trust_region_sampling_temperature
+            if sampling_temperature is None or not float(sampling_temperature) > 0.0:
+                raise ValueError(
+                    "`distillation_mode='trust_region'` needs a positive sampling temperature "
+                    f"(`temperature_sampling` / `generation_temperature`); got {sampling_temperature!r}."
+                )
+            if self.generate_with_teacher:
+                raise ValueError(
+                    "`distillation_mode='trust_region'` scores tokens the student proposed; it cannot be used with "
+                    "`generate_with_teacher=True`."
+                )
+            self._check_trust_region_proposal_is_untruncated()
+
+    def _check_trust_region_proposal_is_untruncated(self) -> None:
+        """Refuse sampler settings that make the proposal differ from ``softmax(student_logits / T)``.
+
+        Raises:
+            ValueError: If top-k / top-p / min-p truncation or a presence, frequency or repetition penalty is
+                active in the generation arguments, ``generation_extra_kwargs`` or ``generation_config_overrides``.
+        """
+        neutral = {
+            "top_k": lambda v: v in (None, 0),
+            "top_p": lambda v: v is None or float(v) >= 1.0,
+            "min_p": lambda v: v is None or float(v) == 0.0,
+            "presence_penalty": lambda v: v is None or float(v) == 0.0,
+            "frequency_penalty": lambda v: v is None or float(v) == 0.0,
+            "repetition_penalty": lambda v: v is None or float(v) == 1.0,
+        }
+        sources = [("generation_" + name, getattr(self, "generation_" + name, None), name) for name in neutral]
+        for container in ("generation_extra_kwargs", "generation_config_overrides"):
+            mapping = getattr(self, container, None) or {}
+            sources.extend((f"{container}[{name!r}]", mapping[name], name) for name in neutral if name in mapping)
+        for label, value, name in sources:
+            if not neutral[name](value):
+                raise ValueError(
+                    "`distillation_mode='trust_region'` computes the acceptance ratio from the untruncated, "
+                    f"unpenalised student distribution, so the sampler must use it too; got `{label}={value!r}`. "
+                    "Disable top-k (0), top-p (1.0), min-p (0.0) and the presence/frequency (0.0) and repetition "
+                    "(1.0) penalties."
+                )
+
+    @property
+    def trust_region_sampling_temperature(self) -> float | None:
+        """Temperature the completions are actually sampled at (``generation_temperature`` wins when set)."""
+        value = getattr(self, "generation_temperature", None)
+        if value is None:
+            value = self.temperature_sampling
+        return None if value is None else float(value)
 
     __hash__ = hash_fn

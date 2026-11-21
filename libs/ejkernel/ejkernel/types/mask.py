@@ -2005,6 +2005,86 @@ class MaskInfo:
             "from_attention_mask() or from_segments()."
         )
 
+    @property
+    def has_explicit_positions(self) -> bool:
+        """Whether both ``q_positions`` and ``kv_positions`` are set on this MaskInfo."""
+        return self.q_positions is not None and self.kv_positions is not None
+
+    def uses_position_causality(self) -> bool:
+        """Whether causality must be derived from the absolute q/kv positions.
+
+        True only for the segments-plus-positions representation: query and key/value segment
+        ids and both position arrays are set, and no dense attention mask is stored. A stored
+        dense mask (for example one baked by a KV cache) is authoritative and keeps the
+        index-based kernel path. Note that :meth:`get_or_compute_attention_mask` and the
+        :attr:`attention_mask` property cache a segment-derived dense mask on the instance,
+        after which this returns False.
+        """
+        return (
+            self.has_explicit_positions
+            and self._q_segment_ids is not None
+            and self._kv_segment_ids is not None
+            and self._attention_mask is None
+        )
+
+    @_debug_trace
+    def get_position_aware_attention_mask(
+        self,
+        *,
+        causal: bool,
+        sliding_window: int | tuple[int, int] | None = None,
+    ) -> Bool[Array, "batch nheads_or_1 qlen kvlen"]:
+        """Pairwise visibility with causality and windowing taken from the absolute positions.
+
+        The base visibility is the stored attention mask when present (exactly what
+        :meth:`get_or_compute_attention_mask` returns), otherwise the segment-id mask (same
+        non-negative id on both sides). On top of it, ``kv_pos <= q_pos`` is applied when
+        ``causal`` and ``q_pos - left <= kv_pos <= q_pos + right`` when ``sliding_window`` is set.
+        Unlike an index-based triangle this stays correct when ``q_len != kv_len`` (queries that
+        continue a key/value prefix). Causality or windowing already baked into the mask
+        (``causal_mask_baked_in`` / ``sliding_window_baked_in``) is not applied a second time.
+        The MaskInfo is not modified.
+
+        Args:
+            causal: Apply position-based causality.
+            sliding_window: ``int`` window size ``W`` (HF convention, same as ``(W - 1, W - 1)``)
+                or ``(left, right)`` inclusive distances, or ``None``.
+
+        Returns:
+            Boolean mask of shape ``(batch, 1, q_len, kv_len)`` (``(batch, heads, q_len, kv_len)``
+            for a per-head stored mask).
+
+        Raises:
+            ValueError: If positions are missing or the MaskInfo carries neither a mask nor segment ids.
+        """
+        if not self.has_explicit_positions:
+            raise ValueError("get_position_aware_attention_mask requires both q_positions and kv_positions.")
+        if self._attention_mask is not None:
+            visible = jnp.asarray(self._attention_mask).astype(jnp.bool_)
+            if visible.ndim == 3:
+                visible = visible[:, None]
+        elif self._q_segment_ids is not None and self._kv_segment_ids is not None:
+            visible = segment_ids_to_mask(
+                (jnp.asarray(self._q_segment_ids, jnp.int32), jnp.asarray(self._kv_segment_ids, jnp.int32)),
+                dtype=jnp.bool_,
+            )
+        else:
+            raise ValueError("get_position_aware_attention_mask requires an attention mask or segment ids.")
+        batch, _, q_len, kv_len = visible.shape
+        q_pos = jnp.broadcast_to(jnp.asarray(self.q_positions, jnp.int32).reshape(-1, q_len), (batch, q_len))
+        kv_pos = jnp.broadcast_to(jnp.asarray(self.kv_positions, jnp.int32).reshape(-1, kv_len), (batch, kv_len))
+        q_pos = q_pos[:, None, :, None]
+        kv_pos = kv_pos[:, None, None, :]
+        if causal and not self.causal_mask_baked_in:
+            visible = visible & (kv_pos <= q_pos)
+        if sliding_window is not None and not self.sliding_window_baked_in:
+            if isinstance(sliding_window, int):
+                left = right = max(int(sliding_window) - 1, 0)
+            else:
+                left, right = (int(w) for w in sliding_window)
+            visible = visible & (kv_pos >= q_pos - left) & (kv_pos <= q_pos + right)
+        return visible
+
     @_debug_trace
     def get_qkv_masks(
         self, dtype: DTypeLike = jnp.bool_

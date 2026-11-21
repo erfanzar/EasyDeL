@@ -38,6 +38,9 @@ from easydel.trainers.randomized_yarn import RandomizedYaRNConfig
 from easydel.trainers.training_configurations import TrainingArguments
 from jax.sharding import PartitionSpec
 
+# Config serialization only: dtypes and PartitionSpecs appear as values, no array computation runs.
+pytestmark = pytest.mark.cpu_ok
+
 
 def _full_training_arguments_kwargs() -> dict[str, Any]:
     """Return kwargs covering every save/load-relevant field of TrainingArguments.
@@ -231,12 +234,94 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "esurge_max_num_batched_tokens": 4096,
         "esurge_enable_prefix_caching": True,
         "esurge_data_parallelism_axis": "dp",
+        "esurge_max_cache_tokens": 65536,
+        # Async rollout runtime. async_mode=True forces both eSurge async flags on in __post_init__.
+        "async_mode": True,
+        "esurge_async_scheduling": False,
+        "esurge_overlap_execution": False,
+        "max_inflight_tasks": 7,
+        "max_staleness": 3,
+        "queue_maxsize": 5,
+        "weight_sync_steps": 2,
+        "request_timeout": 45.5,
+        "first_rollout_timeout": 900.0,
+        "heartbeat_stale_after_s": 33.0,
+        # Host prefetch / profiling / packing
+        "dataloader_prefetch": False,
+        "dataloader_prefetch_workers": 3,
+        "dataloader_prefetch_buffer_size": 6,
+        "profiler_path": "/tmp/roundtrip-profile",
+        "profiler_duration_ms": 1500,
+        "profiler_enable_hlo_proto": True,
+        "profiler_stop_step": 9,
+        "profiler_log_all_workers": True,
+        "profiler_include_compile": True,
+        "profiler_host_tracer_level": 2,
+        "profiler_python_tracer_level": 1,
+        "xla_compiler_options": {"xla_tpu_enable_latency_hiding_scheduler": "true"},
+        "host_phase_log_path": "/tmp/roundtrip-host-phases.jsonl",
+        "sequence_packing": True,
+        "process_encoder": {"enabled": True, "row_bucket_multiple": 4, "max_rows_per_step": 16},
         # Training buckets (runtime-only objects excluded from to_dict;
         # bucket_rule survives as a reconstructed BucketRule) ----
         "buckets": None,
         "bucket_datasets": None,
         "bucket_rule": {"kind": "mod", "mod": 5, "offset": 0, "on_bucket": 0, "off_bucket": 1},
     }
+
+
+# Fields deliberately absent from the full-kwargs helper, each with the reason it cannot be set there.
+_FIELDS_EXCLUDED_FROM_FULL_KWARGS: dict[str, str] = {
+    "_can_log_metrics": "private runtime flag, never serialized",
+    "_im_a_hidden_checkpoint_manager": "private runtime object, never serialized",
+    "arrayrecord_train_datasets": "exclusive with the parquet lane; covered by test_arrayrecord_lane_fields_roundtrip",
+    "arrayrecord_mixture_weights": "exclusive with the parquet lane; covered by test_arrayrecord_lane_fields_roundtrip",
+    "arrayrecord_assistant_only": "exclusive with the parquet lane; covered by test_arrayrecord_lane_fields_roundtrip",
+    "arrayrecord_train_files": "exclusive with the parquet lane; covered by test_arrayrecord_lane_fields_roundtrip",
+    "mpmd_scheduler": "rejected together with gradient_accumulation_mode='execution'",
+    "custom_scheduler": "callable, not JSON-representable",
+    "pruning_module": "runtime object, not JSON-representable",
+    "straight_through_emulator": "callable, not JSON-representable",
+    "tensor_straight_through": "callable, not JSON-representable",
+    "watchers": "LogWatcher objects stringify; covered by test_save_load_preserves_watchers_default_empty",
+}
+
+
+def test_full_kwargs_helper_covers_every_dataclass_field():
+    """A new TrainingArguments field must be added to the helper (or explicitly excluded with a reason)."""
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(TrainingArguments) if f.init}
+    covered = set(_full_training_arguments_kwargs())
+    excluded = set(_FIELDS_EXCLUDED_FROM_FULL_KWARGS)
+    assert covered <= field_names, f"helper names unknown fields: {sorted(covered - field_names)}"
+    assert excluded <= field_names, f"stale exclusions: {sorted(excluded - field_names)}"
+    assert not covered & excluded, f"fields both covered and excluded: {sorted(covered & excluded)}"
+    missing = field_names - covered - excluded
+    assert not missing, f"TrainingArguments fields missing from _full_training_arguments_kwargs: {sorted(missing)}"
+
+
+def test_save_load_preserves_async_rollout_fields(tmp_path, full_args):
+    """Async rollout knobs survive save/load and async_mode=True pins both eSurge async flags on."""
+    assert full_args.esurge_async_scheduling is True
+    assert full_args.esurge_overlap_execution is True
+    json_path = tmp_path / "async.json"
+    full_args.save_arguments(json_path)
+    loaded = TrainingArguments.load_arguments(json_path)
+
+    expected = {
+        "async_mode": True,
+        "esurge_async_scheduling": True,
+        "esurge_overlap_execution": True,
+        "max_inflight_tasks": 7,
+        "max_staleness": 3,
+        "queue_maxsize": 5,
+        "weight_sync_steps": 2,
+        "request_timeout": 45.5,
+        "first_rollout_timeout": 900.0,
+        "heartbeat_stale_after_s": 33.0,
+    }
+    assert {key: getattr(loaded, key) for key in expected} == expected
 
 
 @pytest.fixture

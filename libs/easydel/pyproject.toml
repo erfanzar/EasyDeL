@@ -95,6 +95,11 @@ profile = [
 ]
 podutils = ["eopod==0.0.36"]
 mm = ["pillow>=12.1.1"]
+rl = []
+
+[project.scripts]
+easydel = "easydel.scripts.cli:main"
+easydel-install-kiri = "easydel.environments.kiri_installer:main"
 
 [tool.black]
 line-length = 121

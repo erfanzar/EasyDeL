@@ -75,6 +75,12 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
     unwrap_metadata,
 )
+from easydel.caching.shared_prefix import (
+    PREFIX_SHARED_ATTENTION_MECHANISMS,
+    PREFIX_SHARED_GROUPED_ATTENTION_MECHANISMS,
+    PrefixForkView,
+    is_shared_prefix_view,
+)
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.sharding import StageMesh, inference_mode_forces_decode, resolve_stage_mesh
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
@@ -626,6 +632,20 @@ class FlexibleAttentionModule(spx.Module):
         else:
             softmax_scale_computed = softmax_scale
 
+        if isinstance(cache_view, PrefixForkView) and cache_view.deferred_attention:
+            return self._grouped_fork_forward(
+                cache_view=cache_view,
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                mask_info=mask_info,
+                softmax_aux=softmax_aux,
+                softmax_scale=softmax_scale_computed,
+                logits_soft_cap=logits_soft_cap,
+                compute_dtype=compute_dtype,
+                precision=precision,
+            )
+
         dropout_prob_final: float = 0.0
         dropout_rng_final: tp.Any | None = None
         if not deterministic_computed:
@@ -948,6 +968,56 @@ class FlexibleAttentionModule(spx.Module):
         return result
 
     __call__ = forward
+
+    def _grouped_fork_forward(
+        self,
+        *,
+        cache_view: PrefixForkView,
+        query_states: JArray,
+        key_states: JArray,
+        value_states: JArray,
+        mask_info: MaskInfo | None,
+        softmax_aux: JArray | None,
+        softmax_scale: float | None,
+        logits_soft_cap: float | None,
+        compute_dtype: jnp.dtype | None,
+        precision: lax.PrecisionLike | None,
+    ) -> AttentionOutput:
+        """Prefix-shared fork attention for a view deferred by ``AttentionModule.concatenate``.
+
+        Args:
+            cache_view: Fork view holding the ``B``-row prefix.
+            query_states: Completion queries ``[B * G, C, q_heads, head_dim]``.
+            key_states: Completion keys ``[B * G, C, kv_heads, head_dim]``.
+            value_states: Completion values ``[B * G, C, kv_heads, v_head_dim]``.
+            mask_info: Completion mask carrying query segment ids.
+            softmax_aux: Must be ``None``.
+            softmax_scale: Logit scale.
+            logits_soft_cap: Must be ``None`` or ``0``.
+            compute_dtype: Optional per-call dtype override.
+            precision: Matmul precision; ``None`` inherits the ambient setting.
+
+        Returns:
+            :class:`AttentionOutput` with the fork outputs and the unchanged view.
+
+        Raises:
+            NotImplementedError: For sinks or a logit soft cap.
+        """
+        if softmax_aux is not None or logits_soft_cap:
+            raise NotImplementedError("Grouped prefix-shared fork attention supports neither sinks nor soft caps.")
+        metadata = self.impl.metadata
+        runtime_dtype = compute_dtype if compute_dtype is not None else metadata.runtime_dtype
+        outputs = cache_view.grouped_fork_attention(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            mask_info=mask_info,
+            softmax_scale=softmax_scale,
+            runtime_dtype=runtime_dtype,
+            softmax_dtype=None if compute_dtype is not None else metadata.runtime_softmax_dtype,
+            precision=precision,
+        )
+        return AttentionOutput(attention_outputs=outputs, attention_weights=None, cache_view=cache_view)
 
     # Operation access properties for dynamic discovery
     @property
@@ -1727,6 +1797,47 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                 cache_view,
                 cache_metadata,
             )  # pyright: ignore[reportReturnType]
+
+        if is_shared_prefix_view(cache_view):
+            # Training-time prefix-shared group forward: capture/fork views express visibility
+            # with segment ids and absolute positions. Only operations verified against a dense
+            # reference for that representation with q_len != kv_len are accepted.
+            if sliding_window is not None:
+                raise NotImplementedError("Prefix-shared forward does not support sliding-window attention.")
+            performer = getattr(self, "attention_performer", None)
+            active_impl = getattr(performer, "impl", None) if performer is not None else getattr(self, "impl", None)
+            impl_name = getattr(active_impl, "get_impl_name", lambda: None)()
+            impl_names = {str(n) for n in impl_name} if isinstance(impl_name, tuple) else {str(impl_name)}
+            if not impl_names & PREFIX_SHARED_ATTENTION_MECHANISMS:
+                raise NotImplementedError(
+                    f"Prefix-shared forward requires an attention operation in "
+                    f"{sorted(PREFIX_SHARED_ATTENTION_MECHANISMS)}; got {sorted(impl_names)}."
+                )
+            soft_cap = getattr(performer, "logits_soft_cap", None) or getattr(self, "logits_soft_cap", None)
+            if (
+                isinstance(cache_view, PrefixForkView)
+                and impl_names & PREFIX_SHARED_GROUPED_ATTENTION_MECHANISMS
+                and performer is not None
+                and self._softmax_aux() is None
+                and not soft_cap
+            ):
+                # Grouped fork: the performer computes the fork attention from the completion-only states and
+                # the B-row prefix (no per-completion prefix copy); key/value/mask pass through unchanged.
+                cache_view = cache_view.replace(deferred_attention=True)
+            else:
+                key, value, mask_info, cache_view = cache_view.concatenate_to_cache(
+                    key=key, value=value, mask_info=mask_info
+                )
+            shared_mask_info = mask_info
+            dtype_shared: jnp.dtype = self.dtype
+
+            def init_shared_prefix_bias() -> Array:
+                """Materialize the additive bias of the prefix-shared mask on demand."""
+                if shared_mask_info is None:
+                    return jnp.zeros((query.shape[0], 1, query_length, key.shape[1]), dtype=dtype_shared)
+                return shared_mask_info.create_bias(dtype_shared)
+
+            return key, value, mask_info, init_shared_prefix_bias, cache_view, cache_metadata
 
         if cache_view is not None and cache_view.key is not None:
             query_batch: int = query.shape[0]

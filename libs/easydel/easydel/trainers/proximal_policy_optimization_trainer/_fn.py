@@ -17,7 +17,10 @@
 Implements the PPO clipped objective for language-model RLHF training, including:
 - Per-token log-probabilities and entropies
 - Value head predictions
-- Clipped policy loss and clipped value loss
+- Generalised Advantage Estimation with scalar or per-trajectory lambda
+- Clipped policy loss (optionally asymmetric, "clip-higher") and clipped value loss
+- VAPO extensions: global token-level normalisation, positive-example NLL and
+  value-pretraining gating
 """
 
 from __future__ import annotations
@@ -59,6 +62,163 @@ def _masked_mean(x: jax.Array, mask: jax.Array) -> jax.Array:
     """
     denom = jnp.maximum(jnp.sum(mask), 1.0)
     return jnp.sum(x * mask) / denom
+
+
+def _token_normalizer(
+    local_mask: jax.Array,
+    global_count: jax.Array | None,
+    *,
+    token_level_loss: bool,
+    gradient_accumulation_steps: int,
+) -> jax.Array:
+    """Return the denominator of a masked token-sum loss.
+
+    With ``token_level_loss=False`` this is the microbatch-local token count
+    (a masked mean). With ``token_level_loss=True`` the full rollout-batch
+    count ``global_count`` is used instead. :func:`minibatch_call` does not
+    slice 0-dim leaves and averages microbatch gradients by
+    ``1/gradient_accumulation_steps``, so the global count is divided by the
+    accumulation steps to recombine to ``sum(loss) / global_count`` exactly.
+
+    Args:
+        local_mask: Mask of the tokens contributing to the loss in this
+            microbatch.
+        global_count: 0-dim token count over the whole rollout batch, or
+            ``None`` to fall back to the local count.
+        token_level_loss: Whether to normalise by the global count.
+        gradient_accumulation_steps: Number of accumulated microbatches.
+
+    Returns:
+        A float32 scalar clamped to at least one.
+    """
+    if token_level_loss and global_count is not None:
+        count = jnp.asarray(global_count, dtype=jnp.float32) / max(int(gradient_accumulation_steps), 1)
+    else:
+        count = jnp.sum(local_mask.astype(jnp.float32))
+    return jnp.maximum(count, 1.0)
+
+
+def compute_gae(
+    rewards: jax.Array,
+    values: jax.Array,
+    mask: jax.Array,
+    *,
+    gamma: float,
+    lam: float | jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Generalised Advantage Estimation over right-padded completions.
+
+    Runs the backward recursion
+
+    ``delta_t = r_t + gamma * V_{t+1} * m_{t+1} - V_t``
+
+    ``A_t = (delta_t + gamma * lambda * A_{t+1} * m_{t+1}) * m_t``
+
+    with :func:`jax.lax.scan`. ``lam`` may be a scalar or one value per
+    trajectory row, which is what length-adaptive GAE needs.
+
+    Args:
+        rewards: ``(batch, completion_len)`` per-token rewards.
+        values: ``(batch, completion_len)`` value predictions aligned with
+            ``rewards``.
+        mask: Same-shape mask of valid completion positions.
+        gamma: Discount factor.
+        lam: GAE trace decay; a scalar or a ``(batch,)`` array.
+
+    Returns:
+        ``(advantages, returns)`` with ``returns = advantages + values``. Both
+        are float32 ``(batch, completion_len)``. Advantages are zero outside
+        ``mask``.
+    """
+    rewards = rewards.astype(jnp.float32)
+    values = values.astype(jnp.float32)
+    mask = mask.astype(jnp.float32)
+    batch_size = rewards.shape[0]
+    gamma = float(gamma)
+    if isinstance(lam, int | float):
+        trace_decay: float | jax.Array = gamma * float(lam)
+    else:
+        trace_decay = gamma * jnp.broadcast_to(jnp.asarray(lam, dtype=jnp.float32), (batch_size,))
+
+    values_next = jnp.concatenate([values[:, 1:], jnp.zeros((batch_size, 1), dtype=values.dtype)], axis=1)
+    mask_next = jnp.concatenate([mask[:, 1:], jnp.zeros((batch_size, 1), dtype=mask.dtype)], axis=1)
+
+    def scan_fn(adv_next, inputs):
+        r_t, v_t, v_next_t, m_t, m_next_t = inputs
+        delta = r_t + gamma * v_next_t * m_next_t - v_t
+        adv_t = delta + trace_decay * adv_next * m_next_t
+        adv_t = adv_t * m_t
+        return adv_t, adv_t
+
+    inputs = (
+        rewards[:, ::-1].T,
+        values[:, ::-1].T,
+        values_next[:, ::-1].T,
+        mask[:, ::-1].T,
+        mask_next[:, ::-1].T,
+    )
+    _, adv_rev = jax.lax.scan(scan_fn, jnp.zeros((batch_size,), dtype=jnp.float32), inputs)
+    advantages = adv_rev.T[:, ::-1]
+    return advantages, advantages + values
+
+
+def length_adaptive_gae_lambda(lengths: jax.Array, *, alpha: float) -> jax.Array:
+    """VAPO length-adaptive policy lambda ``clip(1 - 1 / (alpha * l), 0, 1)``.
+
+    Short completions get a small lambda (low variance, more bootstrapping).
+    Long completions get a lambda near one, so the terminal reward is not
+    exponentially decayed before it reaches early tokens. Rows of length zero
+    get ``0``; they are fully masked anyway.
+
+    Args:
+        lengths: ``(batch,)`` number of completion tokens per trajectory.
+        alpha: Positive length scale (VAPO uses ``0.05``).
+
+    Returns:
+        Float32 ``(batch,)`` lambdas in ``[0, 1]``.
+
+    Raises:
+        ValueError: If ``alpha`` is not positive.
+    """
+    if alpha <= 0:
+        raise ValueError(f"`alpha` must be positive, got {alpha}.")
+    lengths = jnp.asarray(lengths, dtype=jnp.float32)
+    scheduled = 1.0 - 1.0 / (float(alpha) * jnp.maximum(lengths, 1.0))
+    return jnp.where(lengths > 0, jnp.clip(scheduled, 0.0, 1.0), 0.0)
+
+
+def clipped_policy_loss(
+    new_logps: jax.Array,
+    old_logps: jax.Array,
+    advantages: jax.Array,
+    *,
+    cliprange: float,
+    cliprange_high: float | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-token PPO clipped surrogate with an optional decoupled upper clip.
+
+    ``loss_t = max(-A_t * r_t, -A_t * clip(r_t, 1 - cliprange, 1 + eps_high))``
+    where ``eps_high = cliprange_high`` when set ("clip-higher", DAPO/VAPO) and
+    ``cliprange`` otherwise.
+
+    Args:
+        new_logps: Current-policy per-token log-probabilities.
+        old_logps: Rollout-policy per-token log-probabilities.
+        advantages: Per-token advantages (treated as constants).
+        cliprange: Lower clip ``eps_low``; also the upper clip when
+            ``cliprange_high`` is ``None``.
+        cliprange_high: Optional upper clip ``eps_high``.
+
+    Returns:
+        ``(per_token_loss, ratio, clipped)`` where ``clipped`` is a float mask
+        of tokens whose clipped branch was selected.
+    """
+    upper = cliprange if cliprange_high is None else cliprange_high
+    ratio = jnp.exp(new_logps - old_logps)
+    unclipped = -advantages * ratio
+    clipped_branch = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + upper)
+    per_token_loss = jnp.maximum(unclipped, clipped_branch)
+    return per_token_loss, ratio, (clipped_branch > unclipped).astype(jnp.float32)
 
 
 def compute_per_token_logps(logits: jax.Array, input_ids: jax.Array, prompt_length: int) -> jax.Array:
@@ -105,6 +265,7 @@ def get_per_token_logps_values_entropies(
     attention_mask: jax.Array,
     prompt_length: int,
     logprob_vocab_chunk_size: int | None = None,
+    detach_value_hidden: bool | jax.Array = False,
 ):
     """Compute per-token log probabilities, values, and entropies for PPO.
 
@@ -130,6 +291,10 @@ def get_per_token_logps_values_entropies(
             and entropy computations over the vocabulary dimension are
             performed in chunks of this size to reduce peak memory.
             ``None`` disables vocabulary chunking.
+        detach_value_hidden: When true (a Python bool or a traced scalar
+            bool), the value head reads ``stop_gradient(hidden_states)``.
+            Value-loss gradients then reach only the value head and leave
+            the shared policy backbone alone (used by value pretraining).
 
     Returns:
         Tuple of ``(token_log_probs, values, entropies)``:
@@ -186,9 +351,73 @@ def get_per_token_logps_values_entropies(
             chunk_size=logprob_vocab_chunk_size,
         )
 
-    values_full = model.value_head(hidden_states).squeeze(-1)
+    value_hidden_states = hidden_states
+    if detach_value_hidden is not False:
+        value_hidden_states = jnp.where(detach_value_hidden, jax.lax.stop_gradient(hidden_states), hidden_states)
+    values_full = model.value_head(value_hidden_states).squeeze(-1)
     values = values_full[:, prompt_length - 1 : -1]
     return token_log_probs, values, entropies
+
+
+VALUE_HEAD_MODULE_NAME = "value_head"
+
+
+def _is_value_head_path(path: tuple[tp.Any, ...]) -> bool:
+    """Return whether a pytree key path addresses a leaf of the ``value_head`` module."""
+    return VALUE_HEAD_MODULE_NAME in jax.tree_util.keystr(path)
+
+
+def freeze_policy_during_value_pretrain(
+    old_state: EasyDeLState,
+    new_state: EasyDeLState,
+    in_value_pretrain: jax.Array,
+) -> EasyDeLState:
+    """Keep every non-value-head parameter (and its optimiser moments) at its pre-step value.
+
+    Zeroing the policy gradient is not enough to freeze the policy: decoupled weight decay
+    (e.g. AdamW) still shrinks the parameters and momentum keeps moving them. While
+    ``in_value_pretrain`` is true this selects, per leaf, the pre-step value for every
+    parameter outside the ``value_head`` module and for every optimiser-state leaf that mirrors
+    such a parameter (moment trees share the parameter's key path as a suffix). Value-head
+    leaves, the step counter and shared optimiser scalars (e.g. Adam's ``count``) advance.
+
+    Args:
+        old_state: State before the optimiser update.
+        new_state: State after the optimiser update.
+        in_value_pretrain: Traced scalar bool; when false ``new_state`` is returned unchanged
+            (as values).
+
+    Returns:
+        ``new_state`` with policy parameters and their optimiser moments restored during
+        value pretraining.
+    """
+
+    def select(path, old, new):
+        if _is_value_head_path(path):
+            return new
+        return jnp.where(in_value_pretrain, old, new)
+
+    graphstate = jax.tree_util.tree_map_with_path(select, old_state.graphstate, new_state.graphstate)
+
+    policy_paths = {
+        tuple(path)
+        for path, _ in jax.tree_util.tree_leaves_with_path(old_state.graphstate)
+        if not _is_value_head_path(path)
+    }
+
+    def mirrors_policy_param(path) -> bool:
+        path = tuple(path)
+        return any(path[len(path) - n :] in policy_paths for n in range(1, len(path) + 1))
+
+    def select_opt(path, old, new):
+        if not mirrors_policy_param(path):
+            return new
+        return jnp.where(in_value_pretrain, old, new)
+
+    opt_state = new_state.opt_state
+    if opt_state is not None and old_state.opt_state is not None:
+        opt_state = jax.tree_util.tree_map_with_path(select_opt, old_state.opt_state, opt_state)
+    return new_state.replace(graphstate=graphstate, opt_state=opt_state)
 
 
 def ppo_step(
@@ -206,6 +435,10 @@ def ppo_step(
     gradient_accumulation_steps: int = 1,
     is_training: bool = True,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
+    cliprange_high: float | None = None,
+    token_level_loss: bool = False,
+    positive_nll_coef: float = 0.0,
+    value_pretrain_steps: int = 0,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Run one PPO update (forward + clipped objective + optimiser step).
 
@@ -228,6 +461,19 @@ def ppo_step(
     * **Entropy bonus**: ``mean(entropy)`` of the per-token policy
       distribution, scaled by ``entropy_coef`` and *subtracted* so that
       higher-entropy policies are preferred.
+
+    VAPO extensions (all disabled by default, which leaves the loss above
+    unchanged):
+
+    * ``cliprange_high`` decouples the upper ratio clip (clip-higher).
+    * ``token_level_loss`` divides the policy-gradient token sum by the
+      rollout-batch token count ``num_items_in_batch`` instead of the
+      microbatch-local count.
+    * ``positive_nll_coef`` adds ``coef * NLL`` over the completion tokens of
+      trajectories flagged by ``positive_mask``.
+    * ``value_pretrain_steps``: while ``state.step < value_pretrain_steps``,
+      the loss is only ``vf_coef * vf_loss`` and the value head reads
+      detached hidden states, so the policy backbone receives zero gradient.
 
     Diagnostics emitted via :class:`LossMetrics` include the approx KL
     ``0.5 * mean(log_ratio**2)``, the policy and value clip-fractions,
@@ -273,11 +519,21 @@ def ppo_step(
         straight_through_emulator: Optional STE wrapper applied to the
             parameter tree inside the loss closure to simulate
             quantised forward passes during training.
+        cliprange_high: Optional upper clip ``eps_high``; ``None`` keeps the
+            symmetric ``cliprange``.
+        token_level_loss: Normalise the policy loss by the global rollout
+            token count carried in ``batch["num_items_in_batch"]``.
+        positive_nll_coef: Weight of the positive-example NLL term; requires
+            ``batch["positive_mask"]`` (and ``num_positive_tokens`` when
+            ``token_level_loss`` is set) when positive.
+        value_pretrain_steps: Number of initial optimiser steps that train
+            only the value head.
 
     Returns:
         ``(updated_state, metrics)`` in training mode; in eval mode
         only the :class:`LossMetrics`.
     """
+    normalizer_accumulation_steps = int(gradient_accumulation_steps) if is_training else 1
     scope_root = "easydel/trainer/ppo/" + ("train_step" if is_training else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -316,6 +572,7 @@ def ppo_step(
             old_values = minibatch["old_values"]
             advantages = jax.lax.stop_gradient(minibatch["advantages"])
             returns = jax.lax.stop_gradient(minibatch["returns"])
+            in_value_pretrain = jnp.asarray(state.step) < value_pretrain_steps if value_pretrain_steps > 0 else None
 
             with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
                 new_logps, new_values, entropies = get_per_token_logps_values_entropies(
@@ -324,15 +581,25 @@ def ppo_step(
                     attention_mask,
                     prompt_length,
                     logprob_vocab_chunk_size,
+                    detach_value_hidden=False if in_value_pretrain is None else in_value_pretrain,
                 )
 
             with jax.named_scope(scope_root + "/loss_fn/policy_loss"):
                 log_ratio = new_logps - old_logps
-                ratio = jnp.exp(log_ratio)
-
-                pg_losses = -advantages * ratio
-                pg_losses2 = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
-                pg_loss = _masked_mean(jnp.maximum(pg_losses, pg_losses2), completion_mask)
+                per_token_pg_loss, ratio, pg_clipped = clipped_policy_loss(
+                    new_logps,
+                    old_logps,
+                    advantages,
+                    cliprange=cliprange,
+                    cliprange_high=cliprange_high,
+                )
+                pg_denominator = _token_normalizer(
+                    completion_mask,
+                    minibatch.get("num_items_in_batch"),
+                    token_level_loss=token_level_loss,
+                    gradient_accumulation_steps=normalizer_accumulation_steps,
+                )
+                pg_loss = jnp.sum(per_token_pg_loss * completion_mask) / pg_denominator
 
             with jax.named_scope(scope_root + "/loss_fn/value_loss"):
                 values_clipped = old_values + jnp.clip(new_values - old_values, -cliprange_value, cliprange_value)
@@ -343,10 +610,23 @@ def ppo_step(
             with jax.named_scope(scope_root + "/loss_fn/entropy_and_combine"):
                 entropy = _masked_mean(entropies, completion_mask)
                 loss = pg_loss + vf_coef * vf_loss - entropy_coef * entropy
+                positive_nll = jnp.zeros((), dtype=jnp.float32)
+                if positive_nll_coef > 0.0:
+                    positive_tokens = completion_mask * minibatch["positive_mask"].astype(jnp.float32)[:, None]
+                    nll_denominator = _token_normalizer(
+                        positive_tokens,
+                        minibatch.get("num_positive_tokens"),
+                        token_level_loss=token_level_loss,
+                        gradient_accumulation_steps=normalizer_accumulation_steps,
+                    )
+                    positive_nll = -jnp.sum(new_logps * positive_tokens) / nll_denominator
+                    loss = loss + positive_nll_coef * positive_nll
+                if in_value_pretrain is not None:
+                    loss = jnp.where(in_value_pretrain, vf_coef * vf_loss, loss)
 
             with jax.named_scope(scope_root + "/loss_fn/diagnostics"):
                 approx_kl = 0.5 * _masked_mean(jnp.square(log_ratio), completion_mask)
-                pg_clipfrac = _masked_mean(((pg_losses2 > pg_losses).astype(jnp.float32)), completion_mask)
+                pg_clipfrac = _masked_mean(pg_clipped, completion_mask)
                 vf_clipfrac = _masked_mean(((vf_losses2 > vf_losses1).astype(jnp.float32)), completion_mask)
 
                 other_metrics: dict[str, jax.Array] = {
@@ -360,6 +640,10 @@ def ppo_step(
                     "advantages_mean": _masked_mean(advantages, completion_mask),
                     "returns_mean": _masked_mean(returns, completion_mask),
                 }
+                if positive_nll_coef > 0.0:
+                    other_metrics["positive_nll"] = positive_nll
+                if in_value_pretrain is not None:
+                    other_metrics["value_pretrain_active"] = in_value_pretrain.astype(jnp.float32)
 
             return loss, LossMetrics(loss=loss, accuracy=1, other_metrics=other_metrics)
 
@@ -371,6 +655,7 @@ def ppo_step(
                 minibatch_size=minibatch_size,
                 grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
             )
+        pre_update_state = state
         with jax.named_scope(scope_root + "/update_state"):
             state = update_state_respectfully(
                 state=state,
@@ -383,6 +668,13 @@ def ppo_step(
                     gradients=gradients,
                 ),
             )
+        if value_pretrain_steps > 0:
+            with jax.named_scope(scope_root + "/freeze_policy_during_value_pretrain"):
+                state = freeze_policy_during_value_pretrain(
+                    pre_update_state,
+                    state,
+                    jnp.asarray(pre_update_state.step) < value_pretrain_steps,
+                )
         return state, metrics
 
     with jax.named_scope(scope_root + "/eval_call"):

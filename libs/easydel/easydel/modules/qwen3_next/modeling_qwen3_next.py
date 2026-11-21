@@ -84,6 +84,7 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
+from easydel.caching.shared_prefix import is_shared_prefix_recurrent_view
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -3073,6 +3074,13 @@ class Qwen3NextLinearAttention(spx.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
+        if is_shared_prefix_recurrent_view(cache_view):
+            # Prefix-shared training views run only the multi-token chunked path (verified with gradients
+            # through the initial state); keep them out of the packed, grouped-decode and single-step branches.
+            if seq_len < 2:
+                raise NotImplementedError("Prefix-shared linear attention requires at least two tokens per pass.")
+            if cache_metadata is not None:
+                raise NotImplementedError("Prefix-shared linear attention does not take cache metadata.")
         expand_ratio = self.num_v_heads // self.num_k_heads
         if self.uses_merged_split_proj:
             projected_qkvz = self.in_proj_qkvz(hidden_states)

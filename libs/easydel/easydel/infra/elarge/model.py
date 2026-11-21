@@ -31,6 +31,7 @@ Key Features:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import os
@@ -85,6 +86,7 @@ from .types import (
     get_training_arguments_class,
     normalize_trainer_config,
 )
+from .types.training import ELARGE_ENVIRONMENT_TRAINER_KEYS
 
 if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -1617,15 +1619,80 @@ class eLargeModel:
         Constructor errors propagate without a retry. ``explicit_keys`` remains
         accepted for compatibility but does not change option filtering.
         """
+        params = inspect.signature(args_class).parameters
+        # Environment keys are eLarge-only for most trainers, but argument classes that declare them
+        # (AgentFlow, AsyncGRPO) read the environment from their own config, so forward them there.
         config_for_args = {
             key: value
             for key, value in trainer_cfg.items()
-            if key != "trainer_type" and key not in ELARGE_ONLY_TRAINER_KEYS
+            if key != "trainer_type"
+            and (key not in ELARGE_ONLY_TRAINER_KEYS or (key in ELARGE_ENVIRONMENT_TRAINER_KEYS and key in params))
         }
-        params = inspect.signature(args_class).parameters
         if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
             config_for_args = {key: value for key, value in config_for_args.items() if key in params}
         return args_class(**config_for_args)
+
+    @staticmethod
+    def _agent_flow_inner_trainer_params(base_type: str) -> Mapping[str, inspect.Parameter] | None:
+        """Constructor parameters of AgentFlow's inner trainer, or ``None`` when it accepts ``**kwargs``."""
+        try:
+            params = inspect.signature(get_trainer_class(base_type)).parameters
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return None
+        return params
+
+    def _agent_flow_base_config(self, training_args: Any, raw_trainer_cfg: Mapping[str, Any]) -> Any | None:
+        """Build the inner trainer's arguments for an ``agent_flow`` run from the same YAML section.
+
+        Without this, ``AgentFlowTrainer`` would build the inner config from a fixed handful of fields and
+        drop every algorithm hyperparameter (``beta``, ``loss_type``, ``max_new_tokens``, ...). The inner
+        config is seeded with the fields AgentFlow has always forwarded, then receives every key the user
+        set explicitly in the trainer section; keys the inner argument class does not declare are dropped,
+        and unset keys keep that class's own dataclass defaults. AgentFlow-only fields (environment,
+        episode controls, ``trainer_prefix``) stay on the wrapper.
+
+        Returns:
+            The constructed inner ``TrainingArguments``, or ``None`` when the user already supplied
+            ``base_config`` (AgentFlow then uses it as given).
+        """
+        if getattr(training_args, "base_config", None) is not None:
+            return None
+        from easydel.trainers.agent_flow_trainer import AgentFlowConfig
+        from easydel.trainers.training_configurations import TrainingArguments
+
+        base_type = str(training_args.base_trainer_type)
+        wrapper_only = (
+            {f.name for f in dataclasses.fields(AgentFlowConfig)}
+            - {f.name for f in dataclasses.fields(TrainingArguments)}
+        ) - {"max_prompt_length", "max_completion_length", "num_generations", "skip_apply_chat_template"}
+        wrapper_only |= {"trainer_type", "trainer_prefix", *ELARGE_ONLY_TRAINER_KEYS}
+
+        cfg: dict[str, Any] = {}
+        for key in (
+            "learning_rate",
+            "max_training_steps",
+            "save_directory",
+            "async_mode",
+            "max_prompt_length",
+            "max_completion_length",
+            "total_batch_size",
+            "gradient_accumulation_steps",
+            "num_generations",
+        ):
+            value = getattr(training_args, key, None)
+            if value is not None:
+                cfg[key] = value
+        normalized = normalize_trainer_config(dict(raw_trainer_cfg))
+        for key in raw_trainer_cfg:
+            if key not in wrapper_only and key in normalized:
+                cfg[key] = normalized[key]
+
+        args_class = get_training_arguments_class(base_type)
+        params = inspect.signature(args_class).parameters
+        cfg = {key: value for key, value in cfg.items() if key in params}
+        return args_class(**cfg)
 
     def _build_pre_tokenize_transform(
         self,
@@ -1768,11 +1835,14 @@ class eLargeModel:
             )
 
         prompt_only_trainers = {
+            "agent_flow",
             "agentic-moshpit",
             "async_grpo",
             "compaction_rl",
             "dppo",
+            "gdpo",
             "gfpo",
+            "gmpo",
             "grpo",
             "grpo_with_replay_buffer",
             "gspo",
@@ -1783,6 +1853,7 @@ class eLargeModel:
             "on_policy_distillation",
             "papo",
             "ppo",
+            "reinforce_plus_plus",
             "rlvr",
             "rloo",
             "sao",
@@ -1791,11 +1862,14 @@ class eLargeModel:
             "seq_kd",
             "sparse_distillation",
             "ssd",
+            "vapo",
             "xpo",
         }
         if trainer_type in prompt_only_trainers:
             transform_cls = (
-                PPOPreprocessTransform if trainer_type in {"compaction_rl", "ppo", "sao"} else GRPOPreprocessTransform
+                PPOPreprocessTransform
+                if trainer_type in {"compaction_rl", "ppo", "sao", "vapo"}
+                else GRPOPreprocessTransform
             )
             return transform_cls(
                 tokenizer=tokenizer,
@@ -2654,21 +2728,85 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type == "agent_flow":
+            base_type = str(getattr(training_args, "base_trainer_type", "grpo") or "grpo").lower()
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            if reward_funcs is not None or reward_model is not None:
+                trainer_kwargs["reward_funcs"] = reward_funcs if reward_funcs is not None else reward_model
+            elif base_type in {"ppo", "vapo"}:
+                reward_model = self.build_reward_model()
+                if reward_model is not None:
+                    trainer_kwargs["reward_funcs"] = reward_model
+            base_params = self._agent_flow_inner_trainer_params(base_type)
+            if base_type not in {"ppo", "vapo", "gkd", "on_policy_distillation", "seq_kd", "sdft", "ssd"}:
+                # Only forward runtime options the inner trainer's constructor declares (OnlineDPO, for
+                # example, takes reward_processing_classes but not data_tokenize_fn).
+                for key in ("reward_processing_classes", "data_tokenize_fn"):
+                    if kwargs.get(key) is not None and (base_params is None or key in base_params):
+                        trainer_kwargs[key] = kwargs[key]
+            base_config = self._agent_flow_base_config(
+                training_args,
+                {**dict(self._config.get("trainer", {})), **argument_overrides},
+            )
+            if base_config is not None:
+                training_args.base_config = base_config
+            if base_params is not None and "reference_model" in base_params:
+                # Preference inners (OnlineDPO) take a frozen reference; build it from YAML when configured,
+                # otherwise the inner trainer falls back to a frozen copy of the policy.
+                if reference_model is None:
+                    reference_model = self.build_reference_model()
+                if reference_model is not None and base_state_class is not None:
+                    reference_model = reference_model.to_state(base_state_class)
+                if reference_model is not None:
+                    trainer_kwargs["reference_model"] = reference_model
+            if kwargs.get("environment") is not None:
+                trainer_kwargs["environment"] = kwargs["environment"]
+            if kwargs.get("environment_factory") is not None:
+                trainer_kwargs["environment_factory"] = kwargs["environment_factory"]
+
         elif trainer_type in {
             "grpo",
+            "gdpo",
             "gfpo",
+            "gmpo",
             "gspo",
             "async_grpo",
             "dppo",
             "grpo_with_replay_buffer",
             "gspo_token",
             "papo",
+            "reinforce_plus_plus",
             "rloo",
         }:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
+            env_spec = self.config.get("trainer", {}).get("environment")
+            env_factory = kwargs.get("environment_factory", kwargs.get("env_factory", None))
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if env_spec is not None and (env_factory is None or resolved_reward is None):
+                from easydel.environments import AutoEnvironment, KiriRuntime, SandboxPool
+                from easydel.trainers.async_grpo_trainer import environment_reward_placeholder
+
+                tcfg = self.config.get("trainer", {})
+                env_backend = str(tcfg.get("environment_backend", "kiri"))
+                env_endpoints = tcfg.get("environment_endpoints")
+                env_runtime = (
+                    SandboxPool(endpoints=env_endpoints, backend=env_backend)
+                    if env_endpoints
+                    else KiriRuntime(backend=env_backend)
+                )
+                if env_factory is None:
+                    env_factory = AutoEnvironment.as_factory(env_spec, runtime=env_runtime)
+                if resolved_reward is None:
+                    # GRPO appends the stepped environment rewards as their own column; a zero-weight
+                    # placeholder keeps the environment reward counted exactly once.
+                    resolved_reward = environment_reward_placeholder
+
             if resolved_reward is None:
                 raise ValueError(
                     f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
@@ -2683,7 +2821,7 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
             trainer_kwargs["tools"] = kwargs.get("tools", None)
-            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
+            trainer_kwargs["environment_factory"] = env_factory
 
         elif trainer_type == "nemo_gym":
             trainer_kwargs["arguments"] = training_args
@@ -2779,7 +2917,7 @@ class eLargeModel:
                 trainer_kwargs["compaction_controller"] = kwargs.get("compaction_controller")
                 trainer_kwargs["tool_guard"] = kwargs.get("tool_guard")
 
-        elif trainer_type == "ppo":
+        elif trainer_type in {"ppo", "vapo"}:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 

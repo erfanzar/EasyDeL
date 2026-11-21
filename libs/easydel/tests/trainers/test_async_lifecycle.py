@@ -36,8 +36,10 @@ def test_epoch_exit_cancels_queue_without_joining_running_reader(monkeypatch, ex
         return async_grpo._AsyncRolloutResult(batch, {}, produced_at_step, 0.0)
 
     def execute(**kwargs):
+        from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal
+
         assert running.wait(2)
-        error_type = async_grpo.EasyDeLPreemptionSignal if exit_mode == "preemption" else async_grpo.EasyDeLBreakRequest
+        error_type = EasyDeLPreemptionSignal if exit_mode == "preemption" else EasyDeLBreakRequest
         return kwargs["state"], SimpleNamespace(), error_type("stop")
 
     trainer = SimpleNamespace(
@@ -81,8 +83,10 @@ def test_epoch_exit_cancels_queue_without_joining_running_reader(monkeypatch, ex
             with pytest.raises(TimeoutError):
                 epoch()
         else:
+            from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal
+
             _, error, _ = epoch()
-            assert isinstance(error, async_grpo.EasyDeLBreakRequest | async_grpo.EasyDeLPreemptionSignal)
+            assert isinstance(error, EasyDeLBreakRequest | EasyDeLPreemptionSignal)
         assert time.monotonic() - before < 1.5
         assert running.is_set()
         assert not released.is_set()

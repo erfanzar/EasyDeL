@@ -131,6 +131,34 @@ class PPOConfig(TrainingArguments):
         logprob_vocab_chunk_size: Optional vocabulary chunking for the
             log-probability / entropy reductions used by the loss; set
             to ``None`` (or non-positive) to disable chunking.
+        gae_lambda_critic: Decoupled GAE trace decay used to build the
+            value-function targets. ``None`` reuses ``lam``; VAPO uses
+            ``1.0`` (unbiased Monte-Carlo returns for the critic).
+        length_adaptive_gae: When ``True`` the *policy* advantages use a
+            per-trajectory lambda
+            ``clip(1 - 1 / (length_adaptive_gae_alpha * l), 0, 1)`` where
+            ``l`` is the number of completion tokens, instead of ``lam``.
+        length_adaptive_gae_alpha: ``alpha`` in the length-adaptive lambda
+            schedule. Must be positive.
+        cliprange_high: Optional decoupled upper policy-ratio clip
+            ("clip-higher"). The ratio is clipped to
+            ``[1 - cliprange, 1 + cliprange_high]``; ``None`` keeps the
+            symmetric ``cliprange``.
+        token_level_loss: When ``True`` the policy-gradient loss (and the
+            positive-example NLL) is a token sum divided by the total number
+            of completion tokens in the rollout batch, so long sequences are
+            not down-weighted, instead of a microbatch-local masked mean.
+        positive_nll_coef: Weight of the auxiliary negative log-likelihood
+            on completions whose score exceeds
+            ``positive_reward_threshold``. ``0`` disables it.
+        positive_reward_threshold: A completion is "positive" when its
+            scalar score (reward-function sum, after the missing-EOS
+            penalty, before the KL penalty) is strictly greater than this.
+        value_pretrain_steps: Number of initial optimiser steps that train
+            only the value head: the loss is ``vf_coef * vf_loss`` and the
+            value head reads detached hidden states, so the policy receives
+            no gradient. Counted in optimiser steps, so each PPO epoch
+            counts.
     """
 
     trainer_prefix: str | None = field(
@@ -354,6 +382,38 @@ class PPOConfig(TrainingArguments):
             )
         },
     )
+    gae_lambda_critic: float | None = field(
+        default=None,
+        metadata={"help": "Decoupled GAE lambda for value targets. `None` reuses `lam`; VAPO uses 1.0."},
+    )
+    length_adaptive_gae: bool = field(
+        default=False,
+        metadata={"help": "Use the per-trajectory policy lambda clip(1 - 1 / (alpha * length), 0, 1)."},
+    )
+    length_adaptive_gae_alpha: float = field(
+        default=0.05,
+        metadata={"help": "Alpha of the length-adaptive GAE lambda schedule. Must be positive."},
+    )
+    cliprange_high: float | None = field(
+        default=None,
+        metadata={"help": "Optional upper policy-ratio clip (clip-higher). `None` keeps the symmetric `cliprange`."},
+    )
+    token_level_loss: bool = field(
+        default=False,
+        metadata={"help": "Normalize the policy loss by the total completion-token count of the rollout batch."},
+    )
+    positive_nll_coef: float = field(
+        default=0.0,
+        metadata={"help": "Weight of the NLL auxiliary loss on positive (score > threshold) completions."},
+    )
+    positive_reward_threshold: float = field(
+        default=0.0,
+        metadata={"help": "Completions with score strictly above this threshold count as positive examples."},
+    )
+    value_pretrain_steps: int = field(
+        default=0,
+        metadata={"help": "Number of initial optimizer steps that train only the value head."},
+    )
 
     def __post_init__(
         self,
@@ -402,6 +462,18 @@ class PPOConfig(TrainingArguments):
 
         if self.num_ppo_epochs < 1:
             raise ValueError("`num_ppo_epochs` must be at least 1.")
+        if self.gae_lambda_critic is not None and not 0.0 <= float(self.gae_lambda_critic) <= 1.0:
+            raise ValueError("`gae_lambda_critic` must be in [0, 1] when set.")
+        if self.length_adaptive_gae_alpha <= 0:
+            raise ValueError("`length_adaptive_gae_alpha` must be positive.")
+        if self.cliprange_high is not None and self.cliprange_high < 0:
+            raise ValueError("`cliprange_high` must be non-negative when set.")
+        if self.positive_nll_coef < 0:
+            raise ValueError("`positive_nll_coef` must be non-negative.")
+        if self.value_pretrain_steps < 0:
+            raise ValueError("`value_pretrain_steps` must be non-negative.")
+        if self.value_pretrain_steps > 0 and self.vf_coef <= 0:
+            raise ValueError("`value_pretrain_steps > 0` requires a positive `vf_coef`; the critic would not train.")
         if self.num_mini_batches != 1:
             raise ValueError("EasyDeL PPO currently supports only `num_mini_batches=1`.")
         if self.local_rollout_forward_batch_size is not None:

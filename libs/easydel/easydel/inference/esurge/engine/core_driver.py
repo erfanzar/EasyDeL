@@ -223,6 +223,9 @@ class EngineCoreDriver:
         self._empty: list[str] = []
         """Admitted requests with an empty prompt: dropped (aborted) at the next schedule, as the former scheduler did."""
         self._empty_freed: list[str] = []
+        self._kv_versions: dict[str, int] = {}
+        """Live request id -> oldest weight version its live KV was computed with; filled only by
+        :meth:`mark_kv_weight_version` (empty, and never consulted, until a between-steps weight swap)."""
 
     def set_verify_budget(
         self,
@@ -482,6 +485,69 @@ class EngineCoreDriver:
     def _drop_live(self, rid: str, h: int) -> None:
         if self._handles.get(rid) == h:
             del self._handles[rid]
+            self._kv_versions.pop(rid, None)
+
+    # ------------------------------------------------------------------------------------------------ KV versions
+    def _computed(self, h: int) -> int:
+        info = self._core.request_info(h)
+        return 0 if info is None else int(info[4])
+
+    def mark_kv_weight_version(self, version: int) -> dict[str, int]:
+        """Record that the live KV of every request was computed with weights ``version`` or older.
+
+        Call it at a weight swap, with no model step in flight, before the new weights run. Every live request
+        holding computed tokens that is not tracked yet starts tracking ``version`` (the outgoing weights); a tracked
+        request keeps its older version. Requests with no computed tokens (never scheduled, or preempted and not
+        resumed) are not tracked: all their KV will be computed with the new weights.
+
+        Args:
+            version: Weight version that computed every KV entry currently held.
+
+        Returns:
+            The requests that started tracking ``version`` in this call, in admission order.
+        """
+        marked: dict[str, int] = {}
+        for rid, h in self._handles.items():
+            if rid in self._kv_versions or self._computed(h) <= 0:
+                continue
+            self._kv_versions[rid] = marked[rid] = int(version)
+        return marked
+
+    def oldest_kv_weight_version(self, request_id: str, current_version: int) -> int | None:
+        """Oldest weight version behind a live request's KV, or ``None`` when it holds none (or is not live).
+
+        Args:
+            request_id: Engine request id (an ``n>1`` child id for samples).
+            current_version: Version of the installed weights, which computed any untracked KV.
+        """
+        tracked = self._kv_versions.get(request_id)
+        if tracked is not None:
+            return tracked
+        h = self._handles.get(request_id)
+        if h is None or self._computed(h) <= 0:
+            return None
+        return int(current_version)
+
+    def stale_kv_parent_ids(self, min_version: int, current_version: int) -> list[str]:
+        """Parent ids of live requests holding KV computed with a weight version below ``min_version``.
+
+        Args:
+            min_version: Oldest weight version a kept request's KV may come from.
+            current_version: Version of the installed weights.
+
+        Returns:
+            Parent request ids (the request id when it has no parent) in admission order, without duplicates.
+        """
+        out: list[str] = []
+        for rid, h in self._handles.items():
+            version = self.oldest_kv_weight_version(rid, current_version)
+            if version is None or version >= int(min_version):
+                continue
+            rec = self._records.get(h)
+            parent = (rec.parent_request_id if rec is not None else None) or rid
+            if parent not in out:
+                out.append(parent)
+        return out
 
     def _reported(self, h: int) -> None:
         """One of the core's reports that ``h`` was freed (plan ``finished``; ``finished_all`` when requested)."""
@@ -662,6 +728,10 @@ class EngineCoreDriver:
                 self._empty_freed.extend(self._empty)
             self._empty = []
         preempted = {names[h] for h in plan.preempted.tolist()}
+        if self._kv_versions:
+            # The core freed a preempted request's KV (computed back to 0): its recompute is new KV.
+            for rid in preempted:
+                self._kv_versions.pop(rid, None)
 
         def pairs(arr) -> dict[str, int]:
             return {rids[int(e)]: int(s) for e, s in arr.tolist()}

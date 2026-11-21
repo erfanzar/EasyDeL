@@ -80,6 +80,8 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
         """
         return {
             "advantages",
+            "behavior_parity_gate",
+            "behavior_per_token_logps",
             "completion_ids",
             "completion_mask",
             "completion_attention_mask",
@@ -158,6 +160,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
                 "prompt_mask": model_batch["prompt_mask"][group_index : group_index + 1],
             }
             for key in (
+                "behavior_per_token_logps",
                 "difficulty_weights",
                 "importance_sampling_ratio",
                 "old_per_token_logps",
@@ -205,6 +208,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             if key == "importance_sampling_ratio" and sequence_correction:
                 continue
             if value is not None and key in {
+                "behavior_per_token_logps",
                 "completion_ids",
                 "completion_mask",
                 "completion_attention_mask",
@@ -257,6 +261,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
                 .set(sampled_group["advantages"].reshape(updated_batch["advantages"][start:end].shape))
             )
             for key in (
+                "behavior_per_token_logps",
                 "difficulty_weights",
                 "importance_sampling_ratio",
                 "old_per_token_logps",
@@ -267,6 +272,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
                     continue
                 sampled_value = sampled_group[key]
                 if key in {
+                    "behavior_per_token_logps",
                     "importance_sampling_ratio",
                     "old_per_token_logps",
                     "ref_per_token_logps",

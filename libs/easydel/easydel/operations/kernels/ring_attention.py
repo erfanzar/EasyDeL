@@ -82,6 +82,33 @@ from ._mask_info import align_mask_info_to_qkv_specs
 from .vanilla_attention import VanillaAttn
 
 
+def _resolve_contraction_precision(precision: jax.lax.PrecisionLike | None) -> jax.lax.PrecisionLike:
+    """Resolve the contraction precision handed to ejkernel's ring attention.
+
+    ejkernel takes an explicit precision, and an explicit ``Precision.DEFAULT``
+    overrides an ambient ``jax.default_matmul_precision(...)`` scope (on TPU that
+    means bf16 matmul passes even for fp32 inputs). An explicit ``precision``
+    argument wins; otherwise the ambient JAX setting is honoured. Without either,
+    ``Precision.DEFAULT`` is returned, exactly as before.
+
+    Args:
+        precision: Precision requested by the caller, or ``None``.
+
+    Returns:
+        The precision to forward to the kernel.
+    """
+    if precision is not None:
+        return precision
+    ambient = jax.config.jax_default_matmul_precision
+    if ambient is None:
+        return jax.lax.Precision.DEFAULT
+    try:
+        return jax.lax.Precision(ambient)
+    except ValueError:
+        # Dot-algorithm preset names: only the XLA ring consumes them, and it does.
+        return ambient
+
+
 @OperationRegistry.register
 class RingAttn(OperationImpl):
     """
@@ -348,7 +375,7 @@ class RingAttn(OperationImpl):
             sliding_window=sliding_window,
             causal=causal_computed,
             fused_backward=fused_backward,
-            precision=ignore.get("precision", jax.lax.Precision.DEFAULT),
+            precision=_resolve_contraction_precision(ignore.get("precision")),
             cfg=self.metadata.get_operation_config("ring"),
             # The Pallas splash ring path cannot represent additive pairwise
             # bias or per-head sinks. The registered XLA ring supports both,

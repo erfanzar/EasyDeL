@@ -144,6 +144,10 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    trainers/compaction_rl.md
    trainers/orpo.md
    trainers/reward.md
+   trainers/environments.md
+   trainers/sandbox_runtime.md
+   trainers/rl_safety.md
+   trainers/agent_flow.md
 
 .. toctree::
    :maxdepth: 2

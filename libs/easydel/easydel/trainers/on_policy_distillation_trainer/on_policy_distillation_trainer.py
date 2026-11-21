@@ -36,6 +36,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from .._shared import drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..metrics import _host_mean_float
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
@@ -53,7 +54,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "on_policy_distillation")
-class OnPolicyDistillationTrainer(Trainer):
+class OnPolicyDistillationTrainer(AsyncRolloutMixin, Trainer):
     """On-policy knowledge distillation trainer.
 
     Unlike standard (offline) distillation which distills on a fixed dataset,
@@ -324,9 +325,13 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.cakld_gamma,
             self.arguments.loss_top_k,
             self.arguments.loss_add_tail,
+            self.arguments.distillation_mode,
+            self.arguments.trust_region_top_k,
+            self.arguments.trust_region_seed,
+            self.arguments.trust_region_sampling_temperature,
         )
 
-        static_argnames = tuple(range(3, 16))
+        static_argnames = tuple(range(3, 20))
 
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
@@ -355,6 +360,10 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.cakld_gamma,
             self.arguments.loss_top_k,
             self.arguments.loss_add_tail,
+            self.arguments.distillation_mode,
+            self.arguments.trust_region_top_k,
+            self.arguments.trust_region_seed,
+            self.arguments.trust_region_sampling_temperature,
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")

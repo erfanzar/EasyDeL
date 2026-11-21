@@ -35,8 +35,10 @@ public API.
 """
 
 from . import prompt_transforms
+from .agent_flow_trainer import AgentFlowConfig, AgentFlowTrainer
 from .agentic_moshpit import AgenticMoshPitConfig, AgenticMoshPitTrainer
 from .async_grpo_trainer import AsyncGRPOConfig, AsyncGRPOTrainer
+from .async_rollout_mixin import AsyncRolloutMixin, AsyncRolloutResult
 from .base_trainer import BaseTrainer
 from .bema_trainer import BEMACallback, BEMAConfig, BEMADPOTrainer
 from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
@@ -47,7 +49,9 @@ from .distillation_trainer import DistillationConfig, DistillationTrainer
 from .dppo_trainer import DPPOConfig, DPPOTrainer
 from .embedding_trainer import EmbeddingConfig, EmbeddingTrainer
 from .esurge_rollout import OpenRewardSpec, eSurgeRolloutConfig, eSurgeRolloutGenerator, generate_rollout_completions
+from .gdpo_trainer import GDPOConfig, GDPOTrainer
 from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
+from .gmpo_trainer import GMPOConfig, GMPOTrainer
 from .gold_trainer import GOLDConfig, GOLDTrainer
 from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
@@ -84,6 +88,7 @@ from .prompt_transforms import (
 )
 from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
 from .ray_scaler import RayDistributedTrainer
+from .reinforce_plus_plus_trainer import ReinforcePlusPlusConfig, ReinforcePlusPlusTrainer
 from .reward_protocol import RewardProtocol
 from .reward_trainer import RewardConfig, RewardTrainer
 from .rloo_trainer import RLOOConfig, RLOOTrainer
@@ -99,13 +104,18 @@ from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .tpo_trainer import TPOConfig, TPOTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
+from .vapo_trainer import VAPOConfig, VAPOTrainer
 from .xpo_trainer import XPOConfig, XPOTrainer
 
 __all__ = (
+    "AgentFlowConfig",
+    "AgentFlowTrainer",
     "AgenticMoshPitConfig",
     "AgenticMoshPitTrainer",
     "AsyncGRPOConfig",
     "AsyncGRPOTrainer",
+    "AsyncRolloutMixin",
+    "AsyncRolloutResult",
     "BCOConfig",
     "BCOPreprocessTransform",
     "BCOTrainer",
@@ -127,10 +137,14 @@ __all__ = (
     "DistillationTrainer",
     "EmbeddingConfig",
     "EmbeddingTrainer",
+    "GDPOConfig",
+    "GDPOTrainer",
     "GFPOConfig",
     "GFPOTrainer",
     "GKDConfig",
     "GKDTrainer",
+    "GMPOConfig",
+    "GMPOTrainer",
     "GOLDConfig",
     "GOLDTrainer",
     "GRPOConfig",
@@ -177,6 +191,8 @@ __all__ = (
     "RLVRConfig",
     "RLVRTrainer",
     "RayDistributedTrainer",
+    "ReinforcePlusPlusConfig",
+    "ReinforcePlusPlusTrainer",
     "RewardConfig",
     "RewardPreprocessTransform",
     "RewardProtocol",
@@ -204,6 +220,8 @@ __all__ = (
     "TPOTrainer",
     "Trainer",
     "TrainingArguments",
+    "VAPOConfig",
+    "VAPOTrainer",
     "XPOConfig",
     "XPOTrainer",
     "eSurgeRolloutConfig",
