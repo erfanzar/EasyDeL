@@ -59,6 +59,7 @@ jobs:
           if [ -n "$UV_PUBLISH_TOKEN" ]; then
             uv publish dist/*
           else
+            unset UV_PUBLISH_TOKEN
             uv publish --trusted-publishing always dist/*
           fi
 
@@ -131,5 +132,6 @@ jobs:
           if [ -n "$UV_PUBLISH_TOKEN" ]; then
             uv publish dist/*
           else
+            unset UV_PUBLISH_TOKEN
             uv publish --trusted-publishing always dist/*
           fi
