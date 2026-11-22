@@ -1,0 +1,154 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading
+from types import SimpleNamespace
+
+from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
+
+
+class _DummyIOEngine(eSurge):
+    """eSurge subclass with stubbed request state; no engine construction."""
+
+    def __init__(self, request_output: RequestOutput, *, core_request_ids: set[str], active_request_ids: set[str]):
+        self._output_lock = threading.RLock()
+        self._scheduler_lock = threading.RLock()
+        self._request_lock = threading.RLock()
+        self._request_outputs = {request_output.request_id: request_output}
+        self._active_requests = {rid: {} for rid in active_request_ids}
+        live = frozenset(core_request_ids)
+        self.core = SimpleNamespace(is_live=lambda request_id: request_id in live)
+        self.aborted: list[str] = []
+
+    def abort_request(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+        with self._output_lock:
+            ro = self._request_outputs.get(request_id)
+            if ro is None:
+                return
+            for comp in ro.outputs:
+                if comp.finish_reason is None:
+                    comp.finish_reason = "abort"
+            ro.finished = True
+            ro.update_seq += 1
+
+
+def _make_request_output(request_id: str, n: int, finished_indices: set[int] | None = None) -> RequestOutput:
+    finished_indices = finished_indices or set()
+    outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n)]
+    for i in finished_indices:
+        outputs[i].finish_reason = "stop"
+    return RequestOutput(
+        request_id=request_id,
+        prompt="prompt",
+        prompt_token_ids=[],
+        outputs=outputs,
+        finished=False,
+    )
+
+
+def test_recover_orphaned_request_aborts_parent_when_children_disappear():
+    ro = _make_request_output("req", n=4, finished_indices={0})
+    engine = _DummyIOEngine(ro, core_request_ids=set(), active_request_ids={"req"})
+
+    recovered = engine._recover_orphaned_request("req")
+
+    assert recovered is True
+    assert engine.aborted == ["req"]
+    assert ro.finished is True
+    assert all(comp.finish_reason is not None for comp in ro.outputs)
+
+
+def test_recover_orphaned_request_skips_when_scheduler_still_has_pending_child():
+    ro = _make_request_output("req", n=4, finished_indices={0})
+    engine = _DummyIOEngine(ro, core_request_ids={"req-2"}, active_request_ids={"req", "req-2"})
+
+    recovered = engine._recover_orphaned_request("req")
+
+    assert recovered is False
+    assert engine.aborted == []
+    assert ro.finished is False
+    assert ro.outputs[2].finish_reason is None
+
+
+class _StreamEngine(_DummyIOEngine):
+    """Adds what ``_iter_request_snapshots`` reads; counts orphan checks instead of running them."""
+
+    _generation_alive = True
+    _max_request_outputs = None
+
+    def __init__(self, request_output: RequestOutput):
+        super().__init__(request_output, core_request_ids={request_output.request_id}, active_request_ids=set())
+        self._request_events = {request_output.request_id: threading.Event()}
+        self.orphan_checks = 0
+        self.on_orphan_check = None
+
+    def _raise_if_scheduler_failed(self) -> None:
+        pass
+
+    def _recover_orphaned_request(self, request_id: str) -> bool:
+        self.orphan_checks += 1
+        if self.on_orphan_check is not None:
+            self.on_orphan_check()
+        return False
+
+
+def _publish(ro: RequestOutput, text: str, *, finished: bool = False) -> None:
+    ro.accumulated_text += text
+    ro.delta_text = text
+    ro.num_generated_tokens += 1
+    ro.finished = finished
+    ro.update_seq += 1
+
+
+def test_signalled_stream_wakeups_skip_the_orphan_check():
+    # The orphan check takes the scheduler lock; a woken waiter was signalled by real progress, so running it on every
+    # wakeup only contends with the engine loop (once per stream per step at high concurrency).
+    ro = _make_request_output("req", n=1)
+    engine = _StreamEngine(ro)
+    event = engine._request_events["req"]
+    stream = engine._iter_request_snapshots("req", stopped_message="stopped")
+    for piece in ("a", "b", "c"):
+        _publish(ro, piece)
+        event.set()
+        assert next(stream).delta_text == piece
+    _publish(ro, "d", finished=True)
+    event.set()
+    assert next(stream).finished
+    assert engine.orphan_checks == 0
+    stream.close()
+
+
+def test_silent_stream_wait_still_runs_the_orphan_check():
+    ro = _make_request_output("req", n=1)
+    engine = _StreamEngine(ro)
+    # Progress that never signals the event: only the timed-out wait's orphan check path can observe it.
+    engine.on_orphan_check = lambda: _publish(ro, "z", finished=True)
+    stream = engine._iter_request_snapshots("req", stopped_message="stopped")
+    snapshot = next(stream)
+    assert snapshot.finished and snapshot.delta_text == "z"
+    assert engine.orphan_checks == 1
+    stream.close()
+
+
+def test_recover_orphaned_request_handles_single_sample_requests():
+    ro = _make_request_output("req-single", n=1)
+    engine = _DummyIOEngine(ro, core_request_ids=set(), active_request_ids=set())
+
+    recovered = engine._recover_orphaned_request("req-single")
+
+    assert recovered is True
+    assert engine.aborted == ["req-single"]
+    assert ro.finished is True
+    assert ro.outputs[0].finish_reason == "abort"

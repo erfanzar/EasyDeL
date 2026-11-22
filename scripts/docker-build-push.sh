@@ -8,7 +8,7 @@ set -e
 REGISTRY="ghcr.io"
 NAMESPACE="erfanzar"
 IMAGE_NAME="easydel"
-VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+VERSION=$(grep '^version = ' libs/easydel/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 DATE=$(date +'%Y%m%d')
 
 # Parse arguments
@@ -58,17 +58,18 @@ build_and_push() {
     if [ "$PUSH" = true ]; then
         echo "Pushing ${hardware_type} image to registry..."
 
-        # Check if logged in to registry
-        if ! sudo docker pull ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:latest${tag_suffix} &>/dev/null; then
-            echo "Please login to ${REGISTRY} first:"
-            echo "  echo \$GITHUB_TOKEN | sudo docker login ${REGISTRY} -u USERNAME --password-stdin"
-            exit 1
-        fi
-
-        # Push all tags
-        sudo docker push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${VERSION}${tag_suffix}
-        sudo docker push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:latest${tag_suffix}
-        sudo docker push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${DATE}${tag_suffix}
+        # Push all tags. No `docker pull` login probe: pulling `latest` would retag it to the
+        # registry's previous image, so the stale image would be pushed as `latest` (r11 S14-2).
+        # A failed push (e.g. not logged in) is reported here instead.
+        local tag
+        for tag in "${VERSION}" "latest" "${DATE}"; do
+            if ! sudo docker push "${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${tag}${tag_suffix}"; then
+                echo "Failed to push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${tag}${tag_suffix}."
+                echo "If you are not logged in to ${REGISTRY}:"
+                echo "  echo \$GITHUB_TOKEN | sudo docker login ${REGISTRY} -u USERNAME --password-stdin"
+                exit 1
+            fi
+        done
 
         echo "Successfully pushed ${hardware_type} images"
     fi

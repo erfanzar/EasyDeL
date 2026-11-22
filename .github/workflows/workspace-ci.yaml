@@ -1,0 +1,214 @@
+name: Workspace CI
+
+# Affected-only verification: each push/PR runs (a) the import-layering
+# contract and (b) a fast functional smoke for every workspace package whose
+# files changed (a foundation-lib or surgecore change also smokes easydel, which sits on
+# top of the foundation libraries and imports surgecore), and (c) cargo fmt/clippy/test, a wheel
+# build and the CPU tests of libs/surgecore when it changed. The deep per-package test suites are too large/hardware-
+# bound for per-PR CI and run locally / on dedicated runners — see WORKSPACE.md.
+
+on:
+  push:
+    branches: [main, vnext]
+  pull_request:
+    branches: [main, vnext]
+  workflow_dispatch:
+
+concurrency:
+  group: workspace-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      spectrax: ${{ steps.filter.outputs.spectrax }}
+      ejkernel: ${{ steps.filter.outputs.ejkernel }}
+      eformer: ${{ steps.filter.outputs.eformer }}
+      eray: ${{ steps.filter.outputs.eray }}
+      easydel: ${{ steps.filter.outputs.easydel }}
+      surgecore: ${{ steps.filter.outputs.surgecore }}
+      root: ${{ steps.filter.outputs.root }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full clone: paths-filter walks real history, and the deepen loop it
+          # falls back to is slow and races ("shallow file has changed since we
+          # read it").
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # On push, diff against the previous tip of the SAME branch rather
+          # than paths-filter's default (the repository default branch).
+          # `main` and `vnext` have no merge-base -- the histories are
+          # unrelated -- so a cross-branch base sends paths-filter into its
+          # deepen-by-doubling loop hunting a merge-base that cannot exist;
+          # it walked 4355 -> 6164 commits and then died on `--deepen=1600`
+          # with "shallow file has changed since we read it". Naming the
+          # current branch makes paths-filter use the push's own
+          # before..after range, which is what "what did this push change"
+          # means anyway. Left empty on pull_request so the PR base is used.
+          base: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          filters: |
+            spectrax: ['libs/spectrax/**']
+            ejkernel: ['libs/ejkernel/**']
+            eformer: ['libs/eformer/**']
+            eray: ['libs/eray/**']
+            easydel: ['libs/easydel/**']
+            surgecore: ['libs/surgecore/**']
+            root: ['pyproject.toml', 'uv.lock']
+
+  import-contract:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # uv sync builds libs/surgecore (a PyO3 extension) from source through maturin: install a stable Rust
+      # toolchain explicitly instead of relying on what the runner image ships.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Sync workspace
+        run: uv sync
+      - name: Enforce layering (foundation libs independent, none import easydel)
+        run: uv run lint-imports
+
+  smoke:
+    needs: changes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lib: spectrax
+            module: spectrax
+          - lib: ejkernel
+            module: ejkernel
+          - lib: eformer
+            module: eformer
+          - lib: eray
+            module: eray
+          - lib: easydel
+            module: easydel
+          - lib: surgecore
+            module: surgecore._native
+    steps:
+      - name: Skip if unaffected
+        id: gate
+        run: |
+          AFFECTED="${{ needs.changes.outputs[matrix.lib] }}"
+          ROOT="${{ needs.changes.outputs.root }}"
+          # easydel sits on top of the foundation libs and imports surgecore: any lib change affects it
+          ANYLIB="false"
+          if [ "${{ matrix.lib }}" = "easydel" ]; then
+            [ "${{ needs.changes.outputs.spectrax }}" = "true" ] && ANYLIB=true
+            [ "${{ needs.changes.outputs.ejkernel }}" = "true" ] && ANYLIB=true
+            [ "${{ needs.changes.outputs.eformer }}" = "true" ] && ANYLIB=true
+            [ "${{ needs.changes.outputs.eray }}" = "true" ] && ANYLIB=true
+            [ "${{ needs.changes.outputs.surgecore }}" = "true" ] && ANYLIB=true
+          fi
+          if [ "$AFFECTED" = "true" ] || [ "$ROOT" = "true" ] || [ "$ANYLIB" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          enable-cache: true
+
+      # uv sync builds libs/surgecore (a PyO3 extension) from source through maturin: install a stable Rust
+      # toolchain explicitly instead of relying on what the runner image ships.
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Sync workspace
+        if: steps.gate.outputs.run == 'true'
+        run: uv sync
+
+      - name: Import smoke
+        if: steps.gate.outputs.run == 'true'
+        env:
+          JAX_PLATFORMS: cpu
+          ENABLE_DISTRIBUTED_INIT: "0"
+        run: uv run python -c "import ${{ matrix.module }} as m; print(m.__name__, getattr(m, '__version__', 'ok'))"
+
+      - name: Functional smoke (easydel tiny forward)
+        if: steps.gate.outputs.run == 'true' && matrix.lib == 'easydel'
+        env:
+          JAX_PLATFORMS: cpu
+          ENABLE_DISTRIBUTED_INIT: "0"
+        run: |
+          uv run python - <<'PY'
+          import easydel as ed, jax.numpy as jnp, spectrax as spx
+          cfg = ed.LlamaConfig(vocab_size=128, hidden_size=64, intermediate_size=128,
+              num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+              head_dim=16, max_position_embeddings=64, mlp_bias=False)
+          m = ed.LlamaForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+          ids = jnp.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+          out, _ = m.compute_loss(input_ids=ids, labels=ids)
+          assert float(out.loss) > 0, "degenerate loss"
+          print("easydel smoke OK, loss:", round(float(out.loss), 4))
+          PY
+
+  # libs/surgecore is a Rust crate (a PyO3 extension, abi3-py311, built by maturin): check its formatting and lints,
+  # run the crate's tests, build its wheel, then run its CPU-only Python tests against the synced workspace.
+  surgecore:
+    needs: changes
+    # The root pyproject.toml and uv.lock pin the crate's build and Python environment too.
+    if: needs.changes.outputs.surgecore == 'true' || needs.changes.outputs.root == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # cargo test of a pyo3 crate links libpython: provide Python 3.13 and point PYO3_PYTHON at it.
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: cargo fmt
+        working-directory: libs/surgecore
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: libs/surgecore
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: libs/surgecore
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo test --locked
+
+      - name: cargo test (pure Rust, no Python)
+        working-directory: libs/surgecore
+        run: cargo test --locked --no-default-features
+
+      - name: Build wheel
+        run: uv build --package surgecore --wheel
+
+      - name: Sync workspace
+        run: uv sync
+
+      - name: pytest (CPU)
+        env:
+          JAX_PLATFORMS: cpu
+          ENABLE_DISTRIBUTED_INIT: "0"
+        run: uv run pytest libs/surgecore/tests

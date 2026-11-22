@@ -1,0 +1,89 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for OLMo3 model."""
+
+import easydel as ed
+import pytest
+import transformers
+
+try:
+    from tests.modules.test_utils import CausalLMTester
+except ImportError:
+    from tests.modules.test_utils import CausalLMTester  # pyright: ignore[reportImplicitRelativeImport]
+
+
+class TestOLMo3:
+    """Test suite for OLMo3 model."""
+
+    @pytest.fixture
+    def olmo3_config(self, small_model_config):
+        """Create OLMo3-specific config."""
+        return ed.Olmo3Config(
+            vocab_size=small_model_config["vocab_size"],
+            hidden_size=small_model_config["hidden_size"],
+            num_hidden_layers=small_model_config["num_hidden_layers"],
+            num_attention_heads=small_model_config["num_attention_heads"],
+            num_key_value_heads=small_model_config["num_key_value_heads"],
+            intermediate_size=small_model_config["intermediate_size"],
+            max_position_embeddings=small_model_config["max_position_embeddings"],
+        )
+
+    @pytest.mark.parametrize(
+        "rope_parameters",
+        [
+            None,
+            {
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {"rope_type": "linear", "rope_theta": 500000.0, "factor": 2.0},
+            },
+        ],
+        ids=["shared_rope", "per_type_rope"],
+    )
+    def test_causal_lm(self, olmo3_config, small_model_config, rope_parameters):
+        """Test Olmo3ForCausalLM, including distinct local/global RoPE math."""
+        if rope_parameters is not None:
+            # The small model may have fewer than four layers; exercise both
+            # attention types rather than leaving the global settings unused.
+            olmo3_config.layer_types = [
+                "sliding_attention" if i % 2 == 0 else "full_attention" for i in range(olmo3_config.num_hidden_layers)
+            ]
+            olmo3_config.rope_parameters = rope_parameters
+        tester = CausalLMTester()
+        result = tester.run(
+            module_name="olmo3",
+            hf_class=transformers.Olmo3ForCausalLM,
+            task=ed.TaskType.CAUSAL_LM,
+            config=olmo3_config,
+            small_model_config=small_model_config,
+        )
+        assert result.success, f"OLMo3 CAUSAL_LM failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, olmo3_config, small_model_config):
+        """Test OLMo3 text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="olmo3",
+            hf_class=transformers.Olmo3ForCausalLM,
+            config=olmo3_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"OLMo3 generation failed: {result.error_message}"
+
+
+if __name__ == "__main__":
+    import pytest
+
+    pytest.main([__file__, "-s"])

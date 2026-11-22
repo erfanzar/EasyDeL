@@ -43,7 +43,7 @@ print_usage() {
     echo "Usage: $0 [HARDWARE_TYPE] [TARGET] [OPTIONS]"
     echo ""
     echo "HARDWARE_TYPE: cpu, cuda, tpu (default: cpu)"
-    echo "TARGET: production, development, test (default: production)"
+    echo "TARGET: production (default; the Dockerfile has a single 'final' stage)"
     echo ""
     echo "Options:"
     echo "  --push              Push image to registry"
@@ -104,7 +104,14 @@ if [[ ! "$HARDWARE_TYPE" =~ ^(cpu|cuda|tpu)$ ]]; then
 fi
 
 # Validate target
-if [[ ! "$TARGET" =~ ^(production|development|test)$ ]]; then
+# The Dockerfile defines a single buildable stage (`final`), so development/test would
+# only produce identically-built images under misleading tags. Fail explicitly instead.
+if [[ "$TARGET" =~ ^(development|test)$ ]]; then
+    echo -e "${RED}Target '$TARGET' is not buildable: the Dockerfile only defines the 'final' stage.${NC}"
+    echo "Use 'production' (the default), or mount the source into it (docker run -v \$(pwd):/app ...)."
+    exit 1
+fi
+if [[ ! "$TARGET" =~ ^production$ ]]; then
     echo -e "${RED}Invalid target: $TARGET${NC}"
     print_usage
     exit 1
@@ -126,12 +133,15 @@ echo "  Tag: ${FULL_TAG}"
 echo "  Python: ${PYTHON_VERSION}"
 echo ""
 
-# Build command
+# Build command. The Dockerfile defines a single buildable stage (`final`);
+# TARGET only selects the runtime flavor used for tagging/usage hints below.
+# Load the built image into the daemon for local runs and the optional push/tag flow.
 BUILD_CMD="docker buildx build \
+    --load \
     --build-arg HARDWARE_TYPE=${HARDWARE_TYPE} \
     --build-arg VERSION=${VERSION} \
     --build-arg PYTHON_VERSION=${PYTHON_VERSION} \
-    --target ${TARGET} \
+    --target final \
     --tag ${FULL_TAG} \
     ${NO_CACHE} \
     ${PLATFORM} \

@@ -1,0 +1,1107 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Spectrax implementation of the Cohere Command decoder-only LLM.
+
+Cohere Command is a Llama-shaped causal transformer with the following
+characteristic choices: a learnable logit scale (default ``1/16``), optional
+LayerNorm of query/key projections (``use_qk_norm``), SwiGLU MLPs, full RoPE,
+grouped-query attention, and tied input/output embeddings by default.
+
+Building blocks:
+
+- :class:`CohereLayerNorm` — module-local bias-free LayerNorm with optional weight
+  transpose.
+- :class:`CohereAttention` — :class:`UnifiedAttention` subclass with optional
+  QK norm and a custom RoPE.
+- :class:`CohereMLP` — SwiGLU FFN.
+- :class:`CohereBlock` — single decoder layer.
+
+Public model classes (registered with the factory):
+
+- :class:`CohereModel` — base decoder.
+- :class:`CohereForCausalLM` — causal LM head with logit scaling.
+- :class:`CohereForSequenceClassification` — pooled classifier head.
+"""
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    CausalLMOutput,
+    DecoderLayerOutput,
+    SequenceClassifierOutput,
+)
+from easydel.infra.utils import ArrayParam, auto_remat, blockwise_ffn
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    gated_mlp_forward,
+)
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
+
+from .cohere_configuration import CohereConfig as CohereConfig
+
+
+class CohereLayerNorm(spx.Module):
+    """Cohere-flavoured bias-free LayerNorm with per-head shape support.
+
+    Matches HF ``CohereLayerNorm``: the input is mean-centred and
+    variance-normalised over the last axis (a real LayerNorm, not RMSNorm),
+    then scaled by a learned ``weight`` with no bias. Everything is computed
+    in ``float32`` and cast back to ``self.dtype`` at the end.
+
+    * ``dim`` may be a tuple (e.g. ``(head_dim, num_heads)``) so a single
+      norm can carry a per-head scale for Cohere's Q/K normalization.
+    * ``do_t`` transposes the learned ``weight`` before scaling. The HF
+      Q/K-norm weight is ``(num_heads, head_dim)``; the checkpoint converter
+      transposes every 2-D ``weight`` on load (and back on export), so the
+      stored parameter is ``(head_dim, num_heads)`` and ``do_t`` restores the
+      ``(num_heads, head_dim)`` orientation that broadcasts against
+      ``[..., num_heads, head_dim]`` activations.
+
+    Computation: ``y = (x - mean(x)) * rsqrt(var(x) + eps) * weight``.
+    """
+
+    kernel_init = staticmethod(jax.nn.initializers.ones)
+
+    def __init__(
+        self,
+        dim: int | tuple,
+        eps: float = 1e-5,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        do_t: bool = False,
+        rngs: spx.Rngs | None = None,
+    ):
+        """Initialize the LayerNorm.
+
+        Args:
+            dim (int | tuple): Dimension(s) of the normalization weight.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-5.
+            dtype (jnp.dtype, optional): Data type for the output. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            do_t (bool, optional): Whether to transpose the weight before scaling. Defaults to False.
+            rngs (spx.Rngs, optional): Random number generator state. Defaults to None.
+        """
+        super().__init__()
+
+        if rngs is None:
+            rngs = spx.Rngs(0)
+        self.dim = dim
+        self.eps = eps
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.do_t = do_t
+        self.weight = ArrayParam.bound(
+            shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
+            dtype=self.param_dtype,
+            init_method="ones",
+            key=rngs.parameters,
+        )
+
+    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Mean-centre and variance-normalise ``x`` over its last axis.
+
+        Args:
+            x (jnp.ndarray): Input tensor to normalize.
+
+        Returns:
+            jnp.ndarray: Normalized tensor.
+        """
+        mean = jnp.mean(x, -1, keepdims=True)
+        variance = jnp.mean(jnp.square(x - mean), -1, keepdims=True)
+        return (x - mean) * jax.lax.rsqrt(variance + self.eps)
+
+    def forward(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply LayerNorm with learnable scale.
+
+        Args:
+            x (jnp.ndarray): Input tensor to normalize.
+
+        Returns:
+            jnp.ndarray: Normalized and scaled tensor in ``self.dtype``.
+        """
+        x = x.astype(jnp.float32)
+        weight = self.weight.value.astype(jnp.float32)
+        if self.do_t:
+            weight = weight.T
+        return (self._norm(x) * weight).astype(self.dtype)
+
+
+class CohereAttention(UnifiedAttention):
+    """Causal GQA attention with optional Q/K-norm for Cohere.
+
+    Standard grouped-query attention (``num_attention_heads`` queries,
+    ``num_key_value_heads`` KV heads) with RoPE rotation. The
+    Cohere-specific bits are:
+
+    * **Q/K-norm.** When ``config.use_qk_norm`` is set, applies a
+      per-head :class:`CohereLayerNorm` (``dim = (head_dim, num_heads)``) to the Q
+      and K projections *before* RoPE (as HF does). Stabilises training of
+      larger Cohere variants.
+    * **RoPE.** ``_create_rotary`` always builds the basic RoPE with the
+      Cohere ``rope_theta`` and ``head_dim`` in the interleaved (GPT-J)
+      pairing; rotation is applied to the full per-head dimension.
+    """
+
+    def __init__(
+        self,
+        config: CohereConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ) -> None:
+        """Initialize Cohere attention with optional Q/K normalization.
+
+        Args:
+            config (CohereConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+        )
+
+        if config.use_qk_norm:
+            self.q_norm = CohereLayerNorm(
+                dim=(self.head_dim, self.config.num_attention_heads),
+                eps=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                do_t=True,
+            )
+            self.k_norm = CohereLayerNorm(
+                dim=(
+                    self.head_dim,
+                    self.config.num_key_value_heads,
+                ),
+                eps=config.layer_norm_eps,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                do_t=True,
+            )
+
+    def _create_rotary(self, config: CohereConfig, dtype: jnp.dtype):
+        """Create Cohere-specific rotary embedding layer.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype): Data type for the rotary embeddings.
+
+        Returns:
+            Rotary embedding module configured for Cohere architecture.
+        """
+        # HF Cohere rotates interleaved (even, odd) pairs (GPT-J style), not NeoX halves.
+        return config.get_basic_rope(dtype, self.head_dim, self.head_dim, False)
+
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization if configured.
+
+        Args:
+            query_states: Query tensor from attention projection.
+            key_states: Key tensor from attention projection.
+            value_states: Value tensor from attention projection.
+
+        Returns:
+            Tuple of (query_states, key_states, value_states), optionally normalized.
+        """
+        if self.config.use_qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+        return query_states, key_states, value_states
+
+
+class CohereMLP(spx.Module):
+    """SwiGLU feed-forward block for Cohere decoder layers.
+
+    Computes ``down_proj(silu(gate_proj(x)) * up_proj(x))`` — the standard
+    SwiGLU formulation. Linears are unbiased, ``gate_proj`` and ``up_proj``
+    are :class:`ColumnParallelLinear` (output sharded across the TP axis),
+    ``down_proj`` is :class:`RowParallelLinear` (input sharded). Intermediate
+    width is ``config.intermediate_size``.
+    """
+
+    def __init__(
+        self,
+        config: CohereConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Cohere MLP block.
+
+        Args:
+            config (CohereConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=self.precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=self.precision,
+            rngs=rngs,
+        )
+        self.act_fn = jax.nn.silu
+
+    @property
+    def reform_param(self):
+        """Build checkpoint reform rules to split fused ``gate_up_proj`` weights.
+
+        Returns:
+            dict: Mapping describing how the upstream HF ``gate_proj`` /
+            ``up_proj`` tensors map onto the fused ``gate_up_proj`` parameter
+            (and back on save), generated from the column-parallel projection's
+            fused layout.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def forward(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
+        return gated_mlp_forward(self, hidden_states)
+
+
+class CohereBlock(spx.Module):
+    """Single Cohere decoder layer with parallel attention/MLP residuals.
+
+    Cohere uses the parallel-residual transformer block (à la GPT-J / PaLM):
+    a single ``input_layernorm`` feeds *both* the attention and MLP paths,
+    and the two outputs are summed back into the residual stream:
+
+        ``y = x + attn(input_ln(x)) + mlp(input_ln(x))``
+
+    rather than the sequential pre-norm pattern. This keeps the attention
+    and feed-forward computations independent so they can run concurrently.
+    Attention is :class:`CohereAttention` (GQA + optional Q/K-norm), MLP is
+    :class:`CohereMLP` (SwiGLU).
+    """
+
+    def __init__(
+        self,
+        config: CohereConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ) -> None:
+        """Initialize Cohere decoder block.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+
+        self.self_attn = CohereAttention(
+            config,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.mlp = CohereMLP(
+            config,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.input_layernorm = CohereLayerNorm(
+            self.config.hidden_size,
+            eps=self.config.layer_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder block.
+
+        Applies parallel attention-feedforward architecture: x + attn(norm(x)) + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        attn_outputs = self.self_attn(
+            hidden_states,
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            output_attentions,
+            frequencies,
+        )
+
+        feed_forward_input = hidden_states
+
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(feed_forward_input)
+
+        hidden_states = attn_outputs.attention_output + feed_forward_hidden_states + residual
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=attn_outputs.attention_weight,
+            router_logits=None,
+            gate_loss=None,
+            cache_view=attn_outputs.cache_view,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=CohereConfig, model_type="cohere")
+class CohereModel(EasyDeLBaseModule):
+    """Cohere Command-family backbone (registered as ``BASE_MODULE``).
+
+    Stack: token embedding -> ``num_hidden_layers`` :class:`CohereBlock`
+    layers (parallel attention/MLP residuals) -> final ``LayerNorm``. Uses
+    GQA with optional Q/K normalisation (``config.use_qk_norm``), RoPE
+    rotation, and SwiGLU MLPs. Decoder layers are wrapped with
+    :func:`auto_remat` so per-layer activation checkpointing follows
+    ``config.gradient_checkpointing``. Returns :class:`BaseModelOutput`.
+
+    Attributes:
+        config (CohereConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    def __init__(
+        self,
+        config: CohereConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Cohere base model.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        remat_layer_block = auto_remat(
+            CohereBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with self.assign_layer_stage(i, total_layers=config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = CohereLayerNorm(
+                self.config.hidden_size,
+                eps=self.config.layer_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        trace: bool = False,
+    ) -> BaseModelOutput:
+        """Performs forward pass through the Cohere transformer model.
+
+        Processes input tokens through embeddings, stacked Cohere decoder blocks with LayerNorm,
+        optional Q/K normalization, SwiGLU gated FFNs, and RoPE position encoding.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated from mask_info if not provided.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput containing:
+                - last_hidden_state: Final LayerNorm output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of all attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
+
+        Raises:
+            ValueError: If neither `input_ids` nor `inputs_embeds` is provided, or if both
+                are provided simultaneously.
+            AssertionError: If sequence length exceeds max_position_embeddings.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        sequence_length = inputs_embeds.shape[1]
+
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        assert sequence_length <= self.config.max_position_embeddings, (
+            f"Maximum Position Embedding Reached ! "
+            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+        )
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+        hidden_states = inputs_embeds
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            """Per-layer body for the decoder ``scan``.
+
+            Carry layout: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, idx)``. Runs one Cohere decoder block at the
+            current pipeline stage, optionally records its input hidden state
+            and attention weights, threads the per-layer cache slot through
+            update, and returns the next carry.
+            """
+            hs, cv, ah, aa, idx = carry
+            stage_idx = getattr(block, "layer_idx", idx)
+            if output_hidden_states:
+                ah = (*ah, hs)
+            with self._layer_stage_context(stage_idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hs,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=self.frequencies,
+                )
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, stage_idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            if output_attentions:
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
+
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            assert all_hidden_states is not None
+            all_hidden_states = (*all_hidden_states, hidden_states)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
+        )
+
+    def get_encoder(self) -> spx.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For CohereModel (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("CohereModel is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> spx.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For CohereModel, this is the model itself.
+        """
+        return self
+
+    def get_lm_head(self) -> spx.Module:
+        """
+        Returns the language model head of the module.
+        CohereModel does not include the lm_head.
+        """
+        raise NotImplementedError("CohereModel does not include the language model head. See CohereForCausalLM.")
+
+    def get_embedding(self) -> spx.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=CohereConfig, model_type="cohere")
+class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
+    """Cohere backbone + scaled LM head for autoregressive generation.
+
+    Wraps :class:`CohereModel` with an unbiased ``vocab_size`` LM head.
+    Cohere's distinguishing inference-time detail is **logit scaling**: the
+    raw logits are multiplied by ``config.logit_scale`` (typically a small
+    constant like 0.0625) before sampling, which the base
+    :class:`BaseCausalLMModule` applies through :meth:`apply_logit_cap`.
+
+    Attributes:
+        config (CohereConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "cohere"
+    _config_class = CohereConfig
+    # This concrete head adds only logit scaling, never an auxiliary objective.
+    _ce_only_forward = True
+
+    def __init__(
+        self,
+        config: CohereConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Cohere model for causal language modeling.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=CohereModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+        )
+        self.logit_scale = self.config.logit_scale
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> CausalLMOutput:
+        """Forward pass through the Cohere model for causal language modeling.
+
+        Processes input through the Cohere transformer and applies the language
+        modeling head to produce next-token predictions with logit scaling.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head.
+                Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            CausalLMOutput: Contains logits (scaled by logit_scale), last_hidden_state,
+                optional all hidden_states, optional attentions, and updated past_key_values.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            inputs_embeds=inputs_embeds,
+        )
+
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
+
+        return CausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
+            attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
+        )
+
+    def get_encoder(self) -> spx.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For CohereForCausalLM (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("CohereForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits and apply Cohere's logit scaling.
+
+        Calls the base LM-head projection and multiplies the result by
+        ``self.logit_scale`` (from ``config.logit_scale``), which Cohere
+        models use to control the temperature of the output distribution.
+
+        Args:
+            hidden_states: Hidden representations, shape ``[B, T, H]``.
+
+        Returns:
+            Scaled logits with shape ``[B, T, V]``.
+        """
+        logits = super().compute_lm_logits(hidden_states)
+        return logits * self.logit_scale
+
+    def get_lm_logit_postprocess(self):
+        """Capture Cohere's base clipping followed by scaling for split LM heads.
+
+        The returned callable captures only the scalar scale and the base
+        scalar-only clipping function, never the model or its parameters.
+        """
+        clip_fn = self.get_base_lm_logit_postprocess()
+        scale = self.logit_scale
+
+        def _postprocess(logits: Array) -> Array:
+            """Apply clipping before Cohere's output scale."""
+            if clip_fn is not None:
+                logits = clip_fn(logits)
+            return logits * scale
+
+        return _postprocess
+
+    def make_lm_head_fn(self, vocab_shard_stage: int | None = None):
+        """Trace-safe projection with Cohere logit scaling."""
+        base_fn = super().make_lm_head_fn(vocab_shard_stage=vocab_shard_stage)
+        scale = self.logit_scale
+
+        def _project(hidden_states):
+            """Apply the LM head and Cohere's learned ``logit_scale``."""
+            return base_fn(hidden_states) * scale
+
+        return _project
+
+    def get_decoder(self) -> spx.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For CohereForCausalLM, this is the underlying CohereModel.
+        """
+        return self.model.get_decoder()  # self.model is the CohereModel instance
+
+    def get_lm_head(self) -> spx.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self) -> spx.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (CohereModel)
+        return self.model.get_embedding()  # Leverages CohereModel's get_embedding
+
+
+@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=CohereConfig, model_type="cohere")
+class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereModel, CohereConfig]):
+    """Cohere backbone + linear classification head.
+
+    Pools the last non-pad token's hidden state from :class:`CohereModel`
+    and feeds it through an unbiased ``score`` head with ``num_labels``
+    outputs. Shares the parallel-residual / Q/K-norm architecture of the
+    base model; ``config.pad_token_id`` is required for batched inputs.
+
+    Attributes:
+        config (CohereConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "cohere"
+    _config_class = CohereConfig
+
+    def __init__(
+        self,
+        config: CohereConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Cohere model for sequence classification.
+
+        Args:
+            config (CohereConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=CohereModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> SequenceClassifierOutput:
+        """Forward pass for sequence classification.
+
+        Processes input through the Cohere transformer and applies the classification
+        head to produce class predictions using pooled representations.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+
+        Returns:
+            SequenceClassifierOutput: Contains pooled logits of shape (batch_size, num_labels),
+                optional past_key_values, optional all hidden_states, and optional attentions.
+
+        Raises:
+            ValueError: If batch_size > 1 and no padding token is defined in config.
+        """
+        transformer_outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            inputs_embeds=inputs_embeds,
+        )
+
+        hidden_states = transformer_outputs.last_hidden_state
+        logits = self.score(hidden_states)
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            batch_size = inputs_embeds.shape[0]
+
+        if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        if input_ids is None and attention_mask is None:
+            pooled_logits = logits[:, -1]
+        else:
+            pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
+
+        return SequenceClassifierOutput(
+            logits=pooled_logits,
+            past_key_values=past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+    def get_encoder(self) -> spx.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For CohereForSequenceClassification (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError(
+            "CohereForSequenceClassification is a decoder-only model and does not have a separate encoder."
+        )
+
+    def get_decoder(self) -> spx.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For CohereForSequenceClassification, this is the underlying CohereModel.
+        """
+        return self.model  # self.model is the CohereModel instance
+
+    def get_lm_head(self) -> spx.Module:
+        """
+        Returns the language model head of the module.
+        CohereForSequenceClassification uses a classification head instead.
+        """
+        raise NotImplementedError(
+            "CohereForSequenceClassification uses a classification head (self.score), not an lm_head."
+        )
+
+    def get_embedding(self) -> spx.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (CohereModel)
+        return self.model.get_embedding()  # Leverages CohereModel's get_embedding

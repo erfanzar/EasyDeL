@@ -1,0 +1,848 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Mistral transformer implementation.
+
+Implements the Mistral decoder family — a LLaMA-like architecture with optional
+sliding-window attention, grouped-query attention, RMSNorm, RoPE, and a SwiGLU
+MLP. Sliding-window vs full-attention is selected per layer through the
+``layer_types`` configuration.
+
+Exports:
+    - ``MistralMLP``: SwiGLU feed-forward block.
+    - ``MistralAttention``: standard / sliding-window attention.
+    - ``MistralDecoderLayer``: a single transformer block.
+    - ``MistralModel``: base transformer trunk.
+    - ``MistralForCausalLM``: causal LM head wrapper.
+    - ``MistralForSequenceClassification``: classification head wrapper.
+"""
+
+import jax
+import spectrax as spx
+from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    CausalLMOutput,
+    DecoderLayerOutput,
+)
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RMSNorm,
+    RowParallelLinear,
+    dense_gate_up_layout,
+    gated_mlp_forward,
+)
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
+
+from .mistral_configuration import MistralConfig
+
+logger = get_logger(__name__)
+
+
+class MistralMLP(spx.Module):
+    """Standard SwiGLU FFN for Mistral decoder layers.
+
+    Identical in shape to LLaMA's MLP — gate / up / down with SiLU — but
+    instantiated separately so checkpoint state-dict keys match the
+    upstream Mistral weight layout. Uses ``ColumnParallelLinear`` on the
+    expanding (gate / up) projections so the intermediate activation is
+    sharded along the model-parallel axis, and ``RowParallelLinear`` on
+    the contracting ``down_proj`` so the cross-shard reduction happens
+    inside the projection rather than in a separate all-reduce.
+
+    Attributes:
+        gate_proj (ColumnParallelLinear): Gate projection
+            ``hidden_size -> intermediate_size``.
+        up_proj (ColumnParallelLinear): Up projection ``hidden_size -> intermediate_size``.
+        down_proj (RowParallelLinear): Output projection
+            ``intermediate_size -> hidden_size``.
+        act_fn (Callable): Pointwise nonlinearity (SiLU by default).
+    """
+
+    def __init__(
+        self,
+        config: MistralConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Mistral MLP block.
+
+        Args:
+            config (MistralConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=self.precision,
+            rngs=rngs,
+        )
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=self.precision,
+            rngs=rngs,
+            layout=dense_gate_up_layout(config.intermediate_size),
+        )
+        self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Reform-param rules for the fused gate/up projection.
+
+        Returns:
+            dict: Checkpoint reform rules that split the fused
+            ``gate_up_proj`` kernel back into the conventional
+            ``gate_proj`` / ``up_proj`` tensor names expected by
+            upstream Mistral checkpoints.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def forward(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SiLU feedforward transformation.
+
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
+        return gated_mlp_forward(self, hidden_states)
+
+
+class MistralAttention(UnifiedAttention):
+    """Mistral attention: GQA + RoPE + sliding-window causal mask.
+
+    A thin subclass of :class:`UnifiedAttention` that
+
+    * Forwards ``config.sliding_window`` so the underlying attention
+      kernel applies a banded causal mask of width
+      ``min(query_len, sliding_window)`` per layer (set to ``None`` for
+      full causal attention).
+    * Uses ``head_dim = config.head_dim`` (a fixed 128 in the official
+      Mistral checkpoints, independent of ``hidden_size /
+      num_attention_heads``).
+    * Builds the rotary table from ``config.rope_theta`` /
+      ``config.rope_scaling`` via ``config.get_basic_rope``.
+
+    Inherits the standard MHA / GQA implementation from the base class.
+    """
+
+    def __init__(
+        self,
+        config: MistralConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Mistral attention layer with sliding window and grouped-query attention support.
+
+        Args:
+            config (MistralConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        # Set sliding window before super().__init__ so it's available during network definition
+
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
+        )
+
+
+class MistralDecoderLayer(spx.Module):
+    """One Mistral block: pre-norm sliding-window attention + SwiGLU FFN.
+
+    Pre-norm residual layout::
+
+        x = x + self_attn(input_layernorm(x))
+        x = x + mlp(post_attention_layernorm(x))
+
+    Both norms are :class:`RMSNorm` at ``rms_norm_eps``. The attention
+    sub-layer applies the sliding-window mask configured on
+    :class:`MistralAttention` so the cost of each layer is O(L · window)
+    rather than O(L²) — long-range mixing is recovered by stacking
+    layers.
+
+    Attributes:
+        self_attn (MistralAttention): Sliding-window GQA attention.
+        mlp (MistralMLP): SwiGLU feed-forward.
+        input_layernorm, post_attention_layernorm (RMSNorm): Pre-attention
+            and pre-FFN RMSNorms.
+    """
+
+    def __init__(
+        self,
+        config: MistralConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Mistral decoder layer.
+
+        Args:
+            config (MistralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        self.self_attn = MistralAttention(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+        self.mlp = MistralMLP(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.input_layernorm = RMSNorm(
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
+        residual = hidden_states
+        attention_output = self.self_attn(
+            self.input_layernorm(hidden_states),
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            output_attentions,
+            frequencies,
+        )
+
+        hidden_states = checkpoint_name(attention_output.attention_output + residual, "residual")
+        ffd_inp = self.post_attention_layernorm(hidden_states)
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(self.mlp, ffd_inp, self.config.scan_mlp_chunk_size)
+        else:
+            feed_forward_hidden_states = self.mlp(ffd_inp)
+
+        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
+
+        return DecoderLayerOutput(
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
+            attention_weight=attention_output.attention_weight,
+            cache_view=attention_output.cache_view,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=MistralConfig, model_type="mistral")
+class MistralModel(EasyDeLBaseModule):
+    """Mistral base trunk: token embeddings + sliding-window decoder stack + final RMSNorm.
+
+    This implements the Mistral language model architecture, utilizing transformer blocks
+    with RMSNorm, sliding window attention, and rotary position embeddings.
+
+    Attributes:
+            config (MistralConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision: Precision setting for JAX operations.
+    """
+
+    def __init__(
+        self,
+        config: MistralConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Mistral base model.
+
+        Args:
+            config (MistralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+        remat_layer_block = auto_remat(
+            MistralDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for i in range(self.config.num_hidden_layers):
+            with self.assign_layer_stage(i, total_layers=self.config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+        if self.config.scan_layers and self._pipeline_stage_count() == 1:
+            self.layers = self.layers.stack()
+        final_layer_idx = max(0, self.config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        trace: bool = False,
+    ) -> BaseModelOutput:
+        """Forward pass through the Mistral base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE, sliding window
+        attention, and RMSNorm, followed by final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+        sequence_length = inputs_embeds.shape[1]
+
+        assert sequence_length <= self.config.max_position_embeddings, (
+            f"Maximum Position Embedding Reached ! "
+            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+        )
+
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        hidden_states = inputs_embeds
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        frequencies = self.config.get_basic_frequencies()
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            """Body of the Mistral decoder scan with sliding-window attention.
+
+            Carry: ``(hidden_states, cache_views, all_hidden_states,
+            all_attentions, layer_index)``. Each layer applies GQA
+            self-attention bounded by ``config.sliding_window`` (when set);
+            cache views are routed through :meth:`_layer_cache_view_at` so
+            the runtime can pick a windowed cache layout if appropriate.
+            """
+            return self._decoder_scan_step(
+                block,
+                carry,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                trace_layers=trace_layers,
+                cache=past_key_values,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                cache_metadata=cache_metadata,
+                frequencies=frequencies,
+            )
+
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=MistralConfig, model_type="mistral")
+class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
+    """Causal LM head wrapper around :class:`MistralModel`.
+
+    Adds a bias-free LM projection on top of the sliding-window decoder
+    trunk. ``compute_lm_logits`` (inherited) is wrapped under
+    ``nn.remat`` by default for the ~34 GB savings on long-vocab models.
+    Tied embeddings follow ``config.tie_word_embeddings`` (default
+    ``False`` for Mistral checkpoints).
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "mistral"
+    _config_class = MistralConfig
+
+    def __init__(
+        self,
+        config: MistralConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Mistral model for causal language modeling.
+
+        Args:
+            config (MistralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=MistralModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> CausalLMOutput:
+        """Forward pass through the Mistral model for causal language modeling.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head projection.
+                Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            CausalLMOutput: Contains logits, hidden_states, last_hidden_state, attentions,
+                and past_key_values.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            inputs_embeds=inputs_embeds,
+        )
+
+        hidden_states = outputs.last_hidden_state
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.compute_lm_logits(hidden_states)
+
+        return CausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
+            attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
+
+
+@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MistralConfig, model_type="mistral")
+class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralModel, MistralConfig]):
+    """Sequence classification head on top of :class:`MistralModel`.
+
+    Pools the trunk's last hidden state at the position of the last
+    non-padded token (``pooling_strategy="last"``) and projects it to
+    ``config.num_labels`` via a bias-free ``score`` linear. Sliding-window
+    attention from the trunk is preserved unchanged — the classifier
+    only reshapes the final output.
+    """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "mistral"
+    _config_class = MistralConfig
+
+    def __init__(
+        self,
+        config: MistralConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Mistral model for sequence classification.
+
+        Args:
+            config (MistralConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=MistralModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            classifier_name="score",  # Mistral uses 'score' not 'classifier'
+            classifier_bias=False,
+        )
+
+    def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
+        """Pool the last token for embeddings-only inputs without a padding mask.
+
+        Args:
+            hidden_states: Per-token representations shaped ``[batch, sequence, hidden]``.
+            input_ids: Optional token IDs for padding-aware pooling.
+            attention_mask: Optional token mask, preferred over token IDs.
+
+        Returns:
+            One representation per sequence, retaining mask-aware shared pooling
+            whenever token IDs or a mask are available.
+        """
+        if input_ids is None and attention_mask is None:
+            return hidden_states[:, -1]
+        return super().pool_sequence(hidden_states, input_ids=input_ids, attention_mask=attention_mask)
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This model has a sequence classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()

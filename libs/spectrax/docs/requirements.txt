@@ -1,0 +1,12 @@
+git+https://github.com/erfanzar/spectrax.git
+sphinx
+sphinx-autobuild
+sphinx-autodoc-typehints
+sphinx-book-theme
+sphinx-book-theme
+ipykernel
+myst_nb
+recommonmark
+ipython_genutils
+sphinx-design
+docutils==0.16

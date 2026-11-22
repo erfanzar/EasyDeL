@@ -1,0 +1,232 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Fused exact top-k.
+
+One operation covering the three shapes that actually occur in this stack,
+because they want different things from the same reduction:
+
+===================== ===================== ======== ==========================
+call site             shape                 k        wants
+===================== ===================== ======== ==========================
+MoE router            ``[tokens, experts]`` small     values + indices
+DSA indexer           ``[b, s, entries]``   large     indices
+sampling top-k filter ``[reqs, vocab]``     per-row   keep-mask
+===================== ===================== ======== ==========================
+
+XLA lowers ``jax.lax.top_k`` on TPU to a full sort of the reduction axis. The
+Pallas path finds the exact ``k``-th key by bisection, compacts the survivors
+and sorts only those, bit-identical to ``top_k``. :meth:`TopK.heuristic_cfg`
+selects it for ``k >= 32`` over at least 768 candidates and 256 rows. Tiny ``k``
+(the MoE router), narrow axes, few rows (sampling) and per-row dynamic ``k``
+stay on the XLA reference, which is faster there.
+
+Consumers that need ``top_k``'s selection but not its order use the sort-free
+modes: ``"exact_mask"`` (the pick set as a boolean mask, exactly ``min(k, n)``
+per row with ``top_k``'s lower-index tie-break) and ``"kth"`` (the ``k``-th
+largest value, the selection threshold). On TPU both run a Pallas kernel that
+reads each row block from HBM once and does every bisection pass in VMEM;
+``k`` may be static or per-row.
+"""
+
+from __future__ import annotations
+
+import os
+import typing as tp
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array
+
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.ops import AutotunePolicy, ConfigCache, ConfigSelectorChain, Executor, Invocation, Kernel, Tuner
+from ejkernel.ops.config.persistent import PersistentCache
+
+from .configs import TopKConfig
+
+_MIN_WIDTH_FOR_PALLAS = 768
+_MIN_K_FOR_PALLAS = 32
+_MIN_ROWS_FOR_PALLAS = 256
+_MIN_WIDTH_FOR_SELECT = 768
+_MIN_ROWS_FOR_SELECT = 64
+_MAX_WIDTH_FOR_SELECT = 65536
+
+
+class TopK(Kernel[TopKConfig, tp.Any]):
+    """Exact top-k with mode-aware backend selection."""
+
+    def __init__(self) -> None:
+        """Register the operation under the ``topk`` id."""
+        super().__init__(op_id="topk")
+
+    def get_impl(self, cfg: TopKConfig) -> tp.Callable[..., tp.Any]:
+        """Resolve the registered implementation for ``cfg``.
+
+        Args:
+            cfg: Selected configuration.
+
+        Returns:
+            The registered callable.
+        """
+        platform = Platform(cfg.platform) if cfg.platform not in (None, "auto") else None
+        backend = Backend(cfg.backend) if cfg.backend not in (None, "any") else Backend.ANY
+        return kernel_registry.get("topk", platform=platform, backend=backend)
+
+    def run(
+        self,
+        operand: Array,
+        k: int | Array,
+        axis: int = -1,
+        mode: str = "values",
+        mask_fill: float | None = None,
+        *,
+        cfg: TopKConfig,
+    ) -> tuple[Array, Array] | Array:
+        """Execute the selected implementation.
+
+        Args:
+            operand: Input array.
+            k: Number kept; static int, or a per-row array for every mode
+                except ``"values"``.
+            axis: Reduction axis.
+            mode: ``"values"``, ``"mask"``, ``"exact_mask"``, ``"kth"`` or
+                ``"filter"``.
+            mask_fill: Fill value for ``mode="filter"``.
+            cfg: Selected configuration.
+
+        Returns:
+            Mode-dependent result; see the XLA reference.
+        """
+        return self.get_impl(cfg)(operand, k, axis=axis, mode=mode, mask_fill=mask_fill)
+
+    def heuristic_cfg(self, inv: Invocation[TopKConfig, tp.Any]) -> TopKConfig:
+        """Pick a platform from the reduction width, ``k``, and mode.
+
+        Args:
+            inv: The invocation being configured.
+
+        Returns:
+            The configuration to run with.
+        """
+        operand = inv.args[0] if inv.args else None
+        k = inv.args[1] if len(inv.args) > 1 else inv.kwargs.get("k")
+        mode = inv.kwargs.get("mode", "values")
+        axis = inv.kwargs.get("axis", -1)
+
+        width = rows = 0
+        if operand is not None and getattr(operand, "ndim", 0):
+            axis_n = axis if axis >= 0 else operand.ndim + axis
+            width = int(operand.shape[axis_n])
+            rows = int(operand.size) // max(width, 1)
+
+        on_tpu_float = (
+            operand is not None
+            and jnp.issubdtype(operand.dtype, jnp.floating)
+            # Mosaic only lowers for real on TPU; on CPU/GPU the Pallas path
+            # would fall into interpret mode, which is slower and not the point.
+            and jax.default_backend() == "tpu"
+        )
+        if mode in ("exact_mask", "kth"):
+            # Sort-free selection: one HBM read per row block, every pass in VMEM.
+            # Static or per-row k; the kernel itself falls back for >32-bit floats.
+            wide_ok = width <= _MAX_WIDTH_FOR_SELECT or (
+                mode == "exact_mask" and operand is not None and operand.dtype == jnp.float32
+            )
+            use_pallas = on_tpu_float and width >= _MIN_WIDTH_FOR_SELECT and rows >= _MIN_ROWS_FOR_SELECT and wide_ok
+        else:
+            use_pallas = (
+                mode == "values"
+                and isinstance(k, int)
+                and _MIN_K_FOR_PALLAS <= k <= width
+                and width >= _MIN_WIDTH_FOR_PALLAS
+                and rows >= _MIN_ROWS_FOR_PALLAS
+                and on_tpu_float
+            )
+        return TopKConfig(platform="pallas" if use_pallas else "xla", backend="tpu" if use_pallas else "any")
+
+    def candidate_cfgs(self, inv: Invocation[TopKConfig, tp.Any]) -> list[TopKConfig]:
+        """Candidates for autotuning: the heuristic pick plus the XLA reference.
+
+        Args:
+            inv: The invocation being configured.
+
+        Returns:
+            Configurations to time against each other.
+        """
+        chosen = self.heuristic_cfg(inv)
+        xla = TopKConfig(platform="xla", backend="any")
+        return [chosen] if chosen.platform == "xla" else [chosen, xla]
+
+
+_topk_executor = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "heuristics"),
+        ),
+        tuner=Tuner(warmup=5, iters=100),
+        persistent=PersistentCache("topk"),
+    )
+)
+
+
+def topk(
+    operand: Array,
+    k: int | Array,
+    axis: int = -1,
+    mode: str = "values",
+    mask_fill: float | None = None,
+    *,
+    cfg: TopKConfig | None = None,
+) -> tuple[Array, Array] | Array:
+    """Exact top-k along ``axis``.
+
+    Args:
+        operand: Input array.
+        k: Number kept. Static ``int`` for ``mode="values"``; may be a per-row
+            traced array for the other modes.
+        axis: Reduction axis; defaults to the last.
+        mode: ``"values"`` returns ``(values, indices)`` with ``jax.lax.top_k``
+            semantics. ``"mask"`` returns a boolean keep-mask that keeps every
+            tie at the threshold (a row may exceed ``k``). ``"exact_mask"``
+            returns the pick set of ``jax.lax.top_k`` as a boolean mask
+            (exactly ``min(k, n)`` per row, lower index wins ties, rows short
+            of finite scores fill with their lowest-index ``-inf`` items).
+            ``"kth"`` returns ``jax.lax.top_k(operand, k)[0][..., -1]`` with
+            ``axis`` removed (``1 <= k <= n``). ``"filter"`` returns
+            ``operand`` with dropped entries set to ``mask_fill``.
+        mask_fill: Replacement value for ``mode="filter"``.
+        cfg: Optional explicit configuration (platform/backend override).
+
+    Returns:
+        Mode-dependent; see ``mode``. ``"exact_mask"`` and ``"kth"`` are not
+        differentiable (the operand is detached on the Pallas path).
+
+    Example:
+        >>> values, indices = topk(logits, k=6)
+        >>> keep = topk(logits, per_row_k, mode="mask")
+        >>> picked = topk(index_scores, 2048, mode="exact_mask")
+    """
+    return _topk_executor(
+        TopK(),
+        operand,
+        k,
+        axis=axis,
+        mode=mode,
+        mask_fill=mask_fill,
+        _cfg=cfg,
+    )
+
+
+__all__ = ("TopK", "topk")

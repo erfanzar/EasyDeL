@@ -1,0 +1,942 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration dataclass for the GRPO trainer.
+
+Group Relative Policy Optimization (DeepSeek, 2024) replaces the
+critic of PPO with group-relative advantage normalization: rewards
+inside each prompt group are mean-centred and (optionally) standardised
+to provide a low-variance learning signal.  :class:`GRPOConfig`
+holds the temperature, KL penalty, group / generation sizes, the chunk
+sizes for memory efficiency, and the reference-model handling knobs.
+"""
+
+import typing as tp
+from dataclasses import dataclass, field
+
+from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
+
+from ..training_configurations import TrainingArguments
+
+
+@Registry.register("trainer-arguments", "grpo")
+@dataclass
+class GRPOConfig(TrainingArguments):
+    """Configuration class for Group Relative Policy Optimization (GRPO) training.
+
+    GRPO (DeepSeekMath, Shao et al. 2024) replaces PPO's value-network
+    baseline with a *group-relative* advantage: for each prompt the
+    policy samples ``num_generations`` completions, scores them with
+    one or more reward functions, and standardises the rewards within
+    the group (mean / std). The standardised rewards become the
+    advantages that drive a clipped-PPO-style policy gradient,
+    optionally regularised by a KL penalty against a reference model.
+
+    This trainer supports several GRPO loss variants exposed via
+    ``loss_type``: the canonical ``"grpo"``, the
+    batch-normalised-policy-gradient ``"bnpo"``, the unbiased
+    ``"dr_grpo"``, the dynamic-clipping ``"dapo"`` (default in EasyDeL),
+    the constant-importance-sampling ``"cispo"``, the
+    soft-advantage-policy-optimization ``"sapo"``, the
+    length-unbiased sequence ``"luspo"``, the variational sequence
+    soft-policy ``"vespo"``, and the geometric-mean ``"gmpo"`` variants. Importance
+    sampling can be applied at the token level (``"token"``) or
+    aggregated per sequence (``"sequence"``).
+
+    Construct with dict-literal kwargs, e.g.:
+
+    >>> cfg = GRPOConfig(num_generations=8, beta=0.04, loss_type="dapo",
+    ...                  max_prompt_length=512, max_completion_length=256)
+
+    Attributes:
+        trainer_prefix: Default prefix used for checkpoints/logs
+            (``"GRPO"``).
+        remove_unused_columns: When ``False``, dataset columns are kept
+            so reward functions can read auxiliary fields.
+        max_prompt_length: Maximum prompt-only token budget. Default
+            ``512``.
+        max_completion_length: Maximum completion token budget. Default
+            ``256``. Must satisfy
+            ``max_prompt_length + max_completion_length <= max_length``.
+        dataset_num_proc: Worker count for ``Dataset.map`` calls.
+        shuffle_dataset: TRL-compatible alias for
+            ``shuffle_train_dataset``. ``None`` leaves the base setting
+            unchanged.
+        learning_rate: Optimizer learning rate. Default ``1e-6``.
+        beta: KL-regularisation coefficient against the reference
+            model. ``0.0`` disables the KL term entirely.
+        epsilon: Lower (and default upper) clipping bound for
+            importance-sampling weights, mirroring PPO.
+        epsilon_high: Optional asymmetric upper clip; falls back to
+            ``epsilon`` when ``None``.
+        delta: Optional two-sided dynamic clipping bound (DAPO).
+            ``None`` disables dynamic clipping.
+        sync_ref_model: When ``True``, the reference model is
+            periodically refreshed from a moving average of the
+            policy.
+        ref_model_mixup_alpha: Polyak mixing coefficient used when
+            syncing the reference (``new_ref = alpha * policy + (1 - alpha) * ref``).
+        ref_model_sync_steps: Optimizer-step interval between
+            reference syncs.
+        num_iterations: Number of optimizer updates per generated
+            batch (PPO-style multi-epoch updates).
+        generation_batch_size: Optional effective generation batch
+            size. When set, it is converted into
+            ``steps_per_generation`` using ``total_batch_size``.
+        steps_per_generation: Number of optimizer steps that reuse a
+            generated/scored GRPO batch before sampling again.
+        loss_type: One of ``"grpo"``, ``"bnpo"``, ``"dr_grpo"``,
+            ``"dapo"``, ``"cispo"``, ``"sapo"``, ``"luspo"``,
+            ``"vespo"``, ``"gmpo"``. Default ``"dapo"``. ``"gmpo"``
+            (arXiv:2507.20673) optimises the geometric mean of the
+            advantage-sign-aware clipped token ratios of each sequence
+            and requires token-level importance sampling and
+            ``epsilon < 1``.
+        kl_estimator: Per-token estimator of ``KL(pi || pi_ref)`` used
+            for the ``beta`` penalty: ``"k1"`` (``log r``), ``"k2"``
+            (``0.5 * (log r)^2``), ``"k3"`` (``1/r - 1 + log r``,
+            default), or ``"l2"`` (``(log r)^2``), with
+            ``r = pi / pi_ref``.
+        disable_dropout: Whether to put policy, reference, and reward
+            model modules into eval mode during trainer construction.
+        sapo_temperature_pos: Positive-advantage soft-clipping
+            temperature used by ``loss_type="sapo"``.
+        sapo_temperature_neg: Negative-advantage soft-clipping
+            temperature used by ``loss_type="sapo"``.
+        vespo_k_pos: Gamma-weight exponent for positive VESPO advantages.
+        vespo_lambda_pos: Gamma-weight decay for positive VESPO advantages.
+        vespo_k_neg: Gamma-weight exponent for negative VESPO advantages.
+        vespo_lambda_neg: Gamma-weight decay for negative VESPO advantages.
+        importance_sampling_level: ``"token"`` or ``"sequence"``.
+        reward_weights: Optional weights for combining multiple reward
+            functions. Length must match the reward-function list.
+        multi_objective_aggregation: Reward aggregation strategy when
+            multiple reward functions are configured.
+        decouple_reward_normalization: GDPO (arXiv:2601.05242) switch.
+            When ``True`` each reward function is normalised within its
+            prompt group before the weighted sum, and the summed reward
+            is then normalised over the batch. This forces
+            ``multi_objective_aggregation="normalize_then_sum"``; after
+            ``__post_init__`` the flag mirrors that setting.
+        scale_rewards: Reward scaling strategy: ``"group"`` (default),
+            ``"batch"``, ``"batch_advantage"`` (standardize group-centred
+            advantages over the batch), ``"none"``. ``True``/``False`` are accepted
+            and mapped to ``"group"``/``"none"``.
+        tools: Optional tool registry forwarded to the reward
+            functions.
+        skip_apply_chat_template: When ``True``, the prompt is taken
+            verbatim from the dataset (no chat-template application).
+        num_return_sequences: Number of completions to sample per
+            prompt. Mirrored on ``num_generations`` for TRL parity.
+        num_generations: Alias of ``num_return_sequences`` (kept for
+            TRL compatibility); both fields are kept in sync after
+            ``__post_init__``.
+        num_generations_eval: Number of completions to sample per
+            prompt during evaluation. ``None`` reuses
+            ``num_generations``.
+        temperature: Sampling temperature.
+        top_p, top_k, presence_penalty, frequency_penalty,
+            repetition_penalty: Standard eSurge generation knobs.
+        chat_template_kwargs: Extra kwargs for chat-template
+            application during generation.
+        pad_to_multiple_of: If set, prompt batches are padded to a
+            multiple of this value while still truncating prompt content
+            to ``max_prompt_length``.
+        mask_truncated_completions: When ``True``, completions that
+            did not terminate with EOS are dropped from the loss to
+            avoid biasing the gradient toward truncated trajectories.
+        top_entropy_quantile: Keeps only the top fraction (by token
+            entropy) of completion tokens in the loss. ``1.0``
+            disables filtering.
+        off_policy_mask_threshold: Optional sequence-level forward-KL
+            threshold for dropping negative-advantage off-policy
+            samples from the policy objective.
+        use_bias_correction_kl: When ``True``, multiply the KL penalty
+            by the same importance-sampling coefficient used by the
+            policy objective.
+        log_completions: When ``True``, log a small sample of generated
+            prompt/completion pairs through the trainer logger.
+        num_completions_to_print: Optional cap on the number of
+            completion rows emitted by ``log_completions``.
+        log_unique_prompts: When logging completions, keep only the
+            first completion for each distinct prompt.
+        ref_logps_chunk_size: Sequence-axis chunk size for the
+            reference-model log-prob forward. ``None`` disables
+            chunking.
+        completion_chunk_size: Sequence-axis chunk size for the
+            policy completion-loss computation. ``None`` disables
+            chunking.
+        max_loss_completion_tokens: Optional cap on the number of
+            completion tokens contributing to the loss.
+        logprob_vocab_chunk_size: Vocab-axis chunk size for
+            :func:`compute_token_logps_and_entropies_chunked` when
+            scoring completions. ``None`` disables chunking.
+        esurge_importance_sampling_correction: When ``True``, apply
+            importance-sampling correction between learner and eSurge
+            rollout log-probabilities.
+        esurge_importance_sampling_mode: Granularity and masking mode
+            for rollout-to-learner mismatch correction. One of
+            ``"token_truncate"``, ``"token_mask"``, ``"token_icepop"``,
+            ``"token_log_mask"``, ``"sequence_truncate"``,
+            ``"sequence_mask"``, ``"sequence_icepop"``, or
+            ``"sequence_log_mask"``. ``"token_icepop"`` implements
+            IcePop's double-sided token mask outside
+            ``[cap_low, cap]``; ``"sequence_icepop"`` is a
+            sequence-level extension of the same band mask. The
+            ``*_log_mask`` modes (Kimi K2.5, arXiv:2602.02276) drop
+            tokens/sequences with ``|log ratio| > log(cap)`` and keep
+            the rest with weight ``1`` (no ratio re-weighting); the
+            sequence variant uses the summed token log ratio and both
+            require ``cap > 1``.
+        esurge_importance_sampling_cap: Upper ratio bound (``beta``) for
+            eSurge importance-sampling correction.
+        esurge_importance_sampling_cap_low: Optional lower ratio bound
+            (``alpha``) for IcePop modes. When ``None``, defaults to
+            ``1.0 / esurge_importance_sampling_cap`` (symmetric
+            ``[1/beta, beta]``).
+        toggle_budget_interval: Kimi "Toggle" budget alternation period
+            in optimizer steps. ``0`` disables it. Otherwise steps in
+            ``[k * interval, (k + 1) * interval)`` with odd ``k``
+            generate with ``toggle_max_completion_length`` new tokens and
+            even ``k`` use the full budget. Budget-phase completions are
+            right-padded to the full width so compiled shapes stay
+            fixed.
+        toggle_max_completion_length: Completion budget of the
+            constrained Toggle phase. Required when
+            ``toggle_budget_interval > 0``; must be in
+            ``(0, max_completion_length]``.
+        dynamic_sampling: DAPO dynamic sampling (arXiv:2503.14476). When
+            ``True``, training batches whose prompt groups have zero
+            reward variance are re-sampled; groups that stay
+            uninformative after ``dynamic_sampling_max_attempts`` are
+            removed from the loss by zeroing their completion mask.
+            Requires ``num_generations >= 2``.
+        dynamic_sampling_max_attempts: Total rollout attempts per
+            training batch (the first rollout included).
+    """
+
+    trainer_prefix: str | None = field(
+        default="GRPO",
+        metadata={"help": "default prefix name for trainer."},
+    )
+    remove_unused_columns: bool | None = field(
+        default=False,
+        metadata={"help": "Whether to remove unused columns from the dataset."},
+    )
+    max_prompt_length: int = field(
+        default=512,
+        metadata={"help": "The maximum length of the prompt."},
+    )
+    max_completion_length: int = field(
+        default=256,
+        metadata={"help": "The maximum length of the completion."},
+    )
+    dataset_num_proc: int | None = field(
+        default=None,
+        metadata={"help": "The number of processes to use for dataset processing."},
+    )
+    shuffle_dataset: bool | None = field(
+        default=None,
+        metadata={"help": "TRL-compatible alias for `shuffle_train_dataset`."},
+    )
+    learning_rate: float = field(
+        default=1e-6,
+        metadata={"help": "The learning rate."},
+    )
+    cast_lm_head_to_fp32: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "TRL compatibility field. EasyDeL keeps model parameter dtypes under the model/sharding config, "
+                "so this flag does not require a trainer-side cast path."
+            )
+        },
+    )
+    beta: float = field(
+        default=0.04,
+        metadata={"help": "The beta parameter for GRPO."},
+    )
+    epsilon: float = field(
+        default=0.2,
+        metadata={"help": "Lower clipping bound for importance sampling weights."},
+    )
+    epsilon_high: float | None = field(
+        default=None,
+        metadata={"help": "Upper clipping bound for importance sampling weights. If None, defaults to `epsilon`."},
+    )
+    delta: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional two-sided clipping bound. If set, importance weights are additionally clipped to `delta`."
+        },
+    )
+    sync_ref_model: bool = field(
+        default=False,
+        metadata={"help": "Whether to periodically sync the reference model with the policy model."},
+    )
+    ref_model_mixup_alpha: float = field(
+        default=0.9,
+        metadata={"help": "The alpha parameter for mixing the reference model with the policy model."},
+    )
+    ref_model_sync_steps: int = field(
+        default=64,
+        metadata={"help": "The number of steps between syncing the reference model."},
+    )
+    num_iterations: int = field(
+        default=1,
+        metadata={"help": "How many optimizer updates to perform per generated batch."},
+    )
+    generation_batch_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Effective batch size used for generation. Mutually exclusive with `steps_per_generation`; "
+                "when set, EasyDeL derives `steps_per_generation = generation_batch_size // total_batch_size`."
+            )
+        },
+    )
+    steps_per_generation: int | None = field(
+        default=None,
+        metadata={"help": "Number of optimizer steps to reuse a generated GRPO batch before sampling again."},
+    )
+    loss_type: str = field(
+        default="dapo",
+        metadata={
+            "help": (
+                "Loss variant to use. One of ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', "
+                "'vespo', 'gmpo']."
+            )
+        },
+    )
+    kl_estimator: str = field(
+        default="k3",
+        metadata={
+            "help": (
+                "Per-token estimator of KL(pi || pi_ref) used by the beta penalty: 'k1' (log r), "
+                "'k2' (0.5 * (log r)^2), 'k3' (1/r - 1 + log r), or 'l2' ((log r)^2), with r = pi / pi_ref."
+            )
+        },
+    )
+    disable_dropout: bool = field(
+        default=True,
+        metadata={"help": "Whether to disable dropout in the policy, reference, and reward models."},
+    )
+    sapo_temperature_pos: float = field(
+        default=1.0,
+        metadata={"help": "Positive-advantage soft-clipping temperature for loss_type='sapo'."},
+    )
+    sapo_temperature_neg: float = field(
+        default=1.05,
+        metadata={"help": "Negative-advantage soft-clipping temperature for loss_type='sapo'."},
+    )
+    vespo_k_pos: float = field(
+        default=2.0,
+        metadata={"help": "VESPO gamma-weight exponent for positive advantages."},
+    )
+    vespo_lambda_pos: float = field(
+        default=3.0,
+        metadata={"help": "VESPO gamma-weight decay for positive advantages."},
+    )
+    vespo_k_neg: float = field(
+        default=3.0,
+        metadata={"help": "VESPO gamma-weight exponent for negative advantages."},
+    )
+    vespo_lambda_neg: float = field(
+        default=2.0,
+        metadata={"help": "VESPO gamma-weight decay for negative advantages."},
+    )
+    importance_sampling_level: str = field(
+        default="token",
+        metadata={
+            "help": (
+                "Importance sampling applied per 'token', aggregated per 'sequence', or GSPO-token 'sequence_token'."
+            )
+        },
+    )
+    reward_weights: list[float] | None = field(
+        default=None,
+        metadata={
+            "help": "Optional weights for each reward function. Must match the number of reward functions if set."
+        },
+    )
+    multi_objective_aggregation: str = field(
+        default="sum_then_normalize",
+        metadata={
+            "help": (
+                "Multi-reward aggregation strategy. 'sum_then_normalize' first sums weighted reward functions and "
+                "then normalizes. 'normalize_then_sum' normalizes each reward function within prompt groups before "
+                "weighted summation and batch-level advantage normalization."
+            )
+        },
+    )
+    decouple_reward_normalization: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "GDPO: normalize each reward function within its prompt group before the weighted sum, then "
+                "batch-normalize the summed reward. Forces multi_objective_aggregation='normalize_then_sum'."
+            )
+        },
+    )
+    scale_rewards: str | bool = field(
+        default="group",
+        metadata={
+            "help": (
+                "Reward scaling strategy: 'group', 'batch', 'batch_advantage', 'none', or the booleans "
+                "True/False for group/none."
+            )
+        },
+    )
+    tools: list[dict | tp.Callable] | None = field(
+        default=None,
+        metadata={"help": "Additional tools for training."},
+    )
+    environment_factory: tp.Callable[[], object] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional factory that creates an agentic environment for each generated completion. "
+                "When set, GRPO steps the environment with the generated completion and exposes the "
+                "environment feedback to reward functions."
+            )
+        },
+    )
+    tool_caller: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Tool call parser used with environment_factory/tools. Either a registered inference parser name "
+                "or a regex pattern prefixed with 'regex:'."
+            )
+        },
+    )
+    max_tool_calls_per_step: int = field(
+        default=5,
+        metadata={"help": "Maximum number of tool calls executed during one environment step."},
+    )
+    max_tool_calling_iterations: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum number of GRPO tool-call regenerate iterations. None means keep iterating until no tool "
+                "calls remain or the completion token budget is exhausted; 0 disables the loop."
+            )
+        },
+    )
+    skip_apply_chat_template: bool = field(
+        default=False,
+        metadata={"help": "whenever to skip extracting prompt from dataset."},
+    )
+    num_return_sequences: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "The number of sequences to return for each input prompt. Used during sampling to "
+                "generate multiple completions per prompt."
+            )
+        },
+    )
+    num_generations: int | None = field(
+        default=None,
+        metadata={"help": "Alias for num_return_sequences to keep parity with TRL's interface."},
+    )
+    num_generations_eval: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Number of generations per prompt during evaluation. None uses the training `num_generations` value."
+            )
+        },
+    )
+    temperature: float = field(
+        default=1.0,
+        metadata={"help": "Sampling temperature used during generation."},
+    )
+    top_p: float = field(
+        default=1.0,
+        metadata={"help": "Top-p nucleus sampling parameter."},
+    )
+    top_k: int | None = field(
+        default=None,
+        metadata={"help": "Top-k sampling parameter. None disables top-k."},
+    )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty applied during generation."},
+    )
+    chat_template_kwargs: dict | None = field(
+        default=None,
+        metadata={"help": "Extra kwargs forwarded to chat template application during generation."},
+    )
+    pad_to_multiple_of: int | None = field(
+        default=None,
+        metadata={"help": "If set, GRPO prompt batches are padded to a multiple of this value."},
+    )
+    mask_truncated_completions: bool = field(
+        default=False,
+        metadata={"help": "If True, drop completions that do not terminate with EOS from the loss calculation."},
+    )
+    top_entropy_quantile: float = field(
+        default=1.0,
+        metadata={"help": "Keep only the top quantile of tokens by entropy in the loss (1.0 disables filtering)."},
+    )
+    off_policy_mask_threshold: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional off-policy sequence mask threshold. Negative-advantage samples with mean forward KL above "
+                "this value are removed from the policy objective."
+            )
+        },
+    )
+    use_bias_correction_kl: bool = field(
+        default=False,
+        metadata={"help": "Whether to importance-weight the KL penalty for bias correction."},
+    )
+    discard_unscorable_groups: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "What a None reward (unscorable sample: judge or infra failure) does to its prompt group. "
+                "None (default): per-function opt-in -- the whole group is dropped from the update (zero "
+                "advantages, tokens and sequences excluded from every loss normaliser) only when the None comes "
+                "from a reward function whose `discard_unscorable` attribute is True; a None from any other "
+                "function becomes NaN and is skipped by the nan-aware reward statistics. True: a None from any "
+                "function drops the group. False: never drop; every None uses the nan-aware aggregation."
+            )
+        },
+    )
+    off_policy_k3_threshold: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional per-sequence mean K3 bound between learner and eSurge behaviour log-probs. Sequences "
+                "above it are rejected (loss zeroed, normaliser unchanged). Requires "
+                "esurge_importance_sampling_correction=True."
+            )
+        },
+    )
+    off_policy_min_acceptance: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional minimum accepted/eligible sequence fraction; below it the step leaves parameters and "
+                "optimizer state unchanged. Requires esurge_importance_sampling_correction=True."
+            )
+        },
+    )
+    startup_behavior_k3_max: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional first-step parity bound on the token-mean behaviour K3. A violation skips the first "
+                "update and raises. Requires esurge_importance_sampling_correction=True."
+            )
+        },
+    )
+    startup_behavior_tail_fraction_max: float = field(
+        default=0.01,
+        metadata={"help": "First-step bound on the fraction of tokens with |log ratio| > 0.25."},
+    )
+    esurge_importance_sampling_correction: bool = field(
+        default=True,
+        metadata={"help": "eSurge importance-sampling correction toggle."},
+    )
+    esurge_importance_sampling_mode: str = field(
+        default="sequence_mask",
+        metadata={
+            "help": (
+                "eSurge importance-sampling mode. One of 'token_truncate', 'token_mask', 'token_icepop', "
+                "'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', or 'sequence_log_mask'."
+            )
+        },
+    )
+    esurge_importance_sampling_cap: float = field(
+        default=3.0,
+        metadata={"help": "Upper ratio bound for eSurge importance-sampling correction."},
+    )
+    esurge_importance_sampling_cap_low: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional lower ratio bound for IcePop importance-sampling modes. "
+                "When None, defaults to 1.0 / esurge_importance_sampling_cap."
+            )
+        },
+    )
+    toggle_budget_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Kimi Toggle budget alternation period in optimizer steps. 0 disables it; otherwise odd "
+                "periods generate with toggle_max_completion_length new tokens."
+            )
+        },
+    )
+    toggle_max_completion_length: int | None = field(
+        default=None,
+        metadata={"help": "Completion budget of the constrained Toggle phase. Required when toggling is enabled."},
+    )
+    dynamic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "DAPO dynamic sampling: re-sample training batches whose prompt groups have zero reward variance."
+        },
+    )
+    dynamic_sampling_max_attempts: int = field(
+        default=3,
+        metadata={"help": "Total rollout attempts per training batch when dynamic_sampling=True."},
+    )
+    log_completions: bool = field(
+        default=False,
+        metadata={"help": "Whether to log sampled prompt/completion pairs during GRPO preprocessing."},
+    )
+    num_completions_to_print: int | None = field(
+        default=None,
+        metadata={"help": "Maximum number of completion rows to print when log_completions=True."},
+    )
+    log_unique_prompts: bool = field(
+        default=False,
+        metadata={"help": "When logging completions, keep only the first completion for each unique prompt."},
+    )
+    log_completions_hub_repo: str | None = field(
+        default=None,
+        metadata={"help": "Hugging Face Hub repository for completion logs. Upload is not supported yet."},
+    )
+    use_transformers_paged: bool = field(
+        default=False,
+        metadata={"help": "Deprecated TRL paged-generation flag. Not supported by EasyDeL GRPO."},
+    )
+    ref_logps_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chunk size for reference-model log-prob computation. "
+                "Set to `None` to disable chunking; `0` is accepted for backward compatibility."
+            )
+        },
+    )
+    completion_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chunk size for completion-loss computation. "
+                "Set to `None` to disable chunked completion loss; `0` is accepted for backward compatibility."
+            )
+        },
+    )
+    max_loss_completion_tokens: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional cap on completion tokens used by the GRPO loss. "
+                "Set to `None` to disable truncation; `0` is accepted for backward compatibility."
+            )
+        },
+    )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing per-token log probabilities and entropies. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
+
+    prefix_shared_forward: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Run the policy loss forward with prompts once per group: a capture pass over the prompts records "
+                "each layer's key/value states and a fork pass scores the completions against the gathered prefix. "
+                "Dense full-attention models, and hybrid qwen3_next models (full attention plus gated-delta "
+                "linear_attention layers, whose end-of-prompt conv window and recurrent state are captured instead; "
+                "prompt and completion lengths must be >= 2), with attn_mechanism 'vanilla', 'sdpa', 'flash_attn2' "
+                "or 'blocksparse' only (flash_attn2 at the model's default matmul precision is bf16-pass accurate, "
+                "about 6e-3, on TPU; the TPU Pallas gated-delta kernel's default precision puts qwen3_next log-probs "
+                "about 2.6e-4 from the repeated-prompt forward). Other hybrid/recurrent families (KDA, MLA, Mamba) "
+                "are rejected; "
+                "incompatible with "
+                "completion_chunk_size, top_entropy_quantile < 1 and mpmd_scheduler. With 'vanilla'/'sdpa' the "
+                "completions attend the shared prefix without a per-completion copy (exact log-sum-exp merge); on "
+                "TPU (697M dense model, G=8) it beat the default forward at every measured prompt/completion ratio, "
+                "e.g. 0.119 s vs 0.316 s per step at P=1024/C=256 and 0.325 s vs 0.378 s at P=512/C=2048. "
+                "'flash_attn2'/'blocksparse' still copy the prefix per completion and only pay off when prompts are "
+                "at least as long as completions."
+            )
+        },
+    )
+
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
+        """Finalize GRPO-specific config invariants.
+
+        Resolves the legacy ``max_sequence_length`` alias, derives
+        ``max_completion_length`` from ``max_length`` /
+        ``max_prompt_length`` when left at the class default, ensures
+        ``max_length == max_prompt_length + max_completion_length``,
+        keeps ``num_generations`` and ``num_return_sequences`` in
+        sync, copies ``temperature`` into ``generation_temperature``
+        when not set, defaults ``epsilon_high`` to ``epsilon``,
+        normalises the various chunk-size aliases (``0`` -> ``None``)
+        and converts ``scale_rewards`` boolean shorthands to their
+        canonical string values. Finally defers to the base
+        :class:`TrainingArguments.__post_init__`.
+
+        Args:
+            max_sequence_length: Legacy alias for ``max_length``.
+            quantization_block: Legacy alias for the quantization group
+                size; forwarded to the base class.
+
+        Raises:
+            ValueError: If ``max_length`` is smaller than
+                ``max_prompt_length`` or
+                ``max_prompt_length + max_completion_length``.
+        """
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
+        if self.log_completions_hub_repo is not None:
+            if not self.log_completions:
+                raise ValueError("`log_completions_hub_repo` requires `log_completions=True`.")
+        if self.shuffle_dataset is not None:
+            self.shuffle_train_dataset = bool(self.shuffle_dataset)
+
+        default_completion = type(self).__dataclass_fields__["max_completion_length"].default
+        if self.max_length is not None:
+            if self.max_length < self.max_prompt_length:
+                raise ValueError(
+                    f"`max_length` ({self.max_length}) must be >= `max_prompt_length` ({self.max_prompt_length})."
+                )
+            max_allowed_completion = self.max_length - self.max_prompt_length
+
+            # Keep legacy behavior when completion length is left at class default:
+            # infer completion from max_length and max_prompt_length.
+            if self.max_completion_length == default_completion:
+                self.max_completion_length = max_allowed_completion
+            elif self.max_completion_length > max_allowed_completion:
+                raise ValueError(
+                    "`max_prompt_length + max_completion_length` "
+                    f"({self.max_prompt_length} + {self.max_completion_length}) must be <= `max_length` "
+                    f"({self.max_length})."
+                )
+
+        self.max_length = self.max_prompt_length + self.max_completion_length
+
+        if self.num_generations is None:
+            self.num_generations = self.num_return_sequences
+        else:
+            self.num_return_sequences = self.num_generations
+        if self.num_generations_eval is not None and self.num_generations_eval <= 0:
+            raise ValueError("`num_generations_eval` must be a positive integer when set.")
+        if self.num_iterations <= 0:
+            raise ValueError("`num_iterations` must be a positive integer.")
+        if not (0.0 <= self.ref_model_mixup_alpha <= 1.0):
+            raise ValueError(f"`ref_model_mixup_alpha` must be in [0.0, 1.0]; got {self.ref_model_mixup_alpha}.")
+        if self.ref_model_sync_steps <= 0:
+            raise ValueError(f"`ref_model_sync_steps` must be positive; got {self.ref_model_sync_steps}.")
+        if self.generation_batch_size is not None and self.steps_per_generation is not None:
+            raise ValueError("`generation_batch_size` and `steps_per_generation` are mutually exclusive.")
+        if self.generation_batch_size is not None:
+            if self.generation_batch_size <= 0:
+                raise ValueError("`generation_batch_size` must be a positive integer when set.")
+            if self.generation_batch_size % self.total_batch_size != 0:
+                raise ValueError("`generation_batch_size` must be divisible by `total_batch_size` in EasyDeL.")
+            self.steps_per_generation = max(1, self.generation_batch_size // self.total_batch_size)
+        elif self.steps_per_generation is None:
+            self.steps_per_generation = 1
+        elif self.steps_per_generation <= 0:
+            raise ValueError("`steps_per_generation` must be a positive integer when set.")
+        self.generation_batch_size = self.total_batch_size * self.steps_per_generation
+        if self.generation_temperature is None:
+            self.generation_temperature = self.temperature
+
+        self.loss_type = self.loss_type.lower() if isinstance(self.loss_type, str) else self.loss_type
+        if self.loss_type not in {"grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo", "gmpo"}:
+            raise ValueError(
+                "`loss_type` must be one of 'grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', "
+                "'luspo', 'vespo', 'dppo', or 'gmpo'. "
+                f"Got {self.loss_type!r}."
+            )
+        if self.loss_type == "gmpo":
+            level = self.importance_sampling_level.lower() if isinstance(self.importance_sampling_level, str) else None
+            if level != "token":
+                raise ValueError(
+                    "`loss_type='gmpo'` builds its own sequence geometric mean and requires "
+                    f"`importance_sampling_level='token'`; got {self.importance_sampling_level!r}."
+                )
+            if not (0.0 < self.epsilon < 1.0):
+                raise ValueError(f"`loss_type='gmpo'` requires `0 < epsilon < 1`; got {self.epsilon}.")
+        self.kl_estimator = self.kl_estimator.lower() if isinstance(self.kl_estimator, str) else self.kl_estimator
+        if self.kl_estimator not in {"k1", "k2", "k3", "l2"}:
+            raise ValueError(f"`kl_estimator` must be one of 'k1', 'k2', 'k3', or 'l2'. Got {self.kl_estimator!r}.")
+        if self.toggle_budget_interval < 0:
+            raise ValueError(f"`toggle_budget_interval` must be non-negative; got {self.toggle_budget_interval}.")
+        if self.toggle_budget_interval > 0:
+            if self.toggle_max_completion_length is None:
+                raise ValueError("`toggle_max_completion_length` is required when `toggle_budget_interval > 0`.")
+            if not (0 < self.toggle_max_completion_length <= self.max_completion_length):
+                raise ValueError(
+                    "`toggle_max_completion_length` must be in (0, max_completion_length] "
+                    f"(max_completion_length={self.max_completion_length}); got {self.toggle_max_completion_length}."
+                )
+        if self.dynamic_sampling_max_attempts <= 0:
+            raise ValueError(
+                f"`dynamic_sampling_max_attempts` must be positive; got {self.dynamic_sampling_max_attempts}."
+            )
+        if self.dynamic_sampling and int(self.num_generations or 0) < 2:
+            raise ValueError("`dynamic_sampling=True` requires `num_generations >= 2` so group variance is defined.")
+        if self.sapo_temperature_pos <= 0.0:
+            raise ValueError(f"`sapo_temperature_pos` must be positive; got {self.sapo_temperature_pos}.")
+        if self.sapo_temperature_neg <= 0.0:
+            raise ValueError(f"`sapo_temperature_neg` must be positive; got {self.sapo_temperature_neg}.")
+        if self.vespo_k_pos <= 0.0:
+            raise ValueError(f"`vespo_k_pos` must be positive; got {self.vespo_k_pos}.")
+        if self.vespo_lambda_pos <= 0.0:
+            raise ValueError(f"`vespo_lambda_pos` must be positive; got {self.vespo_lambda_pos}.")
+        if self.vespo_k_neg <= 0.0:
+            raise ValueError(f"`vespo_k_neg` must be positive; got {self.vespo_k_neg}.")
+        if self.vespo_lambda_neg <= 0.0:
+            raise ValueError(f"`vespo_lambda_neg` must be positive; got {self.vespo_lambda_neg}.")
+        if self.max_tool_calls_per_step <= 0:
+            raise ValueError("`max_tool_calls_per_step` must be positive.")
+        if self.max_tool_calling_iterations is not None and self.max_tool_calling_iterations < 0:
+            raise ValueError("`max_tool_calling_iterations` must be non-negative or None.")
+        if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:
+            raise ValueError("`pad_to_multiple_of` must be a positive integer when set.")
+        if not (0.0 <= self.top_entropy_quantile <= 1.0):
+            raise ValueError("`top_entropy_quantile` must be in [0.0, 1.0].")
+        if self.off_policy_mask_threshold is not None and self.off_policy_mask_threshold <= 0.0:
+            raise ValueError("`off_policy_mask_threshold` must be positive when set.")
+        if self.esurge_importance_sampling_mode not in {
+            "token_truncate",
+            "token_mask",
+            "token_icepop",
+            "token_log_mask",
+            "sequence_truncate",
+            "sequence_mask",
+            "sequence_icepop",
+            "sequence_log_mask",
+        }:
+            raise ValueError(
+                "`esurge_importance_sampling_mode` must be one of 'token_truncate', 'token_mask', 'token_icepop', "
+                "'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', or 'sequence_log_mask'."
+            )
+        if self.esurge_importance_sampling_cap <= 0.0:
+            raise ValueError("`esurge_importance_sampling_cap` must be positive.")
+        if self.esurge_importance_sampling_mode.endswith("_log_mask") and self.esurge_importance_sampling_cap <= 1.0:
+            raise ValueError(
+                "`esurge_importance_sampling_cap` must be > 1.0 for log-mask modes so the band "
+                "|log ratio| <= log(cap) is non-empty."
+            )
+        if self.esurge_importance_sampling_cap_low is not None:
+            if self.esurge_importance_sampling_cap_low <= 0.0:
+                raise ValueError("`esurge_importance_sampling_cap_low` must be positive when set.")
+            if self.esurge_importance_sampling_cap_low > self.esurge_importance_sampling_cap:
+                raise ValueError("`esurge_importance_sampling_cap_low` must be <= `esurge_importance_sampling_cap`.")
+        elif self.esurge_importance_sampling_mode.endswith("_icepop") and self.esurge_importance_sampling_cap < 1.0:
+            raise ValueError(
+                "`esurge_importance_sampling_cap` must be >= 1.0 for IcePop modes when "
+                "`esurge_importance_sampling_cap_low` is None so [1/cap, cap] is non-empty."
+            )
+        for knob in ("off_policy_k3_threshold", "off_policy_min_acceptance", "startup_behavior_k3_max"):
+            value = getattr(self, knob)
+            if value is None:
+                continue
+            if value <= 0.0:
+                raise ValueError(f"`{knob}` must be positive when set; got {value}.")
+            if not self.esurge_importance_sampling_correction:
+                raise ValueError(
+                    f"`{knob}` requires behaviour log-probs from the rollout engine; set "
+                    "`esurge_importance_sampling_correction=True` (eSurge importance-sampling inputs)."
+                )
+        if self.off_policy_min_acceptance is not None and self.off_policy_min_acceptance > 1.0:
+            raise ValueError(f"`off_policy_min_acceptance` must be in (0, 1]; got {self.off_policy_min_acceptance}.")
+        if self.startup_behavior_tail_fraction_max <= 0.0:
+            raise ValueError(
+                f"`startup_behavior_tail_fraction_max` must be positive; got {self.startup_behavior_tail_fraction_max}."
+            )
+        if self.use_transformers_paged:
+            raise ValueError("`use_transformers_paged=True` is unsupported; use EasyDeL eSurge generation instead.")
+        if self.num_completions_to_print is not None and self.num_completions_to_print <= 0:
+            raise ValueError("`num_completions_to_print` must be a positive integer when set.")
+
+        if self.epsilon_high is None:
+            self.epsilon_high = self.epsilon
+
+        if self.scale_rewards is True:
+            self.scale_rewards = "group"
+        elif self.scale_rewards is False:
+            self.scale_rewards = "none"
+        if isinstance(self.multi_objective_aggregation, str):
+            self.multi_objective_aggregation = self.multi_objective_aggregation.lower()
+        if self.multi_objective_aggregation not in {"sum_then_normalize", "normalize_then_sum"}:
+            raise ValueError(
+                "`multi_objective_aggregation` must be 'sum_then_normalize' or 'normalize_then_sum'. "
+                f"Got {self.multi_objective_aggregation!r}."
+            )
+        if self.decouple_reward_normalization:
+            self.multi_objective_aggregation = "normalize_then_sum"
+        self.decouple_reward_normalization = self.multi_objective_aggregation == "normalize_then_sum"
+
+        if self.ref_logps_chunk_size is not None:
+            normalized_ref_chunk_size = int(self.ref_logps_chunk_size)
+            self.ref_logps_chunk_size = normalized_ref_chunk_size if normalized_ref_chunk_size > 0 else None
+        if self.completion_chunk_size is not None:
+            normalized_completion_chunk_size = int(self.completion_chunk_size)
+            self.completion_chunk_size = (
+                normalized_completion_chunk_size if normalized_completion_chunk_size > 0 else None
+            )
+        if self.max_loss_completion_tokens is not None:
+            normalized_max_loss_completion_tokens = int(self.max_loss_completion_tokens)
+            self.max_loss_completion_tokens = (
+                normalized_max_loss_completion_tokens if normalized_max_loss_completion_tokens > 0 else None
+            )
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
+
+        if self.prefix_shared_forward:
+            if getattr(self, "mpmd_scheduler", None) is not None:
+                raise ValueError("`prefix_shared_forward=True` is not supported with `mpmd_scheduler`.")
+            if self.completion_chunk_size is not None:
+                raise ValueError("`prefix_shared_forward=True` is not supported with `completion_chunk_size`.")
+            if self.top_entropy_quantile < 1.0:
+                raise ValueError("`prefix_shared_forward=True` requires `top_entropy_quantile == 1.0`.")
+            if (
+                getattr(self, "gradient_accumulation_mode", "scan") == "execution"
+                and int(getattr(self, "gradient_accumulation_steps", 1) or 1) > 1
+            ):
+                raise ValueError(
+                    "`prefix_shared_forward=True` does not support `gradient_accumulation_mode='execution'` "
+                    "with `gradient_accumulation_steps > 1`; use `gradient_accumulation_mode='scan'`."
+                )
+
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
+
+    __hash__ = hash_fn

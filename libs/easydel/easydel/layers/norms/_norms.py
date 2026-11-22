@@ -1,0 +1,1073 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Normalization layers for neural networks.
+
+Provides efficient normalization layers optimized for JAX/spectrax,
+with support for mixed precision and float8 data types.
+
+Classes:
+    RMSNorm: Root Mean Square normalization layer.
+    RMSNormGated: RMSNorm variant with a sigmoid-gated input branch
+        (Mamba-style "RMSNormGated").
+    LayerNorm: Standard mean-and-variance layer normalization.
+    BatchNorm: Batch normalization with optional running statistics.
+
+Module-level constants:
+    lowfloats: List of supported low-precision floating-point dtypes that
+        the normalization layers promote to ``float32`` before computing
+        statistics for numerical stability. Includes ``jnp.float4_e2m1fn``,
+        the ``float8_e4m3*`` family (``e4m3b11fnuz``, ``e4m3fn``,
+        ``e4m3fnuz``, ``e4m3``), the ``float8_e5m2*`` family
+        (``e5m2``, ``e5m2fnuz``), ``float8_e3m4`` and ``float8_e8m0fnu``
+        (microscaling-style scale dtype). These dtypes are commonly used
+        for quantized training/inference; the layers automatically detect
+        them and run reductions in float32.
+
+Key Features:
+    - Efficient RMS normalization
+    - Support for float8 quantization
+    - Mixed precision computation
+    - Automatic dtype promotion
+
+Example:
+    >>> from easydel.layers import RMSNorm
+    >>> norm = RMSNorm(
+    ...     dim=768,
+    ...     eps=1e-6,
+    ...     dtype=jnp.bfloat16
+    ... )
+    >>> normalized = norm(inputs)
+
+Note:
+    RMSNorm is particularly efficient for large language models
+    as it requires fewer parameters than LayerNorm while providing
+    similar normalization benefits.
+"""
+
+import collections.abc
+import types
+import typing as tp
+
+import jax
+import spectrax as spx
+from jax import lax
+from jax import numpy as jnp
+from jaxtyping import Array, DTypeLike, Float
+from spectrax.common_types import Replicated
+
+from easydel.infra.sharding import sharding_for_layout
+
+Axes = int | tp.Sequence[int]
+Initializer = jax.nn.initializers.Initializer
+PromoteDtypeFn = tp.Callable[..., tuple]
+
+
+def promote_dtype(values, *, dtype=None, inexact=None):
+    """Cast a tuple of arrays to a shared dtype, preserving ``None`` values.
+
+    Args:
+        values: Iterable of arrays (or ``None`` placeholders) to promote.
+        dtype: Target dtype. If ``None``, the values are returned unchanged.
+        inexact: Reserved compatibility argument for embedding dtype promoters.
+            Explicit ``dtype`` casts retain the existing behavior regardless of this value.
+
+    Returns:
+        Tuple of arrays cast to ``dtype`` (or ``None`` for any input that was
+        ``None``). When ``dtype`` is ``None`` the original ``values`` argument
+        is returned as-is.
+    """
+    if dtype is None:
+        return values
+    return tuple(jnp.asarray(v, dtype=dtype) if v is not None else None for v in values)
+
+
+def first_from(*args, default=None):
+    """Return the first non-``None`` argument, or ``default`` if none qualify.
+
+    Args:
+        *args: Candidates to search, in priority order.
+        default: Value to return when every entry in ``args`` is ``None``.
+
+    Returns:
+        The first ``a`` in ``args`` such that ``a is not None``, otherwise
+        ``default``.
+    """
+    for arg in args:
+        if arg is not None:
+            return arg
+    return default
+
+
+def _with_default_sharding(
+    parameter_kwargs: collections.abc.Mapping[str, tp.Any],
+    default_sharding: spx.Sharding | None,
+) -> dict[str, tp.Any]:
+    """Inject a default sharding into parameter kwargs when none is specified.
+
+    Used by the normalization layers to register learnable scale / bias
+    parameters as replicated by default while still letting callers override
+    the sharding via ``sharding`` / ``axis_names`` / ``metadata``.
+
+    Args:
+        parameter_kwargs: Existing ``spx.Parameter`` kwargs (e.g. ``metadata``,
+            ``sharding``, ``axis_names``).
+        default_sharding: Sharding to install when no explicit sharding has
+            been requested. ``None`` keeps the kwargs untouched.
+
+    Returns:
+        Dict of kwargs ready to splat into :class:`spectrax.Parameter`. The
+        returned mapping is always a fresh dict.
+    """
+    kwargs = dict(parameter_kwargs)
+    metadata = dict(kwargs.get("metadata", {}))
+    has_explicit_sharding = (
+        kwargs.get("sharding") is not None
+        or kwargs.get("axis_names") is not None
+        or "sharding" in metadata
+        or "axis_names" in metadata
+    )
+    if default_sharding is not None and not has_explicit_sharding:
+        kwargs["sharding"] = default_sharding
+    if metadata or "metadata" in kwargs:
+        kwargs["metadata"] = metadata
+    return kwargs
+
+
+def _canonicalize_axes(ndim, axes):
+    """Normalize an axis or axis-tuple into a canonical positive-index tuple.
+
+    Args:
+        ndim: Total number of dimensions of the tensor whose axes are being
+            canonicalized.
+        axes: A single integer axis or a sequence of axes, possibly negative.
+
+    Returns:
+        Tuple of non-negative axis indices in the range ``[0, ndim)``.
+    """
+    if isinstance(axes, int):
+        axes = (axes,)
+    return tuple(a if a >= 0 else ndim + a for a in axes)
+
+
+def _compute_stats(x, axes, dtype, axis_name, axis_index_groups, use_fast_variance=True, mask=None):
+    """Compute mean and variance for batch / layer normalization.
+
+    Supports masked statistics (for variable-length sequences) and
+    count-weighted cross-replica aggregation via ``jax.lax.psum`` when ``axis_name`` is
+    provided. The "fast" variance path uses ``E[x^2] - E[x]^2`` while the
+    safe path uses the centered formulation ``E[(x - mean)^2]``.
+
+    Args:
+        x: Input tensor.
+        axes: Reduction axes (int or sequence of ints, possibly negative).
+        dtype: Computation dtype for the reductions.
+        axis_name: Optional named mesh axis for ``pmean`` aggregation; ``None``
+            disables cross-device aggregation.
+        axis_index_groups: Optional groups of axis indices for partitioned
+            ``pmean`` reductions.
+        use_fast_variance: If ``True`` use the algebraically faster but
+            numerically less stable ``E[x^2] - E[x]^2`` form.
+        mask: Optional boolean mask broadcastable to ``x`` selecting which
+            elements participate in the statistics.
+
+    Returns:
+        Tuple ``(mean, var)`` of arrays with the reduction axes kept (size 1)
+        so they can be broadcast against ``x``.
+    """
+    axes = _canonicalize_axes(x.ndim, axes)
+    stats_dtype = dtype if dtype is not None else jnp.promote_types(x.dtype, jnp.float32)
+    values = x.astype(stats_dtype)
+    valid = jnp.ones(x.shape, dtype=jnp.bool_) if mask is None else jnp.broadcast_to(mask, x.shape)
+
+    def aggregate(value):
+        total = jnp.sum(value, axis=axes, keepdims=True, dtype=stats_dtype)
+        if axis_name is not None:
+            total = jax.lax.psum(total, axis_name, axis_index_groups=axis_index_groups)
+        return total
+
+    # Aggregate counts as well as moments: replicas may contain different
+    # numbers of valid elements, including entirely masked local batches.
+    denom = jnp.maximum(aggregate(valid.astype(stats_dtype)), 1.0)
+    mean = aggregate(jnp.where(valid, values, 0)) / denom
+    if use_fast_variance:
+        var = aggregate(jnp.where(valid, jnp.square(values), 0)) / denom - jnp.square(mean)
+    else:
+        # Center on the GLOBAL mean before reducing; averaging local
+        # variances discards the variance between replica means.
+        var = aggregate(jnp.where(valid, jnp.square(values - mean), 0)) / denom
+    return mean, jnp.maximum(var, 0)
+
+
+def _normalize(x, mean, var, scale, bias, reduction_axes, feature_axes, dtype, epsilon):
+    """Apply per-element normalization and (optional) affine transformation.
+
+    Implements ``y = ((x - mean) / sqrt(var + epsilon)) * scale + bias``.
+    Statistics retain their reduction dimensions. Affine parameters are
+    reshaped onto the declared feature axes, including non-trailing axes.
+
+    Args:
+        x: Input tensor.
+        mean: Mean tensor with reduction axes kept (size 1).
+        var: Variance tensor with reduction axes kept (size 1).
+        scale: Optional learnable scale parameter (broadcastable to ``x``).
+        bias: Optional learnable bias parameter (broadcastable to ``x``).
+        reduction_axes: Axes that were reduced when computing the stats.
+        feature_axes: Axes that contain learnable parameters.
+        dtype: Optional dtype to cast ``x`` to before normalization.
+        epsilon: Variance epsilon for numerical stability.
+
+    Returns:
+        Normalized array with the same shape as ``x``.
+    """
+    x = jnp.asarray(x, dtype=dtype) if dtype is not None else x
+    y = (x - mean) * jax.lax.rsqrt(var + epsilon)
+    feature_axes = _canonicalize_axes(x.ndim, feature_axes)
+    param_shape = tuple(x.shape[i] if i in feature_axes else 1 for i in range(x.ndim))
+    if scale is not None:
+        y = y * scale.reshape(param_shape)
+    if bias is not None:
+        y = y + bias.reshape(param_shape)
+    return y
+
+
+lowfloats = [
+    jnp.float4_e2m1fn,
+    jnp.float8_e4m3b11fnuz,
+    jnp.float8_e4m3fn,
+    jnp.float8_e4m3fnuz,
+    jnp.float8_e5m2fnuz,
+    jnp.float8_e5m2,
+    jnp.float8_e3m4,
+    jnp.float8_e4m3,
+    jnp.float8_e8m0fnu,
+]
+
+
+class RMSNorm(spx.Module):
+    """Root Mean Square normalization (no mean-centering, no learnable bias).
+
+    Computes ``y = (x * rsqrt(mean(x**2, axis=-1, keepdims=True) + eps)) * weight``
+    where ``mean`` is the *uncentered* second moment along the trailing feature
+    axis and ``weight`` is a single learnable per-feature scale of shape
+    ``(dim,)``. This is the variant used in LLaMA / Mistral / Qwen / Gemma:
+    cheaper than :class:`LayerNorm` because there is no mean reduction and no
+    learned shift, and empirically just as good for decoder-only transformers.
+
+    Numerical stability rules implemented in :meth:`forward`:
+
+    * ``eps`` is added *inside* the square root via ``rsqrt(var + eps)``, not
+      after. This is the standard placement and matches HuggingFace and common inference backends.
+    * If either ``param_dtype`` or ``dtype`` is one of the low-precision floats
+      in :data:`lowfloats` (float4 / float8 family), the input is promoted to
+      ``float32`` for the entire normalization. Otherwise the input is promoted
+      to ``jnp.promote_types(self.dtype, x.dtype)`` so that bf16 inputs with an
+      fp32 ``dtype`` setting don't silently round-trip.
+    * The final result is cast back to ``x.dtype`` before being returned, so
+      the caller's dtype contract is preserved regardless of internal
+      promotion.
+
+    The scale parameter is registered as fully replicated via
+    :func:`sharding_for_layout(Replicated)` — feature dim is always small
+    enough that sharding it is counter-productive.
+
+    Attributes:
+        dim (int): Size of the trailing feature axis the layer normalizes
+            over. Equal to the size of the learnable ``weight``.
+        eps (float): Variance epsilon, added inside ``rsqrt`` to avoid
+            division by zero on near-zero activations.
+        dtype (DTypeLike): Compute dtype hint used to cast the input/weight
+            during the forward pass. Overridden to ``float32`` when low-precision
+            dtypes are in play.
+        param_dtype (DTypeLike): Storage dtype of the learnable ``weight``
+            parameter (typically ``bfloat16`` for memory or ``float32`` for
+            higher-precision parameter servers).
+        weight (spx.Parameter[Array]): Learnable per-feature scale of shape
+            ``(dim,)``, initialized to ones (so the layer is initially
+            equivalent to plain RMS division).
+
+    See Also:
+        :data:`lowfloats`: Dtypes that trigger fp32 promotion in :meth:`forward`.
+        :class:`RMSNormGated`: SiLU-gated variant used by linear-attention blocks.
+    """
+
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]: ...
+
+    kernel_init = staticmethod(jax.nn.initializers.ones)
+    """Callable: Static initializer for scale parameters, defaults to ones."""
+
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        dtype: DTypeLike = jnp.bfloat16,
+        param_dtype: DTypeLike = jnp.bfloat16,
+        *,
+        scale_offset: float = 0.0,
+        with_scale: bool = True,
+        group_size: int | None = None,
+        fp32_scale: bool = False,
+        output_dtype: jnp.dtype | None = None,
+        kernel_init: tp.Callable | None = None,
+        rngs: spx.Rngs | None = None,
+    ) -> None:
+        """Initialize the RMSNorm layer.
+
+        Creates a Root Mean Square normalization layer with learnable scale
+        parameters. The layer normalizes inputs along the last dimension and
+        applies element-wise scaling.
+
+        Args:
+            dim: Dimension of input features to normalize. This should match
+                the last axis size of input tensors (typically hidden_size
+                in transformer models).
+            eps: Small constant added to the denominator for numerical stability.
+                Prevents division by zero when input variance is very small.
+                Defaults to 1e-6.
+            dtype: Data type for intermediate computations during forward pass.
+                Inputs are cast to this dtype (or float32 for low-precision types)
+                before normalization. Defaults to jnp.bfloat16.
+            param_dtype: Data type for storing learnable parameters (scale kernel).
+                Using float32 for parameters while using bfloat16 for computation
+                is a common mixed-precision strategy. Defaults to jnp.bfloat16.
+            scale_offset: Added to the learned weight before it multiplies the
+                normalized output, so the layer applies ``(scale_offset + w)``.
+                Pass ``1.0`` for the Gemma-family ``(1 + w)`` convention, where
+                the stored parameter is zero-centred at init. Defaults to
+                ``0.0``, which is the plain ``w * output`` behaviour.
+            with_scale: When ``False`` the layer is scale-free: no parameter is
+                allocated and the normalized output is returned directly. Use
+                for the unweighted RMS norms some models apply to Q/K. Note the
+                free function :func:`rms_norm` computes the same thing without
+                a module. Defaults to ``True``.
+            group_size: When set, the trailing axis is reshaped to
+                ``(..., dim // group_size, group_size)`` and the mean-square is
+                taken per group rather than over the whole axis. Qwen4's
+                hyper-connection norms use this to normalize each residual
+                stream independently inside the flattened ``hc_count * hidden``
+                vector. Defaults to ``None`` (single group, the classic RMSNorm).
+            kernel_init: Optional initializer override for the scale parameter.
+                Defaults to ``None``, which keeps the class-level ``kernel_init``
+                (ones). Pass ``jax.nn.initializers.zeros`` together with
+                ``scale_offset=1.0`` for the zero-centred ``(1 + w)`` convention
+                where the effective scale starts at identity.
+            fp32_scale: When ``True`` the statistics AND the ``(scale_offset + w)``
+                multiply run in float32 and the result is cast once at the end
+                (the HF Gemma / Qwen3-Next order). The default multiplies after
+                casting the normalized value to ``dtype`` (the HF Llama order).
+            output_dtype: ``fp32_scale`` only: output dtype (``None`` = the input's
+                dtype). A low-precision float target is returned as bfloat16.
+            rngs: spectrax random number generators for parameter initialization.
+                If None, creates a new Rngs instance with seed 0.
+
+        Example:
+            >>> norm = RMSNorm(
+            ...     dim=768,
+            ...     eps=1e-5,
+            ...     dtype=jnp.bfloat16,
+            ...     param_dtype=jnp.float32,
+            ...     rngs=spx.Rngs(42)
+            ... )
+            >>> # Kernel is initialized to ones
+            >>> assert norm.weight.value.shape == (768,)
+        """
+        if rngs is None:
+            rngs = spx.Rngs(0)
+        self.dim = dim
+        self.eps = eps
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.scale_offset = scale_offset
+        self.with_scale = with_scale
+        if group_size is not None and dim % group_size != 0:
+            raise ValueError(f"RMSNorm dim ({dim}) must be divisible by group_size ({group_size}).")
+        self.group_size = group_size
+        self.fp32_scale = fp32_scale
+        self.output_dtype = output_dtype
+        # Parameter re-initialisation (``base_module`` / ``bridge``) reads ``module.kernel_init``, so an explicit
+        # initializer must shadow the class default; otherwise a zero-centred ``(1 + w)`` norm re-inits to ones.
+        if kernel_init is not None:
+            self.kernel_init = kernel_init
+        init = kernel_init if kernel_init is not None else type(self).kernel_init
+        # ``with_scale=False`` allocates no parameter at all -- a scale-free RMS
+        # norm must not add a phantom leaf to the checkpoint.
+        self.weight = (
+            spx.Parameter(
+                init(rngs.parameters, (self.dim,), self.param_dtype),
+                sharding=sharding_for_layout(Replicated),
+            )
+            if with_scale
+            else None
+        )
+
+    def _norm(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
+        """Compute Root Mean Square normalization without scaling.
+
+        This internal method computes the core RMS normalization operation:
+            output = x / sqrt(mean(x^2) + eps)
+
+        The scale parameters (kernel) are applied separately in forward.
+
+        Args:
+            x: Input array to normalize. Shape: (..., dim) where ... represents
+                any number of leading batch dimensions. The normalization is
+                applied along the last axis.
+
+        Returns:
+            Normalized array with the same shape as input. Each element is
+            scaled by the reciprocal square root of the mean squared value
+            along the last dimension.
+
+        Note:
+            Uses lax.rsqrt for efficient computation of 1/sqrt(x), which is
+            typically faster than separate division and sqrt operations on
+            accelerator hardware.
+        """
+        if self.group_size is not None:
+            grouped = x.reshape(*x.shape[:-1], -1, self.group_size)
+            normed = grouped * lax.rsqrt(jnp.square(grouped).mean(-1, keepdims=True) + self.eps)
+            return normed.reshape(x.shape)
+        return x * lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
+
+    @jax.named_scope("easydel-rmsnorm")
+    def forward(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
+        """Apply RMS normalization to input tensor.
+
+        Normalizes the input using Root Mean Square normalization and applies
+        learned scale parameters. Automatically handles dtype promotion for
+        numerical stability with low-precision types.
+
+        The computation flow is:
+            1. Cast input to computation dtype (float32 for low-precision types)
+            2. Compute RMS normalization: x / sqrt(mean(x^2) + eps)
+            3. Apply learned scale: output * kernel
+            4. Cast back to original input dtype
+
+        Args:
+            x: Input array to normalize. Shape: (..., dim) where the last
+                dimension must match the `dim` parameter used during initialization.
+                Can have any number of leading batch dimensions.
+
+        Returns:
+            Normalized and scaled array with the same shape and dtype as input.
+            Each feature vector along the last dimension is normalized to have
+            unit RMS, then scaled by learned parameters.
+
+        Note:
+            The method is decorated with @jax.named_scope("easydel-rmsnorm")
+            for profiling and debugging visibility in JAX traces.
+
+        Example:
+            >>> norm = RMSNorm(dim=4, dtype=jnp.float32, rngs=spx.Rngs(0))
+            >>> x = jnp.array([[1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0]])
+            >>> y = norm(x)
+            >>> # Each row is normalized independently
+            >>> assert y.shape == (2, 4)
+        """
+        org_dtype = x.dtype
+        if self.fp32_scale:
+            output = self._norm(x.astype(jnp.float32))
+            if self.with_scale:
+                weight = self.weight.astype(jnp.float32)
+                if self.scale_offset:
+                    weight = weight + jnp.asarray(self.scale_offset, jnp.float32)
+                output = weight * output
+            target = org_dtype if self.output_dtype is None else self.output_dtype
+            return output.astype(jnp.bfloat16 if target in lowfloats else target)
+        if self.param_dtype in lowfloats or self.dtype in lowfloats:
+            x = x.astype(jnp.float32)
+        else:
+            x = x.astype(jnp.promote_types(self.dtype, x.dtype))
+        output = self._norm(x).astype(self.dtype)
+        if not self.with_scale:
+            return output.astype(org_dtype)
+        weight = self.weight.astype(self.dtype)
+        if self.scale_offset:
+            # Gemma-family layers store ``w`` and apply ``(1 + w)`` so the
+            # parameter is zero-centred at init. Folding the offset in here is
+            # what let seven families drop their private RMSNorm subclass.
+            weight = weight + jnp.asarray(self.scale_offset, weight.dtype)
+        return (weight * output).astype(org_dtype)
+
+
+class RMSNormGated(spx.Module):
+    """RMSNorm fused with a SiLU output gate (linear-attention output head).
+
+    Implements the post-norm gated activation used at the tail of GatedDeltaNet
+    / KDA / Mamba-style mixer blocks:
+
+    .. code-block:: text
+
+        y = silu(gate) * (weight * rsqrt(mean(x**2, -1) + eps) * x)
+
+    The full computation runs in ``float32`` regardless of the configured
+    ``dtype`` — feature variance and SiLU both lose accuracy quickly in
+    bfloat16 once activations get large, and at this point in the network the
+    extra cast is negligible relative to the matmuls that follow. The result
+    is cast back to the input dtype on exit so the caller still sees its own
+    precision contract.
+
+    Compared to :class:`RMSNorm`, this layer:
+
+    * Takes a separate ``gate`` tensor (typically the output of a
+      ``W_gate(x)`` projection inside the mixer) and multiplies the
+      normalized stream by ``silu(gate)``.
+    * Has no fused-bias path (linear attention blocks handle bias upstream).
+    * Always promotes to fp32, even when neither dtype is a low-precision
+      float — gating amplifies tail values, so fp32 stability matters.
+
+    Attributes:
+        hidden_size (int): Trailing-axis feature count, equal to the shape of
+            the learnable ``weight`` and the expected last-axis size of both
+            ``hidden_states`` and ``gate`` in :meth:`forward`.
+        eps (float): Variance epsilon, added inside ``rsqrt``.
+        dtype (DTypeLike): Compute dtype hint kept for API symmetry; the
+            forward pass always upcasts to ``float32`` internally.
+        param_dtype (DTypeLike): Storage dtype of the learnable scale.
+        weight (spx.Parameter[Array]): Per-feature scale of shape
+            ``(hidden_size,)``, initialized to ones.
+    """
+
+    if tp.TYPE_CHECKING:
+
+        def __call__(
+            self,
+            x: Float[Array, "... dim"],
+            gate: Float[Array, "... dim"] | None = None,
+        ) -> Float[Array, "... dim"]: ...
+
+    kernel_init = staticmethod(jax.nn.initializers.ones)
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: DTypeLike = jnp.bfloat16,
+        param_dtype: DTypeLike = jnp.bfloat16,
+        *,
+        activation: str = "silu",
+        rngs: spx.Rngs,
+    ):
+        """Initialize the gated RMSNorm layer.
+
+        Args:
+            hidden_size: Number of features along the last axis to normalize.
+                Also the size of the learnable scale parameter.
+            eps: Small constant added to the variance for numerical stability.
+                Defaults to ``1e-6``.
+            dtype: Computation dtype hint. The forward pass internally promotes
+                to ``float32`` for the gated branch regardless of this value.
+                Defaults to ``jnp.bfloat16``.
+            param_dtype: Storage dtype for the learnable scale parameter.
+                Defaults to ``jnp.bfloat16``.
+            activation: Gating activation applied to the gate tensor before it
+                multiplies the normalized stream. ``"silu"`` (default) is the
+                GatedDeltaNet/KDA convention; ``"sigmoid"`` is Qwen4's
+                ``output_gate_type: sigmoid`` variant.
+            rngs: SpecTrax random number generators used to initialize the
+                scale parameter (default initializer is ones).
+        """
+        if activation not in ("silu", "sigmoid"):
+            raise ValueError(f"RMSNormGated activation must be 'silu' or 'sigmoid', got {activation!r}")
+        self.activation = activation
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.weight = spx.Parameter(
+            RMSNormGated.kernel_init(rngs.parameters, (hidden_size,), param_dtype),
+            sharding=sharding_for_layout(Replicated),
+        )
+
+    @jax.named_scope("easydel-rmsnorm-gated")
+    def forward(
+        self,
+        hidden_states: Float[Array, "... hidden_size"],
+        gate: Float[Array, "... hidden_size"],
+    ) -> Float[Array, "... hidden_size"]:
+        """Apply gated RMSNorm normalization.
+
+        Computes ``silu(gate) * (kernel * RMSNorm(hidden_states))`` in
+        ``float32`` and casts back to the input dtype.
+
+        Args:
+            hidden_states: Input tensor of shape ``(..., hidden_size)``.
+            gate: Gate tensor of shape ``(..., hidden_size)``. Passed through
+                a SiLU activation before being multiplied with the normalized
+                hidden states.
+
+        Returns:
+            Gated normalized tensor of the same shape and dtype as
+            ``hidden_states``.
+        """
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.astype(jnp.float32)
+        variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
+        hidden_states = hidden_states * lax.rsqrt(variance + self.eps)
+        hidden_states = self.weight.value.astype(jnp.float32) * hidden_states
+        gate_fn = jax.nn.silu if self.activation == "silu" else jax.nn.sigmoid
+        hidden_states = hidden_states * gate_fn(gate.astype(jnp.float32))
+        return hidden_states.astype(input_dtype)
+
+
+class BatchNorm(spx.Module):
+    """Batch Normalization layer.
+
+    Normalizes activations across the batch dimension by subtracting the batch
+    mean and dividing by the batch standard deviation. Maintains running
+    statistics (mean and variance) for use during inference.
+
+    During training, batch statistics are computed from the current mini-batch
+    and exponential moving averages are updated. During inference, the stored
+    running statistics are used instead.
+
+    Attributes:
+        num_features: Number of feature channels to normalize.
+        use_running_average: If True, use stored running statistics instead
+            of computing batch statistics.
+        axis: Feature axis (or axes) to normalize over.
+        momentum: Decay rate for exponential moving average of batch statistics.
+        epsilon: Small constant for numerical stability in division.
+        dtype: Computation dtype. Inputs are promoted to this dtype.
+        param_dtype: Dtype for learnable scale and bias parameters.
+        use_bias: Whether to include a learnable bias (shift) parameter.
+        use_scale: Whether to include a learnable scale parameter.
+        mean: Running mean batch statistic.
+        var: Running variance batch statistic.
+        scale: Learnable scale parameter, or None if ``use_scale=False``.
+        bias: Learnable bias parameter, or None if ``use_bias=False``.
+
+    Example:
+        >>> norm = BatchNorm(num_features=64, rngs=spx.Rngs(0))
+        >>> x = jnp.ones((8, 64))
+        >>> y = norm(x, use_running_average=False)
+        >>> assert y.shape == (8, 64)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        use_running_average: bool = False,
+        axis: int = -1,
+        momentum: float = 0.99,
+        epsilon: float = 1e-5,
+        dtype: DTypeLike | None = None,
+        param_dtype: DTypeLike = jnp.float32,
+        use_bias: bool = True,
+        use_scale: bool = True,
+        bias_init: Initializer = jax.nn.initializers.zeros,  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_init: Initializer = jax.nn.initializers.ones,  # pyright: ignore[reportCallInDefaultInitializer]
+        axis_name: str | None = None,
+        axis_index_groups: tp.Any = None,
+        use_fast_variance: bool = True,
+        promote_dtype: PromoteDtypeFn = promote_dtype,
+        rngs: spx.Rngs,
+        bias_metadata: collections.abc.Mapping[str, tp.Any] = types.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_metadata: collections.abc.Mapping[str, tp.Any] = types.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
+    ):
+        """Initialize the BatchNorm layer.
+
+        Args:
+            num_features: Size of the feature dimension to normalize.
+            use_running_average: If True, use stored running statistics for
+                normalization instead of computing from the input batch.
+                Typically False during training and True during evaluation.
+            axis: Feature axis of the input to normalize over. Defaults to -1
+                (last axis).
+            momentum: Decay factor for the exponential moving average of running
+                statistics. A value of 0.99 means 99% of the old statistic is
+                retained per update. Defaults to 0.99.
+            epsilon: Small constant added to variance for numerical stability.
+                Defaults to 1e-5.
+            dtype: Dtype for computation. If None, uses the input dtype.
+            param_dtype: Dtype for scale and bias parameters.
+                Defaults to jnp.float32.
+            use_bias: Whether to add a learnable bias parameter.
+                Defaults to True.
+            use_scale: Whether to add a learnable scale parameter.
+                Defaults to True.
+            bias_init: Initializer for bias parameter. Defaults to zeros.
+            scale_init: Initializer for scale parameter. Defaults to ones.
+            axis_name: Name of the axis used for ``jax.lax.pmean`` for
+                cross-replica statistics aggregation. If None, no aggregation
+                is performed.
+            axis_index_groups: Groups of axis indices for partitioned
+                cross-replica statistics.
+            use_fast_variance: If True, uses a numerically faster but
+                potentially less stable variance computation. Defaults to True.
+            promote_dtype: Function used for dtype promotion of inputs and
+                parameters.
+            rngs: spectrax random number generators for parameter initialization.
+            bias_metadata: Additional metadata for the bias parameter.
+            scale_metadata: Additional metadata for the scale parameter.
+        """
+        feature_shape = (num_features,)
+        replicated_sharding = sharding_for_layout(Replicated)
+        self.mean = spx.Buffer(jnp.zeros(feature_shape, jnp.float32), sharding=replicated_sharding)
+        self.var = spx.Buffer(jnp.ones(feature_shape, jnp.float32), sharding=replicated_sharding)
+
+        self.weight: spx.Parameter | None
+        if use_scale:
+            key = rngs.parameters
+            self.weight = spx.Parameter(
+                scale_init(key, feature_shape, param_dtype),
+                **_with_default_sharding(scale_metadata, replicated_sharding),
+            )
+        else:
+            self.weight = None
+
+        self.bias: spx.Parameter | None
+        if use_bias:
+            key = rngs.parameters
+            self.bias = spx.Parameter(
+                bias_init(key, feature_shape, param_dtype),
+                **_with_default_sharding(bias_metadata, replicated_sharding),
+            )
+        else:
+            self.bias = None
+
+        self.num_features = num_features
+        self.use_running_average = use_running_average
+        self.axis = axis
+        self.momentum = momentum
+        self.epsilon = epsilon
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.use_bias = use_bias
+        self.use_scale = use_scale
+        self.axis_name = axis_name
+        self.axis_index_groups = axis_index_groups
+        self.use_fast_variance = use_fast_variance
+        self.promote_dtype = promote_dtype
+
+    def forward(
+        self,
+        x,
+        use_running_average: bool | None = None,
+        *,
+        mask: jax.Array | None = None,
+    ):
+        """Apply batch normalization to the input.
+
+        Normalizes the input by subtracting the mean and dividing by the
+        standard deviation computed over the batch (and spatial) dimensions.
+        During training, batch statistics are computed and running averages
+        are updated. During inference, stored running statistics are used.
+
+        Args:
+            x: Input array to normalize.
+            use_running_average: If provided, overrides the instance-level
+                ``use_running_average`` setting. Set to True for inference
+                and False for training.
+            mask: Optional boolean mask of the same shape as ``x``. If
+                provided, masked positions are excluded from statistics
+                computation.
+
+        Returns:
+            Normalized array with the same shape as the input.
+        """
+        use_running_average = first_from(use_running_average, self.use_running_average)
+        if use_running_average is None:
+            raise ValueError(
+                "No `use_running_average` argument was provided to BatchNorm as either a forward argument "
+                "or a class attribute."
+            )
+        feature_axes = _canonicalize_axes(x.ndim, self.axis)
+        reduction_axes = tuple(i for i in range(x.ndim) if i not in feature_axes)
+
+        # Promote dtypes for input and all Variables
+        scale = self.weight[...] if self.weight is not None else None
+        bias = self.bias[...] if self.bias is not None else None
+        x, mean, var, scale, bias = self.promote_dtype((x, self.mean[...], self.var[...], scale, bias), dtype=self.dtype)
+        if len(feature_axes) == 1:
+            # Per-feature vectors must broadcast along the feature axis, wherever it sits in ``x``.
+            param_shape = tuple(x.shape[i] if i in feature_axes else 1 for i in range(x.ndim))
+            mean, var, scale, bias = (None if a is None else a.reshape(param_shape) for a in (mean, var, scale, bias))
+        if not use_running_average:
+            mean, var = _compute_stats(
+                x,
+                reduction_axes,
+                dtype=self.dtype,
+                axis_name=self.axis_name,
+                axis_index_groups=self.axis_index_groups,
+                use_fast_variance=self.use_fast_variance,
+                mask=mask,
+            )
+            # spectrax ``Variable`` cells have no item assignment or ``_can_update``; running statistics are
+            # written through ``.value`` and are never differentiated.
+            stop_gradient = jax.lax.stop_gradient
+            new_mean = self.momentum * self.mean[...] + (1 - self.momentum) * mean.reshape(-1)
+            new_var = self.momentum * self.var[...] + (1 - self.momentum) * var.reshape(-1)
+            self.mean.value = stop_gradient(new_mean).astype(self.mean[...].dtype)
+            self.var.value = stop_gradient(new_var).astype(self.var[...].dtype)
+
+        return _normalize(
+            x,
+            mean,
+            var,
+            scale,
+            bias,
+            reduction_axes,
+            feature_axes,
+            self.dtype,
+            self.epsilon,
+        )
+
+    def set_mode(
+        self,
+        use_running_average: bool | None = None,
+        **kwargs,
+    ) -> dict:
+        """Update layer mode flags from a ``spx.set_mode`` call.
+
+        Invoked by ``spx.set_mode`` to flip BatchNorm between training and
+        inference behaviour without reconstructing the module. Any unknown
+        kwargs are passed through unchanged so a single ``set_mode`` call can
+        be routed to multiple modules.
+
+        Args:
+            use_running_average: If ``True``, subsequent forward passes use
+                the stored running statistics instead of computing fresh
+                batch statistics. ``None`` leaves the current setting in
+                place.
+            **kwargs: Additional mode flags ignored by ``BatchNorm`` itself
+                but forwarded back to the caller.
+
+        Returns:
+            Dict of unconsumed kwargs, ready to be forwarded to other
+            modules registered with ``spx.set_mode``.
+        """
+        if use_running_average is not None:
+            self.use_running_average = use_running_average
+        return kwargs
+
+
+class LayerNorm(spx.Module):
+    """Layer Normalization layer.
+
+    Normalizes activations across the feature dimension by subtracting the mean
+    and dividing by the standard deviation, computed independently for each
+    sample in the batch. Unlike BatchNorm, statistics are computed per-sample
+    rather than across the batch, making LayerNorm independent of batch size
+    and suitable for sequence models.
+
+    The normalization formula is:
+        output = ((x - mean) / sqrt(var + eps)) * scale + bias
+
+    Attributes:
+        num_features: Size of the feature dimension.
+        epsilon: Small constant for numerical stability.
+        dtype: Computation dtype. If None, uses the input dtype.
+        param_dtype: Dtype for learnable parameters.
+        use_bias: Whether a learnable bias parameter is included.
+        use_scale: Whether a learnable scale parameter is included.
+        reduction_axes: Axes over which mean and variance are computed.
+        feature_axes: Axes corresponding to feature dimensions for
+            scale/bias application.
+        scale: Learnable scale parameter, or None if ``use_scale=False``.
+        bias: Learnable bias parameter, or None if ``use_bias=False``.
+
+    Example:
+        >>> norm = LayerNorm(num_features=768, rngs=spx.Rngs(0))
+        >>> x = jnp.ones((2, 512, 768))
+        >>> y = norm(x)
+        >>> assert y.shape == (2, 512, 768)
+    """
+
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, x: Array, *, mask: jax.Array | None = None) -> Array: ...
+
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        epsilon: float = 1e-6,
+        dtype: DTypeLike | None = None,
+        param_dtype: DTypeLike = jnp.float32,
+        use_bias: bool = True,
+        use_scale: bool = True,
+        bias_init: Initializer = jax.nn.initializers.zeros,  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_init: Initializer = jax.nn.initializers.ones,  # pyright: ignore[reportCallInDefaultInitializer]
+        reduction_axes: Axes = -1,
+        feature_axes: Axes = -1,
+        axis_name: str | None = None,
+        axis_index_groups: tp.Any = None,
+        use_fast_variance: bool = True,
+        promote_dtype: PromoteDtypeFn = promote_dtype,
+        rngs: spx.Rngs,
+        bias_metadata: collections.abc.Mapping[str, tp.Any] = types.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_metadata: collections.abc.Mapping[str, tp.Any] = types.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
+    ):
+        """Initialize the LayerNorm layer.
+
+        Args:
+            num_features: Size of the feature dimension. Scale and bias
+                parameters are created with this shape.
+            epsilon: Small constant added to variance for numerical stability.
+                Defaults to 1e-6.
+            dtype: Dtype for computation. If None, uses the input dtype.
+            param_dtype: Dtype for scale and bias parameters.
+                Defaults to jnp.float32.
+            use_bias: Whether to add a learnable bias parameter.
+                Defaults to True.
+            use_scale: Whether to add a learnable scale parameter.
+                Defaults to True.
+            bias_init: Initializer for bias parameter. Defaults to zeros.
+            scale_init: Initializer for scale parameter. Defaults to ones.
+            reduction_axes: Axes over which mean and variance are computed.
+                Defaults to -1 (last axis).
+            feature_axes: Axes that represent features for scale/bias
+                broadcasting. Defaults to -1.
+            axis_name: Name of the axis used for ``jax.lax.pmean`` for
+                cross-replica statistics aggregation. If None, no aggregation
+                is performed.
+            axis_index_groups: Groups of axis indices for partitioned
+                cross-replica statistics.
+            use_fast_variance: If True, uses a numerically faster but
+                potentially less stable variance computation. Defaults to True.
+            promote_dtype: Function used for dtype promotion of inputs and
+                parameters.
+            rngs: spectrax random number generators for parameter initialization.
+            bias_metadata: Additional metadata for the bias parameter.
+            scale_metadata: Additional metadata for the scale parameter.
+        """
+        feature_shape = (num_features,)
+        replicated_sharding = sharding_for_layout(Replicated)
+
+        self.weight: spx.Parameter | None
+        if use_scale:
+            key = rngs.parameters
+            self.weight = spx.Parameter(
+                scale_init(key, feature_shape, param_dtype),
+                **_with_default_sharding(scale_metadata, replicated_sharding),
+            )
+        else:
+            self.weight = None
+
+        self.bias: spx.Parameter | None
+        if use_bias:
+            key = rngs.parameters
+            self.bias = spx.Parameter(
+                bias_init(key, feature_shape, param_dtype),
+                **_with_default_sharding(bias_metadata, replicated_sharding),
+            )
+        else:
+            self.bias = None
+
+        self.num_features = num_features
+        self.epsilon = epsilon
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.use_bias = use_bias
+        self.use_scale = use_scale
+        self.reduction_axes = reduction_axes
+        self.feature_axes = feature_axes
+        self.axis_name = axis_name
+        self.axis_index_groups = axis_index_groups
+        self.use_fast_variance = use_fast_variance
+        self.promote_dtype = promote_dtype
+
+    def forward(self, x, *, mask: jax.Array | None = None):
+        """Apply layer normalization to the input.
+
+        Computes per-sample mean and variance over the reduction axes,
+        normalizes the input, and applies learned scale and bias.
+
+        Args:
+            x: Input array to normalize. The last dimension (by default)
+                must match ``num_features``.
+            mask: Optional boolean mask of the same shape as ``x``. If
+                provided, masked positions are excluded from statistics
+                computation.
+
+        Returns:
+            Normalized array with the same shape as the input.
+        """
+        scale = self.weight[...] if self.weight is not None else None
+        bias = self.bias[...] if self.bias is not None else None
+        x, scale, bias = self.promote_dtype((x, scale, bias), dtype=self.dtype)
+        mean, var = _compute_stats(
+            x,
+            self.reduction_axes,
+            self.dtype,
+            self.axis_name,
+            self.axis_index_groups,
+            use_fast_variance=self.use_fast_variance,
+            mask=mask,
+        )
+
+        return _normalize(
+            x,
+            mean,
+            var,
+            scale,
+            bias,
+            self.reduction_axes,
+            self.feature_axes,
+            self.dtype,
+            self.epsilon,
+        )
+
+
+def rms_norm(x: Float[Array, "... dim"], eps: float = 1e-6, *, upcast: bool = False) -> Float[Array, "... dim"]:
+    """Scale-free RMS normalisation over the trailing axis.
+
+    ``x * rsqrt(mean(x**2, -1) + eps)``, computed in float32 and cast back.
+    This is the unweighted norm four families each wrote out by hand
+    (``_unweighted_rms_norm``, ``_scaleless_rms_norm``, ``Llama4TextL2Norm``,
+    ``Gemma4RMSNorm(with_scale=False)``).
+
+    Use :class:`RMSNorm` with ``with_scale=False`` when a module is wanted;
+    this function is for call sites that just need the math.
+
+    Args:
+        x: Input array; normalised along its last axis.
+        eps: Added to the mean square before the reciprocal square root.
+        upcast: Multiply in float32 too and cast the product back (the Mamba / Muse-Glimmer convention) instead of
+            casting the scale to ``x.dtype`` first. Identical for float32 inputs.
+
+    Returns:
+        Normalised array, same shape and dtype as ``x``.
+    """
+    if upcast:
+        return rms_norm(x.astype(jnp.float32), eps=eps).astype(x.dtype)
+    # The scale is reduced in float32 and cast back *before* multiplying, which
+    # is the HF convention every existing caller follows. Multiplying in float32
+    # and casting the product instead diverges by ~1.6e-2 in bfloat16, so this
+    # ordering is load-bearing, not incidental.
+    scale = lax.rsqrt(jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
+    return x * scale.astype(x.dtype)
+
+
+def l2_norm(x: Float[Array, "... dim"], eps: float = 1e-6) -> Float[Array, "... dim"]:
+    """L2 normalisation over the trailing axis.
+
+    ``x * rsqrt(sum(x**2, -1) + eps)`` -- a *sum*, not a mean, which is what
+    distinguishes it from :func:`rms_norm`. Used where a true unit-norm vector
+    is wanted (``gidd`` attention, ``qwen3_next``'s decode path, which holds a
+    bit-parity contract with its ejkernel counterpart).
+
+    Args:
+        x: Input array; normalised along its last axis.
+        eps: Added to the squared sum before the reciprocal square root.
+
+    Returns:
+        Normalised array, same shape and dtype as ``x``.
+    """
+    scale = lax.rsqrt(jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) + eps)
+    return x * scale.astype(x.dtype)

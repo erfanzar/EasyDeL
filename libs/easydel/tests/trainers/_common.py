@@ -1,0 +1,437 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Callable, Iterable
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import easydel as ed
+import jax
+import numpy as np
+import spectrax as spx
+from datasets import Dataset, IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
+from jax import lax
+from jax import numpy as jnp
+from transformers import AutoTokenizer
+
+_LIGHTWEIGHT = os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+_DEFAULT_MODEL_REPO = (
+    "Qwen/Qwen3-0.6B"
+    if _LIGHTWEIGHT
+    else ("Qwen/Qwen3-4B" if jax.default_backend() == "tpu" else "Qwen/Qwen2.5-0.5B-Instruct")
+)
+MODEL_REPO: str = os.environ.get("EASYDEL_RUNTIME_MODEL_REPO", _DEFAULT_MODEL_REPO)
+
+PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
+PREFERENCE_SPLIT = os.environ.get("EASYDEL_RUNTIME_DATASET_SPLIT") or (
+    "train[:32]"
+    if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}
+    else "train[:50%]"
+)
+MAX_PROMPT_LENGTH = 512
+MAX_COMPLETION_LENGTH = 512
+MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH  # 1024, divisible by 128
+MAX_TRAINING_STEP = 1024
+SAVE_ROOT = Path("tmp-files") / "trainer-smoke-tests"
+
+
+def _ensure_logging_configured() -> None:
+    # Configure root logger once; subsequent calls are cheap no-ops.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
+
+def get_logger(name: str) -> logging.Logger:
+    _ensure_logging_configured()
+    return logging.getLogger(name)
+
+
+def _prepare_save_dir(name: str) -> str:
+    path = SAVE_ROOT / name
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+@lru_cache(maxsize=4)
+def get_tokenizer(model_repo: str = MODEL_REPO):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_repo)
+    except ValueError as exc:
+        msg = str(exc).lower()
+        if "tiktoken" in msg:
+            tokenizer = AutoTokenizer.from_pretrained(model_repo, use_fast=False)
+        else:
+            raise
+    if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    return tokenizer
+
+
+def _load_model_kwargs() -> dict[str, Any]:
+    return dict(
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=lax.Precision.DEFAULT,
+        auto_shard_model=True,
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
+        config_kwargs=ed.EasyDeLBaseConfigDict(
+            freq_max_position_embeddings=MAX_TOTAL_LENGTH,
+            mask_max_position_embeddings=MAX_TOTAL_LENGTH,
+            attn_mechanism=ed.AttentionMechanisms.VANILLA if _LIGHTWEIGHT else ed.AttentionMechanisms.AUTO,
+            attn_dtype=jnp.bfloat16,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+            scan_layers=False,
+            use_expert_tensor_mode=False,
+            moe_force_xla_gmm=True,
+        ),
+        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
+    )
+
+
+def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelForCausalLM:
+    repo = model_repo or MODEL_REPO
+    tokenizer = get_tokenizer(repo)
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=repo,
+        **_load_model_kwargs(),
+    )
+    model.config.pad_token_id = tokenizer.pad_token_id
+    return model  # pyright: ignore[reportReturnType]
+
+
+def load_sequence_classifier_model(
+    model_repo: str | None = None,
+) -> ed.AutoEasyDeLModelForSequenceClassification:
+    repo = model_repo or MODEL_REPO
+    tokenizer = get_tokenizer(repo)
+    kwargs = _load_model_kwargs()
+    kwargs["config_kwargs"]["num_labels"] = 1
+    model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
+        pretrained_model_name_or_path=repo,
+        **kwargs,
+    )
+    model.config.pad_token_id = tokenizer.pad_token_id
+    return model  # pyright: ignore[reportReturnType]
+
+
+def load_token_classifier_model(tokenizer=None):
+    tokenizer = tokenizer or get_tokenizer()
+    vocab_size = max(int(getattr(tokenizer, "vocab_size", 32000) or 32000), len(tokenizer), 1024)
+    config = ed.RobertaConfig(
+        vocab_size=vocab_size,
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=256,
+        max_position_embeddings=MAX_TOTAL_LENGTH + 2,
+        pad_token_id=0,
+        bos_token_id=getattr(tokenizer, "bos_token_id", None) or 0,
+        eos_token_id=getattr(tokenizer, "eos_token_id", None) or tokenizer.pad_token_id,
+        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+        num_labels=2,
+        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
+    )
+    model = ed.RobertaForTokenClassification.sequential_init(
+        config=config,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=lax.Precision.DEFAULT,
+        rngs=spx.Rngs(0),
+    )
+    return model.shard_model()
+
+
+def load_preference_dataset(split: str = PREFERENCE_SPLIT):
+    return load_dataset(PREFERENCE_DATASET, split=split)
+
+
+def build_sft_text_dataset(
+    split: str = PREFERENCE_SPLIT,
+    template: Callable[[dict[str, Any]], str] | None = None,
+    tokenizer=None,
+) -> Dataset | IterableDataset:
+    dataset = load_preference_dataset(split)
+    if template is None:
+
+        def template(sample):
+            return sample["chosen"]
+
+    out = dataset.map(lambda sample: {"messages": template(sample)}, remove_columns=dataset.column_names)
+    return out
+
+
+def build_lm_dataset(
+    tokenizer,
+    split: str = PREFERENCE_SPLIT,
+    max_length: int = MAX_TOTAL_LENGTH,
+) -> Dataset | IterableDataset:
+    text_dataset = build_sft_text_dataset(split, tokenizer=tokenizer)
+
+    def tokenize(batch: dict[str, list[str]]) -> dict[str, list[np.ndarray]]:
+        encoded = tokenizer.apply_chat_template(
+            batch["messages"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_attention_mask=True,
+            return_dict=True,
+        )
+        return encoded
+
+    return text_dataset.map(tokenize, batched=True, remove_columns=["messages"])
+
+
+def make_config(
+    config_cls,
+    name: str,
+    *,
+    overrides: dict[str, Any] | None = None,
+) -> Any:
+    base_args = {
+        "save_directory": _prepare_save_dir(name),
+        "num_train_epochs": 1,
+        "total_batch_size": 4,
+        "gradient_accumulation_steps": 2,
+        "log_steps": 1,
+        "learning_rate": 8e-6,
+        "max_training_steps": MAX_TRAINING_STEP,
+        "save_steps": 1_000,
+        "save_total_limit": 1,
+        "save_optimizer_state": True,
+        "do_last_save": True,
+        "use_wandb": True,
+        "wandb_entity": "erfanzar",
+        "shuffle_train_dataset": False,
+        "progress_bar_type": "json",
+        "max_prompt_length": MAX_PROMPT_LENGTH,
+        "max_completion_length": MAX_COMPLETION_LENGTH,
+        "max_length": MAX_TOTAL_LENGTH,
+        "generation_top_p": 0.95,
+        "generation_top_k": 64,
+        "generation_temperature": 0.7,
+        "generation_do_sample": True,
+        "generation_num_return_sequences": 4,
+        "generation_interval": 100,
+        "generation_prompts": ["Here's Fibo in c++"],
+        "generation_use_train_prompts": False,
+        "generation_log_to_wandb": True,
+    }
+
+    runtime_steps = os.environ.get("EASYDEL_RUNTIME_MAX_TRAINING_STEPS")
+    if runtime_steps:
+        base_args["max_training_steps"] = int(runtime_steps)
+    if os.environ.get("EASYDEL_RUNTIME_LIGHTWEIGHT", "0").lower() in {"1", "true", "yes", "on"}:
+        base_args.update(
+            {
+                "total_batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "max_prompt_length": 512,
+                "max_completion_length": 512,
+                "max_length": 1024,
+                "generation_num_return_sequences": 1,
+                "generation_interval": 1_000_000,
+                "num_return_sequences": 1,
+                "num_generations": 3,
+                "num_remains_in_group": 2,
+                "group_size": 1,
+                "num_env_groups": 1,
+                "max_steps": 1,
+                "use_wandb": False,
+                "do_last_save": False,
+                "save_optimizer_state": False,
+                "save_steps": None,
+                "generation_log_to_wandb": False,
+            }
+        )
+    if overrides:
+        base_args.update(overrides)
+
+    field_names = set(getattr(config_cls, "__dataclass_fields__", {}).keys())
+    filtered = {key: value for key, value in base_args.items() if key in field_names}
+    if issubclass(config_cls, ed.DistillationConfig):
+        needs_generation_lengths = issubclass(
+            config_cls,
+            (ed.OnPolicyDistillationConfig, ed.SparseDistillationConfig),
+        )
+        distillation_defaults = {
+            "max_prompt_length": None,
+            "max_completion_length": None,
+            "num_generations": 1,
+            "num_return_sequences": 1,
+            "generation_batch_size": None,
+            "top_p": 1.0,
+            "top_k": 0,
+            "wandb_entity": None,
+            "wandb_project": None,
+            "wandb_run_group": None,
+            "log_completions": False,
+        }
+        for key, value in distillation_defaults.items():
+            if key in field_names:
+                if key in {
+                    "max_prompt_length",
+                    "max_completion_length",
+                    "wandb_entity",
+                    "wandb_project",
+                    "wandb_run_group",
+                    "log_completions",
+                }:
+                    if needs_generation_lengths and key in {"max_prompt_length", "max_completion_length"}:
+                        continue
+                    filtered[key] = value
+                else:
+                    filtered.setdefault(key, value)
+    return config_cls(**filtered)
+
+
+def run_trainer(
+    trainer_factory: Callable[..., Any],
+    *,
+    model,
+    arguments,
+    tokenizer,
+    train_dataset,
+    logger: logging.Logger,
+    extra_kwargs: dict[str, Any] | None = None,
+) -> None:
+    extra_kwargs = extra_kwargs or {}
+    logger.info("Instantiating %s", trainer_factory.__name__)
+    trainer = trainer_factory(
+        model=model,
+        arguments=arguments,
+        train_dataset=train_dataset,
+        processing_class=tokenizer,
+        **extra_kwargs,
+    )
+    logger.info("Launching training loop.")
+    trainer.train()
+    logger.info("Finished training run.")
+
+
+def build_reward_dataset(split: str = PREFERENCE_SPLIT):
+    """Load paired preference data for reward-model runtime smoke tests.
+
+    The reward trainer can derive the prompt from chat-style chosen/rejected
+    records, so the helper accepts the UltraFeedback layout used by the other
+    runtime scripts instead of requiring a separate ``prompt`` column.
+    """
+    return load_preference_dataset(split)
+
+
+def build_tpo_dataset(split: str = PREFERENCE_SPLIT):
+    dataset = load_preference_dataset(split)
+
+    def convert(sample):
+        prompt, chosen_completion = split_preference_messages(sample["chosen"])
+        _, rejected_completion = split_preference_messages(sample["rejected"])
+        return {
+            "prompt": prompt,
+            "chosen": chosen_completion,
+            "rejected": rejected_completion,
+            "reference": chosen_completion,
+        }
+
+    return dataset.map(convert, remove_columns=dataset.column_names)
+
+
+def build_prompt_dataset(split: str = PREFERENCE_SPLIT):
+    dataset = load_preference_dataset(split)
+
+    def convert(sample):
+        prompt, _completion = split_preference_messages(sample["chosen"])
+        if isinstance(prompt, list):
+            prompt = "\n".join(str(message.get("content", "")) for message in prompt)
+        return {"prompt": prompt}
+
+    return dataset.map(convert, remove_columns=dataset.column_names)
+
+
+def split_preference_messages(messages) -> tuple[list[dict[str, str]] | str, str]:
+    if not isinstance(messages, list) or not messages:
+        return "", str(messages)
+    prompt_messages = []
+    completion_parts = []
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content", ""))
+        if role == "assistant":
+            completion_parts.append(content)
+        else:
+            prompt_messages.append({"role": role or "user", "content": content})
+    completion = "\n".join(part for part in completion_parts if part).strip() or "."
+    return prompt_messages or [{"role": "user", "content": ""}], completion
+
+
+def build_prm_dataset(split: str = PREFERENCE_SPLIT):
+    dataset = load_preference_dataset(split)
+
+    def convert(sample):
+        prompt, completion = split_preference_messages(sample["chosen"])
+        if isinstance(prompt, list):
+            prompt = "\n".join(str(message.get("content", "")) for message in prompt)
+        midpoint = max(1, len(completion) // 2)
+        return {
+            "prompt": prompt,
+            "completions": [completion[:midpoint], completion[midpoint:] or "."],
+            "labels": [0, 1],
+        }
+
+    return dataset.map(convert, remove_columns=dataset.column_names)
+
+
+def dummy_reward_fn(*, prompts: Iterable[Any] | None = None, completions: Iterable[Any] | None = None, **_: Any):
+    # print("Lengths", len(prompts), len(completions))
+    # print("Prompt ===> ", prompts[0])
+    # print("COMPL ===> ", completions[0])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[1])
+    # print("COMPL ===> ", completions[1])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[2])
+    # print("COMPL ===> ", completions[2])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[3])
+    # print("COMPL ===> ", completions[3])
+    # print("FIRST 4")
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[4])
+    # print("COMPL ===> ", completions[4])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[5])
+    # print("COMPL ===> ", completions[5])
+    # print("THESE 2 should be match")
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[8])
+    # print("COMPL ===> ", completions[8])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[9])
+    # print("COMPL ===> ", completions[9])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[10])
+    # print("COMPL ===> ", completions[10])
+    # print("THESE 3 should be match")
+    # print("=" * 15)
+    if completions is None:
+        return [0.1]
+    if isinstance(completions, list | tuple):
+        length = len(completions)
+    else:
+        completions = list(completions)
+        length = len(completions)
+    return [0.1] * max(length, 1)

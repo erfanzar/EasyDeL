@@ -1,0 +1,535 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for XLA grouped matrix multiplication (ragged_dot)."""
+
+import inspect
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from ejkernel.kernels import Platform, kernel_registry
+from ejkernel.kernels._xla.grouped_matmul import grouped_matmul
+from ejkernel.kernels._xla.grouped_matmulv3 import grouped_matmulv3
+
+
+def _naive_grouped_matmul(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, transpose_rhs: bool) -> jax.Array:
+    outs = []
+    start = 0
+    for group_idx in range(int(group_sizes.shape[0])):
+        rows = int(group_sizes[group_idx])
+        end = start + rows
+        if rows == 0:
+            continue
+        if transpose_rhs:
+            # rhs[group_idx] is (n, k)
+            w = rhs[group_idx].T
+        else:
+            # rhs[group_idx] is (k, n)
+            w = rhs[group_idx]
+        outs.append(lhs[start:end] @ w)
+        start = end
+    return jnp.concatenate(outs, axis=0) if outs else jnp.zeros((0, rhs.shape[-2 if transpose_rhs else -1]), lhs.dtype)
+
+
+def _naive_grouped_matmul_v3(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    *,
+    rhs_scale: jax.Array | None,
+    rhs_bias: jax.Array | None,
+    transpose_rhs: bool,
+    existing_out: jax.Array | None = None,
+) -> jax.Array:
+    rhs_prepped = rhs.swapaxes(1, 2) if transpose_rhs else rhs
+    if rhs_scale is not None:
+        num_blocks = int(rhs_scale.shape[1])
+        block_size = rhs_prepped.shape[1] // num_blocks
+        scale = jnp.repeat(rhs_scale[:, :, 0, :], block_size, axis=1)
+        rhs_prepped = rhs_prepped * scale.astype(rhs_prepped.dtype)
+    group_ids = jnp.repeat(
+        jnp.arange(group_sizes.shape[0], dtype=group_sizes.dtype),
+        group_sizes,
+        total_repeat_length=lhs.shape[0],
+    )
+    out = jax.vmap(lambda row, mat: jnp.matmul(row, mat, preferred_element_type=jnp.float32))(
+        lhs, rhs_prepped[group_ids]
+    )
+
+    if rhs_bias is not None:
+        out = out + rhs_bias[:, 0, :][group_ids].astype(out.dtype)
+    if existing_out is not None:
+        out = out + existing_out.astype(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_matches_naive(transpose_rhs, use_jit):
+    key = jax.random.PRNGKey(0)
+    key, kl, kr = jax.random.split(key, 3)
+
+    group_sizes = jnp.array([3, 5, 2], dtype=jnp.int32)
+    m = int(group_sizes.sum())
+    k = 7
+    n = 4
+    lhs = jax.random.normal(kl, (m, k), dtype=jnp.float32)
+
+    if transpose_rhs:
+        rhs = jax.random.normal(kr, (len(group_sizes), n, k), dtype=jnp.float32)
+    else:
+        rhs = jax.random.normal(kr, (len(group_sizes), k, n), dtype=jnp.float32)
+
+    if use_jit:
+
+        def _run(lhs, rhs, group_sizes):
+            return grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, tiling=None)
+
+        fn = jax.jit(_run)
+        out = fn(lhs, rhs, group_sizes)
+    else:
+        out = grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, tiling=None)
+    expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs)
+
+    assert out.shape == expected.shape
+    assert jnp.allclose(out, expected, rtol=0, atol=0.125)
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize("return_none", [False, True])
+def test_callable_tiling_matches_dense_reference(transpose_rhs, return_none):
+    """A LutFn hint must resolve for both rhs layouts and the untiled fallback."""
+    lhs = jnp.arange(63, dtype=jnp.float32).reshape(9, 7) / 64
+    rhs = jnp.arange(3 * 7 * 4, dtype=jnp.float32).reshape(3, 7, 4) / 128
+    group_sizes = jnp.asarray([3, 0, 6], dtype=jnp.int32)
+    if transpose_rhs:
+        rhs = rhs.swapaxes(1, 2)
+
+    def tiling(m, k, n):
+        # The TPU native GMM requires the padded m (16 here) to be a multiple of the m tile.
+        return None if return_none else (16, 128, 128)
+
+    result = grouped_matmul(lhs, rhs, group_sizes, tiling=tiling, transpose_rhs=transpose_rhs)
+    expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs)
+    assert result.shape == (9, 4)
+    assert jnp.allclose(result, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize(
+    ("group_sizes", "k", "n"),
+    [
+        # m=52, num_groups=8: the DeepSeek-V4 / mistral4 / minimax MoE down-proj
+        # shape. m is not a multiple of the TPU sublane size (8), which used to
+        # abort XLA:TPU compilation inside ragged_dot_expander ("Window too large
+        # 7 max_ragged_dim_window_bound 2"). The XLA grouped_matmul now pads the
+        # ragged dimension internally; assert it stays numerically exact.
+        ([7, 7, 7, 7, 6, 6, 6, 6], 32, 128),
+        # Skewed real-routing distribution with empty groups (top-k routing).
+        ([20, 0, 11, 0, 7, 0, 14, 0], 32, 128),
+        # m=52, num_groups=4 (hy_v3): a multiple of num_groups but NOT of 8 -
+        # still crashed pre-fix, so padding must key off 8 and not num_groups.
+        ([13, 13, 13, 13], 32, 128),
+        # Small odd m that pads up to one sublane.
+        ([3, 5, 2], 7, 4),
+    ],
+)
+def test_ragged_dim_not_multiple_of_eight_matches_naive(group_sizes, k, n, transpose_rhs):
+    """Ragged (m) dimensions that are not a multiple of 8 must stay correct.
+
+    XLA:TPU's ragged_dot_expander aborts the process for such shapes unless the
+    ragged dimension is padded up to the sublane size; the XLA grouped_matmul now
+    pads internally and trims the result. This locks in that the padded path is
+    numerically identical to a per-group reference and preserves the m rows
+    (regression for the fused-MoE grouped-matmul crash).
+    """
+    key = jax.random.PRNGKey(11)
+    _, kl, kr = jax.random.split(key, 3)
+    group_sizes = jnp.asarray(group_sizes, dtype=jnp.int32)
+    m = int(group_sizes.sum())
+    g = int(group_sizes.shape[0])
+    assert m % 8 != 0, "this regression must exercise the padding path"
+    lhs = jax.random.normal(kl, (m, k), dtype=jnp.float32)
+    rhs = jax.random.normal(kr, (g, n, k) if transpose_rhs else (g, k, n), dtype=jnp.float32)
+
+    out = jax.jit(lambda lhs, rhs, gs: grouped_matmul(lhs, rhs, gs, transpose_rhs=transpose_rhs, tiling=None))(
+        lhs, rhs, group_sizes
+    )
+    expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs)
+
+    assert out.shape == (m, n)
+    assert out.shape == expected.shape
+    assert jnp.allclose(out, expected, rtol=0, atol=1e-4)
+
+
+def test_registry_alias_for_grouped_matmulv2():
+    impl = kernel_registry.get("grouped_matmulv2", platform=Platform.XLA)
+    assert inspect.unwrap(impl) is inspect.unwrap(grouped_matmul)
+
+
+def test_registry_alias_for_grouped_matmulv3():
+    impl = kernel_registry.get("grouped_matmulv3", platform=Platform.XLA)
+    assert callable(impl)
+
+    key = jax.random.PRNGKey(7)
+    key, kl, kr = jax.random.split(key, 3)
+    group_sizes = jnp.array([4, 4], dtype=jnp.int32)
+    lhs = jax.random.normal(kl, (8, 6), dtype=jnp.float32)
+    rhs = jax.random.normal(kr, (2, 6, 5), dtype=jnp.float32)
+
+    out = grouped_matmulv3(lhs, rhs, group_sizes, tiling=None)
+    expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=False)
+    assert jnp.allclose(out, expected, rtol=0, atol=0.125)
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+def test_grouped_matmulv3_supports_rhs_scale_and_bias(transpose_rhs):
+    key = jax.random.PRNGKey(17)
+    key, kl, kr, ks, kb, ko = jax.random.split(key, 6)
+
+    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
+    m = int(group_sizes.sum())
+    k = 4
+    n = 3
+    lhs = jax.random.normal(kl, (m, k), dtype=jnp.float32)
+    rhs_scale = jax.random.normal(ks, (2, 2, 1, n), dtype=jnp.float32)
+    rhs_bias = jax.random.normal(kb, (2, 1, n), dtype=jnp.float32)
+    existing_out = jax.random.normal(ko, (m, n), dtype=jnp.float32)
+
+    if transpose_rhs:
+        rhs = jax.random.normal(kr, (2, n, k), dtype=jnp.float32)
+    else:
+        rhs = jax.random.normal(kr, (2, k, n), dtype=jnp.float32)
+
+    out = grouped_matmulv3(
+        lhs,
+        rhs,
+        group_sizes,
+        tiling=None,
+        existing_out=existing_out,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        transpose_rhs=transpose_rhs,
+        # TPU's default precision is single-pass bf16; exact tolerances need fp32.
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    expected = _naive_grouped_matmul_v3(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
+        transpose_rhs=transpose_rhs,
+        existing_out=existing_out,
+    )
+
+    assert out.shape == expected.shape
+    assert jnp.allclose(out, expected, rtol=0, atol=1e-5)
+
+
+def test_grouped_matmulv3_scale_bias_gradients_match_reference():
+    key = jax.random.PRNGKey(23)
+    key, kl, kr, ks, kb, ko = jax.random.split(key, 6)
+
+    group_sizes = jnp.array([2, 3], dtype=jnp.int32)
+    lhs = jax.random.normal(kl, (5, 4), dtype=jnp.float32)
+    rhs = jax.random.normal(kr, (2, 4, 3), dtype=jnp.float32)
+    rhs_scale = jax.random.normal(ks, (2, 2, 1, 3), dtype=jnp.float32)
+    rhs_bias = jax.random.normal(kb, (2, 1, 3), dtype=jnp.float32)
+    existing_out = jax.random.normal(ko, (5, 3), dtype=jnp.float32)
+
+    def kernel_loss(lhs, rhs, rhs_scale, rhs_bias):
+        out = grouped_matmulv3(
+            lhs,
+            rhs,
+            group_sizes,
+            tiling=None,
+            existing_out=existing_out,
+            rhs_scale=rhs_scale,
+            rhs_bias=rhs_bias,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        return jnp.sum(out**2)
+
+    def ref_loss(lhs, rhs, rhs_scale, rhs_bias):
+        out = _naive_grouped_matmul_v3(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            rhs_bias=rhs_bias,
+            transpose_rhs=False,
+            existing_out=existing_out,
+        )
+        return jnp.sum(out**2)
+
+    with jax.default_matmul_precision("highest"):  # exact tolerances need fp32 matmuls on TPU
+        grads = jax.grad(kernel_loss, argnums=(0, 1, 2, 3))(lhs, rhs, rhs_scale, rhs_bias)
+        expected_grads = jax.grad(ref_loss, argnums=(0, 1, 2, 3))(lhs, rhs, rhs_scale, rhs_bias)
+
+    for got, expected in zip(grads, expected_grads, strict=True):
+        assert got.shape == expected.shape
+        assert jnp.allclose(got, expected, rtol=0, atol=1e-4)
+
+
+def _sliced_grouped_matmul_reference(lhs, rhs, sizes, *, transpose_rhs, preferred_element_type, precision):
+    """Independent dense products with static slices, including empty experts."""
+    n = rhs.shape[1] if transpose_rhs else rhs.shape[2]
+    out = jnp.zeros((lhs.shape[0], n), dtype=preferred_element_type)
+    start = 0
+    for expert, rows in enumerate(sizes):
+        if rows:
+            weight = rhs[expert].T if transpose_rhs else rhs[expert]
+            product = jnp.matmul(
+                lhs[start : start + rows],
+                weight,
+                precision=precision,
+                preferred_element_type=preferred_element_type,
+            )
+            out = out.at[start : start + rows].set(product)
+        start += rows
+    return out
+
+
+def _alignment_inputs(m, k, n, groups, dtype, transpose_rhs):
+    """Use dyadic inputs so DEFAULT/bf16 comparisons need no loose tolerance."""
+    rng = np.random.default_rng(73)
+    lhs = jnp.asarray(rng.integers(-2, 3, (m, k), dtype=np.int8), dtype=dtype) / 8
+    rhs = jnp.asarray(rng.integers(-2, 3, (groups, k, n), dtype=np.int8), dtype=dtype) / 8
+    existing = jnp.asarray(rng.integers(-2, 3, (m, n), dtype=np.int8), dtype=jnp.float32) / 16
+    return lhs, rhs.swapaxes(1, 2) if transpose_rhs else rhs, existing
+
+
+@pytest.mark.parametrize("m,add_existing", [(24, True), (40, False), (32, True)])
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize(
+    "dtype,precision", [(jnp.bfloat16, jax.lax.Precision.DEFAULT), (jnp.float32, jax.lax.Precision.HIGHEST)]
+)
+def test_ragged_alignment_matches_dense_reference(m, add_existing, transpose_rhs, dtype, precision):
+    """Padding preserves dynamic routing, empty groups, dtype and accumulation."""
+    lhs, rhs, existing = _alignment_inputs(m, 8, 4, 4, dtype, transpose_rhs)
+
+    @jax.jit
+    def run(lhs, rhs, sizes, existing):
+        return grouped_matmul(
+            lhs,
+            rhs,
+            sizes,
+            preferred_element_type=dtype,
+            precision=precision,
+            transpose_rhs=transpose_rhs,
+            tiling=None,
+            existing_out=existing if add_existing else None,
+        )
+
+    # Both calls share a compiled signature, but move rows between experts.
+    # The final expert is empty in one case, the first in the other.
+    for sizes in ((3, 0, m - 3, 0), (0, m - 5, 0, 5)):
+        out = run(lhs, rhs, jnp.asarray(sizes, dtype=jnp.int32), existing)
+        expected = _sliced_grouped_matmul_reference(
+            lhs, rhs, sizes, transpose_rhs=transpose_rhs, preferred_element_type=dtype, precision=precision
+        )
+        if add_existing:
+            expected = expected + existing.astype(dtype)
+        assert out.shape == (m, 4)
+        assert out.dtype == dtype
+        assert np.isfinite(np.asarray(out, dtype=np.float32)).all()
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+@pytest.mark.parametrize("m", [24, 32])
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+@pytest.mark.parametrize(
+    "dtype,precision", [(jnp.bfloat16, jax.lax.Precision.DEFAULT), (jnp.float32, jax.lax.Precision.HIGHEST)]
+)
+def test_ragged_alignment_gradients_match_dense_reference(m, transpose_rhs, dtype, precision):
+    """JIT both operand gradients, including the ragged-contracting RHS VJP."""
+    lhs, rhs, existing = _alignment_inputs(m, 8, 4, 4, dtype, transpose_rhs)
+    sizes = (3, 0, m - 3, 0)
+    cotangent = ((jnp.arange(m * 4).reshape(m, 4) % 5) - 2).astype(jnp.float32) / 8
+
+    def kernel_loss(lhs, rhs, existing, group_sizes):
+        out = grouped_matmul(
+            lhs,
+            rhs,
+            group_sizes,
+            preferred_element_type=dtype,
+            precision=precision,
+            transpose_rhs=transpose_rhs,
+            tiling=None,
+            existing_out=existing,
+        )
+        return jnp.sum(out.astype(jnp.float32) * cotangent)
+
+    def reference_loss(lhs, rhs, existing):
+        out = _sliced_grouped_matmul_reference(
+            lhs, rhs, sizes, transpose_rhs=transpose_rhs, preferred_element_type=dtype, precision=precision
+        )
+        out = out + existing.astype(dtype)
+        return jnp.sum(out.astype(jnp.float32) * cotangent)
+
+    value, grads = jax.jit(jax.value_and_grad(kernel_loss, argnums=(0, 1, 2)))(
+        lhs, rhs, existing, jnp.asarray(sizes, dtype=jnp.int32)
+    )
+    expected_value, expected_grads = jax.jit(jax.value_and_grad(reference_loss, argnums=(0, 1, 2)))(lhs, rhs, existing)
+    np.testing.assert_array_equal(np.asarray(value), np.asarray(expected_value))
+    for got, expected, original in zip(grads, expected_grads, (lhs, rhs, existing), strict=True):
+        assert got.shape == original.shape
+        assert got.dtype == original.dtype
+        assert np.isfinite(np.asarray(got, dtype=np.float32)).all()
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+    np.testing.assert_array_equal(np.asarray(grads[1][1]), 0)
+    np.testing.assert_array_equal(np.asarray(grads[1][3]), 0)
+
+
+def test_ragged_alignment_120_rows_bf16_output_matches_dense_reference():
+    """Qwen3-Next TP4 gate-up shard: 12 tokens x top-10, 512 experts, K=64/N=256.
+
+    Float32 operands with bf16 GMM output at DEFAULT precision.
+    """
+    lhs, rhs, _ = _alignment_inputs(120, 64, 256, 512, jnp.float32, False)
+    # Valid top-10 routing for twelve tokens, with intervening/trailing empties.
+    sizes = tuple(12 if expert in range(0, 100, 10) else 0 for expert in range(512))
+    out = jax.jit(
+        lambda lhs, rhs, gs: grouped_matmul(
+            lhs,
+            rhs,
+            gs,
+            preferred_element_type=jnp.bfloat16,
+            precision=jax.lax.Precision.DEFAULT,
+            tiling=None,
+        )
+    )(lhs, rhs, jnp.asarray(sizes, dtype=jnp.int32))
+    expected = _sliced_grouped_matmul_reference(
+        lhs,
+        rhs,
+        sizes,
+        transpose_rhs=False,
+        preferred_element_type=jnp.bfloat16,
+        precision=jax.lax.Precision.DEFAULT,
+    )
+    assert out.shape == (120, 256)
+    assert out.dtype == jnp.bfloat16
+    assert np.isfinite(np.asarray(out, dtype=np.float32)).all()
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+def _sliced_v3_reference(lhs, rhs, sizes, rhs_scale=None, rhs_bias=None):
+    """Static-slice GMM v3 reference: rows past ``sum(sizes)`` belong to no group (zero output)."""
+    n = rhs.shape[2]
+    out = jnp.zeros((lhs.shape[0], n), dtype=jnp.float32)
+    start = 0
+    for group, rows in enumerate(sizes):
+        if rows:
+            weight = rhs[group]
+            if rhs_scale is not None:
+                block = rhs.shape[1] // rhs_scale.shape[1]
+                weight = weight * jnp.repeat(rhs_scale[group, :, 0, :], block, axis=0)
+            product = jnp.matmul(lhs[start : start + rows], weight, precision=jax.lax.Precision.HIGHEST)
+            if rhs_bias is not None:
+                product = product + rhs_bias[group, 0]
+            out = out.at[start : start + rows].set(product)
+        start += rows
+    return out
+
+
+def _dyadic(shape, seed, denom=8):
+    rng = np.random.default_rng(seed)
+    return jnp.asarray(rng.integers(-2, 3, shape, dtype=np.int8), dtype=jnp.float32) / denom
+
+
+@pytest.mark.parametrize("with_scale_bias", [False, True])
+def test_grouped_matmulv3_tail_rows_contribute_nothing_fwd_and_bwd(with_scale_bias):
+    """``sum(group_sizes) < m``: tail rows are zero in the forward and get/give no gradient.
+
+    The per-row reference used to assign tail rows to the last group, so the backward disagreed
+    with the ragged_dot forward (and bias leaked into tail rows).
+    """
+    sizes = (3, 0, 5)
+    m, k, n = 13, 8, 4
+    lhs = _dyadic((m, k), 1)
+    rhs = _dyadic((len(sizes), k, n), 2)
+    scale = _dyadic((len(sizes), 2, 1, n), 3, denom=2) if with_scale_bias else None
+    bias = _dyadic((len(sizes), 1, n), 4) if with_scale_bias else None
+    cotangent = _dyadic((m, n), 5)
+    group_sizes = jnp.asarray(sizes, dtype=jnp.int32)
+
+    def kernel_loss(lhs, rhs, scale, bias):
+        out = grouped_matmulv3(
+            lhs,
+            rhs,
+            group_sizes,
+            tiling=None,
+            rhs_scale=scale,
+            rhs_bias=bias,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        return jnp.sum(out * cotangent), out
+
+    def reference_loss(lhs, rhs, scale, bias):
+        out = _sliced_v3_reference(lhs, rhs, sizes, scale, bias)
+        return jnp.sum(out * cotangent), out
+
+    argnums = (0, 1, 2, 3) if with_scale_bias else (0, 1)
+    (_, out), grads = jax.value_and_grad(kernel_loss, argnums=argnums, has_aux=True)(lhs, rhs, scale, bias)
+    (_, expected), expected_grads = jax.value_and_grad(reference_loss, argnums=argnums, has_aux=True)(
+        lhs, rhs, scale, bias
+    )
+
+    np.testing.assert_array_equal(np.asarray(out[sum(sizes) :]), 0)
+    np.testing.assert_allclose(np.asarray(out), np.asarray(expected), atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(grads[0][sum(sizes) :]), 0)
+    for got, want in zip(grads, expected_grads, strict=True):
+        assert got.shape == want.shape
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=1e-6)
+
+
+def test_grouped_matmulv3_group_offset_selects_local_groups():
+    """``group_offset`` (sharded experts) used to raise inside ``ragged_dot_general``.
+
+    Rows are assigned from row 0 to groups ``offset .. offset + rhs.shape[0] - 1`` (the Pallas v3
+    contract); the remaining rows are zero.
+    """
+    all_sizes = (4, 3, 5, 2)
+    offset, local = 1, 2
+    local_sizes = all_sizes[offset : offset + local]
+    m, k, n = 10, 8, 4
+    lhs = _dyadic((m, k), 11)
+    rhs = _dyadic((local, k, n), 12)
+    bias = _dyadic((local, 1, n), 13)
+    cotangent = _dyadic((m, n), 14)
+
+    def kernel_loss(lhs, rhs, bias):
+        out = grouped_matmulv3(
+            lhs,
+            rhs,
+            jnp.asarray(all_sizes, dtype=jnp.int32),
+            tiling=None,
+            group_offset=jnp.asarray([offset], dtype=jnp.int32),
+            rhs_bias=bias,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        return jnp.sum(out * cotangent), out
+
+    def reference_loss(lhs, rhs, bias):
+        out = _sliced_v3_reference(lhs, rhs, local_sizes, None, bias)
+        return jnp.sum(out * cotangent), out
+
+    (_, out), grads = jax.value_and_grad(kernel_loss, argnums=(0, 1, 2), has_aux=True)(lhs, rhs, bias)
+    (_, expected), expected_grads = jax.value_and_grad(reference_loss, argnums=(0, 1, 2), has_aux=True)(lhs, rhs, bias)
+    np.testing.assert_allclose(np.asarray(out), np.asarray(expected), atol=1e-6)
+    for got, want in zip(grads, expected_grads, strict=True):
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=1e-6)

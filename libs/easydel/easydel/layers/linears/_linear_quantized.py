@@ -1,0 +1,1904 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Quantized linear layers for memory-efficient neural networks.
+
+This module provides quantized versions of linear layers that reduce memory
+footprint while maintaining model quality. It supports multiple quantization
+formats including INT8, NF4, MXFP4, MXFP8, and NVFP8.
+
+Classes:
+    ParallelLinearQuantized: Base quantized linear layer with parallel support.
+    RowParallelLinearQuantized: Row-parallel variant for distributed training.
+    ColumnParallelLinearQuantized: Column-parallel variant for distributed training.
+
+Key Features:
+    - On-the-fly dequantization during forward pass
+    - Support for multiple quantization formats (INT8, NF4, MXFP4, MXFP8, NVFP8)
+    - Conversion to/from non-quantized layers
+    - Runtime quantization of activations
+    - Integration with parallel linear layers
+
+Example:
+    >>> from easydel.layers.linears import ColumnParallelLinearQuantized
+    >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
+    >>>
+    >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
+    >>> layer = ColumnParallelLinearQuantized(
+    ...     in_features=768,
+    ...     out_features=3072,
+    ...     config=config,
+    ...     rngs=rngs
+    ... )
+    >>> output = layer(input_tensor)
+"""
+
+from __future__ import annotations
+
+import typing as tp
+from functools import partial
+
+import jax
+import spectrax as spx
+from ejkernel.loggings import get_logger
+from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeStubs]
+    quantized_matmul as ej_quantized_matmul,
+)
+from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
+from jax import numpy as jnp
+from jax import shard_map
+from spectrax.common_types import ColumnWise, Replicated, RowWise
+
+from easydel.infra.sharding import (
+    MeshLike,
+    TensorLayout,
+    partition_spec_for_mesh,
+    pick_array_mesh,
+    sanitize_partition_spec_for_shape,
+    sharding_for_layout,
+)
+from easydel.layers.quantization._configs import QuantizationConfig, QuantizationType, resolve_ejkernel_quant_params
+from easydel.layers.quantization._quants import quantize
+
+from ._linear import ColumnParallelLinear, Dtype, Initializer, PrecisionLike, RowParallelLinear
+
+logger = get_logger(__name__)
+
+Array = jax.Array
+Axis = int
+Size = int
+
+default_kernel_init = jax.nn.initializers.lecun_normal()
+default_bias_init = jax.nn.initializers.zeros
+
+_QMM_NON_AFFINE_MODES = frozenset({"nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"})
+_EJKERNEL_GROUP_SIZES = (1024, 512, 256, 128, 64, 32, 16)
+
+#: Combined packed-byte floor of the fused W4A4 decode route: the route only
+#: engages when the gate_up + down packed pair is at least this large
+#: (mirrored by the dispatch gate in ``easydel.layers.mlp``).
+W4A4_FUSED_PAIR_MIN_PACKED_BYTES = 48 * 1024 * 1024
+
+
+def should_pack_int4_companion(in_features: int, out_features: int) -> bool:
+    """Whether a channelwise-int4 linear should carry a packed companion.
+
+    The ``quant_kernel_packed`` companion exists solely to feed the fused
+    W4A4 decode kernel, whose dispatch gate requires a gate_up/down pair
+    whose combined packed bytes reach
+    :data:`W4A4_FUSED_PAIR_MIN_PACKED_BYTES`. In such a pair the smallest
+    member is the down projection at one third of the pair total
+    (``gate_up`` packs ``K*I`` bytes, ``down`` packs ``K*I/2``), so any layer
+    whose own packed size falls below a third of the gate can NEVER be part
+    of a qualifying pair — materializing its companion is pure dead HBM and
+    checkpoint weight (~1 GB across a 7B's attention projections).
+
+    Args:
+        in_features: The layer's contraction dimension.
+        out_features: The layer's (summed) output dimension.
+
+    Returns:
+        ``True`` when the packed companion could actually be consumed.
+    """
+    packed_nbytes = (int(in_features) * int(out_features)) // 2  # uint8, two int4 codes per byte
+    return packed_nbytes >= W4A4_FUSED_PAIR_MIN_PACKED_BYTES // 3
+
+
+_QMM_DEFAULT_POLICY_TABLE: dict[str, tp.Any] = {
+    "tpu": {
+        "affine": {
+            "small": {"fuse": False, "platform": "xla"},
+            "large": {
+                "fuse": True,
+                "platform": "auto",
+                "allow_dense_fallback": False,
+                "strict_fuse": True,
+                "tpu_path": "predecode",
+            },
+            "default": {
+                "fuse": False,
+                "platform": "xla",
+            },
+        },
+        "non_affine": {
+            "small": {
+                "fuse": True,
+                "platform": "auto",
+                "allow_dense_fallback": True,
+                "strict_fuse": False,
+                "tpu_path": "predecode",
+            },
+            "large": {
+                "fuse": True,
+                "platform": "auto",
+                "allow_dense_fallback": True,
+                "strict_fuse": False,
+                "tpu_path": "predecode",
+            },
+            "default": {
+                "fuse": True,
+                "platform": "auto",
+                "allow_dense_fallback": True,
+                "strict_fuse": False,
+                "tpu_path": "predecode",
+            },
+        },
+        "default": {
+            "default": {"fuse": False, "platform": "xla"},
+        },
+    },
+    "default": {
+        "default": {
+            "default": {"fuse": True, "platform": "auto"},
+        },
+    },
+}
+
+
+def _is_mosaic_version_error(exc: BaseException) -> bool:
+    """Detect Mosaic-stack version errors raised by Pallas/TPU kernels.
+
+    Args:
+        exc: Exception to inspect.
+
+    Returns:
+        ``True`` if ``exc``'s message contains the canonical
+        ``"stable_mosaic.version"`` / ``"Unsupported version"`` substrings used
+        by Mosaic to signal a kernel/runtime mismatch, ``False`` otherwise.
+    """
+    message = str(exc)
+    return "stable_mosaic.version" in message and "Unsupported version" in message
+
+
+def _qmm_xla_fallback_kwargs(kwargs: dict[str, tp.Any]) -> dict[str, tp.Any]:
+    """Build XLA-only kwargs for quantized matmul fallback.
+
+    Used when a fused TPU kernel raises a Mosaic version error and we need to
+    retry with the unfused XLA path.
+
+    Args:
+        kwargs: Original kwargs passed to ``ej_quantized_matmul``. Only
+            ``use_best_config`` is preserved.
+
+    Returns:
+        A dict with ``fuse=False``, ``platform="xla"`` and the original
+        ``use_best_config`` flag (defaulting to ``True``).
+    """
+    return {
+        "fuse": False,
+        "platform": "xla",
+        "use_best_config": bool(kwargs.get("use_best_config", True)),
+    }
+
+
+def _policy_mode_key(mode: str | None) -> str:
+    """Map a quantization-mode string to a policy-table key.
+
+    Args:
+        mode: Quantization mode (e.g. ``"affine"``, ``"nf4"``, ``"mxfp4"``).
+
+    Returns:
+        ``"affine"`` for affine quantization, ``"non_affine"`` for
+        microscaling formats listed in :data:`_QMM_NON_AFFINE_MODES`, or
+        ``"default"`` for any unrecognized mode.
+    """
+    mode_n = str(mode).strip().lower() if mode is not None else ""
+    if mode_n == "affine":
+        return "affine"
+    if mode_n in _QMM_NON_AFFINE_MODES:
+        return "non_affine"
+    return "default"
+
+
+def _policy_size_key(m_tokens: int | None, threshold: int | None) -> str:
+    """Bucket the token-count dimension into a policy size category.
+
+    Args:
+        m_tokens: Number of rows (flattened token count) being processed.
+        threshold: Threshold separating ``"small"`` from ``"large"`` sizes.
+
+    Returns:
+        ``"small"`` if ``m_tokens <= threshold``, ``"large"`` otherwise. Falls
+        back to ``"default"`` when either input is ``None``.
+    """
+    if m_tokens is None or threshold is None:
+        return "default"
+    return "small" if int(m_tokens) <= int(threshold) else "large"
+
+
+def _lookup_qmm_policy_entry(
+    *,
+    backend: str,
+    mode: str | None,
+    m_tokens: int | None,
+    tpu_small_threshold: int | None,
+    policy_table: dict[str, tp.Any] | None,
+) -> dict[str, tp.Any]:
+    """Resolve the per-call quantized-matmul policy entry.
+
+    Performs a three-level lookup ``backend -> mode_key -> size_key`` against
+    ``policy_table`` (or :data:`_QMM_DEFAULT_POLICY_TABLE` when ``None``),
+    falling back to ``"default"`` at each level when the specific key is
+    missing.
+
+    Args:
+        backend: JAX default backend (``"tpu"``, ``"gpu"``, ``"cpu"``).
+        mode: Quantization mode string (see :func:`_policy_mode_key`).
+        m_tokens: Number of token rows in the current matmul call.
+        tpu_small_threshold: Threshold below which calls are considered
+            "small" on TPU (see :func:`_policy_size_key`).
+        policy_table: Optional override table; when ``None`` the built-in
+            default is used.
+
+    Returns:
+        A copy of the matched policy entry as a dict, or an empty dict if no
+        entry was found.
+    """
+    table = policy_table if policy_table is not None else _QMM_DEFAULT_POLICY_TABLE
+    backend_table = table.get(backend, table.get("default", {}))
+    mode_table = backend_table.get(_policy_mode_key(mode), backend_table.get("default", {}))
+    size_table = mode_table.get(_policy_size_key(m_tokens, tpu_small_threshold), mode_table.get("default", {}))
+    return dict(size_table) if isinstance(size_table, dict) else {}
+
+
+@partial(jax.jit, static_argnames=("group_size", "bits", "mode"))
+def prepack_quantized_weights_jit(array: jax.Array, *, group_size: int, bits: int, mode: str):
+    """Jitted wrapper around ``prepack_quantized_weights``.
+
+    Packing sub-byte weights into ``uint32`` is dozens of small elementwise and
+    bit-manipulation ops. Run eagerly, each pays full dispatch cost, which makes
+    quantizing a real model absurdly slow — measured on a ``(4096, 6144)``
+    weight on TPU v5:
+
+    ==========  =========  ==============  =======
+    mode        eager      jitted (warm)   ratio
+    ==========  =========  ==============  =======
+    ``mxfp4``   4.80 s     8.2 ms          585x
+    ``affine``  2.34 s     0.7 ms          3490x
+    ==========  =========  ==============  =======
+
+    At ~112 linears in a 7B-class model that is the difference between a
+    sub-second conversion and one that runs for half an hour. ``mode``,
+    ``group_size`` and ``bits`` are static because they select the packing
+    layout and the number of returned arrays.
+
+    Args:
+        array: Full-precision weight to pack.
+        group_size: Elements per quantization group.
+        bits: Bit width of a packed element.
+        mode: ejkernel quantization mode.
+
+    Returns:
+        ``(w_q, scales)`` or ``(w_q, scales, zeros)`` depending on ``mode``.
+    """
+    return prepack_quantized_weights(array, group_size=group_size, bits=bits, mode=mode, transpose=False)
+
+
+def channelwise_quantize_array(
+    array: jax.Array, bits: int, expert_chunk: int | None = None
+) -> tuple[jax.Array, jax.Array, None]:
+    """Per-output-channel symmetric quantization over the full contraction axis.
+
+    Produces the exact format the channelwise/fused-MLP kernels consume
+    without unpacking: integer codes ``[in, out]`` (int8 or int4) and float32
+    scales ``[1, out]``. Single source of truth for both module-level
+    quantization (:meth:`ParallelLinearQuantized._quantize_array`) and the
+    streaming quantize-at-load path in the checkpoint bridge.
+
+    Args:
+        array: Full-precision weight ``[in_features, out_features]``.
+        bits: 8 or 4.
+        expert_chunk: For stacked expert kernels ``[experts, in, out]``, quantize this many experts at a time
+            (experts are independent, so the result is identical) to bound the fp32 temporaries. ``None`` (default)
+            quantizes the whole array in one step.
+
+    Returns:
+        Tuple of (codes, scales, None) — the trailing None mirrors the
+        (kernel, scales, biases) triple of the grouped modes.
+    """
+    if expert_chunk is not None and array.ndim == 3 and 0 < int(expert_chunk) < array.shape[0]:
+        step = int(expert_chunk)
+        parts = [channelwise_quantize_array(array[i : i + step], bits) for i in range(0, array.shape[0], step)]
+        codes = jnp.concatenate([p[0] for p in parts], axis=0)
+        scales = jnp.concatenate([p[1] for p in parts], axis=0)
+        sharding = getattr(array, "sharding", None)
+        if isinstance(sharding, jax.sharding.NamedSharding):
+            # Slicing + concatenation may re-shard; restore the layout the unchunked path produces (the scales
+            # reduce the contraction axis, so that dim is unsharded there).
+            spec = list(sharding.spec) + [None] * (array.ndim - len(sharding.spec))
+            spec[-2] = None
+            codes = jax.device_put(codes, sharding)
+            scales = jax.device_put(scales, jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*spec)))
+        return codes, scales, None
+    qmax = 127.0 if bits == 8 else 7.0
+    qdtype = jnp.int8 if bits == 8 else jnp.int4
+    w32 = array.astype(jnp.float32)
+    # Reduce over the contraction axis: axis 0 for [in, out] dense kernels,
+    # axis 1 for stacked expert kernels [experts, in, out] — both are axis -2.
+    scales = jnp.max(jnp.abs(w32), axis=-2, keepdims=True) / qmax
+    scales = jnp.where(scales == 0, 1.0, scales)
+    codes = jnp.clip(jnp.round(w32 / scales), -qmax, qmax).astype(qdtype)
+    return codes, scales.astype(jnp.float32), None
+
+
+def _effective_ejkernel_group_size(mode: str, requested_group_size: int, array_shape: tuple[int, ...]) -> int:
+    """Clamp the ejkernel group size to the local packed weight layout.
+
+    The grouped-quantization kernels require ``group_size`` to evenly divide
+    the trailing axis of the weight tensor. When the user-requested size does
+    not divide cleanly, this helper picks the largest supported value from
+    :data:`_EJKERNEL_GROUP_SIZES` that is both ``<= requested`` and divides
+    the local group dimension.
+
+    Args:
+        mode: Quantization mode name (e.g. ``"affine"``, ``"nf4"``).
+        requested_group_size: User-requested grouping size.
+        array_shape: Shape of the local packed weight tensor; the trailing
+            dimension is treated as the group dimension.
+
+    Returns:
+        A valid group size compatible with the packed weight layout.
+
+    Raises:
+        ValueError: If ``requested_group_size`` is non-positive, or if no
+            supported group size in :data:`_EJKERNEL_GROUP_SIZES` divides the
+            local group dimension for modes that require alignment.
+    """
+    if requested_group_size <= 0:
+        raise ValueError(f"`group_size` must be > 0, got {requested_group_size}.")
+    if len(array_shape) == 0:
+        return requested_group_size
+
+    group_dim = int(array_shape[-1])
+    if requested_group_size <= group_dim and group_dim % requested_group_size == 0:
+        return requested_group_size
+
+    if mode in {"affine", "nf4"}:
+        for candidate in _EJKERNEL_GROUP_SIZES:
+            if candidate > requested_group_size:
+                continue
+            if candidate <= group_dim and group_dim % candidate == 0:
+                logger.warning(
+                    "Adjusted ejkernel group_size from %d to %d for mode=%r "
+                    "(group_dim=%d is not divisible by requested size).",
+                    requested_group_size,
+                    candidate,
+                    mode,
+                    group_dim,
+                )
+                return candidate
+        raise ValueError(
+            "No supported ejkernel group_size divides the local grouping axis. "
+            f"got mode={mode!r}, requested_group_size={requested_group_size}, group_dim={group_dim}, "
+            f"supported_group_sizes={_EJKERNEL_GROUP_SIZES}."
+        )
+
+    # Other modes (mxfp4, mxfp8, nvfp4, etc.) have different layout constraints;
+    # return as-is and let the backend validate.
+    return requested_group_size
+
+
+def _spec_is_sharded(spec: jax.sharding.PartitionSpec) -> bool:
+    """Test whether any axis of a :class:`PartitionSpec` is partitioned.
+
+    Args:
+        spec: A partition spec to inspect.
+
+    Returns:
+        ``True`` if at least one axis entry is non-``None`` (i.e. partitioned
+        across some mesh axis), ``False`` if every entry is ``None``.
+    """
+    return any(axis is not None for axis in tuple(spec))
+
+
+def _spec_matches_kernel_parallel_layout(
+    kernel_spec: jax.sharding.PartitionSpec,
+    aux_spec: jax.sharding.PartitionSpec,
+    direction: tp.Literal["row", "column"] | None,
+) -> bool:
+    """Return whether an aux tensor sharding is compatible with the kernel sharding.
+
+    Quantized kernels, scales, and affine zero-points are packed with matching
+    ``(in_features, out_features_*)`` semantics. When the kernel is sharded, aux
+    tensors must use the same partitioning so local ejkernel calls see aligned
+    shard-local shapes.
+
+    Args:
+        kernel_spec: Partition spec of the quantized kernel.
+        aux_spec: Partition spec of the aux tensor (scales or zero-points).
+        direction: Parallelism direction of the layer; only ``"row"`` and
+            ``"column"`` are considered, everything else returns ``False``.
+
+    Returns:
+        ``True`` if the aux tensor's sharding aligns with the kernel's so the
+        per-shard shapes are consistent. ``False`` otherwise.
+    """
+    if direction not in {"row", "column"}:
+        return False
+
+    kernel_tuple = tuple(kernel_spec)
+    aux_tuple = tuple(aux_spec)
+    kernel_is_sharded = _spec_is_sharded(kernel_spec)
+    aux_is_sharded = _spec_is_sharded(aux_spec)
+
+    if not kernel_is_sharded:
+        # Keep replicated aux params on the non-distributed path.
+        return True
+    if not aux_is_sharded:
+        return False
+
+    # Require exact parallel layout when entering shard_map.
+    return kernel_tuple == aux_tuple
+
+
+def _axis_names(axis_spec: tp.Any) -> tuple[str, ...]:
+    """Normalize a single :class:`PartitionSpec` entry into a tuple of names.
+
+    Args:
+        axis_spec: Single axis entry from a partition spec. May be ``None``,
+            a string axis name, or a list/tuple of axis names.
+
+    Returns:
+        Tuple of mesh-axis names, possibly empty.
+    """
+    if axis_spec is None:
+        return ()
+    if isinstance(axis_spec, str):
+        return (axis_spec,)
+    if isinstance(axis_spec, (list, tuple)):
+        return tuple(axis for axis in axis_spec if isinstance(axis, str))
+    return ()
+
+
+def _extract_tp_axis_name(
+    kernel_spec: jax.sharding.PartitionSpec,
+    direction: tp.Literal["row", "column"] | None,
+    mesh: MeshLike,
+) -> str | None:
+    """Extract the TP-axis name actively partitioning the kernel.
+
+    Looks at the kernel's row axis (for row-parallel) or column axis (for
+    column-parallel) and finds an active mesh axis (size > 1). Prefers the
+    canonical name ``"tp"`` when present.
+
+    Args:
+        kernel_spec: Partition spec of the quantized kernel
+            ``(in_features, out_features)``.
+        direction: Parallelism direction of the layer.
+        mesh: Active JAX mesh.
+
+    Returns:
+        The mesh-axis name partitioning the relevant kernel dimension, or
+        ``None`` if no eligible axis is found.
+    """
+    if direction not in {"row", "column"}:
+        return None
+    dim = 0 if direction == "row" else 1
+    if len(kernel_spec) <= dim:
+        return None
+    axis = kernel_spec[dim]
+    if axis is None:
+        return None
+    candidates = _axis_names(axis)
+
+    # Prefer canonical tensor axis name when available.
+    for candidate in candidates:
+        if candidate == "tp" and candidate in mesh.axis_names and mesh.shape[candidate] > 1:
+            return candidate
+    for candidate in candidates:
+        if candidate in mesh.axis_names and mesh.shape[candidate] > 1:
+            return candidate
+    return None
+
+
+def _pick_tensor_axis_name(mesh: MeshLike) -> str | None:
+    """Pick a multi-device tensor-parallel mesh axis name.
+
+    Prefers the canonical ``"tp"`` / ``"tensor"`` names when available,
+    otherwise falls back to the first mesh axis whose size is greater than
+    one.
+
+    Args:
+        mesh: Active JAX mesh.
+
+    Returns:
+        The chosen mesh-axis name, or ``None`` if no multi-device axis exists.
+    """
+
+    for axis_name in ("tp", "tensor"):
+        if axis_name in mesh.axis_names and mesh.shape.get(axis_name, 1) > 1:
+            return axis_name
+    for axis_name in mesh.axis_names:
+        if mesh.shape.get(axis_name, 1) > 1:
+            return axis_name
+    return None
+
+
+def _quantized_linear_sharding_fn(
+    *,
+    direction: tp.Literal["row", "column"] | None,
+    param_name: str,
+    mode: str,
+    group_size: int,
+    needs_biases: bool,
+) -> tp.Any | None:
+    """Return the sharding layout marker for a quantized linear parameter.
+
+    Maps a parameter name (``quant_kernel``, ``quant_scales``,
+    ``quant_biases``, ``bias``) to the appropriate Spectrax sharding layout
+    constant (``RowWise``, ``ColumnWise``, ``Replicated``, or ``None``).
+
+    Args:
+        direction: Parallelism direction of the layer (``"row"``, ``"column"``,
+            or ``None``).
+        param_name: Name of the parameter being annotated.
+        mode: Quantization mode (e.g. ``"affine"``, ``"nf4"``).
+        group_size: Quantization group size.
+        needs_biases: Whether the mode materializes per-group zero/bias
+            tensors (true for affine, false for non-affine modes).
+
+    Returns:
+        A sharding layout marker (``RowWise`` / ``ColumnWise`` / ``Replicated``)
+        appropriate for ``param_name``, or ``None`` when no sharding is
+        required.
+
+    Raises:
+        ValueError: If ``group_size`` is non-positive.
+
+    Notes:
+        - ``prepack_quantized_weights(..., transpose=False)`` stores packed
+          tensors in ``(in_features, out_features_*)`` layout for all
+          supported modes.
+        - ``group_size`` only changes the grouped output extent
+          (``out_features_*``), not the sharded axis semantics.
+    """
+    if direction is None:
+        return None
+
+    if mode not in {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "channelwise"}:
+        return None
+    if group_size <= 0 and mode != "channelwise":
+        raise ValueError(f"`group_size` must be > 0, got {group_size}.")
+
+    if param_name == "bias":
+        return Replicated
+
+    if param_name == "quant_biases" and not needs_biases:
+        # Non-affine modes do not materialize per-group zero/bias tensors.
+        return None
+
+    base = RowWise if direction == "row" else ColumnWise
+
+    if mode == "channelwise" and param_name == "quant_scales":
+        # Channelwise reduces the whole contraction axis, so its scales are
+        # [1, out] rather than the grouped modes' [in // group, out]. Handing
+        # a size-1 axis the contraction placement (TP for row-parallel,
+        # (FSDP, SP) for column-parallel) asks it to divide across an axis of
+        # size > 1. The stacked-expert twin drops the same placement for the
+        # same reason (see ParallelMoELinearQuantized's scales_layout).
+        return TensorLayout((None, base.axes[1]), mode=base.mode)
+
+    if param_name in {"quant_kernel", "quant_scales", "quant_biases"}:
+        return base
+
+    return None
+
+
+def _quantized_linear_layout_spec(
+    *,
+    direction: tp.Literal["row", "column"] | None,
+    use_bias: bool,
+    mode: str,
+    group_size: int,
+    needs_biases: bool,
+) -> dict[str, tp.Any]:
+    """Build the per-parameter sharding spec dict for a quantized linear layer.
+
+    Aggregates :func:`_quantized_linear_sharding_fn` lookups for every
+    parameter the layer may register (``quant_kernel``, ``quant_scales``,
+    ``quant_biases``, and the optional dense ``bias``).
+
+    Args:
+        direction: Parallelism direction of the layer.
+        use_bias: Whether the layer carries a learnable dense bias.
+        mode: Quantization mode.
+        group_size: Quantization group size.
+        needs_biases: Whether the mode materializes per-group zero/bias tensors.
+
+    Returns:
+        Dict mapping parameter names to sharding layout markers; absent keys
+        indicate the parameter should be left unsharded.
+    """
+    specs: dict[str, tp.Any] = {}
+
+    for param_name in ("quant_kernel", "quant_scales", "quant_biases"):
+        spec = _quantized_linear_sharding_fn(
+            direction=direction,
+            param_name=param_name,
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
+        if spec is not None:
+            specs[param_name] = spec
+
+    if use_bias:
+        spec = _quantized_linear_sharding_fn(
+            direction=direction,
+            param_name="bias",
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
+        if spec is not None:
+            specs["bias"] = spec
+
+    return specs
+
+
+def _reconcile_input_k_dim(
+    local_inputs: Array,
+    local_kernel: Array,
+    direction: tp.Literal["row", "column"] | None,
+    tp_axis_name: str | None,
+    *,
+    allow_column_all_gather: bool = False,
+) -> Array:
+    """Align the K dimension of local inputs with the local kernel shard.
+
+    Inside ``shard_map`` the local input slice may not match the local kernel's
+    K extent. This helper reconciles the mismatch:
+
+    * **column-parallel** — kernels keep full K and shard N. Reconstructing K
+      via ``all_gather`` can blow device memory, so it is opt-in.
+    * **row-parallel** — kernels shard K, so replicated inputs are sliced to
+      the local K chunk via ``dynamic_slice_in_dim``.
+
+    Args:
+        local_inputs: Per-shard activation tensor with K on the last axis.
+        local_kernel: Per-shard quantized kernel slice; the leading axis is
+            the local K extent.
+        direction: Parallelism direction of the parent layer.
+        tp_axis_name: Name of the TP mesh axis currently in scope. Required
+            when a K mismatch must be reconciled.
+        allow_column_all_gather: When ``True`` and ``direction == "column"``,
+            permit an implicit ``all_gather`` along the K axis to assemble the
+            full K. Defaults to ``False`` to avoid TPU OOM.
+
+    Returns:
+        ``local_inputs`` already aligned to ``local_kernel`` along K; either
+        the input unchanged, an ``all_gather``-ed full tensor, or a
+        dynamic-sliced local chunk.
+
+    Raises:
+        ValueError: If a TP axis name is required but missing, if column
+            all-gather is requested when not permitted, or if row-parallel
+            inputs do not divide evenly into local K chunks.
+    """
+    if local_inputs.shape[-1] == local_kernel.shape[0]:
+        return local_inputs
+
+    if tp_axis_name is None:
+        raise ValueError(f"{direction}-parallel quantized matmul requires a TP axis to reconcile local K sizes.")
+
+    if direction == "column":
+        if not allow_column_all_gather:
+            raise ValueError(
+                "Column-parallel quantized matmul local K mismatch detected. "
+                "Implicit input all_gather is disabled by default to avoid TPU OOM. "
+                "Set `qmm_allow_input_all_gather=True` on the layer to enable it explicitly."
+            )
+        return jax.lax.all_gather(local_inputs, tp_axis_name, axis=-1, tiled=True)
+
+    # Row-parallel: slice the local K chunk from replicated inputs.
+    if local_inputs.shape[-1] % local_kernel.shape[0] != 0:
+        raise ValueError(
+            "Row-parallel quantized matmul got incompatible local K sizes: "
+            f"input={local_inputs.shape[-1]} kernel={local_kernel.shape[0]}."
+        )
+    shard_index = jax.lax.axis_index(tp_axis_name)
+    start = shard_index * local_kernel.shape[0]
+    return jax.lax.dynamic_slice_in_dim(local_inputs, start, local_kernel.shape[0], axis=-1)
+
+
+class ParallelLinearQuantized(spx.Module):
+    """A quantized linear transformation layer with parallel execution support.
+
+    This layer stores weights in a quantized format to reduce memory usage,
+    and dequantizes them on-the-fly during forward passes. It supports multiple
+    quantization schemes including INT8, NF4, and microscaling formats.
+
+    The layer can be converted to/from non-quantized ParallelLinear layers,
+    allowing for flexible model deployment strategies where you train in
+    full precision and deploy with quantization.
+
+    Attributes:
+        in_features: Number of input features.
+        out_features: Number of output features.
+        use_bias: Whether the layer includes a bias term.
+        dtype: Data type for computation (default inferred from inputs).
+        param_dtype: Data type for non-quantized parameters (bias).
+        precision: JAX precision setting for matrix multiplication.
+        kernel_init: Initializer for kernel weights before quantization.
+        bias_init: Initializer for bias term.
+        config: Quantization configuration specifying format and parameters.
+        rngs: Random number generators for initialization.
+        quant_kernel: Quantized kernel weights.
+        quant_scales: Per-block scaling factors for dequantization.
+        quant_biases: Per-block biases for affine quantization (if applicable).
+        bias: Optional bias parameter (not quantized).
+        _direction: Parallelism direction ("row", "column", or None).
+
+    Example:
+        >>> from easydel.layers.linears import ParallelLinearQuantized
+        >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
+        >>>
+        >>> # Create INT8 quantized layer
+        >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
+        >>> layer = ParallelLinearQuantized(
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     config=config,
+        ...     rngs=spx.Rngs(0)
+        ... )
+        >>>
+        >>> # Forward pass with automatic dequantization
+        >>> output = layer(jnp.ones((32, 768)))
+    """
+
+    _direction: tp.Literal["row", "column"] | None = None
+
+    if tp.TYPE_CHECKING:
+
+        def __call__(self, inputs: Array, w: Array | None = None) -> Array: ...
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bias: bool = True,
+        dtype: Dtype | None = None,
+        param_dtype: Dtype = jnp.float32,
+        precision: PrecisionLike = None,
+        kernel_init: Initializer = default_kernel_init,
+        bias_init: Initializer = default_bias_init,
+        config: QuantizationConfig,
+        qmm_platform: tp.Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
+        qmm_use_best_config: bool | None = None,
+        qmm_fuse: bool | None = None,
+        qmm_strict_fuse: bool | None = None,
+        qmm_allow_dense_fallback: bool | None = None,
+        qmm_tpu_path: tp.Literal["hybrid", "packed", "predecode"] | None = None,
+        qmm_tpu_auto_xla_max_m: int | None = 1024,
+        qmm_policy_table: dict[str, tp.Any] | None = None,
+        qmm_allow_input_all_gather: bool = False,
+        layout: tp.Any | None = None,
+        scale: float | tp.Literal["fan_in", "fan_out"] = 1.0,
+        sharding_layout: tp.Any | None = None,
+        bias_sharding_layout: tp.Any | None = None,
+        rngs: spx.Rngs,
+    ):
+        """Initialize a quantized parallel linear layer.
+
+        Creates a linear layer with quantized weights. The kernel is initialized
+        using the provided initializer, then immediately quantized according to
+        the configuration.
+
+        Args:
+            in_features: Size of each input sample.
+            out_features: Size of each output sample.
+            use_bias: If True, adds a learnable bias to the output.
+                Defaults to True.
+            dtype: Data type for computation. If None, uses input dtype.
+                Defaults to None.
+            param_dtype: Data type for parameters (bias). Defaults to float32.
+            precision: JAX precision for matrix multiplication. Can be None,
+                'default', 'high', 'highest', or specific precision combinations.
+                Defaults to None.
+            kernel_init: Initializer function for the weight matrix.
+                Defaults to lecun_normal().
+            bias_init: Initializer function for the bias vector.
+                Defaults to zeros.
+            config: Quantization configuration specifying the quantization
+                type (INT8, NF4, etc.) and related parameters like group_size.
+            qmm_platform: Optional explicit platform override for ejkernel
+                quantized_matmul calls.
+            qmm_use_best_config: Optional ejkernel tuned-config toggle for
+                quantized_matmul calls. Defaults to True when omitted.
+            qmm_fuse: Optional fuse policy forwarded to ejkernel quantized_matmul.
+                If None on TPU, defaults to False unless explicit fused controls
+                are provided (e.g. qmm_tpu_path/qmm_strict_fuse/qmm_platform="pallas").
+            qmm_strict_fuse: Optional strict fused-kernel policy forwarded to
+                ejkernel quantized_matmul.
+            qmm_allow_dense_fallback: Optional policy forwarded to ejkernel to
+                permit/disallow dense dequantize+matmul fallback.
+            qmm_tpu_path: Optional TPU path override ("hybrid", "packed",
+                "predecode") forwarded per-call to ejkernel fused execution.
+            qmm_tpu_auto_xla_max_m: TPU auto-policy threshold on flattened token
+                count ``m``. When ``qmm_platform="auto"`` and no explicit fused
+                controls are provided, calls with ``m <= qmm_tpu_auto_xla_max_m``
+                use unfused XLA; larger ``m`` uses fused TPU path. Set to None
+                to disable threshold-based switching.
+            qmm_policy_table: Optional policy lookup table for runtime
+                quantized matmul controls keyed by backend/mode/size bucket.
+                When None, uses built-in defaults.
+            qmm_allow_input_all_gather: Whether column-parallel execution may
+                all_gather local input K slices when they mismatch the local
+                kernel shard. Defaults to False to avoid OOM.
+            layout: Optional fused projection layout carried over from the
+                dense layer. Consumers (e.g. UnifiedAttention) use it to split
+                fused activations TP-interleave-aware; dropping it silently
+                falls back to a contiguous split, which scrambles Q/K/V under
+                tensor parallelism.
+            scale: Output scaling applied after the matmul and before the
+                bias, exactly like :class:`ParallelLinear` (a float, or
+                ``"fan_in"`` / ``"fan_out"``). :meth:`ParallelLinear.to_quantized`
+                forwards the dense layer's resolved scale so quantizing a
+                ``scale="fan_in"`` layer does not change its activations.
+            sharding_layout: Optional explicit layout for the quantized kernel
+                (and its scales / zero-points). Defaults to the row/column
+                layout derived from ``_direction``.
+            bias_sharding_layout: Optional explicit layout for the dense bias.
+            rngs: SpecTrax random number generators for initialization.
+
+        Raises:
+            ValueError: If config.dtype is not a supported quantization type.
+        """
+        self.in_features = in_features
+        self.out_features = out_features
+        # Fused projections pass a sequence of output widths (e.g. qkv = (q, k, v));
+        # the stored quantized kernel/bias use the summed width like the dense layer.
+        out_features_sum = sum(out_features) if isinstance(out_features, (tuple, list)) else out_features
+        self.out_features_sum = int(out_features_sum)
+        self.use_bias = use_bias
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.kernel_init = kernel_init
+        self.bias_init = bias_init
+        self.config = config
+        self.qmm_platform = qmm_platform
+        self.qmm_use_best_config = qmm_use_best_config
+        self.qmm_fuse = qmm_fuse
+        self.qmm_strict_fuse = qmm_strict_fuse
+        self.qmm_allow_dense_fallback = qmm_allow_dense_fallback
+        self.qmm_tpu_path = qmm_tpu_path
+        self.qmm_tpu_auto_xla_max_m = qmm_tpu_auto_xla_max_m
+        self.qmm_policy_table = qmm_policy_table
+        self.qmm_allow_input_all_gather = bool(qmm_allow_input_all_gather)
+        self.layout = layout
+        if scale == "fan_in":
+            resolved_scale = float(in_features) ** -0.5
+        elif scale == "fan_out":
+            resolved_scale = float(self.out_features_sum) ** -0.5
+        else:
+            resolved_scale = float(scale)
+        self.output_scale: float = resolved_scale
+        self.sharding_layout = TensorLayout.from_any(sharding_layout)
+        self.bias_sharding_layout = TensorLayout.from_any(bias_sharding_layout)
+        # `rngs` is deliberately NOT retained. spx treats module attributes as
+        # state, so holding the Rngs object puts PRNG leaves into the exported
+        # State; under lazy init those leaves stay abstract and
+        # `save_pretrained` fails with "'ShapeDtypeStruct' object has no
+        # attribute 'addressable_shards'" for every quantized model. No dense
+        # layer retains rngs either, and `from_quantized` builds its own.
+        # Set by _quantize_array during __init__; used by _resolve_ejkernel_params afterwards.
+        self._ej_group_size: int | None = None
+
+        kernel = kernel_init(rngs.parameters, (in_features, out_features_sum), param_dtype)
+        quant_kernel, quant_scales, quant_biases = self._quantize_array(kernel)
+        mode, group_size, _bits, needs_biases = self._resolve_ejkernel_params()
+        layout_specs = _quantized_linear_layout_spec(
+            direction=self._direction,
+            use_bias=use_bias,
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
+        if self.sharding_layout is not None:
+            custom_axes = self.sharding_layout.axes
+            aux_layout = self.sharding_layout
+            if mode == "channelwise" and len(custom_axes) >= 2:
+                # Channelwise scales are ``[1, out]``: the contraction placement does not apply to a size-1 axis.
+                aux_layout = TensorLayout((None, custom_axes[1]), mode=self.sharding_layout.mode)
+            layout_specs["quant_kernel"] = self.sharding_layout
+            layout_specs["quant_scales"] = aux_layout
+            if needs_biases:
+                layout_specs["quant_biases"] = aux_layout
+        if self.bias_sharding_layout is not None and use_bias:
+            layout_specs["bias"] = self.bias_sharding_layout
+        runtime_config = self._runtime_config()
+        if runtime_config is not None and runtime_config.dtype not in {
+            QuantizationType.BINARY,
+            QuantizationType.TERNARY,
+        }:
+            # Binary/ternary use a dense code matmul; packed formats go through ejkernel.
+            resolve_ejkernel_quant_params(runtime_config)
+
+        self.quant_kernel = spx.Parameter(
+            quant_kernel,
+            sharding=sharding_for_layout(layout_specs.get("quant_kernel")),
+        )
+        self.quant_scales = spx.Parameter(
+            quant_scales,
+            sharding=sharding_for_layout(layout_specs.get("quant_scales")),
+        )
+        self.quant_biases = spx.Parameter(
+            quant_biases,
+            sharding=sharding_for_layout(layout_specs.get("quant_biases")),
+        )
+        if (
+            mode == "channelwise"
+            and quant_kernel.dtype == jnp.int4
+            and should_pack_int4_companion(in_features, out_features_sum)
+        ):
+            # Adjacent-rows packed companion feeding the fused W4A4 decode
+            # kernel (uint8 [in/2, out]); shares the kernel's sharding. Only
+            # layers large enough to ever pass the fused route's pair gate
+            # carry one — for everything else (attention projections, small
+            # MLPs) it would be dead HBM and checkpoint weight.
+            from ejkernel.modules import pack_int4_adjacent as _pack_int4_adjacent
+
+            self.quant_kernel_packed = spx.Parameter(
+                _pack_int4_adjacent(quant_kernel),
+                sharding=sharding_for_layout(layout_specs.get("quant_kernel")),
+            )
+        else:
+            self.quant_kernel_packed = None
+
+        if use_bias:
+            self.bias = spx.Parameter(
+                bias_init(rngs.parameters, (out_features_sum,), param_dtype),
+                sharding=sharding_for_layout(layout_specs.get("bias")),
+            )
+        else:
+            # Mirror ParallelLinear's attribute surface: consumers read `.bias`
+            # directly (e.g. fused gate/up separate-projection guards).
+            self.bias = None
+
+    def split(self, outputs: Array, *, config: tp.Any | None = None) -> tuple[Array, ...]:
+        """Split outputs with the projection's fused layout (mirrors :class:`ParallelLinear`)."""
+        if self.layout is None:
+            raise ValueError("This quantized linear layer does not carry a fused projection layout.")
+        return self.layout.split(outputs, config=config)
+
+    def build_reform_param(
+        self,
+        target_prefix: str,
+        *,
+        config: tp.Any | None = None,
+        include_bias: bool | None = None,
+    ) -> dict:
+        """Build checkpoint reform rules from the projection's fused layout (mirrors :class:`ParallelLinear`)."""
+        if self.layout is None:
+            raise ValueError("This quantized linear layer does not carry a fused projection layout.")
+        return self.layout.reform_param(
+            target_prefix,
+            config=config,
+            include_bias=self.use_bias if include_bias is None else include_bias,
+        )
+
+    def _qmm_runtime_kwargs(
+        self,
+        backend: str,
+        *,
+        m_tokens: int | None = None,
+        quant_mode: str | None = None,
+    ) -> dict[str, tp.Any]:
+        """Resolve per-call ejkernel ``quantized_matmul`` controls.
+
+        Control values are resolved from a policy lookup table keyed by
+        backend, quantization mode, and size bucket, then explicit layer-level
+        overrides (``self.qmm_*``) are applied on top.
+
+        Args:
+            backend: JAX default backend (``"tpu"``, ``"gpu"``, ``"cpu"``).
+            m_tokens: Flattened token count for the current call; consulted
+                for the size-bucket policy lookup. ``None`` skips the
+                size-aware path.
+            quant_mode: Quantization mode string used to bucket the policy
+                lookup (``"affine"`` vs non-affine).
+
+        Returns:
+            Dict of kwargs to forward to ``ej_quantized_matmul``. Always
+            contains ``fuse``, ``platform``, and ``use_best_config``; may
+            additionally include ``allow_dense_fallback``, ``strict_fuse``,
+            and ``tpu_path`` when fused execution is selected.
+
+        Raises:
+            ValueError: If incompatible combinations of overrides are
+                supplied (e.g. ``qmm_strict_fuse`` without ``qmm_fuse=True``,
+                or ``qmm_tpu_path`` not in ``{"hybrid","packed","predecode"}``).
+        """
+        policy = _lookup_qmm_policy_entry(
+            backend=backend,
+            mode=quant_mode,
+            m_tokens=m_tokens,
+            tpu_small_threshold=self.qmm_tpu_auto_xla_max_m,
+            policy_table=self.qmm_policy_table,
+        )
+
+        tpu_path = self.qmm_tpu_path if self.qmm_tpu_path is not None else policy.get("tpu_path")
+        if tpu_path is not None:
+            tpu_path = str(tpu_path).strip().lower()
+            if tpu_path not in {"hybrid", "packed", "predecode"}:
+                raise ValueError(f"qmm_tpu_path must be one of {{'hybrid','packed','predecode'}}, got {tpu_path!r}.")
+
+        platform_requested = self.qmm_platform
+        fuse_policy = policy.get("fuse")
+        explicit_fused_controls = backend == "tpu" and (
+            self.qmm_tpu_path is not None
+            or self.qmm_strict_fuse is not None
+            or self.qmm_allow_dense_fallback is not None
+            or platform_requested == "pallas"
+        )
+        if self.qmm_fuse is not None:
+            fuse = self.qmm_fuse
+        elif explicit_fused_controls:
+            fuse = True
+        else:
+            fuse = fuse_policy
+        if fuse is None:
+            fuse = backend != "tpu"
+        fuse = bool(fuse)
+
+        platform_policy = policy.get("platform")
+        if platform_requested in {None, "auto"}:
+            platform = platform_policy if platform_policy is not None else ("auto" if backend != "tpu" else "xla")
+        else:
+            platform = platform_requested
+        if backend == "tpu" and fuse and platform_requested is None and platform == "auto":
+            # Keep explicit fused TPU requests deterministic.
+            platform = "pallas"
+        if backend == "tpu" and fuse and self.qmm_tpu_path is not None and platform_requested in {None, "auto"}:
+            # Explicit TPU path override implies TPU fused dispatch.
+            platform = "pallas"
+        if backend == "tpu" and platform == "auto" and not fuse:
+            platform = "xla"
+
+        use_best_config = self.qmm_use_best_config
+        if use_best_config is None:
+            use_best_config = True
+
+        kwargs: dict[str, tp.Any] = {"fuse": fuse, "platform": platform, "use_best_config": bool(use_best_config)}
+
+        allow_dense_fallback = (
+            self.qmm_allow_dense_fallback
+            if self.qmm_allow_dense_fallback is not None
+            else policy.get("allow_dense_fallback")
+        )
+        strict_fuse = self.qmm_strict_fuse if self.qmm_strict_fuse is not None else policy.get("strict_fuse")
+
+        if not fuse:
+            # Policy entries describe fused defaults, not explicit user
+            # requests. An unfused override must work in every size bucket.
+            if self.qmm_strict_fuse is not None:
+                raise ValueError("qmm_strict_fuse requires qmm_fuse=True.")
+            if self.qmm_allow_dense_fallback is not None:
+                raise ValueError("qmm_allow_dense_fallback requires qmm_fuse=True.")
+            if backend == "tpu" and self.qmm_tpu_path is not None:
+                raise ValueError("qmm_tpu_path requires qmm_fuse=True.")
+            if platform_requested in {None, "auto"}:
+                kwargs["platform"] = "xla"
+            return kwargs
+
+        if allow_dense_fallback is not None:
+            allow_dense_fallback = bool(allow_dense_fallback)
+            kwargs["allow_dense_fallback"] = allow_dense_fallback
+
+        if strict_fuse is not None:
+            strict_fuse = bool(strict_fuse)
+            if allow_dense_fallback and strict_fuse:
+                raise ValueError("qmm_allow_dense_fallback=True is incompatible with qmm_strict_fuse=True.")
+            kwargs["strict_fuse"] = strict_fuse
+        elif allow_dense_fallback is not None:
+            kwargs["strict_fuse"] = not allow_dense_fallback
+
+        if backend == "tpu":
+            kwargs["tpu_path"] = tpu_path if tpu_path is not None else "predecode"
+
+        return kwargs
+
+    def _resolve_ejkernel_params(self) -> tuple[str, int, int, bool]:
+        """Resolve ejkernel quantization parameters from the layer config.
+
+        Reads the configured quantization mode/bits/group-size from
+        ``self.config`` (via :func:`resolve_ejkernel_quant_params`) and
+        substitutes the actual group size used during weight packing if
+        ``_quantize_array`` had to clamp it.
+
+        Returns:
+            Tuple ``(mode, group_size, bits, needs_biases)`` describing the
+            ejkernel call parameters: ``mode`` is the quantization-mode
+            string, ``group_size`` the effective per-block grouping size,
+            ``bits`` the bit-width, and ``needs_biases`` whether per-group
+            zero/bias tensors must be supplied.
+        """
+        mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(self.config)
+        if self._ej_group_size is not None:
+            group_size = int(self._ej_group_size)
+        return mode, group_size, bits, needs_biases
+
+    def _quantize_array(self, array: jax.Array):
+        """Quantize an array according to the configured quantization type.
+
+        Applies the appropriate quantization function based on self.config.dtype
+        to convert a full-precision array to its quantized representation.
+
+        Args:
+            array: Full-precision array to quantize. Typically the kernel
+                weights with shape (in_features, out_features).
+
+        Returns:
+            A tuple of (quantized_array, scale_factors, bias_factors):
+                - quantized_array: The quantized weight values
+                - scale_factors: Per-block scaling factors for dequantization
+                - bias_factors: Per-block biases for affine quantization
+                  (None for non-affine modes)
+
+        Raises:
+            ValueError: If the configured quantization dtype is not supported.
+        """
+        mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
+        if mode == "channelwise":
+            self._ej_group_size = int(array.shape[0])
+            return channelwise_quantize_array(array, bits)
+        group_size = _effective_ejkernel_group_size(mode, group_size, tuple(array.shape))
+        self._ej_group_size = int(group_size)
+        if needs_biases:
+            wq, scales, biases = prepack_quantized_weights_jit(
+                array,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            return wq, scales, biases
+
+        wq, scales = prepack_quantized_weights_jit(
+            array,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        return wq, scales, None
+
+    def _runtime_config(self) -> QuantizationConfig | None:
+        """Return the quantization config of the runtime format, or ``None`` when it equals the stored one.
+
+        ``QuantizationConfig.runtime_dtype`` documents "weights are stored in ``dtype`` but computed in
+        ``runtime_dtype``". The runtime format uses that format's own default group size / bit-width.
+
+        Returns:
+            A :class:`QuantizationConfig` for the runtime format, or ``None`` when ``runtime_dtype`` is unset or
+            identical to the storage ``dtype``.
+        """
+        runtime = self.config.runtime_dtype
+        if runtime is None:
+            return None
+        runtime = QuantizationType(runtime)
+        if runtime == QuantizationType(self.config.dtype):
+            return None
+        return QuantizationConfig(dtype=runtime)
+
+    def _runtime_weights(
+        self,
+        kernel_value: jax.Array,
+        scale_value: jax.Array,
+        bias_value: jax.Array | None,
+        mode: str,
+        group_size: int,
+        bits: int,
+        needs_biases: bool,
+    ):
+        """Re-pack the stored weights into the configured runtime format.
+
+        When ``config.runtime_dtype`` differs from the storage ``dtype`` the stored codes are dequantized and
+        re-quantized into the runtime format, which then drives the quantized matmul. With no distinct runtime
+        format the inputs are returned unchanged.
+
+        Args:
+            kernel_value: Stored quantized kernel.
+            scale_value: Stored scales.
+            bias_value: Stored per-group zero-points (affine) or ``None``.
+            mode: Stored quantization mode.
+            group_size: Stored effective group size.
+            bits: Stored bit-width.
+            needs_biases: Whether the stored mode carries zero-points.
+
+        Returns:
+            ``(kernel, scales, biases, mode, group_size, bits, needs_biases)`` describing the weights the matmul
+            should consume.
+        """
+        runtime_cfg = self._runtime_config()
+        if runtime_cfg is None:
+            return kernel_value, scale_value, bias_value, mode, group_size, bits, needs_biases
+        dense = self._dequantize_array(kernel_value, scale_value, bias_value)
+        r_mode, r_group, r_bits, r_needs = resolve_ejkernel_quant_params(runtime_cfg)
+        if r_mode == "channelwise":
+            codes, scales, _ = channelwise_quantize_array(dense, r_bits)
+            return codes, scales, None, r_mode, r_group, r_bits, r_needs
+        r_group = _effective_ejkernel_group_size(r_mode, r_group, tuple(dense.shape))
+        packed = prepack_quantized_weights_jit(dense, group_size=r_group, bits=r_bits, mode=r_mode)
+        if r_needs:
+            wq, scales, biases = packed
+        else:
+            wq, scales = packed
+            biases = None
+        return wq, scales, biases, r_mode, r_group, r_bits, r_needs
+
+    def _dequantize_array(self, wq: jax.Array, scale: jax.Array, bias: jax.Array | None):
+        """Dequantize weights back to full precision for computation.
+
+        Converts quantized weights to full precision using the stored
+        scaling factors. The dequantization method depends on the
+        quantization type.
+
+        Args:
+            wq: Quantized weight array.
+            scale: Per-block scaling factors.
+            bias: Per-block bias values (affine mode) or None.
+
+        Returns:
+            Dequantized weight array in full precision (param_dtype).
+
+        Raises:
+            ValueError: If the configured quantization dtype is not supported
+                for dequantization.
+        """
+        mode, group_size, bits, _ = self._resolve_ejkernel_params()
+        if mode == "channelwise":
+            return (wq.astype(jnp.float32) * scale.astype(jnp.float32)).astype(self.param_dtype)
+        array = ej_dequantize(
+            wq,
+            scale,
+            bias,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        return array.astype(self.param_dtype)
+
+    def from_quantized(self, rngs: spx.Rngs | None = None) -> RowParallelLinear | ColumnParallelLinear:
+        """Convert this quantized module back to a regular Linear module.
+
+        Creates a non-quantized linear layer with the same configuration
+        and dequantized weights. Useful for debugging, fine-tuning, or
+        deployment scenarios where memory is not constrained.
+
+        Args:
+            rngs: Random number generators for the new module. If None,
+                creates a default Rngs with seed 0.
+
+        Returns:
+            A RowParallelLinear or ColumnParallelLinear instance with
+            dequantized weights, depending on self._direction.
+
+        Raises:
+            ValueError: If _direction is not "row" or "column".
+
+        Example:
+            >>> quantized_layer = ColumnParallelLinearQuantized(...)
+            >>> regular_layer = quantized_layer.from_quantized()
+            >>> # regular_layer is now a ColumnParallelLinear
+        """
+        if rngs is None:
+            rngs = spx.Rngs(0)
+        if self._direction == "row":
+            linear_class = RowParallelLinear
+        elif self._direction == "column":
+            linear_class = ColumnParallelLinear
+        else:
+            raise ValueError(f"Unknown direction '{self._direction}'. Use 'row' or 'column'.")
+        linear = jax.eval_shape(
+            lambda r: linear_class(
+                in_features=self.in_features,
+                out_features=self.out_features,
+                use_bias=self.use_bias,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init,
+                layout=getattr(self, "layout", None),
+                scale=getattr(self, "output_scale", 1.0),
+                sharding_layout=getattr(self, "sharding_layout", None),
+                bias_sharding_layout=getattr(self, "bias_sharding_layout", None),
+                rngs=r,
+            ),
+            rngs,
+        )
+
+        kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
+        scale_value = getattr(self.quant_scales, "value", self.quant_scales)
+        bias_value = getattr(self.quant_biases, "value", self.quant_biases)
+        dequantized_kernel = self._dequantize_array(kernel_value, scale_value, bias_value)
+        weight_metadata = dict(getattr(linear.weight, "metadata", {}))
+        weight_sharding = weight_metadata.pop("sharding", getattr(linear.weight, "sharding", None))
+        weight_axis_names = weight_metadata.pop("axis_names", None)
+        linear.weight = spx.Parameter(
+            dequantized_kernel,
+            sharding=weight_sharding,
+            axis_names=weight_axis_names,
+            metadata=weight_metadata,
+        )
+
+        if self.use_bias:
+            bias_metadata = dict(getattr(linear.bias, "metadata", {})) if linear.bias is not None else {}
+            bias_sharding = bias_metadata.pop("sharding", getattr(linear.bias, "sharding", None))
+            bias_axis_names = bias_metadata.pop("axis_names", None)
+            linear.bias = spx.Parameter(
+                self.bias.value,
+                sharding=bias_sharding,
+                axis_names=bias_axis_names,
+                metadata=bias_metadata,
+            )
+
+        return linear
+
+    def restage(self, kernel: jax.Array, bias: jax.Array | None):
+        """Update the layer's weights by quantizing new kernel values.
+
+        Replaces the current quantized weights with newly quantized versions
+        of the provided kernel. This is useful when loading pre-trained
+        weights or updating weights during training.
+
+        Args:
+            kernel: New kernel weights to quantize and store.
+                Can be a jax.Array or spx.Parameter.
+            bias: New bias values to store. Can be a jax.Array, spx.Parameter,
+                or None. Ignored if use_bias is False.
+
+        Returns:
+            self: The updated layer instance (for method chaining).
+
+        Example:
+            >>> layer = ColumnParallelLinearQuantized(...)
+            >>> new_weights = jnp.ones((768, 3072))
+            >>> layer.restage(new_weights, None)
+        """
+        kernel_value = getattr(kernel, "value", kernel)
+        bias_value = getattr(bias, "value", bias)
+        wq, scale, quant_bias = self._quantize_array(kernel_value)
+        self.quant_kernel.value = wq
+        self.quant_scales.value = scale
+        self.quant_biases.value = quant_bias
+        if self.quant_kernel_packed is not None and wq.dtype == jnp.int4:
+            # Keep the fused-W4A4 companion in sync with the fresh codes; a
+            # stale packed twin would feed the decode kernel garbage.
+            from ejkernel.modules import pack_int4_adjacent as _pack_int4_adjacent
+
+            self.quant_kernel_packed.value = _pack_int4_adjacent(wq)
+        if bias_value is not None and self.use_bias:
+            self.bias.value = bias_value
+        return self
+
+    def _resolve_shard_specs(
+        self,
+        mesh: MeshLike,
+        inputs_2d: Array,
+        kernel_value: Array,
+        scale_value: Array,
+        bias_value: Array | None,
+        is_tpu: bool,
+    ) -> tuple | None:
+        """Resolve partition specs for the distributed quantized matmul.
+
+        Inspects the input/kernel/scale/bias shardings and the active mesh to
+        decide whether a ``shard_map``-wrapped execution is viable. On TPU
+        with a row/column-parallel layer, falls back to a forced TP layout
+        even when explicit ``NamedSharding`` metadata is missing.
+
+        Args:
+            mesh: Active JAX mesh.
+            inputs_2d: Flattened activation tensor ``(M, K)``.
+            kernel_value: Quantized kernel.
+            scale_value: Quantization scales.
+            bias_value: Optional quantization-bias tensor (affine modes).
+            is_tpu: ``True`` when running on a TPU backend.
+
+        Returns:
+            Tuple ``(input_spec, kernel_spec, scale_spec, bias_spec,
+            output_spec, tp_axis_name)`` when sharded execution is viable,
+            or ``None`` to signal the caller should fall back to a direct
+            (non-mapped) matmul.
+        """
+        input_spec = partition_spec_for_mesh(inputs_2d, mesh)
+        kernel_spec = partition_spec_for_mesh(kernel_value, mesh)
+        scale_spec = partition_spec_for_mesh(scale_value, mesh)
+        bias_spec = partition_spec_for_mesh(bias_value, mesh)
+
+        tp_axis_name = None
+        use_forced_layout = False
+
+        # On TPU, force a shard_map route even when NamedSharding metadata is
+        # absent during lowered compilation.
+        if is_tpu and self._direction in {"row", "column"}:
+            tp_axis_name = _pick_tensor_axis_name(mesh)
+            if tp_axis_name is not None:
+                use_forced_layout = True
+                input_spec = jax.sharding.PartitionSpec(None, None)
+                kernel_spec = (
+                    jax.sharding.PartitionSpec(tp_axis_name, None)
+                    if self._direction == "row"
+                    else jax.sharding.PartitionSpec(None, tp_axis_name)
+                )
+                scale_spec = kernel_spec
+                if bias_value is not None:
+                    bias_rank = int(getattr(bias_value, "ndim", 0))
+                    kernel_axes = tuple(kernel_spec)
+                    if bias_rank > 0 and bias_rank <= len(kernel_axes):
+                        bias_spec = jax.sharding.PartitionSpec(*kernel_axes[-bias_rank:])
+                    elif bias_rank > 0:
+                        bias_spec = jax.sharding.PartitionSpec(*((None,) * bias_rank))
+                    else:
+                        bias_spec = jax.sharding.PartitionSpec()
+                else:
+                    bias_spec = jax.sharding.PartitionSpec()
+
+                kernel_spec = sanitize_partition_spec_for_shape(kernel_spec, tuple(kernel_value.shape), mesh)
+                scale_spec = sanitize_partition_spec_for_shape(scale_spec, tuple(scale_value.shape), mesh)
+                if bias_value is not None:
+                    bias_spec = sanitize_partition_spec_for_shape(bias_spec, tuple(bias_value.shape), mesh)
+
+        if not use_forced_layout:
+            if not any(_spec_is_sharded(s) for s in (input_spec, kernel_spec, scale_spec, bias_spec)):
+                return None
+            if self._direction not in {"row", "column"}:
+                return None
+            if not _spec_matches_kernel_parallel_layout(kernel_spec, scale_spec, self._direction):
+                return None
+            if bias_value is not None and not _spec_matches_kernel_parallel_layout(
+                kernel_spec, bias_spec, self._direction
+            ):
+                return None
+
+            tp_axis_name = _extract_tp_axis_name(kernel_spec, self._direction, mesh)
+
+            # Reject non-TP axes on the K dimension.
+            kernel_k_axes = _axis_names(kernel_spec[0] if len(kernel_spec) > 0 else None)
+            input_k_axes = _axis_names(input_spec[-1] if len(input_spec) > 0 else None)
+            if any(a != tp_axis_name for a in (*kernel_k_axes, *input_k_axes)):
+                return None
+
+            # Row-parallel reduction assumes batch is local; reject TP on batch.
+            if self._direction == "row" and tp_axis_name is not None:
+                input_batch_axes = _axis_names(input_spec[0] if len(input_spec) > 0 else None)
+                if tp_axis_name in input_batch_axes:
+                    return None
+
+        output_spec = jax.sharding.PartitionSpec(
+            input_spec[0] if len(input_spec) > 0 else None,
+            kernel_spec[1] if len(kernel_spec) > 1 else None,
+        )
+
+        return input_spec, kernel_spec, scale_spec, bias_spec, output_spec, tp_axis_name
+
+    def _distributed_quantized_matmul(
+        self,
+        inputs_2d: Array,
+        kernel_value: Array,
+        scale_value: Array,
+        bias_value: Array | None,
+        *,
+        group_size: int,
+        bits: int,
+        mode: str,
+    ) -> Array:
+        """Run the quantized matmul under ``shard_map`` with explicit TP communication.
+
+        Quantized CUDA/Pallas kernels are invoked on local shards only;
+        cross-shard semantics are restored with collectives:
+            - row parallel: reduce partial outputs with ``psum`` on TP
+            - column parallel: gather TP-sharded inputs when needed
+
+        When no mesh is detected or shard-spec resolution fails the call
+        falls back to an unmapped ejkernel matmul. Mosaic-version errors on
+        TPU trigger an automatic XLA-fallback retry when
+        ``allow_dense_fallback`` is enabled.
+
+        Args:
+            inputs_2d: Flattened activation tensor ``(M, K)``.
+            kernel_value: Quantized kernel.
+            scale_value: Per-block scales.
+            bias_value: Optional per-block bias tensor (affine modes only).
+            group_size: Quantization group size.
+            bits: Quantization bit-width.
+            mode: Quantization mode string.
+
+        Returns:
+            Output array of shape ``(M, out_features)``.
+        """
+        backend = jax.default_backend()
+        qmm_kwargs = self._qmm_runtime_kwargs(backend, m_tokens=int(inputs_2d.shape[0]), quant_mode=mode)
+
+        def _direct_matmul(runtime_kwargs: dict[str, tp.Any] | None = None) -> Array:
+            """Run ``ej_quantized_matmul`` without ``shard_map`` wrapping.
+
+            Used when no mesh is detected on the inputs (single-host /
+            replicated execution) or when shard-spec resolution fails.
+
+            Args:
+                runtime_kwargs: Optional override of the resolved qmm
+                    runtime kwargs (defaults to ``qmm_kwargs`` from the
+                    enclosing scope). Used for the XLA fallback path on
+                    Mosaic-version errors.
+
+            Returns:
+                Array: Quantized matmul result.
+            """
+            runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
+            return ej_quantized_matmul(
+                inputs_2d,
+                kernel_value,
+                scale_value,
+                bias_value,
+                transpose=False,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                **runtime_kwargs,
+            )
+
+        mesh = pick_array_mesh(inputs_2d, kernel_value, scale_value, bias_value)
+        if mesh is None:
+            try:
+                return _direct_matmul()
+            except Exception as exc:
+                if qmm_kwargs.get("allow_dense_fallback", False) and _is_mosaic_version_error(exc):
+                    return _direct_matmul(_qmm_xla_fallback_kwargs(qmm_kwargs))
+                raise
+
+        resolved = self._resolve_shard_specs(mesh, inputs_2d, kernel_value, scale_value, bias_value, backend == "tpu")
+        if resolved is None:
+            try:
+                return _direct_matmul()
+            except Exception as exc:
+                if qmm_kwargs.get("allow_dense_fallback", False) and _is_mosaic_version_error(exc):
+                    return _direct_matmul(_qmm_xla_fallback_kwargs(qmm_kwargs))
+                raise
+
+        input_spec, kernel_spec, scale_spec, bias_spec, output_spec, tp_axis_name = resolved
+        direction = self._direction
+
+        def _local_matmul(
+            local_inputs,
+            local_kernel,
+            local_scales,
+            local_biases=None,
+            runtime_kwargs: dict[str, tp.Any] | None = None,
+        ):
+            """Per-shard quantized matmul body executed under ``shard_map``.
+
+            Reconciles the input contraction (K) dimension with the local
+            kernel slice (gathers when needed for column-parallel
+            inputs), runs the quantized matmul, and ``psum``-reduces the
+            output for row-parallel layers.
+
+            Args:
+                local_inputs: Local activation slice for this device.
+                local_kernel: Local quantized-kernel slice.
+                local_scales: Local quantization scales slice.
+                local_biases: Optional local bias slice (``None`` when
+                    the layer has no bias).
+                runtime_kwargs: Optional override of the resolved qmm
+                    runtime kwargs (defaults to the captured
+                    ``qmm_kwargs``).
+
+            Returns:
+                Array: Per-shard output, reduced across TP for row-parallel.
+            """
+            runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
+            local_inputs = _reconcile_input_k_dim(
+                local_inputs,
+                local_kernel,
+                direction,
+                tp_axis_name,
+                allow_column_all_gather=self.qmm_allow_input_all_gather,
+            )
+            out = ej_quantized_matmul(
+                local_inputs,
+                local_kernel,
+                local_scales,
+                local_biases,
+                transpose=False,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                **runtime_kwargs,
+            )
+            if tp_axis_name is not None and direction == "row":
+                out = jax.lax.psum(out, tp_axis_name)
+            return out
+
+        shard_kw = dict(mesh=mesh, out_specs=output_spec, check_vma=False)
+
+        def _run_mapped(runtime_kwargs: dict[str, tp.Any] | None = None):
+            """Build the right ``shard_map`` and invoke it on the resolved specs.
+
+            Picks between a 3-input (no bias) and 4-input (with bias)
+            ``shard_map`` based on whether ``bias_value`` is ``None``.
+
+            Args:
+                runtime_kwargs: Optional override of the resolved qmm
+                    runtime kwargs (defaults to the captured
+                    ``qmm_kwargs``). Forwarded to ``_local_matmul``.
+
+            Returns:
+                Array: Sharded output of the quantized matmul.
+            """
+            runtime_kwargs = qmm_kwargs if runtime_kwargs is None else runtime_kwargs
+            if bias_value is None:
+
+                @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec), **shard_kw)
+                def _mapped(local_inputs, local_kernel, local_scales):
+                    """``shard_map`` body for the no-bias path.
+
+                    Args:
+                        local_inputs: Per-shard activation slice.
+                        local_kernel: Per-shard quantized kernel slice.
+                        local_scales: Per-shard scales slice.
+
+                    Returns:
+                        Array: Local quantized matmul output.
+                    """
+                    return _local_matmul(local_inputs, local_kernel, local_scales, runtime_kwargs=runtime_kwargs)
+
+                return _mapped(inputs_2d, kernel_value, scale_value)
+
+            @partial(shard_map, in_specs=(input_spec, kernel_spec, scale_spec, bias_spec), **shard_kw)
+            def _mapped(local_inputs, local_kernel, local_scales, local_biases):
+                """``shard_map`` body for the path with biases.
+
+                Args:
+                    local_inputs: Per-shard activation slice.
+                    local_kernel: Per-shard quantized kernel slice.
+                    local_scales: Per-shard scales slice.
+                    local_biases: Per-shard bias slice.
+
+                Returns:
+                    Array: Local quantized matmul output (with bias).
+                """
+                return _local_matmul(
+                    local_inputs,
+                    local_kernel,
+                    local_scales,
+                    local_biases,
+                    runtime_kwargs=runtime_kwargs,
+                )
+
+            return _mapped(inputs_2d, kernel_value, scale_value, bias_value)
+
+        try:
+            return _run_mapped()
+        except Exception as exc:
+            if qmm_kwargs.get("allow_dense_fallback", False) and _is_mosaic_version_error(exc):
+                return _run_mapped(_qmm_xla_fallback_kwargs(qmm_kwargs))
+            raise
+
+    @jax.named_scope("easydel-linear-quantized-call")
+    def forward(self, inputs: Array, w: Array | None = None) -> Array:
+        """Apply the quantized linear transformation to inputs.
+
+        Dequantizes weights on-the-fly and performs matrix multiplication
+        with the input. When enabled, uses ejkernel's fused quantized
+        matmul kernels for weight dequantization and multiplication.
+
+        Args:
+            inputs: Input array of shape (..., in_features).
+            w: Optional pre-dequantized weights to use instead of the
+                stored quantized weights. Useful for debugging or when
+                weights have been modified externally.
+
+        Returns:
+            Output array of shape (..., out_features) after linear
+            transformation and optional bias addition.
+
+        Note:
+            The computation path varies by configuration:
+            - If w is provided: uses standard matmul with the provided weights.
+            - Otherwise: uses ejkernel quantized_matmul.
+        """
+        if self.dtype is not None:
+            inputs = inputs.astype(self.dtype)
+
+        runtime_config = self._runtime_config() if w is None else None
+        if runtime_config is not None and runtime_config.dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
+            dense_kernel = self._dequantize_array(
+                self.quant_kernel.value, self.quant_scales.value, self.quant_biases.value
+            )
+            # These formats have ordinary integer codes rather than ejkernel's packed representation.
+            w = quantize(dense_kernel, config=runtime_config).astype(self.dtype or dense_kernel.dtype)
+
+        if w is not None:
+            kernel = w.astype(self.dtype) if self.dtype is not None else w
+            subscript = "...ik,...kj->...ij" if inputs.ndim > 1 else "...k,...kj->...j"
+            out = jnp.einsum(subscript, inputs, kernel, precision=self.precision, optimize=True)
+        else:
+            kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
+            scale_value = getattr(self.quant_scales, "value", self.quant_scales)
+            bias_value = getattr(self.quant_biases, "value", self.quant_biases)
+
+            mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
+            if needs_biases and bias_value is None:
+                raise ValueError("Affine quantization requires quant_biases; re-quantize the module weights.")
+
+            kernel_value, scale_value, bias_value, mode, group_size, bits, needs_biases = self._runtime_weights(
+                kernel_value, scale_value, bias_value, mode, group_size, bits, needs_biases
+            )
+
+            if mode == "channelwise":
+                from ejkernel.modules import channelwise_quantized_matmul as _cw_qmm
+
+                from easydel.layers.quantization._configs import explicit_activation_kwargs
+
+                act_bits = getattr(self.config, "activation_bits", None)
+                activation_kwargs = explicit_activation_kwargs(self.config) or {
+                    "quantize_activations": act_bits is not None,
+                    "activation_bits": int(act_bits) if act_bits is not None else 8,
+                }
+                out = _cw_qmm(
+                    inputs.reshape((-1, inputs.shape[-1])),
+                    kernel_value,
+                    scale_value,
+                    **activation_kwargs,
+                ).reshape((*inputs.shape[:-1], self.out_features_sum))
+            else:
+                out = self._distributed_quantized_matmul(
+                    inputs.reshape((-1, inputs.shape[-1])),
+                    kernel_value,
+                    scale_value,
+                    bias_value,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                ).reshape((*inputs.shape[:-1], self.out_features_sum))
+
+            if self.dtype is not None:
+                out = out.astype(self.dtype)
+
+        if self.output_scale != 1.0:
+            out = out * self.output_scale
+
+        bias_value: jax.Array | None = self.bias.value if self.use_bias else None
+        if self.use_bias and bias_value is not None:
+            if self.dtype is not None:
+                bias_value = bias_value.astype(self.dtype)
+            out = out + jnp.reshape(bias_value, (1,) * (out.ndim - 1) + (-1,))
+
+        return out
+
+    def native_forward(
+        self,
+        inputs: Array,
+        *,
+        w: Array | None = None,
+    ) -> Array:
+        """Trace-safe alias to the layer's forward used by LM-head helpers.
+
+        Mirrors :meth:`ParallelLinear.native_forward`: chunked LM-head and
+        rematerialised projection paths call this stable non-overridable name
+        so that the bypass remains trace-safe even when subclasses override
+        ``forward`` for fused execution.
+
+        Args:
+            inputs: Input tensor of shape ``(..., in_features)``.
+            w: Optional dense weight override (e.g. a tied embedding matrix).
+                When provided, the layer multiplies with this weight instead
+                of using the stored quantized kernel.
+
+        Returns:
+            Output tensor of shape ``(..., out_features)``.
+        """
+        return self(inputs=inputs, w=w)
+
+    @property
+    def wqdtype(self) -> QuantizationType:
+        """Get the weight quantization data type.
+
+        Returns:
+            The QuantizationType enum value indicating the quantization
+            format used for weights (INT8, NF4, MXFP4, etc.).
+        """
+        return QuantizationType(self.config.dtype)
+
+    def __repr__(self):
+        """Return a string representation of the quantized layer.
+
+        Returns:
+            A string showing the class name, in_features, out_features,
+            and the quantization data type.
+        """
+        return (
+            f"{self.__class__.__name__}("
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"wqdtype={self.wqdtype}"
+            ")"
+        )
+
+    def __str__(self):
+        """Return a string representation of the quantized layer.
+
+        Returns:
+            Same as __repr__.
+        """
+        return self.__repr__()
+
+
+class RowParallelLinearQuantized(ParallelLinearQuantized):
+    """Row-parallel variant of quantized linear layer.
+
+    This class specializes ParallelLinearQuantized for row-wise parallelism,
+    where the input dimension is partitioned across devices. In row parallelism,
+    each device holds a subset of input features and computes partial results
+    that are then reduced across devices.
+
+    Attributes:
+        _direction: Fixed to "row" to indicate row-wise parallelism.
+
+    Example:
+        >>> layer = RowParallelLinearQuantized(
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     config=config,
+        ...     rngs=rngs
+        ... )
+    """
+
+    _direction: tp.Literal["row"] = "row"
+
+
+class ColumnParallelLinearQuantized(ParallelLinearQuantized):
+    """Column-parallel variant of quantized linear layer.
+
+    This class specializes ParallelLinearQuantized for column-wise parallelism,
+    where the output dimension is partitioned across devices. In column parallelism,
+    each device computes a subset of output features independently without
+    requiring reduction.
+
+    Attributes:
+        _direction: Fixed to "column" to indicate column-wise parallelism.
+
+    Example:
+        >>> layer = ColumnParallelLinearQuantized(
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     config=config,
+        ...     rngs=rngs
+        ... )
+    """
+
+    _direction: tp.Literal["column"] = "column"

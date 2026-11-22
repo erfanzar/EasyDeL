@@ -1,0 +1,3 @@
+[submodule "libs/ejkernel/csrc/cutlass"]
+	path = libs/ejkernel/csrc/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

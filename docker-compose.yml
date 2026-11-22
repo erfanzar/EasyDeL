@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: cpu
@@ -42,7 +42,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: cuda
@@ -81,7 +81,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: tpu
@@ -124,7 +124,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: production
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: cpu
@@ -142,7 +142,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: production
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: cuda
@@ -171,7 +171,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: test
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: ${TEST_HARDWARE:-cpu}
@@ -181,6 +181,9 @@ services:
       <<: *common-variables
     volumes:
       - ./test-results:/app/test-results
+    # No test tooling or accelerator-backed test suite is installed in the final image.
+    # Fail instead of silently executing its default `bash` and reporting zero tests as green.
+    command: ["bash", "-c", "echo 'easydel-test has no test suite installed; run the accelerator-backed workspace tests on a configured host.' >&2; exit 1"]
     networks:
       - easydel-network
 
@@ -189,7 +192,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      target: final
       args:
         <<: *build-args
         HARDWARE_TYPE: ${NOTEBOOK_HARDWARE:-cpu}

@@ -1,0 +1,375 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Persistent disk-based configuration cache for kernel optimization.
+
+This module provides persistent storage for optimal kernel configurations,
+allowing optimization results to be preserved across program runs. The cache
+uses JSON files for storage with automatic serialization/deserialization.
+
+Key Features:
+    - Atomic file operations to prevent corruption
+    - Automatic serialization for dataclasses and Pydantic models
+    - Custom loader/dumper support for complex types
+    - Device and operation-specific configuration storage
+    - Thread-safe atomic updates using temporary files
+    - Provenance envelopes: only autotune-measured entries are trusted on
+      read; legacy or foreign-origin entries are ignored, not loaded
+
+The persistent cache complements the in-memory cache by providing:
+    - Long-term storage of optimization results
+    - Sharing of configurations across program runs
+    - Reduced autotuning overhead for repeated operations
+    - Backup storage for critical optimization data
+
+Example Usage:
+    >>>
+    >>> from ejkernel.ops.config.persistent import PROVENANCE_AUTOTUNE
+    >>> cache = PersistentCache('/path/to/cache.json')
+    >>> cache.put('gpu:0', 'matmul_v1', 'key123', my_config, provenance=PROVENANCE_AUTOTUNE)
+    >>> config = cache.get('gpu:0', 'matmul_v1', 'key123')
+    >>>
+    >>>
+    >>> def custom_dumper(cfg): return cfg.to_dict()
+    >>> def custom_loader(data): return MyConfig.from_dict(data)
+    >>> cache = PersistentCache('/path/to/cache.json', custom_loader, custom_dumper)
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import pathlib
+import tempfile
+from argparse import Namespace
+from collections.abc import Callable
+from dataclasses import asdict, is_dataclass
+from typing import Any, Generic, TypeVar
+
+Cfg = TypeVar("Cfg")
+
+PROVENANCE_KEY = "__ejk_provenance__"
+"""Envelope key marking a persisted entry's origin (e.g. ``'autotune'``)."""
+
+PROVENANCE_AUTOTUNE = "autotune"
+"""Provenance recorded for configurations measured by the autotuner."""
+
+CFG_CLASS_KEY = "__ejk_cfg_class__"
+"""Envelope key recording the ``module:qualname`` of a persisted dataclass / pydantic config.
+
+JSON has no tuples and no types, so without it a fresh process can only rebuild an
+``argparse.Namespace`` whose tuple fields came back as lists (e.g. the per-mode
+``(decode, prefill, mixed)`` block sizes of ``MultiLatentRaggedPageAttentionV2Config``),
+which kernels then fail to consume. Only classes under the ``ejkernel`` package are
+re-imported from this key.
+"""
+
+TRUSTED_PROVENANCE: frozenset[str] = frozenset({PROVENANCE_AUTOTUNE})
+"""Provenance values that :meth:`PersistentCache.get` will return.
+
+The on-disk cache file is shared between processes on the same host (keys are
+``device_fingerprint|op_id|call_key``), so any process — a benchmark, a
+notebook, a stray script — running the same op at the same shapes writes into
+the same entry a production run would read. Only autotune-measured winners are
+trustworthy across processes; anything else (explicit caller-provided configs,
+heuristic fallbacks, legacy entries written before provenance existed) is
+ignored on read and re-tuned instead.
+"""
+
+
+class PersistentCache(Generic[Cfg]):
+    """Disk-backed JSON cache for kernel configurations.
+
+    Stores and retrieves optimisation results across Python process restarts.
+    Uses atomic file operations (write to a temp file, then ``os.replace``) to
+    prevent data corruption during concurrent writes.
+
+    Every entry written by :meth:`put` is wrapped in a provenance envelope
+    ``{"__ejk_provenance__": <origin>, "cfg": <serialized config>}``.
+    :meth:`get` only returns entries whose provenance is in
+    :data:`TRUSTED_PROVENANCE`; legacy entries written without an envelope
+    (pre-provenance files) are treated as cache misses rather than errors, so
+    an old or polluted cache file degrades to re-tuning instead of silently
+    poisoning a run.
+
+    The cache is *best-effort*: if the backing file cannot be created or written
+    (e.g. due to permission errors or a read-only filesystem), the instance
+    silently degrades to an in-process-only cache (``_disabled = True``) rather
+    than raising an exception.
+
+    Serialization priority for :meth:`put`:
+        1. Custom ``dumper`` function (if provided at construction).
+        2. ``dataclasses.asdict()`` for dataclass instances.
+        3. ``model_dump()`` for Pydantic v2 models.
+        4. Raw value (must be JSON-serializable).
+
+    Deserialization priority for :meth:`get`:
+        1. Custom ``loader`` function (if provided at construction).
+        2. If the stored value is a ``dict`` and ``cfg_type`` was given,
+           ``cfg_type(**stored_dict)`` is called to reconstruct the object.
+        3. If the stored value is a ``dict``, no ``cfg_type`` was given, and
+           the entry recorded an ``ejkernel`` config class at :meth:`put`
+           time, that class is re-imported and called with the stored dict.
+        4. Otherwise a ``dict`` is wrapped in ``argparse.Namespace``.
+        5. Otherwise the raw JSON value is returned.
+
+        JSON lists inside dict payloads are converted back to tuples first.
+
+    Type Parameters:
+        Cfg: Configuration type to be cached.
+
+    Attributes:
+        path: Absolute path of the backing JSON file.
+        loader: Optional ``(raw_json_value) -> Cfg`` deserialiser.
+        dumper: Optional ``(Cfg) -> json_serializable`` serialiser.
+        cfg_type: Optional class used to reconstruct dict-valued cache entries
+            when no ``loader`` is provided.
+    """
+
+    def __init__(
+        self,
+        opname: str,
+        path: str | None = None,
+        loader: Callable[[Any], Cfg] | None = None,
+        dumper: Callable[[Cfg], Any] | None = None,
+        cfg_type: type[Cfg] | None = None,
+    ):
+        """Initialize persistent cache with file path and optional serializers.
+
+        Args:
+            opname: Operation name used to generate default cache filename
+            path: File path for JSON storage (default: auto-generated from opname)
+            loader: Optional function to deserialize stored data to Cfg type
+            dumper: Optional function to serialize Cfg type for storage
+            cfg_type: Optional configuration type for automatic deserialization
+
+        Note:
+            If path is not provided, the cache file is created at:
+            - $EJKERNEL_PERSISTENT_CACHE_DIR/{opname}.json (if env var set)
+            - ~/ejkernel-presistent-cache/{opname}.json (default)
+            - ./.ejkernel-presistent-cache/{opname}.json (fallback)
+            - $TMPDIR/ejkernel-presistent-cache/{opname}.json (last resort)
+
+            If loader/dumper are not provided, automatic serialization is attempted
+            for dataclasses and Pydantic models. When cfg_type is provided and
+            loader is not, retrieved dicts are automatically converted to cfg_type.
+        """
+        self._disabled = False
+        if path is None:
+            root = os.getenv("EJKERNEL_PERSISTENT_CACHE_DIR")
+            if root is not None:
+                path_obj = pathlib.Path(root).expanduser() / f"{opname}.json"
+            else:
+                path_obj = pathlib.Path().home().expanduser() / "ejkernel-presistent-cache" / f"{opname}.json"
+        else:
+            path_obj = pathlib.Path(path).expanduser()
+
+        dir_path = path_obj.parent
+        try:
+            dir_path.mkdir(exist_ok=True, parents=True)
+        except OSError:
+            fallbacks = [
+                pathlib.Path.cwd() / ".ejkernel-presistent-cache",
+                pathlib.Path(tempfile.gettempdir()) / "ejkernel-presistent-cache",
+            ]
+            for fb in fallbacks:
+                try:
+                    fb.mkdir(exist_ok=True, parents=True)
+                    path_obj = fb / f"{opname}.json"
+                    break
+                except OSError:
+                    continue
+            else:
+                self._disabled = True
+
+        self.path = str(path_obj)
+        self.loader = loader
+        self.dumper = dumper
+        self.cfg_type = cfg_type
+        if self._disabled:
+            self._data = {}
+            return
+        try:
+            with open(self.path, "r") as f:
+                loaded = json.load(f)
+            self._data = loaded if isinstance(loaded, dict) else {}
+        except (FileNotFoundError, PermissionError, OSError, ValueError):
+            self._data = {}
+
+    def _key(self, device: str, op_id: str, call_key: str) -> str:
+        """Generate internal storage key from cache coordinates.
+
+        Args:
+            device: Device fingerprint (e.g., 'gpu:0', 'tpu:v4')
+            op_id: Operation identifier with version (e.g., 'matmul@v1')
+            call_key: Function call signature hash
+
+        Returns:
+            String key for internal storage dictionary
+        """
+        return "|".join((device, op_id, call_key))
+
+    def get(self, device: str, op_id: str, call_key: str) -> Cfg | None:
+        """Retrieve cached configuration for the given coordinates.
+
+        Args:
+            device: Device fingerprint for the configuration
+            op_id: Operation identifier
+            call_key: Function call signature hash
+
+        Returns:
+            Cached configuration if found and its provenance is trusted,
+            None otherwise.
+
+        Note:
+            Only entries carrying a trusted provenance envelope (see
+            :data:`TRUSTED_PROVENANCE`) are returned. Legacy entries written
+            before provenance existed, and entries with untrusted provenance,
+            are treated as cache misses so callers re-tune instead of
+            inheriting configurations of unknown origin from other processes.
+
+            If a custom loader was provided, it is applied to the unwrapped
+            config payload. Otherwise, the raw payload is returned (dicts are
+            reconstructed via ``cfg_type`` or wrapped in a ``Namespace``).
+        """
+        if self._disabled:
+            return None
+        raw = self._data.get(self._key(device, op_id, call_key))
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or PROVENANCE_KEY not in raw:
+            return None
+        provenance = raw.get(PROVENANCE_KEY)
+        # `provenance` comes from a file this process doesn't fully control (shared
+        # across other processes/hosts); a foreign or malformed entry can carry a
+        # non-hashable value (list/dict) here, which would raise on the `in`
+        # membership check below. Reject anything that isn't a plain trusted string
+        # instead of letting a malformed entry crash every reader of this key.
+        if not isinstance(provenance, str) or provenance not in TRUSTED_PROVENANCE:
+            return None
+        cfg_class = raw.get(CFG_CLASS_KEY)
+        raw = raw.get("cfg")
+        out = None if raw is None else (self.loader(raw) if self.loader else raw)
+        if out is not None and isinstance(out, dict):
+            fields = {k: _lists_to_tuples(v) for k, v in out.items()}
+            if self.cfg_type is not None:
+                out = self.cfg_type(**fields)
+            else:
+                recorded_type = _resolve_cfg_class(cfg_class) if self.loader is None else None
+                out = None
+                if recorded_type is not None:
+                    try:
+                        out = recorded_type(**fields)
+                    except (TypeError, ValueError):
+                        # Schema drift since the entry was written: fall back to the untyped view.
+                        out = None
+                if out is None:
+                    out = Namespace(**fields)
+        return out
+
+    def put(self, device: str, op_id: str, call_key: str, cfg: Cfg, *, provenance: str):
+        """Store configuration in the cache with atomic file update.
+
+        Args:
+            device: Device fingerprint for the configuration
+            op_id: Operation identifier
+            call_key: Function call signature hash
+            cfg: Configuration to store
+            provenance: Origin of the configuration, recorded in the entry's
+                envelope. Required (no default) so every call site makes an
+                explicit, reviewable choice — the file is shared across
+                processes, and :meth:`get` trusts entries whose provenance is
+                in :data:`TRUSTED_PROVENANCE`. Only pass
+                :data:`PROVENANCE_AUTOTUNE` for winners that were actually
+                measured by the autotuner. Explicit caller-provided configs
+                and heuristic fallbacks must stay in per-process in-memory
+                caches instead — never persist them here under any
+                provenance value.
+
+        Note:
+            Uses atomic file operations (write to temporary file, then replace)
+            to ensure data consistency. If a custom dumper was provided, it will
+            be used for serialization. Otherwise, automatic serialization is
+            attempted for dataclasses and Pydantic models.
+
+        Serialization Priority:
+            1. Custom dumper function (if provided)
+            2. Dataclass.asdict() for dataclass objects
+            3. model_dump() for Pydantic v2 models
+            4. Raw value (must be JSON-serializable)
+        """
+        if self._disabled:
+            return
+        entry: dict[str, Any] = {PROVENANCE_KEY: provenance}
+        if self.dumper is not None:
+            val = self.dumper(cfg)
+        else:
+            if is_dataclass(cfg) and not isinstance(cfg, type):
+                val = asdict(cfg)
+                entry[CFG_CLASS_KEY] = _cfg_class_path(cfg)
+            elif hasattr(cfg, "model_dump"):
+                val = cfg.model_dump()
+                entry[CFG_CLASS_KEY] = _cfg_class_path(cfg)
+            else:
+                val = cfg
+        entry["cfg"] = val
+
+        self._data[self._key(device, op_id, call_key)] = entry
+
+        try:
+            dir_name = os.path.dirname(os.path.abspath(self.path)) or "."
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False) as tmp:
+                json.dump(self._data, tmp)
+                tmp_path = tmp.name
+            os.replace(tmp_path, self.path)
+        except (PermissionError, OSError):
+            self._disabled = True
+
+
+def _cfg_class_path(cfg: Any) -> str:
+    """Return ``module:qualname`` for ``cfg``'s class (recorded in the cache envelope)."""
+    cls = type(cfg)
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _resolve_cfg_class(path: Any) -> type | None:
+    """Re-import a config class recorded by :meth:`PersistentCache.put`.
+
+    Returns ``None`` for anything that is not an ``ejkernel`` dataclass / pydantic
+    model (the cache file is shared across processes, so it must not drive
+    arbitrary imports) or cannot be resolved.
+    """
+    if not isinstance(path, str) or ":" not in path:
+        return None
+    module_name, _, qualname = path.partition(":")
+    if module_name != "ejkernel" and not module_name.startswith("ejkernel."):
+        return None
+    try:
+        obj: Any = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+    except (ImportError, AttributeError):
+        return None
+    if isinstance(obj, type) and (is_dataclass(obj) or hasattr(obj, "model_validate")):
+        return obj
+    return None
+
+
+def _lists_to_tuples(value: Any) -> Any:
+    """Recursively convert JSON lists back to tuples (configs hold hashable tuples)."""
+    if isinstance(value, list):
+        return tuple(_lists_to_tuples(v) for v in value)
+    return value

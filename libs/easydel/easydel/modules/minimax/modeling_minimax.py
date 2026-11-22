@@ -1,0 +1,1438 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MiniMax (MiniMax-Text-01) model implementation.
+
+Implements the MiniMax decoder family which alternates between two attention
+flavors per layer:
+
+- ``MiniMaxLightningAttention``: a block-wise linear attention with per-head
+  exponential decay, suited for very long sequences.
+- ``MiniMaxAttention``: standard causal multi-head attention (with optional
+  sliding window) inheriting from :class:`UnifiedAttention`.
+
+Each decoder layer also contains a top-k Sparse Mixture-of-Experts feed-forward
+block (``MiniMaxSparseMoeBlock`` over ``MiniMaxExperts``) and per-component
+residual scaling factors (``*_alpha_factor`` / ``*_beta_factor``).
+
+Exports:
+    - ``MiniMaxLightningAttention``, ``MiniMaxAttention``: attention variants.
+    - ``MiniMaxExperts``, ``MiniMaxSparseMoeBlock``: MoE feed-forward blocks.
+    - ``MiniMaxDecoderLayer``: hybrid-attention + MoE decoder block.
+    - ``MiniMaxModel``: base transformer trunk.
+    - ``MiniMaxForCausalLM``: causal LM head wrapper with auxiliary MoE loss.
+"""
+
+from __future__ import annotations
+
+import typing
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesMetadata,
+    RecurrentCacheView,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, token_attention_mask_from_mask_info
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers import (
+    BaseMoeModule,
+    ColumnParallelLinear,
+    ColumnParallelMoELinear,
+    Embed,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
+    RowParallelMoELinear,
+    dense_qkv_layout,
+    split_fused_gate_up_projection,
+    split_fused_qkv_projection,
+)
+from easydel.layers.attention import UnifiedAttention
+from easydel.layers.layouts import mixtral_moe_reform_param
+from easydel.modules._base import BaseCausalLMModule
+
+from .minimax_configuration import MiniMaxConfig
+
+
+class MiniMaxLightningAttention(spx.Module):
+    """Lightning Attention — MiniMax's linear-attention block.
+
+    Replaces softmax attention with a per-head **exponentially-decaying linear
+    attention** maintaining a recurrent KV-outer-product memory
+    :math:`S_t \\in \\mathbb{R}^{d_k \\times d_v}` per head:
+
+    .. math::
+        S_t = e^{-\\lambda} \\, S_{t-1} + k_t v_t^\\top, \\qquad
+        o_t = q_t^\\top S_t
+
+    where :math:`\\lambda` is a *fixed*, non-learned per-head slope produced
+    by :meth:`_get_slope_rate` (geometric series :math:`2^{-8 i / H}` scaled
+    by a layer-depth factor — earlier layers decay faster, later layers
+    integrate longer histories). Q/K/V are silu-activated, the output is
+    sigmoid-gated by ``output_gate``, and an RMSNorm sits between the
+    aggregator and the output projection.
+
+    Implementation: prefill is computed *block-wise* with two terms per
+    block — an intra-block ``Q K^T`` masked by an exponential causal kernel
+    (``diagonal_decay``) and an inter-block contribution from the rolling
+    memory ``S`` (``query_decay``/``key_decay`` factors). Decode (mode ==
+    ``MODE_DECODE``) collapses to the single-token recurrence above.
+    The recurrent ``S`` is what is carried in :class:`RecurrentCacheView`.
+
+    Attributes:
+        qkv_proj, out_proj, output_gate: Linear projections for the QKV fan-in,
+            output projection, and the sigmoid output gate.
+        norm (RMSNorm): RMSNorm applied to the aggregated head outputs before
+            gating.
+        layer_idx (int): Layer index, used to compute the depth-dependent
+            decay scale.
+        block_size (int): Size of the block-wise scan during prefill.
+        head_dim (int): Per-head Q/K/V dimension.
+        num_attention_heads (int): Number of independent decay-attention
+            heads.
+        num_hidden_layers (int): Total layers (used to scale the decay
+            factor).
+        hidden_size (int): Channel dimension of the input/output.
+        act_fn: Pre-projection activation applied to the fused QKV.
+    """
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize the MiniMaxLightningAttention module.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+            layer_idx (int): Index of this layer in the transformer stack.
+        """
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_hidden_layers = config.num_hidden_layers
+        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.block_size = config.block_size
+        self.act_fn = ACT2FN[config.hidden_act]
+
+        self.qkv_proj = ColumnParallelLinear(
+            config.hidden_size,
+            (
+                self.num_attention_heads * self.head_dim,
+                self.num_attention_heads * self.head_dim,
+                self.num_attention_heads * self.head_dim,
+            ),
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            layout=dense_qkv_layout(
+                self.num_attention_heads * self.head_dim,
+                self.num_attention_heads * self.head_dim,
+                source_is_fused=True,
+            ),
+        )
+        self.out_proj = RowParallelLinear(
+            self.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+        self.output_gate = ColumnParallelLinear(
+            config.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+        self.norm = RMSNorm(
+            self.num_attention_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    @property
+    def reform_param(self):
+        """Reorder the checkpoint's per-head ``qkv_proj`` into EasyDeL's ``[Q | K | V]``.
+
+        HF MiniMax packs the lightning-attention projection per head
+        (``reshape(heads, 3 * head_dim)`` then split), while the runtime splits
+        one contiguous ``[Q_all | K_all | V_all]`` tensor. The prefused layout
+        rule then handles the TP interleave and transpose (and their inverse
+        on export).
+        """
+        heads, head_dim = self.num_attention_heads, self.head_dim
+        rules = self.qkv_proj.build_reform_param("qkv_proj", config=self.config)
+        rule = rules["qkv_proj.weight$"]
+        split, inverse = rule["splits"][0]["spliter"], rule["inverse_spliter"]
+
+        def _per_head_to_contiguous(tensor):
+            rest = tensor.shape[1:]
+            return tensor.reshape(heads, 3, head_dim, *rest).transpose(0, 1).reshape(3 * heads * head_dim, *rest)
+
+        def _contiguous_to_per_head(tensor):
+            rest = tensor.shape[1:]
+            return tensor.reshape(3, heads, head_dim, *rest).transpose(0, 1).reshape(3 * heads * head_dim, *rest)
+
+        rule["splits"][0]["spliter"] = lambda tensor: split(_per_head_to_contiguous(tensor))
+        rule["inverse_spliter"] = lambda torch, tensor: _contiguous_to_per_head(inverse(torch, tensor)).contiguous()
+        return rules
+
+    def _get_slope_rate(self) -> Array:
+        """Build the per-head exponential decay scalar :math:`\\lambda`.
+
+        Slopes are picked from the geometric sequence
+        :math:`\\lambda_h = 2^{-8 (h+1) / H}` (head ``h``, ``H = num_heads``)
+        and scaled by ``1 - layer_idx / (num_hidden_layers - 1)``. The
+        layer-depth factor makes early layers decay aggressively (short
+        memory) and late layers decay slowly (long memory), which is what
+        gives Lightning Attention its long-context behaviour without
+        learnable decay parameters.
+
+        Returns:
+            jax.Array: ``(num_heads, 1, 1)`` float32 tensor of per-head
+            decay rates suitable for broadcasting against ``(seq, head_dim)``.
+        """
+        base = 1.0 / (2.0 ** (8.0 / self.num_attention_heads))
+        exponent = jnp.arange(self.num_attention_heads, dtype=jnp.float32) + 1.0
+        factor = 1.0 - float(self.layer_idx) / (float(self.num_hidden_layers) - 1.0 + 1e-5) + 1e-5
+        rate = (base**exponent) * factor
+        return rate[:, None, None].astype(jnp.float32)
+
+    def _decay_factors(self, slope_rate: Array) -> tuple[Array, Array, Array]:
+        """Materialize the three per-block decay tensors used in the chunked scan.
+
+        For a block of length ``block_size``:
+
+        * ``query_decay[i] = exp(-λ * (i + 1))`` weights how strongly each
+          query in this block reads from the rolling memory carried over
+          from the previous block.
+        * ``key_decay[i] = exp(-λ * (block_size - i))`` weights how strongly
+          each key contributes to the next block's rolling memory.
+        * ``diagonal_decay[i, j] = exp(λ * (i - j))`` for ``i >= j`` and
+          ``0`` for ``i < j`` — the *exponential causal kernel* used inside
+          the intra-block ``Q K^T``, replacing softmax with a cheaply
+          differentiable substitute.
+
+        Args:
+            slope_rate: Per-head decay :math:`\\lambda`, shape ``(num_heads, 1, 1)``.
+
+        Returns:
+            tuple: ``(query_decay, key_decay, diagonal_decay)`` with shapes
+            ``(num_heads, block_size, 1)``, ``(num_heads, block_size, 1)``,
+            ``(1, 1, block_size, block_size)``.
+        """
+        block_size_range = jnp.arange(self.block_size, dtype=jnp.float32) + 1.0
+        block_size_range_2d = block_size_range[:, None]
+
+        query_decay = jnp.exp(-slope_rate * block_size_range_2d)
+        key_decay = jnp.exp(-slope_rate * (float(self.block_size) - block_size_range_2d))
+
+        diagonal_decay = block_size_range_2d - block_size_range[None, :]
+        diagonal_decay = diagonal_decay[None, None, :, :]
+        diagonal_decay = slope_rate * diagonal_decay
+        diagonal_decay = jnp.where(diagonal_decay >= 0, -diagonal_decay, -jnp.inf)
+        diagonal_decay = jnp.exp(diagonal_decay)
+
+        return query_decay, key_decay, diagonal_decay
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: RecurrentCacheView | None = None,
+        mask_info: MaskInfo | None = None,
+    ) -> tuple[Float[Array, "batch seq_len hidden_dim"], RecurrentCacheView | None]:
+        """Run Lightning Attention with the appropriate prefill/decode path.
+
+        Two branches:
+
+        * **Prefill** (``mode != MODE_DECODE``): split the sequence into
+          ``ceil(seq_len / block_size)`` chunks. For each chunk compute the
+          full output as ``intra(chunk) + inter(chunk)``: the intra-chunk
+          term is :math:`(Q K^\\top \\odot \\text{diag\\_decay})V` and the
+          inter-chunk term reads from the rolling memory ``S``. After the
+          chunk, ``S`` is decayed by ``exp(-λ * block_size)`` and updated
+          with :math:`\\sum (k_t \\, e^{-λ(B-t)}) v_t^\\top`. Padding tokens
+          are masked out of the *value* stream so their keys do not
+          contaminate ``S``.
+        * **Decode** (``mode == MODE_DECODE``): run the scalar recurrence
+          ``S = exp(-λ) * S + k v^T`` once per token and project queries
+          against the updated ``S``.
+
+        Args:
+            hidden_states: ``(batch, seq_len, hidden_size)`` block input.
+            attention_mask: Optional ``(batch, seq_len)`` 0/1 mask used to
+                zero-out padding values during prefill.
+            mode: Runtime mode toggling between the chunked-prefill and
+                single-step-decode code paths.
+            cache_view: Per-layer recurrent state carrying ``S`` of shape
+                ``(batch, num_heads, head_dim, head_dim)``. ``None`` skips
+                state threading entirely.
+            mask_info: Token validity and packed-document segments. Segment
+                transitions reset the rolling memory and isolate intra-block
+                products, including transitions across block boundaries.
+
+        Returns:
+            tuple: ``(attn_output, cache_view)`` where ``attn_output`` has
+            shape ``(batch, seq_len, hidden_size)`` and ``cache_view`` is
+            the updated recurrent state (or ``None``).
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        segment_ids = packed_segment_ids_from_mask_info(mask_info, seq_len)
+        token_mask = token_attention_mask_from_mask_info(mask_info, seq_len)
+        if attention_mask is not None:
+            explicit_mask = attention_mask[:, -seq_len:].astype(jnp.bool_)
+            token_mask = explicit_mask if token_mask is None else token_mask & explicit_mask
+        # Run IDs, rather than document labels alone, also isolate repeated
+        # segment labels separated by another document or padding.
+        segment_runs = None
+        if segment_ids is not None:
+            segment_runs = jnp.cumsum(
+                jnp.concatenate(
+                    (jnp.zeros_like(segment_ids[:, :1]), (segment_ids[:, 1:] != segment_ids[:, :-1]).astype(jnp.int32)),
+                    axis=1,
+                ),
+                axis=1,
+            )
+
+        slope_rate = self._get_slope_rate()
+        query_decay, key_decay, diagonal_decay = self._decay_factors(slope_rate)
+
+        qkv_states = self.act_fn(checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv"))
+        q_size = self.num_attention_heads * self.head_dim
+        query_states, key_states, value_states = split_fused_qkv_projection(
+            qkv_states,
+            q_size=q_size,
+            kv_size=q_size,
+            config=self.config,
+        )
+        query_states = query_states.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        query_states = apply_logical_sharding(
+            query_states,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        key_states = apply_logical_sharding(
+            key_states,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        value_states = apply_logical_sharding(
+            value_states,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        query_states = jnp.transpose(query_states, (0, 2, 1, 3))
+        key_states = jnp.transpose(key_states, (0, 2, 1, 3))
+        value_states = jnp.transpose(value_states, (0, 2, 1, 3))
+
+        attn_weights_inter: Array
+        if cache_view is not None and cache_view.recurrent_state is not None:
+            attn_weights_inter = cache_view.recurrent_state
+        else:
+            attn_weights_inter = jnp.zeros(
+                (batch_size, self.num_attention_heads, self.head_dim, self.head_dim), dtype=value_states.dtype
+            )
+
+        if token_mask is not None:
+            value_states = jnp.where(token_mask[:, None, :, None], value_states, jnp.zeros_like(value_states))
+
+        if mode != common_types.MODE_DECODE:
+            attn_outputs = []
+            for i in range(num_blocks):
+                start_idx = i * self.block_size
+                end_idx = min(start_idx + self.block_size, seq_len)
+                current_block_size = end_idx - start_idx
+
+                current_query_states = query_states[:, :, start_idx:end_idx]
+                current_key_states = key_states[:, :, start_idx:end_idx]
+                current_value_states = value_states[:, :, start_idx:end_idx]
+
+                current_query_decay = query_decay[:, :current_block_size]
+                current_key_decay = key_decay[:, -current_block_size:]
+                current_diagonal_decay = diagonal_decay[:, :, :current_block_size, :current_block_size]
+                block_decay = jnp.exp(-slope_rate * float(current_block_size))
+
+                if segment_runs is not None:
+                    runs = segment_runs[:, start_idx:end_idx]
+                    incoming_run = segment_runs[:, max(start_idx - 1, 0)]
+                    same_run = runs[:, :, None] == runs[:, None, :]
+                    current_diagonal_decay = current_diagonal_decay * same_run[:, None]
+                    # Only the run continuing the incoming memory can read it;
+                    # the final run alone contributes to the outgoing memory.
+                    current_query_decay = current_query_decay * (runs == incoming_run[:, None])[:, None, :, None]
+                    current_key_decay = current_key_decay * (runs == runs[:, -1:])[:, None, :, None]
+                    block_decay = block_decay * (runs[:, -1] == incoming_run)[:, None, None, None]
+
+                attn_weights_intra = jnp.matmul(current_query_states, jnp.swapaxes(current_key_states, -1, -2))
+                attn_output_intra = jnp.matmul(attn_weights_intra * current_diagonal_decay, current_value_states)
+
+                attn_output_inter = jnp.matmul(current_query_states * current_query_decay, attn_weights_inter)
+                current_attn_output = attn_output_inter + attn_output_intra
+                attn_outputs.append(current_attn_output)
+
+                next_attn_weights_inter = jnp.matmul(
+                    jnp.swapaxes(current_key_states * current_key_decay, -1, -2),
+                    current_value_states,
+                )
+                attn_weights_inter = attn_weights_inter * block_decay + next_attn_weights_inter
+
+            attn_output = jnp.concatenate(attn_outputs, axis=-2)
+        else:
+            ratio = jnp.exp(-slope_rate)
+            attn_outputs = []
+            for i in range(seq_len):
+                current_query_states = query_states[:, :, i : i + 1]
+                current_key_states = key_states[:, :, i : i + 1]
+                current_value_states = value_states[:, :, i : i + 1]
+
+                current_attn_weights_inter = jnp.matmul(
+                    jnp.swapaxes(current_key_states, -1, -2),
+                    current_value_states,
+                )
+                if segment_runs is not None and i > 0:
+                    reset = segment_runs[:, i] != segment_runs[:, i - 1]
+                    attn_weights_inter = jnp.where(reset[:, None, None, None], 0, attn_weights_inter)
+                attn_weights_inter = ratio * attn_weights_inter + current_attn_weights_inter
+                current_attn_output = jnp.matmul(current_query_states, attn_weights_inter)
+                attn_outputs.append(current_attn_output)
+            attn_output = jnp.concatenate(attn_outputs, axis=-2)
+
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
+        attn_output = attn_output.reshape(batch_size, seq_len, self.num_attention_heads * self.head_dim)
+        attn_output = self.norm(attn_output)
+        attn_output = jax.nn.sigmoid(checkpoint_name(self.output_gate(hidden_states), "attn_gate")) * attn_output
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        if token_mask is not None:
+            attn_output = jnp.where(token_mask[:, :, None], attn_output, 0)
+        if cache_view is not None:
+            cache_view = cache_view.update_recurrent_state(attn_weights_inter)
+
+        return typing.cast(Array, attn_output), cache_view
+
+
+class MiniMaxAttention(UnifiedAttention[MiniMaxConfig]):
+    """Standard multi-head attention module for MiniMax models.
+
+    This module extends UnifiedAttention to provide standard causal self-attention
+    with optional sliding window support. Used in layers that require full attention
+    as opposed to lightning (linear) attention.
+
+    Attributes:
+        Inherits all attributes from UnifiedAttention.
+    """
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize the MiniMaxAttention module.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+            layer_idx (int): Index of this layer in the transformer stack.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=getattr(config, "sliding_window", None),
+        )
+
+
+class MiniMaxExperts(spx.Module):
+    """Expert feed-forward networks for MiniMax Mixture-of-Experts layers.
+
+    This module implements the expert networks used in the sparse MoE architecture.
+    Each expert consists of a gated feed-forward network with up-projection (w1),
+    gate projection (w3), and down-projection (w2) layers.
+
+    Attributes:
+        config: Model configuration object.
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: JAX precision setting for matrix operations.
+        w1: Up-projection linear layer.
+        w2: Down-projection linear layer.
+        w3: Gate projection linear layer.
+        act_fn: Activation function for the gating mechanism.
+    """
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the MiniMaxExperts module.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        init = jax.nn.initializers.normal(config.initializer_range)
+        self.gate_up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=2 * config.intermediate_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=init,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.w2 = RowParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=init,
+            partition_manager=config.runtime_sharding_resolver,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "tokens hidden_dim"],
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
+        """Forward pass through the expert networks.
+
+        Computes gated feed-forward transformation: w2(act(w1(x)) * w3(x)).
+
+        Args:
+            hidden_states (Array): Input tensor of shape (tokens, hidden_dim).
+            group_sizes (Array): Number of tokens assigned to each expert.
+            sorted_experts (Array | None, optional): Sorted expert indices for routing.
+                Defaults to None.
+
+        Returns:
+            Array: Output tensor of shape (tokens, hidden_dim).
+        """
+        gate_up = self.gate_up_proj(hidden_states, group_sizes, sorted_experts)
+        # The fused expert kernel is TP-interleaved (FusedExpertLayout); a
+        # contiguous split would mix gate and up columns whenever tp > 1.
+        gate, up = split_fused_gate_up_projection(gate_up, config=self.config)
+        return self.w2(self.act_fn(gate) * up, group_sizes, sorted_experts)
+
+
+class MiniMaxSparseMoeBlock(BaseMoeModule):
+    """Sparse Mixture-of-Experts block for MiniMax models.
+
+    This module implements top-k expert routing with load balancing. Each token
+    is routed to a subset of experts based on router logits, and the outputs
+    are combined using weighted averaging.
+
+    Attributes:
+        config: Model configuration object.
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: JAX precision setting for matrix operations.
+        gate: Router network that produces expert selection logits.
+        experts: The MiniMaxExperts module containing all expert networks.
+        jitter_noise: Noise level for router jitter during training.
+    """
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the MiniMaxSparseMoeBlock module.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+        """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.rngs = rngs
+
+        self.gate = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_local_experts,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+        self.experts = MiniMaxExperts(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        def _normalize_weights(weights: Array) -> Array:
+            """Renormalise top-k expert gates to sum to 1 along the last axis.
+
+            Plugged into ``moe_hooks.refine_weights_hook`` so MiniMax routes
+            tokens by *softmax-then-renormalise-after-top-k*, matching the
+            reference HF implementation. The ``1e-8`` floor avoids division
+            by zero when all gates collapse to the same expert under fp16.
+            """
+            return weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-8)
+
+        self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=_normalize_weights)
+
+        self.jitter_noise = config.router_jitter_noise
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        training: bool = False,
+        layer_idx: int | None = None,
+    ) -> tuple[Array, Array]:
+        """Forward pass through the sparse MoE block.
+
+        Routes each token to top-k experts and combines their outputs.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            training (bool, optional): Whether the model is in training mode (enables jitter noise).
+                Defaults to False.
+            layer_idx (int | None, optional): Layer index for auxiliary loss computation.
+                Defaults to None.
+
+        Returns:
+            tuple[Array, Array]: A tuple containing the output hidden states of shape
+                (batch, seq_len, hidden_dim) and router logits for auxiliary loss computation.
+        """
+        if training and self.jitter_noise > 0:
+            hidden_states = hidden_states * jax.random.uniform(
+                self.rngs.param,
+                shape=hidden_states.shape,
+                minval=1.0 - self.jitter_noise,
+                maxval=1.0 + self.jitter_noise,
+            )
+
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
+            wd_kernel=self.experts.w2.kernel_view(),
+            act_fn=self.experts.act_fn,
+            layer_idx=layer_idx,
+        )
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
+
+
+class MiniMaxDecoderLayer(spx.Module):
+    """One MiniMax block: hybrid attention plus sparse MoE feed-forward.
+
+    The attention type per layer is read from ``config.layer_types[layer_idx]``;
+    layers tagged ``"linear_attention"`` use :class:`MiniMaxLightningAttention`
+    and the corresponding ``linear_attn_*`` residual scaling factors, while
+    ``"full_attention"`` layers use the standard softmax :class:`MiniMaxAttention`
+    with the ``full_attn_*`` factors. Both branches feed a
+    :class:`MiniMaxSparseMoeBlock`. Residuals are scaled by the configured
+    ``alpha_factor`` (residual stream contribution) / ``beta_factor`` (sub-layer
+    contribution) so the architecture can match HF MiniMax-Text-01 weight
+    behaviour exactly:
+
+    .. math::
+        x \\leftarrow \\alpha_a \\, x + \\beta_a \\, \\text{attn}(\\text{RMSNorm}(x)),
+        \\qquad
+        x \\leftarrow \\alpha_m \\, x + \\beta_m \\, \\text{MoE}(\\text{RMSNorm}(x))
+
+    Attributes:
+        layer_type (str): ``"linear_attention"`` or ``"full_attention"``;
+            determines which attention block this layer instantiates.
+        self_attn (spx.Module): Either :class:`MiniMaxLightningAttention` or
+            :class:`MiniMaxAttention`.
+        block_sparse_moe (MiniMaxSparseMoeBlock): Top-k MoE feed-forward.
+        input_layernorm, post_attention_layernorm (RMSNorm): Pre-attention
+            and pre-MLP RMSNorms.
+        attn_alpha_factor, attn_beta_factor (float): Residual / sub-layer
+            scales for the attention block; selected from the linear vs full
+            config groups based on ``layer_type``.
+        mlp_alpha_factor, mlp_beta_factor (float): Residual / sub-layer
+            scales for the MoE block.
+    """
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize the MiniMaxDecoderLayer module.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing layer parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+            layer_idx (int): Index of this layer in the transformer stack.
+        """
+        self.config = config
+        self.layer_idx = layer_idx
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.layer_type = config.layer_types[layer_idx] if config.layer_types is not None else "full_attention"
+
+        if self.layer_type == "linear_attention":
+            attn_block: type[spx.Module] = MiniMaxLightningAttention
+            self.attn_alpha_factor = config.linear_attn_alpha_factor
+            self.attn_beta_factor = config.linear_attn_beta_factor
+        else:
+            attn_block = MiniMaxAttention
+            self.attn_alpha_factor = config.full_attn_alpha_factor
+            self.attn_beta_factor = config.full_attn_beta_factor
+
+        mlp_block: type[spx.Module] = MiniMaxSparseMoeBlock
+
+        self.self_attn = attn_block(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+        self.block_sparse_moe = mlp_block(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.mlp_alpha_factor = config.mlp_alpha_factor
+        self.mlp_beta_factor = config.mlp_beta_factor
+
+    @property
+    def reform_param(self):
+        return mixtral_moe_reform_param(config=self.config)
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo,
+        position_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RecurrentCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        frequencies: Array | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with attention (lightning or standard)
+        followed by sparse MoE feed-forward network.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Mask information for attention computation.
+            position_ids (Array): Position indices of shape (batch, seq_len).
+            attention_mask (Array | None): Optional boolean mask of shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view (TransformerCacheView | RecurrentCacheView | None, optional): Cache view
+                for key-value or recurrent state caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, cache view,
+                and router logits.
+        """
+        residual = self.input_layernorm(hidden_states)
+        residual = apply_logical_sharding(
+            residual,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        attn_weights = None
+        if self.layer_type == "linear_attention":
+            linear_cache = cache_view if isinstance(cache_view, RecurrentCacheView) else None
+            attn_out, linear_cache = self.self_attn(
+                residual,
+                attention_mask=attention_mask,
+                mode=mode,
+                cache_view=linear_cache,
+                mask_info=mask_info,
+            )
+            cache_view = linear_cache
+        else:
+            kv_cache = cache_view if isinstance(cache_view, TransformerCacheView) else None
+            attn_outputs: AttentionLayerOutput = self.self_attn(
+                residual,
+                mask_info,
+                position_ids,
+                mode,
+                kv_cache,
+                cache_metadata,
+                output_attentions,
+                frequencies,
+            )
+            attn_out = attn_outputs.attention_output
+            attn_weights = attn_outputs.attention_weight
+            cache_view = attn_outputs.cache_view
+
+        hidden_states = residual * self.attn_alpha_factor + attn_out * self.attn_beta_factor
+
+        ff_input = self.post_attention_layernorm(hidden_states)
+        training = mode == common_types.MODE_TRAIN
+        ff_out, router_logits = self.block_sparse_moe(ff_input, training=training, layer_idx=self.layer_idx)
+        hidden_states = ff_input * self.mlp_alpha_factor + ff_out * self.mlp_beta_factor
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=attn_weights if output_attentions else None,
+            cache_view=cache_view,
+            router_logits=router_logits if output_router_logits else None,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=MiniMaxConfig, model_type="minimax")
+@register_module(TaskType.BASE_MODULE, config=MiniMaxConfig, model_type="minimax_text_01")
+@register_module(TaskType.BASE_MODULE, config=MiniMaxConfig, model_type="MiniMaxText01")
+class MiniMaxModel(EasyDeLBaseModule):
+    """MiniMax-Text-01 base trunk: embeddings + hybrid attention/MoE stack + final RMSNorm.
+
+    Each layer's attention type is read from ``config.layer_types``; in the
+    canonical MiniMax-Text-01 schedule a 1:7 ratio (one full attention layer
+    every eight blocks) gives most of the long-context speedup while keeping
+    a few softmax layers for accuracy. Linear-attention layers consume
+    :class:`RecurrentCacheView` slots from a hybrid cache; full-attention
+    layers consume :class:`TransformerCacheView` slots from the same hybrid
+    cache. Token embedding -> ``num_hidden_layers`` :class:`MiniMaxDecoderLayer`
+    blocks (executed via :meth:`nn.ModuleList.scan`) -> final RMSNorm.
+
+    Attributes:
+        embed_tokens (Embed): Token embedding ``(vocab_size, hidden_size)``.
+        layers (nn.ModuleList[MiniMaxDecoderLayer]): One block per layer,
+            assigned to pipeline stages via :func:`spx.assign_stage`.
+        norm (RMSNorm): Final RMS normalization at ``rms_norm_eps``.
+    """
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the MiniMaxModel.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing architecture parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                rngs=rngs,
+            )
+
+        remat_layer_block = auto_remat(
+            MiniMaxDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for layer_idx in range(config.num_hidden_layers):
+            with self.assign_layer_stage(layer_idx, total_layers=config.num_hidden_layers):
+                self.layers.append(
+                    remat_layer_block(
+                        config=config,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                        layer_idx=layer_idx,
+                    )
+                )
+
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> MoeModelOutput:
+        """Forward pass through the MiniMax model.
+
+        Processes input tokens through embedding, all decoder layers with hybrid attention
+        (lightning and standard) and sparse MoE feed-forward networks, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_dim). Mutually exclusive with input_ids. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape (batch, seq_len)
+                to avoid attention on padding tokens. Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed mask information for attention.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices of shape (batch, seq_len).
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights
+                from all layers. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits
+                from MoE layers. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train, decode, etc.).
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for incremental decoding. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional hidden_states, attentions,
+                router_logits, all_router_losses, and updated past_key_values.
+
+        Raises:
+            ValueError: If both or neither of input_ids and inputs_embeds are provided.
+            ValueError: If sequence length exceeds max_position_embeddings.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of `input_ids` or `inputs_embeds`.")
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+
+        sequence_length = inputs_embeds.shape[1]
+        if sequence_length > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Maximum Position Embedding Reached (expected <= {self.config.max_position_embeddings}, got {sequence_length})."
+            )
+
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        all_router_logits = () if output_router_logits else None
+
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        hidden_states = inputs_embeds
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+
+        if past_key_values is None:
+            past_key_values = HybridCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        # Router-logit aggregation grows a Python tuple per layer, which
+        # lax.scan cannot carry — collecting it forces the trace path too.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache or bool(output_router_logits),
+        )
+        cache_views = views if trace_layers else None
+        # Hoisted out of the loop body: the caching property must not be
+        # first materialized inside the lax.scan trace (tracer leak).
+        frequencies = self.frequencies
+
+        def _layer_loop(block, carry):
+            """Body of the MiniMax decoder scan over hybrid attention layers.
+
+            Carry: ``(hidden_states, cv, all_hidden_states, all_attentions,
+            all_router_logits, layer_index)``. ``block`` may be either a
+            *lightning* (linear-attention) layer or a softmax-attention
+            layer; the shared :class:`HybridCache` view at ``idx`` decides
+            which kernel to use. ``attention_mask`` is forwarded raw so
+            lightning attention can apply its window-free padding correction.
+            """
+            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hidden_states,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=bool(output_attentions),
+                    output_router_logits=bool(output_router_logits),
+                    frequencies=frequencies,
+                )
+
+            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+            if output_attentions:
+                all_attentions += (layer_outputs.attention_weight,)
+
+            if output_router_logits:
+                all_router_logits += (layer_outputs.router_logits,)
+
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+
+            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+            _layer_loop,
+            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        router_losses = None
+        if output_router_logits and all_router_logits is not None:
+            router_losses = (
+                auxiliary_load_balancing_loss_func(
+                    gate_logits=all_router_logits,
+                    num_experts=self.config.num_local_experts,
+                    top_k=self.config.num_experts_per_tok,
+                    attention_mask=attention_mask,
+                ),
+            )
+
+        return MoeModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            router_logits=all_router_logits,
+            all_router_losses=router_losses,
+            past_key_values=past_key_values,
+        )
+
+    def get_encoder(self):
+        """Get the encoder module.
+
+        Raises:
+            NotImplementedError: MiniMax is a decoder-only architecture.
+        """
+        raise NotImplementedError("MiniMax is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """Get the decoder module.
+
+        Returns:
+            The model itself, as MiniMax is a decoder-only architecture.
+        """
+        return self
+
+    def get_lm_head(self):
+        """Get the language model head.
+
+        Raises:
+            NotImplementedError: The base model does not include an LM head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """Get the token embedding layer.
+
+        Returns:
+            The embed_tokens module.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=MiniMaxConfig, model_type="minimax")
+@register_module(TaskType.CAUSAL_LM, config=MiniMaxConfig, model_type="minimax_text_01")
+@register_module(TaskType.CAUSAL_LM, config=MiniMaxConfig, model_type="MiniMaxText01")
+class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # type: ignore
+    """MiniMax model with a causal language modeling head.
+
+    This model extends MiniMaxModel with a language modeling head for next-token
+    prediction tasks. It supports both training and generation with hybrid caching
+    for efficient inference.
+
+    Attributes:
+        _task_type: The task type (CAUSAL_LM).
+        _model_type: The model type identifier.
+        _config_class: The configuration class for this model.
+        model: The underlying MiniMaxModel backbone.
+        lm_head: Linear layer projecting hidden states to vocabulary logits.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "minimax_text_01"
+    _config_class = MiniMaxConfig
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize the MiniMaxForCausalLM model.
+
+        Args:
+            config (MiniMaxConfig): Model configuration containing architecture parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generators for initialization.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=MiniMaxModel,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+            router_aux_loss_coef=config.router_aux_loss_coef,
+        )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> MoeCausalLMOutput:
+        """Forward pass for causal language modeling.
+
+        Processes input through the MiniMax backbone and applies the language model head
+        to produce next-token logits.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_dim). Mutually exclusive with input_ids. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape (batch, seq_len)
+                to avoid attention on padding tokens. Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed mask information for attention.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices of shape (batch, seq_len).
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights
+                from all layers. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits
+                from MoE layers. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train, decode, etc.).
+                Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for incremental decoding. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head.
+                Defaults to True.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, optional hidden_states, attentions,
+                router_logits, auxiliary_loss, and updated past_key_values.
+        """
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+        )
+
+    def get_inference_cache_type(self) -> str:
+        """Get the cache type used for inference.
+
+        Returns:
+            The string "hybrid" indicating this model uses hybrid caching
+            (combining transformer and recurrent caches).
+        """
+        return "hybrid"
+
+    def get_operations_cache_view(self) -> dict[int, type]:
+        """Get the cache view type for each layer.
+
+        Returns:
+            dict[int, type]: A dictionary mapping layer indices to their respective
+                cache view types (RecurrentCacheView for lightning attention,
+                TransformerCacheView for standard attention).
+        """
+        from easydel.caching import RecurrentCacheView, TransformerCacheView
+
+        layer_types = self.config.get_text_config().layer_types
+        return {
+            idx: RecurrentCacheView if layer_type == "linear_attention" else TransformerCacheView
+            for idx, layer_type in enumerate(layer_types)
+        }
+
+    def create_recurrent_cache_config(self, batch_size: int):
+        """Create configuration for recurrent cache used in lightning attention layers.
+
+        Args:
+            batch_size (int): The batch size for cache allocation.
+
+        Returns:
+            RecurrentCacheConfig: Configuration with appropriate dimensions for the
+                model's lightning attention layers.
+        """
+        from spectrax import PartitionAxis
+
+        from easydel.caching import RecurrentCacheConfig
+
+        text_config = self.config.get_text_config()
+        partition_axis = getattr(text_config, "partition_axis", None) or PartitionAxis()
+        num_hidden_layers = int(getattr(text_config, "num_hidden_layers", 1))
+        num_heads = int(getattr(text_config, "num_attention_heads", 1))
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            head_dim = int(text_config.hidden_size // text_config.num_attention_heads)
+
+        return RecurrentCacheConfig.create(
+            num_hidden_layers=num_hidden_layers,
+            partition_axis=partition_axis,
+            batch_size=int(batch_size),
+            conv_dim=1,
+            conv_kernel_size=1,
+            recurrent_state_shape=(num_heads, int(head_dim), int(head_dim)),
+        )

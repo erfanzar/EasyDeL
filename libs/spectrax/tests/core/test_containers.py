@@ -1,0 +1,812 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Exhaustive tests for :mod:`spectrax.core.containers`."""
+
+from __future__ import annotations
+
+import functools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import spectrax as spx
+from spectrax.core.containers import (
+    ModuleDict,
+    ModuleList,
+    ParameterList,
+    Sequential,
+    StackedModuleList,
+    _build_scan_plan_from_modules,
+    _build_scan_plan_from_stacked,
+)
+from spectrax.core.module import Module
+from spectrax.core.variable import Parameter
+from spectrax.nn.linear import Linear
+
+
+def _linear(rngs_seed=0):
+    """Return a small :class:`Linear` for tests."""
+    from spectrax.rng.rngs import Rngs
+
+    return Linear(4, 4, rngs=Rngs(rngs_seed))
+
+
+class IndexedBlock(Module):
+    """Tiny module with per-layer static index metadata."""
+
+    _spx_scan_safe_static_fields = frozenset({"layer_idx"})
+
+    def __init__(self, layer_idx: int):
+        """Initialize with layer_idx, weight."""
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.weight = Parameter(jnp.asarray(float(layer_idx + 1), dtype=jnp.float32))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        return x + self.weight.value
+
+
+class StaticScaleBlock(Module):
+    """Tiny module whose static scale changes computation."""
+
+    def __init__(self, scale: int):
+        """Initialize with scale, weight."""
+        super().__init__()
+        self.scale = scale
+        self.weight = Parameter(jnp.asarray(1.0, dtype=jnp.float32))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        return x * self.scale + self.weight.value
+
+
+class HeterogeneousA(Module):
+    """First heterogeneous module shape for segmented scan tests."""
+
+    def __init__(self):
+        """Initialize with weight."""
+        super().__init__()
+        self.weight = Parameter(jnp.ones((1,)))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        return x * self.weight.value
+
+
+class HeterogeneousB(Module):
+    """Second heterogeneous module shape for segmented scan tests."""
+
+    def __init__(self):
+        """Initialize with other."""
+        super().__init__()
+        self.other = Parameter(jnp.ones((1,)))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        return x + self.other.value
+
+
+class MutatingOpaqueImpl:
+    """Opaque helper that records runtime-only attributes."""
+
+    def __init__(self):
+        """Initialize with scale."""
+        self.scale = 1.0
+
+
+class OpaqueMutationBlock(Module):
+    """Block whose opaque helper mutates during forward."""
+
+    def __init__(self):
+        """Initialize with impl, weight."""
+        super().__init__()
+        self.impl = spx.Opaque(MutatingOpaqueImpl())
+        self.weight = Parameter(jnp.asarray(1.0, dtype=jnp.float32))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        self.impl.RuntimeOnlyType = type(self)
+        return x + self.weight.value * self.impl.scale
+
+
+def test_modulelist_construction_and_len():
+    """Construct a :class:`ModuleList` from an iterable."""
+    ml = ModuleList([_linear(0), _linear(1)])
+    assert len(ml) == 2
+
+
+def test_modulelist_indexing():
+    """Integer indexing returns the stored module."""
+    a, b = _linear(0), _linear(1)
+    ml = ModuleList([a, b])
+    assert ml[0] is a
+    assert ml[1] is b
+
+
+def test_modulelist_slice_returns_same_type():
+    """Slicing returns a new :class:`ModuleList` with the same items."""
+    a, b, c = _linear(0), _linear(1), _linear(2)
+    ml = ModuleList([a, b, c])
+    sliced = ml[:2]
+    assert isinstance(sliced, ModuleList)
+    assert list(sliced) == [a, b]
+
+
+def test_modulelist_iteration():
+    """``__iter__`` yields items in order."""
+    items = [_linear(i) for i in range(3)]
+    ml = ModuleList(items)
+    assert list(iter(ml)) == items
+
+
+def test_modulelist_append_valid():
+    """Appending a :class:`Module` succeeds."""
+    ml = ModuleList()
+    m = _linear(0)
+    ml.append(m)
+    assert ml[0] is m
+
+
+def test_modulelist_append_rejects_non_module():
+    """Appending a non-Module raises :class:`TypeError`."""
+    ml = ModuleList()
+    with pytest.raises(TypeError):
+        ml.append("not a module")
+
+
+def test_modulelist_extend():
+    """``extend`` validates every item."""
+    ml = ModuleList()
+    ml.extend([_linear(0), _linear(1)])
+    assert len(ml) == 2
+
+
+def test_modulelist_not_callable():
+    """:class:`ModuleList` is not a callable layer."""
+    ml = ModuleList()
+    with pytest.raises(RuntimeError):
+        ml.forward(jnp.zeros(1))
+
+
+def test_modulelist_stack_scan_matches_loop():
+    """StackedModuleList scans homogeneous layers without changing numerics."""
+    layers = ModuleList([_linear(i) for i in range(3)])
+    stacked = layers.stack()
+    x = jnp.ones((2, 4))
+    expected = x
+    for layer in layers:
+        expected = layer(expected)
+
+    out = stacked.scan(lambda layer, carry: layer(carry), x)
+
+    assert isinstance(stacked, StackedModuleList)
+    assert len(stacked) == len(layers)
+    assert jnp.allclose(out, expected, atol=1e-5)
+
+
+def test_modulelist_scan_trace_matches_scan():
+    """``trace=True`` executes the Python-loop path with scan-equivalent output."""
+    layers = ModuleList([_linear(i) for i in range(3)])
+    x = jnp.ones((2, 4))
+
+    scanned = layers.scan(lambda layer, carry: layer(carry), x)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert jnp.allclose(traced, scanned, atol=1e-5)
+
+
+def test_modulelist_scan_default_uses_real_scan_plan():
+    """Default unstacked scans should still use the real scan planner."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+
+    scanned = layers.scan(lambda layer, carry: layer(carry), x)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert getattr(layers, "_spx_scan_plan_cache", None) is not None
+    assert jnp.allclose(scanned, traced)
+
+
+def test_modulelist_scan_explicit_unroll_uses_rolled_scan_plan():
+    """Explicit unroll keeps the real ``lax.scan`` path available."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+
+    rolled = layers.scan(lambda layer, carry: layer(carry), x, unroll=1)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert getattr(layers, "_spx_scan_plan_cache", None) is not None
+    assert jnp.allclose(rolled, traced)
+
+
+def test_modulelist_scan_unroll_zero_is_preserved_as_full_unroll():
+    """``unroll=0`` is a real JAX mode and must not be rewritten to 1."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+
+    fully_unrolled = layers.scan(lambda layer, carry: layer(carry), x, unroll=0)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert jnp.allclose(fully_unrolled, traced)
+
+
+def test_modulelist_scan_rejects_negative_unroll():
+    """Negative unroll values are user errors, not hidden JAX crashes."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+
+    with pytest.raises(ValueError, match="unroll"):
+        layers.scan(lambda layer, carry: layer(carry), jnp.asarray(0.0), unroll=-1)
+
+
+def test_modulelist_scan_accepts_per_layer_index_static():
+    """Layer-index statics should not force slow per-layer graph dispatch."""
+
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+    plan = _build_scan_plan_from_modules(list(layers), context="test")
+
+    scanned = layers.scan(lambda layer, carry: layer(carry), x)
+    rolled = layers.scan(lambda layer, carry: layer(carry), x, unroll=1)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert plan.lowering == "single_template"
+    assert jnp.allclose(scanned, traced)
+    assert jnp.allclose(rolled, traced)
+
+
+def test_modulelist_scan_segments_behavior_changing_static_runs():
+    """Behavior-changing statics form graph families instead of unsafe templates."""
+
+    layers = ModuleList([StaticScaleBlock(2), StaticScaleBlock(2), StaticScaleBlock(3), StaticScaleBlock(3)])
+    x = jnp.asarray(1.0, dtype=jnp.float32)
+    plan = _build_scan_plan_from_modules(list(layers), context="test")
+
+    scanned = layers.scan(lambda layer, carry: layer(carry), x)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert plan.lowering == "segmented_templates"
+    assert [segment.length for segment in plan.segments] == [2, 2]
+    assert jnp.allclose(scanned, traced)
+
+
+def test_stacked_modulelist_scan_supports_segmented_static_families():
+    """Pre-stacked containers keep segmented multi-graph scan semantics."""
+
+    layers = ModuleList([StaticScaleBlock(2), StaticScaleBlock(2), StaticScaleBlock(3)]).stack()
+    x = jnp.asarray(1.0, dtype=jnp.float32)
+
+    scanned = layers.scan(lambda layer, carry: layer(carry), x)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+
+    assert jnp.allclose(scanned, traced)
+
+
+def test_stacked_modulelist_scan_plan_cache_keeps_fresh_values():
+    """Cached segmentation metadata must not freeze old parameter values."""
+
+    layers = ModuleList([IndexedBlock(0), IndexedBlock(1)]).stack()
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+
+    first = layers.scan(lambda layer, carry: layer(carry), x)
+    layers.v0.value = layers.v0.value + 1.0
+    second = layers.scan(lambda layer, carry: layer(carry), x)
+
+    assert layers._spx_scan_plan_cache is not None
+    assert jnp.allclose(second, first + 2.0)
+
+
+def test_stacked_modulelist_family_keys_survive_opaque_runtime_mutation():
+    """Runtime-only opaque mutations must not split homogeneous scan plans."""
+
+    layers = ModuleList([OpaqueMutationBlock() for _ in range(3)]).stack()
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+
+    first = layers.scan(lambda layer, carry: layer(carry), x)
+    plan = _build_scan_plan_from_stacked(
+        layers._spx_item_gdefs,
+        layers._stacked_state(),
+        context="test",
+        family_keys=layers._spx_item_family_keys,
+    )
+    second = layers.scan(lambda layer, carry: layer(carry), x)
+
+    assert [segment.length for segment in plan.segments] == [3]
+    assert jnp.allclose(first, second)
+
+
+def test_stacked_modulelist_scan_trace_matches_scan_under_jit():
+    """Stacked scan keeps a traceable loop fallback for debugging paths."""
+    layers = ModuleList([_linear(i) for i in range(3)]).stack()
+    x = jnp.ones((2, 4))
+
+    def run(stacked_layers, xb):
+        """Run helper."""
+        scanned = stacked_layers.scan(lambda layer, carry: layer(carry), xb)
+        traced = stacked_layers.scan(lambda layer, carry: layer(carry), xb, trace=True)
+        return scanned, traced
+
+    scanned, traced = jax.jit(run)(layers, x)
+    assert jnp.allclose(traced, scanned, atol=1e-5)
+
+
+def test_stacked_modulelist_is_trainable_pytree():
+    """Gradients flow through the stacked layer-axis leaves."""
+    layers = ModuleList([_linear(i) for i in range(2)]).stack()
+    x = jnp.ones((2, 4))
+
+    def loss(stacked_layers, xb):
+        """Compute the loss."""
+        return stacked_layers.scan(lambda layer, carry: layer(carry), xb).sum()
+
+    value, grads = spx.value_and_grad(loss)(layers, x)
+
+    assert value.shape == ()
+    assert "parameters" in grads
+    assert all(leaf.shape[0] == 2 for _collection, _path, leaf in grads.items())
+
+
+def test_stacked_modulelist_jit_forward():
+    """JAX sees a stacked module list as normal model state."""
+    layers = ModuleList([_linear(i) for i in range(2)]).stack()
+    x = jnp.ones((2, 4))
+    out = jax.jit(lambda stacked_layers, xb: stacked_layers.scan(lambda layer, carry: layer(carry), xb))(layers, x)
+    assert out.shape == (2, 4)
+
+
+def test_stacked_modulelist_rejects_heterogeneous_graphs():
+    """Stacked scans require identical per-layer graph definitions."""
+
+    class A(Module):
+        """Fixture module for testing."""
+
+        def __init__(self):
+            """Initialize with weight."""
+            super().__init__()
+            self.weight = Parameter(jnp.ones((1,)))
+
+        def forward(self, x):
+            """Run the forward pass."""
+            return x * self.weight.value
+
+    class B(Module):
+        """Fixture module for testing."""
+
+        def __init__(self):
+            """Initialize with other."""
+            super().__init__()
+            self.other = Parameter(jnp.ones((1,)))
+
+        def forward(self, x):
+            """Run the forward pass."""
+            return x + self.other.value
+
+    with pytest.raises(ValueError, match="compatible graph topology"):
+        ModuleList([A(), B()]).stack()
+
+
+def test_modulelist_scan_segments_heterogeneous_graphs():
+    """Plain ModuleList.scan can segment mixed graph definitions."""
+
+    layers = ModuleList([HeterogeneousA(), HeterogeneousB(), HeterogeneousA()])
+    x = jnp.ones((1,))
+    scanned = layers.scan(lambda layer, carry: layer(carry), x)
+    traced = layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+    assert jnp.allclose(scanned, traced)
+
+
+def test_modulelist_graph_children_integer_keys():
+    """``_spx_graph_children`` yields integer keys."""
+    ml = ModuleList([_linear(0), _linear(1)])
+    keys = [k for k, _ in ml._spx_graph_children()]
+    assert keys == [0, 1]
+
+
+def test_sequential_forwards_through_items():
+    """``Sequential`` threads input through each child in order."""
+    seq = Sequential(_linear(0), _linear(1))
+    x = jnp.zeros((2, 4))
+    y = seq(x)
+    assert y.shape == (2, 4)
+
+
+def test_sequential_rejects_non_module():
+    """Non-Modules in the constructor raise via validation on append."""
+    with pytest.raises(TypeError):
+        Sequential(_linear(0), "bogus")
+
+
+def test_sequential_kwargs_passthrough_or_fallback():
+    """``Sequential`` passes kwargs where accepted, falls back otherwise."""
+
+    class AcceptsKwargs(Module):
+        """Module that consumes arbitrary kwargs."""
+
+        def forward(self, x, **kwargs):
+            """Return ``x + 1`` regardless of kwargs."""
+            return x + 1
+
+    class PositionalOnly(Module):
+        """Module whose ``forward`` rejects extra kwargs."""
+
+        def forward(self, x):
+            """Return ``x * 2``."""
+            return x * 2
+
+    seq = Sequential(AcceptsKwargs(), PositionalOnly())
+    y = seq(jnp.asarray([1.0]), some_kwarg=True)
+    assert float(y[0]) == 4.0
+
+
+def test_parameterlist_only_accepts_parameters():
+    """``ParameterList`` rejects non-:class:`Parameter` items."""
+    pl = ParameterList()
+    pl.append(Parameter(jnp.zeros(3)))
+    assert len(pl) == 1
+    with pytest.raises(TypeError):
+        pl.append(jnp.zeros(3))
+
+
+def test_parameterlist_not_callable():
+    """:class:`ParameterList` is not a callable layer."""
+    with pytest.raises(RuntimeError):
+        ParameterList().forward(None)
+
+
+def test_moduledict_setitem_and_getitem():
+    """String-keyed setitem/getitem round-trips a module."""
+    md = ModuleDict()
+    m = _linear(0)
+    md["a"] = m
+    assert md["a"] is m
+
+
+def test_moduledict_construction_from_mapping():
+    """Construct from a plain dict of modules."""
+    a, b = _linear(0), _linear(1)
+    md = ModuleDict({"a": a, "b": b})
+    assert md["a"] is a and md["b"] is b
+
+
+def test_moduledict_rejects_non_string_key():
+    """Non-string keys raise :class:`TypeError`."""
+    md = ModuleDict()
+    with pytest.raises(TypeError):
+        md[1] = _linear(0)
+
+
+def test_moduledict_rejects_non_module_value():
+    """Non-Module values raise :class:`TypeError`."""
+    md = ModuleDict()
+    with pytest.raises(TypeError):
+        md["x"] = "bogus"
+
+
+def test_moduledict_contains_len_iter():
+    """Standard collection protocols on :class:`ModuleDict`."""
+    md = ModuleDict({"a": _linear(0)})
+    assert "a" in md
+    assert "b" not in md
+    assert len(md) == 1
+    assert list(md) == ["a"]
+
+
+def test_moduledict_keys_values_items():
+    """``keys``/``values``/``items`` return views of the stored dict."""
+    a, b = _linear(0), _linear(1)
+    md = ModuleDict({"a": a, "b": b})
+    assert set(md.keys()) == {"a", "b"}
+    assert set(md.values()) == {a, b}
+    assert dict(md.items()) == {"a": a, "b": b}
+
+
+def test_moduledict_graph_children_string_keys():
+    """``_spx_graph_children`` yields string keys in insertion order."""
+    md = ModuleDict({"first": _linear(0), "second": _linear(1)})
+    keys = [k for k, _ in md._spx_graph_children()]
+    assert keys == ["first", "second"]
+
+
+def test_moduledict_not_callable():
+    """:class:`ModuleDict` is not a callable layer."""
+    with pytest.raises(RuntimeError):
+        ModuleDict().forward(None)
+
+
+def test_containers_have_no_static_fields():
+    """Containers override ``_spx_static_fields`` to empty."""
+    assert ModuleList()._spx_static_fields() == {}
+    assert Sequential()._spx_static_fields() == {}
+    assert ModuleDict()._spx_static_fields() == {}
+    assert ParameterList()._spx_static_fields() == {}
+
+
+class _NoisyBlock(Module):
+    """Adds uniform noise drawn from a (possibly shared) :class:`Rngs`."""
+
+    def __init__(self, rngs):
+        """Keep a reference to ``rngs`` (shared across layers in the tests)."""
+        super().__init__()
+        self.rngs = rngs
+
+    def forward(self, x):
+        """Draw a fresh key from the default stream."""
+        return x + jax.random.uniform(self.rngs.default, x.shape)
+
+
+class _CountingBlock(Module):
+    """Increments a per-layer buffer on every call."""
+
+    def __init__(self, scale: float):
+        """Initialize the weight and the call counter."""
+        from spectrax.core.variable import Buffer
+
+        super().__init__()
+        self.w = Parameter(jnp.full((4,), scale, dtype=jnp.float32))
+        self.count = Buffer(jnp.zeros((), dtype=jnp.float32))
+
+    def forward(self, x):
+        """Count the call and apply the layer."""
+        self.count.value = self.count.value + 1.0
+        return x * self.w.value + self.count.value
+
+
+def _noisy_layers(n: int):
+    """``n`` noisy layers sharing one :class:`Rngs`."""
+    from spectrax.rng.rngs import Rngs
+
+    rngs = Rngs(0)
+    return ModuleList([_NoisyBlock(rngs) for _ in range(n)]), rngs
+
+
+def _counter(rngs) -> int:
+    """Low word of the default stream counter."""
+    return int(rngs.stream("default")._unpack()[2])
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_modulelist_scan_threads_shared_rng_like_python_loop(use_jit):
+    """``scan(trace=False)`` must advance a shared Rngs per layer and per call, like the Python loop."""
+    scanned_layers, scanned_rngs = _noisy_layers(3)
+    looped_layers, looped_rngs = _noisy_layers(3)
+    x = jnp.zeros((2, 4))
+
+    def run_scan(layers, inp):
+        """Lowered scan."""
+        return layers.scan(lambda layer, carry: layer(carry), inp)
+
+    if use_jit:
+        run_scan = spx.jit(run_scan, mutable="rng")
+
+    for _ in range(2):
+        out_scan = run_scan(scanned_layers, x)
+        out_loop = looped_layers.scan(lambda layer, carry: layer(carry), x, trace=True)
+        assert jnp.allclose(out_scan, out_loop, atol=1e-6)
+    assert _counter(scanned_rngs) == _counter(looped_rngs) == 6
+
+
+def test_modulelist_scan_and_fori_loop_write_back_per_layer_buffers():
+    """Per-layer buffer writes inside ``scan`` / ``fori_loop`` reach the live items."""
+    layers = ModuleList([_CountingBlock(float(i + 1)) for i in range(3)])
+    x = jnp.ones((4,))
+
+    expected = x
+    for i in range(3):
+        expected = expected * (i + 1) + 1.0
+    out = layers.scan(lambda layer, carry: layer(carry), x)
+    assert jnp.allclose(out, expected)
+    assert [float(layer.count.value) for layer in layers] == [1.0, 1.0, 1.0]
+
+    expected = x
+    for i in range(3):
+        expected = expected * (i + 1) + 2.0
+    out = layers.fori_loop(lambda _i, layer, carry: layer(carry), x)
+    assert jnp.allclose(out, expected)
+    assert [float(layer.count.value) for layer in layers] == [2.0, 2.0, 2.0]
+
+
+def test_stacked_modulelist_scan_writes_back_stacked_buffers():
+    """``StackedModuleList.scan`` / ``fori_loop`` write per-layer buffers into the stacked rows."""
+    stacked = ModuleList([_CountingBlock(float(i + 1)) for i in range(3)]).stack()
+    x = jnp.ones((4,))
+    stacked.scan(lambda layer, carry: layer(carry), x)
+    stacked.fori_loop(lambda _i, layer, carry: layer(carry), x)
+    counts = [float(stacked[i].count.value) for i in range(3)]
+    assert counts == [2.0, 2.0, 2.0]
+
+
+def test_modulelist_traced_index_writes_through_under_fori_loop():
+    """``m[i]`` with a traced ``i`` inside ``spx.fori_loop`` must not drop buffer writes."""
+    layers = ModuleList([_CountingBlock(float(i + 1)) for i in range(3)])
+    x = jnp.ones((4,))
+    out = spx.fori_loop(0, 3, lambda i, m, carry: m[i](carry), layers, x, mutable="buffers")
+    expected = x
+    for i in range(3):
+        expected = expected * (i + 1) + 1.0
+    assert jnp.allclose(out, expected)
+    assert [float(layer.count.value) for layer in layers] == [1.0, 1.0, 1.0]
+
+
+def test_sequential_does_not_retry_forward_internal_type_error():
+    """A child TypeError is not a signal to drop supported kwargs and invoke it twice."""
+
+    class Failing(Module):
+        """Child with observable invocation count."""
+
+        def __init__(self):
+            """Initialize the counter."""
+            super().__init__()
+            self.calls = []
+
+        def forward(self, x, *, factor=1):
+            """Fail inside the implementation, not during argument binding."""
+            self.calls.append(factor)
+            raise TypeError("bad input in forward")
+
+    child = Failing()
+    with pytest.raises(TypeError, match="bad input in forward"):
+        Sequential(child)(1, factor=2)
+    assert child.calls == [2]
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("signature_error", [TypeError, ValueError])
+def test_sequential_surfaces_child_type_error_when_signature_is_unavailable(monkeypatch, signature_error):
+    """An un-introspectable ``forward`` must not turn the child's TypeError into UnboundLocalError."""
+    from spectrax.core import containers
+
+    class Failing(Module):
+        """Child whose forward raises a TypeError."""
+
+        def forward(self, x, **kwargs):
+            """Always fail."""
+            raise TypeError("child boom")
+
+    def no_signature(_obj):
+        raise signature_error("no signature found for builtin")
+
+    monkeypatch.setattr(containers.inspect, "signature", no_signature)
+    with pytest.raises(TypeError, match="child boom"):
+        Sequential(Failing())(1, factor=2)
+
+
+def test_sequential_ignores_only_unsupported_kwargs():
+    """Children without the forwarded keyword still run once positionally."""
+
+    class Positional(Module):
+        """Child accepting only the input."""
+
+        def forward(self, x):
+            """Increment an integer input."""
+            return x + 1
+
+    assert Sequential(Positional())(3, factor=2) == 4
+
+
+def test_modulelist_scan_inside_fori_loop_covers_every_layer():
+    """With the fori_loop stacked cache injected, ``ModuleList.scan`` still runs all layers."""
+
+    class Holder(Module):
+        """Owns a nested ModuleList so ``spx.fori_loop`` injects its stacked cache."""
+
+        def __init__(self):
+            """Create three linear layers."""
+            super().__init__()
+            self.layers = ModuleList([_linear(i) for i in range(3)])
+
+    holder = Holder()
+    x = jnp.ones((2, 4))
+    expected = x
+    for layer in holder.layers:
+        expected = layer(expected)
+    out = spx.fori_loop(0, 1, lambda _i, m, carry: m.layers.scan(lambda layer, c: layer(c), carry), holder, x)
+    assert jnp.allclose(out, expected, atol=1e-5)
+
+
+class CachedConfig:
+    """Plain config object exposing a ``functools.cached_property``."""
+
+    def __init__(self, width: int):
+        """Initialize with width."""
+        self.width = width
+
+    @functools.cached_property
+    def derived(self) -> int:
+        """Value that lands in the instance ``__dict__`` once read."""
+        return self.width * 2
+
+
+class CachedConfigBlock(Module):
+    """Block holding a config object as a static/opaque field."""
+
+    def __init__(self, cfg: CachedConfig):
+        """Initialize with cfg, weight."""
+        super().__init__()
+        self.cfg = cfg
+        self.weight = Parameter(jnp.asarray(1.0, dtype=jnp.float32))
+
+    def forward(self, x):
+        """Run the forward pass."""
+        return x + self.weight.value
+
+
+@pytest.mark.parametrize("populated", [0, 1, 2])
+def test_modulelist_scan_plan_ignores_populated_cached_property(populated):
+    """A read ``cached_property`` on a held object must not split one layer into its own scan segment."""
+    cfgs = [CachedConfig(3) for _ in range(3)]
+    assert cfgs[populated].derived == 6
+    assert "derived" in vars(cfgs[populated])
+    layers = ModuleList([CachedConfigBlock(cfg) for cfg in cfgs])
+
+    plan = _build_scan_plan_from_modules(list(layers), context="test")
+
+    assert plan.lowering == "single_template"
+    assert [segment.length for segment in plan.segments] == [3]
+
+
+def test_modulelist_scan_plan_still_splits_on_real_config_difference():
+    """Ignoring cached values must not hide genuinely different public attributes."""
+    layers = ModuleList(
+        [CachedConfigBlock(CachedConfig(3)), CachedConfigBlock(CachedConfig(3)), CachedConfigBlock(CachedConfig(5))]
+    )
+
+    plan = _build_scan_plan_from_modules(list(layers), context="test")
+
+    assert [segment.length for segment in plan.segments] == [2, 1]
+
+
+def _concrete_index_makers():
+    """Index constructors that must all be treated as concrete."""
+    return [
+        pytest.param(int, id="python-int"),
+        pytest.param(np.int32, id="np-int32"),
+        pytest.param(np.int64, id="np-int64"),
+        pytest.param(lambda i: jnp.asarray(i, dtype=jnp.int32), id="jax-scalar"),
+    ]
+
+
+@pytest.mark.parametrize("make_idx", _concrete_index_makers())
+def test_modulelist_getitem_accepts_concrete_index_types(make_idx):
+    """Concrete integer-like indices return the stored module itself."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)])
+    for i in range(3):
+        assert layers[make_idx(i)] is layers[i]
+
+
+@pytest.mark.parametrize("make_idx", _concrete_index_makers())
+def test_stacked_modulelist_getitem_accepts_concrete_index_types(make_idx):
+    """Stacked containers bind the requested row for every concrete index type."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)]).stack()
+    for i in range(3):
+        assert float(layers[make_idx(i)].weight.value) == float(i + 1)
+
+
+def test_modulelist_getitem_traced_index_under_jit():
+    """A traced index takes the dynamic path and selects the right layer."""
+    layers = ModuleList([_linear(i) for i in range(3)])
+    expected = [layer.weight.value for layer in layers]
+
+    @jax.jit
+    def pick(i):
+        return layers[i].weight.value
+
+    for i in range(3):
+        assert jnp.allclose(pick(jnp.asarray(i)), expected[i])
+
+
+def test_stacked_modulelist_getitem_traced_index_under_jit_and_fori_loop():
+    """Stacked traced indexing works under ``jax.jit`` and ``spx.fori_loop``."""
+    layers = ModuleList([IndexedBlock(i) for i in range(3)]).stack()
+
+    @jax.jit
+    def pick(i):
+        return layers[i].weight.value
+
+    assert [float(pick(jnp.asarray(i))) for i in range(3)] == [1.0, 2.0, 3.0]
+
+    x = jnp.asarray(0.0, dtype=jnp.float32)
+    out = spx.fori_loop(0, 3, lambda i, m, carry: m[i](carry), layers, x)
+    assert float(out) == 6.0

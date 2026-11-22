@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Benchmark ragged_page_attention_v2_turboquant across all available implementations."""
+
+import os
+import sys
+
+sys.path.append(os.path.dirname(__file__))
+from _op_benchmark_registry import run_benchmark
+
+if __name__ == "__main__":
+    raise SystemExit(run_benchmark("ragged_page_attention_v2_turboquant"))

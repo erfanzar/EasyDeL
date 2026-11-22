@@ -18,7 +18,7 @@
 
 EasyDeL is an open-source framework designed to enhance and streamline the
 training, fine-tuning, and serving of machine learning models. Built on modern
-**Flax NNX** and **JAX**, it provides production-ready solutions for
+**Spectrax** and **JAX**, it provides production-ready solutions for
 training and deploying LLMs, multimodal models, and vision models at scale on
 TPU/GPU clusters.
 
@@ -42,7 +42,7 @@ TPU/GPU clusters.
 
 ## Why EasyDeL?
 
-- **🔮 Modern Architecture**: Built on Flax NNX (not legacy Linen) for better modularity and performance
+- **🔮 Modern Architecture**: Built on SpecTrax for better modularity and performance
 - **70+ Model Architectures**: Broad JAX model collection including LLaMA, Qwen, Mistral, DeepSeek, Gemma, and more
 - **16 Specialized Trainers**: From supervised fine-tuning to RLHF, preference optimization, and knowledge distillation
 - **🚀 Production-Ready Inference**: eSurge engine with continuous batching, paged KV cache, OpenAI-compatible API, and multimodal serving (text/image/video)
@@ -1388,7 +1388,8 @@ EasyDeL's `EasyDeLBaseModule` provides a powerful foundation for custom models:
 ```python
 import easydel as ed
 import jax.numpy as jnp
-from flax import nnx as nn
+import spectrax as spx
+from spectrax import nn
 
 class MyCustomModule(ed.EasyDeLBaseModule):
     def __init__(
@@ -1571,7 +1572,7 @@ EasyDeL is released under the Apache License 2.0. See the [LICENSE](LICENSE) fil
 
 ## Acknowledgments
 
-- Built on top of [JAX](https://github.com/google/jax), [Flax](https://github.com/google/flax), and [Flax NNX](https://flax.readthedocs.io/en/latest/nnx/index.html)
+- Built on top of [JAX](https://github.com/google/jax) and [Spectrux](https://github.com/erfanzar/spectrax)
 - Base idea of Model implementations inspired by [HuggingFace Transformers](https://github.com/huggingface/transformers)
 - Trainer implementations are inspired from [TRL](https://github.com/huggingface/trl)
 - Inference optimizations inspired by [vLLM](https://github.com/vllm-project/vllm)

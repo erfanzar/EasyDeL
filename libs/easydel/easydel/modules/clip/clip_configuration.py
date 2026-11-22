@@ -1,0 +1,465 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration classes for the CLIP family of dual-encoder models.
+
+CLIP (Contrastive Language-Image Pre-training) jointly trains a vision
+encoder and a text encoder so their projections live in a shared embedding
+space. This module exposes:
+
+- :class:`CLIPTextConfig` — text transformer encoder hyperparameters.
+- :class:`CLIPVisionConfig` — vision transformer (ViT) hyperparameters,
+  including ``image_size``, ``patch_size``, and ``num_channels``.
+- :class:`CLIPConfig` — composite config that owns both sub-configs plus the
+  shared ``projection_dim`` and the contrastive ``logit_scale_init_value``.
+"""
+
+import typing
+
+from eformer.loggings import get_logger
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
+
+logger = get_logger(__name__)
+
+
+@register_config("clip_text_model")
+class CLIPTextConfig(EasyDeLBaseConfig):
+    r"""
+    This is the configuration class to store the configuration of a [`CLIPTextModel`]. It is used to instantiate a CLIP
+    text encoder according to the specified arguments, defining the model architecture. Instantiating a configuration
+    with the defaults will yield a similar configuration to that of the text encoder of the CLIP
+    [openai/clip-vit-base-patch32](https://huggingface.co/openai/clip-vit-base-patch32) architecture.
+
+    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read the
+    documentation from [`EasyDeLBaseConfig`] for more information.
+
+    Args:
+            vocab_size (`int`, *optional*, defaults to 49408):
+                    Vocabulary size of the CLIP text model. Defines the number of different tokens that can be
+                    represented by the `inputs_ids` passed when calling [`CLIPModel`].
+            hidden_size (`int`, *optional*, defaults to 512):
+                    Dimensionality of the encoder layers and the pooler layer.
+            intermediate_size (`int`, *optional*, defaults to 2048):
+                    Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+            projection_dim (`int`, *optional*, defaults to 512):
+                    Dimensionality of text and vision projection layers.
+            num_hidden_layers (`int`, *optional*, defaults to 12):
+                    Number of hidden layers in the Transformer encoder.
+            num_attention_heads (`int`, *optional*, defaults to 8):
+                    Number of attention heads for each attention layer in the Transformer encoder.
+            max_position_embeddings (`int`, *optional*, defaults to 77):
+                    The maximum sequence length that this model might ever be used with. Typically set this to something
+                large just in case (e.g., 512 or 1024 or 2048).
+            hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
+                    The non-linear activation function (function or string) in the encoder and pooler. If string,
+                    `"gelu"`,`"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
+            layer_norm_eps (`float`, *optional*, defaults to 1e-05):
+                    The epsilon used by the layer normalization layers.
+            attention_dropout (`float`, *optional*, defaults to 0.0):
+                    The dropout ratio for the attention probabilities.
+            initializer_range (`float`, *optional*, defaults to 0.02):
+                    The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+            initializer_factor (`float`, *optional*, defaults to 1.0):
+                    A factor for initializing all weight matrices
+                    (should be kept to 1, used internally for initialization testing).
+            pad_token_id (`int`, *optional*, defaults to 1):
+                    Padding token id.
+            bos_token_id (`int`, *optional*, defaults to 49406):
+                    Beginning of stream token id.
+            eos_token_id (`int`, *optional*, defaults to 49407):
+                    End of stream token id.
+
+    Example:
+
+    ```python
+    >>> from transformers import CLIPTextConfig, CLIPTextModel
+
+    >>> # Initializing a CLIPTextConfig with openai/clip-vit-base-patch32 style configuration
+    >>> configuration = CLIPTextConfig()
+
+    >>> # Initializing a CLIPTextModel (with random weights) from the openai/clip-vit-base-patch32 style configuration
+    >>> model = CLIPTextModel(configuration)
+
+    >>> # Accessing the model configuration
+    >>> configuration = model.config
+    ```"""
+
+    model_type = "clip_text_model"
+    base_config_key = "text_config"
+
+    def __init__(
+        self,
+        vocab_size: int = 49408,
+        hidden_size: int = 512,
+        intermediate_size: int = 2048,
+        projection_dim: int = 512,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 8,
+        max_position_embeddings: int = 77,
+        hidden_act: str = "quick_gelu",
+        layer_norm_eps: float = 1e-5,
+        attention_dropout: float = 0.0,
+        initializer_range: float = 0.02,
+        initializer_factor: float = 1.0,
+        pad_token_id: int = 1,
+        bos_token_id: int = 49406,
+        eos_token_id: int = 49407,
+        **kwargs,
+    ):
+        """Initialize the CLIP text encoder configuration.
+
+        Args:
+            vocab_size (int, optional): Token vocabulary size. Defaults to ``49408``.
+            hidden_size (int, optional): Encoder/pooler hidden width. Defaults to ``512``.
+            intermediate_size (int, optional): Feed-forward intermediate width.
+                Defaults to ``2048``.
+            projection_dim (int, optional): Shared joint embedding dimensionality.
+                Defaults to ``512``.
+            num_hidden_layers (int, optional): Number of transformer encoder layers.
+                Defaults to ``12``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``8``.
+            max_position_embeddings (int, optional): Maximum text sequence length.
+                Defaults to ``77``.
+            hidden_act (str, optional): Activation function name. Defaults to
+                ``"quick_gelu"``.
+            layer_norm_eps (float, optional): LayerNorm epsilon. Defaults to ``1e-5``.
+            attention_dropout (float, optional): Attention probability dropout.
+                Defaults to ``0.0``.
+            initializer_range (float, optional): Stddev for truncated-normal weight
+                init. Defaults to ``0.02``.
+            initializer_factor (float, optional): Multiplicative factor on weight
+                initialization (kept at ``1.0`` outside testing). Defaults to ``1.0``.
+            pad_token_id (int, optional): Padding token id. Defaults to ``1``.
+            bos_token_id (int, optional): Start-of-sequence token id. Defaults to
+                ``49406``.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to
+                ``49407``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs,
+        )
+
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.projection_dim = projection_dim
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.layer_norm_eps = layer_norm_eps
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.initializer_factor = initializer_factor
+        self.attention_dropout = attention_dropout
+
+
+@register_config("clip_vision_model")
+class CLIPVisionConfig(EasyDeLBaseConfig):
+    r"""
+    This is the configuration class to store the configuration of a [`CLIPVisionModel`]. It is used to instantiate a
+    CLIP vision encoder according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a similar configuration to that of the vision encoder of the CLIP
+    [openai/clip-vit-base-patch32](https://huggingface.co/openai/clip-vit-base-patch32) architecture.
+
+    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read the
+    documentation from [`EasyDeLBaseConfig`] for more information.
+
+    Args:
+            hidden_size (`int`, *optional*, defaults to 768):
+                    Dimensionality of the encoder layers and the pooler layer.
+            intermediate_size (`int`, *optional*, defaults to 3072):
+                    Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+            projection_dim (`int`, *optional*, defaults to 512):
+                    Dimensionality of text and vision projection layers.
+            num_hidden_layers (`int`, *optional*, defaults to 12):
+                    Number of hidden layers in the Transformer encoder.
+            num_attention_heads (`int`, *optional*, defaults to 12):
+                    Number of attention heads for each attention layer in the Transformer encoder.
+            num_channels (`int`, *optional*, defaults to 3):
+                    The number of input channels.
+            image_size (`int`, *optional*, defaults to 224):
+                    The size (resolution) of each image.
+            patch_size (`int`, *optional*, defaults to 32):
+                    The size (resolution) of each patch.
+            hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
+                    The non-linear activation function (function or string) in the encoder and pooler.
+                    If string, `"gelu"`, `"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
+            layer_norm_eps (`float`, *optional*, defaults to 1e-05):
+                    The epsilon used by the layer normalization layers.
+            attention_dropout (`float`, *optional*, defaults to 0.0):
+                    The dropout ratio for the attention probabilities.
+            initializer_range (`float`, *optional*, defaults to 0.02):
+                    The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+            initializer_factor (`float`, *optional*, defaults to 1.0):
+                    A factor for initializing all weight matrices (should be kept to 1, used internally
+                    for initialization testing).
+
+    Example:
+
+    ```python
+    >>> from transformers import CLIPVisionConfig, CLIPVisionModel
+
+    >>> # Initializing a CLIPVisionConfig with openai/clip-vit-base-patch32 style configuration
+    >>> configuration = CLIPVisionConfig()
+
+    >>> # Initializing a CLIPVisionModel (with random weights) from the openai/clip-vit-base-patch32 style configuration
+    >>> model = CLIPVisionModel(configuration)
+
+    >>> # Accessing the model configuration
+    >>> configuration = model.config
+    ```"""
+
+    model_type = "clip_vision_model"
+    base_config_key = "vision_config"
+
+    def __init__(
+        self,
+        hidden_size: int = 768,
+        intermediate_size: int = 3072,
+        projection_dim: int = 512,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        num_channels: int = 3,
+        image_size: int = 224,
+        patch_size: int = 32,
+        hidden_act: str = "quick_gelu",
+        layer_norm_eps: float = 1e-5,
+        attention_dropout: float = 0.0,
+        initializer_range: float = 0.02,
+        initializer_factor: float = 1.0,
+        **kwargs,
+    ):
+        """Initialize the CLIP vision encoder configuration.
+
+        Args:
+            hidden_size (int, optional): Vision transformer hidden width.
+                Defaults to ``768``.
+            intermediate_size (int, optional): Feed-forward intermediate width.
+                Defaults to ``3072``.
+            projection_dim (int, optional): Shared joint embedding dimensionality.
+                Defaults to ``512``.
+            num_hidden_layers (int, optional): Number of ViT encoder layers.
+                Defaults to ``12``.
+            num_attention_heads (int, optional): Attention heads per layer.
+                Defaults to ``12``.
+            num_channels (int, optional): Number of input image channels.
+                Defaults to ``3``.
+            image_size (int, optional): Input image side length in pixels.
+                Defaults to ``224``.
+            patch_size (int, optional): ViT patch side length in pixels.
+                Defaults to ``32``.
+            hidden_act (str, optional): Activation function name. Defaults to
+                ``"quick_gelu"``.
+            layer_norm_eps (float, optional): LayerNorm epsilon. Defaults to ``1e-5``.
+            attention_dropout (float, optional): Attention probability dropout.
+                Defaults to ``0.0``.
+            initializer_range (float, optional): Stddev for truncated-normal
+                weight init. Defaults to ``0.02``.
+            initializer_factor (float, optional): Multiplicative weight-init factor.
+                Defaults to ``1.0``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`.
+        """
+        super().__init__(**kwargs)
+
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.projection_dim = projection_dim
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_channels = num_channels
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.initializer_range = initializer_range
+        self.initializer_factor = initializer_factor
+        self.attention_dropout = attention_dropout
+        self.layer_norm_eps = layer_norm_eps
+        self.hidden_act = hidden_act
+
+
+@register_config("clip")
+class CLIPConfig(EasyDeLBaseConfig):
+    r"""
+    [`CLIPConfig`] is the configuration class to store the configuration of a [`CLIPModel`]. It is used to instantiate
+    a CLIP model according to the specified arguments, defining the text model and vision model configs. Instantiating
+    a configuration with the defaults will yield a similar configuration to that of the CLIP
+    [openai/clip-vit-base-patch32](https://huggingface.co/openai/clip-vit-base-patch32) architecture.
+
+    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read the
+    documentation from [`EasyDeLBaseConfig`] for more information.
+
+    Args:
+            text_config (`dict`, *optional*):
+                    Dictionary of configuration options used to initialize [`CLIPTextConfig`].
+            vision_config (`dict`, *optional*):
+                    Dictionary of configuration options used to initialize [`CLIPVisionConfig`].
+            projection_dim (`int`, *optional*, defaults to 512):
+                    Dimensionality of text and vision projection layers.
+            logit_scale_init_value (`float`, *optional*, defaults to 2.6592):
+                    The initial value of the *logit_scale* parameter. Default is used as per the
+                    original CLIP implementation.
+            kwargs (*optional*):
+                    Dictionary of keyword arguments.
+
+    Example:
+
+    ```python
+    >>> from transformers import CLIPConfig, CLIPModel
+
+    >>> # Initializing a CLIPConfig with openai/clip-vit-base-patch32 style configuration
+    >>> configuration = CLIPConfig()
+
+    >>> # Initializing a CLIPModel (with random weights) from the openai/clip-vit-base-patch32 style configuration
+    >>> model = CLIPModel(configuration)
+
+    >>> # Accessing the model configuration
+    >>> configuration = model.config
+
+    >>> # We can also initialize a CLIPConfig from a CLIPTextConfig and a CLIPVisionConfig
+    >>> from transformers import CLIPTextConfig, CLIPVisionConfig
+
+    >>> # Initializing a CLIPText and CLIPVision configuration
+    >>> config_text = CLIPTextConfig()
+    >>> config_vision = CLIPVisionConfig()
+
+    >>> config = CLIPConfig.from_text_vision_configs(config_text, config_vision)
+    ```"""
+
+    model_type = "clip"
+    sub_configs: typing.ClassVar = {"text_config": CLIPTextConfig, "vision_config": CLIPVisionConfig}
+
+    def __init__(
+        self,
+        text_config: dict | None = None,
+        vision_config: dict | None = None,
+        projection_dim: int = 512,
+        logit_scale_init_value: float = 2.6592,
+        **kwargs,
+    ):
+        """Initialize the composite CLIP configuration.
+
+        Builds and stores child :class:`CLIPTextConfig` and
+        :class:`CLIPVisionConfig` instances. Optional ``text_config_dict`` /
+        ``vision_config_dict`` kwargs (recognized by HF round-trip dumps) take
+        precedence over the corresponding ``text_config`` / ``vision_config``
+        entries, with mismatches logged.
+
+        Args:
+            text_config (dict | None, optional): Init kwargs for the inner
+                :class:`CLIPTextConfig`. Defaults to ``None`` (use defaults).
+            vision_config (dict | None, optional): Init kwargs for the inner
+                :class:`CLIPVisionConfig`. Defaults to ``None`` (use defaults).
+            projection_dim (int, optional): Dimensionality of the shared
+                text/vision projection space. Defaults to ``512``.
+            logit_scale_init_value (float, optional): Initial value for the
+                learnable temperature parameter. Defaults to ``2.6592``.
+            **kwargs: Forwarded to :class:`EasyDeLBaseConfig`. May include
+                ``text_config_dict`` and ``vision_config_dict`` (popped before
+                forwarding).
+        """
+        text_config_dict = kwargs.pop("text_config_dict", None)
+        vision_config_dict = kwargs.pop("vision_config_dict", None)
+
+        super().__init__(**kwargs)
+
+        if text_config_dict is not None:
+            if text_config is None:
+                text_config = {}
+
+            _text_config_dict = CLIPTextConfig(**text_config_dict).to_dict()
+            for key, value in _text_config_dict.items():
+                if key in text_config and value != text_config[key] and key not in ["transformers_version"]:
+                    if key in text_config_dict:
+                        message = (
+                            f"`{key}` is found in both `text_config_dict` and `text_config` but with different values. "
+                            f'The value `text_config_dict["{key}"]` will be used instead.'
+                        )
+                    else:
+                        message = (
+                            f"`text_config_dict` is provided which will be used to initialize `CLIPTextConfig`. The "
+                            f'value `text_config["{key}"]` will be overridden.'
+                        )
+                    logger.info(message)
+
+            text_config.update(_text_config_dict)
+
+        if vision_config_dict is not None:
+            if vision_config is None:
+                vision_config = {}
+
+            _vision_config_dict = CLIPVisionConfig(**vision_config_dict).to_dict()
+            # convert keys to string instead of integer
+            if "id2label" in _vision_config_dict:
+                _vision_config_dict["id2label"] = {
+                    str(key): value for key, value in _vision_config_dict["id2label"].items()
+                }
+
+            # Give a warning if the values exist in both `_vision_config_dict` and `vision_config` but being different.
+            for key, value in _vision_config_dict.items():
+                if key in vision_config and value != vision_config[key] and key not in ["transformers_version"]:
+                    if key in vision_config_dict:
+                        message = (
+                            f"`{key}` is found in both `vision_config_dict` and `vision_config` but with different "
+                            f'values. The value `vision_config_dict["{key}"]` will be used instead.'
+                        )
+                    # If inferred from default argument values (just to be super careful)
+                    else:
+                        message = (
+                            f"`vision_config_dict` is provided which will be used to initialize `CLIPVisionConfig`. "
+                            f'The value `vision_config["{key}"]` will be overridden.'
+                        )
+                    logger.info(message)
+
+            vision_config.update(_vision_config_dict)
+
+        if text_config is None:
+            text_config = {}
+            logger.info("`text_config` is `None`. Initializing the `CLIPTextConfig` with default values.")
+
+        if vision_config is None:
+            vision_config = {}
+            logger.info("`vision_config` is `None`. initializing the `CLIPVisionConfig` with default values.")
+
+        self.text_config = CLIPTextConfig(**text_config)
+        self.vision_config = CLIPVisionConfig(**vision_config)
+
+        self.projection_dim = projection_dim
+        self.logit_scale_init_value = logit_scale_init_value
+        self.initializer_factor = 1.0
+
+    @classmethod
+    def from_text_vision_configs(cls, text_config: CLIPTextConfig, vision_config: CLIPVisionConfig, **kwargs):
+        r"""
+        Instantiate a [`CLIPConfig`] (or a derived class) from clip text model configuration and clip vision model
+        configuration.
+
+        Args:
+                text_config (CLIPTextConfig): The text model configuration.
+                vision_config (CLIPVisionConfig): The vision model configuration.
+                **kwargs: Additional keyword arguments.
+
+        Returns:
+                [`CLIPConfig`]: An instance of a configuration object
+        """
+
+        return cls(
+            text_config=text_config.to_dict(),
+            vision_config=vision_config.to_dict(),
+            **kwargs,
+        )

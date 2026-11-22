@@ -1,0 +1,312 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configuration class for the SmolLM3 model family.
+
+Defines :class:`SmolLM3Config`, the EasyDeL configuration object for
+HuggingFace's SmolLM3 small decoder-only language model. SmolLM3 uses
+RMSNorm, SwiGLU MLP, GQA, RoPE, and a "NoPE"-style schedule where
+selected layers omit rotary position embeddings entirely (controlled by
+``no_rope_layers``).
+"""
+
+import math
+import typing
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
+
+# HF ``SmolLM3Config`` default KV-head count, and a sentinel marking "not specified" so the
+# default can adapt to small head counts while an explicit ``None`` still means MHA.
+_HF_DEFAULT_KV_HEADS = 4
+_DEFAULT_KV_HEADS = object()
+
+
+@register_config("smollm3")
+class SmolLM3Config(EasyDeLBaseConfig):
+    r"""
+    This is the configuration class to store the configuration of a [`SmolLM3Model`]. It is used to
+    instantiate a SmolLM3 model according to the specified arguments, defining the model architecture.
+
+    Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs.
+
+    Args:
+            vocab_size (`int`, *optional*, defaults to 128256):
+                    Vocabulary size of the SmolLM3 model.
+            hidden_size (`int`, *optional*, defaults to 2048):
+                    Dimension of the hidden representations.
+            intermediate_size (`int`, *optional*, defaults to 11008):
+                    Dimensionality of the MLP representations.
+            num_hidden_layers (`int`, *optional*, defaults to 36):
+                    Number of hidden layers in the Transformer encoder.
+            num_attention_heads (`int`, *optional*, defaults to 16):
+                    Number of attention heads for each attention layer.
+            num_key_value_heads (`int`, *optional*, defaults to 4):
+                    Number of key_value heads for Grouped Query Attention. ``None`` means `num_attention_heads`
+                    (multi-head attention), matching HF `SmolLM3Config`. When omitted it resolves to
+                    ``gcd(4, num_attention_heads)`` (4 for the default 16 heads). Explicit values must
+                    divide `num_attention_heads`.
+            hidden_act (`str`, *optional*, defaults to `"silu"`):
+                    The non-linear activation function in the decoder.
+            max_position_embeddings (`int`, *optional*, defaults to 32768):
+                    The maximum sequence length.
+            initializer_range (`float`, *optional*, defaults to 0.02):
+                    The standard deviation for initializing all weight matrices.
+            rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+                    The epsilon used by the layer normalization layers.
+            use_cache (`bool`, *optional*, defaults to `True`):
+                    Whether the model should return the last key/values attentions.
+            bos_token_id (`int`, *optional*, defaults to 128000):
+                    Beginning of stream token id.
+            eos_token_id (`int`, *optional*, defaults to 128001):
+                    End of stream token id.
+            pad_token_id (`int`, *optional*, defaults to 128004):
+                    Padding token id.
+            tie_word_embeddings (`bool`, *optional*, defaults to `True`):
+                    Whether to tie weight embeddings.
+            rope_theta (`float`, *optional*, defaults to 2000000.0):
+                    The base period of the RoPE embeddings.
+            rope_scaling (`dict`, *optional*):
+                    Dictionary containing the scaling configuration for the RoPE embeddings.
+            attention_bias (`bool`, *optional*, defaults to `False`):
+                    Whether to use a bias in the query, key, value and output projection layers.
+            attention_dropout (`float`, *optional*, defaults to 0.0):
+                    The dropout ratio for the attention probabilities.
+            mlp_bias (`bool`, *optional*, defaults to `False`):
+                    Whether to use bias in MLP layers.
+            use_sliding_window (`bool`, *optional*, defaults to `False`):
+                    Whether to use sliding window attention.
+            sliding_window (`int`, *optional*):
+                    Sliding window attention window size. If not specified, will default to `None`.
+            no_rope_layers (`list[int]`, *optional*):
+                    List indicating which layers use RoPE (1) or NoPE (0). Must have same length as num_hidden_layers.
+            no_rope_layer_interval (`int`, *optional*, defaults to 4):
+                    If `no_rope_layers` is `None`, create pattern with NoPE every `no_rope_layer_interval` layers.
+            layer_types (`list`, *optional*):
+                    Attention pattern for each layer. Automatically computed based on sliding window and NoPE settings.
+            gradient_checkpointing (`EasyDeLGradientCheckPointers`, *optional*):
+                    Gradient checkpointing strategy.
+            use_scan_mlp (`bool`, *optional*, defaults to False):
+                    Whether to use scan for MLP layers.
+            scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+                    Chunk size for scan MLP.
+            bits (`int`, *optional*):
+                    Quantization bits.
+    """
+
+    model_type = "smollm3"
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __init__(
+        self,
+        vocab_size: int = 128256,
+        hidden_size: int = 2048,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 36,
+        num_attention_heads: int = 16,
+        num_key_value_heads: int | object | None = _DEFAULT_KV_HEADS,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 32768,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int = 128004,
+        bos_token_id: int = 128000,
+        eos_token_id: int = 128001,
+        tie_word_embeddings: bool = True,
+        rope_theta: float = 2000000.0,
+        rope_scaling: dict | None = None,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        mlp_bias: bool = False,
+        use_sliding_window: bool = False,
+        sliding_window: int | None = None,
+        no_rope_layers: list[int] | None = None,
+        no_rope_layer_interval: int = 4,
+        layer_types: list[str] | None = None,
+        **kwargs,
+    ):
+        """Initialize SmolLM3Config.
+
+        See the class docstring for parameter semantics. ``no_rope_layers``
+        and ``no_rope_layer_interval`` together control SmolLM3's
+        characteristic NoPE schedule (selected layers omit rotary
+        position embeddings). ``**kwargs`` are forwarded to
+        :class:`EasyDeLBaseConfig`.
+        """
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.mlp_bias = mlp_bias
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window = sliding_window
+        self.no_rope_layer_interval = no_rope_layer_interval
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self._rope_scaling_validation()
+
+        # HF parity: the default is 4 KV heads and an explicit ``None`` means MHA. When the
+        # KV-head count is left unspecified it resolves to gcd(4, num_attention_heads), which is
+        # 4 for the real 16-head architecture and never exceeds or fails to divide a smaller
+        # head count. Explicit values are kept as given and validated.
+        if num_key_value_heads is _DEFAULT_KV_HEADS:
+            num_key_value_heads = math.gcd(_HF_DEFAULT_KV_HEADS, num_attention_heads)
+        elif num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+        elif num_key_value_heads <= 0 or num_attention_heads % num_key_value_heads != 0:
+            raise ValueError(
+                f"num_key_value_heads ({num_key_value_heads}) must be positive and divide "
+                f"num_attention_heads ({num_attention_heads})."
+            )
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = hidden_size // num_attention_heads
+
+        if no_rope_layers is None:
+            self.no_rope_layers = [
+                int((layer_idx + 1) % no_rope_layer_interval != 0) for layer_idx in range(num_hidden_layers)
+            ]
+        else:
+            self.no_rope_layers = no_rope_layers
+
+        if layer_types is None:
+            layer_types = []
+            for layer_idx in range(num_hidden_layers):
+                has_rope = self.no_rope_layers[layer_idx]
+                if use_sliding_window and sliding_window is not None and not has_rope:
+                    layer_types.append("sliding_attention")
+                else:
+                    layer_types.append("full_attention")
+            self.layer_types = layer_types
+        else:
+            self.layer_types = layer_types
+
+        self._validate_no_rope_layers()
+        self._validate_layer_types()
+
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+
+    def _rope_scaling_validation(self):
+        """Validate and normalise the ``rope_scaling`` configuration.
+
+        SmolLM3 supports ``"linear"``, ``"dynamic"``, ``"yarn"`` and ``"llama3"`` scaling. The
+        validator (a) accepts ``"rope_type"`` as an alias for
+        ``"type"`` for forward-compat with newer HF schemas, (b)
+        clears ``rope_scaling`` to ``None`` when the requested type is
+        ``"default"``/``None`` so downstream code can use a simple
+        ``is None`` check, and (c) coerces the ``factor`` field to
+        ``float`` while requiring ``factor >= 1``.
+
+        Raises:
+            ValueError: When ``rope_scaling`` is not a mapping, uses an
+                unknown type, or carries a non-float / sub-unity factor.
+        """
+        if self.rope_scaling is None:
+            return
+
+        if not isinstance(self.rope_scaling, dict):
+            raise ValueError(
+                f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {self.rope_scaling}"
+            )
+
+        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+        if rope_scaling_type in {None, "default"}:
+            self.rope_scaling = None
+            return
+
+        # Official checkpoints ship ``llama3`` (EXAONE-4.0) / ``yarn`` (long-context
+        # SmolLM3); their extra keys must survive normalization below.
+        if rope_scaling_type not in {"linear", "dynamic", "yarn", "llama3"}:
+            raise ValueError(
+                "`rope_scaling`'s type field must be one of ['linear', 'dynamic', 'yarn', 'llama3'], "
+                f"got {rope_scaling_type}"
+            )
+
+        rope_scaling_factor = self.rope_scaling.get("factor", 1.0)
+        try:
+            rope_scaling_factor = float(rope_scaling_factor)
+        except Exception as err:  # pragma: no cover
+            raise ValueError(f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}") from err
+
+        if rope_scaling_factor < 1.0:
+            raise ValueError(f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}")
+
+        self.rope_scaling = {
+            **self.rope_scaling,
+            "type": rope_scaling_type,
+            "rope_type": rope_scaling_type,
+            "factor": rope_scaling_factor,
+        }
+
+    def _validate_no_rope_layers(self):
+        """Sanity-check the per-layer NoPE flag list.
+
+        Each entry of ``no_rope_layers`` is a 0/1 indicator that
+        controls whether the corresponding decoder layer applies RoPE
+        (1) or skips it entirely (0; "NoPE" layers in SmolLM3
+        terminology). The validator confirms the length matches
+        ``num_hidden_layers`` and that every entry is one of the two
+        allowed values.
+
+        Raises:
+            ValueError: If the list length differs from
+                ``num_hidden_layers`` or contains any value other than
+                0/1.
+        """
+        if len(self.no_rope_layers) != self.num_hidden_layers:
+            raise ValueError(
+                f"`no_rope_layers` must have length equal to `num_hidden_layers` ({self.num_hidden_layers}), "
+                f"got {len(self.no_rope_layers)}"
+            )
+
+        for idx, use_rope in enumerate(self.no_rope_layers):
+            if use_rope not in {0, 1}:
+                raise ValueError(f"`no_rope_layers[{idx}]` must be 0 or 1, got {use_rope}")
+
+    def _validate_layer_types(self):
+        """Sanity-check the per-layer attention-type list.
+
+        SmolLM3 lets the configuration mix sliding-window and full
+        attention layers via ``layer_types``. The validator ensures the
+        list has exactly ``num_hidden_layers`` entries and that each
+        entry is one of ``"sliding_attention"`` or ``"full_attention"``.
+
+        Raises:
+            ValueError: If the list length is wrong or contains an
+                unsupported attention type.
+        """
+        if len(self.layer_types) != self.num_hidden_layers:
+            raise ValueError(
+                f"`layer_types` must have length equal to `num_hidden_layers` ({self.num_hidden_layers}), "
+                f"got {len(self.layer_types)}"
+            )
+
+        valid_types = {"sliding_attention", "full_attention"}
+        for idx, layer_type in enumerate(self.layer_types):
+            if layer_type not in valid_types:
+                raise ValueError(f"`layer_types[{idx}]` must be one of {valid_types}, got '{layer_type}'")

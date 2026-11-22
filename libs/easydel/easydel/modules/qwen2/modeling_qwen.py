@@ -1,0 +1,975 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Qwen2 model implementation for EasyDeL.
+
+This module implements Alibaba's Qwen2 dense decoder-only architecture.
+Notable architectural traits:
+
+- RMSNorm normalization with pre-norm residual placement.
+- SwiGLU MLP with gate / up / down projections.
+- Grouped-query attention (GQA) with full RoPE.
+- Optional sliding-window attention controlled per layer via
+  ``layer_types``.
+- Optional weight tying between input embeddings and the LM head.
+
+Exposes :class:`Qwen2Model` (transformer trunk) and the task wrappers
+:class:`Qwen2ForCausalLM`, :class:`Qwen2ForSequenceClassification`, and
+the embedding-only :class:`Qwen2ForEmbedding`.
+"""
+
+import jax
+import jax.numpy as jnp
+import spectrax as spx
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
+from spectrax import apply_logical_sharding, common_types, nn
+
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    DecoderLayerOutput,
+    SequenceClassifierOutput,
+)
+from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
+from easydel.layers import (
+    ColumnParallelLinear,
+    Embed,
+    RowParallelLinear,
+    build_fused_gate_up_projection,
+    dense_qkv_layout,
+    gated_mlp_forward,
+)
+from easydel.layers import RMSNorm as RMSNorm
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseEmbeddingModule, BaseSequenceClassificationModule
+
+from .qwen_configuration import Qwen2Config
+
+
+class Qwen2MLP(spx.Module):
+    """Multi-Layer Perceptron module for Qwen2 models.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in Qwen2 architecture.
+    """
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen2 MLP block.
+
+        Args:
+            config (Qwen2Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+        )
+        self.gate_up_proj = build_fused_gate_up_projection(
+            config=config,
+            intermediate_size=config.intermediate_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        )
+        self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
+        self.act_fn = ACT2FN[self.config.hidden_act]
+
+    @property
+    def reform_param(self):
+        """Checkpoint-reform rules for the fused gate-up projection.
+
+        Forwards to :meth:`ColumnParallelLinear.build_reform_param` so that
+        upstream checkpoints carrying separate ``gate_proj`` / ``up_proj``
+        tensors can be loaded into Qwen2's fused ``gate_up_proj`` layout
+        without manual remapping.
+
+        Returns:
+            dict: Mapping from upstream parameter prefixes to the fused
+            ``gate_up_proj`` parameter slot for this MLP, consumable by
+            EasyDeL's HF-to-EasyDeL conversion pipeline.
+        """
+        return self.gate_up_proj.build_reform_param("gate_up_proj", config=self.config)
+
+    def forward(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SwiGLU feedforward transformation.
+
+        Delegates to :func:`easydel.layers.gated_mlp_forward`, which routes
+        supported layouts through the ejkernel fused MLP kernels and runs
+        the legacy composition otherwise.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
+        return gated_mlp_forward(self, hidden_states, dropout=self.dropout)
+
+
+class Qwen2Attention(UnifiedAttention):
+    """Multi-head attention layer with RoPE embeddings and sliding window support for Qwen2 models.
+
+    Inherits from UnifiedAttention with Qwen2-specific customizations including
+    layer-specific sliding window attention and custom bias configuration
+    where Q/K/V projections use bias while output projection does not.
+    """
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Qwen2 attention layer with grouped-query attention and sliding window support.
+
+        Args:
+            config (Qwen2Config): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model, used for determining
+                sliding window attention configuration.
+        """
+
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+            layer_idx=layer_idx,
+            sliding_window=(
+                config.sliding_window
+                if config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+                else None
+            ),
+        )
+
+    def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Build the fused QKV projection with Qwen2's configured Q/K/V bias.
+
+        Constructs a single :class:`ColumnParallelLinear` that produces the
+        concatenated Q, K and V outputs in one matmul, sized via
+        :func:`dense_qkv_layout` so the GQA segment widths
+        (``num_attention_heads * head_dim`` for Q,
+        ``num_key_value_heads * head_dim`` each for K and V) line up with
+        the downstream split. The bias toggle follows
+        ``config.attention_bias`` (default ``True`` for Qwen2).
+
+        Args:
+            config: Qwen2 configuration providing head counts, hidden size,
+                initializer range, and the attention-bias flag.
+            dtype: Compute dtype for the projection.
+            param_dtype: Storage dtype for the kernel and optional bias.
+            precision: JAX precision passed through to the matmul.
+            rngs: Random number generators used for parameter init.
+
+        Returns:
+            ColumnParallelLinear: Fused QKV projection with the
+            ``dense_qkv_layout`` attached so the result can be split into
+            Q/K/V via the layout's segment sizes.
+        """
+        qkv_layout = dense_qkv_layout(
+            config.num_attention_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
+        )
+        return ColumnParallelLinear(
+            config.hidden_size,
+            qkv_layout.segment_sizes,
+            rngs=rngs,
+            use_bias=bool(getattr(config, "attention_bias", True)),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            layout=qkv_layout,
+        )
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Build the output projection without bias.
+
+        Qwen2 keeps the output projection bias-free even when QKV is
+        biased — the convention preserves the residual stream
+        magnitude. Maps ``num_attention_heads * head_dim`` back to
+        ``hidden_size`` via a row-parallel linear so the row-sharded
+        output reduces along the sequence dim cleanly.
+
+        Returns:
+            RowParallelLinear: O projection.
+        """
+        from easydel.layers import RowParallelLinear
+
+        return RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+        )
+
+    def _create_rotary(self, config: Qwen2Config, dtype: jnp.dtype):
+        """Create the RoPE module for Qwen2 attention.
+
+        Qwen2 uses full (not partial) rotary embeddings, so both
+        ``head_size`` and ``rotary_dim`` are set to the full
+        ``head_dim``; the period is controlled by ``config.rope_theta``.
+
+        Returns:
+            RoPE module produced by ``config.get_basic_rope``.
+        """
+        return config.get_basic_rope(
+            head_size=config.hidden_size // config.num_attention_heads,
+            rotary_dim=config.hidden_size // config.num_attention_heads,
+            base=config.rope_theta,
+            dtype=dtype,
+        )
+
+
+class Qwen2DecoderLayer(spx.Module):
+    """Single decoder layer for Qwen2 models.
+
+    Combines multi-head attention with sliding window support and feedforward
+    networks with RMS normalization and residual connections.
+    """
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+        layer_idx: int,
+    ):
+        """Initialize Qwen2 decoder layer.
+
+        Args:
+            config (Qwen2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.self_attn = Qwen2Attention(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+        )
+
+        self.mlp = Qwen2MLP(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
+
+        attn_outputs = self.self_attn(
+            self.input_layernorm(hidden_states),
+            mask_info,
+            position_ids,
+            mode,
+            cache_view,
+            cache_metadata,
+            output_attentions,
+            frequencies,
+        )
+        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
+
+        feed_forward_input = self.post_attention_layernorm(hidden_states)
+
+        if self.config.use_scan_mlp:
+            feed_forward_hidden_states = blockwise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+            )
+        else:
+            feed_forward_hidden_states = self.mlp(
+                feed_forward_input,
+            )
+
+        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=attn_outputs.attention_weight,
+            cache_view=attn_outputs.cache_view,
+        )
+
+
+@register_module(TaskType.BASE_MODULE, config=Qwen2Config, model_type="qwen2")
+class Qwen2Model(EasyDeLBaseModule):
+    """Qwen2 model implementation.
+
+    This implements the Qwen2 language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, sliding window attention, and a specific
+    attention mechanism with bias on Q/K/V projections.
+
+    Attributes:
+        config (Qwen2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen2 base model.
+
+        Args:
+            config (Qwen2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        self.dropout = nn.Dropout(rate=config.embd_pdrop, rngs=rngs)
+        layer_block = auto_remat(
+            Qwen2DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.layers = nn.ModuleList([])
+        for i in range(config.num_hidden_layers):
+            with self.assign_layer_stage(i, total_layers=config.num_hidden_layers):
+                self.layers.append(
+                    layer_block(
+                        config=config,
+                        layer_idx=i,
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                )
+        if self.config.scan_layers and self._pipeline_stage_count() == 1:
+            self.layers = self.layers.stack()
+        final_layer_idx = max(0, config.num_hidden_layers - 1)
+        with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+
+    def forward(
+        self,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        trace: bool = False,
+    ) -> BaseModelOutput:
+        """Forward pass through the Qwen2 base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+        sequence_length = inputs_embeds.shape[1]
+
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        assert sequence_length <= self.config.max_position_embeddings, (
+            f"Maximum Position Embedding Reached ! "
+            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+        )
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
+        hidden_states = self.dropout(inputs_embeds)
+        if mode is None:
+            mode = (
+                common_types.MODE_DECODE
+                if sequence_length == 1 and past_key_values is not None
+                else common_types.MODE_TRAIN
+            )
+        if past_key_values is None:
+            past_key_values = TransformerCache.init_empty(len(self.layers))
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.runtime_sharding_resolver,
+        )
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        frequencies = self.config.get_basic_frequencies()
+
+        trace_layers = self._layer_scan_trace(
+            trace,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            cache_views=views,
+            extra=needs_trace_cache,
+        )
+        cache_views = views if trace_layers else None
+
+        def _run_layer(block, carry):
+            """Apply a single decoder layer inside the layer-stack scan.
+
+            Used as the body function for ``self.layers.scan``. Unpacks
+            the carry, runs ``block`` under the appropriate pipeline
+            stage context, accumulates per-layer hidden states /
+            attention weights when requested, and returns the updated
+            carry.
+
+            Args:
+                block: The current decoder layer being scanned.
+                carry: Tuple ``(hidden_states, cache_views,
+                    all_hidden_states, all_attentions, layer_idx)``.
+
+            Returns:
+                Updated carry tuple with ``layer_idx`` incremented.
+            """
+            hs, cv, ah, aa, idx = carry
+            if output_hidden_states:
+                ah = (*ah, hs)
+            with self._layer_stage_context(idx, layers=self.layers):
+                layer_outputs = block(
+                    hidden_states=hs,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_metadata=cache_metadata,
+                    output_attentions=output_attentions,
+                    frequencies=frequencies,
+                )
+            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+            cv = self._layer_cache_view_update(
+                cv,
+                idx,
+                layer_outputs.cache_view,
+                enabled=trace_layers,
+                cache=past_key_values,
+            )
+            if output_attentions:
+                aa = (*aa, layer_outputs.attention_weight)
+            return hs, cv, ah, aa, idx + 1
+
+        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+            _run_layer,
+            init_carry,
+            trace=trace_layers,
+            **self._layer_scan_kwargs("text"),
+        )
+        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
+
+@register_module(TaskType.CAUSAL_LM, config=Qwen2Config, model_type="qwen2")
+class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
+    """Qwen2 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    and sliding window attention applied to perform autoregressive language generation.
+
+    Attributes:
+        config (Qwen2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "qwen2"
+    _config_class = Qwen2Config
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen2 model for causal language modeling.
+
+        Args:
+            config (Qwen2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen2Model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            lm_head_bias=False,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
+
+
+@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2Config, model_type="qwen2")
+class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model, Qwen2Config]):
+    """Qwen2 model for sequence classification tasks.
+
+    This class extends the base Qwen2 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (Qwen2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "qwen2"
+    _config_class = Qwen2Config
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen2 model for sequence classification.
+
+        Args:
+            config (Qwen2Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (spx.Rngs): Random number generator state.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen2Model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type: ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Forward pass through the Qwen2 sequence classification model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            segment_ids (Array | None, optional): Segment IDs (unused). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply classification head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            SequenceClassifierOutput: Contains logits, past_key_values, optional hidden_states,
+                and optional attentions.
+
+        Raises:
+            ValueError: If config.pad_token_id is None and batch_size > 1.
+        """
+        if not apply_lm_head:
+            outputs = self.model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                past_key_values=past_key_values,
+                cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            return SequenceClassifierOutput(
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                aux_loss=self.compute_router_aux_loss(outputs, attention_mask=attention_mask),
+            )
+        # Pooling (attention-mask aware), cache pass-through and aux loss all live in the shared base forward.
+        return super().forward(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This model has a sequence classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
+
+
+@register_module(TaskType.EMBEDDING, config=Qwen2Config, model_type="qwen2")
+class Qwen2ForEmbedding(BaseEmbeddingModule[Qwen2Model, Qwen2Config]):
+    """Qwen2 model for text embedding and similarity tasks.
+
+    Produces dense vector representations by pooling the last hidden state
+    of the Qwen2 transformer and optionally L2-normalizing. Compatible with
+    GTE-Qwen2 and other Qwen2-based embedding checkpoints.
+
+    Uses ``last`` token pooling by default (matching the GTE-Qwen2 convention
+    where the EOS/last token aggregates sequence information).
+
+    Example:
+        >>> model = Qwen2ForEmbedding(config, rngs=rngs)
+        >>> outputs = model(input_ids=input_ids, attention_mask=mask)
+        >>> embeddings = outputs.embeddings  # (batch, hidden_size)
+    """
+
+    _task_type = TaskType.EMBEDDING
+    _model_type = "qwen2"
+    _config_class = Qwen2Config
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        """Initialize Qwen2 embedding model.
+
+        Args:
+            config: Qwen2 model configuration.
+            dtype: Computation data type. Defaults to bfloat16.
+            param_dtype: Parameter data type. Defaults to bfloat16.
+            precision: JAX precision setting.
+            rngs: SpecTrax random number generators.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen2Model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            pooling_strategy="last",
+            normalize_embeddings=True,
+        )

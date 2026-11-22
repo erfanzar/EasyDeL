@@ -4,7 +4,7 @@ build:
   tools:
     python: "3.11"
 sphinx:
-  configuration: docs/conf.py
+  configuration: libs/easydel/docs/conf.py
 python:
   install:
-    - requirements: docs/requirements.txt
+    - requirements: libs/easydel/docs/requirements.txt

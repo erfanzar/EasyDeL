@@ -1,0 +1,433 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Module-level tests for GatedDeltaRule operation."""
+
+from __future__ import annotations
+
+import importlib
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from ejkernel import modules
+from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gated_delta_rule_xla
+from ejkernel.modules import operations
+from ejkernel.modules.operations import (
+    GatedDeltaRule,
+    GatedDeltaRuleConfig,
+    gated_delta_rule,
+    gdr_attention,
+)
+from jax.sharding import Mesh, PartitionSpec
+
+from ._utils import assert_allclose, device_platform
+
+
+def test_gdr_is_exported_from_modules_init_files():
+    assert hasattr(operations, "gated_delta_rule")
+    assert hasattr(operations, "GatedDeltaRule")
+    assert hasattr(operations, "GatedDeltaRuleConfig")
+    assert hasattr(operations, "gdr_attention")
+
+    assert hasattr(modules, "gated_delta_rule")
+    assert hasattr(modules, "GatedDeltaRule")
+    assert hasattr(modules, "GatedDeltaRuleConfig")
+    assert hasattr(modules, "gdr_attention")
+
+
+def test_gdr_attention_alias():
+    assert gdr_attention is gated_delta_rule
+
+
+def test_gdr_config_serialization():
+    cfg = GatedDeltaRuleConfig(
+        chunk_size=128,
+        platform="xla",
+        backend="any",
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+        sequence_parallel_truncate_state_gradient=True,
+        sequence_parallel_forward_only=True,
+    )
+    d = cfg.to_dict()
+    assert d["chunk_size"] == 128
+    assert d["platform"] == "xla"
+    assert d["use_input_dtype_phase1_outputs"] is True
+    assert d["use_input_dtype_state"] is True
+
+    cfg2 = GatedDeltaRuleConfig.from_dict(d)
+    assert cfg2.chunk_size == cfg.chunk_size
+    assert cfg2.platform == cfg.platform
+    assert cfg2.use_input_dtype_phase1_outputs is True
+    assert cfg2.use_input_dtype_state is True
+    assert cfg2.sequence_parallel_truncate_state_gradient is True
+    assert cfg2.sequence_parallel_forward_only is True
+
+    j = cfg.to_json()
+    cfg3 = GatedDeltaRuleConfig.from_json(j)
+    assert cfg3.chunk_size == cfg.chunk_size
+    assert cfg3.use_input_dtype_state is True
+    assert cfg3.sequence_parallel_truncate_state_gradient is True
+    assert cfg3.sequence_parallel_forward_only is True
+
+
+def _make_inputs(batch=1, seq_len=8, heads=2, qk_dim=8, v_dim=8, dtype=jnp.bfloat16, seed=0):
+    key = jax.random.PRNGKey(seed)
+    kq, kk, kv, kb, kd = jax.random.split(key, 5)
+
+    q = jax.random.normal(kq, (batch, seq_len, heads, qk_dim), dtype=jnp.float32).astype(dtype)
+    k = jax.random.normal(kk, (batch, seq_len, heads, qk_dim), dtype=jnp.float32).astype(dtype)
+    v = jax.random.normal(kv, (batch, seq_len, heads, v_dim), dtype=jnp.float32).astype(dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(kb, (batch, seq_len, heads), dtype=jnp.float32)).astype(dtype)
+    decay = (jax.random.normal(kd, (batch, seq_len, heads), dtype=jnp.float32) * -0.01).astype(dtype)
+
+    return q, k, v, beta, decay
+
+
+def test_gdr_chunked_and_recurrent_match_and_return_state():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+
+    out_chunked, state = gated_delta_rule(q, k, v, beta, decay, return_state=True, use_chunked=True, platform="xla")
+    out_recurrent = gated_delta_rule(q, k, v, beta, decay, return_state=False, use_chunked=False, platform="xla")
+
+    assert out_chunked.shape == (batch, seq_len, heads, v_dim)
+    assert out_recurrent.shape == (batch, seq_len, heads, v_dim)
+    assert state.shape == (batch, heads, qk_dim, v_dim)
+
+    assert_allclose(out_chunked, out_recurrent, atol=0.25)
+
+
+def test_gdr_grouped_xla_matches_repeated_heads():
+    batch, seq_len, q_heads, expand_ratio, qk_dim, v_dim = 1, 8, 2, 2, 8, 8
+    v_heads = q_heads * expand_ratio
+    q, k, _, _, _ = _make_inputs(batch, seq_len, q_heads, qk_dim, v_dim, dtype=jnp.float32, seed=31)
+    _, _, v, beta, decay = _make_inputs(batch, seq_len, v_heads, qk_dim, v_dim, dtype=jnp.float32, seed=32)
+
+    out_grouped, state_grouped = gated_delta_rule(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        return_state=True,
+        use_chunked=True,
+        platform="xla",
+        cfg=GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any"),
+    )
+    out_repeated, state_repeated = gated_delta_rule(
+        jnp.repeat(q, expand_ratio, axis=2),
+        jnp.repeat(k, expand_ratio, axis=2),
+        v,
+        beta,
+        decay,
+        return_state=True,
+        use_chunked=True,
+        platform="xla",
+        cfg=GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any"),
+    )
+
+    assert out_grouped.shape == v.shape
+    assert state_grouped.shape == (batch, v_heads, qk_dim, v_dim)
+    assert_allclose(out_grouped, out_repeated, atol=1e-5)
+    assert_allclose(state_grouped, state_repeated, atol=1e-5)
+
+
+def test_gdr_single_step_with_state():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+
+    _, state = gated_delta_rule(q, k, v, beta, decay, return_state=True, use_chunked=True, platform="xla")
+
+    q1, k1, v1, beta1, decay1 = _make_inputs(batch, 1, heads, qk_dim, v_dim, seed=1)
+
+    out_next, state_next = gated_delta_rule(q1, k1, v1, beta1, decay1, state, return_state=True, platform="xla")
+    assert out_next.shape == (batch, 1, heads, v_dim)
+    assert state_next.shape == (batch, heads, qk_dim, v_dim)
+
+
+@pytest.mark.skipif(jax.local_device_count() < 4, reason="requires at least 4 local devices for sequence sharding")
+def test_gdr_sequence_parallel_matches_full_grouped_segmented():
+    batch, seq_len, q_heads, v_heads, qk_dim, v_dim = 1, 16, 1, 2, 4, 3
+    q, k, _, _, _ = _make_inputs(batch, seq_len, q_heads, qk_dim, v_dim, dtype=jnp.float32, seed=41)
+    _, _, v, beta, decay = _make_inputs(batch, seq_len, v_heads, qk_dim, v_dim, dtype=jnp.float32, seed=42)
+    init = jax.random.normal(jax.random.PRNGKey(43), (batch, v_heads, qk_dim, v_dim), dtype=jnp.float32) * 0.1
+    seg_ids = jnp.array([[0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, -1, -1, -1, -1]], dtype=jnp.int32)
+    cfg = GatedDeltaRuleConfig(chunk_size=4, platform="xla", backend="any")
+
+    full_out, full_state = gated_delta_rule(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        seg_ids,
+        init,
+        return_state=True,
+        use_chunked=True,
+        platform="xla",
+        cfg=cfg,
+    )
+
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(4), ("sp",))
+    seq4 = PartitionSpec(None, "sp", None, None)
+    seq3 = PartitionSpec(None, "sp", None)
+    state_spec = PartitionSpec(None, None, None, None)
+    with mesh:
+        sp_out, sp_state = gated_delta_rule(
+            q,
+            k,
+            v,
+            beta,
+            decay,
+            seg_ids,
+            init,
+            return_state=True,
+            use_chunked=True,
+            platform="xla",
+            cfg=cfg.to_dict(),
+            mesh=mesh,
+            in_specs=(seq4, seq4, seq4, seq3, seq3, state_spec, PartitionSpec(None, "sp")),
+            out_specs=(seq4, state_spec),
+            sequence_axis_name="sp",
+        )
+
+    assert_allclose(sp_out, full_out, atol=2e-5)
+    assert_allclose(sp_state, full_state, atol=2e-5)
+
+
+@pytest.mark.skipif(jax.local_device_count() < 4, reason="requires at least 4 local devices for sequence sharding")
+def test_gdr_sequence_parallel_backward_is_finite_and_matches_full():
+    batch, seq_len, q_heads, v_heads, qk_dim, v_dim = 1, 16, 1, 2, 4, 3
+    q, k, _, _, _ = _make_inputs(batch, seq_len, q_heads, qk_dim, v_dim, dtype=jnp.bfloat16, seed=51)
+    _, _, v, beta, decay = _make_inputs(batch, seq_len, v_heads, qk_dim, v_dim, dtype=jnp.bfloat16, seed=52)
+    init = (jax.random.normal(jax.random.PRNGKey(53), (batch, v_heads, qk_dim, v_dim), dtype=jnp.float32) * 0.1).astype(
+        jnp.bfloat16
+    )
+    seg_ids = jnp.array([[0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, -1, -1, -1, -1]], dtype=jnp.int32)
+    cfg = GatedDeltaRuleConfig(chunk_size=4, platform="xla", backend="any")
+
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(4), ("sp",))
+    seq4 = PartitionSpec(None, "sp", None, None)
+    seq3 = PartitionSpec(None, "sp", None)
+    state_spec = PartitionSpec(None, None, None, None)
+
+    def full_loss(q, k, v, beta, decay, init):
+        out, state = gated_delta_rule(
+            q,
+            k,
+            v,
+            beta,
+            decay,
+            seg_ids,
+            init,
+            return_state=True,
+            use_chunked=True,
+            platform="xla",
+            cfg=cfg,
+        )
+        return jnp.mean(out.astype(jnp.float32) ** 2) + 0.01 * jnp.mean(state.astype(jnp.float32) ** 2)
+
+    def sp_loss(q, k, v, beta, decay, init, sp_cfg=cfg):
+        with mesh:
+            out, state = gated_delta_rule(
+                q,
+                k,
+                v,
+                beta,
+                decay,
+                seg_ids,
+                init,
+                return_state=True,
+                use_chunked=True,
+                platform="xla",
+                cfg=sp_cfg.to_dict(),
+                mesh=mesh,
+                in_specs=(seq4, seq4, seq4, seq3, seq3, state_spec, PartitionSpec(None, "sp")),
+                out_specs=(seq4, state_spec),
+                sequence_axis_name="sp",
+            )
+        return jnp.mean(out.astype(jnp.float32) ** 2) + 0.01 * jnp.mean(state.astype(jnp.float32) ** 2)
+
+    full_grads = jax.grad(full_loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, beta, decay, init)
+    sp_grads = jax.grad(sp_loss, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, beta, decay, init)
+
+    for full_grad, sp_grad in zip(full_grads, sp_grads, strict=True):
+        assert bool(jnp.all(jnp.isfinite(sp_grad.astype(jnp.float32))))
+        assert_allclose(sp_grad, full_grad, atol=7e-4)
+
+    truncate_cfg = GatedDeltaRuleConfig(
+        chunk_size=4,
+        platform="xla",
+        backend="any",
+        sequence_parallel_truncate_state_gradient=True,
+    )
+    truncated_grads = jax.grad(
+        lambda q, k, v, beta, decay, init: sp_loss(q, k, v, beta, decay, init, truncate_cfg),
+        argnums=(0, 1, 2, 3, 4, 5),
+    )(q, k, v, beta, decay, init)
+    for grad in truncated_grads:
+        assert bool(jnp.all(jnp.isfinite(grad.astype(jnp.float32))))
+
+    forward_only_cfg = GatedDeltaRuleConfig(
+        chunk_size=4,
+        platform="xla",
+        backend="any",
+        sequence_parallel_forward_only=True,
+    )
+    forward_only_grads = jax.grad(
+        lambda q, k, v, beta, decay, init: sp_loss(q, k, v, beta, decay, init, forward_only_cfg),
+        argnums=(0, 1, 2, 3, 4, 5),
+    )(q, k, v, beta, decay, init)
+    for grad in forward_only_grads:
+        assert bool(jnp.all(jnp.isfinite(grad.astype(jnp.float32))))
+        assert_allclose(grad, jnp.zeros_like(grad), atol=0.0)
+
+
+def test_gdr_single_step_function_fast_path_bypasses_executor(monkeypatch):
+    batch, heads, qk_dim, v_dim = 1, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, 1, heads, qk_dim, v_dim, dtype=jnp.bfloat16, seed=21)
+    init = jax.random.normal(
+        jax.random.PRNGKey(22),
+        (batch, heads, qk_dim, v_dim),
+        dtype=jnp.bfloat16,
+    )
+    cfg = GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any")
+    module_impl = importlib.import_module("ejkernel.modules.operations.gated_delta_rule")
+
+    def _fail_executor(*args, **kwargs):
+        raise AssertionError("single-step inference should bypass the executor")
+
+    monkeypatch.setattr(module_impl, "_executor", _fail_executor)
+
+    out_fast, state_fast = module_impl.gated_delta_rule(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        init,
+        return_state=True,
+        cfg=cfg,
+    )
+    out_xla, state_xla = gated_delta_rule_xla(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        initial_state=init,
+        use_chunked=False,
+    )
+
+    assert_allclose(out_fast, out_xla, atol=0.01)
+    assert_allclose(state_fast, state_xla, atol=0.03)
+
+
+def test_gdr_class_api():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+
+    op = GatedDeltaRule()
+    cfg = GatedDeltaRuleConfig(chunk_size=8, platform="xla")
+
+    out = op.run(q, k, v, beta, decay, use_chunked=True, cfg=cfg)
+    assert out.shape == (batch, seq_len, heads, v_dim)
+
+
+def test_gdr_auto_pallas_forwards_forward_only_dtype_config(monkeypatch):
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+    cfg = GatedDeltaRuleConfig(
+        chunk_size=8,
+        platform="auto",
+        backend="any",
+        use_input_dtype_phase1_outputs=True,
+        use_input_dtype_state=True,
+    )
+    module_impl = importlib.import_module("ejkernel.modules.operations.gated_delta_rule")
+    op = GatedDeltaRule()
+    captured_kwargs = {}
+
+    def _fake_impl(**kwargs):
+        captured_kwargs.update(kwargs)
+        state = jnp.zeros((batch, heads, qk_dim, v_dim), dtype=v.dtype)
+        return jnp.zeros_like(v), state
+
+    monkeypatch.setattr(op, "resolve_platform", lambda _cfg: module_impl.Platform.PALLAS)
+    monkeypatch.setattr(module_impl.kernel_registry, "get", lambda *_, **__: _fake_impl)
+
+    out = op.run(q, k, v, beta, decay, use_chunked=True, cfg=cfg)
+
+    assert out.shape == v.shape
+    assert captured_kwargs["chunk_size"] == 8
+    assert captured_kwargs["use_input_dtype_phase1_outputs"] is True
+    assert captured_kwargs["use_input_dtype_state"] is True
+
+
+def test_gdr_no_decay():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, _ = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+
+    out = gated_delta_rule(q, k, v, beta, None, platform="xla")
+    assert out.shape == (batch, seq_len, heads, v_dim)
+    assert jnp.all(jnp.isfinite(out))
+
+
+def test_gdr_backward():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim, dtype=jnp.float32)
+
+    def loss_fn(q, k, v, beta, decay):
+        out = gated_delta_rule(q, k, v, beta, decay, use_chunked=True, platform="xla")
+        return jnp.sum(out)
+
+    grads = jax.grad(loss_fn, argnums=(0, 1, 2, 3, 4))(q, k, v, beta, decay)
+    for i, g in enumerate(grads):
+        assert g.shape == [q, k, v, beta, decay][i].shape, f"grad {i} shape mismatch"
+        assert jnp.all(jnp.isfinite(g)), f"grad {i} has non-finite values"
+
+
+def test_gdr_use_qk_l2norm_toggle():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
+
+    out_norm = gated_delta_rule(q, k, v, beta, decay, use_qk_l2norm=True, platform="xla")
+    out_nonorm = gated_delta_rule(q, k, v, beta, decay, use_qk_l2norm=False, platform="xla")
+
+    assert out_norm.shape == out_nonorm.shape
+    # Results should differ when L2 norm is toggled
+    assert not jnp.allclose(out_norm.astype(jnp.float32), out_nonorm.astype(jnp.float32), atol=1e-3)
+
+
+@pytest.mark.skipif(device_platform() != "tpu", reason="TPU-only cross-backend comparison (pallas vs xla)")
+def test_gdr_pallas_matches_xla_and_auto_dispatches_on_tpu():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim, dtype=jnp.float32, seed=7)
+    cfg_xla = GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any")
+    cfg_pallas = GatedDeltaRuleConfig(chunk_size=8, platform="pallas", backend="any")
+    cfg_auto = GatedDeltaRuleConfig(chunk_size=8, platform="auto", backend="any")
+
+    out_xla, state_xla = gated_delta_rule(q, k, v, beta, decay, return_state=True, use_chunked=True, cfg=cfg_xla)
+    out_pallas, state_pallas = gated_delta_rule(
+        q, k, v, beta, decay, return_state=True, use_chunked=True, cfg=cfg_pallas
+    )
+    out_auto, state_auto = gated_delta_rule(q, k, v, beta, decay, return_state=True, use_chunked=True, cfg=cfg_auto)
+
+    assert_allclose(out_pallas, out_xla, atol=0.25)
+    assert_allclose(state_pallas, state_xla, atol=0.25)
+    assert_allclose(out_auto, out_pallas, atol=0.0)
+    assert_allclose(state_auto, state_pallas, atol=0.0)

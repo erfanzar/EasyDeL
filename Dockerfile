@@ -67,18 +67,29 @@ RUN uv venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:/usr/local/cuda/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
-# Project files
+# Project files (uv workspace: root pyproject + the four packages under libs/)
 COPY pyproject.toml README.md ./
-COPY easydel ./easydel
+COPY libs ./libs
+
+# libs/surgecore is a Rust (PyO3) extension built by maturin and not on PyPI yet: install it from the copied
+# source before easydel, whose exact surgecore pin it then satisfies. Every base already has a C toolchain and curl
+# (build-essential and curl from the OS deps step above), so only a minimal rustup toolchain is added; it and the
+# cargo build directory are deleted in this same layer to keep the image small.
+RUN set -euxo pipefail; \
+    export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo CARGO_TARGET_DIR=/tmp/surgecore-target; \
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path; \
+    PATH="$CARGO_HOME/bin:$PATH" uv pip install ./libs/surgecore; \
+    rm -rf "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
 # Install project deps
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" == "cuda" ]]; then \
-        JAX_PLATFORMS=cpu uv pip install -e ".[cuda,torch,lm_eval,profile]"; \
+        JAX_PLATFORMS=cpu uv pip install -e "./libs/easydel[cuda,torch,lm_eval,profile]"; \
     elif [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
-        JAX_PLATFORMS=cpu uv pip install -e ".[tpu,torch,lm_eval,profile]"; \
+        JAX_PLATFORMS=cpu uv pip install -e "./libs/easydel[tpu,torch,lm_eval,profile]"; \
     else \
-        uv pip install -e ".[torch,lm_eval,profile]"; \
+        uv pip install -e "./libs/easydel[torch,lm_eval,profile]"; \
     fi
 
 # Ray with GCP extras
@@ -113,7 +124,7 @@ RUN mkdir -p "$HOME" && \
     chown -R easydel:easydel "$HOME"
 
 # Helpful env
-ENV PYTHONPATH=/app:/app/easydel:. \
+ENV PYTHONPATH=/app:/app/libs/easydel:. \
     RAY_USAGE_STATS_ENABLED=0 \
     TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS=60 \
     TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES=1024 \

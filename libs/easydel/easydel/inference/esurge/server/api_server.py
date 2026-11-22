@@ -1,0 +1,3860 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""FastAPI server for eSurge with OpenAI API compatibility.
+
+This module implements a production-ready API server that exposes eSurge inference
+engines through OpenAI-compatible REST endpoints. It provides comprehensive features
+for serving large language models in production environments.
+
+Key Features:
+    - Full OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions)
+    - Multi-model support with automatic routing based on model name
+    - Streaming responses using Server-Sent Events (SSE)
+    - Function/tool calling surfaced directly from eSurge parser outputs
+    - Production-grade authentication with RBAC, rate limiting, and audit logging
+    - Real-time metrics and health monitoring
+    - Thread-safe request handling with configurable concurrency limits
+
+Architecture:
+    The server uses an adapter pattern to bridge eSurge engines with the FastAPI
+    infrastructure. The main components are:
+
+    - eSurgeAdapter: Wraps eSurge instances to implement InferenceEngineAdapter
+    - eSurgeApiServer: Main server class combining base server, tool calling,
+      and auth endpoint mixins
+
+Type Aliases:
+    RefineSamplingParamsFn: Callback type for customizing sampling parameters.
+    RefineChatRequestFn: Callback type for preprocessing chat requests.
+
+Example:
+    Basic single-model server::
+
+        from easydel.inference.esurge import eSurge
+        from easydel.inference.esurge.server import eSurgeApiServer
+
+        esurge = eSurge.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+        server = eSurgeApiServer(esurge, require_api_key=True)
+        server.run(host="0.0.0.0", port=8000)
+
+    Multi-model server with custom configurations::
+
+        esurge_map = {
+            "llama-7b": eSurge.from_pretrained("model-a"),
+            "llama-13b": eSurge.from_pretrained("model-b"),
+        }
+        server = eSurgeApiServer(esurge_map, enable_function_calling=True, require_api_key=True, admin_key="sk-admin-secret-long-enough")
+        server.run()
+
+See Also:
+    - `easydel.inference.esurge.esurge_engine.eSurge`: Core inference engine
+    - `easydel.inference.inference_engine_interface`: Base server infrastructure
+    - `easydel.workers.esurge.auth`: Authentication and authorization system
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import inspect
+import json
+import math
+import threading
+import time
+import traceback
+import typing as tp
+import uuid
+from collections.abc import AsyncGenerator, Iterator, Sequence
+from http import HTTPStatus
+
+import anyio
+from eformer.loggings import get_logger
+from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from transformers import ProcessorMixin
+
+from easydel.workers.esurge.auth import (
+    ApiKeyRole,
+    EnhancedApiKeyManager,
+    InvalidApiKey,
+    PermissionDenied,
+    QuotaExceeded,
+    RateLimitExceeded,
+)
+from easydel.workers.esurge.auth.credentials import api_key_from_headers
+
+from ...inference_engine_interface import (
+    BaseInferenceApiServer,
+    InferenceEngineAdapter,
+    ServerStatus,
+    create_error_response,
+)
+from ...openai_api_modules import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionStreamResponse,
+    ChatMessage,
+    CompletionRequest,
+    CompletionResponse,
+    CompletionResponseChoice,
+    DeltaMessage,
+    ResponsesRequest,
+    UsageInfo,
+)
+from ...sampling_params import SamplingParams
+from ...stream_protocol import StreamEventFrame
+from ...typed_models import ResponseCompletedEvent, ResponsesFinalizationOptions, ResponsesOutputItem, ResponsesResponse
+from ..esurge_engine import RequestOutput, eSurge
+from ..metrics import get_metrics_collector, initialize_metrics
+from .auth_endpoints import AuthEndpointsMixin
+
+logger = get_logger("eSurgeApiServer")
+
+__all__ = (
+    "RefineChatRequestFn",
+    "RefineSamplingParamsFn",
+    "ServerStatus",
+    "create_error_response",
+    "eSurgeAdapter",
+    "eSurgeApiServer",
+)
+
+_STREAM_DATA = "data"
+_STREAM_ERROR = "error"
+_STREAM_END = "end"
+# Completed requests older than this are left out of the per-model summary in ``/metrics``.
+_METRICS_WINDOW_S = 300.0
+
+
+class _AdmissionStream:
+    """Close the source and release admission even before the first body iteration."""
+
+    def __init__(self, iterator, release: tp.Callable[[], None]):
+        self._iterator = iterator
+        self._release = release
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await anext(self._iterator)
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self):
+        if self._closed:
+            return
+        self._closed = True
+        # Starlette may cancel its streaming task group on an ASGI disconnect.
+        # Source finalizers must run before the unused reservation is released.
+        with anyio.CancelScope(shield=True):
+            try:
+                close = getattr(self._iterator, "aclose", None)
+                if close is not None:
+                    await close()
+            finally:
+                self._release()
+
+
+class _AdmissionStreamingResponse(StreamingResponse):
+    """Tie source cleanup to the ASGI lifecycle, including response-start failure."""
+
+    def __init__(self, response: StreamingResponse, release: tp.Callable[[], None]):
+        super().__init__(
+            _AdmissionStream(response.body_iterator, release),
+            status_code=response.status_code,
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self.raw_headers = response.raw_headers
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.body_iterator.aclose()
+
+
+# Content-item fields whose values reach image/video loaders or HF processors.
+_MEDIA_REFERENCE_FIELDS = ("image", "image_url", "input_image", "video", "video_url", "input_video")
+
+
+def _collect_string_references(value: tp.Any, out: list[str]) -> None:
+    """Collect every string media reference inside ``value``, recursing through lists and tuples.
+
+    HF video processors recursively flatten nested lists into string references and load each one,
+    so a reference wrapped in any list depth must be gated (r14 S11-1). For mappings only the URL keys
+    are references (``{"url": ..., "detail": "auto"}`` keeps its non-reference ``detail``).
+
+    Args:
+        value: A media field value (string, URL mapping, nested list, or numeric frames).
+        out: Accumulator the string references are appended to.
+    """
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key in ("url", "image_url", "video_url"):
+            if key in value:
+                _collect_string_references(value[key], out)
+    elif isinstance(value, list | tuple):
+        for element in value:
+            _collect_string_references(element, out)
+
+
+# Type alias for sampling parameter refinement callbacks.
+#
+# A callable that receives the initial SamplingParams, the original request,
+# and the eSurge instance, and returns modified SamplingParams or None to
+# keep the original.
+RefineSamplingParamsFn = tp.Callable[
+    [SamplingParams, ChatCompletionRequest | CompletionRequest, "eSurge"],
+    SamplingParams | None,
+]
+
+# Type alias for chat request preprocessing callbacks.
+#
+# A callable that receives a ChatCompletionRequest and returns a modified
+# request or None to keep the original.
+RefineChatRequestFn = tp.Callable[[ChatCompletionRequest], ChatCompletionRequest | None]
+
+
+class eSurgeAdapter(InferenceEngineAdapter):
+    """Adapter for eSurge inference engine.
+
+    Bridges the synchronous eSurge engine with the async FastAPI server.
+    Implements the InferenceEngineAdapter interface for compatibility
+    with the base API server infrastructure.
+    """
+
+    def __init__(self, esurge_instance: eSurge, model_name: str):
+        """Initialize the adapter with an eSurge engine and model name.
+
+        Args:
+            esurge_instance: The eSurge inference engine to wrap.
+            model_name: Display name for the model in API responses.
+        """
+        self.esurge = esurge_instance
+        self._model_name = model_name
+
+    async def generate(
+        self,
+        prompts: str | list[str],
+        sampling_params: SamplingParams,
+        stream: bool = False,
+    ) -> list[RequestOutput] | AsyncGenerator[RequestOutput, None]:
+        """Generate text using the wrapped eSurge engine.
+
+        Dispatches a synchronous ``esurge.generate`` call onto the running
+        event loop's default executor so the FastAPI thread is not blocked.
+
+        Args:
+            prompts: Single prompt string or list of prompt strings.
+            sampling_params: Generation parameters (temperature, top-p, etc.).
+            stream: Whether to stream results. Streaming is not implemented
+                in this adapter — use the streaming code paths on
+                :class:`eSurgeApiServer` instead.
+
+        Returns:
+            List of :class:`RequestOutput` objects for batch generation.
+
+        Raises:
+            NotImplementedError: If ``stream=True``.
+        """
+        if stream:
+            raise NotImplementedError()
+        else:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, self.esurge.generate, prompts, sampling_params, None, False)
+
+    def count_tokens(self, content: str) -> int:
+        """Count tokens using eSurge tokenizer.
+
+        Args:
+            content: Text to tokenize.
+
+        Returns:
+            Number of tokens in the content.
+        """
+        return len(self.esurge.tokenizer(content)["input_ids"])
+
+    def get_model_info(self) -> dict[str, tp.Any]:
+        """Get eSurge model information.
+
+        Returns:
+            Dictionary containing model metadata: name, type, max_model_len,
+            and max_num_seqs.
+        """
+        return {
+            "name": self._model_name,
+            "type": "esurge",
+            "max_model_len": self.esurge.max_model_len,
+            "max_num_seqs": self.esurge.max_num_seqs,
+        }
+
+    @property
+    def model_name(self) -> str:
+        """Return the model name.
+
+        Returns:
+            The model name string assigned during adapter initialization.
+        """
+        return self._model_name
+
+    @property
+    def processor(self) -> tp.Any:
+        """Return the tokenizer/processor associated with the eSurge instance.
+
+        Returns:
+            The tokenizer or processor object used by the underlying eSurge
+            engine for text encoding and decoding.
+        """
+        return self.esurge.tokenizer
+
+
+class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
+    """eSurge-specific API server implementation with OpenAI compatibility.
+
+    Provides a FastAPI-based REST API server that exposes eSurge engines
+    through OpenAI-compatible endpoints. Supports multiple models, streaming,
+    function calling, and comprehensive monitoring.
+
+    Features:
+    - OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions)
+    - Multi-model support with dynamic routing
+    - Streaming responses with Server-Sent Events (SSE)
+    - Function/tool calling support
+    - Real-time metrics and health monitoring
+    - Thread-safe request handling
+    - Production-grade authentication with RBAC, rate limiting, and audit logging
+    """
+
+    def __init__(
+        self,
+        esurge_map: dict[str, eSurge] | eSurge,
+        oai_like_processor: bool = True,
+        enable_function_calling: bool = True,
+        require_api_key: bool = False,
+        admin_key: str | None = None,
+        enable_audit_logging: bool = True,
+        max_audit_entries: int = 10000,
+        storage_dir: str | None = None,
+        enable_persistence: bool = True,
+        auto_save_interval: float = 60.0,
+        auth_worker_client: tp.Any | None = None,
+        response_store_worker_client: tp.Any | None = None,
+        max_concurrent_generations: int | None = None,
+        overload_message: str = "Server is busy, please try again later",
+        extra_stops: str | list[str] | None = None,
+        refine_sampling_params: RefineSamplingParamsFn | None = None,
+        refine_chat_request: RefineChatRequestFn | None = None,
+        enable_response_store: bool = True,
+        default_store_responses: bool = True,
+        max_stored_responses: int = 10_000,
+        max_stored_conversations: int = 1_000,
+        allow_local_media_paths: bool = False,
+        **kwargs,
+    ) -> None:
+        """Initialize the eSurge API server.
+
+        Args:
+            esurge_map: Single eSurge instance or dict mapping model names to instances.
+            oai_like_processor: Enable OpenAI-like processor compatibility for chat templates.
+            enable_function_calling: Enable function/tool calling support.
+            require_api_key: Enforce API key authentication for every endpoint.
+            admin_key: Optional admin key for initial setup. If provided, creates an admin key.
+            enable_audit_logging: Enable comprehensive audit logging for all auth operations.
+            max_audit_entries: Maximum number of audit log entries to keep in memory (default: 10000).
+            storage_dir: Directory for persistent auth storage. Defaults to ~/.cache/esurge-auth/
+            enable_persistence: Enable persistent storage of auth data to disk (default: True).
+            auto_save_interval: Seconds between automatic saves (default: 60.0).
+            auth_worker_client: Optional AuthWorkerClient instance for ZMQ-based auth (default: None, uses in-process auth).
+            response_store_worker_client: Optional ResponseStoreWorkerClient instance for persistent /v1/responses state.
+            max_concurrent_generations: Maximum concurrent inference jobs allowed. Defaults to the smallest
+                runtime request cap across loaded eSurge instances when not provided, falling back to
+                ``max_num_seqs`` when runtime metadata is unavailable.
+            overload_message: Custom error message returned when all generation slots are busy.
+            extra_stops: Global stop strings applied to every request in addition to request-level stop values.
+                Useful for enforcing server-side delimiters (for example ``\"<user>\"``) without requiring
+                clients to set ``stop`` on each call.
+            refine_sampling_params: Optional callable to adjust SamplingParams per request.
+            refine_chat_request: Optional callable to mutate or replace chat requests before processing.
+            allow_local_media_paths: When ``False`` (default), image references in requests must be inline
+                base64 ``data:`` URLs; server-local file paths and ``file://`` URLs are rejected with 400 so a
+                client cannot make the server read arbitrary files from its filesystem. Enable only for
+                trusted clients.
+            **kwargs: Additional arguments passed to BaseInferenceApiServer.
+
+        Raises:
+            TypeError: If esurge_map values are not eSurge instances.
+        """
+        if not isinstance(esurge_map, dict):
+            model_name = getattr(esurge_map, "esurge_name", None) or "esurge"
+            esurge_map = {model_name: esurge_map}
+
+        self.esurge_map = esurge_map
+        self.adapters: dict[str, eSurgeAdapter] = {}
+
+        # Engines are accepted by surface, not by class: RoutedEngine and
+        # RemoteEngineHandle (DP-replica fronts) serve exactly like a local
+        # eSurge as long as they expose the adapter contract.
+        engine_surface = ("generate", "stream", "chat", "abort_request", "tokenizer", "max_model_len", "max_num_seqs")
+        for name, esurge in esurge_map.items():
+            missing = [attr for attr in engine_surface if not hasattr(esurge, attr)]
+            if missing:
+                raise TypeError(f"Value for key '{name}' does not expose the eSurge engine surface; missing: {missing}")
+            coordinator = getattr(esurge, "_step_coordinator", None)
+            if coordinator is not None and not getattr(coordinator, "is_leader", True):
+                raise ValueError(
+                    f"Model '{name}' is a step-coordination worker rank "
+                    f"{getattr(coordinator, 'rank', '?')}; only the leader rank can run eSurgeApiServer."
+                )
+            if isinstance(esurge, eSurge):
+                # Remote/routed members run no local collectives; only a
+                # local engine can deadlock a multi-host runtime.
+                self._reject_uncoordinated_multihost(name, esurge, coordinator)
+            self.adapters[name] = eSurgeAdapter(esurge, name)
+
+        self.oai_like_processor = oai_like_processor
+        self._allow_local_media_paths = bool(allow_local_media_paths)
+        self._refine_sampling_params_callback = refine_sampling_params
+        self._refine_chat_request_callback = refine_chat_request
+        self._extra_stops = self._normalize_stop_sequences(extra_stops)
+
+        try:
+            esurge_max_concurrency = min(
+                self._resolve_esurge_runtime_request_cap(esurge) for esurge in esurge_map.values()
+            )
+        except (AttributeError, TypeError, ValueError) as e:
+            raise ValueError(
+                "Loaded eSurge instances must expose a positive runtime request cap or `max_num_seqs`."
+            ) from e
+        if esurge_max_concurrency <= 0:
+            raise ValueError("Loaded eSurge instances must expose a positive runtime request cap or `max_num_seqs`.")
+
+        if max_concurrent_generations is not None:
+            try:
+                max_slots = int(max_concurrent_generations)
+            except (TypeError, ValueError):
+                max_slots = 0
+        else:
+            max_slots = esurge_max_concurrency
+        max_slots = max(0, max_slots)
+        self._resolved_generation_slot_cap = max_slots
+        kwargs["max_workers"] = esurge_max_concurrency * 2
+
+        # The engines record per-request metrics only into an existing collector; monitoring may not have made one.
+        if get_metrics_collector() is None:
+            initialize_metrics(enable_detailed_logging=False)
+
+        # Initialize authentication manager (either ZMQ worker or in-process)
+        self._require_api_key = bool(require_api_key)
+
+        if auth_worker_client is not None:
+            # Use ZMQ worker for authentication
+            self.auth_manager = auth_worker_client
+            logger.info("Using ZMQ auth worker for authentication")
+        else:
+            # Use in-process enhanced authentication manager
+            self.auth_manager = EnhancedApiKeyManager(
+                require_api_key=require_api_key,
+                admin_key=admin_key,
+                enable_audit_logging=enable_audit_logging,
+                max_audit_entries=max_audit_entries,
+                storage_dir=storage_dir,
+                enable_persistence=enable_persistence,
+                auto_save=enable_persistence,  # Auto-save if persistence enabled
+                save_interval=auto_save_interval,
+            )
+            if enable_persistence:
+                storage_path = storage_dir or "~/.cache/esurge-auth"
+                logger.info(f"Enhanced authentication system initialized with persistent storage at: {storage_path}")
+            else:
+                logger.info("Enhanced authentication system initialized (in-memory only)")
+
+        super().__init__(
+            server_name="EasyDeL eSurge API Server",
+            server_description="High-performance eSurge inference server with OpenAI compatibility",
+            enable_function_calling=enable_function_calling,
+            max_concurrent_generations=max_slots,
+            overload_message=overload_message,
+            enable_response_store=enable_response_store,
+            default_store_responses=default_store_responses,
+            max_stored_responses=max_stored_responses,
+            max_stored_conversations=max_stored_conversations,
+            response_store_client=response_store_worker_client,
+            **kwargs,
+        )
+
+    async def on_startup(self) -> None:
+        """Custom startup logic for eSurge.
+
+        Called when the FastAPI server starts. Logs loaded models
+        and sets server status to READY.
+        """
+        logger.info(f"Loaded {len(self.adapters)} eSurge models")
+        for name in self.adapters:
+            logger.info(f"  - {name}")
+        logger.info("eSurge API Server is ready")
+
+    async def on_shutdown(self) -> None:
+        """Custom shutdown logic for eSurge.
+
+        Called when the FastAPI server shuts down. Cleans up ZMQ workers.
+        """
+        logger.info("eSurge API Server shutting down")
+        self.status = ServerStatus.SHUTTING_DOWN
+        self.auth_manager.flush()
+        logger.info("eSurge API Server shutdown complete")
+
+    def _get_adapter(self, model_name: str) -> eSurgeAdapter:
+        """Get adapter by model name.
+
+        Args:
+            model_name: Name of the model to retrieve.
+
+        Returns:
+            eSurgeAdapter instance for the specified model.
+
+        Raises:
+            HTTPException: If model not found (404).
+        """
+        adapter = self.adapters.get(model_name)
+        if adapter is None:
+            available = list(self.adapters.keys())
+            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Available: {available}")
+        return adapter
+
+    def _count_tokens(self, content: str, model_name: str | None = None) -> int:
+        """Count tokens for the given content.
+
+        Args:
+            content: Text to tokenize.
+            model_name: Optional model to use for tokenization.
+
+        Returns:
+            Number of tokens in the content.
+        """
+        if model_name:
+            adapter = self._get_adapter(model_name)
+            return adapter.count_tokens(content)
+        adapter = next(iter(self.adapters.values()))
+        return adapter.count_tokens(content)
+
+    def generate_api_key(
+        self,
+        name: str,
+        role: tp.Any = None,
+        **kwargs,
+    ) -> tuple[str, tp.Any]:
+        """Create and register a new random API key with enhanced features.
+
+        Thin convenience wrapper around the underlying
+        :class:`EnhancedApiKeyManager.generate_api_key` that supplies a
+        sensible default role.
+
+        Args:
+            name: Human-readable name for the key.
+            role: Access control role (``ApiKeyRole``). Defaults to
+                ``ApiKeyRole.USER`` when ``None``.
+            **kwargs: Additional arguments forwarded to
+                ``auth_manager.generate_api_key`` (``description``,
+                ``expires_in_days``, ``rate_limits``, ``quota``,
+                ``permissions``, ``tags``, ``metadata``).
+
+        Returns:
+            Tuple of ``(raw_key, metadata)``. Store ``raw_key`` securely —
+            it cannot be retrieved later.
+        """
+
+        if role is None:
+            role = ApiKeyRole.USER
+        return self.auth_manager.generate_api_key(name=name, role=role, **kwargs)
+
+    def _extract_api_key(self, raw_request: Request) -> str | None:
+        """Return the API key in ``Authorization: Bearer`` or ``X-API-Key``; see :func:`api_key_from_headers`.
+
+        Query parameters and request-body fields are never read as credentials.
+        """
+        return api_key_from_headers(raw_request.headers)
+
+    def _auth_system_enabled(self) -> bool:
+        """Determine whether authentication enforcement is active.
+
+        ``require_api_key=True`` always enforces, whatever state the auth manager is in: a missing or
+        misconfigured manager must refuse requests, never open the server. Otherwise authentication is
+        active when the manager reports itself enabled (for example because keys are registered).
+
+        Returns:
+            True if authentication should be enforced, False otherwise.
+        """
+        if getattr(self, "_require_api_key", False):
+            return True
+
+        manager = getattr(self, "auth_manager", None)
+        if manager is None:
+            return False
+
+        try:
+            enabled = manager.enabled
+        except AttributeError:
+            enabled = None
+
+        if enabled is not None:
+            return bool(enabled)
+
+        try:
+            _ = manager.authorize_request
+        except AttributeError:
+            return self._require_api_key
+
+        return True
+
+    def _authorize_request(
+        self,
+        raw_request: Request,
+        endpoint: str | None = None,
+        model: str | None = None,
+        requested_tokens: int = 0,
+        stream: bool = False,
+        uses_tools: bool = False,
+        reconcile_immediately: bool | None = None,
+    ) -> str | None:
+        """Authorize request using enhanced auth system with RBAC and rate limiting.
+
+        Args:
+            raw_request: FastAPI request object.
+            endpoint: Endpoint being accessed.
+            model: Model being requested.
+            requested_tokens: Number of tokens requested.
+            stream: Whether streaming permission is required.
+            uses_tools: Whether function-calling permission is required.
+            reconcile_immediately: Explicitly control whether to immediately
+                reconcile a zero-token reservation (e.g. for metadata routes
+                such as ``GET /v1/models/{model_id}`` that also pass ``model``).
+                When ``None``, defaults to ``model is None`` for backward
+                compatibility.
+
+        Returns:
+            Validated API key string if successful, None if auth not required.
+
+        Raises:
+            HTTPException: If authentication or authorization fails.
+        """
+        if not self._auth_system_enabled():
+            return None
+        if getattr(self, "auth_manager", None) is None:
+            # Enforcement is on but nothing can validate a key: refuse rather than serve unauthenticated.
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
+
+        candidate_keys: list[str] = []
+
+        def add_candidate(value: tp.Any) -> None:
+            """Append a non-empty, stripped string to the candidate_keys list if unique."""
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped and stripped not in candidate_keys:
+                    candidate_keys.append(stripped)
+
+        add_candidate(self._extract_api_key(raw_request))
+
+        ip_address = raw_request.client.host if raw_request.client else None
+        reservation_id = uuid.uuid4().hex
+
+        for candidate in candidate_keys:
+            try:
+                metadata = self.auth_manager.authorize_request(
+                    raw_key=candidate,
+                    ip_address=ip_address,
+                    endpoint=endpoint,
+                    model=model,
+                    requested_tokens=requested_tokens,
+                    stream=stream,
+                    uses_tools=uses_tools,
+                    reservation_id=reservation_id,
+                )
+                raw_request.state.api_key = candidate
+                raw_request.state.api_key_metadata = metadata
+                raw_request.state.auth_reservation_id = reservation_id
+                raw_request.state.auth_reservation_completed = False
+                should_reconcile = (model is None) if reconcile_immediately is None else bool(reconcile_immediately)
+                if should_reconcile:
+                    # Non-generation routes have no deferred token usage to reconcile.
+                    self._record_api_key_usage(raw_request, 0, 0)
+                return candidate
+            except (PermissionDenied, RateLimitExceeded, QuotaExceeded) as e:
+                # If we have more candidates, try them. Otherwise, raise the exception.
+                if candidate == candidate_keys[-1]:
+                    if isinstance(e, RateLimitExceeded | QuotaExceeded):
+                        raise HTTPException(status_code=429, detail=str(e)) from e
+                    if isinstance(e, InvalidApiKey):
+                        raise HTTPException(status_code=401, detail=str(e)) from e
+                    raise HTTPException(status_code=403, detail=str(e)) from e
+                continue
+
+        require_key = bool(getattr(self, "_require_api_key", False)) or bool(
+            getattr(self.auth_manager, "require_api_key", False)
+        )
+        if require_key:
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
+        return None
+
+    def _authorize_endpoint(
+        self,
+        raw_request: Request,
+        *,
+        endpoint: str,
+        model: str | None = None,
+        requested_tokens: int = 0,
+        stream: bool = False,
+        uses_tools: bool = False,
+        reconcile_immediately: bool | None = None,
+    ) -> str | None:
+        """Invoke ``_authorize_request`` while supporting legacy single-arg test overrides."""
+        authorize = self._authorize_request
+        kwargs: dict[str, tp.Any] = {
+            "endpoint": endpoint,
+            "model": model,
+            "requested_tokens": requested_tokens,
+            "stream": stream,
+            "uses_tools": uses_tools,
+            "reconcile_immediately": reconcile_immediately,
+        }
+        if getattr(authorize, "__func__", None) is eSurgeApiServer._authorize_request:
+            return authorize(raw_request, **kwargs)
+        try:
+            params = inspect.signature(authorize).parameters
+        except (TypeError, ValueError):
+            return authorize(raw_request, **kwargs)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_var_kw:
+            return authorize(raw_request, **kwargs)
+        accepted = {k: v for k, v in kwargs.items() if k in params}
+        return authorize(raw_request, **accepted)
+
+    def _request_auth_metadata(self, raw_request: Request | None) -> tp.Any | None:
+        """Return the validated ``ApiKeyMetadata`` attached to ``raw_request.state``, if any."""
+        state = getattr(raw_request, "state", None)
+        return getattr(state, "api_key_metadata", None) if state is not None else None
+
+    def _is_privileged_metrics_caller(self, raw_request: Request | None) -> bool:
+        """Whether ``raw_request`` may view admin ``auth_stats`` and cross-tenant ``recent_requests``.
+
+        When authentication is inactive (dev/unauthenticated mode), full metrics remain visible.
+        When authentication is active, only ``ApiKeyRole.ADMIN`` callers receive admin/cross-tenant
+        details on ``/metrics``.
+        """
+        if not self._auth_system_enabled():
+            return True
+        metadata = self._request_auth_metadata(raw_request)
+        if metadata is None:
+            return False
+        role = getattr(metadata, "role", None)
+        return role == ApiKeyRole.ADMIN or getattr(role, "value", None) == ApiKeyRole.ADMIN.value
+
+    def _allowed_models_for_request(self, raw_request: Request | None) -> set[str] | None:
+        """Return the caller's permitted model set from ``metadata.permissions.allowed_models``, or ``None``."""
+        if not self._auth_system_enabled():
+            return None
+        metadata = self._request_auth_metadata(raw_request)
+        if metadata is None:
+            return None
+        permissions = getattr(metadata, "permissions", None)
+        allowed = getattr(permissions, "allowed_models", None) if permissions is not None else None
+        if allowed is None:
+            return None
+        return set(allowed)
+
+    @staticmethod
+    def _response_store_owner_id(raw_request: Request | None) -> str | None:
+        """Return a stable tenant owner identifier for ``/v1/responses`` persistence isolation."""
+        state = getattr(raw_request, "state", None)
+        if state is None:
+            return None
+        metadata = getattr(state, "api_key_metadata", None)
+        key_id = getattr(metadata, "key_id", None)
+        if isinstance(key_id, str) and key_id:
+            return key_id
+        api_key = getattr(state, "api_key", None)
+        if isinstance(api_key, str) and api_key:
+            return f"keyhash:{hashlib.sha256(api_key.encode('utf-8')).hexdigest()}"
+        return None
+
+    @staticmethod
+    def _scoped_conversation_store_key(conversation_id: str, owner_key_id: str | None) -> str:
+        """Namespace client-chosen conversation IDs by authenticated tenant owner."""
+        if owner_key_id is not None:
+            return f"owner:{owner_key_id}:{conversation_id}"
+        return f"anon:{conversation_id}"
+
+    @staticmethod
+    def _resolved_tool_call_visible_text(
+        completion: tp.Any | None,
+        output: tp.Any | None = None,
+    ) -> str | None:
+        """Return parser-separated assistant text accompanying tool calls, or ``None``.
+
+        ``OutputPipeline`` populates ``completion.raw_text`` / ``output.raw_accumulated_text``
+        whenever it separates parsed visible content from raw tool-call protocol markup.
+        When that separation occurred and visible assistant text remains, preserve it so
+        non-streaming responses match streaming parity; otherwise return ``None``.
+        """
+        text = ""
+        raw_text = None
+        if completion is not None:
+            text = getattr(completion, "text", "") or ""
+            raw_text = getattr(completion, "raw_text", None)
+        if not text and output is not None:
+            text = getattr(output, "accumulated_text", "") or ""
+        if raw_text is None and output is not None:
+            raw_accum = getattr(output, "raw_accumulated_text", None)
+            if raw_accum:
+                raw_text = raw_accum
+        if raw_text is not None and text:
+            return text
+        return None
+
+    async def _run_in_thread_with_cancel_abort(
+        self,
+        fn: tp.Callable[[], tp.Any],
+        *,
+        abort_fn: tp.Callable[[], None],
+        on_cancelled_result: tp.Callable[[tp.Any], None] | None = None,
+    ) -> tp.Any:
+        """Execute blocking engine work in the thread pool and hold resources until abort unwinds."""
+        executor = getattr(self, "thread_pool", None)
+        cf_future = None
+        if executor is not None:
+            cf_future = executor.submit(fn)
+            pending: asyncio.Future[tp.Any] = asyncio.wrap_future(cf_future)
+        else:
+            loop = asyncio.get_running_loop()
+            pending = loop.run_in_executor(None, fn)
+
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            if cf_future is not None and cf_future.cancel():
+                raise
+            abort_fn()
+            with anyio.CancelScope(shield=True):
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                        break
+                    except asyncio.CancelledError:
+                        if pending.cancelled():
+                            break
+                        continue
+                    except Exception:
+                        break
+            if pending.done() and not pending.cancelled():
+                try:
+                    result = pending.result()
+                except Exception:
+                    result = None
+                if result is not None and on_cancelled_result is not None:
+                    try:
+                        on_cancelled_result(result)
+                    except Exception:
+                        logger.debug("Failed to reconcile usage after cancellation", exc_info=True)
+            raise
+
+    @staticmethod
+    def _request_uses_tools(request: tp.Any) -> bool:
+        """Check current and legacy tool/function controls before inference admission."""
+        if getattr(request, "tools", None) or getattr(request, "functions", None):
+            return True
+        return any(
+            choice is not None and choice != "none"
+            for choice in (getattr(request, "tool_choice", None), getattr(request, "function_call", None))
+        )
+
+    def _record_api_key_usage(
+        self,
+        raw_request: Request | None,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        """Record token usage statistics for the authenticated API key.
+
+        Updates the auth manager's usage tracking for the API key that was
+        used to authenticate the request. This enables per-key usage monitoring
+        and quota enforcement.
+
+        Args:
+            raw_request: The FastAPI request object containing the authenticated
+                API key in `request.state.api_key`. If None, no action is taken.
+            prompt_tokens: Number of tokens in the input prompt.
+            completion_tokens: Number of tokens generated in the response.
+
+        Note:
+            This method silently returns if no API key was used or if the
+            request object is None. It should be called after successful
+            completion of a request.
+        """
+        if raw_request is None:
+            return
+
+        api_key = getattr(raw_request.state, "api_key", None)
+        if not api_key:
+            return
+
+        if getattr(raw_request.state, "auth_reservation_completed", False):
+            return
+        reservation_id = getattr(raw_request.state, "auth_reservation_id", None)
+        self.auth_manager.record_usage(api_key, prompt_tokens, completion_tokens, reservation_id=reservation_id)
+        raw_request.state.auth_reservation_completed = True
+
+    def _observe_api_key_stream_usage(
+        self, raw_request: Request, prompt_tokens: int, completion_tokens: int, *, usage_key: str = "stream"
+    ) -> None:
+        """Retain cumulative engine counts before yielding, including each batch child.
+
+        Counts are snapshots, not deltas. Keep each child separately so repeated
+        updates neither double-charge a prompt nor discard an interrupted child.
+        """
+        state = getattr(raw_request, "state", None)
+        if state is None:
+            return
+        # Progress arrives on the producer thread, while terminal chunks may be
+        # observed on the event loop. Serialize their cumulative snapshot updates.
+        with getattr(state, "auth_stream_lock", contextlib.nullcontext()):
+            children = getattr(state, "auth_stream_children", None)
+            if children is None:
+                children = state.auth_stream_children = {}
+            previous = children.get(usage_key, (0, 0))
+            children[usage_key] = (max(previous[0], int(prompt_tokens)), max(previous[1], int(completion_tokens)))
+            state.auth_stream_usage = tuple(sum(counts[i] for counts in children.values()) for i in range(2))
+
+    def _observe_stream_outputs(
+        self, outputs: Iterator[tp.Any], raw_request: Request, *, usage_key: str = "stream"
+    ) -> Iterator[tp.Any]:
+        """Observe producer snapshots before the bounded queue can discard them.
+
+        Keep wire-level usage unchanged. Chat/Responses engines can additionally
+        report invisible intermediate snapshots through ``usage_callback``.
+        """
+        iterator = iter(outputs)
+        try:
+            for output in iterator:
+                if isinstance(output, RequestOutput):
+                    self._observe_api_key_stream_usage(
+                        raw_request,
+                        self._prompt_token_count_from_output(output),
+                        int(output.num_generated_tokens or 0),
+                        usage_key=usage_key,
+                    )
+                elif isinstance(output, ChatCompletionStreamResponse) and output.usage is not None:
+                    self._observe_api_key_stream_usage(
+                        raw_request, output.usage.prompt_tokens or 0, output.usage.completion_tokens or 0
+                    )
+                elif isinstance(output, StreamEventFrame) and isinstance(output.payload, ResponseCompletedEvent):
+                    usage = output.payload.response.usage
+                    if usage is not None:
+                        self._observe_api_key_stream_usage(raw_request, usage.input_tokens, usage.output_tokens)
+                yield output
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    def _start_observed_stream_task(
+        self,
+        stream_fn: tp.Callable[[], Iterator[tp.Any]],
+        on_abandon: tp.Callable[[], None],
+        raw_request: Request,
+        *,
+        usage_key: str = "stream",
+    ) -> tp.Any:
+        """Attach accounting inside the producer, not behind its read-ahead queue."""
+        return self._start_stream_task(
+            lambda: self._observe_stream_outputs(stream_fn(), raw_request, usage_key=usage_key), on_abandon
+        )
+
+    async def _close_stream_queue_and_wait(self, queue: tp.Any) -> None:
+        """Abort/drain the queue, then finish observing any in-flight engine snapshot.
+
+        Queue close alone discards pending data and cannot interrupt a blocked
+        ``next(iterator)``. Its producer future resolves only after that call and
+        iterator cleanup finish. Await it before admission cleanup reconciles the
+        final cumulative counts, including work returned in response to abort.
+        """
+        self._close_stream_queue(queue)
+        producer = getattr(queue, "_producer_future", None)
+        if producer is not None:
+            pending = asyncio.wrap_future(producer)
+            cancellation: asyncio.CancelledError | None = None
+            with anyio.CancelScope(shield=True):
+                while True:
+                    try:
+                        await asyncio.shield(pending)
+                        break
+                    except asyncio.CancelledError as exc:
+                        if pending.cancelled():
+                            raise
+                        # asyncio.Task.cancel() bypasses AnyIO's shield. Delay
+                        # propagation until the producer has stopped too; a
+                        # cancelled closer must not release admission early.
+                        cancellation = exc
+            if cancellation is not None:
+                raise cancellation
+
+    def _stream_usage_callback_kwargs(self, stream_fn: tp.Callable, raw_request: Request) -> dict[str, tp.Any]:
+        """Opt into engine progress without changing legacy engine or SSE contracts."""
+        try:
+            params = inspect.signature(stream_fn).parameters
+        except (TypeError, ValueError):
+            return {}
+        # Generic **kwargs may be forwarded to a legacy member by a router;
+        # only an explicit parameter advertises support for this extension.
+        if "usage_callback" not in params:
+            return {}
+        return {
+            "usage_callback": lambda prompt, completion: self._observe_api_key_stream_usage(
+                raw_request, prompt, completion
+            )
+        }
+
+    def _release_api_key_reservation(self, raw_request: Request | None) -> None:
+        """Reconcile observed consumption, or release genuinely unused admission."""
+        state = getattr(raw_request, "state", None)
+        reservation_id = getattr(state, "auth_reservation_id", None)
+        if reservation_id is None or getattr(state, "auth_reservation_completed", False):
+            return
+        completed_usage = getattr(state, "auth_stream_usage", None)
+        if completed_usage is not None:
+            # Closing a body must account for already observed work, even mid-child.
+            self._record_api_key_usage(raw_request, *completed_usage)
+            return
+        self.auth_manager.release_reservation(state.api_key, reservation_id=reservation_id)
+        state.auth_reservation_completed = True
+
+    def _track_api_key_stream(self, response: StreamingResponse, raw_request: Request) -> StreamingResponse:
+        """Reconcile admission on body close and on every ASGI response exit path."""
+        state = getattr(raw_request, "state", None)
+        if state is None:
+            return response
+        state.auth_stream_lock = threading.RLock()
+        return _AdmissionStreamingResponse(response, lambda: self._release_api_key_reservation(raw_request))
+
+    def _infer_sequence_length_from_engine(self, esurge: eSurge | None) -> int:
+        """Infer the maximum sequence length from an eSurge engine.
+
+        Attempts to determine the maximum sequence length for token generation
+        by examining the engine's configuration. This is used as a default when
+        `max_tokens` is not explicitly specified in requests.
+
+        Args:
+            esurge: The eSurge engine instance to query. If None, falls back to
+                the first available adapter.
+
+        Returns:
+            The maximum model length if determinable, otherwise 128 as a
+            conservative default.
+
+        Note:
+            The fallback value of 128 is intentionally conservative to prevent
+            unexpected resource consumption when model configuration is unavailable.
+        """
+        if esurge is not None and getattr(esurge, "max_model_len", None):
+            try:
+                return int(esurge.max_model_len)
+            except (TypeError, ValueError):
+                pass
+        if self.adapters:
+            first_adapter = next(iter(self.adapters.values()), None)
+            if first_adapter and getattr(first_adapter.esurge, "max_model_len", None):
+                try:
+                    return int(first_adapter.esurge.max_model_len)
+                except (TypeError, ValueError):
+                    pass
+        return 128
+
+    @staticmethod
+    def _get_engine_tool_parser(esurge: eSurge) -> str | None:
+        """Return the parser name configured on the eSurge engine, if any.
+
+        Args:
+            esurge: The eSurge engine instance to inspect.
+
+        Returns:
+            The trimmed tool-parser name, or ``None`` when the engine has no
+            non-empty ``tool_parser`` attribute.
+        """
+
+        engine_name = getattr(esurge, "tool_parser", None)
+        if isinstance(engine_name, str):
+            normalized = engine_name.strip()
+            return normalized or None
+        return None
+
+    @staticmethod
+    def _example_tool_definitions() -> list[dict[str, tp.Any]]:
+        """Return placeholder tool definitions for discovery endpoints.
+
+        Returns:
+            A list with a single sample function definition, suitable for
+            populating the ``/v1/tools`` discovery response.
+        """
+
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "example_function",
+                    "description": "An example function for demonstration",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "param1": {
+                                "type": "string",
+                                "description": "First parameter",
+                            },
+                            "param2": {
+                                "type": "number",
+                                "description": "Second parameter",
+                            },
+                        },
+                        "required": ["param1"],
+                    },
+                },
+            }
+        ]
+
+    def _create_tools_response(self, *, allowed_models: set[str] | None = None) -> dict[str, tp.Any]:
+        """Describe tool-calling capabilities as reported by each permitted eSurge engine.
+
+        Args:
+            allowed_models: Optional model allowlist; ``None`` includes all loaded models.
+
+        Returns:
+            Dictionary keyed by model name with each entry containing
+            example tool definitions and the engine-reported parser
+            metadata, plus a ``default_format`` field for the response root.
+        """
+
+        tools_by_model: dict[str, dict[str, tp.Any]] = {}
+        for model_name, adapter in self.adapters.items():
+            if allowed_models is not None and model_name not in allowed_models:
+                continue
+            tool_parser = self._get_engine_tool_parser(adapter.esurge) if self.enable_function_calling else None
+            tools_by_model[model_name] = {
+                "tools": self._example_tool_definitions(),
+                "tool_parser": tool_parser,
+                "formats_supported": [tool_parser] if tool_parser else [],
+                "parallel_calls": True,
+            }
+
+        return {"models": tools_by_model, "default_format": "openai"}
+
+    @staticmethod
+    def _create_tool_execution_placeholder_response() -> JSONResponse:
+        """Return the placeholder response for the unimplemented tool executor.
+
+        Returns:
+            JSONResponse with HTTP 501 (Not Implemented) and a structured
+            error payload describing that tool execution is left to the
+            deployment-specific integration.
+        """
+
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Tool execution endpoint is a placeholder. Implement based on your needs.",
+                    "type": HTTPStatus.NOT_IMPLEMENTED.name,
+                }
+            },
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
+
+    def _ensure_request_max_tokens(
+        self,
+        request: ChatCompletionRequest | CompletionRequest,
+        esurge: eSurge | None = None,
+    ) -> int:
+        """Ensure the request has a valid max_tokens value.
+
+        Validates and normalizes the `max_tokens` field in the request,
+        inferring a reasonable default from the engine configuration when
+        the value is missing, invalid, or negative.
+
+        This method also tracks whether the value was auto-inferred or
+        explicitly provided by setting `request._auto_max_tokens`.
+
+        Args:
+            request: The chat or completion request to validate.
+            esurge: Optional eSurge engine to query for default max length.
+
+        Returns:
+            The validated max_tokens value (either from request or inferred).
+
+        Note:
+            The method modifies the request object in-place when inferring
+            a value, and sets `_auto_max_tokens` flag for downstream processing.
+        """
+        max_tokens_raw = getattr(request, "max_completion_tokens", None)
+        if max_tokens_raw is None:
+            max_tokens_raw = getattr(request, "max_tokens", None)
+        inferred_value: int | None = None
+
+        def _mark_auto(value: int) -> int:
+            try:
+                request._auto_max_tokens = True
+            except (AttributeError, ValueError):
+                logger.debug("Unable to mark request as auto max_tokens.", exc_info=True)
+            return value
+
+        def _mark_manual() -> None:
+            try:
+                request._auto_max_tokens = False
+            except (AttributeError, ValueError):
+                logger.debug("Unable to mark request as manual max_tokens.", exc_info=True)
+
+        def _infer_and_assign() -> int:
+            nonlocal inferred_value
+            if inferred_value is None:
+                inferred_value = self._infer_sequence_length_from_engine(esurge)
+            try:
+                request.max_tokens = inferred_value
+            except (AttributeError, ValueError):
+                logger.debug("Unable to set inferred max_tokens on request; continuing with inferred value.")
+            return _mark_auto(inferred_value)
+
+        if max_tokens_raw is None:
+            return _infer_and_assign()
+
+        try:
+            max_tokens_int = int(max_tokens_raw)
+        except (TypeError, ValueError):
+            logger.debug("Invalid max_tokens=%s supplied; inferring from engine.", max_tokens_raw)
+            return _infer_and_assign()
+
+        if max_tokens_int < 0:
+            return _infer_and_assign()
+
+        _mark_manual()
+        return max_tokens_int
+
+    def _prepare_sampling_params(
+        self,
+        request: ChatCompletionRequest | CompletionRequest,
+        esurge: eSurge,
+    ) -> SamplingParams:
+        """Create and optionally refine sampling parameters for generation.
+
+        Builds SamplingParams from the request and applies any user-provided
+        refinement callback to customize generation behavior.
+
+        Args:
+            request: The chat or completion request containing generation settings.
+            esurge: The eSurge engine instance (passed to refinement callback).
+
+        Returns:
+            SamplingParams configured for the generation, potentially modified
+            by the refinement callback if one was provided during server init.
+        """
+        sampling_params = self._create_sampling_params(request)
+        if self._refine_sampling_params_callback:
+            refined = self._refine_sampling_params_callback(sampling_params, request, esurge)
+            if refined is not None:
+                sampling_params = refined
+        sampling_params = self._apply_extra_stops_to_sampling_params(sampling_params)
+        return sampling_params
+
+    @staticmethod
+    def _stream_debug_preview(text: tp.Any, *, max_chars: int = 160) -> str | None:
+        """Return a compact escaped preview for debug logging.
+
+        Args:
+            text: Candidate value; only :class:`str` inputs produce a preview.
+            max_chars: Maximum number of escaped characters to keep before
+                truncating with an ellipsis.
+
+        Returns:
+            Escaped string with ``\\n`` / ``\\r`` rendered explicitly, or
+            ``None`` when ``text`` is not a string.
+        """
+
+        if not isinstance(text, str):
+            return None
+        escaped = text.replace("\n", "\\n").replace("\r", "\\r")
+        if len(escaped) <= max_chars:
+            return escaped
+        return f"{escaped[:max_chars]}..."
+
+    @staticmethod
+    def _stream_debug_len(value: tp.Any) -> int | None:
+        """Return length for strings/sequences/mappings when available.
+
+        Args:
+            value: Candidate value to size.
+
+        Returns:
+            ``len(value)`` for strings, lists, tuples, and dicts. ``None``
+            for other types and for ``None``.
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, (str, list, tuple, dict)):
+            return len(value)
+        return None
+
+    async def _abort_non_stream_request_on_disconnect(
+        self,
+        *,
+        raw_request: Request,
+        esurge: eSurge,
+        request_id: str | Sequence[str],
+        endpoint: str,
+        model: str | None,
+        done_event: asyncio.Event,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        """Abort non-stream engine work when the HTTP client disconnects.
+
+        Polls the request's disconnect state and, when set, asks the engine
+        to abort every request ID associated with the call. The loop exits once
+        ``done_event`` is set by the caller.
+
+        Args:
+            raw_request: FastAPI request whose disconnect state is polled.
+            esurge: eSurge engine to abort against.
+            request_id: Engine-side request identifier (or sequence of identifiers)
+                to abort.
+            endpoint: Endpoint path used only for log context.
+            model: Model name used only for log context.
+            done_event: Event the caller sets when the request finished and
+                disconnect polling should stop.
+            poll_interval_s: Seconds between disconnect probes.
+        """
+
+        target_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        disconnect_logged = False
+
+        while not done_event.is_set():
+            try:
+                disconnected = await raw_request.is_disconnected()
+            except Exception:
+                logger.debug(
+                    "Failed to probe disconnect state for non-stream request %s",
+                    request_id,
+                    exc_info=True,
+                )
+                disconnected = False
+
+            if disconnected:
+                if not disconnect_logged:
+                    client = getattr(raw_request, "client", None)
+                    logger.warning(
+                        "Client disconnected during non-stream request; attempting abort until completion. "
+                        "endpoint=%s request_id=%s model=%s client_host=%s client_port=%s",
+                        endpoint,
+                        request_id,
+                        model,
+                        getattr(client, "host", None),
+                        getattr(client, "port", None),
+                    )
+                    disconnect_logged = True
+
+                for target_id in target_ids:
+                    try:
+                        esurge.abort_request(target_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to abort non-stream request %s after disconnect",
+                            target_id,
+                            exc_info=True,
+                        )
+
+            await asyncio.sleep(poll_interval_s)
+
+    @staticmethod
+    def _abort_request_after_handler_cancel(
+        *,
+        esurge: eSurge,
+        request_id: str,
+        endpoint: str,
+        model: str | None,
+    ) -> None:
+        """Abort engine work when the HTTP handler itself is cancelled.
+
+        Args:
+            esurge: eSurge engine to abort against.
+            request_id: Engine-side request identifier to abort.
+            endpoint: Endpoint path used only for log context.
+            model: Model name used only for log context.
+        """
+
+        logger.warning(
+            "HTTP handler cancelled; aborting engine request. endpoint=%s request_id=%s model=%s",
+            endpoint,
+            request_id,
+            model,
+        )
+        try:
+            esurge.abort_request(request_id)
+        except Exception:
+            logger.debug("Failed to abort request %s after handler cancellation", request_id, exc_info=True)
+
+    @classmethod
+    def _build_stream_debug_context(
+        cls,
+        *,
+        endpoint: str,
+        request_id: str | None,
+        model: str | None,
+        queue_kind: str | None = None,
+        disconnected: bool | None = None,
+        output: RequestOutput | None = None,
+        last_output: RequestOutput | None = None,
+        previous_text: tp.Any = None,
+        current_text: tp.Any = None,
+        delta_text: tp.Any = None,
+        previous_token_ids: tp.Any = None,
+        current_token_ids: tp.Any = None,
+        delta_token_ids: tp.Any = None,
+        raw_delta_message: tp.Any = None,
+        delta_message: tp.Any = None,
+        delta_tool_calls_raw: tp.Any = None,
+        saw_tool_call_delta: bool | None = None,
+        saw_function_call_delta: bool | None = None,
+        stream_error: Exception | None = None,
+        tools: tp.Any = None,
+        messages: tp.Any = None,
+    ) -> dict[str, tp.Any]:
+        """Build a bounded debug payload for streaming failures.
+
+        Captures the endpoint, request/model identifiers, and previews of
+        the surrounding stream state (text deltas, token id counts, tool
+        call shapes, exception type/message, ...) into a single dict for
+        structured logging. All previews and lengths are size-bounded.
+
+        Args:
+            endpoint: Endpoint path being streamed.
+            request_id: Engine-side request identifier, if available.
+            model: Model name being served.
+            queue_kind: Last queue event kind observed (``data``/``error``/
+                ``end``) or ``None``.
+            disconnected: Whether the HTTP client had disconnected.
+            output: Most recent ``RequestOutput`` for the request.
+            last_output: Last completed ``RequestOutput``.
+            previous_text: Accumulated text up to the previous chunk.
+            current_text: Accumulated text including the current chunk.
+            delta_text: Incremental text emitted in the current chunk.
+            previous_token_ids: Tokens emitted up to the previous chunk.
+            current_token_ids: Tokens including the current chunk.
+            delta_token_ids: Tokens added by the current chunk.
+            raw_delta_message: Raw protocol message before any normalization.
+            delta_message: Normalised :class:`DeltaMessage`, when available.
+            delta_tool_calls_raw: Raw tool-call payload before normalization.
+            saw_tool_call_delta: Whether a tool-call delta was observed.
+            saw_function_call_delta: Whether a legacy function-call delta
+                was observed.
+            stream_error: Exception that triggered debug capture.
+            tools: Tools list from the original request (logged as type/len).
+            messages: Original message list (logged as type/len + tiny peek).
+
+        Returns:
+            Dictionary with bounded previews and counters suitable for
+            single-line structured log emission.
+        """
+
+        observed_output = output or last_output
+        primary_output = (
+            observed_output.outputs[0] if (observed_output is not None and observed_output.outputs) else None
+        )
+        context: dict[str, tp.Any] = {
+            "endpoint": endpoint,
+            "request_id": request_id,
+            "model": model,
+            "queue_kind": queue_kind,
+            "disconnected": disconnected,
+            "tools_type": type(tools).__name__ if tools is not None else None,
+            "tools_len": cls._stream_debug_len(tools),
+            "first_tool_type": type(tools[0]).__name__ if isinstance(tools, list) and len(tools) > 0 else None,
+            "messages_type": type(messages).__name__ if messages is not None else None,
+            "messages_len": cls._stream_debug_len(messages),
+            "stream_error_type": type(stream_error).__name__ if stream_error is not None else None,
+            "stream_error_message": str(stream_error) if stream_error is not None else None,
+            "raw_delta_message_type": type(raw_delta_message).__name__ if raw_delta_message is not None else None,
+            "delta_message_type": type(delta_message).__name__ if delta_message is not None else None,
+            "delta_tool_calls_raw_type": (
+                type(delta_tool_calls_raw).__name__ if delta_tool_calls_raw is not None else None
+            ),
+            "delta_tool_calls_raw_len": cls._stream_debug_len(delta_tool_calls_raw),
+            "delta_text_type": type(delta_text).__name__ if delta_text is not None else None,
+            "delta_text_len": cls._stream_debug_len(delta_text),
+            "delta_text_preview": cls._stream_debug_preview(delta_text),
+            "previous_text_len": cls._stream_debug_len(previous_text),
+            "current_text_len": cls._stream_debug_len(current_text),
+            "previous_text_preview": cls._stream_debug_preview(previous_text),
+            "current_text_preview": cls._stream_debug_preview(current_text),
+            "previous_token_ids_len": cls._stream_debug_len(previous_token_ids),
+            "current_token_ids_len": cls._stream_debug_len(current_token_ids),
+            "delta_token_ids_len": cls._stream_debug_len(delta_token_ids),
+            "saw_tool_call_delta": saw_tool_call_delta,
+            "saw_function_call_delta": saw_function_call_delta,
+        }
+
+        if isinstance(delta_message, DeltaMessage):
+            context["delta_message_content_type"] = (
+                type(delta_message.content).__name__ if delta_message.content is not None else None
+            )
+            context["delta_message_content_len"] = cls._stream_debug_len(delta_message.content)
+            context["delta_message_content_preview"] = cls._stream_debug_preview(delta_message.content)
+            context["delta_message_tool_calls_type"] = (
+                type(delta_message.tool_calls).__name__ if delta_message.tool_calls is not None else None
+            )
+            context["delta_message_tool_calls_len"] = cls._stream_debug_len(delta_message.tool_calls)
+            context["delta_message_reasoning_len"] = cls._stream_debug_len(delta_message.reasoning_content)
+
+        if observed_output is not None:
+            context["output_request_id"] = observed_output.request_id
+            context["output_finished"] = observed_output.finished
+            context["output_num_generated_tokens"] = int(observed_output.num_generated_tokens or 0)
+            context["output_accumulated_text_len"] = cls._stream_debug_len(observed_output.accumulated_text)
+            context["output_delta_text_len"] = cls._stream_debug_len(observed_output.delta_text)
+            context["output_reasoning_len"] = cls._stream_debug_len(observed_output.reasoning_content)
+            context["output_delta_reasoning_len"] = cls._stream_debug_len(observed_output.delta_reasoning_content)
+            context["output_tool_calls_type"] = (
+                type(observed_output.tool_calls).__name__ if observed_output.tool_calls else None
+            )
+            context["output_delta_tool_calls_type"] = (
+                type(observed_output.delta_tool_calls).__name__ if observed_output.delta_tool_calls else None
+            )
+            context["output_primary_token_ids_len"] = (
+                cls._stream_debug_len(primary_output.token_ids) if primary_output is not None else None
+            )
+
+        producer_tb = getattr(stream_error, "__stream_producer_traceback__", None) if stream_error is not None else None
+        if isinstance(producer_tb, str):
+            if len(producer_tb) > 6000:
+                producer_tb = f"{producer_tb[:6000]}..."
+            context["stream_error_producer_traceback"] = producer_tb
+
+        if isinstance(messages, list) and messages:
+            first_message = messages[0]
+            if isinstance(first_message, dict):
+                context["first_message_role"] = first_message.get("role")
+                context["first_message_content_type"] = (
+                    type(first_message.get("content")).__name__ if "content" in first_message else None
+                )
+
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list) or not tool_calls:
+                    continue
+                first_tool_call = tool_calls[0]
+                if isinstance(first_tool_call, dict):
+                    context["message_tool_calls_type"] = type(tool_calls).__name__
+                    context["message_tool_calls_len"] = len(tool_calls)
+                    function_payload = first_tool_call.get("function")
+                    if isinstance(function_payload, dict):
+                        arguments = function_payload.get("arguments")
+                        context["message_tool_call_arguments_type"] = type(arguments).__name__
+                        context["message_tool_call_arguments_len"] = cls._stream_debug_len(arguments)
+                break
+
+        return context
+
+    @staticmethod
+    def _normalize_stop_sequences(stop: tp.Any) -> list[str]:
+        """Normalize stop input into a de-duplicated list of non-empty strings.
+
+        Accepts ``None``, a single string, or any iterable, and returns a
+        list of unique, non-empty strings preserving discovery order.
+        Non-string entries are stringified via ``str()``.
+
+        Args:
+            stop: Raw stop value supplied by the caller.
+
+        Returns:
+            Ordered list of unique non-empty stop strings.
+        """
+
+        if stop is None:
+            return []
+        if isinstance(stop, str):
+            candidates = [stop]
+        elif isinstance(stop, (list, tuple, set)):
+            candidates = list(stop)
+        else:
+            candidates = [stop]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            value = candidate if isinstance(candidate, str) else str(candidate)
+            if value == "" or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    @staticmethod
+    def _reject_uncoordinated_multihost(name: str, esurge: eSurge, coordinator) -> None:
+        """Refuse to serve on a multi-host runtime without a control plane.
+
+        HTTP requests arrive at one host only, but the jitted step is a
+        global-mesh collective requiring every process. Without a
+        step-coordination plane the other hosts never enter the collective
+        and the leader blocks forever — a silent deadlock. Failing loudly at
+        startup with the fix beats hanging on the first request.
+
+        Args:
+            name: Engine map key (for the error message).
+            esurge: The engine being served.
+            coordinator: The engine's step coordinator (may be ``None`` for
+                harnesses).
+
+        Raises:
+            ValueError: When ``jax.process_count() > 1`` and the engine has
+                no ``coordination="zmq"`` step-replication plane.
+        """
+        try:
+            import jax
+
+            process_count = int(jax.process_count())
+        except Exception:
+            return
+        if process_count <= 1:
+            return
+        world_size = int(getattr(coordinator, "world_size", 1) or 1) if coordinator is not None else 1
+        if world_size > 1:
+            return
+        raise ValueError(
+            f"Model '{name}' runs on a {process_count}-process JAX runtime but has no multi-host "
+            "step coordination: HTTP requests would reach only this host while the jitted step "
+            "requires every process, deadlocking on the first request. Configure the engine with "
+            'distributed={"coordination": "zmq", "distributed_auth_token": "<same-on-all-hosts>"} '
+            "and start one engine process per host (rank 0 serves; other ranks replay steps)."
+        )
+
+    @staticmethod
+    def _resolve_esurge_runtime_request_cap(esurge: eSurge) -> int:
+        """Infer the effective request cap for one engine.
+
+        Prefers the runner / cache runtime cap when available, then falls
+        back to the configured ``max_num_seqs``. The smaller positive value
+        wins so the server never schedules more than the engine can run.
+
+        Args:
+            esurge: eSurge engine instance to inspect.
+
+        Returns:
+            Positive request cap derived from runtime metadata or
+            configuration.
+
+        Raises:
+            ValueError: If neither the runtime cap nor ``max_num_seqs``
+                yields a positive integer.
+        """
+
+        configured_cap = 0
+        try:
+            configured_cap = int(getattr(esurge, "max_num_seqs", 0) or 0)
+        except (TypeError, ValueError):
+            configured_cap = 0
+
+        runtime_cap = 0
+        runner = getattr(esurge, "runner", None)
+        metadata = getattr(runner, "metadata", None)
+        if metadata is not None and hasattr(metadata, "get_max_num_seqs"):
+            try:
+                runtime_cap = int(metadata.get_max_num_seqs())
+            except (TypeError, ValueError):
+                runtime_cap = 0
+        if runtime_cap <= 0 and runner is not None:
+            try:
+                runtime_cap = int(getattr(runner, "num_reqs_max_model_len", 0) or 0)
+            except (TypeError, ValueError):
+                runtime_cap = 0
+
+        candidates = [cap for cap in (runtime_cap, configured_cap) if cap > 0]
+        if not candidates:
+            raise ValueError("Loaded eSurge instances must expose a positive runtime request cap or `max_num_seqs`.")
+        return min(candidates)
+
+    def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Merge server-level stop strings into request sampling parameters.
+
+        Combines the existing ``sampling_params.stop`` with the server's
+        configured ``_extra_stops`` while preserving order and removing
+        duplicates.
+
+        Args:
+            sampling_params: Sampling parameters to augment in-place.
+
+        Returns:
+            The same ``sampling_params`` object (returned for chaining)
+            with its ``stop`` field updated.
+        """
+
+        if not self._extra_stops:
+            return sampling_params
+
+        merged = self._normalize_stop_sequences(getattr(sampling_params, "stop", None))
+        seen = set(merged)
+        for stop in self._extra_stops:
+            if stop in seen:
+                continue
+            seen.add(stop)
+            merged.append(stop)
+        sampling_params.stop = merged
+        return sampling_params
+
+    def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
+        """Create sampling parameters from request.
+
+        Converts OpenAI API request parameters to eSurge SamplingParams.
+        Applies validation and defaults.
+
+        Args:
+            request: OpenAI API request object.
+
+        Returns:
+            SamplingParams configured for eSurge generation.
+        """
+        raw_max_tokens = getattr(request, "max_completion_tokens", None)
+        if raw_max_tokens is None:
+            raw_max_tokens = getattr(request, "max_tokens", None)
+        max_tokens: int | None
+        auto_max_tokens_requested = bool(getattr(request, "_auto_max_tokens", False))
+        if raw_max_tokens is None or auto_max_tokens_requested:
+            max_tokens = None
+        else:
+            try:
+                max_tokens = int(raw_max_tokens)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid max_tokens value: {raw_max_tokens!r}") from exc
+            if max_tokens < 0:
+                max_tokens = None
+
+        raw_temperature: float | None = request.temperature
+        if raw_temperature is None:
+            temperature_f = 1.0
+        else:
+            temperature_f = float(raw_temperature)
+        if not math.isfinite(temperature_f):
+            raise ValueError(f"temperature must be finite, got {raw_temperature!r}")
+        if temperature_f < 0.0 or temperature_f > 2.0:
+            raise ValueError(f"temperature must be in [0.0, 2.0], got {temperature_f}")
+        temperature = temperature_f
+
+        raw_top_k = getattr(request, "top_k", None)
+        if raw_top_k is None:
+            top_k = 0
+        else:
+            top_k = int(raw_top_k)
+        if top_k < 0:
+            raise ValueError(f"top_k must be >= 0, got {top_k}")
+
+        def _coerce_optional_bool(value: tp.Any, default: bool) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if lowered in {"0", "false", "no", "n", "off"}:
+                    return False
+            return bool(value)
+
+        presence_penalty = float(0.0 if request.presence_penalty is None else request.presence_penalty)
+        frequency_penalty = float(0.0 if request.frequency_penalty is None else request.frequency_penalty)
+        raw_rep = getattr(request, "repetition_penalty", 1.0)
+        repetition_penalty = float(1.0 if raw_rep is None else raw_rep)
+        top_p = float(1.0 if request.top_p is None else request.top_p)
+        raw_min_p = getattr(request, "min_p", 0.0)
+        min_p = float(0.0 if raw_min_p is None else raw_min_p)
+        n = int(1 if request.n is None else request.n)
+
+        for field_name, field_val in (
+            ("presence_penalty", presence_penalty),
+            ("frequency_penalty", frequency_penalty),
+            ("repetition_penalty", repetition_penalty),
+            ("top_p", top_p),
+            ("min_p", min_p),
+        ):
+            if not math.isfinite(field_val):
+                raise ValueError(f"{field_name} must be finite, got {field_val!r}")
+        if not -2.0 <= frequency_penalty <= 2.0:
+            raise ValueError(f"frequency_penalty must be in [-2, 2], got {frequency_penalty}.")
+        if not 0.0 <= min_p <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {min_p}.")
+
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            n=n,
+            stop=request.stop or [],
+            ignore_eos=_coerce_optional_bool(getattr(request, "ignore_eos", None), False),
+            skip_special_tokens=_coerce_optional_bool(getattr(request, "skip_special_tokens", None), False),
+            spaces_between_special_tokens=_coerce_optional_bool(
+                getattr(request, "spaces_between_special_tokens", None), True
+            ),
+        )
+
+    async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request) -> tp.Any:
+        """Handle chat completion requests.
+
+        Main endpoint for ``/v1/chat/completions``. Supports both streaming
+        and non-streaming responses, with optional function calling. Applies
+        the configured chat-request refinement callback, authorizes against
+        the auth manager, and dispatches to the streaming or non-streaming
+        helper as requested.
+
+        Args:
+            request: Chat completion request (with or without tools).
+            raw_request: Raw FastAPI request used for auth and disconnect
+                detection.
+
+        Returns:
+            ChatCompletionResponse for non-streaming requests, a
+            StreamingResponse for streaming requests, or a JSONResponse
+            wrapping the error on failure.
+
+        Raises:
+            HTTPException: For client errors (e.g. 400 empty messages, 404
+                model not found, 401/403/429 auth failures).
+        """
+        request_id = str(uuid.uuid4())
+        if self._refine_chat_request_callback:
+            refined_request = self._refine_chat_request_callback(request)
+            if refined_request is not None:
+                request = refined_request
+
+        try:
+            adapters = getattr(self, "adapters", None)
+            peek_adapter = adapters.get(request.model) if isinstance(adapters, dict) else None
+            peek_esurge = peek_adapter.esurge if peek_adapter is not None else None
+
+            max_tokens = self._ensure_request_max_tokens(request, peek_esurge)
+            n_samples = max(1, int(request.n or 1))
+            self._authorize_endpoint(
+                raw_request,
+                endpoint="/v1/chat/completions",
+                model=request.model,
+                requested_tokens=max_tokens * n_samples,
+                stream=bool(request.stream),
+                uses_tools=self._request_uses_tools(request),
+                reconcile_immediately=False,
+            )
+
+            adapter = self._get_adapter(request.model)
+            esurge = adapter.esurge
+
+            if not request.messages:
+                raise HTTPException(400, "Messages cannot be empty")
+
+            messages = self._prepare_messages_for_engine(request, esurge)
+            is_multimodal = self._messages_have_multimodal_content(messages)
+            if is_multimodal:
+                self._reject_local_media_references(messages)
+            else:
+                messages = self._prepare_text_messages_for_chat(messages)
+
+            if request.stream:
+                response = await self._handle_chat_streaming(request, esurge, messages, request_id, raw_request)
+                return self._track_api_key_stream(response, raw_request)
+            return await self._handle_chat_completion(request, esurge, messages, request_id, raw_request)
+
+        except (HTTPException, asyncio.CancelledError):
+            self._release_api_key_reservation(raw_request)
+            raise
+        except Exception as e:
+            self._release_api_key_reservation(raw_request)
+            traceback.print_exc()
+            logger.exception(f"Error in chat completion: {e}")
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+
+    @staticmethod
+    def _messages_have_multimodal_content(messages: list[dict[str, tp.Any]]) -> bool:
+        """Check if the message list contains multimodal content (images or videos).
+
+        Examines message content parts to detect the presence of image or video
+        data that requires special handling through the multimodal processing
+        pipeline.
+
+        Args:
+            messages: List of message dictionaries with content fields.
+
+        Returns:
+            True if any message contains image or video content, False otherwise.
+
+        Note:
+            Supported multimodal type indicators include:
+            - image, image_url, input_image (for images)
+            - video, video_url, input_video (for videos)
+        """
+        for msg in messages:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type in ("image", "image_url", "input_image", "video", "video_url", "input_video"):
+                    return True
+                if any(k in item for k in ("image", "image_url", "video", "video_url")):
+                    return True
+        return False
+
+    def _reject_local_media_references(self, messages: list[dict[str, tp.Any]]) -> None:
+        """Reject image references that would make the server read its own filesystem.
+
+        The multimodal loader resolves plain paths and ``file://`` URLs against the
+        server's local filesystem. Over HTTP that lets any client read arbitrary
+        server files, so unless the server was built with
+        ``allow_local_media_paths=True`` every string image reference must be an
+        inline ``data:`` URL. (Remote ``http(s)`` URLs are never fetched and are
+        rejected here too, with a 400 instead of a later 500.)
+
+        Args:
+            messages: Engine-ready message dicts.
+
+        Raises:
+            HTTPException: 400 when a non-``data:`` image reference is present.
+        """
+        allow_local = getattr(self, "_allow_local_media_paths", False)
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                # The loader rejects every video_url item (it fetches nothing), so answer 400 here instead
+                # of letting the request reach the engine and fail with a 500 (r15 S11-1).
+                if "video" not in item and (item.get("type") == "video_url" or "video_url" in item):
+                    raise HTTPException(
+                        400,
+                        "video_url content is not supported; send video frames or inline data via the `video` field.",
+                    )
+                if allow_local:
+                    continue
+                # Media values are handed to loaders / HF processors that resolve paths and URLs
+                # themselves and recursively flatten nested lists, so every string anywhere inside a
+                # media field is a reference and needs the gate (r14 S11-1: ``["/srv/x.mp4"]`` and
+                # nested URL lists used to bypass it). Numeric frame arrays hold no strings and pass.
+                references: list[str] = []
+                for field in _MEDIA_REFERENCE_FIELDS:
+                    if field in item:
+                        _collect_string_references(item[field], references)
+                for reference in references:
+                    if not reference.startswith("data:"):
+                        raise HTTPException(
+                            400,
+                            "Images and videos must be sent inline as base64 `data:` URLs. Server-local paths "
+                            "and file:// URLs are disabled (start the server with allow_local_media_paths=True "
+                            "to allow them for trusted clients); remote http(s) URLs are not fetched.",
+                        )
+
+    def _prepare_messages_for_engine(self, request: ChatCompletionRequest, esurge: eSurge) -> list[dict[str, tp.Any]]:
+        """Convert Pydantic request messages into dictionaries for the eSurge engine.
+
+        Extracts messages from the request and applies any necessary format
+        conversions for compatibility with the underlying processor.
+
+        Args:
+            request: The chat completion request containing messages.
+            esurge: The eSurge engine instance with the processor/tokenizer.
+
+        Returns:
+            List of message dictionaries ready for engine processing.
+            Messages may be converted to OpenAI format if using a
+            ProcessorMixin with `oai_like_processor` enabled.
+        """
+        conversation = [message.model_dump(exclude_none=True) for message in request.messages]
+        processor = esurge.tokenizer
+
+        if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
+            from easydel.utils.prompt_utils import convert_to_openai_format
+
+            conversation = convert_to_openai_format(conversation)
+
+        return tp.cast(list[dict[str, tp.Any]], conversation)
+
+    @staticmethod
+    def _prepare_text_messages_for_chat(messages: list[dict[str, tp.Any]]) -> list[dict[str, tp.Any]]:
+        """Normalize text-only messages into plain string content.
+
+        Walks each message and concatenates any list-of-parts text content
+        into a single space-joined string so the downstream chat template
+        sees uniform string content. Non-text parts are dropped because
+        this code path runs only when the request has no multimodal items.
+
+        Args:
+            messages: Pre-converted message dicts (post Pydantic dump).
+
+        Returns:
+            New list of messages with ``content`` normalized to ``str``.
+        """
+
+        normalized: list[dict[str, tp.Any]] = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            content = msg_copy.get("content")
+            if not isinstance(content, list):
+                normalized.append(msg_copy)
+                continue
+
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part:
+                        text_parts.append(part)
+                    continue
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type in ("text", "input_text", "output_text"):
+                    text = part.get("text", part.get("content", ""))
+                    if text:
+                        text_parts.append(str(text))
+            msg_copy["content"] = " ".join(part for part in text_parts if part)
+            normalized.append(msg_copy)
+        return normalized
+
+    @staticmethod
+    def _prompt_token_count_from_output(output: RequestOutput) -> int:
+        """Extract the prompt token count from a RequestOutput.
+
+        Handles both flat and nested token ID structures that may be present
+        in the output depending on the processing mode (single vs batched).
+
+        Args:
+            output: The RequestOutput containing prompt token information.
+
+        Returns:
+            Total count of prompt tokens. Returns 0 if prompt_token_ids is
+            not available or not in a recognized format.
+        """
+        prompt_ids = output.prompt_token_ids
+        if isinstance(prompt_ids, list) and prompt_ids:
+            first = prompt_ids[0]
+            if isinstance(first, list):
+                return sum(len(seg) for seg in prompt_ids)
+        if isinstance(prompt_ids, list):
+            return len(prompt_ids)
+        return 0
+
+    async def responses(self, request: ResponsesRequest, raw_request: Request) -> tp.Any:
+        """Handle OpenAI Responses API requests.
+
+        Implements the /v1/responses endpoint for the OpenAI Responses API,
+        supporting conversation continuations via `previous_response_id` or
+        `conversation` parameters, and optional response persistence.
+
+        Args:
+            request: The Responses API request containing input, model selection,
+                and optional continuation/storage parameters.
+            raw_request: The raw FastAPI request for authentication context.
+
+        Returns:
+            For non-streaming: A JSON object conforming to the Responses API spec
+                with output text, usage stats, and metadata.
+            For streaming: A StreamingResponse with SSE events following the
+                Responses API streaming protocol.
+
+        Raises:
+            HTTPException: For validation errors (400), auth failures (401/403/429),
+                or model not found (404).
+
+        Note:
+            The Responses API supports stateful conversations when
+            `enable_response_store=True` is configured on the server.
+        """
+
+        response_id = f"resp_{uuid.uuid4().hex}"
+
+        try:
+            store_flag = request.store
+            store_response = self._default_store_responses if store_flag is None else bool(store_flag)
+
+            previous_response_id = request.previous_response_id
+            if not isinstance(previous_response_id, str):
+                previous_response_id = None
+            else:
+                previous_response_id = previous_response_id.strip() or None
+
+            conversation_id = self._normalize_conversation_id(request.conversation)
+
+            model = request.model.strip() if isinstance(request.model, str) else ""
+            adapters = getattr(self, "adapters", None)
+            peek_adapter = adapters.get(model) if (model and isinstance(adapters, dict)) else None
+            peek_esurge = peek_adapter.esurge if peek_adapter is not None else None
+
+            try:
+                requested_tokens, max_tokens = self._parse_responses_max_tokens(request, peek_esurge)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+            n_samples = max(1, int(request.n or 1))
+            self._authorize_endpoint(
+                raw_request,
+                endpoint="/v1/responses",
+                model=model or None,
+                requested_tokens=requested_tokens * n_samples,
+                stream=bool(request.stream),
+                uses_tools=self._request_uses_tools(request),
+                reconcile_immediately=False,
+            )
+
+            if previous_response_id and conversation_id:
+                raise HTTPException(status_code=400, detail="Cannot use both 'previous_response_id' and 'conversation'")
+
+            if not model:
+                raise HTTPException(400, "Field 'model' is required")
+
+            adapter = self._get_adapter(model)
+            esurge = adapter.esurge
+
+            input_messages = [
+                message if isinstance(message, ChatMessage) else ChatMessage.model_validate(message)
+                for message in self._responses_payload_to_messages(request, include_instructions=False)
+            ]
+            if not input_messages:
+                raise HTTPException(400, "Field 'input' (or 'messages') cannot be empty")
+
+            instructions = request.instructions
+            if not isinstance(instructions, str) or not instructions.strip():
+                instructions = None
+            else:
+                instructions = instructions.strip()
+
+            owner_key_id = self._response_store_owner_id(raw_request)
+            conversation_store_key = (
+                self._scoped_conversation_store_key(conversation_id, owner_key_id) if conversation_id else None
+            )
+
+            history_messages: list[ChatMessage] = []
+            if previous_response_id:
+                if not self._enable_response_store:
+                    raise HTTPException(
+                        status_code=400, detail="previous_response_id requires enable_response_store=True"
+                    )
+                prev = await self._response_store_get_response(previous_response_id)
+                if prev is None:
+                    raise HTTPException(status_code=400, detail=f"Unknown previous_response_id '{previous_response_id}'")
+                if prev.get("owner_key_id") != owner_key_id:
+                    raise HTTPException(
+                        status_code=403, detail=f"Access denied to previous_response_id '{previous_response_id}'"
+                    )
+                history_messages = [
+                    ChatMessage.model_validate(message)
+                    for message in tp.cast(list[dict[str, tp.Any]], prev.get("conversation", []))
+                ]
+            elif conversation_id and conversation_store_key is not None:
+                if not self._enable_response_store:
+                    raise HTTPException(status_code=400, detail="conversation requires enable_response_store=True")
+                conversation_history = (await self._response_store_get_conversation(conversation_store_key)) or []
+                history_messages = [ChatMessage.model_validate(message) for message in conversation_history]
+
+            # `full_messages` is the persisted conversation state for this response (excludes `instructions`).
+            full_messages = list(history_messages) + list(input_messages)
+
+            # `engine_messages` is what we send to the model (may include ephemeral instructions).
+            engine_messages = list(full_messages)
+            if instructions:
+                engine_messages.insert(0, ChatMessage(role="system", content=instructions))
+
+            engine_messages_payload = [message.model_dump(exclude_none=True) for message in engine_messages]
+            processor = getattr(esurge, "tokenizer", None)
+            if isinstance(processor, ProcessorMixin) and getattr(self, "oai_like_processor", False):
+                from easydel.utils.prompt_utils import convert_to_openai_format
+
+                engine_messages_payload = tp.cast(
+                    list[dict[str, tp.Any]], convert_to_openai_format(engine_messages_payload)
+                )
+            if self._messages_have_multimodal_content(engine_messages_payload):
+                self._reject_local_media_references(engine_messages_payload)
+            else:
+                engine_messages_payload = self._prepare_text_messages_for_chat(engine_messages_payload)
+
+            raw_tools, tools_for_template = self._extract_responses_tools(request)
+
+            try:
+                sampling_params = self._create_sampling_params_from_responses(request, max_tokens)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            sampling_params = self._apply_extra_stops_to_sampling_params(sampling_params)
+            stream = bool(request.stream)
+            reasoning_summary_requested = self._responses_reasoning_summary_requested(request)
+
+            final_response_overrides = ResponsesFinalizationOptions(
+                error=None,
+                incomplete_details=None,
+                instructions=instructions,
+                max_output_tokens=request.max_output_tokens,
+                previous_response_id=previous_response_id,
+                store=store_response,
+                temperature=1.0 if request.temperature is None else request.temperature,
+                top_p=1.0 if request.top_p is None else request.top_p,
+                truncation=request.truncation or "disabled",
+                tool_choice=request.tool_choice or "auto",
+                tools=list(raw_tools or []),
+                parallel_tool_calls=True if request.parallel_tool_calls is None else request.parallel_tool_calls,
+                metadata=request.metadata if isinstance(request.metadata, dict) else {},
+            )
+
+            if not stream:
+                async with self._acquire_generation_slot(
+                    endpoint="/v1/responses",
+                    request_id=response_id,
+                    model=model,
+                    raw_request=raw_request,
+                    stream=False,
+                ):
+                    disconnect_done = asyncio.Event()
+                    disconnect_task = asyncio.create_task(
+                        self._abort_non_stream_request_on_disconnect(
+                            raw_request=raw_request,
+                            esurge=esurge,
+                            request_id=response_id,
+                            endpoint="/v1/responses",
+                            model=model,
+                            done_event=disconnect_done,
+                        )
+                    )
+
+                    def _run_chat() -> RequestOutput:
+                        return tp.cast(
+                            RequestOutput,
+                            esurge.chat(
+                                messages=engine_messages_payload,
+                                tools=tools_for_template,
+                                tool_choice=request.tool_choice,
+                                sampling_params=sampling_params,
+                                request_id=response_id,
+                                stream=False,
+                            ),
+                        )
+
+                    def _reconcile_cancelled_response(partial_output: RequestOutput) -> None:
+                        p_tokens = self._prompt_token_count_from_output(partial_output)
+                        c_tokens = int(getattr(partial_output, "num_generated_tokens", 0) or 0)
+                        if p_tokens > 0 or c_tokens > 0:
+                            self.metrics.total_tokens_generated += c_tokens
+                            self._record_api_key_usage(raw_request, p_tokens, c_tokens)
+
+                    try:
+                        output = await self._run_in_thread_with_cancel_abort(
+                            _run_chat,
+                            abort_fn=lambda: self._abort_request_after_handler_cancel(
+                                esurge=esurge,
+                                request_id=response_id,
+                                endpoint="/v1/responses",
+                                model=model,
+                            ),
+                            on_cancelled_result=_reconcile_cancelled_response,
+                        )
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e)) from e
+                    finally:
+                        disconnect_done.set()
+                        disconnect_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await disconnect_task
+
+                completion_tokens = int(output.num_generated_tokens or 0)
+                prompt_tokens = self._prompt_token_count_from_output(output)
+
+                primary_output = output.outputs[0] if output.outputs else None
+                response_text = output.accumulated_text or output.get_text()
+                reasoning_text = output.reasoning_content or (
+                    primary_output.reasoning_content if primary_output is not None else None
+                )
+                tool_calls_payload = self._jsonify_tool_calls(
+                    output.tool_calls or (primary_output.tool_calls if primary_output is not None else None)
+                )
+
+                if tool_calls_payload:
+                    response_text = self._resolved_tool_call_visible_text(primary_output, output) or ""
+
+                output_items = self._build_responses_output_items(
+                    output_text=response_text,
+                    tool_calls=tool_calls_payload,
+                    reasoning_text=reasoning_text,
+                    include_reasoning_summary=reasoning_summary_requested,
+                )
+
+                self.metrics.total_tokens_generated += completion_tokens
+                self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+
+                response_obj = self._build_responses_object(
+                    response_id=response_id,
+                    model=model,
+                    output_text=response_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    tool_calls=tool_calls_payload,
+                    reasoning_text=reasoning_text,
+                    include_reasoning_summary=reasoning_summary_requested,
+                    output_items=output_items,
+                )
+                response_obj = response_obj.model_copy(update=final_response_overrides.as_update_dict())
+
+                if store_response and self._enable_response_store:
+                    assistant_turn = self._responses_assistant_message_from_output_items(output_items)
+                    conversation_after = self._conversation_from_messages(full_messages, assistant_turn)
+                    await self._response_store_put_response(
+                        response_id,
+                        {
+                            "id": response_id,
+                            "owner_key_id": owner_key_id,
+                            "model": model,
+                            "created_at": response_obj.created_at,
+                            "previous_response_id": previous_response_id,
+                            "conversation_id": conversation_id,
+                            "conversation": conversation_after,
+                            "response": response_obj.model_dump(exclude_none=False),
+                        },
+                    )
+                    if conversation_id and conversation_store_key is not None:
+                        await self._response_store_put_conversation(conversation_store_key, conversation_after)
+
+                return response_obj.model_dump(exclude_none=False)
+
+            self._check_generation_slot_capacity(
+                endpoint="/v1/responses",
+                request_id=response_id,
+                model=model,
+                raw_request=raw_request,
+                stream=True,
+            )
+
+            created_at = int(time.time())
+
+            async def generate_stream():
+                """Async generator yielding SSE events for Responses API streaming."""
+
+                async with self._acquire_generation_slot(
+                    endpoint="/v1/responses",
+                    request_id=response_id,
+                    model=model,
+                    raw_request=raw_request,
+                    stream=True,
+                ):
+                    disconnected = False
+                    final_obj: ResponsesResponse | None = None
+                    persisted_response = False
+                    accounted_completion = False
+                    queue = self._start_observed_stream_task(
+                        lambda: tp.cast(
+                            Iterator[StreamEventFrame],
+                            esurge.iter_responses_stream(
+                                response_id=response_id,
+                                model=model,
+                                messages=engine_messages_payload,
+                                tools=tools_for_template,
+                                tool_choice=request.tool_choice,
+                                sampling_params=sampling_params,
+                                request_id=response_id,
+                                include_reasoning_summary=reasoning_summary_requested,
+                                final_response_overrides=final_response_overrides,
+                                created_at=created_at,
+                                **self._stream_usage_callback_kwargs(esurge.iter_responses_stream, raw_request),
+                            ),
+                        ),
+                        lambda: esurge.abort_request(response_id),
+                        raw_request,
+                    )
+
+                    try:
+                        stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
+                        while True:
+                            if await raw_request.is_disconnected():
+                                try:
+                                    esurge.abort_request(response_id)
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to abort response %s after disconnect", response_id, exc_info=True
+                                    )
+                                disconnected = True
+                                break
+                            kind, stream_payload = await queue.get()
+                            if kind == _STREAM_END:
+                                break
+                            if kind == _STREAM_ERROR:
+                                stream_error = tp.cast(Exception, stream_payload)  # pyright: ignore[reportUnusedVariable]
+                                raise tp.cast(Exception, stream_payload)
+
+                            frame = tp.cast(StreamEventFrame, stream_payload)
+                            frame_event = frame.event
+                            frame_payload = frame.payload
+                            if frame_event == "response.completed" and isinstance(frame_payload, ResponseCompletedEvent):
+                                final_obj = frame_payload.response
+                                # Persist response/conversation state and finalize accounting BEFORE
+                                # yielding ``response.completed`` so clients that immediately close or
+                                # send a follow-up with ``previous_response_id`` never observe a race.
+                                if store_response and self._enable_response_store and not persisted_response:
+                                    output_items = list(tp.cast(list[ResponsesOutputItem], final_obj.output))
+                                    assistant_turn = self._responses_assistant_message_from_output_items(output_items)
+                                    conversation_after = self._conversation_from_messages(full_messages, assistant_turn)
+                                    await self._response_store_put_response(
+                                        response_id,
+                                        {
+                                            "id": response_id,
+                                            "owner_key_id": owner_key_id,
+                                            "model": model,
+                                            "created_at": final_obj.created_at,
+                                            "previous_response_id": previous_response_id,
+                                            "conversation_id": conversation_id,
+                                            "conversation": conversation_after,
+                                            "response": final_obj.model_dump(exclude_none=False),
+                                        },
+                                    )
+                                    if conversation_id and conversation_store_key is not None:
+                                        await self._response_store_put_conversation(
+                                            conversation_store_key, conversation_after
+                                        )
+                                    persisted_response = True
+                                usage = final_obj.usage
+                                prompt_tokens = int(usage.input_tokens if usage is not None else 0)
+                                completion_tokens = int(usage.output_tokens if usage is not None else 0)
+                                if not accounted_completion:
+                                    self.metrics.total_tokens_generated += completion_tokens
+                                    self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+                                    accounted_completion = True
+
+                            yield self._sse_event(frame_event, frame_payload)
+
+                        if disconnected:
+                            return
+
+                        if final_obj is None:
+                            raise RuntimeError("Streaming finished without response.completed")
+
+                    except Exception as e:
+                        self._mark_stream_failure()
+                        debug_context = self._build_stream_debug_context(
+                            endpoint="/v1/responses",
+                            request_id=response_id,
+                            model=model,
+                            queue_kind=locals().get("kind"),
+                            disconnected=locals().get("disconnected"),
+                            delta_text=locals().get("frame_event"),
+                            raw_delta_message=locals().get("frame_payload"),
+                            stream_error=locals().get("stream_error"),
+                            tools=tools_for_template,
+                            messages=engine_messages,
+                        )
+                        logger.exception("Error during /v1/responses streaming: %s | context=%s", e, debug_context)
+                        error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), response_id)
+                        yield self._sse_event(
+                            "response.error",
+                            {"type": "response.error", "error": json.loads(error_response.body.decode())},
+                        )
+                    finally:
+                        await self._close_stream_queue_and_wait(queue)
+                        if final_obj is None:
+                            try:
+                                esurge.abort_request(response_id)
+                            except Exception:
+                                logger.debug("Failed to abort unfinished response %s", response_id, exc_info=True)
+
+            response = StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Request-ID": response_id,
+                },
+            )
+            return self._track_api_key_stream(response, raw_request)
+
+        except (HTTPException, asyncio.CancelledError):
+            self._release_api_key_reservation(raw_request)
+            raise
+        except Exception as e:
+            self._release_api_key_reservation(raw_request)
+            logger.exception("Error in /v1/responses: %s", e)
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), response_id)
+
+    @staticmethod
+    def _build_completion_choices(output: RequestOutput) -> list[CompletionResponseChoice]:
+        """Build one ``CompletionResponseChoice`` per sampled completion.
+
+        Each choice must carry its own sample's text (``completion.text``).
+        ``output.accumulated_text`` mirrors only sample index 0, so using it
+        for every choice made ``/v1/completions`` with ``n>1`` return the same
+        text for every choice.
+
+        Args:
+            output: Finalized :class:`RequestOutput` holding one
+                :class:`CompletionOutput` per requested sample.
+
+        Returns:
+            A list of :class:`CompletionResponseChoice`, one per sample, in
+            sample order.
+        """
+        choices: list[CompletionResponseChoice] = []
+        for idx, completion in enumerate(output.outputs):
+            choices.append(
+                CompletionResponseChoice(
+                    index=idx,
+                    text=completion.text,
+                    finish_reason=completion.finish_reason or "stop",
+                )
+            )
+        return choices
+
+    def _build_chat_completion_response(
+        self,
+        request: ChatCompletionRequest,
+        esurge: eSurge,
+        output: RequestOutput,
+        raw_request: Request,
+    ) -> ChatCompletionResponse:
+        """Build a ChatCompletionResponse from a finalized RequestOutput.
+
+        Computes prompt/completion token counts, updates the rolling
+        tokens-per-second metric, builds one ``ChatCompletionResponseChoice``
+        per completion (mapping tool calls or text content appropriately),
+        and records per-API-key usage.
+
+        Args:
+            request: Original chat completion request.
+            esurge: eSurge engine that produced the output.
+            output: Finalized :class:`RequestOutput` snapshot.
+            raw_request: Raw FastAPI request, used to attribute usage to
+                the authenticated API key.
+
+        Returns:
+            Fully populated :class:`ChatCompletionResponse`.
+        """
+
+        completion_tokens = int(output.num_generated_tokens or 0)
+        prompt_tokens = self._prompt_token_count_from_output(output)
+        self.metrics.total_tokens_generated += completion_tokens
+
+        tokens_per_second = output.tokens_per_second
+        processing_time = output.processing_time
+
+        if self.metrics.average_tokens_per_second == 0:
+            self.metrics.average_tokens_per_second = tokens_per_second
+        else:
+            self.metrics.average_tokens_per_second = (
+                self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
+            )
+
+        choices: list[ChatCompletionResponseChoice] = []
+        for idx, completion in enumerate(output.outputs):
+            if completion.tool_calls:
+                message = ChatMessage(
+                    role="assistant",
+                    content=self._resolved_tool_call_visible_text(completion, output if idx == 0 else None),
+                    tool_calls=completion.tool_calls,
+                    reasoning_content=completion.reasoning_content,
+                )
+                finish_reason = "tool_calls"
+            else:
+                message = ChatMessage(
+                    role="assistant",
+                    content=completion.text,
+                    reasoning_content=completion.reasoning_content,
+                )
+                finish_reason = completion.finish_reason or "stop"
+            if finish_reason == "finished":
+                finish_reason = "stop"
+            choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
+
+        usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            tokens_per_second=tokens_per_second,
+            processing_time=processing_time,
+            first_token_time=output.first_token_time,
+            **UsageInfo.cache_fields(output),
+        )
+
+        self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+
+        return ChatCompletionResponse(
+            model=request.model,
+            choices=choices,
+            usage=usage,
+        )
+
+    async def _handle_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        esurge: eSurge,
+        messages: list[dict[str, tp.Any]],
+        request_id: str,
+        raw_request: Request,
+    ) -> ChatCompletionResponse:
+        """Handle non-streaming chat completion via ``eSurge.chat()``.
+
+        Acquires a generation slot, dispatches the synchronous chat call to
+        the executor thread pool, and installs a background disconnect
+        watcher so the engine aborts if the HTTP client disappears.
+
+        Args:
+            request: Original chat completion request.
+            esurge: eSurge engine to run against.
+            messages: Pre-normalised message list ready for the chat template.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
+
+        Returns:
+            Fully populated :class:`ChatCompletionResponse`.
+
+        Raises:
+            HTTPException: HTTP 400 if the engine raises ``ValueError``
+                (typically invalid input).
+            asyncio.CancelledError: Re-raised after aborting the engine
+                request when the handler itself is cancelled.
+        """
+
+        async with self._acquire_generation_slot(
+            endpoint="/v1/chat/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=False,
+        ):
+            try:
+                sampling_params = self._prepare_sampling_params(request, esurge)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            disconnect_done = asyncio.Event()
+            disconnect_task = asyncio.create_task(
+                self._abort_non_stream_request_on_disconnect(
+                    raw_request=raw_request,
+                    esurge=esurge,
+                    request_id=request_id,
+                    endpoint="/v1/chat/completions",
+                    model=request.model,
+                    done_event=disconnect_done,
+                )
+            )
+
+            def _run_chat() -> RequestOutput:
+                return tp.cast(
+                    RequestOutput,
+                    esurge.chat(
+                        messages=messages,
+                        tools=self.extract_tools(request=request),
+                        tool_choice=request.tool_choice,
+                        sampling_params=sampling_params,
+                        request_id=request_id,
+                        stream=False,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                    ),
+                )
+
+            def _reconcile_cancelled_chat(partial_output: RequestOutput) -> None:
+                p_tokens = self._prompt_token_count_from_output(partial_output)
+                c_tokens = int(getattr(partial_output, "num_generated_tokens", 0) or 0)
+                if p_tokens > 0 or c_tokens > 0:
+                    self.metrics.total_tokens_generated += c_tokens
+                    self._record_api_key_usage(raw_request, p_tokens, c_tokens)
+
+            try:
+                output = await self._run_in_thread_with_cancel_abort(
+                    _run_chat,
+                    abort_fn=lambda: self._abort_request_after_handler_cancel(
+                        esurge=esurge,
+                        request_id=request_id,
+                        endpoint="/v1/chat/completions",
+                        model=request.model,
+                    ),
+                    on_cancelled_result=_reconcile_cancelled_chat,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            finally:
+                disconnect_done.set()
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
+
+            return self._build_chat_completion_response(request, esurge, output, raw_request)
+
+    async def _handle_chat_streaming(
+        self,
+        request: ChatCompletionRequest,
+        esurge: eSurge,
+        messages: list[dict[str, tp.Any]],
+        request_id: str,
+        raw_request: Request,
+    ) -> StreamingResponse:
+        """Handle streaming chat completion via ``eSurge.chat()``.
+
+        Returns a :class:`StreamingResponse` that emits SSE events as
+        ``ChatCompletionStreamResponse`` chunks become available, ending
+        with a terminal ``[DONE]`` marker.
+
+        Args:
+            request: Original chat completion request.
+            esurge: eSurge engine to run against.
+            messages: Pre-normalised message list ready for the chat template.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
+
+        Returns:
+            FastAPI :class:`StreamingResponse` configured for SSE with
+            cache and connection headers, plus ``X-Request-ID``.
+        """
+
+        try:
+            sampling_params = self._prepare_sampling_params(request, esurge)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        tools = self.extract_tools(request=request)
+        # Refuse overload before the SSE response starts: a 503 raised inside the
+        # body iterator reaches the client as an empty, aborted stream instead.
+        self._check_generation_slot_capacity(
+            endpoint="/v1/chat/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=True,
+        )
+
+        async def generate_stream():
+            """Async generator yielding SSE events for chat completion streaming."""
+            async with self._acquire_generation_slot(
+                endpoint="/v1/chat/completions",
+                request_id=request_id,
+                model=request.model,
+                raw_request=raw_request,
+                stream=True,
+            ):
+                queue = self._start_observed_stream_task(
+                    lambda: tp.cast(
+                        Iterator[ChatCompletionStreamResponse],
+                        esurge.iter_chat_completion_stream(
+                            model=request.model,
+                            messages=messages,
+                            tools=tools,
+                            tool_choice=request.tool_choice,
+                            sampling_params=sampling_params,
+                            request_id=request_id,
+                            chat_template_kwargs=request.chat_template_kwargs,
+                            **self._stream_usage_callback_kwargs(esurge.iter_chat_completion_stream, raw_request),
+                        ),
+                    ),
+                    lambda: esurge.abort_request(request_id),
+                    raw_request,
+                )
+                last_chunk: ChatCompletionStreamResponse | None = None
+                disconnected = False
+                completed = False
+
+                try:
+                    stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
+                    while True:
+                        if await raw_request.is_disconnected():
+                            try:
+                                esurge.abort_request(request_id)
+                            except Exception:
+                                logger.debug("Failed to abort request %s after disconnect", request_id, exc_info=True)
+                            disconnected = True
+                            break
+                        kind, payload = await queue.get()
+                        if kind == _STREAM_END:
+                            completed = True
+                            break
+                        if kind == _STREAM_ERROR:
+                            stream_error = tp.cast(Exception, payload)  # pyright: ignore[reportUnusedVariable]
+                            raise tp.cast(Exception, payload)
+
+                        chunk = tp.cast(ChatCompletionStreamResponse, payload)
+                        last_chunk = chunk
+                        delta_message = chunk.choices[0].delta if chunk.choices else None
+                        usage = getattr(chunk, "usage", None)
+                        if usage is not None:
+                            self._observe_api_key_stream_usage(
+                                raw_request, usage.prompt_tokens or 0, usage.completion_tokens or 0
+                            )
+                            if any(choice.finish_reason is not None for choice in chunk.choices):
+                                # A terminal chunk can be the consumer's last iterator advance.
+                                self._record_api_key_usage(
+                                    raw_request, usage.prompt_tokens or 0, usage.completion_tokens or 0
+                                )
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+                    if disconnected:
+                        return
+
+                    if last_chunk is None:
+                        raise RuntimeError("Streaming finished without any output")
+
+                    usage = last_chunk.usage
+                    prompt_tokens = int(usage.prompt_tokens or 0) if usage is not None else 0
+                    completion_tokens = int(usage.completion_tokens or 0) if usage is not None else 0
+                    self.metrics.total_tokens_generated += completion_tokens
+                    self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+                    yield "data: [DONE]\n\n"
+
+                except Exception as e:
+                    self._mark_stream_failure()
+                    debug_context = self._build_stream_debug_context(
+                        endpoint="/v1/chat/completions",
+                        request_id=request_id,
+                        model=request.model,
+                        queue_kind=locals().get("kind"),
+                        disconnected=locals().get("disconnected"),
+                        delta_text=locals().get("chunk").model_dump_json(exclude_unset=True, exclude_none=True)
+                        if "chunk" in locals()
+                        else None,
+                        raw_delta_message=locals().get("chunk"),
+                        delta_message=locals().get("delta_message"),
+                        stream_error=locals().get("stream_error"),
+                        tools=tools,
+                        messages=messages,
+                    )
+                    logger.exception("Error during /v1/chat/completions streaming: %s | context=%s", e, debug_context)
+                    error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+                    yield f"data: {error_response.body.decode()}\n\n"
+                finally:
+                    await self._close_stream_queue_and_wait(queue)
+                    if not completed:
+                        try:
+                            esurge.abort_request(request_id)
+                        except Exception:
+                            logger.debug("Failed to abort unfinished chat %s", request_id, exc_info=True)
+
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    async def completions(self, request: CompletionRequest, raw_request: Request) -> tp.Any:
+        """Handle completion requests.
+
+        Endpoint for ``/v1/completions``. Simpler text completion without
+        chat formatting. Authorizes the request, normalises the prompt,
+        and dispatches to the streaming or non-streaming helper.
+
+        Args:
+            request: Completion request payload.
+            raw_request: Raw FastAPI request used for auth and disconnect
+                detection.
+
+        Returns:
+            :class:`CompletionResponse`, :class:`StreamingResponse`, or
+            a :class:`JSONResponse` wrapping the error on failure.
+
+        Raises:
+            HTTPException: For client errors (e.g. 400 empty prompt,
+                404 model not found, 401/403/429 auth failures).
+        """
+        request_id = str(uuid.uuid4())
+
+        try:
+            prompt = request.prompt
+            prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+
+            adapters = getattr(self, "adapters", None)
+            peek_adapter = adapters.get(request.model) if isinstance(adapters, dict) else None
+            peek_esurge = peek_adapter.esurge if peek_adapter is not None else None
+
+            max_tokens = self._ensure_request_max_tokens(request, peek_esurge)
+            batch_size = max(1, len(prompts))
+            n_samples = max(1, int(request.n or 1))
+            self._authorize_endpoint(
+                raw_request,
+                endpoint="/v1/completions",
+                model=request.model,
+                requested_tokens=max_tokens * batch_size * n_samples,
+                stream=bool(request.stream),
+                uses_tools=self._request_uses_tools(request),
+                reconcile_immediately=False,
+            )
+
+            adapter = self._get_adapter(request.model)
+            esurge = adapter.esurge
+
+            if not prompts or any(not p for p in prompts):
+                raise HTTPException(400, "Prompt cannot be empty")
+
+            if len(prompts) > 1:
+                if request.stream:
+                    response = await self._handle_completion_batch_streaming(
+                        request, esurge, prompts, request_id, raw_request
+                    )
+                    return self._track_api_key_stream(response, raw_request)
+                return await self._handle_completion_response(request, esurge, prompts, request_id, raw_request)
+
+            if request.stream:
+                response = await self._handle_completion_streaming(request, esurge, prompts[0], request_id, raw_request)
+                return self._track_api_key_stream(response, raw_request)
+            else:
+                return await self._handle_completion_response(request, esurge, prompts[0], request_id, raw_request)
+
+        except (HTTPException, asyncio.CancelledError):
+            self._release_api_key_reservation(raw_request)
+            raise
+        except Exception as e:
+            self._release_api_key_reservation(raw_request)
+            logger.exception(f"Error in completion: {e}")
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+
+    async def _handle_completion_response(
+        self,
+        request: CompletionRequest,
+        esurge: eSurge,
+        prompt: str | list[str],
+        request_id: str,
+        raw_request: Request,
+    ) -> CompletionResponse:
+        """Handle non-streaming completion via ``eSurge.generate()``.
+
+        Acquires a generation slot, runs the synchronous generate call on
+        the executor thread pool, and installs a background disconnect
+        watcher so the engine aborts if the client disappears. A list of
+        prompts yields one group of choices per prompt, with choice indices
+        numbered consecutively across prompts as in the OpenAI API.
+
+        Args:
+            request: Original completion request.
+            esurge: eSurge engine instance.
+            prompt: Text prompt (or list of prompts) to feed the model.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
+
+        Returns:
+            Complete :class:`CompletionResponse` with generated text
+            and usage statistics.
+
+        Raises:
+            RuntimeError: If generation returns no outputs.
+            asyncio.CancelledError: Re-raised after aborting the engine
+                request when the handler itself is cancelled.
+        """
+        multi_prompt = not isinstance(prompt, str)
+        prompts = list(prompt) if multi_prompt else [prompt]
+        slot_kwargs: dict[str, tp.Any] = {
+            "endpoint": "/v1/completions",
+            "request_id": request_id,
+            "model": request.model,
+            "raw_request": raw_request,
+            "stream": False,
+        }
+        if len(prompts) > 1:
+            slot_kwargs["count"] = len(prompts)
+
+        async with self._acquire_generation_slot(**slot_kwargs):
+            # ``generate`` needs one id per prompt when batching; a single prompt keeps the caller's id unchanged.
+            request_ids = [f"{request_id}-{i}" for i in range(len(prompts))] if multi_prompt else [request_id]
+            try:
+                sampling_params = self._prepare_sampling_params(request, esurge)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            loop = asyncio.get_running_loop()
+            prompt_tokens = await loop.run_in_executor(
+                getattr(self, "thread_pool", None),
+                lambda: sum(len(esurge.tokenizer(p)["input_ids"]) for p in prompts),
+            )
+            disconnect_done = asyncio.Event()
+            disconnect_task = asyncio.create_task(
+                self._abort_non_stream_request_on_disconnect(
+                    raw_request=raw_request,
+                    esurge=esurge,
+                    request_id=request_ids if multi_prompt else request_ids[0],
+                    endpoint="/v1/completions",
+                    model=request.model,
+                    done_event=disconnect_done,
+                )
+            )
+
+            def _run_generate() -> list[RequestOutput]:
+                return esurge.generate(
+                    prompts if multi_prompt else prompts[0],
+                    sampling_params,
+                    request_id=request_ids if multi_prompt else request_ids[0],
+                    use_tqdm=False,
+                )
+
+            def _abort_batch() -> None:
+                for rid in request_ids:
+                    self._abort_request_after_handler_cancel(
+                        esurge=esurge,
+                        request_id=rid,
+                        endpoint="/v1/completions",
+                        model=request.model,
+                    )
+
+            def _reconcile_cancelled_completion(partial_outputs: list[RequestOutput]) -> None:
+                if not partial_outputs:
+                    return
+                c_tokens = sum(int(getattr(o, "num_generated_tokens", 0) or 0) for o in partial_outputs)
+                if c_tokens > 0 or prompt_tokens > 0:
+                    self.metrics.total_tokens_generated += c_tokens
+                    self._record_api_key_usage(raw_request, prompt_tokens, c_tokens)
+
+            try:
+                outputs = await self._run_in_thread_with_cancel_abort(
+                    _run_generate,
+                    abort_fn=_abort_batch,
+                    on_cancelled_result=_reconcile_cancelled_completion,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            finally:
+                disconnect_done.set()
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
+
+            if not outputs:
+                raise RuntimeError("Generation failed to produce output")
+
+            # One group of choices per prompt, indices numbered consecutively across prompts (OpenAI semantics).
+            choices: list[CompletionResponseChoice] = []
+            for output in outputs:
+                for choice in self._build_completion_choices(output):
+                    choice.index = len(choices)
+                    choices.append(choice)
+
+            completion_tokens = sum(o.num_generated_tokens for o in outputs)
+            self.metrics.total_tokens_generated += completion_tokens
+            processing_time = max(o.processing_time for o in outputs)
+            if len(outputs) == 1:
+                tokens_per_second = outputs[0].tokens_per_second
+            else:
+                tokens_per_second = completion_tokens / processing_time if processing_time > 0 else 0.0
+            first_token_times = [o.first_token_time for o in outputs if o.first_token_time is not None]
+
+            usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                tokens_per_second=tokens_per_second,
+                processing_time=processing_time,
+                first_token_time=min(first_token_times) if first_token_times else None,
+                **UsageInfo.cache_fields(outputs),
+            )
+
+            self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+
+            return CompletionResponse(
+                model=request.model,
+                choices=choices,
+                usage=usage,
+            )
+
+    async def _handle_completion_batch_streaming(
+        self,
+        request: CompletionRequest,
+        esurge: eSurge,
+        prompts: list[str],
+        request_id: str,
+        raw_request: Request,
+    ) -> StreamingResponse:
+        """Stream every prompt with stable, batch-wide choice indices and aggregate usage.
+
+        Prompts are streamed sequentially so each uses the normal generation-slot admission and cancellation
+        handling without holding a slot while waiting to acquire another. Only one final ``[DONE]`` is emitted.
+
+        Args:
+            request: Completion request and sampling parameters.
+            esurge: Engine serving the request.
+            prompts: Nonempty prompts, in response-choice order.
+            request_id: Batch identifier; child request IDs have a prompt-index suffix.
+            raw_request: Request used to detect disconnects and attribute usage.
+
+        Returns:
+            An SSE response covering all prompt completions.
+        """
+
+        try:
+            self._prepare_sampling_params(request, esurge)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        self._check_generation_slot_capacity(
+            endpoint="/v1/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=True,
+        )
+
+        async def generate_stream():
+            stream_id = f"cmpl-{uuid.uuid4().hex}"
+            created_at = int(time.time())
+            choice_offset = 0
+            prompt_tokens = 0
+            completion_tokens = 0
+            processing_time = 0.0
+            cache_hit = False
+            cache_read = 0
+            cache_written = 0
+            cache_written_unknown = False
+            uncached_input = 0
+            for prompt_index, prompt in enumerate(prompts):
+                if await raw_request.is_disconnected():
+                    return
+                try:
+                    response = await self._handle_completion_streaming(
+                        request, esurge, prompt, f"{request_id}-{prompt_index}", raw_request, record_usage=False
+                    )
+                except HTTPException as exc:
+                    self._mark_stream_failure()
+                    try:
+                        status_code = HTTPStatus(exc.status_code)
+                    except ValueError:
+                        status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                    error_response = create_error_response(status_code, str(exc.detail), request_id)
+                    yield f"data: {error_response.body.decode()}\n\n"
+                    return
+                iterator = response.body_iterator
+                next_choice_offset = choice_offset
+                completed = False
+                try:
+                    async for event in iterator:
+                        event = event.decode() if isinstance(event, bytes) else event
+                        payload = event.removeprefix("data: ").strip()
+                        if payload == "[DONE]":
+                            completed = True
+                            continue
+                        chunk = json.loads(payload)
+                        if "error" in chunk:
+                            yield event
+                            return
+                        chunk["id"] = stream_id
+                        chunk["created"] = created_at
+                        for choice in chunk.get("choices", []):
+                            choice["index"] += choice_offset
+                            next_choice_offset = max(next_choice_offset, choice["index"] + 1)
+                        usage = chunk.pop("usage", None)
+                        if usage is not None:
+                            prompt_tokens += usage["prompt_tokens"]
+                            completion_tokens += usage["completion_tokens"]
+                            processing_time += usage.get("processing_time", 0.0)
+                            cache_hit = cache_hit or bool(usage.get("cache_hit", False))
+                            cache_read += int(usage.get("cache_read", 0))
+                            uncached_input += int(usage.get("uncached_input", 0))
+                            if usage.get("cache_written") is None:
+                                cache_written_unknown = True
+                            else:
+                                cache_written += int(usage["cache_written"])
+                            if prompt_index == len(prompts) - 1:
+                                # Reconcile before exposing terminal usage: the consumer
+                                # may disconnect without ever requesting the next event.
+                                self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+                                chunk["usage"] = UsageInfo(
+                                    prompt_tokens=prompt_tokens,
+                                    completion_tokens=completion_tokens,
+                                    total_tokens=prompt_tokens + completion_tokens,
+                                    processing_time=processing_time,
+                                    tokens_per_second=(completion_tokens / processing_time if processing_time else 0.0),
+                                    cache_hit=cache_hit,
+                                    cache_read=cache_read,
+                                    cache_written=None if cache_written_unknown else cache_written,
+                                    uncached_input=uncached_input,
+                                ).model_dump(exclude_none=True)
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                finally:
+                    await iterator.aclose()
+                if not completed:
+                    return
+                choice_offset = next_choice_offset
+            self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Request-ID": request_id},
+        )
+
+    async def _handle_completion_streaming(
+        self,
+        request: CompletionRequest,
+        esurge: eSurge,
+        prompt: str,
+        request_id: str,
+        raw_request: Request,
+        record_usage: bool = True,
+    ) -> StreamingResponse:
+        """Handle streaming completion with delta chunks.
+
+        Similar to chat streaming but for raw text completion. Emits SSE
+        events with :class:`ChatCompletionStreamResponse` chunks carrying
+        incremental text and usage information; closes with a ``[DONE]``
+        marker.
+
+        Args:
+            request: Original completion request.
+            esurge: eSurge engine instance.
+            prompt: Text prompt to feed the model.
+            request_id: Unique request identifier passed to the engine.
+            raw_request: Raw FastAPI request for auth attribution and
+                disconnect polling.
+            record_usage: Reconcile admission here; False defers batch-wide usage
+                to the caller after all child prompts finish.
+
+        Returns:
+            FastAPI :class:`StreamingResponse` configured for SSE with the
+            usual cache/connection headers and ``X-Request-ID``.
+        """
+
+        try:
+            sampling_params = self._prepare_sampling_params(request, esurge)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        # Same pre-flight check as chat.
+        self._check_generation_slot_capacity(
+            endpoint="/v1/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=True,
+        )
+
+        async def generate_stream():
+            """Async generator yielding SSE events for text completion streaming.
+
+            Streams incremental text deltas as they are produced by the
+            eSurge engine for the /v1/completions endpoint.
+            """
+            async with self._acquire_generation_slot(
+                endpoint="/v1/completions",
+                request_id=request_id,
+                model=request.model,
+                raw_request=raw_request,
+                stream=True,
+            ):
+                loop = asyncio.get_running_loop()
+                prompt_tokens = await loop.run_in_executor(
+                    getattr(self, "thread_pool", None),
+                    lambda: len(esurge.tokenizer(prompt)["input_ids"]),
+                )
+                previous_texts: dict[int, str] = {}
+                stream_id = f"cmpl-{uuid.uuid4().hex}"
+                created_at = int(time.time())
+                queue = self._start_observed_stream_task(
+                    lambda: esurge.stream(prompt, sampling_params, request_id=request_id),
+                    lambda: esurge.abort_request(request_id),
+                    raw_request,
+                    usage_key=request_id,
+                )
+                total_generated = 0
+                generation_time = 0.0
+                tokens_per_second = 0.0
+                last_output: RequestOutput | None = None
+                disconnected = False
+
+                try:
+                    stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
+                    while True:
+                        if await raw_request.is_disconnected():
+                            try:
+                                esurge.abort_request(request_id)
+                            except Exception:
+                                logger.debug("Failed to abort request %s after disconnect", request_id, exc_info=True)
+                            disconnected = True
+                            break
+                        kind, payload = await queue.get()
+                        if kind == _STREAM_END:
+                            break
+                        if kind == _STREAM_ERROR:
+                            stream_error = tp.cast(Exception, payload)  # pyright: ignore[reportUnusedVariable]
+                            raise tp.cast(Exception, payload)
+
+                        output = tp.cast(RequestOutput, payload)
+                        last_output = output
+                        prompt_tokens = self._prompt_token_count_from_output(output)
+                        total_generated = int(output.num_generated_tokens or 0)
+                        generation_time = output.processing_time
+                        tokens_per_second = output.tokens_per_second
+                        choices = []
+                        for completion in output.outputs:
+                            index = completion.index
+                            current_text = completion.text or ""
+                            previous_text = previous_texts.get(index, "")
+                            delta_text = self._compute_delta_text(current_text, previous_text, "")
+                            previous_texts[index] = current_text
+                            if delta_text:
+                                choices.append(
+                                    {"index": index, "text": delta_text, "logprobs": None, "finish_reason": None}
+                                )
+                        if choices:
+                            chunk = {
+                                "id": stream_id,
+                                "object": "text_completion",
+                                "created": created_at,
+                                "model": request.model,
+                                "choices": choices,
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+
+                    if disconnected:
+                        return
+
+                    if last_output is None:
+                        raise RuntimeError("Streaming finished without any output")
+
+                    usage = UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=total_generated,
+                        total_tokens=prompt_tokens + total_generated,
+                        tokens_per_second=tokens_per_second,
+                        processing_time=generation_time,
+                        first_token_time=last_output.first_token_time,
+                        **UsageInfo.cache_fields(last_output),
+                    )
+
+                    final_chunk = {
+                        "id": stream_id,
+                        "object": "text_completion",
+                        "created": created_at,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": completion.index,
+                                "text": "",
+                                "logprobs": None,
+                                "finish_reason": (
+                                    "stop"
+                                    if completion.finish_reason in (None, "finished")
+                                    else completion.finish_reason
+                                ),
+                            }
+                            for completion in last_output.outputs
+                        ],
+                        "usage": usage.model_dump(exclude_none=True),
+                    }
+
+                    self.metrics.total_tokens_generated += total_generated
+                    if record_usage:
+                        self._record_api_key_usage(raw_request, prompt_tokens, total_generated)
+
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                except Exception as e:
+                    self._mark_stream_failure()
+                    debug_context = self._build_stream_debug_context(
+                        endpoint="/v1/completions",
+                        request_id=request_id,
+                        model=request.model,
+                        queue_kind=locals().get("kind"),
+                        disconnected=locals().get("disconnected"),
+                        output=locals().get("output"),
+                        last_output=locals().get("last_output"),
+                        previous_text=locals().get("previous_text"),
+                        current_text=locals().get("current_text"),
+                        delta_text=locals().get("delta_text"),
+                        stream_error=locals().get("stream_error"),
+                    )
+                    logger.exception("Error during /v1/completions streaming: %s | context=%s", e, debug_context)
+                    error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+                    yield f"data: {error_response.body.decode()}\n\n"
+                finally:
+                    await self._close_stream_queue_and_wait(queue)
+                    if last_output is None or not last_output.finished:
+                        try:
+                            esurge.abort_request(request_id)
+                        except Exception:
+                            logger.debug("Failed to abort unfinished completion %s", request_id, exc_info=True)
+
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    async def health_check(self, raw_request: Request) -> JSONResponse:
+        """Health check endpoint.
+
+        Returns server health status and model information.
+
+        Args:
+            raw_request: Raw FastAPI request used for optional auth check.
+
+        Returns:
+            JSONResponse with:
+            - status: Current server status
+            - timestamp: Current time
+            - uptime_seconds: Server uptime
+            - models: Loaded model information
+            - active_requests: Current HTTP middleware request count
+            - active_http_requests: Alias for active_requests
+            - pending_requests: Total eSurge pending requests across loaded models
+            - running_requests: Total eSurge running requests across loaded models
+            - max_generation_slots: Configured generation-slot limit
+            - available_generation_slots: Currently free generation slots
+            - active_generation_slots: Currently occupied generation slots
+
+            Status code 200 if READY, 503 otherwise.
+        """
+        self._authorize_endpoint(raw_request, endpoint="/health", reconcile_immediately=True)
+        allowed_models = self._allowed_models_for_request(raw_request)
+        self.metrics.uptime_seconds = time.time() - self.metrics.start_time
+
+        model_health_info = {}
+        total_pending_requests = 0
+        total_running_requests = 0
+        for name, adapter in self.adapters.items():
+            if allowed_models is not None and name not in allowed_models:
+                continue
+            pending_requests = int(getattr(adapter.esurge, "num_pending_requests", 0) or 0)
+            running_requests = int(getattr(adapter.esurge, "num_running_requests", 0) or 0)
+            total_pending_requests += pending_requests
+            total_running_requests += running_requests
+            model_health_info[name] = {
+                "loaded": True,
+                "type": adapter.get_model_info()["type"],
+                "max_model_len": adapter.get_model_info()["max_model_len"],
+                "pending_requests": pending_requests,
+                "running_requests": running_requests,
+            }
+
+        max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+        generation_slot_queue = getattr(self, "_generation_slots", None)
+        if generation_slot_queue is not None and max_generation_slots > 0:
+            available_generation_slots = int(generation_slot_queue.qsize())
+            active_generation_slots = max(0, max_generation_slots - available_generation_slots)
+        else:
+            available_generation_slots = None
+            active_generation_slots = None
+
+        active_http_requests = len(self._active_requests)
+        health_status = {
+            "status": self.status.value,
+            "timestamp": time.time(),
+            "uptime_seconds": self.metrics.uptime_seconds,
+            "models": model_health_info,
+            "active_requests": active_http_requests,
+            "active_http_requests": active_http_requests,
+            "pending_requests": total_pending_requests,
+            "running_requests": total_running_requests,
+            "max_generation_slots": max_generation_slots,
+            "available_generation_slots": available_generation_slots,
+            "active_generation_slots": active_generation_slots,
+        }
+
+        status_code = 200 if self.status == ServerStatus.READY else 503
+        return JSONResponse(health_status, status_code=status_code)
+
+    def _engine_metrics_snapshot(
+        self,
+        *,
+        allowed_models: set[str] | None = None,
+        include_recent_requests: bool = True,
+    ) -> dict[str, tp.Any]:
+        """Per-model windowed metrics from the engine's :class:`MetricsCollector`.
+
+        The collector owns the accounting (cache reads, TTFT, decode rate, percentiles); this method only adds
+        the live queue depths and keys the result by the served model name.
+        """
+        collector = get_metrics_collector()
+        snapshots: dict[str, tp.Any] = {}
+        for model_name, engine in self.esurge_map.items():
+            if allowed_models is not None and model_name not in allowed_models:
+                continue
+            summary = (
+                collector.model_summary(getattr(engine, "esurge_name", model_name), window_seconds=_METRICS_WINDOW_S)
+                if collector is not None
+                else {"window_seconds": _METRICS_WINDOW_S, "aggregate": {}, "recent_requests": []}
+            )
+            if not include_recent_requests:
+                summary = {k: v for k, v in summary.items() if k != "recent_requests"}
+            snapshot_stats_fn = getattr(engine, "prefix_snapshot_stats", None)
+            snapshots[model_name] = {
+                "running_requests": int(getattr(engine, "num_running_requests", 0) or 0),
+                "waiting_requests": int(getattr(engine, "num_pending_requests", 0) or 0),
+                **summary,
+                # Cumulative recurrent prefix-snapshot counters (hybrid linear-attention models only; ``None``
+                # otherwise): restores, saves, evictions, and KV hits lost because no snapshot was ready.
+                "prefix_snapshots": snapshot_stats_fn() if callable(snapshot_stats_fn) else None,
+                # Engine-step prefill/decode split. The collector is process-wide, so with several engines in one
+                # process every model reports the same totals.
+                "phase": collector.phase_summary(window_seconds=_METRICS_WINDOW_S) if collector is not None else None,
+            }
+        return snapshots
+
+    async def get_metrics(self, raw_request: Request) -> JSONResponse:
+        """Get server performance metrics.
+
+        Args:
+            raw_request: Raw FastAPI request for endpoint-scoped auth.
+
+        Returns:
+            JSONResponse with server metrics including request counts, token
+            statistics, throughput, status, and (for ``ADMIN`` keys or when
+            auth is disabled) ``auth_stats`` and per-request ``recent_requests``.
+        """
+        self._authorize_endpoint(raw_request, endpoint="/metrics", reconcile_immediately=True)
+        return JSONResponse(
+            self.metrics_payload(
+                include_admin_details=self._is_privileged_metrics_caller(raw_request),
+                allowed_models=self._allowed_models_for_request(raw_request),
+            )
+        )
+
+    def metrics_payload(
+        self,
+        *,
+        include_admin_details: bool = True,
+        allowed_models: set[str] | None = None,
+    ) -> dict[str, tp.Any]:
+        """The ``/metrics`` body, without an authorization check (callers must have authorized already)."""
+        self.metrics.uptime_seconds = time.time() - self.metrics.start_time
+        engine_metrics = self._engine_metrics_snapshot(
+            allowed_models=allowed_models,
+            include_recent_requests=include_admin_details,
+        )
+        payload: dict[str, tp.Any] = {
+            "uptime_seconds": self.metrics.uptime_seconds,
+            "total_requests": self.metrics.total_requests,
+            "successful_requests": self.metrics.successful_requests,
+            "failed_requests": self.metrics.failed_requests,
+            "total_tokens_generated": self.metrics.total_tokens_generated,
+            "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
+            "active_requests": len(self._active_requests),
+            "models_loaded": len(engine_metrics) if allowed_models is not None else len(self.adapters),
+            "status": self.status.value,
+            "engine_metrics": engine_metrics,
+        }
+        if include_admin_details:
+            payload["auth_stats"] = self.auth_manager.get_statistics()
+        return payload
+
+    async def list_models(self, raw_request: Request) -> JSONResponse:
+        """List available models.
+
+        OpenAI-compatible model listing endpoint.
+
+        Args:
+            raw_request: Raw FastAPI request used for auth.
+
+        Returns:
+            JSONResponse with list of available models and their metadata.
+        """
+        self._authorize_endpoint(raw_request, endpoint="/v1/models", reconcile_immediately=True)
+        allowed_models = self._allowed_models_for_request(raw_request)
+        models_data = []
+        for model_id, adapter in self.adapters.items():
+            if allowed_models is not None and model_id not in allowed_models:
+                continue
+            model_info = adapter.get_model_info()
+            models_data.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": int(self.metrics.start_time),
+                    "owned_by": "easydel",
+                    "max_model_len": adapter.esurge.max_model_len,
+                    "metadata": {
+                        **model_info,
+                        "supports_chat": hasattr(adapter.processor, "apply_chat_template"),
+                        "supports_function_calling": self.enable_function_calling,
+                    },
+                }
+            )
+
+        return JSONResponse(
+            {
+                "object": "list",
+                "data": models_data,
+                "total": len(models_data),
+            }
+        )
+
+    async def get_model(self, model_id: str, raw_request: Request) -> JSONResponse:
+        """Get model details.
+
+        Args:
+            model_id: Model identifier.
+            raw_request: Raw FastAPI request used for auth.
+
+        Returns:
+            JSONResponse with model metadata.
+
+        Raises:
+            HTTPException: If model not found (404).
+        """
+        self._authorize_endpoint(
+            raw_request,
+            endpoint=f"/v1/models/{model_id}",
+            model=model_id,
+            reconcile_immediately=True,
+        )
+        adapter = self._get_adapter(model_id)
+        model_info = adapter.get_model_info()
+
+        return JSONResponse(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": int(self.metrics.start_time),
+                "owned_by": "easydel",
+                "metadata": {
+                    **model_info,
+                    "supports_chat": hasattr(adapter.processor, "apply_chat_template"),
+                    "supports_function_calling": self.enable_function_calling,
+                },
+            }
+        )
+
+    async def list_tools(self, raw_request: Request) -> JSONResponse:
+        """List available tools/functions for each model.
+
+        Returns example tool definitions and engine-reported parser metadata.
+
+        Args:
+            raw_request: Raw FastAPI request used for auth.
+
+        Returns:
+            JSONResponse with tool definitions per model.
+        """
+        self._authorize_endpoint(raw_request, endpoint="/v1/tools", reconcile_immediately=True)
+        return JSONResponse(self._create_tools_response(allowed_models=self._allowed_models_for_request(raw_request)))
+
+    async def execute_tool(self, raw_request: Request) -> JSONResponse:
+        """Execute a tool/function call.
+
+        Placeholder endpoint for tool execution. Override or replace this
+        method to integrate with deployment-specific tool execution
+        infrastructure.
+
+        Args:
+            raw_request: Raw FastAPI request describing the tool call.
+
+        Returns:
+            JSONResponse with HTTP 501 NOT_IMPLEMENTED status.
+
+        Note:
+            This is intentionally a placeholder; production deployments
+            should bind this endpoint to a real tool executor.
+        """
+        self._authorize_endpoint(
+            raw_request,
+            endpoint="/v1/tools/execute",
+            uses_tools=True,
+            reconcile_immediately=True,
+        )
+        return self._create_tool_execution_placeholder_response()
+
+    @property
+    def _endpoints(self) -> list:
+        """Define all API endpoints including admin authentication endpoints.
+
+        Assembles the complete list of API endpoints by combining base server
+        endpoints with admin authentication endpoints for API key management.
+
+        The admin endpoints provide comprehensive key lifecycle management:
+        - Key CRUD operations (create, read, update, delete)
+        - Key lifecycle actions (suspend, reactivate, revoke, rotate)
+        - Usage statistics and audit logging
+
+        Returns:
+            List of EndpointConfig objects defining all server endpoints,
+            including both inference endpoints and admin management endpoints.
+
+        Note:
+            Admin endpoints require an API key with admin role for access.
+            They are all prefixed with /v1/admin/.
+        """
+        from ...inference_engine_interface import EndpointConfig
+
+        base_endpoints = super()._endpoints
+
+        admin_endpoints = [
+            EndpointConfig(
+                path="/v1/admin/keys",
+                handler=self.create_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Provision a fresh API key (optionally scoped via rate limits,"
+                    "quotas, model filters, and metadata) and return the raw secret"
+                    "exactly once. Use this endpoint during bootstrap or whenever new"
+                    "tenants/on-call operators need access.\n\n"
+                    "Because the raw key is only shown in the creation response, callers"
+                    "should immediately store or display it securely—subsequent GET"
+                    "requests only expose metadata."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys",
+                handler=self.list_api_keys_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Enumerate every API key with pagination-friendly metadata (role,"
+                    "status, usage counters) so administrators can audit who has access."
+                    "The listing honors optional role/status filters, making it easy to"
+                    "surface suspended or expiring credentials.\n\n"
+                    "Use this endpoint to drive web consoles or to export inventories for"
+                    "compliance reviews without digging into storage backends."
+                ),
+            ),
+            # Registered before ``/v1/admin/keys/{key_id}``: Starlette matches routes in order, so the literal
+            # ``stats`` segment would otherwise bind ``key_id="stats"`` and never reach this handler.
+            EndpointConfig(
+                path="/v1/admin/keys/stats",
+                handler=self.get_api_key_stats_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Provide aggregate counts and usage histograms across all keys so"
+                    "operators can understand growth, saturation, or abuse patterns."
+                    "Great for dashboards or alerting systems that watch for sudden spikes"
+                    "in key creation or suspension events.\n\n"
+                    "Because the endpoint is read-only, it can be safely wired into cron"
+                    "jobs that feed BI tooling."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}",
+                handler=self.get_api_key_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Fetch the full metadata record for a specific key ID—including role,"
+                    "quotas, rate limits, and audit timestamps—without ever returning the"
+                    "raw secret. Handy for incident response or when verifying what a"
+                    "given credential is allowed to do.\n\n"
+                    "Errors use standard 404 semantics, which makes it trivial to integrate"
+                    "with scripts that verify key lifecycle."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}",
+                handler=self.update_api_key_endpoint,
+                methods=["PATCH"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Patch mutable properties of an API key (name, description, role,"
+                    "rate-limit/quota policies, tags, metadata) in a single request."
+                    "Only the provided fields change; everything else remains untouched.\n\n"
+                    "Use this when rotating access levels or tightening quotas without"
+                    "generating a brand new key."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/revoke",
+                handler=self.revoke_api_key_endpoint,
+                methods=["DELETE"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Permanently revoke a key so it can no longer authenticate. The action"
+                    "is logged with the admin's identity, making it suitable for emergency"
+                    "credential revocation.\n\n"
+                    "Unlike soft suspension, revocation is final—clients must request a new"
+                    "key to regain access."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/suspend",
+                handler=self.suspend_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Temporarily disable a key without deleting its metadata. Suspended"
+                    "keys can later be reactivated, which is useful for responding to"
+                    "incidents or billing issues while preserving audit history.\n\n"
+                    "The response confirms the action so operators can update ticketing"
+                    "systems or dashboards."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/reactivate",
+                handler=self.reactivate_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Lift a prior suspension and restore the key to active status. Use this"
+                    "after resolving the condition that triggered suspension (payment,"
+                    "abuse investigation, etc.).\n\n"
+                    "The endpoint keeps rate limits/quota settings intact, so reactivation"
+                    "is a true toggle without additional configuration work."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}",
+                handler=self.delete_api_key_endpoint,
+                methods=["DELETE"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Remove a key and all associated metadata from storage. Choose this"
+                    "route when cleaning up stale test credentials or when regulations"
+                    "require full data deletion.\n\n"
+                    "Because the action is irreversible, clients should double-check key"
+                    "IDs before calling the endpoint."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/rotate",
+                handler=self.rotate_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary=(
+                    "Issue a brand new secret for an existing key record while preserving"
+                    "its metadata, quotas, and audit trail. Rotations are ideal for routine"
+                    "maintenance or when the secret may have leaked.\n\n"
+                    "The response returns the new raw key exactly once—clients must store"
+                    "it immediately before the value is discarded."
+                ),
+            ),
+            EndpointConfig(
+                path="/v1/admin/audit-logs",
+                handler=self.get_audit_logs_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Audit"],
+                summary=(
+                    "Return the chronological audit log covering key creation, updates,"
+                    "revocations, and other sensitive events. Supports filters for key_id"
+                    "and action type so investigations can focus on a narrow slice.\n\n"
+                    "Teams should integrate this endpoint with SIEM pipelines or simply"
+                    "download logs during compliance reviews."
+                ),
+            ),
+        ]
+
+        return base_endpoints + admin_endpoints

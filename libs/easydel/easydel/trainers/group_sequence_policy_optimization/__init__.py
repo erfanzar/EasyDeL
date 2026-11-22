@@ -1,0 +1,26 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Group Sequence Policy Optimization (GSPO) trainer entry point.
+
+GSPO -- introduced by Qwen (2025) -- swaps GRPO's per-token importance
+ratio for a *sequence-level* importance ratio (geometric average of
+per-token ratios), producing a more stable PPO-style clip-objective on
+long generations.  This package re-exports :class:`GSPOConfig` and
+:class:`GSPOTrainer`; the algorithm reuses GRPO's loss kernels.
+"""
+
+from .gspo_config import GSPOConfig
+from .gspo_trainer import GSPOTrainer
+
+__all__ = ["GSPOConfig", "GSPOTrainer"]

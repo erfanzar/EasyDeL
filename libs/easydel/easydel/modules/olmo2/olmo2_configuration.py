@@ -1,0 +1,256 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Configuration class for the OLMo-2 (Open Language Model v2) family.
+
+Defines :class:`Olmo2Config`, registered as ``model_type="olmo2"``. OLMo-2's
+defining architectural change vs. OLMo-1 is **QK normalization** (RMSNorm on
+the query and key projections inside attention) for training stability;
+this is implemented in the modeling code, but the config still inherits the
+LLaMA-style hyperparameters (RoPE ``theta`` and ``rope_scaling``, RMSNorm
+epsilon, GQA via ``num_key_value_heads``). The defaults match the OLMo2-7B
+1124 release.
+"""
+
+import typing
+
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.etils import EasyDeLGradientCheckPointers
+from easydel.infra.factory import register_config
+
+
+@register_config("olmo2")
+class Olmo2Config(EasyDeLBaseConfig):
+    r"""Configuration for AI2's OLMo-2 (Open Language Model v2) decoder family.
+
+    OLMo-2's headline architectural change vs. OLMo-1 is **Q/K
+    normalization** — an RMSNorm applied to the query and key projections
+    inside attention to keep their magnitudes bounded and improve training
+    stability at large scale. The rest of the architecture is LLaMA-style:
+    SwiGLU MLP, RoPE positional encoding (configurable
+    ``rope_theta`` / ``rope_scaling``), RMSNorm at ``rms_norm_eps``, and
+    grouped-query attention via ``num_key_value_heads``. Defaults reproduce
+    the OLMo2-7B-1124 release. Inherits from :class:`EasyDeLBaseConfig`,
+    so all standard EasyDeL sharding/quantization knobs are also accepted.
+
+    Attributes:
+        vocab_size (`int`, *optional*, defaults to 50304):
+            Vocabulary size of the Olmo2 model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`Olmo2Model`]
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimension of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 11008):
+            Dimension of the MLP representations.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer decoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer decoder.
+        num_key_value_heads (`int`, *optional*):
+            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
+            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
+            `num_key_value_heads=1` the model will use Multi Query Attention (MQA) otherwise GQA is used. When
+            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
+            by meanpooling all the original heads within that group. For more details checkout [this
+            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
+            `num_attention_heads`.
+        head_dim (`int`, *optional*):
+            Dimensionality of each attention head. If not provided, defaults to
+            ``hidden_size // num_attention_heads``.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) in the decoder.
+        max_position_embeddings (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*, defaults to 1):
+            Padding token id.
+        bos_token_id (`int`, *optional*):
+            Beginning of stream token id.
+        eos_token_id (`int`, *optional*, defaults to 50279):
+            End of stream token id.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie weight embeddings
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The base period of the RoPE embeddings.
+        rope_scaling (`tp.Dict`, *optional*):
+            Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
+            strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
+            `{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
+            `max_position_embeddings` to the expected new maximum. See the following thread for more information on how
+            these scaling strategies behave:
+            https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
+            experimental feature, subject to breaking API changes in future versions.
+        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
+            Whether to use a bias in the query, key, value and output projection layers during self-attention.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-05):
+            The epsilon used by the rms normalization layers.
+
+    Example:
+        >>> from easydel import Olmo2Config, Olmo2Model
+        >>> configuration = Olmo2Config()
+        >>> model = Olmo2Model(configuration)
+        >>> configuration = model.config
+    """
+
+    model_type = "olmo2"
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __init__(
+        self,
+        vocab_size: int = 50304,
+        hidden_size: int = 4096,
+        intermediate_size: int = 11008,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int | None = None,
+        head_dim: int | None = None,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 2048,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        pad_token_id: int = 1,
+        bos_token_id: int | None = None,
+        eos_token_id: int = 50279,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        rms_norm_eps: float = 1e-5,
+        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        use_scan_mlp: bool = False,
+        scan_mlp_chunk_size: int = 1024,
+        bits: int | None = None,
+        layer_types: list[str] | None = None,
+        **kwargs,
+    ):
+        """Initialize the Olmo2 configuration.
+
+        Args:
+            vocab_size (int, optional): Vocabulary size. Defaults to 50304.
+            hidden_size (int, optional): Hidden dimension. Defaults to 4096.
+            intermediate_size (int, optional): MLP intermediate dimension. Defaults to 11008.
+            num_hidden_layers (int, optional): Number of decoder layers. Defaults to 32.
+            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+            num_key_value_heads (int | None, optional): Number of key/value heads for
+                grouped-query attention; defaults to ``num_attention_heads`` when
+                ``None``. Defaults to None.
+            head_dim (int | None, optional): Per-head dimension; defaults to
+                ``hidden_size // num_attention_heads`` when ``None``. Defaults to None.
+            hidden_act (str, optional): MLP activation function. Defaults to "silu".
+            max_position_embeddings (int, optional): Maximum sequence length.
+                Defaults to 2048.
+            initializer_range (float, optional): Initializer standard deviation.
+                Defaults to 0.02.
+            use_cache (bool, optional): Whether to enable KV caching. Defaults to True.
+            pad_token_id (int, optional): Padding token id. Defaults to 1.
+            bos_token_id (int | None, optional): Beginning-of-sequence token id.
+                Defaults to None.
+            eos_token_id (int, optional): End-of-sequence token id. Defaults to 50279.
+            tie_word_embeddings (bool, optional): Tie input/output embeddings.
+                Defaults to False.
+            rope_theta (float, optional): RoPE base period. Defaults to 10000.0.
+            rope_scaling (dict | None, optional): RoPE scaling configuration.
+                Defaults to None.
+            attention_bias (bool, optional): Whether attention projections use bias.
+                Defaults to False.
+            attention_dropout (float, optional): Attention dropout. Defaults to 0.0.
+            rms_norm_eps (float, optional): Epsilon for RMSNorm. Defaults to 1e-5.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient
+                checkpointing policy. Defaults to ``EasyDeLGradientCheckPointers.NONE``.
+            use_scan_mlp (bool, optional): Whether to use the scan implementation
+                for the MLP. Defaults to False.
+            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP.
+                Defaults to 1024.
+            bits (int | None, optional): Quantization bits. Defaults to None.
+            layer_types (list[str] | None, optional): Per-layer attention type;
+                defaults to ``"full_attention"`` for every layer when ``None``.
+                Defaults to None.
+            **kwargs: Additional keyword arguments forwarded to ``EasyDeLBaseConfig``.
+
+        Raises:
+            ValueError: If ``rope_scaling`` does not validate (see
+                :meth:`_rope_scaling_validation`).
+        """
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_scan_mlp = use_scan_mlp
+        self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.bits = bits
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim or hidden_size // num_attention_heads
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self._rope_scaling_validation()
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+
+        self.rms_norm_eps = rms_norm_eps
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
+
+    def _rope_scaling_validation(self):
+        """
+        Validates the `rope_scaling` configuration dictionary to ensure it meets the expected format and values.
+        Raises:
+            ValueError: If `rope_scaling` is not a dictionary with the correct fields (`type`, `factor`)
+                or if the values are invalid (type not 'linear' or 'dynamic', factor not a float > 1.0).
+        """
+        if self.rope_scaling is None:
+            return
+
+        if not isinstance(self.rope_scaling, dict):
+            raise ValueError(
+                f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {self.rope_scaling}"
+            )
+
+        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+        # Base config compatibility can inject a default rope payload; treat it as no scaling.
+        if rope_scaling_type in (None, "default"):
+            self.rope_scaling = None
+            return
+
+        rope_scaling_factor = self.rope_scaling.get("factor", None)
+        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+            raise ValueError(
+                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+            )
+        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
+            raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
