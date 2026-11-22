@@ -524,8 +524,9 @@ class FlexibleAttentionModule(spx.Module):
             output_attentions: When ``True`` instructs the backend to
                 materialise softmax weights. Falls back to
                 ``config.output_attentions`` when ``None``.
-            precision: JAX matmul precision, forwarded to the vanilla backend
-                only. There ``None`` inherits the ambient JAX precision and an
+            precision: JAX matmul precision, forwarded directly (including
+                ``None`` to inherit the ambient JAX precision) to the vanilla,
+                ring, ring_paged, and paged_attention_reference backends. An
                 explicit value (including ``DEFAULT``) is used as given.
             prevent_cse: Whether to prevent common-subexpression elimination
                 inside the kernel.
@@ -632,20 +633,6 @@ class FlexibleAttentionModule(spx.Module):
         else:
             softmax_scale_computed = softmax_scale
 
-        if isinstance(cache_view, PrefixForkView) and cache_view.deferred_attention:
-            return self._grouped_fork_forward(
-                cache_view=cache_view,
-                query_states=query_states,
-                key_states=key_states,
-                value_states=value_states,
-                mask_info=mask_info,
-                softmax_aux=softmax_aux,
-                softmax_scale=softmax_scale_computed,
-                logits_soft_cap=logits_soft_cap,
-                compute_dtype=compute_dtype,
-                precision=precision,
-            )
-
         dropout_prob_final: float = 0.0
         dropout_rng_final: tp.Any | None = None
         if not deterministic_computed:
@@ -663,6 +650,46 @@ class FlexibleAttentionModule(spx.Module):
                         "dropout_rng must be provided when deterministic=False and dropout_prob > 0, "
                         "or supply rngs at construction."
                     )
+
+        if isinstance(cache_view, PrefixForkView) and cache_view.deferred_attention:
+            can_use_grouped_fork = (
+                bias is None
+                and softmax_aux is None
+                and not logits_soft_cap
+                and sliding_window is None
+                and causal
+                and normalize_output
+                and dropout_prob_final == 0.0
+                and not output_attentions_computed
+                and cum_seqlens_q is None
+                and cum_seqlens_k is None
+            )
+            if can_use_grouped_fork:
+                return self._grouped_fork_forward(
+                    cache_view=cache_view,
+                    query_states=query_states,
+                    key_states=key_states,
+                    value_states=value_states,
+                    mask_info=mask_info,
+                    softmax_aux=softmax_aux,
+                    softmax_scale=softmax_scale_computed,
+                    logits_soft_cap=logits_soft_cap,
+                    compute_dtype=compute_dtype,
+                    precision=precision,
+                )
+            key_states, value_states, mask_info, cache_view = cache_view.concatenate_to_cache(
+                key=key_states,
+                value=value_states,
+                mask_info=mask_info,
+            )
+            cache_view = cache_view.replace(deferred_attention=False)
+            attention_view = cache_view
+            if init_bias is not None:
+                materialized_mask_info = mask_info
+                target_bias_dtype = key_states.dtype
+
+                def init_bias() -> JArray:
+                    return materialized_mask_info.create_bias(target_bias_dtype)
 
         if dropout_prob_final > 0.0:
             active_impl = OperationRegistry.create(
@@ -869,7 +896,12 @@ class FlexibleAttentionModule(spx.Module):
             }
             if impl_names & weight_aware_impls:
                 call_kwargs["return_attention_weights"] = output_attentions_computed
-            if impl_names & {AttentionMechanisms.VANILLA.value, "paged_attention_reference"}:
+            if impl_names & {
+                AttentionMechanisms.VANILLA.value,
+                AttentionMechanisms.RING.value,
+                "ring_paged",
+                "paged_attention_reference",
+            }:
                 # None inherits ambient JAX precision; explicit values (including
                 # DEFAULT) are forwarded.
                 call_kwargs["precision"] = precision
@@ -1814,10 +1846,16 @@ class AttentionModule(spx.Module, tp.Generic[Cfg]):
                     f"{sorted(PREFIX_SHARED_ATTENTION_MECHANISMS)}; got {sorted(impl_names)}."
                 )
             soft_cap = getattr(performer, "logits_soft_cap", None) or getattr(self, "logits_soft_cap", None)
+            uses_alibi = (
+                getattr(self, "attention_type", None) == "alibi"
+                or getattr(self, "alibi_slopes", None) is not None
+            )
             if (
                 isinstance(cache_view, PrefixForkView)
                 and impl_names & PREFIX_SHARED_GROUPED_ATTENTION_MECHANISMS
                 and performer is not None
+                and causal
+                and not uses_alibi
                 and self._softmax_aux() is None
                 and not soft_cap
             ):

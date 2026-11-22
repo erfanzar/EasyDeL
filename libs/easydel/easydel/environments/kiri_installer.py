@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import collections.abc
 import dataclasses
 import hashlib
 import hmac
@@ -50,6 +51,7 @@ import socket
 import stat
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import typing as tp
@@ -85,6 +87,19 @@ _MISSING_KIRI_MESSAGE = (
 )
 _MIN_BRIDGE_TOKEN_CHARS = 16
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_KIRI_VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+_MAX_RELEASE_METADATA_BYTES = 4 * 1024 * 1024
+_MAX_KIRI_ARCHIVE_BYTES = 256 * 1024 * 1024
+_BLOCKED_DOWNLOAD_HOSTNAMES = frozenset(
+    {
+        "localhost",
+        "metadata",
+        "metadata.google.internal",
+        "metadata.goog",
+        "instance-data",
+    }
+)
+_BLOCKED_DOWNLOAD_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".arpa", ".home", ".lan", ".metadata.goog")
 
 
 def validate_kiri_repo(repo: str) -> str:
@@ -109,6 +124,89 @@ def validate_kiri_repo(repo: str) -> str:
     if owner in {".", ".."} or name in {".", ".."}:
         raise ValueError(f"Invalid GitHub repository slug {repo!r}: components must not be '.' or '..'.")
     return repo
+
+
+def validate_kiri_version(version: str) -> str:
+    """Validate and resolve a Kiri release tag (``""`` / ``"latest"`` -> :data:`DEFAULT_KIRI_VERSION`).
+
+    Raises:
+        ValueError: If ``version`` does not match ``^[A-Za-z0-9._+-]+$`` or is ``.`` / ``..``.
+    """
+    if not isinstance(version, str):
+        raise ValueError(f"Invalid Kiri release version {version!r}: expected a string.")
+    resolved = DEFAULT_KIRI_VERSION if version in ("", "latest") else version
+    if not _KIRI_VERSION_RE.fullmatch(resolved) or resolved in {".", ".."}:
+        raise ValueError(
+            f"Invalid Kiri release version {version!r}: expected a tag matching "
+            "'^[A-Za-z0-9._+-]+$' (not '.' or '..')."
+        )
+    return resolved
+
+
+def validate_kiri_download_url(url: str) -> str:
+    """Validate that a Kiri release download URL uses HTTPS and targets a public hostname.
+
+    Refuses non-HTTPS schemes (``file://``, ``http://``, etc.), embedded credentials,
+    control characters/whitespace, non-443 ports, IP literals (including loopback,
+    private and cloud-metadata addresses), and local/internal hostnames.
+
+    Raises:
+        ValueError: When the download URL fails validation.
+    """
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"Invalid Kiri download URL: {url!r}.")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in url):
+        raise ValueError(f"Invalid Kiri download URL (control or whitespace characters): {url!r}.")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"Refusing non-HTTPS Kiri download URL: {url!r}.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Refusing Kiri download URL with embedded credentials: {url!r}.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in Kiri download URL {url!r}: {exc}") from exc
+    if port is not None and port != 443:
+        raise ValueError(f"Refusing Kiri download URL with non-443 port {port}: {url!r}.")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or "." not in host:
+        raise ValueError(f"Refusing Kiri download URL with invalid hostname: {url!r}.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"Refusing IP-literal Kiri download URL: {url!r}.")
+    if host in _BLOCKED_DOWNLOAD_HOSTNAMES or host.endswith(_BLOCKED_DOWNLOAD_HOST_SUFFIXES):
+        raise ValueError(f"Refusing local/internal/metadata Kiri download URL: {url!r}.")
+    tld = host.rsplit(".", 1)[-1]
+    if not (tld.isalpha() or (tld.startswith("xn--") and len(tld) > 4)):
+        raise ValueError(f"Refusing Kiri download URL with non-domain host: {url!r}.")
+    return url
+
+
+def _read_bounded(resp: tp.Any, max_bytes: int, *, label: str) -> bytes:
+    """Read up to ``max_bytes`` from an HTTP response, raising on oversized payloads."""
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while True:
+            remaining = max_bytes - total + 1
+            chunk = resp.read(min(65536, remaining))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise RuntimeError(f"{label} exceeds maximum allowed size of {max_bytes} bytes.")
+            chunks.append(chunk)
+    except TypeError:
+        if chunks:
+            raise
+        data = resp.read()
+        if len(data) > max_bytes:
+            raise RuntimeError(f"{label} exceeds maximum allowed size of {max_bytes} bytes.") from None
+        return data
+    return b"".join(chunks)
 
 
 def _kiri_releases_api(repo: str = KIRI_GITHUB_REPO) -> str:
@@ -136,9 +234,17 @@ def _extract_ar_data_tar(deb_bytes: bytes) -> bytes:
     n = len(deb_bytes)
     while pos + 60 <= n:
         header = deb_bytes[pos : pos + 60]
+        if header[58:60] != b"`\n":
+            raise RuntimeError("Invalid .deb ar member header trailer.")
         pos += 60
         name = header[:16].decode("ascii", errors="replace").strip().rstrip("/")
-        size = int(header[48:58].decode("ascii", errors="replace").strip())
+        size_str = header[48:58].decode("ascii", errors="replace").strip()
+        try:
+            size = int(size_str)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid .deb ar member size: {size_str!r}") from exc
+        if size < 0 or size > n - pos:
+            raise RuntimeError(f"Invalid or truncated .deb ar member {name!r} (size={size}, remaining={n - pos}).")
         member_data = deb_bytes[pos : pos + size]
         pos += size + (size % 2)
         if name.startswith("data.tar"):
@@ -171,11 +277,12 @@ def resolve_kiri_asset_url(
             For a pinned asset it must equal the pinned value.
 
     Raises:
+        ValueError: When ``repo``, ``version``, or the resolved download URL is invalid.
         RuntimeError: When no asset matches, or the tag has no pinned digest and ``expected_sha256`` is missing,
             or ``expected_sha256`` contradicts the pinned digest.
     """
     releases_api = _kiri_releases_api(repo)
-    resolved_ver = DEFAULT_KIRI_VERSION if version in ("", "latest") else version
+    resolved_ver = validate_kiri_version(version)
     arch_tar, arch_deb = _normalize_arch(machine)
     sys_name = (system or platform.system()).lower()
     api_url = f"{releases_api}/tags/{resolved_ver}"
@@ -184,7 +291,8 @@ def resolve_kiri_asset_url(
         headers={"Accept": "application/vnd.github+json", "User-Agent": "easydel-kiri-installer"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+        raw_meta = _read_bounded(resp, _MAX_RELEASE_METADATA_BYTES, label="GitHub release metadata")
+        payload = json.loads(raw_meta.decode("utf-8"))
 
     tag = str(payload.get("tag_name") or resolved_ver)
     assets = payload.get("assets", [])
@@ -213,6 +321,7 @@ def resolve_kiri_asset_url(
             name = str(asset.get("name", ""))
             url = str(asset.get("browser_download_url", ""))
             if name.startswith("kiri-lite_") and name.endswith(deb_suffix) and url:
+                validate_kiri_download_url(url)
                 return tag, name, url, _pick_digest(asset, name)
 
     tar_suffix = f"-{arch_tar}.tar.gz"
@@ -220,12 +329,15 @@ def resolve_kiri_asset_url(
         name = str(asset.get("name", ""))
         url = str(asset.get("browser_download_url", ""))
         if name.startswith("Kiri-") and name.endswith(tar_suffix) and url:
+            validate_kiri_download_url(url)
             return tag, name, url, _pick_digest(asset, name)
 
     raise RuntimeError(f"No Kiri binary release found for {sys_name}/{arch_tar} in {tag!r}.")
 
 
 def _extract_kiri_binary_from_tar(tar_stream: bytes, target_bin: str) -> str:
+    target_dir = os.path.dirname(os.path.abspath(target_bin)) or "."
+    os.makedirs(target_dir, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(tar_stream), mode="r:*") as tf:
         for member in tf.getmembers():
             if not member.isfile():
@@ -235,15 +347,24 @@ def _extract_kiri_binary_from_tar(tar_stream: bytes, target_bin: str) -> str:
             extracted = tf.extractfile(member)
             if extracted is None:
                 continue
-            tmp_path = f"{target_bin}.tmp.{os.getpid()}"
-            with open(tmp_path, "wb") as out_f:
-                shutil.copyfileobj(extracted, out_f)
-            os.chmod(
-                tmp_path,
-                stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH,
-            )
-            os.replace(tmp_path, target_bin)
-            return target_bin
+            tmp_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=target_dir, prefix=".kiri.tmp.", delete=False) as out_f:
+                    tmp_path = out_f.name
+                    shutil.copyfileobj(extracted, out_f)
+                os.chmod(
+                    tmp_path,
+                    stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH,
+                )
+                os.replace(tmp_path, target_bin)
+                tmp_path = None
+                return target_bin
+            finally:
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
     raise RuntimeError("Kiri release archive did not contain a `kiri` binary.")
 
 
@@ -267,6 +388,7 @@ def install_kiri(
     this process exits.
     """
     validate_kiri_repo(repo)
+    resolved_version = validate_kiri_version(version)
     existing = shutil.which("kiri")
     if existing and not force:
         if start_daemon:
@@ -282,11 +404,12 @@ def install_kiri(
         return target_bin
 
     _tag, asset_name, url, expected_sha256 = resolve_kiri_asset_url(
-        repo=repo, version=version, timeout=min(timeout, 20.0), expected_sha256=expected_sha256
+        repo=repo, version=resolved_version, timeout=min(timeout, 20.0), expected_sha256=expected_sha256
     )
+    validate_kiri_download_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": "easydel-kiri-installer"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        archive_bytes = resp.read()
+        archive_bytes = _read_bounded(resp, _MAX_KIRI_ARCHIVE_BYTES, label=f"Kiri release asset {asset_name!r}")
 
     actual_sha256 = hashlib.sha256(archive_bytes).hexdigest()
     if actual_sha256.lower() != expected_sha256.lower():
@@ -330,6 +453,29 @@ def kiri_daemon_budget(endpoint: str) -> KiriDaemonBudget | None:
     """Return the resource budget registered for ``endpoint`` by this process, if any."""
     with _REGISTRY_LOCK:
         return _ENDPOINT_BUDGETS.get(endpoint)
+
+
+def _close_tcp_bridges(bridge_keys: collections.abc.Iterable[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Close and unregister the TCP bridges identified by ``bridge_keys``."""
+    closed_keys: list[tuple[str, int]] = []
+    bridges: list[tuple[tuple[str, int], _Bridge]] = []
+    with _REGISTRY_LOCK:
+        for raw_host, port in bridge_keys:
+            try:
+                norm_host = str(ipaddress.ip_address(raw_host))
+            except ValueError:
+                norm_host = raw_host
+            key = (norm_host, int(port))
+            bridge = _TCP_BRIDGES.pop(key, None)
+            if bridge is None and (raw_host, int(port)) != key:
+                bridge = _TCP_BRIDGES.pop((raw_host, int(port)), None)
+            if bridge is not None:
+                _ENDPOINT_BUDGETS.pop(bridge.endpoint, None)
+                bridges.append((key, bridge))
+                closed_keys.append(key)
+    for _key, bridge in bridges:
+        bridge.close()
+    return closed_keys
 
 
 def shutdown_kiri_daemons(endpoints: list[str] | tuple[str, ...] | None = None, *, grace: float = 2.0) -> list[str]:
@@ -461,26 +607,54 @@ def _ensure_daemon(
             start_new_session=True,
         )
 
-        deadline = time.monotonic() + max(1.0, float(wait_seconds))
-        while time.monotonic() < deadline:
-            uri = _ping_any(candidates)
-            if uri is not None:
-                with _REGISTRY_LOCK:
-                    if not persist:
-                        _OWNED_DAEMONS[uri] = _OwnedDaemon(uri=uri, proc=proc, pgid=proc.pid)
-                    if budget is not None:
-                        _ENDPOINT_BUDGETS[uri] = budget
-                return uri, not persist
-            time.sleep(0.1)
+        def _cleanup_proc() -> None:
+            pid = getattr(proc, "pid", None)
+            if isinstance(pid, int):
+                _terminate_process_groups([pid])
+                wait_fn = getattr(proc, "wait", None)
+                if callable(wait_fn):
+                    try:
+                        wait_fn(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+
+        registered = False
+        try:
+            deadline = time.monotonic() + max(1.0, float(wait_seconds))
+            poll_fn = getattr(proc, "poll", None)
+            while time.monotonic() < deadline:
+                uri = _ping_any(candidates)
+                if uri is not None:
+                    with _REGISTRY_LOCK:
+                        if not persist:
+                            _OWNED_DAEMONS[uri] = _OwnedDaemon(uri=uri, proc=proc, pgid=proc.pid)
+                        if budget is not None:
+                            _ENDPOINT_BUDGETS[uri] = budget
+                    registered = True
+                    return uri, not persist
+                if callable(poll_fn):
+                    rc = poll_fn()
+                    if rc is not None:
+                        uri = _ping_any(candidates)
+                        if uri is not None:
+                            with _REGISTRY_LOCK:
+                                if not persist:
+                                    _OWNED_DAEMONS[uri] = _OwnedDaemon(uri=uri, proc=proc, pgid=proc.pid)
+                                if budget is not None:
+                                    _ENDPOINT_BUDGETS[uri] = budget
+                            registered = True
+                            return uri, not persist
+                        raise SandboxInfraError(
+                            f"Kiri daemon {exe!r} exited prematurely with status {rc} before answering /_ping."
+                        )
+                time.sleep(0.1)
+        except BaseException:
+            if not registered:
+                _cleanup_proc()
+            raise
 
         # The daemon never came up: it is ours, so tear its process group down.
-        pid = getattr(proc, "pid", None)
-        if isinstance(pid, int):
-            _terminate_process_groups([pid])
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                pass
+        _cleanup_proc()
     raise SandboxInfraError(f"Kiri daemon {exe!r} did not answer /_ping within {wait_seconds}s (tried {candidates}).")
 
 
@@ -575,15 +749,34 @@ _BRIDGE_REQUEST_TIMEOUT_S = 30.0
 _API_VERSION_RE = re.compile(r"^/v\d+(?:\.\d+)*(?=/)")
 _EXEC_CREATE_RE = re.compile(r"/containers/[^/]+/exec")
 _DENIED_API_PREFIXES = ("/plugins", "/swarm", "/services", "/secrets", "/configs", "/nodes", "/session", "/build")
+_BRIDGE_ALLOWED_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("GET", re.compile(r"^/_ping$")),
+    ("HEAD", re.compile(r"^/_ping$")),
+    ("GET", re.compile(r"^/version$")),
+    ("GET", re.compile(r"^/images/.+/json$")),
+    ("POST", re.compile(r"^/images/create$")),
+    ("POST", re.compile(r"^/containers/create$")),
+    ("GET", re.compile(r"^/containers/[^/]+/json$")),
+    ("POST", re.compile(r"^/containers/[^/]+/(?:start|stop|kill|wait|exec)$")),
+    ("GET", re.compile(r"^/containers/[^/]+/archive$")),
+    ("HEAD", re.compile(r"^/containers/[^/]+/archive$")),
+    ("PUT", re.compile(r"^/containers/[^/]+/archive$")),
+    ("DELETE", re.compile(r"^/containers/[^/]+$")),
+    ("POST", re.compile(r"^/exec/[^/]+/start$")),
+    ("GET", re.compile(r"^/exec/[^/]+/json$")),
+    ("POST", re.compile(r"^/volumes/create$")),
+    ("DELETE", re.compile(r"^/volumes/[^/]+$")),
+)
 _HOST_NAMESPACE_KEYS = ("NetworkMode", "PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode")
 _HOP_HEADERS = ("connection", "keep-alive", "proxy-connection")
 
 
 _ALLOWED_MOUNT_TYPES = ("volume", "tmpfs")
 _LOCAL_VOLUME_DRIVERS = ("", "local")
+_ALLOWED_SECURITY_OPTS = frozenset({"no-new-privileges", "no-new-privileges=true", "no-new-privileges:true"})
 _PATH_SAFE_CHARS = "/:@!$&'()*+,;=-._~"
 _HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
-_BUDGET_HOST_KEYS = ("Memory", "NanoCpus", "PidsLimit", "Tmpfs")
+_BUDGET_HOST_KEYS = ("Memory", "MemorySwap", "NanoCpus", "PidsLimit", "ShmSize", "Tmpfs", "Mounts")
 
 
 def _has_control_chars(text: str, *, allow_tab: bool) -> bool:
@@ -608,6 +801,10 @@ def _reject_duplicate_keys(pairs: list[tuple[str, tp.Any]]) -> dict[str, tp.Any]
             raise _BridgePolicyError(f"duplicate JSON key {key!r}")
         out[key] = value
     return out
+
+
+def _reject_json_constant(token: str) -> tp.NoReturn:
+    raise _BridgePolicyError(f"non-standard JSON constant {token!r} is not allowed")
 
 
 def _casefold_keys(value: tp.Any) -> tp.Any:
@@ -689,28 +886,55 @@ def _host_config_violations(host_config: dict) -> list[str]:
         found.append("VolumesFrom")
     if str(host_config.get("volumedriver") or "").lower() not in _LOCAL_VOLUME_DRIVERS:
         found.append("VolumeDriver (non-local volume driver)")
-    mounts = host_config.get("mounts") or []
-    if not isinstance(mounts, list):
+    tmpfs = host_config.get("tmpfs")
+    if tmpfs is not None and not isinstance(tmpfs, dict):
+        found.append("Tmpfs must be an object")
+    mounts = host_config.get("mounts")
+    if mounts is not None and not isinstance(mounts, list):
         found.append("Mounts must be a list")
         mounts = []
-    for mount in mounts:
+    for mount in mounts or []:
         if not isinstance(mount, dict) or str(mount.get("type", "")).lower() not in _ALLOWED_MOUNT_TYPES:
             found.append("Mounts (only volume and tmpfs mounts are allowed)")
+            break
+        if mount.get("bindoptions"):
+            found.append("Mounts (BindOptions)")
             break
         options = mount.get("volumeoptions")
         if options is not None and (not isinstance(options, dict) or options.get("driverconfig")):
             found.append("Mounts (volume DriverConfig)")
             break
+        tmpfs_options = mount.get("tmpfsoptions")
+        if tmpfs_options is not None and not isinstance(tmpfs_options, dict):
+            found.append("Mounts (TmpfsOptions must be an object)")
+            break
     if host_config.get("devices") or host_config.get("devicerequests") or host_config.get("devicecgrouprules"):
         found.append("Devices")
     if host_config.get("capadd"):
         found.append("CapAdd")
+    if host_config.get("cgroupparent"):
+        found.append("CgroupParent")
+    if host_config.get("sysctls"):
+        found.append("Sysctls")
+    if host_config.get("groupadd"):
+        found.append("GroupAdd")
     for key in _HOST_NAMESPACE_KEYS:
         value = str(host_config.get(key.casefold()) or "").lower()
         if value == "host" or value.startswith("container:"):
             found.append(f"{key}={value}")
-    if any("unconfined" in str(opt).lower() for opt in host_config.get("securityopt") or []):
-        found.append("SecurityOpt unconfined")
+    sec_opts = host_config.get("securityopt")
+    if sec_opts is not None:
+        if not isinstance(sec_opts, list):
+            found.append("SecurityOpt must be a list")
+        elif any(
+            not isinstance(opt, str) or opt.strip().lower() not in _ALLOWED_SECURITY_OPTS
+            for opt in sec_opts
+        ):
+            found.append("SecurityOpt (only no-new-privileges is allowed)")
+    if "maskedpaths" in host_config and host_config["maskedpaths"] is not None:
+        found.append("MaskedPaths")
+    if "readonlypaths" in host_config and host_config["readonlypaths"] is not None:
+        found.append("ReadonlyPaths")
     return found
 
 
@@ -742,7 +966,7 @@ def _clamp_create_spec(spec: dict[str, tp.Any], budget: KiriDaemonBudget) -> Non
             host_config[canon] = host_config.pop(key)
     try:
         host_config = budget.clamp_host_config(host_config)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise _BridgePolicyError(f"container create refused: invalid resource limit ({exc})") from exc
     for key in list(spec):
         if key.casefold() in folded_limits:
@@ -774,6 +998,8 @@ def _bridge_policy_check(
     path = _API_VERSION_RE.sub("", path, count=1)
     if any(path == p or path.startswith(p + "/") for p in _DENIED_API_PREFIXES):
         raise _BridgePolicyError(f"{path} is not available through the sandbox bridge")
+    if not any(m == method and pat.fullmatch(path) for m, pat in _BRIDGE_ALLOWED_ROUTES):
+        raise _BridgePolicyError(f"{method} {path} is not available through the sandbox bridge")
     if method != "POST":
         return forwarded, body
     kind = None
@@ -786,7 +1012,15 @@ def _bridge_policy_check(
     if kind is None:
         return forwarded, body
     try:
-        spec = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys) if body else {}
+        spec = (
+            json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_json_constant,
+            )
+            if body
+            else {}
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _BridgePolicyError("request body must be valid JSON") from exc
     if not isinstance(spec, dict):
@@ -1065,23 +1299,37 @@ def _start_unix_tcp_bridge(
             raise ValueError(f"Refusing to expose the sandbox engine on {bind_host} without an allowed_peers list.")
     allowed = frozenset(ipaddress.ip_address(p) for p in allowed_peers) if allowed_peers else None
 
-    endpoint = _format_endpoint(bind_host, int(port))
-    key = (bind_host, int(port))
+    norm_host = str(bind_ip)
+    endpoint = _format_endpoint(norm_host, int(port))
+    key = (norm_host, int(port))
     with _REGISTRY_LOCK:
         existing = _TCP_BRIDGES.get(key)
-        if existing is not None and existing.is_alive():
-            if existing.sock_path != sock_path:
-                raise ValueError(f"{endpoint} already bridges {existing.sock_path!r}, not {sock_path!r}.")
-            return endpoint
+        if existing is not None:
+            if existing.is_alive():
+                if existing.sock_path != sock_path:
+                    raise ValueError(f"{endpoint} already bridges {existing.sock_path!r}, not {sock_path!r}.")
+                token_matches = (existing.token is None and token is None) or (
+                    existing.token is not None
+                    and token is not None
+                    and hmac.compare_digest(existing.token.encode("utf-8"), token.encode("utf-8"))
+                )
+                if not token_matches:
+                    raise ValueError(f"{endpoint} already has an active bridge with a different token.")
+                if existing.allowed != allowed:
+                    raise ValueError(f"{endpoint} already has an active bridge with a different allowed_peers policy.")
+                return endpoint
+            _TCP_BRIDGES.pop(key, None)
+            _ENDPOINT_BUDGETS.pop(existing.endpoint, None)
+            existing.close()
 
         srv = socket.socket(socket.AF_INET6 if bind_ip.version == 6 else socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            srv.bind((bind_host, int(port)))
+            srv.bind((norm_host, int(port)))
             srv.listen(128)
         except OSError as exc:
             srv.close()
-            raise SandboxInfraError(f"Failed to bind sandbox bridge on {bind_host}:{port}: {exc}") from exc
+            raise SandboxInfraError(f"Failed to bind sandbox bridge on {norm_host}:{port}: {exc}") from exc
         srv.settimeout(0.25)
         bridge = _Bridge(endpoint=endpoint, sock_path=sock_path, server=srv, token=token, allowed=allowed)
         bridge.thread = threading.Thread(target=bridge.serve, name=f"kiri-tcp-bridge-{port}", daemon=True)
@@ -1224,7 +1472,7 @@ def _ensure_pod_shm_pool(
     expose_bridge: bool = False,
     bridge_token: str | None = None,
     allowed_peers: list[str] | tuple[str, ...] | None = None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[tuple[str, int]]]:
     if not expose_bridge and host_ips:
         raise ValueError(
             "host_ips requires expose_bridge=True and a bridge_token: remote hosts can only reach this host's "
@@ -1241,26 +1489,44 @@ def _ensure_pod_shm_pool(
         budget=budget,
     )
     if not expose_bridge:
-        return local_uris, started
+        return local_uris, started, []
 
+    opened_bridges: list[tuple[str, int]] = []
     try:
         my_ip = _detect_private_ip()
+        try:
+            norm_my_ip = str(ipaddress.ip_address(my_ip))
+        except ValueError:
+            norm_my_ip = my_ip
         all_ips = list(host_ips) if host_ips else _gather_pod_ips(my_ip)
         peers = list(allowed_peers) if allowed_peers is not None else list(all_ips)
         if my_ip not in peers:
             peers.append(my_ip)
         for idx, uri in enumerate(local_uris):
-            _start_unix_tcp_bridge(
-                uri.removeprefix("unix://"),
-                my_ip,
-                base_port + idx,
-                token=bridge_token,
-                allowed_peers=peers,
-            )
+            port = base_port + idx
+            bridge_key = (norm_my_ip, port)
+            with _REGISTRY_LOCK:
+                existed = bridge_key in _TCP_BRIDGES and _TCP_BRIDGES[bridge_key].is_alive()
+                _start_unix_tcp_bridge(
+                    uri.removeprefix("unix://"),
+                    my_ip,
+                    port,
+                    token=bridge_token,
+                    allowed_peers=peers,
+                )
+            if not existed:
+                opened_bridges.append(bridge_key)
     except BaseException:
-        shutdown_kiri_daemons(started)
+        if opened_bridges:
+            _close_tcp_bridges(opened_bridges)
+        if started:
+            shutdown_kiri_daemons(started)
         raise
-    return [_format_endpoint(ip, base_port + idx) for ip in all_ips for idx in range(len(local_uris))], started
+    return (
+        [_format_endpoint(ip, base_port + idx) for ip in all_ips for idx in range(len(local_uris))],
+        started,
+        opened_bridges,
+    )
 
 
 def ensure_kiri_pod_shm_pool(
@@ -1302,7 +1568,7 @@ def ensure_kiri_pod_shm_pool(
     Returns:
         Local ``unix://`` endpoints, or every host's bridge endpoints when bridging.
     """
-    endpoints, _started = _ensure_pod_shm_pool(
+    endpoints, _started, _bridges = _ensure_pod_shm_pool(
         num_daemons_per_host,
         data_dir=data_dir,
         base_port=base_port,
@@ -1334,6 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=f"Install the Kiri container runtime ({KIRI_GITHUB_REPO}).")
     parser.add_argument(
         "--version",
+        type=validate_kiri_version,
         default=DEFAULT_KIRI_VERSION,
         help=(
             f"GitHub release tag (default: {DEFAULT_KIRI_VERSION}). Only {sorted(PINNED_KIRI_SHA256)} are pinned; "
@@ -1374,4 +1641,7 @@ __all__ = (
     "owned_kiri_daemons",
     "resolve_kiri_asset_url",
     "shutdown_kiri_daemons",
+    "validate_kiri_download_url",
+    "validate_kiri_repo",
+    "validate_kiri_version",
 )

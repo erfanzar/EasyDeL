@@ -261,7 +261,18 @@ class OnPolicyDistillationConfig(DistillationConfig):
             self.top_k = on_policy_fields["top_k"]
 
         if self.distillation_mode == "trust_region":
-            if self.generation_do_sample is False:
+            if getattr(self, "async_mode", False):
+                raise ValueError(
+                    "`distillation_mode='trust_region'` requires on-policy student proposals so the acceptance "
+                    "ratio compares the true sampling distribution `p(y)/q_theta(y)`; it cannot be used with "
+                    "`async_mode=True`."
+                )
+            effective_do_sample = self.generation_do_sample
+            for container in ("generation_extra_kwargs", "generation_config_overrides"):
+                mapping = getattr(self, container, None) or {}
+                if "do_sample" in mapping and mapping["do_sample"] is not None:
+                    effective_do_sample = mapping["do_sample"]
+            if effective_do_sample is False:
                 raise ValueError(
                     "`distillation_mode='trust_region'` scores sampled tokens; it cannot be used with "
                     "`generation_do_sample=False`."
@@ -309,10 +320,18 @@ class OnPolicyDistillationConfig(DistillationConfig):
 
     @property
     def trust_region_sampling_temperature(self) -> float | None:
-        """Temperature the completions are actually sampled at (``generation_temperature`` wins when set)."""
+        """Temperature the completions are actually sampled at.
+
+        Follows rollout sampling precedence: ``generation_config_overrides["temperature"]`` >
+        ``generation_extra_kwargs["temperature"]`` > ``generation_temperature`` > ``temperature_sampling``.
+        """
         value = getattr(self, "generation_temperature", None)
         if value is None:
             value = self.temperature_sampling
+        for container in ("generation_extra_kwargs", "generation_config_overrides"):
+            mapping = getattr(self, container, None) or {}
+            if "temperature" in mapping and mapping["temperature"] is not None:
+                value = mapping["temperature"]
         return None if value is None else float(value)
 
     __hash__ = hash_fn

@@ -519,24 +519,59 @@ class CodeJudgeEnvironment(SandboxEnvironment):
             },
         )
 
+    def _clean_workspace_for_case(
+        self,
+        session: tp.Any,
+        *,
+        src_name: str,
+        code: str,
+        keep_compiled: bool,
+    ) -> str | None:
+        """Kill lingering processes and reset workspace files between stdin test cases."""
+        killer = getattr(session, "kill_sandbox_processes", None)
+        if callable(killer):
+            try:
+                killer()
+            except Exception as exc:
+                return f"failed to clean up solution processes between test cases: {exc}"
+        if keep_compiled:
+            clean_cmd = (
+                "chmod u+rwx . 2>/dev/null; "
+                "find . -mindepth 1 ! -type l -exec chmod u+rwx -- {} + 2>/dev/null; "
+                "find . -mindepth 1 -maxdepth 1 ! -name 'solution.bin' ! -name \"$1\" -exec rm -rf -- {} +"
+            )
+            clean_res = session.exec(["/bin/sh", "-c", clean_cmd, "sh", src_name], timeout=10.0)
+        else:
+            clean_cmd = (
+                "chmod u+rwx . 2>/dev/null; "
+                "find . -mindepth 1 ! -type l -exec chmod u+rwx -- {} + 2>/dev/null; "
+                "find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+            )
+            clean_res = session.exec(["/bin/sh", "-c", clean_cmd], timeout=10.0)
+        if clean_res.infra_error:
+            return clean_res.infra_error
+        if not keep_compiled:
+            session.write_files({src_name: code})
+        return None
+
     def _evaluate_code(self, code: str) -> tuple[int, int, str, str | None]:
+        import sys as _sys
+
+        from .runtime import LocalSandboxSession
+
         src_name, compile_cmd, run_cmd = _LANGUAGE_SPECS[self._language]
         session = self.session
+        if self._session_evaluated:
+            # An earlier step's solution ran in this session and could have left files, modified binaries, or
+            # spawned background processes; grade every later step in a fresh session.
+            step_count = self._step_count
+            session = self._open_session(seed=self._reset_seed)
+            self._step_count = step_count
+        self._session_evaluated = True
 
         if self._test_code and self._language == "python":
             # The solution runs in a child process of a trusted runner; see the module-level design notes.
             # Only the runner's single nonce-prefixed result line decides the reward.
-            import sys as _sys
-
-            from .runtime import LocalSandboxSession
-
-            if self._session_evaluated:
-                # An earlier step's solution ran in this session and could have replaced the interpreter or left a
-                # process behind that reads the runner's stdin; grade every later step in a fresh session.
-                step_count = self._step_count
-                session = self._open_session(seed=self._reset_seed)
-                self._step_count = step_count
-            self._session_evaluated = True
             nonce = f"__ED_RESULT_{secrets.token_hex(16)}__"
             session.write_files({src_name: code})
             runner_src = _build_unit_test_runner(nonce, src_name, self._test_code, self._test_timeout)
@@ -566,19 +601,14 @@ class CodeJudgeEnvironment(SandboxEnvironment):
             if not comp.ok:
                 return 0, max(1, len(self._stdin_tests)), f"Compilation failed:\n{comp.combined_output(4096)}", None
 
-        exec_argv = list(run_cmd)
         if self._language == "python":
-            # Use local interpreter path when running in LocalSandboxSession.
-            res_probe = session.run_python("print('ok')", timeout=2.0)
-            if res_probe.infra_error:
-                return 0, max(1, len(self._stdin_tests)), "", res_probe.infra_error
+            py_bin = _sys.executable if isinstance(session, LocalSandboxSession) else "python3"
+            exec_argv = [py_bin, "-I", src_name]
+        else:
+            exec_argv = list(run_cmd)
 
         if not self._stdin_tests:
-            run_res = (
-                session.run_python(code, timeout=self._test_timeout)
-                if self._language == "python"
-                else session.exec(exec_argv, timeout=self._test_timeout)
-            )
+            run_res = session.exec(exec_argv, timeout=self._test_timeout)
             if run_res.infra_error:
                 return 0, 1, "", run_res.infra_error
             if run_res.ok:
@@ -588,13 +618,18 @@ class CodeJudgeEnvironment(SandboxEnvironment):
         passed = 0
         first_failure = ""
         for idx, case in enumerate(self._stdin_tests):
+            if idx > 0:
+                clean_err = self._clean_workspace_for_case(
+                    session,
+                    src_name=src_name,
+                    code=code,
+                    keep_compiled=compile_cmd is not None,
+                )
+                if clean_err is not None:
+                    return passed, len(self._stdin_tests), "", clean_err
             inp = str(case.get("input", ""))
             expected = str(case.get("output", "")).strip()
-            run_res = (
-                session.run_python(code, stdin=inp, timeout=self._test_timeout)
-                if self._language == "python"
-                else session.exec(exec_argv, stdin=inp, timeout=self._test_timeout)
-            )
+            run_res = session.exec(exec_argv, stdin=inp, timeout=self._test_timeout)
             if run_res.infra_error:
                 return passed, len(self._stdin_tests), "", run_res.infra_error
             actual = run_res.stdout.strip()

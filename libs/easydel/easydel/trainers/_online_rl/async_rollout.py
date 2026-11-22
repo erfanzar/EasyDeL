@@ -589,6 +589,8 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
                     break
                 if closed:
                     raise RuntimeError("rollout coordinator was closed while waiting for completion")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for an asynchronous rollout")
         finally:
             with self._lock:
                 self._waiters -= 1

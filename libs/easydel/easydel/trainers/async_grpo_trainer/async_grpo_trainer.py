@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax  # noqa: F401 - kept for test monkeypatching compatibility
+from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -26,6 +28,8 @@ from easydel.utils import Registry
 from ..async_rollout_mixin import AsyncRolloutResult as _AsyncRolloutResult  # noqa: F401
 from ..group_relative_policy_optimization import GRPOTrainer
 from .async_grpo_config import AsyncGRPOConfig
+
+logger = get_logger(__name__)
 
 
 def environment_reward_placeholder(
@@ -90,40 +94,67 @@ class AsyncGRPOTrainer(GRPOTrainer):
         if not isinstance(arguments, AsyncGRPOConfig):
             raise TypeError(f"arguments must be AsyncGRPOConfig, got {type(arguments)}")
 
+        self._owned_env_runtime: tp.Any = None
         env_spec = environment if environment is not None else arguments.environment
-        resolved_runtime = None
-        if env_spec is not None and environment_factory is None:
-            from easydel.environments import AutoEnvironment, KiriRuntime, SandboxPool
+        try:
+            if env_spec is not None and environment_factory is None:
+                if callable(env_spec) and not isinstance(env_spec, type):
+                    environment_factory = env_spec
+                else:
+                    from easydel.environments import AutoEnvironment, KiriRuntime, SandboxPool
 
-            if arguments.environment_endpoints:
-                resolved_runtime = SandboxPool(
-                    endpoints=arguments.environment_endpoints,
-                    backend=arguments.environment_backend,
-                )
-            else:
-                resolved_runtime = KiriRuntime(backend=arguments.environment_backend)
-            if callable(env_spec) and not isinstance(env_spec, type):
-                environment_factory = env_spec
-            else:
-                environment_factory = AutoEnvironment.as_factory(env_spec, runtime=resolved_runtime)
+                    resolved_runtime = None
+                    if not (isinstance(env_spec, collections.abc.Mapping) and env_spec.get("runtime") is not None):
+                        if arguments.environment_endpoints:
+                            resolved_runtime = SandboxPool(
+                                endpoints=arguments.environment_endpoints,
+                                backend=arguments.environment_backend,
+                            )
+                        else:
+                            resolved_runtime = KiriRuntime(backend=arguments.environment_backend)
+                        self._owned_env_runtime = resolved_runtime
+                    environment_factory = AutoEnvironment.as_factory(env_spec, runtime=resolved_runtime)
 
-        if reward_funcs is None:
-            if environment_factory is not None:
-                # GRPO appends the stepped environment rewards as their own column; a reward fn that
-                # echoed them would double-count, so install a zero-weight placeholder instead.
-                reward_funcs = environment_reward_placeholder
-            else:
-                raise ValueError("AsyncGRPOTrainer requires `reward_funcs` unless `environment` is provided.")
+            if reward_funcs is None:
+                if environment_factory is not None:
+                    # GRPO appends the stepped environment rewards as their own column; a reward fn that
+                    # echoed them would double-count, so install a zero-weight placeholder instead.
+                    reward_funcs = environment_reward_placeholder
+                else:
+                    raise ValueError("AsyncGRPOTrainer requires `reward_funcs` unless `environment` is provided.")
 
-        super().__init__(
-            arguments=arguments,
-            model=model,
-            reward_funcs=reward_funcs,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=processing_class,
-            reward_processing_classes=reward_processing_classes,
-            data_tokenize_fn=data_tokenize_fn,
-            tools=tools,
-            environment_factory=environment_factory,
-        )
+            super().__init__(
+                arguments=arguments,
+                model=model,
+                reward_funcs=reward_funcs,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                processing_class=processing_class,
+                reward_processing_classes=reward_processing_classes,
+                data_tokenize_fn=data_tokenize_fn,
+                tools=tools,
+                environment_factory=environment_factory,
+            )
+        except BaseException:
+            self._close_owned_env_runtime()
+            raise
+
+    def _close_owned_env_runtime(self) -> None:
+        """Close and clear any environment runtime (``SandboxPool``/``KiriRuntime``) owned by this trainer."""
+        runtime = getattr(self, "_owned_env_runtime", None)
+        self._owned_env_runtime = None
+        if runtime is None:
+            return
+        close_fn = getattr(runtime, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception as exc:
+                logger.warning("AsyncGRPOTrainer owned env runtime close() failed (%s): %s", type(exc).__name__, exc)
+
+    def _teardown_resources(self) -> None:
+        """Release trainer resources and close any owned environment runtime."""
+        try:
+            super()._teardown_resources()
+        finally:
+            self._close_owned_env_runtime()

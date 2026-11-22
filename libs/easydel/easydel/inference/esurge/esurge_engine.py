@@ -2844,6 +2844,16 @@ class eSurge:
         plane = getattr(self, "_request_plane", None)
         if plane is not None and plane.owns_scheduling and plane.needs_tee:
             plane.tee_outputs(engine_outputs)
+        # Propagate any pre-token preemptions (freed KV) ahead of the step's outputs so
+        # OutputPipeline clears stale pre-token oldest_kv_weight_version before new tokens land.
+        core = getattr(self, "core", None)
+        drain_preempted = getattr(core, "drain_preempted_kv_requests", None)
+        if callable(drain_preempted):
+            preempted_kv = drain_preempted()
+            if preempted_kv:
+                clear_kv = getattr(self._output_pipeline, "clear_kv_versions", None)
+                if callable(clear_kv):
+                    clear_kv(preempted_kv)
         # Every weight install happens while no step is in flight (the loop is stopped, or the swap runs between
         # steps on the loop thread after draining), so the version read here is the one whose weights ran the
         # forward that produced these tokens, including steps harvested one iteration late under overlap.
@@ -3312,6 +3322,8 @@ class eSurge:
         self, model, graphdef, graphstate, graphother, restart_scheduler, version, keep_requests
     ) -> int:
         """Body of :meth:`update_model_weights`; the caller holds the engine's weight-update lock."""
+        if getattr(self, "_closed", False) or getattr(self, "runner", None) is None:
+            raise RuntimeError("Cannot update model weights on a closed eSurge engine")
         new_version = self._next_weight_version(version)
         if model is None and graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No new model or graph components provided for update")
@@ -3514,6 +3526,8 @@ class eSurge:
 
         def _swap() -> None:
             with self._scheduler_lock:
+                if getattr(self, "_closed", False) or getattr(self, "runner", None) is None:
+                    raise RuntimeError("Cannot update model weights on a closed eSurge engine")
                 # No step is in flight: every KV entry held now was computed with the outgoing weights. The pipeline
                 # update is queued behind the tokens already emitted, so it lands before any new-weight token.
                 marked = self.core.mark_kv_weight_version(int(getattr(self, "_weight_version", 0)))
@@ -3545,7 +3559,10 @@ class eSurge:
                         mm_manager.cache.clear()
                 self._weight_version = new_version
 
-        engine_loop = self._engine_loop if self._scheduler_running else None
+        # Always route through the engine loop whenever one exists, even if terminate() has already
+        # cleared _scheduler_running while the final step is still in flight; run_between_steps()
+        # falls back inline only once the loop thread is no longer alive.
+        engine_loop = self._engine_loop
         if engine_loop is not None:
             engine_loop.run_between_steps(_swap)
         else:
@@ -3569,17 +3586,29 @@ class eSurge:
         Returns:
             Parent request ids that were aborted, in admission order.
         """
+        # Drain queued output bundles and KV-version updates before reading RequestOutputs or aborting, so:
+        # (a) _KVVersionUpdate items from an earlier swap land before abort_request() clears _active_requests, and
+        # (b) tokens already emitted before a preemption are visible on output.oldest_weight_version.
+        pipeline = getattr(self, "_output_pipeline", None)
+        flush = getattr(pipeline, "flush", None)
+        if callable(flush):
+            flush()
         stale: list[str] = []
-        with self._output_lock:
+        stale_seen: set[str] = set()
+        min_v = int(min_version)
+        with self._scheduler_lock, self._output_lock:
             for request_id, output in self._request_outputs.items():
                 if output.finished:
                     continue
                 oldest = output.oldest_weight_version
-                if oldest is not None and oldest < int(min_version):
+                if oldest is not None and oldest < min_v and request_id not in stale_seen:
+                    stale_seen.add(request_id)
                     stale.append(request_id)
-        with self._scheduler_lock:
-            stale_kv = self.core.stale_kv_parent_ids(int(min_version), int(getattr(self, "_weight_version", 0)))
-        stale.extend(request_id for request_id in stale_kv if request_id not in stale)
+            stale_kv = self.core.stale_kv_parent_ids(min_v, int(getattr(self, "_weight_version", 0)))
+            for request_id in stale_kv:
+                if request_id not in stale_seen:
+                    stale_seen.add(request_id)
+                    stale.append(request_id)
         for request_id in stale:
             self.abort_request(request_id)
         return stale

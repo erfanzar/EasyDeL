@@ -23,6 +23,7 @@ the KL penalty, and dispatches to the JIT-compiled GRPO step.
 
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import inspect
 import json
@@ -1515,9 +1516,13 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
                 return None
             return jnp.pad(value, ((0, 0), (0, pad)), constant_values=fill)
 
+        completion_mask = results.completion_mask
+        if completion_mask is None:
+            completion_mask = jnp.ones_like(results.completion_ids, dtype=jnp.int32)
+
         return results._replace(
             completion_ids=right_pad(results.completion_ids, pad_token_id),
-            completion_mask=right_pad(results.completion_mask, 0),
+            completion_mask=right_pad(completion_mask, 0),
             sequences=right_pad(results.sequences, pad_token_id),
             sampling_per_token_logps=right_pad(results.sampling_per_token_logps, 0.0),
         )
@@ -2195,76 +2200,71 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
         )
         self._runtime_trace("eval.compile_wrapper.end")
 
-        def _compute_refmodel_logps(
-            graphtree,
-            graphother,
-            ids,
-            mask,
-            model_kwargs=None,
-            *,
-            graphdef=None,
-            prompt_length: int | None = None,
-        ):
-            """Sharded reference-model per-token log-prob forward.
-
-            Stops gradients through the reference parameters, applies
-            the trainer's step partition spec, and dispatches to
-            :func:`get_per_token_logps` with the runtime ``prompt_length`` and
-            configured vocab chunk size.
-
-            Args:
-                graphtree: Reference trainable graphstate.
-                graphother: Reference frozen graphother.
-                ids: Token id array ``[batch, seq_len]``.
-                mask: Attention mask ``[batch, seq_len]``.
-                model_kwargs: Optional dict of additional model kwargs
-                    (forwarded after normalization).
-                graphdef: Reference graphdef captured via partial.
-                prompt_length: Runtime prompt width ``prompt_ids.shape[-1]``;
-                    defaults to ``self.arguments.max_prompt_length`` for legacy callers.
-
-            Returns:
-                ``[batch, seq_len - prompt_length]`` reference log-probabilities.
-            """
-            graphother = jax.tree_util.tree_map(
-                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
-                graphother,
-            )
-            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
-            resolved_prompt_length = (
-                self.arguments.max_prompt_length if prompt_length is None else int(prompt_length)
-            )
-            with apply.mesh:
-                ids = with_sharding_constraint(
-                    ids,
-                    self.arguments.step_partition_spec,
-                    mesh=apply.mesh,
-                    ignore_mpmd=True,
-                )
-                mask = with_sharding_constraint(
-                    mask,
-                    self.arguments.step_partition_spec,
-                    mesh=apply.mesh,
-                    ignore_mpmd=True,
-                )
-                model_kwargs = normalize_generation_model_kwargs(
-                    model_kwargs,
-                    model_callable=getattr(apply, "forward", apply),
-                )
-                return get_per_token_logps(
-                    apply,
-                    ids,
-                    mask,
-                    resolved_prompt_length,
-                    model_kwargs=model_kwargs,
-                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
-                )
-
         if self.ref_state is not None:
-            self.compute_refmodel_logps = compile_trainer_step(
-                partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
+            ref_graphdef = self.ref_state.graphdef
+            ref_model_callable = getattr(self.model, "forward", self.model)
+
+            def _compute_refmodel_logps(
+                graphtree,
+                graphother,
+                ids,
+                mask,
+                model_kwargs,
+                prompt_length: int,
+            ):
+                """Sharded reference-model per-token log-prob forward.
+
+                Stops gradients through the reference parameters, applies
+                the trainer's step partition spec, and dispatches to
+                :func:`get_per_token_logps` with the runtime ``prompt_length`` and
+                configured vocab chunk size.
+
+                Args:
+                    graphtree: Reference trainable graphstate.
+                    graphother: Reference frozen graphother.
+                    ids: Token id array ``[batch, seq_len]``.
+                    mask: Attention mask ``[batch, seq_len]``.
+                    model_kwargs: Normalized dict of additional model kwargs.
+                    prompt_length: Static runtime prompt width ``prompt_ids.shape[-1]``.
+
+                Returns:
+                    ``[batch, seq_len - prompt_length]`` reference log-probabilities.
+                """
+                graphother = jax.tree_util.tree_map(
+                    lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                    graphother,
+                )
+                apply = spx.bind(ref_graphdef, graphtree.merge(graphother, copy=False))
+                with apply.mesh:
+                    ids = with_sharding_constraint(
+                        ids,
+                        self.arguments.step_partition_spec,
+                        mesh=apply.mesh,
+                        ignore_mpmd=True,
+                    )
+                    mask = with_sharding_constraint(
+                        mask,
+                        self.arguments.step_partition_spec,
+                        mesh=apply.mesh,
+                        ignore_mpmd=True,
+                    )
+                    normalized_kwargs = normalize_generation_model_kwargs(
+                        model_kwargs,
+                        model_callable=getattr(apply, "forward", apply),
+                    )
+                    return get_per_token_logps(
+                        apply,
+                        ids,
+                        mask,
+                        prompt_length,
+                        model_kwargs=normalized_kwargs,
+                        logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                    )
+
+            compiled_refmodel_logps = compile_trainer_step(
+                _compute_refmodel_logps,
                 mesh=mesh,
-                static_argnames=("graphdef", "prompt_length"),
+                static_argnums=(5,),
                 in_shardings=(
                     self.ref_state.shardings.graphstate,
                     self.ref_state.shardings.graphother,
@@ -2274,6 +2274,32 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
                 ),
                 out_shardings=empty_sharding,
             )
+
+            def _call_refmodel_logps(
+                graphtree,
+                graphother,
+                ids,
+                mask,
+                model_kwargs=None,
+                prompt_length: int | None = None,
+            ):
+                resolved_prompt_length = (
+                    self.arguments.max_prompt_length if prompt_length is None else int(prompt_length)
+                )
+                normalized_kwargs = normalize_generation_model_kwargs(
+                    model_kwargs,
+                    model_callable=ref_model_callable,
+                )
+                return compiled_refmodel_logps(
+                    graphtree,
+                    graphother,
+                    ids,
+                    mask,
+                    normalized_kwargs,
+                    resolved_prompt_length,
+                )
+
+            self.compute_refmodel_logps = _call_refmodel_logps
         else:
             # beta == 0: no reference model, so no reference-logps function.
             self.compute_refmodel_logps = None
@@ -2434,22 +2460,70 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
         *,
         prompt_length: int,
     ):
-        """Invoke ``compute_refmodel_logps``, falling back cleanly for 5-arg legacy overrides."""
+        """Invoke ``compute_refmodel_logps`` positionally when supported, with safe fallbacks.
+
+        Prefers a 6-argument positional call whenever ``compute_refmodel_logps``
+        accepts ``prompt_length`` as its 6th positional parameter, avoiding JAX's
+        ``ValueError: pjit does not support kwargs when in_shardings is specified``
+        on compiled callables. Falls back to keyword dispatch for keyword-only
+        ``prompt_length`` / ``**kwargs`` callables, and to the legacy 5-argument
+        signature when ``prompt_length`` is unsupported or rejected by ``pjit``.
+        """
         fn = self.compute_refmodel_logps
         try:
             sig = inspect.signature(fn)
         except (TypeError, ValueError):
             sig = None
+
+        call_mode = "positional"
+        has_var_positional = False
         if sig is not None:
-            accepts_prompt_length = "prompt_length" in sig.parameters or any(
-                param.kind is inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
-            )
-            if not accepts_prompt_length:
-                return fn(graphstate, graphother, ids, mask, model_kwargs)
+            params = list(sig.parameters.values())
+            positional_params = [
+                p
+                for p in params
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            has_var_positional = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
+            has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+            prompt_param = sig.parameters.get("prompt_length")
+
+            if prompt_param is not None:
+                if prompt_param.kind is inspect.Parameter.KEYWORD_ONLY:
+                    call_mode = "keyword"
+                elif len(positional_params) >= 6 and positional_params[5].name == "prompt_length":
+                    call_mode = "positional"
+                else:
+                    call_mode = "keyword"
+            elif has_var_keyword:
+                call_mode = "keyword"
+            elif has_var_positional:
+                call_mode = "positional"
+            else:
+                call_mode = "legacy5"
+
+        if call_mode == "legacy5":
+            return fn(graphstate, graphother, ids, mask, model_kwargs)
+
+        if call_mode == "positional":
+            try:
+                return fn(graphstate, graphother, ids, mask, model_kwargs, prompt_length)
+            except TypeError as exc:
+                msg = str(exc)
+                if "positional argument" in msg or "prompt_length" in msg:
+                    return fn(graphstate, graphother, ids, mask, model_kwargs)
+                raise
+
         try:
             return fn(graphstate, graphother, ids, mask, model_kwargs, prompt_length=prompt_length)
         except TypeError as exc:
             if "prompt_length" in str(exc):
+                return fn(graphstate, graphother, ids, mask, model_kwargs)
+            raise
+        except ValueError as exc:
+            if "pjit does not support kwargs" in str(exc):
+                if has_var_positional:
+                    return fn(graphstate, graphother, ids, mask, model_kwargs, prompt_length)
                 return fn(graphstate, graphother, ids, mask, model_kwargs)
             raise
 
@@ -2531,6 +2605,32 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
         pending = not bool(getattr(self, "_startup_behavior_parity_checked", False))
         model_batch["behavior_parity_gate"] = jnp.asarray(int(pending), dtype=jnp.int32)
         return model_batch, metrics
+
+    def _refresh_behavior_parity_gate_for_step(
+        self,
+        batch: dict[str, jax.Array],
+    ) -> dict[str, jax.Array]:
+        """Refresh ``behavior_parity_gate`` on the learner thread right before executing a step.
+
+        In ``async_mode=True``, background rollout workers can preprocess lookahead batches
+        before step 0 completes :meth:`on_step_end` (which sets
+        ``_startup_behavior_parity_checked = True``). Refreshing the 0-dim flag immediately
+        before step dispatch ensures step 0 enforces the startup parity gate while every
+        subsequent step (including prefetched lookahead batches) clears it to ``0`` without
+        altering the batch pytree structure.
+        """
+        if not isinstance(batch, collections.abc.Mapping):
+            return batch
+        if getattr(self.arguments, "startup_behavior_k3_max", None) is None:
+            return batch
+        pending = not bool(getattr(self, "_startup_behavior_parity_checked", False))
+        refreshed = dict(batch)
+        existing = refreshed.get("behavior_parity_gate")
+        if isinstance(existing, jax.Array):
+            refreshed["behavior_parity_gate"] = jnp.full_like(existing, int(pending), dtype=jnp.int32)
+        else:
+            refreshed["behavior_parity_gate"] = jnp.asarray(int(pending), dtype=jnp.int32)
+        return refreshed
 
     def _apply_dynamic_sampling(
         self,
@@ -2626,10 +2726,27 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             metrics["reward_mean"] = _host_mean_float(jnp.nanmean(rewards, -1))
             metrics["reward_std"] = _host_scalar_float(jnp.nanmean(std_rewards))
             metrics["frac_reward_zero_std"] = _host_mean_float(is_std_zero.astype(jnp.float32))
+            if discard_columns is not None:
+                discarded_rows = _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns)
+                discarded_groups = discarded_rows.reshape(-1, max(int(generation_factor), 1))[:, 0]
+                num_discarded = int(jax.device_get(jnp.sum(discarded_groups)))
+                metrics["rewards/discarded_groups"] = num_discarded
+                metrics["rewards/discarded_group_fraction"] = num_discarded / max(int(discarded_groups.shape[0]), 1)
         if zero.any():
             keep_rows = jnp.asarray(np.repeat(~zero, generation_factor))
             completion_mask = model_batch["completion_mask"]
             model_batch["completion_mask"] = completion_mask * keep_rows[:, None].astype(completion_mask.dtype)
+            advantages = model_batch["advantages"]
+            model_batch["advantages"] = jnp.where(
+                keep_rows.reshape((-1,) + (1,) * (advantages.ndim - 1)),
+                advantages,
+                0.0,
+            )
+            weights = model_batch.get("difficulty_weights")
+            if weights is None:
+                weights = jnp.ones((keep_rows.shape[0],), dtype=jnp.float32)
+            keep_w = keep_rows.reshape((-1,) + (1,) * (weights.ndim - 1)).astype(weights.dtype)
+            model_batch["difficulty_weights"] = weights * keep_w
         model_batch["num_items_in_batch"] = jnp.sum(model_batch["completion_mask"])
         metrics["dynamic_sampling/attempts"] = attempts
         metrics["dynamic_sampling/initial_zero_std_group_frac"] = initial_zero / num_groups
@@ -3060,6 +3177,11 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
                 if environment_feedback is not None:
                     reward_weights = jnp.concatenate([reward_weights, jnp.ones((1,), dtype=reward_weights.dtype)])
                 discard_columns = self._discard_columns(int(rewards_per_func.shape[-1]))
+                discarded_rows = (
+                    _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns)
+                    if discard_columns is not None
+                    else None
+                )
                 rewards, advantages, std_rewards, is_std_zero = _compute_rewards_and_advantages(
                     rewards_per_func=rewards_per_func,
                     reward_weights=reward_weights,
@@ -3080,6 +3202,13 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
                         completion_attention_mask = completion_attention_mask[selected_indices]
                         ref_per_token_logps = ref_per_token_logps[selected_indices]
                         rewards_per_func = rewards_per_func[selected_indices]
+                        if discarded_rows is not None:
+                            discarded_rows = discarded_rows[selected_indices]
+                            rewards_per_func = jnp.where(
+                                discarded_rows[:, None] & jnp.asarray(discard_columns, dtype=bool)[None, :],
+                                jnp.nan,
+                                rewards_per_func,
+                            )
                         if old_per_token_logps is not None:
                             old_per_token_logps = old_per_token_logps[selected_indices]
                         if rollout_logps is not None:
@@ -3173,10 +3302,10 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             model_batch["difficulty_weights"] = difficulty_weights
         if behavior_per_token_logps is not None and self._accepts_batch_key("behavior_per_token_logps"):
             model_batch["behavior_per_token_logps"] = behavior_per_token_logps
-        if discard_columns is not None:
+        if discarded_rows is not None:
             model_batch, discard_metrics = _apply_discarded_groups(
                 model_batch,
-                _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns),
+                discarded_rows,
                 generation_factor,
             )
             metrics_dict.update(discard_metrics)

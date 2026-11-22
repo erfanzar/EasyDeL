@@ -31,7 +31,14 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float
 
 from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_bwd
-from ._pallas_impl_fwd import _N_FUSE, _chunk_blockspec, _dot, _neumann_inv, _segmented_chunk_cumsum
+from ._pallas_impl_fwd import (
+    _N_FUSE,
+    _chunk_blockspec,
+    _dot,
+    _neumann_inv,
+    _PrimalDTypes,
+    _segmented_chunk_cumsum,
+)
 
 
 def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
@@ -670,6 +677,23 @@ def _cast_grad(x, dtype):
     return x.astype(dtype) if x.dtype != dtype else x
 
 
+def _resolve_primal_dtypes(primal_meta, fallback_dtype):
+    """Resolve ``(beta_dtype, decay_dtype, initial_state_dtype)`` from backward residual metadata.
+
+    Handles both :class:`_PrimalDTypes` tokens stored by the forward rules and
+    legacy residual tuples whose slot holds a raw ``initial_state`` array or
+    ``None``.
+    """
+    if isinstance(primal_meta, _PrimalDTypes):
+        return (
+            primal_meta.beta or fallback_dtype,
+            primal_meta.decay or fallback_dtype,
+            primal_meta.initial_state or fallback_dtype,
+        )
+    state_dtype = getattr(primal_meta, "dtype", None) or fallback_dtype
+    return fallback_dtype, fallback_dtype, state_dtype
+
+
 def _chunk_gdr_bwd(
     chunk_size: int,
     use_qk_l2norm: bool,
@@ -710,7 +734,7 @@ def _chunk_gdr_bwd(
             beta,
             decay,
             state_pre_all,
-            _initial_state,
+            primal_meta,
             q_inv_norm,
             k_inv_norm,
             seq_len,
@@ -732,7 +756,7 @@ def _chunk_gdr_bwd(
             beta,
             decay,
             state_pre_all,
-            _initial_state,
+            primal_meta,
             q_inv_norm,
             k_inv_norm,
             seq_len,
@@ -747,6 +771,7 @@ def _chunk_gdr_bwd(
     chunk_size = effective_chunk_size
     d_out, d_final_state = g
     input_dtype = query.dtype
+    beta_dtype, decay_dtype, initial_state_dtype = _resolve_primal_dtypes(primal_meta, input_dtype)
     B, H, num_chunks, _C, K_dim = query.shape
     V_dim = value.shape[-1]
     scale = 1.0 / math.sqrt(K_dim)
@@ -919,12 +944,12 @@ def _chunk_gdr_bwd(
         return x.astype(dtype) if x.dtype != dtype else x
 
     return (
-        _safe_cast(d_query, input_dtype),
-        _safe_cast(d_key, input_dtype),
-        _safe_cast(d_value, input_dtype),
-        _safe_cast(d_beta, input_dtype),
-        _safe_cast(d_decay, input_dtype),
-        _safe_cast(d_initial_state, input_dtype),
+        _safe_cast(d_query, query.dtype),
+        _safe_cast(d_key, key.dtype),
+        _safe_cast(d_value, value.dtype),
+        _safe_cast(d_beta, beta_dtype),
+        _safe_cast(d_decay, decay_dtype),
+        _safe_cast(d_initial_state, initial_state_dtype),
     )
 
 
@@ -943,7 +968,7 @@ def _chunk_gdr_grouped_bwd(
             beta,
             decay,
             state_group_pre,
-            _initial_state,
+            primal_meta,
             q_inv_norm,
             k_inv_norm,
             seq_len,
@@ -967,7 +992,7 @@ def _chunk_gdr_grouped_bwd(
             beta,
             decay,
             state_group_pre,
-            _initial_state,
+            primal_meta,
             q_inv_norm,
             k_inv_norm,
             seq_len,
@@ -984,6 +1009,7 @@ def _chunk_gdr_grouped_bwd(
     chunk_size = effective_chunk_size
     d_out, d_final_state = g
     input_dtype = query.dtype
+    beta_dtype, decay_dtype, initial_state_dtype = _resolve_primal_dtypes(primal_meta, input_dtype)
     B, Hq, num_chunks, _C, K_dim = query.shape
     Hv = value.shape[1]
     V_dim = value.shape[-1]
@@ -1117,12 +1143,12 @@ def _chunk_gdr_grouped_bwd(
         return x.astype(dtype) if x.dtype != dtype else x
 
     return (
-        _safe_cast(d_query, input_dtype),
-        _safe_cast(d_key, input_dtype),
-        _safe_cast(d_value, input_dtype),
-        _safe_cast(d_beta, input_dtype),
-        _safe_cast(d_decay, input_dtype),
-        _safe_cast(d_initial_state, input_dtype),
+        _safe_cast(d_query, query.dtype),
+        _safe_cast(d_key, key.dtype),
+        _safe_cast(d_value, value.dtype),
+        _safe_cast(d_beta, beta_dtype),
+        _safe_cast(d_decay, decay_dtype),
+        _safe_cast(d_initial_state, initial_state_dtype),
     )
 
 
@@ -1410,9 +1436,16 @@ def _single_step_gdr_bwd(
         cast to the input dtype.  ``d_decay`` is ``None`` if ``decay`` was
         ``None`` in the forward call.
     """
-    query, key, value, beta, decay, recurrent_state, q_inv_norm, k_inv_norm, decay_was_none = res
+    if len(res) == 10:
+        query, key, value, beta, decay, recurrent_state, q_inv_norm, k_inv_norm, decay_was_none, primal_meta = res
+    elif len(res) == 9:
+        query, key, value, beta, decay, recurrent_state, q_inv_norm, k_inv_norm, decay_was_none = res
+        primal_meta = recurrent_state
+    else:
+        raise ValueError(f"Unexpected single-step GDR backward residual length: {len(res)}")
     d_out, d_final_state = g
     input_dtype = query.dtype
+    beta_dtype, decay_dtype, state_dtype = _resolve_primal_dtypes(primal_meta, input_dtype)
     scale = 1.0 / math.sqrt(query.shape[-1])
     d_query, d_key, d_value, d_beta, d_decay, d_state = _run_single_step_backward(
         query,
@@ -1435,10 +1468,10 @@ def _single_step_gdr_bwd(
     if decay_was_none:
         d_decay = None
     return (
-        _cast_grad(d_query, input_dtype),
-        _cast_grad(d_key, input_dtype),
-        _cast_grad(d_value, input_dtype),
-        _cast_grad(d_beta, input_dtype),
-        _cast_grad(d_decay, input_dtype),
-        _cast_grad(d_state, input_dtype),
+        _cast_grad(d_query, query.dtype),
+        _cast_grad(d_key, key.dtype),
+        _cast_grad(d_value, value.dtype),
+        _cast_grad(d_beta, beta_dtype),
+        _cast_grad(d_decay, decay_dtype),
+        _cast_grad(d_state, state_dtype),
     )

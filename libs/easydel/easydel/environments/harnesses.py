@@ -26,7 +26,8 @@ import dataclasses
 import http.server
 import ipaddress
 import json
-import os
+import posixpath
+import socket
 import threading
 import typing as tp
 import urllib.parse
@@ -51,18 +52,67 @@ from .runtime import (
     SandboxSession,
 )
 from .swe_repo import (
+    _CLEAN_GIT_ENV,
     GradingSnapshot,
+    _build_protected_predicate,
+    _list_base_tree,
+    _parse_python_test_command,
+    _seed_repo_dir_files,
+    apply_patch_via_stdin,
     capture_base_revision,
-    capture_grading_snapshot,
+    extract_agent_workspace_changes,
+    init_clean_git_repo,
     kill_agent_processes,
-    restore_grading_files,
-    run_clean_git,
+    run_verified_test_command,
     unscorable_step,
     verification_resolved,
 )
 
 ProtocolKind = tp.Literal["openai_chat", "openai_responses", "anthropic_messages"]
 SubagentTrainingMode = tp.Literal["root_only", "all_streams"]
+
+_DEFAULT_MAX_GATEWAY_REQUEST_BYTES = 16 * 1024 * 1024
+_MAX_CHUNK_LINE_BYTES = 4096
+_HARNESS_VERIFY_ENV = {
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONSAFEPATH": "1",
+    "PYTHONPATH": "",
+    "PYTHONSTARTUP": "",
+    "BASH_ENV": "",
+    "ENV": "",
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+_HARNESS_VERIFY_HOOK_BASENAMES = (
+    "sitecustomize.py",
+    "usercustomize.py",
+    "conftest.py",
+    "pytest.ini",
+    ".pytest.ini",
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.py",
+    "pytest",
+    "_pytest",
+)
+_HARNESS_VERIFY_HOOK_SUFFIXES = (".pth",)
+
+
+def _format_host_for_url(host: str) -> str:
+    """Wrap bare IPv6 literals in ``[...]`` for valid ``http://<host>:<port>`` URLs."""
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host
+
+
+def _is_ipv6_host(host: str) -> bool:
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return isinstance(ipaddress.ip_address(bare), ipaddress.IPv6Address)
+    except ValueError:
+        return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -299,9 +349,19 @@ class _EpisodeState:
         self.episode_id = episode_id
         self.trajectory_id = trajectory_id
         self.lock = threading.Lock()
+        self.stream_locks: dict[str, threading.Lock] = {}
         self.active_streams: dict[str, _SegmentBuilder] = {}
         self.sealed_segments: list[_SegmentBuilder] = []
         self.next_segment_id = 0
+        self.finalized = False
+
+    def get_stream_lock(self, stream_id: str) -> threading.Lock:
+        with self.lock:
+            lk = self.stream_locks.get(stream_id)
+            if lk is None:
+                lk = threading.Lock()
+                self.stream_locks[stream_id] = lk
+            return lk
 
     def alloc_segment(self, stream_id: str, *, is_root: bool) -> _SegmentBuilder:
         seg = _SegmentBuilder(segment_id=self.next_segment_id, stream_id=stream_id, is_root=is_root)
@@ -309,10 +369,46 @@ class _EpisodeState:
         return seg
 
 
+def _canonical_json_args(raw: tp.Any) -> str:
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    try:
+        return json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except TypeError:
+        return str(raw)
+
+
+def _finalize_tool_calls(
+    tool_calls: list[dict[str, tp.Any]] | None, *, id_prefix: str
+) -> list[dict[str, tp.Any]] | None:
+    """Return a copy of ``tool_calls`` where every entry has a stable ID and string JSON arguments."""
+    if not tool_calls:
+        return None
+    out: list[dict[str, tp.Any]] = []
+    for tc in tool_calls:
+        fn_raw = tc.get("function")
+        fn = dict(fn_raw) if isinstance(fn_raw, dict) else {}
+        args_val = fn.get("arguments", "{}")
+        if not isinstance(args_val, str):
+            args_val = json.dumps(args_val, ensure_ascii=False)
+        out.append(
+            {
+                "id": str(tc.get("id") or f"{id_prefix}_{uuid.uuid4().hex[:8]}"),
+                "type": str(tc.get("type") or "function"),
+                "function": {"name": str(fn.get("name", "")), "arguments": args_val},
+            }
+        )
+    return out
+
+
 def _normalize_openai_chat_messages(
     body: dict[str, tp.Any],
 ) -> tuple[list[dict[str, tp.Any]], list[dict[str, tp.Any]] | None]:
-    msgs = [dict(m) for m in body.get("messages", [])]
+    msgs = [dict(m) for m in body.get("messages", []) if isinstance(m, dict)]
     tools = body.get("tools")
     return msgs, (list(tools) if isinstance(tools, list) else None)
 
@@ -354,6 +450,15 @@ def _normalize_openai_responses_input(
                         ],
                     }
                 )
+            elif itype == "reasoning":
+                summary = item.get("summary")
+                if isinstance(summary, list):
+                    parts = [str(s.get("text", "")) for s in summary if isinstance(s, dict)]
+                    rtext = "\n".join(p for p in parts if p)
+                else:
+                    rtext = str(item.get("text", ""))
+                if rtext:
+                    msgs.append({"role": "assistant", "content": f"<think>{rtext}</think>"})
             else:
                 role = item.get("role", "user")
                 content = item.get("content", "")
@@ -450,12 +555,37 @@ def _normalize_anthropic_messages(
     return msgs, norm_tools
 
 
+def _canonical_tool_calls(tool_calls: tp.Any) -> list[dict[str, tp.Any]] | None:
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+    norm: list[dict[str, tp.Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        fn_dict = fn if isinstance(fn, dict) else {}
+        norm.append(
+            {
+                "id": str(tc.get("id", "")),
+                "type": str(tc.get("type", "function")),
+                "function": {
+                    "name": str(fn_dict.get("name", "")),
+                    "arguments": _canonical_json_args(fn_dict.get("arguments", "{}")),
+                },
+            }
+        )
+    return norm or None
+
+
 def _canonical_msg(msg: dict[str, tp.Any]) -> str:
+    content = msg.get("content", "")
+    if content is None:
+        content = ""
     return json.dumps(
         {
             "role": msg.get("role", ""),
-            "content": msg.get("content", ""),
-            "tool_calls": msg.get("tool_calls"),
+            "content": content,
+            "tool_calls": _canonical_tool_calls(msg.get("tool_calls")),
             "tool_call_id": msg.get("tool_call_id"),
         },
         sort_keys=True,
@@ -467,6 +597,141 @@ def _is_prefix_messages(prefix: list[dict[str, tp.Any]], full: list[dict[str, tp
     if not prefix or len(prefix) > len(full):
         return False
     return all(_canonical_msg(p) == _canonical_msg(f) for p, f in zip(prefix, full[: len(prefix)], strict=True))
+
+
+def _build_protocol_response_and_messages(
+    protocol: ProtocolKind, out: GatewayTurnOutput
+) -> tuple[tp.Any, list[dict[str, tp.Any]]]:
+    """Finalize tool IDs and derive protocol wire items + exact normalized assistant messages for TITO stitching."""
+    if protocol == "openai_chat":
+        final_tcs = _finalize_tool_calls(out.tool_calls, id_prefix="call")
+        msg: dict[str, tp.Any] = {"role": "assistant", "content": out.text}
+        if final_tcs:
+            msg["tool_calls"] = final_tcs
+        return final_tcs, [msg]
+
+    if protocol == "openai_responses":
+        final_tcs = _finalize_tool_calls(out.tool_calls, id_prefix="call")
+        output_items: list[dict[str, tp.Any]] = []
+        if out.reasoning_text:
+            output_items.append(
+                {
+                    "type": "reasoning",
+                    "id": f"rs_{uuid.uuid4().hex[:8]}",
+                    "summary": [{"type": "summary_text", "text": out.reasoning_text}],
+                }
+            )
+        if out.text:
+            output_items.append(
+                {
+                    "type": "message",
+                    "id": f"msg_{uuid.uuid4().hex[:8]}",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": out.text, "annotations": []}],
+                }
+            )
+        if final_tcs:
+            for tc in final_tcs:
+                fn = tc["function"]
+                output_items.append(
+                    {
+                        "type": "function_call",
+                        "id": f"fc_{uuid.uuid4().hex[:8]}",
+                        "call_id": tc["id"],
+                        "name": fn["name"],
+                        "arguments": fn["arguments"],
+                        "status": "completed",
+                    }
+                )
+        assistant_msgs, _ = _normalize_openai_responses_input({"input": output_items})
+        return output_items, assistant_msgs
+
+    # protocol == "anthropic_messages"
+    final_tcs = _finalize_tool_calls(out.tool_calls, id_prefix="toolu")
+    blocks: list[dict[str, tp.Any]] = []
+    if out.reasoning_text:
+        blocks.append({"type": "thinking", "thinking": out.reasoning_text})
+    if out.text:
+        blocks.append({"type": "text", "text": out.text})
+    if final_tcs:
+        for tc in final_tcs:
+            fn = tc["function"]
+            raw_args = fn["arguments"]
+            try:
+                parsed_inp = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError:
+                parsed_inp = {}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": fn["name"],
+                    "input": parsed_inp,
+                }
+            )
+    assistant_msgs, _ = _normalize_anthropic_messages({"messages": [{"role": "assistant", "content": blocks}]})
+    return blocks, assistant_msgs
+
+
+class _RequestBodyError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _read_bounded_request_body(rfile: tp.Any, headers: tp.Any, max_bytes: int) -> bytes:
+    """Read an HTTP request body (Content-Length or chunked) enforcing a strict ``max_bytes`` cap."""
+    te = (headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        out = bytearray()
+        while True:
+            line = rfile.readline(_MAX_CHUNK_LINE_BYTES + 1)
+            if not line or len(line) > _MAX_CHUNK_LINE_BYTES or not line.endswith(b"\n"):
+                raise _RequestBodyError(400, "Malformed chunked transfer encoding")
+            size_part = line.split(b";", 1)[0].strip()
+            try:
+                chunk_len = int(size_part, 16)
+            except ValueError as exc:
+                raise _RequestBodyError(400, "Invalid chunk size") from exc
+            if chunk_len < 0:
+                raise _RequestBodyError(400, "Negative chunk size")
+            if chunk_len == 0:
+                # Consume trailer headers up to the terminating empty line.
+                for _ in range(64):
+                    trailer = rfile.readline(_MAX_CHUNK_LINE_BYTES + 1)
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            if len(out) + chunk_len > max_bytes:
+                raise _RequestBodyError(413, f"Request body exceeds limit of {max_bytes} bytes")
+            chunk = rfile.read(chunk_len)
+            if len(chunk) < chunk_len:
+                raise _RequestBodyError(400, "Truncated chunked request body")
+            out.extend(chunk)
+            crlf = rfile.read(2)
+            if crlf != b"\r\n":
+                raise _RequestBodyError(400, "Malformed chunk terminator")
+        return bytes(out) if out else b"{}"
+
+    cl_raw = headers.get("Content-Length")
+    if cl_raw is None:
+        return b"{}"
+    try:
+        length = int(cl_raw.strip())
+    except ValueError as exc:
+        raise _RequestBodyError(400, "Invalid Content-Length header") from exc
+    if length < 0:
+        raise _RequestBodyError(400, "Negative Content-Length header")
+    if length > max_bytes:
+        raise _RequestBodyError(413, f"Request body exceeds limit of {max_bytes} bytes")
+    if length == 0:
+        return b"{}"
+    raw = rfile.read(length)
+    if len(raw) < length:
+        raise _RequestBodyError(400, "Incomplete request body")
+    return raw
 
 
 class HarnessTITOGateway:
@@ -493,6 +758,7 @@ class HarnessTITOGateway:
         port: int = 0,
         advertise_host: str | None = None,
         public_base_url: str | None = None,
+        max_request_bytes: int = _DEFAULT_MAX_GATEWAY_REQUEST_BYTES,
     ):
         """Create the gateway.
 
@@ -507,9 +773,13 @@ class HarnessTITOGateway:
                 (the bound port is kept).
             public_base_url: Full URL (e.g. ``"http://gateway.internal:8080"``) written into harness URLs;
                 overrides ``advertise_host``.
+            max_request_bytes: Maximum accepted POST body size in bytes (larger bodies return HTTP 413).
         """
+        if int(max_request_bytes) <= 0:
+            raise ValueError(f"max_request_bytes must be positive, got {max_request_bytes}")
         self._advertise_host = advertise_host
         self._public_base_url = public_base_url.rstrip("/") if public_base_url else None
+        self._max_request_bytes = int(max_request_bytes)
         self._generate = generate_fn
         self._encode_messages = encode_messages_fn
         self.model_name = model_name
@@ -538,12 +808,18 @@ class HarnessTITOGateway:
                     self._send_json(404, {"error": {"message": f"Unknown path {self.path}"}})
 
             def do_POST(self) -> None:
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    raw = _read_bounded_request_body(self.rfile, self.headers, gateway._max_request_bytes)
+                except _RequestBodyError as exc:
+                    self._send_json(exc.status, {"error": {"message": exc.message}})
+                    return
                 try:
                     body = json.loads(raw.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json(400, {"error": {"message": "Invalid JSON request body"}})
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._send_json(400, {"error": {"message": "Invalid UTF-8 or JSON request body"}})
+                    return
+                if not isinstance(body, dict):
+                    self._send_json(400, {"error": {"message": "Request body must be a JSON object"}})
                     return
 
                 token = gateway._extract_token(dict(self.headers))
@@ -564,16 +840,22 @@ class HarnessTITOGateway:
                 try:
                     if clean_path.endswith("/chat/completions"):
                         msgs, tools = _normalize_openai_chat_messages(body)
-                        turn = gateway._step_turn(ep, stream_id=stream_id, messages=msgs, tools=tools)
-                        gateway._respond_openai_chat(self, turn, stream=stream)
+                        turn, final_tcs = gateway._step_turn(
+                            ep, stream_id=stream_id, messages=msgs, tools=tools, protocol="openai_chat"
+                        )
+                        gateway._respond_openai_chat(self, turn, tool_calls=final_tcs, stream=stream)
                     elif clean_path.endswith("/responses"):
                         msgs, tools = _normalize_openai_responses_input(body)
-                        turn = gateway._step_turn(ep, stream_id=stream_id, messages=msgs, tools=tools)
-                        gateway._respond_openai_responses(self, turn, stream=stream)
+                        turn, output_items = gateway._step_turn(
+                            ep, stream_id=stream_id, messages=msgs, tools=tools, protocol="openai_responses"
+                        )
+                        gateway._respond_openai_responses(self, turn, output_items=output_items, stream=stream)
                     elif clean_path.endswith("/messages"):
                         msgs, tools = _normalize_anthropic_messages(body)
-                        turn = gateway._step_turn(ep, stream_id=stream_id, messages=msgs, tools=tools)
-                        gateway._respond_anthropic_messages(self, turn, stream=stream)
+                        turn, blocks = gateway._step_turn(
+                            ep, stream_id=stream_id, messages=msgs, tools=tools, protocol="anthropic_messages"
+                        )
+                        gateway._respond_anthropic_messages(self, turn, blocks=blocks, stream=stream)
                     else:
                         self._send_json(404, {"error": {"message": f"Unsupported endpoint {clean_path}"}})
                 except Exception as exc:
@@ -603,12 +885,25 @@ class HarnessTITOGateway:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self._server = http.server.ThreadingHTTPServer((host, port), _Handler)
+        bind_host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        if _is_ipv6_host(host):
+
+            class _IPv6ThreadingHTTPServer(http.server.ThreadingHTTPServer):
+                address_family = socket.AF_INET6
+
+            server_cls: type[http.server.ThreadingHTTPServer] = _IPv6ThreadingHTTPServer
+        else:
+            server_cls = http.server.ThreadingHTTPServer
+
+        self._server = server_cls((bind_host, port), _Handler)
         self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, name="ed-tito-gateway", daemon=True)
         self._started = False
+        self._closed = False
 
     def start(self) -> HarnessTITOGateway:
+        if self._closed:
+            raise RuntimeError("HarnessTITOGateway is closed.")
         if not self._started:
             self._thread.start()
             self._started = True
@@ -617,7 +912,7 @@ class HarnessTITOGateway:
     @property
     def base_url(self) -> str:
         host, port = self._server.server_address[:2]
-        return f"http://{host}:{port}"
+        return f"http://{_format_host_for_url(str(host))}:{port}"
 
     @property
     def base_url_v1(self) -> str:
@@ -630,7 +925,7 @@ class HarnessTITOGateway:
             return self._public_base_url
         if self._advertise_host:
             port = self._server.server_address[1]
-            return f"http://{self._advertise_host}:{port}"
+            return f"http://{_format_host_for_url(self._advertise_host)}:{port}"
         return self.base_url
 
     @property
@@ -672,6 +967,7 @@ class HarnessTITOGateway:
             return [], {"segments": 0, "oldest_policy_version": 0, "latest_policy_version": 0}
 
         with ep.lock:
+            ep.finalized = True
             all_segs = [*ep.sealed_segments, *ep.active_streams.values()]
             ep.active_streams.clear()
 
@@ -748,70 +1044,94 @@ class HarnessTITOGateway:
         stream_id: str,
         messages: list[dict[str, tp.Any]],
         tools: list[dict[str, tp.Any]] | None,
-    ) -> GatewayTurnOutput:
-        with ep.lock:
-            is_root = (stream_id == "root") and (
-                ("root" in ep.active_streams) or ((not ep.active_streams) and (not ep.sealed_segments))
-            )
-            seg = ep.active_streams.get(stream_id)
-            if seg is not None and _is_prefix_messages(seg.messages, messages):
-                delta_msgs = messages[len(seg.messages) :]
+        protocol: ProtocolKind = "openai_chat",
+    ) -> tuple[GatewayTurnOutput, tp.Any]:
+        stream_lock = ep.get_stream_lock(stream_id)
+        with stream_lock:
+            # Snapshot current stream state without mutating it; commit obs + act atomically only after _generate
+            # succeeds so exceptions never leave dangling observation tokens or clobber active streams.
+            with ep.lock:
+                is_root = (stream_id == "root") and (
+                    ("root" in ep.active_streams) or ((not ep.active_streams) and (not ep.sealed_segments))
+                )
+                seg = ep.active_streams.get(stream_id)
+                is_continuation = seg is not None and _is_prefix_messages(seg.messages, messages)
+                base_tokens = list(seg.token_ids) if (is_continuation and seg is not None) else []
+                prev_msg_count = len(seg.messages) if (is_continuation and seg is not None) else 0
+
+            obs_tokens: list[int] = []
+            prompt_tokens: list[int] = []
+            if is_continuation:
+                delta_msgs = messages[prev_msg_count:]
                 if delta_msgs:
                     obs_tokens = [int(t) for t in self._encode_messages(delta_msgs, None)]
+                context_tokens = [*base_tokens, *obs_tokens]
+            else:
+                prompt_tokens = [int(t) for t in self._encode_messages(messages, tools)]
+                if not prompt_tokens:
+                    prompt_tokens = [0]
+                context_tokens = list(prompt_tokens)
+
+            out = self._generate(context_tokens, messages, tools)
+            wire_items, assistant_msgs = _build_protocol_response_and_messages(protocol, out)
+            act_ids = [int(t) for t in out.token_ids]
+
+            with ep.lock:
+                if ep.finalized:
+                    return out, wire_items
+                if is_continuation and seg is not None:
                     if obs_tokens:
-                        start = len(seg.token_ids)
+                        obs_start = len(seg.token_ids)
                         seg.token_ids.extend(obs_tokens)
                         seg.action_mask.extend([False] * len(obs_tokens))
                         seg.behavior_logps.extend([0.0] * len(obs_tokens))
                         seg.spans.append(
-                            TrajectorySpan(start=start, stop=len(seg.token_ids), kind="observation", segment_id=0)
+                            TrajectorySpan(start=obs_start, stop=len(seg.token_ids), kind="observation", segment_id=0)
                         )
-            else:
-                if seg is not None and any(seg.action_mask):
-                    ep.sealed_segments.append(seg)
-                seg = ep.alloc_segment(stream_id, is_root=is_root or stream_id == "root")
-                ep.active_streams[stream_id] = seg
-                prompt_tokens = [int(t) for t in self._encode_messages(messages, tools)]
-                if not prompt_tokens:
-                    prompt_tokens = [0]
-                seg.token_ids.extend(prompt_tokens)
-                seg.action_mask.extend([False] * len(prompt_tokens))
-                seg.behavior_logps.extend([0.0] * len(prompt_tokens))
-                seg.spans.append(TrajectorySpan(start=0, stop=len(seg.token_ids), kind="prompt", segment_id=0))
+                else:
+                    if seg is not None and any(seg.action_mask):
+                        ep.sealed_segments.append(seg)
+                    seg = ep.alloc_segment(stream_id, is_root=is_root or stream_id == "root")
+                    ep.active_streams[stream_id] = seg
+                    seg.token_ids.extend(prompt_tokens)
+                    seg.action_mask.extend([False] * len(prompt_tokens))
+                    seg.behavior_logps.extend([0.0] * len(prompt_tokens))
+                    seg.spans.append(TrajectorySpan(start=0, stop=len(seg.token_ids), kind="prompt", segment_id=0))
 
-            context_tokens = list(seg.token_ids)
+                if act_ids:
+                    act_start = len(seg.token_ids)
+                    seg.token_ids.extend(act_ids)
+                    seg.action_mask.extend([True] * len(act_ids))
+                    if out.logprobs is not None and len(out.logprobs) == len(act_ids):
+                        seg.behavior_logps.extend(float(lp) for lp in out.logprobs)
+                    else:
+                        seg.has_all_logps = False
+                        seg.behavior_logps.extend([0.0] * len(act_ids))
+                    seg.spans.append(
+                        TrajectorySpan(start=act_start, stop=len(seg.token_ids), kind="action", segment_id=0)
+                    )
+                seg.versions.append(int(out.policy_version))
+                seg.messages = [*messages, *assistant_msgs]
 
-        out = self._generate(context_tokens, messages, tools)
-        act_ids = [int(t) for t in out.token_ids] or [0]
+            return out, wire_items
 
-        assistant_msg: dict[str, tp.Any] = {"role": "assistant", "content": out.text}
-        if out.tool_calls:
-            assistant_msg["tool_calls"] = out.tool_calls
-
-        with ep.lock:
-            start = len(seg.token_ids)
-            seg.token_ids.extend(act_ids)
-            seg.action_mask.extend([True] * len(act_ids))
-            if out.logprobs is not None and len(out.logprobs) == len(act_ids):
-                seg.behavior_logps.extend(float(lp) for lp in out.logprobs)
-            else:
-                seg.has_all_logps = False
-                seg.behavior_logps.extend([0.0] * len(act_ids))
-            seg.spans.append(TrajectorySpan(start=start, stop=len(seg.token_ids), kind="action", segment_id=0))
-            seg.versions.append(int(out.policy_version))
-            seg.messages = [*messages, assistant_msg]
-
-        return out
-
-    def _respond_openai_chat(self, handler: tp.Any, out: GatewayTurnOutput, *, stream: bool) -> None:
+    def _respond_openai_chat(
+        self,
+        handler: tp.Any,
+        out: GatewayTurnOutput,
+        *,
+        tool_calls: list[dict[str, tp.Any]] | None = None,
+        stream: bool,
+    ) -> None:
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        finish = "tool_calls" if out.tool_calls else out.finish_reason
+        effective_tcs = tool_calls if tool_calls is not None else out.tool_calls
+        finish = "tool_calls" if effective_tcs else out.finish_reason
         if not stream:
             msg: dict[str, tp.Any] = {"role": "assistant", "content": out.text}
             if out.reasoning_text:
                 msg["reasoning_content"] = out.reasoning_text
-            if out.tool_calls:
-                msg["tool_calls"] = out.tool_calls
+            if effective_tcs:
+                msg["tool_calls"] = effective_tcs
             handler._send_json(
                 200,
                 {
@@ -831,8 +1151,8 @@ class HarnessTITOGateway:
         delta: dict[str, tp.Any] = {"role": "assistant", "content": out.text}
         if out.reasoning_text:
             delta["reasoning_content"] = out.reasoning_text
-        if out.tool_calls:
-            delta["tool_calls"] = [{**tc, "index": i} for i, tc in enumerate(out.tool_calls)]
+        if effective_tcs:
+            delta["tool_calls"] = [{**tc, "index": i} for i, tc in enumerate(effective_tcs)]
         chunk1 = json.dumps(
             {
                 "id": cid,
@@ -851,40 +1171,17 @@ class HarnessTITOGateway:
         )
         handler._send_sse([(None, chunk1), (None, chunk2), (None, "[DONE]")])
 
-    def _respond_openai_responses(self, handler: tp.Any, out: GatewayTurnOutput, *, stream: bool) -> None:
+    def _respond_openai_responses(
+        self,
+        handler: tp.Any,
+        out: GatewayTurnOutput,
+        *,
+        output_items: list[dict[str, tp.Any]] | None = None,
+        stream: bool,
+    ) -> None:
         rid = f"resp_{uuid.uuid4().hex[:12]}"
-        output_items: list[dict[str, tp.Any]] = []
-        if out.reasoning_text:
-            output_items.append(
-                {
-                    "type": "reasoning",
-                    "id": f"rs_{uuid.uuid4().hex[:8]}",
-                    "summary": [{"type": "summary_text", "text": out.reasoning_text}],
-                }
-            )
-        if out.text:
-            output_items.append(
-                {
-                    "type": "message",
-                    "id": f"msg_{uuid.uuid4().hex[:8]}",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": out.text, "annotations": []}],
-                }
-            )
-        if out.tool_calls:
-            for tc in out.tool_calls:
-                fn = tc.get("function", {})
-                output_items.append(
-                    {
-                        "type": "function_call",
-                        "id": f"fc_{uuid.uuid4().hex[:8]}",
-                        "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                        "name": fn.get("name", ""),
-                        "arguments": fn.get("arguments", "{}"),
-                        "status": "completed",
-                    }
-                )
+        if output_items is None:
+            output_items, _ = _build_protocol_response_and_messages("openai_responses", out)
         payload = {
             "id": rid,
             "object": "response",
@@ -908,30 +1205,19 @@ class HarnessTITOGateway:
             ]
         )
 
-    def _respond_anthropic_messages(self, handler: tp.Any, out: GatewayTurnOutput, *, stream: bool) -> None:
+    def _respond_anthropic_messages(
+        self,
+        handler: tp.Any,
+        out: GatewayTurnOutput,
+        *,
+        blocks: list[dict[str, tp.Any]] | None = None,
+        stream: bool,
+    ) -> None:
         mid = f"msg_{uuid.uuid4().hex[:12]}"
-        blocks: list[dict[str, tp.Any]] = []
-        if out.reasoning_text:
-            blocks.append({"type": "thinking", "thinking": out.reasoning_text})
-        if out.text:
-            blocks.append({"type": "text", "text": out.text})
-        if out.tool_calls:
-            for tc in out.tool_calls:
-                fn = tc.get("function", {})
-                raw_args = fn.get("arguments", "{}")
-                try:
-                    parsed_inp = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except json.JSONDecodeError:
-                    parsed_inp = {}
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
-                        "name": fn.get("name", ""),
-                        "input": parsed_inp,
-                    }
-                )
-        stop_reason = "tool_use" if out.tool_calls else "end_turn"
+        if blocks is None:
+            blocks, _ = _build_protocol_response_and_messages("anthropic_messages", out)
+        has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
+        stop_reason = "tool_use" if has_tool_use else "end_turn"
         payload = {
             "id": mid,
             "type": "message",
@@ -974,9 +1260,11 @@ class HarnessTITOGateway:
     def close(self) -> None:
         if self._started:
             self._server.shutdown()
-            self._server.server_close()
             self._thread.join(timeout=2.0)
             self._started = False
+        if not self._closed:
+            self._server.server_close()
+            self._closed = True
 
 
 @register_environment(["harness", "cli_harness"])
@@ -1034,8 +1322,11 @@ class HarnessEnvironment(SandboxEnvironment):
         self._harness_timeout = float(harness_timeout)
         self._verify_timeout = float(verify_timeout)
         self._last_trajectories: list[OnlineRLTrajectory] = []
+        self._reset_seed: int | None = None
         self._base_sha: str | None = None
         self._grading_snapshot: GradingSnapshot | None = None
+        self._base_tracked_paths: set[str] = set()
+        self._cached_repo_files: dict[str, bytes] | None = None
 
     _infra_failure_step = staticmethod(unscorable_step)
 
@@ -1044,10 +1335,58 @@ class HarnessEnvironment(SandboxEnvironment):
         """TITO trajectory segments captured during the most recent harness run."""
         return list(self._last_trajectories)
 
+    def _all_test_commands(self) -> list[str]:
+        return [*self._fail_to_pass, *self._pass_to_pass]
+
+    def _seed_workspace(self, session: SandboxSession, *, needs_base: bool, capture_metadata: bool) -> str | None:
+        if self._repo_dir is not None:
+            if self._cached_repo_files is None:
+                copied, seed_err = _seed_repo_dir_files(self._repo_dir, None)
+                if seed_err is not None or copied is None:
+                    return seed_err or "Failed to seed workspace from repo_dir."
+                self._cached_repo_files = copied
+            if self._cached_repo_files:
+                session.write_files(self._cached_repo_files)
+        if self._initial_files:
+            session.write_files(self._initial_files)
+        if self._preset.requires_git or needs_base:
+            git_check = session.exec(
+                ["/bin/sh", "-c", 'test "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)"'],
+                env=_CLEAN_GIT_ENV,
+                timeout=5.0,
+            )
+            if git_check.infra_error:
+                return git_check.infra_error
+            if not git_check.ok:
+                init_err = init_clean_git_repo(session, email="rl@easydel.local", name="EasyDeL RL")
+                if init_err is not None:
+                    return init_err
+        if not capture_metadata:
+            return None
+        base_sha, infra_err = capture_base_revision(session)
+        if infra_err:
+            return infra_err
+        if needs_base and base_sha is None:
+            return "Could not record the workspace base revision."
+        if needs_base and base_sha is not None:
+            entries, list_err = _list_base_tree(session, base_sha)
+            if entries is None:
+                return list_err or "Could not record the protected files of the base revision."
+            all_paths = {path for _, _, path in entries}
+            is_protected = _build_protected_predicate(self._test_patch, self._all_test_commands(), all_paths)
+            self._base_tracked_paths = all_paths
+            self._grading_snapshot = {path: (mode, blob_id) for mode, blob_id, path in entries if is_protected(path)}
+        self._base_sha = base_sha
+        return None
+
     def reset(self, seed: int | None = None) -> ResetResult:
+        self._reset_seed = seed
         self._last_trajectories = []
         self._base_sha = None
         self._grading_snapshot = None
+        self._base_tracked_paths = set()
+        self._cached_repo_files = None
+        needs_base = bool(self._test_patch or self._fail_to_pass or self._pass_to_pass)
         try:
             session = self._open_session(seed=seed)
             try:
@@ -1055,48 +1394,13 @@ class HarnessEnvironment(SandboxEnvironment):
             except ValueError:
                 self.close()
                 raise
-            if self._repo_dir is not None:
-                copied: dict[str, bytes] = {}
-                root = os.path.abspath(self._repo_dir)
-                for dirpath, dirnames, filenames in os.walk(root):
-                    dirnames[:] = [d for d in dirnames if d not in {".git", ".pytest_cache", "__pycache__"}]
-                    for fname in filenames:
-                        full = os.path.join(dirpath, fname)
-                        if os.path.isfile(full):
-                            with open(full, "rb") as f:
-                                copied[os.path.relpath(full, root)] = f.read()
-                if copied:
-                    session.write_files(copied)
-            if self._initial_files:
-                session.write_files(self._initial_files)
-            needs_base = bool(self._test_patch or self._fail_to_pass or self._pass_to_pass)
-            if self._preset.requires_git or needs_base:
-                res = session.run_bash(
-                    "git rev-parse --is-inside-work-tree >/dev/null 2>&1 || "
-                    "(git init -q && git config user.email 'rl@easydel.local' && "
-                    "git config user.name 'EasyDeL RL' && git add -A && "
-                    "git commit -q --allow-empty -m 'base')",
-                    timeout=10.0,
-                )
-                if res.infra_error:
-                    return ResetResult(self._prompt, info={"env_error": True, "env_error_message": res.infra_error})
-            base_sha, infra_err = capture_base_revision(session)
-            if infra_err:
-                return ResetResult(self._prompt, info={"env_error": True, "env_error_message": infra_err})
-            if needs_base and base_sha is None:
-                return ResetResult(
-                    self._prompt,
-                    info={"env_error": True, "env_error_message": "Could not record the workspace base revision."},
-                )
-            if needs_base:
-                snapshot, snap_err = capture_grading_snapshot(session, base_sha, self._test_patch)
-                if snapshot is None:
-                    message = snap_err or "Could not record the protected files of the base revision."
-                    return ResetResult(self._prompt, info={"env_error": True, "env_error_message": message})
-                self._grading_snapshot = snapshot
-            self._base_sha = base_sha
+            err = self._seed_workspace(session, needs_base=needs_base, capture_metadata=True)
         except SandboxInfraError as exc:
+            self.close()
             return ResetResult(self._prompt, info={"env_error": True, "env_error_message": str(exc)})
+        if err is not None:
+            self.close()
+            return ResetResult(self._prompt, info={"env_error": True, "env_error_message": err})
         return ResetResult(self._prompt, info={"harness": self._preset.name, "env_error": False})
 
     def _check_gateway_reachability(self, session: SandboxSession) -> None:
@@ -1116,51 +1420,140 @@ class HarnessEnvironment(SandboxEnvironment):
             )
 
     def _grade_workspace(self) -> tuple[float, dict[str, tp.Any], str | None]:
-        session = self.session
-        kill_err = kill_agent_processes(session)
+        agent_session = self.session
+        kill_err = kill_agent_processes(agent_session)
         if kill_err is not None:
             return 0.0, {}, kill_err
-        if self._test_patch or self._fail_to_pass or self._pass_to_pass:
+
+        uses_swe_grading = bool(self._test_patch or self._fail_to_pass or self._pass_to_pass)
+        if uses_swe_grading:
             if self._base_sha is None or self._grading_snapshot is None:
                 return 0.0, {}, "Base revision was not recorded at reset; cannot grade safely."
-            restore_err = restore_grading_files(session, self._base_sha, self._test_patch, self._grading_snapshot)
-            if restore_err is not None:
-                return 0.0, {}, restore_err
-        if self._test_patch:
-            session.write_files({".ed_harness_eval.patch": self._test_patch})
-            ap = run_clean_git(session, ["apply", ".ed_harness_eval.patch"], timeout=10.0)
-            if ap.infra_error:
-                return 0.0, {}, ap.infra_error
-            if not ap.ok:
-                return 0.0, {"resolved": False, "error": ap.stderr.strip()}, None
+            safe_patch, untracked_files, tamper_reason, extract_infra = extract_agent_workspace_changes(
+                agent_session,
+                self._base_sha,
+                test_patch=self._test_patch,
+                test_commands=self._all_test_commands(),
+                base_tracked_paths=self._base_tracked_paths,
+            )
+            if extract_infra is not None:
+                return 0.0, {}, extract_infra
+            if tamper_reason is not None:
+                return (
+                    0.0,
+                    {"resolved": False, "workspace_tampered": True, "error": tamper_reason},
+                    None,
+                )
 
-        # Second kill: anything started between the first kill and now must not race the verification.
-        kill_err = kill_agent_processes(session)
-        if kill_err is not None:
-            return 0.0, {}, kill_err
+            step_count = self._step_count
+            grade_session = self._open_session(seed=self._reset_seed)
+            self._step_count = step_count
+            seed_err = self._seed_workspace(grade_session, needs_base=True, capture_metadata=False)
+            if seed_err is not None:
+                return 0.0, {}, seed_err
 
+            if safe_patch:
+                ap_agent = apply_patch_via_stdin(grade_session, safe_patch, timeout=15.0)
+                if ap_agent.infra_error:
+                    return 0.0, {}, ap_agent.infra_error
+                if not ap_agent.ok:
+                    return 0.0, {"resolved": False, "error": ap_agent.stderr.strip()}, None
+
+            if untracked_files:
+                try:
+                    grade_session.write_files(untracked_files)
+                except (OSError, ValueError) as exc:
+                    return (
+                        0.0,
+                        {"resolved": False, "workspace_tampered": True, "error": f"could not apply untracked files: {exc}"},
+                        None,
+                    )
+
+            if self._test_patch:
+                ap = apply_patch_via_stdin(grade_session, self._test_patch, timeout=15.0)
+                if ap.infra_error:
+                    return 0.0, {}, ap.infra_error
+                if not ap.ok:
+                    return 0.0, {"resolved": False, "error": ap.stderr.strip()}, None
+
+            if self._verify_script is not None:
+                return self._run_verify_script(grade_session, neutralize_hooks=False)
+
+            f2p: list[bool] = []
+            for cmd in self._fail_to_pass:
+                ok, infra_err = run_verified_test_command(grade_session, cmd, timeout=self._verify_timeout)
+                if infra_err is not None:
+                    return 0.0, {}, infra_err
+                f2p.append(ok)
+
+            p2p: list[bool] = []
+            for cmd in self._pass_to_pass:
+                ok, infra_err = run_verified_test_command(grade_session, cmd, timeout=self._verify_timeout)
+                if infra_err is not None:
+                    return 0.0, {}, infra_err
+                p2p.append(ok)
+
+            ok = verification_resolved(f2p, p2p, has_f2p=bool(self._fail_to_pass), has_p2p=bool(self._pass_to_pass))
+            return (1.0 if ok else 0.0), {"resolved": ok, "f2p_passed": sum(f2p), "p2p_passed": sum(p2p)}, None
+
+        # Pure verify_script mode (no SWE test suite).
         if self._verify_script is not None:
-            vres = session.run_bash(self._verify_script, timeout=self._verify_timeout)
-            if vres.infra_error:
-                return 0.0, {}, vres.infra_error
-            return (1.0 if vres.ok else 0.0), {"resolved": vres.ok, "verify_output": vres.combined_output(2048)}, None
+            return self._run_verify_script(agent_session, neutralize_hooks=True)
 
-        f2p = []
-        for cmd in self._fail_to_pass:
-            r = session.run_bash(cmd, timeout=self._verify_timeout)
-            if r.infra_error:
-                return 0.0, {}, r.infra_error
-            f2p.append(r.ok)
+        return 0.0, {"resolved": False, "f2p_passed": 0, "p2p_passed": 0}, None
 
-        p2p = []
-        for cmd in self._pass_to_pass:
-            r = session.run_bash(cmd, timeout=self._verify_timeout)
-            if r.infra_error:
-                return 0.0, {}, r.infra_error
-            p2p.append(r.ok)
+    def _run_verify_script(
+        self, session: SandboxSession, *, neutralize_hooks: bool
+    ) -> tuple[float, dict[str, tp.Any], str | None]:
+        assert self._verify_script is not None
+        if neutralize_hooks:
+            chmod_res = session.exec(
+                [
+                    "/bin/sh",
+                    "-c",
+                    "chmod u+rwx . 2>/dev/null; find . -maxdepth 6 ! -type l -exec chmod u+rwx -- {} + 2>/dev/null || true",
+                ],
+                timeout=15.0,
+            )
+            if chmod_res.infra_error:
+                return 0.0, {}, chmod_res.infra_error
+            name_tests: list[str] = []
+            for name in [*_HARNESS_VERIFY_HOOK_BASENAMES, *(f"*{s}" for s in _HARNESS_VERIFY_HOOK_SUFFIXES)]:
+                name_tests += [*(["-o"] if name_tests else []), "-name", name]
+            clean_res = session.exec(
+                ["find", ".", "-maxdepth", "6", "(", *name_tests, ")", "-prune", "-exec", "rm", "-rf", "--", "{}", "+"],
+                timeout=15.0,
+            )
+            if clean_res.infra_error:
+                return 0.0, {}, clean_res.infra_error
+            restore: dict[str, bytes | str] = {}
+            for source in (self._cached_repo_files, self._initial_files):
+                if not source:
+                    continue
+                for path, content in source.items():
+                    base = posixpath.basename(path)
+                    if base in _HARNESS_VERIFY_HOOK_BASENAMES or base.endswith(_HARNESS_VERIFY_HOOK_SUFFIXES):
+                        restore[path] = content
+            if restore:
+                try:
+                    session.write_files(restore)
+                except (OSError, ValueError):
+                    pass
 
-        ok = verification_resolved(f2p, p2p, has_f2p=bool(self._fail_to_pass), has_p2p=bool(self._pass_to_pass))
-        return (1.0 if ok else 0.0), {"resolved": ok, "f2p_passed": sum(f2p), "p2p_passed": sum(p2p)}, None
+        if _parse_python_test_command(self._verify_script) is not None:
+            ok, infra_err = run_verified_test_command(session, self._verify_script, timeout=self._verify_timeout)
+            if infra_err is not None:
+                return 0.0, {}, infra_err
+            return (1.0 if ok else 0.0), {"resolved": ok}, None
+
+        vres = session.exec(
+            ["/bin/sh", "-c", self._verify_script],
+            env=_HARNESS_VERIFY_ENV,
+            timeout=self._verify_timeout,
+        )
+        if vres.infra_error:
+            return 0.0, {}, vres.infra_error
+        return (1.0 if vres.ok else 0.0), {"resolved": vres.ok, "verify_output": vres.combined_output(2048)}, None
 
     def step(self, action: str = "") -> StepResult:
         """Launch the configured CLI harness for ``prompt`` (or override ``action``) and grade."""
@@ -1169,6 +1562,7 @@ class HarnessEnvironment(SandboxEnvironment):
         self._gateway.start()
         task_text = action.strip() or self._prompt
         _ep_id, api_key = self._gateway.open_episode()
+        finalized = False
 
         template_vars = {
             "prompt": task_text,
@@ -1178,46 +1572,51 @@ class HarnessEnvironment(SandboxEnvironment):
             "api_key": api_key,
         }
         try:
-            cfg_files = self._preset.render_files(**template_vars)
-            if cfg_files:
-                self.session.write_files(cfg_files)
+            try:
+                cfg_files = self._preset.render_files(**template_vars)
+                if cfg_files:
+                    self.session.write_files(cfg_files)
 
-            argv = self._preset.render_argv(**template_vars)
-            env_vars = self._preset.render_env(**template_vars)
-            run_res = self.session.exec(argv, env=env_vars, timeout=self._harness_timeout)
-        except SandboxInfraError as exc:
-            self._gateway.finalize_episode(api_key, reward=0.0, subagent_mode=self._subagent_mode)
-            return self._infra_failure_step(exc)
-        if run_res.infra_error:
-            self._gateway.finalize_episode(api_key, reward=0.0, subagent_mode=self._subagent_mode)
-            return self._infra_failure_step(run_res.infra_error)
+                argv = self._preset.render_argv(**template_vars)
+                env_vars = self._preset.render_env(**template_vars)
+                run_res = self.session.exec(argv, env=env_vars, timeout=self._harness_timeout)
+            except SandboxInfraError as exc:
+                return self._infra_failure_step(exc)
+            if run_res.infra_error:
+                return self._infra_failure_step(run_res.infra_error)
 
-        reward, grade_info, infra_err = self._grade_workspace()
-        if infra_err is not None:
-            self._gateway.finalize_episode(api_key, reward=0.0, subagent_mode=self._subagent_mode)
-            return self._infra_failure_step(infra_err)
+            try:
+                reward, grade_info, infra_err = self._grade_workspace()
+            except SandboxInfraError as exc:
+                return self._infra_failure_step(exc)
+            if infra_err is not None:
+                return self._infra_failure_step(infra_err)
 
-        trajectories, gw_meta = self._gateway.finalize_episode(
-            api_key,
-            reward=reward,
-            subagent_mode=self._subagent_mode,
-        )
-        self._last_trajectories = trajectories
-        info = {
-            **grade_info,
-            **gw_meta,
-            "harness": self._preset.name,
-            "harness_returncode": run_res.returncode,
-            "harness_timed_out": run_res.timed_out,
-            "env_error": False,
-        }
-        return StepResult(
-            observation=run_res.combined_output(4096),
-            reward=reward,
-            terminated=not run_res.timed_out,
-            truncated=run_res.timed_out,
-            info=info,
-        )
+            trajectories, gw_meta = self._gateway.finalize_episode(
+                api_key,
+                reward=reward,
+                subagent_mode=self._subagent_mode,
+            )
+            finalized = True
+            self._last_trajectories = trajectories
+            info = {
+                **grade_info,
+                **gw_meta,
+                "harness": self._preset.name,
+                "harness_returncode": run_res.returncode,
+                "harness_timed_out": run_res.timed_out,
+                "env_error": False,
+            }
+            return StepResult(
+                observation=run_res.combined_output(4096),
+                reward=reward,
+                terminated=not run_res.timed_out,
+                truncated=run_res.timed_out,
+                info=info,
+            )
+        finally:
+            if not finalized:
+                self._gateway.finalize_episode(api_key, reward=0.0, subagent_mode=self._subagent_mode)
 
 
 __all__ = (

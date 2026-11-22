@@ -2461,6 +2461,7 @@ def _slice_batch_for_scheduled_step(
     minibatch_size: int,
     *,
     dynamic: bool = True,
+    prompt_group_size: int | None = None,
 ) -> tp.Any:
     """Slice each leaf's named batch axis, preserving multimodal position-ID axes.
 
@@ -2468,12 +2469,34 @@ def _slice_batch_for_scheduled_step(
     accumulation and auxiliary forwards. Dynamic slices support scan indices;
     auxiliary forwards use static slices to keep their existing sharding path.
 
+    When ``prompt_group_size`` (``G > 1``) is provided (e.g. prefix-shared GRPO
+    with ``prompt_ids`` of leading dim ``B`` and completion leaves of leading
+    dim ``B * G``), prompt-level leaves with leading dim ``B = batch_size // G``
+    are sliced in lockstep by ``(start_index // G, minibatch_size // G)`` so
+    every microbatch keeps whole prompt groups aligned with their completions.
+
     Packed image-embed leaves are re-selected per microbatch by :func:`slice_packed_embed_leaves`
     (static shapes, so the scan body compiles once).
 
     Raises:
-        ValueError: If packed embed leaves carry unusable row-ownership markers.
+        ValueError: If packed embed leaves carry unusable row-ownership markers,
+            or ``prompt_group_size`` does not evenly divide ``batch_size`` and
+            ``minibatch_size``.
     """
+    prompt_batch_size: int | None = None
+    prompt_minibatch_size: int | None = None
+    prompt_start_index: tp.Any = None
+    if prompt_group_size is not None and int(prompt_group_size) > 1:
+        group_size = int(prompt_group_size)
+        if int(batch_size) % group_size != 0 or int(minibatch_size) % group_size != 0:
+            raise ValueError(
+                f"`prompt_group_size` ({group_size}) must evenly divide both `batch_size` ({batch_size}) "
+                f"and `minibatch_size` ({minibatch_size})."
+            )
+        prompt_batch_size = int(batch_size) // group_size
+        prompt_minibatch_size = int(minibatch_size) // group_size
+        prompt_start_index = start_index // group_size
+
     packed = {}
     if int(minibatch_size) < int(batch_size):
         packed = slice_packed_embed_leaves(
@@ -2488,11 +2511,27 @@ def _slice_batch_for_scheduled_step(
         if key in SHARED_GENERATION_MODEL_INPUT_KEYS or key in passthrough:
             return arr
         axis = infer_prompt_batch_axis(arr, batch_size, key=key)
-        if axis is None:
-            return arr
-        if dynamic:
-            return lax.dynamic_slice_in_dim(arr, start_index, minibatch_size, axis=axis)
-        return lax.slice_in_dim(arr, start_index, start_index + minibatch_size, axis=axis)
+        if axis is not None:
+            if dynamic:
+                return lax.dynamic_slice_in_dim(arr, start_index, minibatch_size, axis=axis)
+            return lax.slice_in_dim(arr, start_index, start_index + minibatch_size, axis=axis)
+        if prompt_batch_size is not None and prompt_minibatch_size is not None:
+            prompt_axis = infer_prompt_batch_axis(arr, prompt_batch_size, key=key)
+            if prompt_axis is not None:
+                if dynamic:
+                    return lax.dynamic_slice_in_dim(
+                        arr,
+                        prompt_start_index,
+                        prompt_minibatch_size,
+                        axis=prompt_axis,
+                    )
+                return lax.slice_in_dim(
+                    arr,
+                    prompt_start_index,
+                    prompt_start_index + prompt_minibatch_size,
+                    axis=prompt_axis,
+                )
+        return arr
 
     out = jax.tree_util.tree_map_with_path(_slice_leaf, batch)
     if packed:
@@ -2836,6 +2875,12 @@ def _run_scheduled_value_and_grad(
     template_loss = None
     template_grads = None
     template_aux = None
+    # Preserve unweighted gate-sum / presence indicators (e.g. ``grpo_gate_sums/*``)
+    # via uniform averaging when all outer accumulation chunks have zero weight, so
+    # zero-gradient all-discarded steps still report exact behaviour diagnostics and
+    # do not zero out ``has_behavior`` / crash startup parity checks.
+    gate_aux_acc: dict[str, tp.Any] = {}
+    uniform_scale = 1.0 / float(num_accum_steps)
     for index, scale_val in enumerate(scales_f):
         minibatch = _slice_batch_for_scheduled_step(batch, batch_size, index * minibatch_size, minibatch_size)
         loss_i, gradients_i, aux_i = value_and_grad(graphstate, minibatch)
@@ -2843,9 +2888,17 @@ def _run_scheduled_value_and_grad(
             template_loss = loss_i
             template_grads = gradients_i
             template_aux = aux_i
-        if aux_i is not None and aux_i.get("weight_sum") is not None:
-            count = jnp.asarray(aux_i["weight_sum"], jnp.float32)
-            weight_sum = count if weight_sum is None else weight_sum + count
+        if isinstance(aux_i, collections.abc.Mapping):
+            if aux_i.get("weight_sum") is not None:
+                count = jnp.asarray(aux_i["weight_sum"], jnp.float32)
+                weight_sum = count if weight_sum is None else weight_sum + count
+            if scale_val <= 0.0:
+                for key, value in aux_i.items():
+                    if isinstance(key, str) and key.startswith("grpo_gate_sums/"):
+                        scaled_gate = _scale_leaf_fp32(value, uniform_scale)
+                        gate_aux_acc[key] = (
+                            scaled_gate if key not in gate_aux_acc else jnp.add(gate_aux_acc[key], scaled_gate)
+                        )
         if scale_val <= 0.0:
             # Skip zero-weight chunks before multiplying so NaN/Inf on empty chunks
             # cannot poison the accumulated loss, gradients, or auxiliary metrics.
@@ -2865,6 +2918,11 @@ def _run_scheduled_value_and_grad(
         grad_acc = jax.tree_util.tree_map(_zero_like_safe, template_grads)
         if template_aux is not None:
             aux_acc = jax.tree_util.tree_map(_zero_like_safe, template_aux)
+            if gate_aux_acc and isinstance(aux_acc, collections.abc.Mapping):
+                aux_acc = {
+                    **aux_acc,
+                    **{key: _restore_dtype(val, template_aux[key]) for key, val in gate_aux_acc.items()},
+                }
     else:
         loss_acc = _restore_dtype(loss_acc, template_loss)
         grad_acc = jax.tree_util.tree_map(_restore_dtype, grad_acc, template_grads)
@@ -3361,6 +3419,7 @@ def minibatch_call(
     minibatch_size: int,
     grad_fn: tp.Callable[[jax.Array, dict], tuple[jax.Array, LossMetrics]],
     microbatch_weight_fn: tp.Callable[[tp.Any, dict], jax.Array] | None = None,
+    prompt_group_size: int | None = None,
 ) -> tuple[jax.Array, LossMetrics]:
     """
     Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
@@ -3416,7 +3475,13 @@ def minibatch_call(
 
         def slice_minibatch(tree, start_index):
             """Extract one minibatch while leaving shared/global leaves untouched."""
-            return _slice_batch_for_scheduled_step(tree, batch_size, start_index, minibatch_size)
+            return _slice_batch_for_scheduled_step(
+                tree,
+                batch_size,
+                start_index,
+                minibatch_size,
+                prompt_group_size=prompt_group_size,
+            )
 
         shape_minibatch = slice_minibatch(batch, 0)
 

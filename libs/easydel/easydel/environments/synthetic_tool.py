@@ -21,12 +21,14 @@ import collections.abc
 import copy
 import inspect
 import json
+import math
 import typing as tp
 
 from easydel.trainers._shared.environment import AgenticEnvironment, ResetResult, StepResult, create_tool_call_parser
 from easydel.trainers._shared.tools import function_to_json
 
 from ._base import register_environment
+from .swe_repo import unscorable_step
 
 
 @register_environment(["synthetic_tool", "stateful_tool"])
@@ -64,7 +66,10 @@ class SyntheticToolEnvironment(AgenticEnvironment):
         self._verifier = verifier
         self._parser = create_tool_call_parser(tool_caller, tokenizer=tokenizer)
         self._max_tool_calls_per_step = int(max_tool_calls_per_step)
-        self._format_penalty = float(format_penalty)
+        fp = float(format_penalty)
+        if not math.isfinite(fp):
+            raise ValueError(f"`format_penalty` must be finite; got {format_penalty}.")
+        self._format_penalty = fp
         self._halt_on_invalid_tool = bool(halt_on_invalid_tool)
         self._max_steps = int(max_steps)
         self._state: dict[str, tp.Any] = {}
@@ -111,15 +116,25 @@ class SyntheticToolEnvironment(AgenticEnvironment):
         return await asyncio.to_thread(self.step, action)
 
     def _invoke_tool(self, fn: tp.Callable[..., tp.Any], kwargs: dict[str, tp.Any]) -> tp.Any:
+        clean_kwargs = {k: v for k, v in kwargs.items() if k != "state"}
         sig = inspect.signature(fn)
         if "state" in sig.parameters:
-            return fn(state=self._state, **kwargs)
-        return fn(**kwargs)
+            return fn(state=self._state, **clean_kwargs)
+        return fn(**clean_kwargs)
 
     def _score(self, final_answer: str) -> float:
         if self._verifier is None:
             return 0.0
-        return float(self._verifier(self._state, final_answer))
+        val = float(self._verifier(self._state, final_answer))
+        if not math.isfinite(val):
+            raise ValueError(f"verifier returned non-finite reward: {val!r}")
+        return val
+
+    def _safe_score(self, final_answer: str) -> tuple[float, StepResult | None]:
+        try:
+            return self._score(final_answer), None
+        except Exception as exc:
+            return 0.0, unscorable_step(f"verifier failed: {type(exc).__name__}: {exc}")
 
     def step(self, action: str) -> StepResult:
         self._step_count += 1
@@ -133,7 +148,9 @@ class SyntheticToolEnvironment(AgenticEnvironment):
                     truncated=False,
                     info={"step": self._step_count, "format_error": True, "env_error": False},
                 )
-            reward = self._score(action)
+            reward, err_step = self._safe_score(action)
+            if err_step is not None:
+                return err_step
             return StepResult(
                 observation="Submitted.",
                 reward=reward,
@@ -181,13 +198,15 @@ class SyntheticToolEnvironment(AgenticEnvironment):
 
             try:
                 result = self._invoke_tool(fn, kwargs)
-                rendered = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                rendered = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
                 observations.append(f"[{name}]: {rendered}")
             except Exception as exc:
                 observations.append(f"[{name}]: Error: {exc}")
 
         if submitted_answer is not None:
-            reward = self._score(submitted_answer)
+            reward, err_step = self._safe_score(submitted_answer)
+            if err_step is not None:
+                return err_step
             return StepResult(
                 observation="Result submitted.",
                 reward=reward,
@@ -197,7 +216,12 @@ class SyntheticToolEnvironment(AgenticEnvironment):
             )
 
         at_limit = self._step_count >= self._max_steps
-        reward = self._score(action) if at_limit else 0.0
+        if at_limit:
+            reward, err_step = self._safe_score(action)
+            if err_step is not None:
+                return err_step
+        else:
+            reward = 0.0
         return StepResult(
             observation="\n\n".join(observations),
             reward=reward,

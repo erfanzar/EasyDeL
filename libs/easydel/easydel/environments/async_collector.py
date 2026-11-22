@@ -37,6 +37,7 @@ import collections.abc
 import dataclasses
 import math
 import threading
+import time
 import typing as tp
 
 import numpy as np
@@ -391,6 +392,9 @@ class AsyncEnvironmentRolloutCollector:
                             TrajectorySpan(start=obs_start, stop=len(all_tokens), kind="observation", segment_id=0)
                         )
 
+            if not terminated and not truncated:
+                truncated = True
+
             oldest_ver = min(turn_versions) if turn_versions else initial_snapshot.version
             latest_ver = max(turn_versions) if turn_versions else initial_snapshot.version
 
@@ -595,14 +599,22 @@ class AsyncEnvironmentRolloutCollector:
         with self._drain_lock:
             try:
                 while next_idx < len(pending) or ours:
-                    while next_idx < len(pending) and self._free_capacity() > 0:
+                    while next_idx < len(pending):
                         g, seed, kw = pending[next_idx]
-                        ticket = self.submit_episode(prompt_index=g, group_id=g, seed=seed, env_kwargs=kw)
+                        try:
+                            ticket = self.submit_episode(
+                                prompt_index=g, group_id=g, seed=seed, env_kwargs=kw, timeout=0.0
+                            )
+                        except TimeoutError:
+                            break
                         ours.add(ticket.submission_id)
                         next_idx += 1
                     outcome = self._pop_own_aside(ours)
                     if outcome is None:
                         if self._coordinator.outstanding_count == 0:
+                            if next_idx < len(pending):
+                                time.sleep(0.001)
+                                continue
                             break
                         try:
                             outcome = self._coordinator.next_completed(timeout=timeout_per_episode)

@@ -924,6 +924,14 @@ class GRPOConfig(TrainingArguments):
                 raise ValueError("`prefix_shared_forward=True` is not supported with `completion_chunk_size`.")
             if self.top_entropy_quantile < 1.0:
                 raise ValueError("`prefix_shared_forward=True` requires `top_entropy_quantile == 1.0`.")
+            if (
+                getattr(self, "gradient_accumulation_mode", "scan") == "execution"
+                and int(getattr(self, "gradient_accumulation_steps", 1) or 1) > 1
+            ):
+                raise ValueError(
+                    "`prefix_shared_forward=True` does not support `gradient_accumulation_mode='execution'` "
+                    "with `gradient_accumulation_steps > 1`; use `gradient_accumulation_mode='scan'`."
+                )
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

@@ -141,13 +141,29 @@ def test_explicit_base_config_is_used_as_given(captured_inner):
 
 @pytest.mark.parametrize(
     "name",
-    ["grpo", "gmpo", "gdpo", "reinforce_plus_plus", "rloo", "ppo", "vapo", "online_dpo", "gkd", "seq_kd", "sdft"],
+    [
+        "grpo",
+        "gmpo",
+        "gdpo",
+        "reinforce_plus_plus",
+        "rloo",
+        "ppo",
+        "vapo",
+        "online_dpo",
+        "gkd",
+        "on_policy_distillation",
+        "seq_kd",
+        "ssd",
+    ],
 )
 def test_supported_base_trainer_types_accepted(name):
     assert AgentFlowConfig(base_trainer_type=name.upper()).base_trainer_type == name
 
 
-@pytest.mark.parametrize("name", ["sft", "dpo", "kto", "orpo", "reward", "not_a_trainer"])
+@pytest.mark.parametrize(
+    "name",
+    ["sft", "dpo", "kto", "orpo", "reward", "not_a_trainer", "sdft", "sdpo", "nash-md", "xpo", "sao", "compaction_rl"],
+)
 def test_unsupported_base_trainer_types_rejected(name):
     with pytest.raises(ValueError, match="not supported by AgentFlowTrainer"):
         AgentFlowConfig(base_trainer_type=name)

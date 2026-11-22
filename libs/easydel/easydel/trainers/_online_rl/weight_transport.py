@@ -67,12 +67,17 @@ import dataclasses
 import enum
 import itertools
 import json
+import logging
+import math
+import selectors
 import socket
 import struct
 import threading
 import time
 import types
 import typing as tp
+
+logger = logging.getLogger(__name__)
 
 __all__ = (
     "InProcessWeightTransport",
@@ -301,8 +306,10 @@ class WeightPublisher:
         clock: tp.Callable[[], float] = time.monotonic,
         history_size: int = 1024,
     ):
-        if pull_timeout is not None and pull_timeout <= 0:
-            raise ValueError(f"pull_timeout must be positive, got {pull_timeout}")
+        if pull_timeout is not None and (not math.isfinite(pull_timeout) or pull_timeout <= 0):
+            raise ValueError(f"pull_timeout must be finite and positive, got {pull_timeout}")
+        if watchdog_interval is not None and (not math.isfinite(watchdog_interval) or watchdog_interval <= 0):
+            raise ValueError(f"watchdog_interval must be finite and positive, got {watchdog_interval}")
         self.backend: WeightTransportBackend = backend if backend is not None else InProcessWeightTransport()
         self.pull_timeout = pull_timeout
         self._clock = clock
@@ -401,12 +408,19 @@ class WeightPublisher:
             if self._latest_version is not None and version <= self._latest_version:
                 raise ValueError(f"version must increase: {version} <= {self._latest_version}")
             handle = self.backend.stage(version, snapshot)
+            try:
+                descriptor = types.MappingProxyType(dict(self.backend.describe(handle)))
+                frozen_metadata = types.MappingProxyType(dict(metadata or {}))
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self.backend.release(handle)
+                raise
             staged = _Staged(
                 version=version,
                 snapshot=snapshot,
                 handle=handle,
-                descriptor=types.MappingProxyType(dict(self.backend.describe(handle))),
-                metadata=types.MappingProxyType(dict(metadata or {})),
+                descriptor=descriptor,
+                metadata=frozen_metadata,
                 release=release,
             )
             previous, self._staged, self._latest_version = self._staged, staged, version
@@ -473,7 +487,12 @@ class WeightPublisher:
                 active = record.active
                 if active is not None and active.state == "offered":
                     return active.offer
-                if not record.requested and active is None:
+                if active is not None:
+                    raise WeightTransportError(
+                        f"subscriber {name!r} has an active offer {active.offer.offer_id} "
+                        f"in state {active.state!r}; settle it before receiving again"
+                    )
+                if not record.requested:
                     raise WeightTransportError(f"subscriber {name!r} has no outstanding request to receive on")
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
@@ -485,9 +504,9 @@ class WeightPublisher:
             active = self._active_for(name, offer)
             if active.state != "offered":
                 raise WeightTransportError(f"offer {offer.offer_id} is already being pulled")
+            self.backend.serve(active.staged.handle, offer.offer_id, self.pull_timeout)
             active.state = "pulling"
             active.pulling_since = self._clock()
-            self.backend.serve(active.staged.handle, offer.offer_id, self.pull_timeout)
             return active.staged
 
     def _ack(self, name: str, offer: WeightOffer) -> None:
@@ -648,10 +667,13 @@ class WeightPublisher:
 
     def _watchdog_loop(self, interval: float) -> None:
         while not self._watchdog_stop.wait(interval):
-            with self._locked():
-                if self._closed:
-                    return
-                self._expire_stalled_locked()
+            try:
+                with self._locked():
+                    if self._closed:
+                        return
+                    self._expire_stalled_locked()
+            except Exception:
+                logger.warning("WeightPublisher watchdog iteration failed", exc_info=True)
 
 
 class WeightSubscriber:
@@ -723,19 +745,33 @@ class WeightSubscriber:
 _MAX_FRAME_BYTES = 64 << 20
 _HANDSHAKE_FRAME_BYTES = 1024
 _HANDSHAKE_TIMEOUT = 10.0
+_BRIDGE_RECEIVE_POLL_INTERVAL = 0.05
+_CLOSE_RPC_TIMEOUT = 2.0
 _LEARNER_ROLE = "learner"
 _SAMPLER_ROLE = "sampler"
 
 
+class _PeerDisconnected(Exception):
+    """Internal signal raised when the bridge detects peer EOF/RST or local close."""
+
+
 def _peer_is_local(sock: socket.socket) -> bool:
     """Whether ``sock`` is a Unix-domain socket or a TCP socket whose peer is a loopback address."""
-    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+    af_unix = getattr(socket, "AF_UNIX", None)
+    if af_unix is not None and sock.family == af_unix:
         return True
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return False
     import ipaddress
 
     try:
         host = sock.getpeername()[0]
-        return ipaddress.ip_address(str(host).split("%", 1)[0]).is_loopback
+        addr = ipaddress.ip_address(str(host).split("%", 1)[0])
+        if addr.is_loopback:
+            return True
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return addr.ipv4_mapped.is_loopback
+        return False
     except (OSError, ValueError):
         return False
 
@@ -799,16 +835,16 @@ class SocketMessageChannel:
             raise WeightTransportError("auth_token must not be empty")
         peer_role = _SAMPLER_ROLE if role == _LEARNER_ROLE else _LEARNER_ROLE
         previous_timeout = self._sock.gettimeout()
-        self._sock.settimeout(_HANDSHAKE_TIMEOUT)
+        deadline = time.monotonic() + _HANDSHAKE_TIMEOUT
         try:
             own_nonce = secrets.token_hex(32).encode("ascii")
-            self.send({"op": "hello", "nonce": own_nonce.decode("ascii")})
-            hello = self.recv(max_bytes=_HANDSHAKE_FRAME_BYTES)
+            self.send({"op": "hello", "nonce": own_nonce.decode("ascii")}, deadline=deadline)
+            hello = self.recv(max_bytes=_HANDSHAKE_FRAME_BYTES, deadline=deadline)
             peer_nonce = str(hello.get("nonce", "")).encode("ascii")
             if hello.get("op") != "hello" or len(peer_nonce) != 64 or peer_nonce == own_nonce:
                 raise WeightTransportError("malformed weight-transport handshake")
-            self.send({"op": "auth", "mac": _handshake_mac(token, role, own_nonce, peer_nonce)})
-            proof = self.recv(max_bytes=_HANDSHAKE_FRAME_BYTES)
+            self.send({"op": "auth", "mac": _handshake_mac(token, role, own_nonce, peer_nonce)}, deadline=deadline)
+            proof = self.recv(max_bytes=_HANDSHAKE_FRAME_BYTES, deadline=deadline)
             expected = _handshake_mac(token, peer_role, peer_nonce, own_nonce)
             if proof.get("op") != "auth" or not hmac.compare_digest(str(proof.get("mac", "")), expected):
                 raise WeightTransportError("weight-transport peer failed authentication")
@@ -819,29 +855,75 @@ class SocketMessageChannel:
             raise WeightTransportError(f"weight-transport handshake failed: {err}") from err
         self._sock.settimeout(previous_timeout)
 
-    def send(self, message: tp.Mapping[str, tp.Any]) -> None:
+    def send(self, message: tp.Mapping[str, tp.Any], *, deadline: float | None = None) -> None:
         payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
         if len(payload) > _MAX_FRAME_BYTES:
             raise WeightTransportError(f"control message of {len(payload)} bytes exceeds {_MAX_FRAME_BYTES}")
+        frame = struct.pack(">I", len(payload)) + payload
         with self._send_lock:
+            previous_timeout: float | None = None
+            restore_timeout = False
             try:
-                self._sock.sendall(struct.pack(">I", len(payload)) + payload)
+                if deadline is None:
+                    self._sock.sendall(frame)
+                else:
+                    previous_timeout = self._sock.gettimeout()
+                    restore_timeout = True
+                    view = memoryview(frame)
+                    sent = 0
+                    while sent < len(view):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("control channel send timed out")
+                        self._sock.settimeout(remaining)
+                        written = self._sock.send(view[sent:])
+                        if written <= 0:
+                            raise WeightTransportClosed("control channel closed by peer")
+                        sent += written
+            except WeightTransportClosed:
+                raise
             except OSError as err:
                 raise WeightTransportClosed(f"control channel send failed: {err}") from err
+            finally:
+                if restore_timeout:
+                    with contextlib.suppress(OSError):
+                        self._sock.settimeout(previous_timeout)
 
-    def recv(self, *, max_bytes: int = _MAX_FRAME_BYTES) -> dict[str, tp.Any]:
+    def recv(self, *, max_bytes: int = _MAX_FRAME_BYTES, deadline: float | None = None) -> dict[str, tp.Any]:
         with self._recv_lock:
-            (size,) = struct.unpack(">I", self._recv_exact(4))
-            if size > max_bytes:
-                raise WeightTransportError(f"control message of {size} bytes exceeds {max_bytes}")
-            message = json.loads(self._recv_exact(size).decode("utf-8"))
-            if not isinstance(message, dict):
-                raise WeightTransportError("control message is not a JSON object")
-            return message
+            previous_timeout: float | None = None
+            restore_timeout = False
+            try:
+                if deadline is not None:
+                    try:
+                        previous_timeout = self._sock.gettimeout()
+                        restore_timeout = True
+                    except OSError as err:
+                        raise WeightTransportClosed(f"control channel recv failed: {err}") from err
+                (size,) = struct.unpack(">I", self._recv_exact(4, deadline=deadline))
+                if size > max_bytes:
+                    raise WeightTransportError(f"control message of {size} bytes exceeds {max_bytes}")
+                raw = self._recv_exact(size, deadline=deadline)
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except (UnicodeError, ValueError) as err:
+                    raise WeightTransportError(f"malformed control message: {err}") from err
+                if not isinstance(message, dict):
+                    raise WeightTransportError("control message is not a JSON object")
+                return message
+            finally:
+                if restore_timeout:
+                    with contextlib.suppress(OSError):
+                        self._sock.settimeout(previous_timeout)
 
-    def _recv_exact(self, size: int) -> bytes:
+    def _recv_exact(self, size: int, *, deadline: float | None = None) -> bytes:
         chunks = bytearray()
         while len(chunks) < size:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WeightTransportClosed("control channel recv timed out")
+                self._sock.settimeout(remaining)
             try:
                 chunk = self._sock.recv(size - len(chunks))
             except OSError as err:
@@ -851,10 +933,37 @@ class SocketMessageChannel:
             chunks.extend(chunk)
         return bytes(chunks)
 
+    def is_peer_closed(self) -> bool:
+        """Return whether the socket is closed locally or the peer has sent EOF/RST."""
+        with self._recv_lock:
+            try:
+                fd = self._sock.fileno()
+            except OSError:
+                return True
+            if fd < 0:
+                return True
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(fd, selectors.EVENT_READ)
+                    events = selector.select(timeout=0)
+            except (OSError, ValueError):
+                return True
+            if not events:
+                return False
+            flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+            try:
+                peeked = self._sock.recv(1, flags)
+                return len(peeked) == 0
+            except BlockingIOError:
+                return False
+            except OSError:
+                return True
+
     def close(self) -> None:
         with contextlib.suppress(OSError):
             self._sock.shutdown(socket.SHUT_RDWR)
-        self._sock.close()
+        with contextlib.suppress(OSError):
+            self._sock.close()
 
 
 _REMOTE_ERRORS: dict[str, type[WeightTransportError]] = {
@@ -901,6 +1010,7 @@ class RemoteSubscriberBridge:
         self._auth_token = auth_token
         self.authenticated = threading.Event()
         self.auth_error: WeightTransportError | None = None
+        self._closed = False
         self._subscriber = publisher.subscribe(name, installed_version=installed_version)
         self._offers: dict[int, WeightOffer] = {}
         self._thread = threading.Thread(target=self._serve, name=f"weight-bridge-{name}", daemon=True)
@@ -908,6 +1018,14 @@ class RemoteSubscriberBridge:
 
     def join(self, timeout: float | None = None) -> None:
         self._thread.join(timeout)
+
+    def close(self, timeout: float | None = 5.0) -> None:
+        """Close the bridge, unsubscribe its subscriber, close its channel, and wait for its serving thread."""
+        self._closed = True
+        self._subscriber.close()
+        self._channel.close()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout)
 
     def _serve(self) -> None:
         try:
@@ -923,9 +1041,18 @@ class RemoteSubscriberBridge:
                     message = self._channel.recv()
                 except WeightTransportClosed:
                     return
+                except (WeightTransportError, ValueError, UnicodeError) as err:
+                    logger.warning(
+                        "Closing weight-transport bridge %r after invalid frame: %s",
+                        self._subscriber.name,
+                        err,
+                    )
+                    return
                 op = message.get("op")
                 try:
                     reply = self._handle(op, message)
+                except _PeerDisconnected:
+                    return
                 except WeightTransportError as err:
                     reply = {"ok": False, "error": type(err).__name__, "message": str(err)}
                     if isinstance(err, WeightOfferSettled) and err.outcome is not None:
@@ -939,6 +1066,7 @@ class RemoteSubscriberBridge:
                 if op == "close":
                     return
         finally:
+            self._offers.clear()
             self._subscriber.close()
             self._channel.close()
 
@@ -948,24 +1076,65 @@ class RemoteSubscriberBridge:
             return {"ok": True}
         if op == "receive":
             timeout = message.get("timeout")
-            offer = self._publisher._receive(self._subscriber.name, None if timeout is None else float(timeout))
+            if timeout is not None and float(timeout) <= 0:
+                if self._closed or self._channel.is_peer_closed():
+                    raise _PeerDisconnected()
+                offer = self._publisher._receive(self._subscriber.name, 0.0)
+            else:
+                deadline = None if timeout is None else time.monotonic() + float(timeout)
+                offer = None
+                while True:
+                    if self._closed or self._channel.is_peer_closed():
+                        raise _PeerDisconnected()
+                    if deadline is None:
+                        step_timeout = _BRIDGE_RECEIVE_POLL_INTERVAL
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        step_timeout = min(remaining, _BRIDGE_RECEIVE_POLL_INTERVAL)
+                    offer = self._publisher._receive(self._subscriber.name, step_timeout)
+                    if offer is not None:
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
             if offer is None:
                 return {"ok": True, "offer": None}
+            # A subscriber can hold at most one active offer; drop any superseded/stalled descriptor immediately.
+            self._offers.clear()
             self._offers[offer.offer_id] = offer
             return {"ok": True, "offer": offer.to_wire()}
         if op in ("begin", "ack", "decline"):
-            offer = self._offers.get(int(message["offer_id"]))
+            offer_id = int(message["offer_id"])
+            offer = self._offers.get(offer_id)
             if offer is None:
-                raise WeightOfferSettled(f"unknown offer {message['offer_id']}")
+                if op == "decline":
+                    with self._publisher._locked():
+                        self._publisher._record(self._subscriber.name)
+                    return {"ok": True, "declined": False}
+                with self._publisher._cond:
+                    outcome = self._publisher._outcome_of(offer_id)
+                if outcome is OfferOutcome.STALLED:
+                    raise WeightTransferStalled(f"offer {offer_id} was settled as stalled")
+                raise WeightOfferSettled(f"unknown offer {offer_id}", outcome)
             if op == "begin":
-                self._subscriber.pull(offer)
+                try:
+                    self._subscriber.pull(offer)
+                except (WeightOfferSettled, WeightTransferStalled):
+                    self._offers.pop(offer.offer_id, None)
+                    raise
                 return {"ok": True}
             if op == "ack":
+                try:
+                    self._subscriber.ack(offer)
+                except (WeightOfferSettled, WeightTransferStalled):
+                    self._offers.pop(offer.offer_id, None)
+                    raise
                 self._offers.pop(offer.offer_id, None)
-                self._subscriber.ack(offer)
                 return {"ok": True}
+            declined = self._subscriber.decline(offer)
             self._offers.pop(offer.offer_id, None)
-            return {"ok": True, "declined": self._subscriber.decline(offer)}
+            return {"ok": True, "declined": declined}
         if op == "close":
             return {"ok": True}
         raise WeightTransportError(f"unknown op {op!r}")
@@ -1054,11 +1223,23 @@ class RemoteWeightSubscriber:
         return bool(self._call({"op": "decline", "offer_id": offer.offer_id}).get("declined"))
 
     def close(self) -> None:
-        with contextlib.suppress(WeightTransportError):
-            self._call({"op": "close"})
-        with self._lock:
+        if self._lock.acquire(blocking=False):
+            try:
+                if self._closed:
+                    return
+                self._closed = True
+                deadline = time.monotonic() + _CLOSE_RPC_TIMEOUT
+                with contextlib.suppress(WeightTransportError):
+                    self._channel.send({"op": "close"}, deadline=deadline)
+                    self._channel.recv(deadline=deadline)
+            finally:
+                self._channel.close()
+                self._lock.release()
+        else:
+            # Another thread holds _lock (e.g. blocked in receive(timeout=None)):
+            # mark closed and shut down the socket immediately so the blocked recv() wakes up.
             self._closed = True
-        self._channel.close()
+            self._channel.close()
 
 
 # ---------------------------------------------------------------------- jax transfer-server backend
@@ -1080,18 +1261,42 @@ class LeafSpec:
         return cls(shape=tuple(int(d) for d in data["shape"]), dtype=str(data["dtype"]), sharding=data.get("sharding"))
 
 
+_DEFAULT_TRANSFER_PULL_TIMEOUT = 300.0
+
+
 def _describe_sharding(sharding: tp.Any) -> dict[str, tp.Any] | None:
-    from jax.sharding import NamedSharding
+    if sharding is None:
+        return None
+    from jax.sharding import NamedSharding, PartitionSpec, SingleDeviceSharding
 
     if isinstance(sharding, NamedSharding):
-        spec = [list(entry) if isinstance(entry, tuple) else entry for entry in sharding.spec]
+        spec: list[tp.Any] = []
+        for entry in sharding.spec:
+            if entry is PartitionSpec.UNCONSTRAINED:
+                raise WeightTransportError("PartitionSpec.UNCONSTRAINED is not supported for weight transfer")
+            if isinstance(entry, tuple):
+                if any(sub is PartitionSpec.UNCONSTRAINED or not isinstance(sub, str) for sub in entry):
+                    raise WeightTransportError(f"unsupported PartitionSpec axis tuple {entry!r} for weight transfer")
+                spec.append(list(entry))
+            elif entry is None or isinstance(entry, str):
+                spec.append(entry)
+            else:
+                raise WeightTransportError(f"unsupported PartitionSpec entry {entry!r} for weight transfer")
         return {
             "kind": "named",
             "axis_names": list(sharding.mesh.axis_names),
             "mesh_shape": [int(size) for size in sharding.mesh.devices.shape],
             "spec": spec,
         }
-    return None
+    if isinstance(sharding, SingleDeviceSharding):
+        return None
+    device_set = getattr(sharding, "device_set", None)
+    if device_set is not None and len(device_set) == 1:
+        return None
+    raise WeightTransportError(
+        f"unsupported multi-device sharding {type(sharding).__name__}; "
+        "only NamedSharding and single-device shardings are supported for weight transfer"
+    )
 
 
 def _uuid(offer_id: int, leaf_index: int) -> int:
@@ -1118,6 +1323,9 @@ class JaxTransferServerBackend:
         address: Bind address of the started server.
         transport_addresses: Data-plane addresses of the started server.
         device: Device whose client hosts the server (default: first local device).
+        default_pull_timeout: Finite fallback timeout (seconds) passed to
+            ``server.await_pull`` whenever the publisher's ``pull_timeout`` is
+            ``None``, ensuring unpulled leaves never stay pinned in HBM forever.
     """
 
     def __init__(
@@ -1127,19 +1335,30 @@ class JaxTransferServerBackend:
         address: str = "127.0.0.1:0",
         transport_addresses: tp.Sequence[str] = ("127.0.0.1:0",),
         device: tp.Any = None,
+        default_pull_timeout: float = _DEFAULT_TRANSFER_PULL_TIMEOUT,
     ):
+        if not math.isfinite(default_pull_timeout) or default_pull_timeout <= 0:
+            raise ValueError(f"default_pull_timeout must be finite and positive, got {default_pull_timeout}")
         if server is None:
             server = _start_transfer_server(address, transport_addresses, device)
         self.server = server
+        self._address: str = server.address()
+        self.default_pull_timeout = float(default_pull_timeout)
+        self._closed = False
 
     @property
     def address(self) -> str:
-        return self.server.address()
+        if self._closed or self.server is None:
+            raise WeightTransportClosed("JaxTransferServerBackend is closed")
+        return self._address
 
     def stage(self, version: int, snapshot: tp.Any) -> _JaxStaged:
         import jax
 
         del version
+        server = self.server
+        if self._closed or server is None:
+            raise WeightTransportClosed("JaxTransferServerBackend is closed")
         leaves, treedef = jax.tree.flatten(snapshot)
         if len(leaves) >= 1 << 24:
             raise ValueError(f"snapshot has too many leaves ({len(leaves)})")
@@ -1156,7 +1375,7 @@ class JaxTransferServerBackend:
         ]
         descriptor = {
             "kind": "jax_transfer",
-            "address": self.address,
+            "address": self._address,
             "treedef": encoded_treedef,
             "leaves": [spec.to_wire() for spec in specs],
         }
@@ -1168,15 +1387,40 @@ class JaxTransferServerBackend:
     def serve(self, handle: _JaxStaged, offer_id: int, timeout: float | None) -> None:
         import datetime
 
-        deadline = None if timeout is None else datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+        server = self.server
+        if self._closed or server is None:
+            raise WeightTransportClosed("JaxTransferServerBackend is closed")
+        effective_timeout = self.default_pull_timeout if timeout is None else float(timeout)
+        if not math.isfinite(effective_timeout) or effective_timeout <= 0:
+            raise ValueError(f"pull timeout must be finite and positive, got {effective_timeout}")
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=effective_timeout)
         for index, leaf in enumerate(handle.leaves):
-            if deadline is None:
-                self.server.await_pull(_uuid(offer_id, index), [leaf])
-            else:
-                self.server.await_pull(_uuid(offer_id, index), [leaf], timeout=deadline)
+            if self._closed:
+                raise WeightTransportClosed("JaxTransferServerBackend is closed")
+            server.await_pull(_uuid(offer_id, index), [leaf], timeout=deadline)
 
     def release(self, handle: _JaxStaged) -> None:
         handle.leaves.clear()
+
+    def close(self) -> None:
+        """Close the backend and drop its transfer-server reference. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        server, self.server = self.server, None
+        if server is not None:
+            for method_name in ("close", "shutdown"):
+                method = getattr(server, method_name, None)
+                if callable(method):
+                    with contextlib.suppress(Exception):
+                        method()
+                    break
+
+    def __enter__(self) -> JaxTransferServerBackend:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def _start_transfer_server(address: str, transport_addresses: tp.Sequence[str], device: tp.Any) -> tp.Any:
@@ -1220,14 +1464,56 @@ class JaxTransferClient:
         self._resolver = sharding_resolver
         self._treedef = treedef
         self._device = device
+        self._lock = threading.Lock()
+        self._closed = False
         self._connections: dict[str, tp.Any] = {}
 
     def _connection(self, address: str) -> tp.Any:
-        connection = self._connections.get(address)
-        if connection is None:
-            connection = self.server.connect(address)
-            self._connections[address] = connection
-        return connection
+        with self._lock:
+            if self._closed or self.server is None:
+                raise WeightTransportClosed("JaxTransferClient is closed")
+            connection = self._connections.get(address)
+            if connection is None:
+                connection = self.server.connect(address)
+                self._connections[address] = connection
+            return connection
+
+    def _evict_connection(self, address: str, connection: tp.Any) -> None:
+        with self._lock:
+            if self._connections.get(address) is connection:
+                self._connections.pop(address, None)
+        close_fn = getattr(connection, "close", None)
+        if callable(close_fn):
+            with contextlib.suppress(Exception):
+                close_fn()
+
+    def close(self) -> None:
+        """Close the client, dropping cached connections and transfer-server references. Idempotent."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            connections = list(self._connections.values())
+            self._connections.clear()
+            server, self.server = self.server, None
+        for connection in connections:
+            close_fn = getattr(connection, "close", None)
+            if callable(close_fn):
+                with contextlib.suppress(Exception):
+                    close_fn()
+        if server is not None:
+            for method_name in ("close", "shutdown"):
+                method = getattr(server, method_name, None)
+                if callable(method):
+                    with contextlib.suppress(Exception):
+                        method()
+                    break
+
+    def __enter__(self) -> JaxTransferClient:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _sharding(self, index: int, spec: LeafSpec) -> tp.Any:
         import jax
@@ -1264,36 +1550,64 @@ class JaxTransferClient:
             treedef = jax.tree_util.PyTreeDef.deserialize_using_proto(
                 jax.tree_util.default_registry, base64.b64decode(encoded)
             )
-        connection = self._connection(str(descriptor["address"]))
+        address = str(descriptor["address"])
+        connection = self._connection(address)
         deadline = None if timeout is None else time.monotonic() + timeout
-        leaves = []
-        for index, wire in enumerate(descriptor["leaves"]):
-            spec = LeafSpec.from_wire(wire)
-            target = jax.ShapeDtypeStruct(spec.shape, jnp.dtype(spec.dtype), sharding=self._sharding(index, spec))
-            leaves.append(self._pull_leaf(connection, offer, index, target, deadline))
+        leaves: list[tp.Any] = []
+        try:
+            for index, wire in enumerate(descriptor["leaves"]):
+                spec = LeafSpec.from_wire(wire)
+                target = jax.ShapeDtypeStruct(spec.shape, jnp.dtype(spec.dtype), sharding=self._sharding(index, spec))
+                leaves.append(self._pull_leaf(connection, offer, index, target, deadline))
+        except BaseException:
+            leaves.clear()
+            self._evict_connection(address, connection)
+            raise
         return jax.tree.unflatten(treedef, leaves)
 
     def _pull_leaf(self, connection: tp.Any, offer: WeightOffer, index: int, target: tp.Any, deadline) -> tp.Any:
+        import datetime
+
         import jax
 
+        pull_uuid = _uuid(offer.offer_id, index)
+        if deadline is None:
+            try:
+                (array,) = connection.pull(pull_uuid, [target])
+                return jax.block_until_ready(array)
+            except Exception as err:
+                raise WeightTransportError(f"pull of leaf {index} of offer {offer.offer_id} failed") from err
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WeightTransferStalled(
+                f"pull of leaf {index} of offer {offer.offer_id} (version {offer.version}) did not finish "
+                "within the pull timeout"
+            )
+        pull_deadline = datetime.datetime.now() + datetime.timedelta(seconds=remaining)
         result: list[tp.Any] = []
         failure: list[BaseException] = []
 
         def run() -> None:
             try:
-                (array,) = connection.pull(_uuid(offer.offer_id, index), [target])
+                (array,) = connection.pull(pull_uuid, [target], timeout=pull_deadline)
                 result.append(jax.block_until_ready(array))
             except BaseException as err:
                 failure.append(err)
 
         worker = threading.Thread(target=run, name=f"weight-pull-{offer.offer_id}-{index}", daemon=True)
         worker.start()
-        worker.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        worker.join(max(0.0, deadline - time.monotonic()))
         if worker.is_alive():
             raise WeightTransferStalled(
                 f"pull of leaf {index} of offer {offer.offer_id} (version {offer.version}) did not finish "
                 "within the pull timeout"
             )
         if failure:
+            if isinstance(failure[0], TimeoutError) or time.monotonic() >= deadline:
+                raise WeightTransferStalled(
+                    f"pull of leaf {index} of offer {offer.offer_id} (version {offer.version}) did not finish "
+                    "within the pull timeout"
+                ) from failure[0]
             raise WeightTransportError(f"pull of leaf {index} of offer {offer.offer_id} failed") from failure[0]
         return result[0]

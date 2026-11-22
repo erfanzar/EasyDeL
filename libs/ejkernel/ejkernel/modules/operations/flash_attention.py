@@ -59,7 +59,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     BwdParams,
@@ -240,11 +240,14 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         return shard_map_fn, call_args
 
-    def get_impl(self, cfg: FlashAttentionConfig):
+    def get_impl(self, cfg: FlashAttentionConfig, *, prefer_cuda: bool = True):
         """Get kernel implementation from registry based on configuration.
 
         Args:
             cfg: Configuration specifying platform and backend
+            prefer_cuda: Prefer the CUDA backend when auto-detecting on NVIDIA
+                GPUs. Set ``False`` when an additive 4-D bias is supplied, since
+                the native CUDA kernel only supports ALiBi slopes.
 
         Returns:
             Callable kernel implementation
@@ -252,14 +255,21 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         Raises:
             ValueError: If no matching implementation is found
         """
+        resolved_platform = detect_platform(
+            "flash_attention",
+            cfg.platform,
+            prefer_cuda=prefer_cuda,
+            prefer_triton=not prefer_cuda,
+        )
+        backend = cfg.backend
+        if not prefer_cuda and cfg.platform in ("auto", None) and resolved_platform == Platform.CUDA:
+            resolved_platform = Platform.XLA
+        if resolved_platform == Platform.XLA:
+            backend = Backend.ANY
         return kernel_registry.get(
             algorithm="flash_attention",
-            platform=detect_platform(
-                "flash_attention",
-                cfg.platform,
-                prefer_cuda=True,
-            ),
-            backend=cfg.backend,
+            platform=resolved_platform,
+            backend=backend,
         )
 
     def run(
@@ -320,6 +330,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             Attention output [batch, seq_len_q, num_heads, head_dim]
         """
 
+        has_additive_bias = bias is not None and getattr(bias, "ndim", 0) > 2
+        cfg_platform_val = getattr(cfg.platform, "value", str(cfg.platform))
         if platform is not None:
             cfg = FlashAttentionConfig(
                 fwd_params=cfg.fwd_params,
@@ -327,7 +339,17 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        impl = self.get_impl(cfg)
+        elif has_additive_bias and cfg_platform_val == "cuda":
+            # Executor._prefer_cuda_cfg upgrades heuristic/autotuned "auto"/"triton" configs
+            # to platform="cuda" on NVIDIA GPUs when platform is None/"auto", but the native
+            # CUDA flash kernel only accepts ALiBi slopes, never 4-D additive bias.
+            cfg = FlashAttentionConfig(
+                fwd_params=cfg.fwd_params,
+                bwd_params=cfg.bwd_params,
+                platform="auto",
+                backend=cfg.backend,
+            )
+        impl = self.get_impl(cfg, prefer_cuda=not has_additive_bias)
         out = impl(
             query=query,
             key=key,
@@ -504,7 +526,18 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         sliding_window = inv.kwargs.get("sliding_window", None)
         causal = bool(inv.kwargs.get("causal", True))
         requested = inv.kwargs.get("platform", None)
-        platforms = ("triton", "cuda", "cute", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        bias = inv.kwargs.get("bias", None)
+        has_additive_bias = bias is not None and getattr(bias, "ndim", 0) > 2
+        if requested in (None, "auto"):
+            platforms = ("triton", "cute", "tilelang", "xla") if has_additive_bias else (
+                "triton",
+                "cuda",
+                "cute",
+                "tilelang",
+                "xla",
+            )
+        else:
+            platforms = (str(requested),)
 
         def window_total(sw):
             """Compute total window span from a sliding window specification."""
@@ -949,6 +982,17 @@ def flash_attention(
 
     if block_tables is not None and platform in (None, "auto"):
         platform = "cute"
+    elif position_bias is not None and (
+        platform == "cuda"
+        or (
+            platform in (None, "auto")
+            and cfg is not None
+            and getattr(cfg.platform, "value", str(cfg.platform)) == "cuda"
+        )
+    ):
+        # The position-aware path folds visibility into an additive 4-D bias, which
+        # the native CUDA flash kernel rejects (it only supports 1-D/2-D ALiBi slopes).
+        platform = "xla"
 
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
@@ -965,13 +1009,23 @@ def flash_attention(
             )
         q_spec, k_spec, v_spec, bias_spec, cu_q_spec, cu_k_spec, aux_spec = in_specs[:7]
         block_tables_spec = in_specs[7] if len(in_specs) == 8 else None
-        if position_bias is not None and bias_spec is None:
-            # The bias was built here, so the caller had no spec for it: shard it like the query
-            # (batch, heads, q sequence) and the kv sequence like the key.
+        if position_bias is not None:
+            # ``bias`` was broadcast/expanded to ``(batch, num_heads, q_len, kv_len)`` above,
+            # even when the caller supplied a broadcastable bias like ``(batch, 1, q_len, kv_len)``
+            # or ``bias=None``. Always align ``bias_spec`` with ``query``'s batch and head axes,
+            # reject active sequence-axis sharding, and keep bias sequence dims unsharded so
+            # ``q_spec``/``k_spec`` never duplicate a sequence mesh axis across dims 2 and 3.
             q_axes = (*tuple(q_spec), None, None, None, None)[:4] if q_spec is not None else (None,) * 4
             k_axes = (*tuple(k_spec), None, None, None, None)[:4] if k_spec is not None else (None,) * 4
-            bias_spec = PartitionSpec(q_axes[0], q_axes[2], q_axes[1], k_axes[1])
-        if mask_info is None:
+            for name, spec, seq_axis in (("query", q_spec, q_axes[1]), ("key", k_spec, k_axes[1])):
+                axes = () if seq_axis is None else (seq_axis if isinstance(seq_axis, tuple) else (seq_axis,))
+                if math.prod(int(mesh.shape[a]) for a in axes) != 1:
+                    raise NotImplementedError(
+                        "flash_attention with explicit q/kv positions and q_len != kv_len "
+                        f"does not support a sharded {name} sequence axis ({spec})."
+                    )
+            bias_spec = PartitionSpec(q_axes[0], q_axes[2], None, None)
+        if mask_info is None or (attention_mask is None and q_segment_ids is None and kv_segment_ids is None):
             mask_spec = q_seg_spec = kv_seg_spec = None
         else:
             shardings = mask_info.get_shardings(False, mesh=mesh)

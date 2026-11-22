@@ -127,13 +127,18 @@ def compose_outcome_reward(
             and ceiling clamps, so it is rejected rather than guessed at).
     """
     floor = correct_answer_floor(incorrect_ceiling, correct_reward)
+    inc_reward = float(incorrect_reward)
+    if not math.isfinite(inc_reward):
+        raise ValueError(f"`incorrect_reward` must be finite; got {incorrect_reward}.")
     terms = [float(term) for term in shaping_terms if term is not None]
     if not all(math.isfinite(term) for term in terms):
         raise ValueError(f"Shaping terms must be finite; got {terms}.")
     shaping = math.fsum(terms)
+    if not math.isfinite(shaping):
+        raise ValueError(f"Sum of shaping terms must be finite; got {shaping}.")
     if correct:
         return max(float(correct_reward) + shaping, floor)
-    return min(float(incorrect_reward) + shaping, float(incorrect_ceiling))
+    return min(inc_reward + shaping, float(incorrect_ceiling))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -274,8 +279,15 @@ def gate_invalid(reward: float, valid: bool, *, cap: float = 0.0) -> float:
 
     Returns:
         ``reward`` when valid, else ``min(cap, reward)`` (negative shaping is kept).
+
+    Raises:
+        ValueError: If ``reward`` or ``cap`` is non-finite.
     """
-    return float(reward) if valid else min(float(cap), float(reward))
+    r = float(reward)
+    c = float(cap)
+    if not (math.isfinite(r) and math.isfinite(c)):
+        raise ValueError(f"`reward` and `cap` must be finite; got reward={reward}, cap={cap}.")
+    return r if valid else min(c, r)
 
 
 def lexicographic_blend(
@@ -319,24 +331,35 @@ def lexicographic_blend(
     Raises:
         ValueError: On mismatched weights, negative/all-zero weights, or out-of-range parameters.
     """
-    if not primary_scale > 0:
-        raise ValueError(f"`primary_scale` must be positive; got {primary_scale}.")
-    if not secondary_max > 0:
-        raise ValueError(f"`secondary_max` must be positive; got {secondary_max}.")
-    if not 0.0 <= band < 1.0:
-        raise ValueError(f"`band` must be in [0, 1); got {band}.")
-    secondaries = [float(s) for s in secondaries]
-    if not secondaries:
-        return float(primary)
-    weights = [1.0] * len(secondaries) if weights is None else [float(w) for w in weights]
-    if len(weights) != len(secondaries):
-        raise ValueError(f"Got {len(weights)} weights for {len(secondaries)} secondaries.")
-    if any(w < 0 for w in weights) or sum(weights) <= 0:
-        raise ValueError("Weights must be non-negative with a positive sum.")
-    normalized = [min(max(s, 0.0), float(secondary_max)) / float(secondary_max) for s in secondaries]
-    mean = math.fsum(w * s for w, s in zip(weights, normalized, strict=True)) / math.fsum(weights)
+    prim = float(primary)
+    pscale = float(primary_scale)
+    smax = float(secondary_max)
+    b = float(band)
+    if not math.isfinite(prim):
+        raise ValueError(f"`primary` must be finite; got {primary}.")
+    if not (math.isfinite(pscale) and pscale > 0.0):
+        raise ValueError(f"`primary_scale` must be finite and positive; got {primary_scale}.")
+    if not (math.isfinite(smax) and smax > 0.0):
+        raise ValueError(f"`secondary_max` must be finite and positive; got {secondary_max}.")
+    if not (math.isfinite(b) and 0.0 <= b < 1.0):
+        raise ValueError(f"`band` must be finite and in [0, 1); got {band}.")
+    secs = [float(s) for s in secondaries]
+    if not all(math.isfinite(s) for s in secs):
+        raise ValueError(f"`secondaries` must be finite; got {secs}.")
+    if not secs:
+        return prim
+    wts = [1.0] * len(secs) if weights is None else [float(w) for w in weights]
+    if len(wts) != len(secs):
+        raise ValueError(f"Got {len(wts)} weights for {len(secs)} secondaries.")
+    if not all(math.isfinite(w) and w >= 0.0 for w in wts):
+        raise ValueError("Weights must be finite and non-negative.")
+    total_weight = math.fsum(wts)
+    if not (math.isfinite(total_weight) and total_weight > 0.0):
+        raise ValueError("Weights must have a finite positive sum.")
+    normalized = [min(max(s, 0.0), smax) / smax for s in secs]
+    mean = math.fsum(w * s for w, s in zip(wts, normalized, strict=True)) / total_weight
     mean = min(max(mean, 0.0), 1.0)
-    return float(primary) + float(band) * float(primary_scale) * mean
+    return prim + b * pscale * mean
 
 
 def think_budget_penalty(
@@ -375,20 +398,26 @@ def think_budget_penalty(
     Raises:
         ValueError: If a parameter is out of range.
     """
-    if int(budget) < 1:
+    if isinstance(budget, bool) or not math.isfinite(float(budget)) or int(budget) < 1:
         raise ValueError(f"`budget` must be positive; got {budget}.")
-    if not 0.0 <= min_fraction <= 1.0:
-        raise ValueError(f"`min_fraction` must be in [0, 1]; got {min_fraction}.")
-    if not tolerance > 0:
-        raise ValueError(f"`tolerance` must be positive; got {tolerance}.")
-    if weight < 0:
-        raise ValueError(f"`weight` must be non-negative; got {weight}.")
-    n = max(0.0, float(n_think_tokens))
-    lo = float(min_fraction) * float(budget)
+    mf = float(min_fraction)
+    tol = float(tolerance)
+    wt = float(weight)
+    nt = float(n_think_tokens)
+    if not math.isfinite(nt):
+        raise ValueError(f"`n_think_tokens` must be finite; got {n_think_tokens}.")
+    if not (math.isfinite(mf) and 0.0 <= mf <= 1.0):
+        raise ValueError(f"`min_fraction` must be finite and in [0, 1]; got {min_fraction}.")
+    if not (math.isfinite(tol) and tol > 0.0):
+        raise ValueError(f"`tolerance` must be finite and positive; got {tolerance}.")
+    if not (math.isfinite(wt) and wt >= 0.0):
+        raise ValueError(f"`weight` must be finite and non-negative; got {weight}.")
+    n = max(0.0, nt)
+    lo = mf * float(budget)
     if n < lo:
-        return -float(weight) * ((lo - n) / lo) ** 2
+        return -wt * ((lo - n) / lo) ** 2
     if n > budget:
-        return -float(weight) * min(1.0, (n - float(budget)) / (float(tolerance) * float(budget)))
+        return -wt * min(1.0, (n - float(budget)) / (tol * float(budget)))
     return 0.0
 
 
@@ -490,6 +519,12 @@ class RewardShaper(RewardProtocol):
         name: str | None = None,
     ) -> None:
         _check_outcome_bounds(float(incorrect_ceiling), float(correct_reward))
+        if not math.isfinite(float(incorrect_reward)):
+            raise ValueError(f"`incorrect_reward` must be finite; got {incorrect_reward}.")
+        if not math.isfinite(float(correct_threshold)):
+            raise ValueError(f"`correct_threshold` must be finite; got {correct_threshold}.")
+        if weight is not None and not math.isfinite(float(weight)):
+            raise ValueError(f"`weight` must be finite; got {weight}.")
         if structural is not None:
             validate_structural_config(**structural)
         if think_budget is not None:

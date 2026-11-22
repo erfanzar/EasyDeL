@@ -782,10 +782,23 @@ def test_code_judge_container_backend_blocks_fd0_and_tmp_stdin_leak():
         def get_file(self, cid, path):
             return b""
 
-        def exec_run(self, cid, cmd, *, workdir=None, env=None, stdin=None, timeout=30.0, max_output_chars=16384):
+        def exec_run(
+            self,
+            cid,
+            cmd,
+            *,
+            workdir=None,
+            env=None,
+            stdin=None,
+            timeout=30.0,
+            max_output_chars=16384,
+            max_stdin_bytes=None,
+        ):
             # Stand-in for the engine: run the command locally with stdin piped straight in.
             # The production wrapper's fd handling is covered against EngineSocketClient itself in
             # test_runtime_sandbox.py::test_container_exec_stdin_file_is_held_only_by_the_command.
+            if cmd[:2] == ["mkdir", "-p"]:
+                return ExecResult(ok=True, stdout="", stderr="", returncode=0)
             exec_cmd = [sys.executable if part == "python3" else part for part in cmd]
             proc = subprocess.run(
                 exec_cmd, cwd=self.ws_dir, input=stdin, capture_output=True, text=True, timeout=timeout

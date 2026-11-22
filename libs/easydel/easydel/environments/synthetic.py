@@ -20,6 +20,7 @@ import collections
 import collections.abc
 import concurrent.futures
 import dataclasses
+import math
 import queue
 import threading
 import time
@@ -214,26 +215,41 @@ class DifficultyTracker:
     ):
         if window_size <= 0:
             raise ValueError("window_size must be positive.")
-        if not (0.0 <= min_solve_rate <= max_solve_rate <= 1.0):
+        min_r = float(min_solve_rate)
+        max_r = float(max_solve_rate)
+        thresh = float(pass_threshold)
+        if not (math.isfinite(min_r) and math.isfinite(max_r) and 0.0 <= min_r <= max_r <= 1.0):
             raise ValueError("Solve-rate bounds must satisfy 0 <= min_solve_rate <= max_solve_rate <= 1.")
+        if not math.isfinite(thresh):
+            raise ValueError(f"pass_threshold must be finite; got {pass_threshold}.")
         self._window_size = int(window_size)
-        self._min_rate = float(min_solve_rate)
-        self._max_rate = float(max_solve_rate)
-        self._pass_threshold = float(pass_threshold)
+        self._min_rate = min_r
+        self._max_rate = max_r
+        self._pass_threshold = thresh
         self._lock = threading.Lock()
         self._history: dict[str, collections.deque[float]] = {}
 
-    def record(self, task_id: str, rewards: collections.abc.Sequence[float]) -> float:
-        """Record rollout rewards for ``task_id`` and return its updated rolling pass rate."""
-        if not rewards:
+    def record(self, task_id: str, rewards: collections.abc.Sequence[float | None]) -> float:
+        """Record rollout rewards for ``task_id`` and return its updated rolling pass rate.
+
+        ``None`` and non-finite entries (unscorable samples) are ignored.
+        """
+        valid: list[float] = []
+        for r in rewards:
+            if r is None:
+                continue
+            val = float(r)
+            if math.isfinite(val):
+                valid.append(val)
+        if not valid:
             return self.solve_rate(task_id) or 0.0
         with self._lock:
             buf = self._history.get(task_id)
             if buf is None:
                 buf = collections.deque(maxlen=self._window_size)
                 self._history[task_id] = buf
-            for r in rewards:
-                buf.append(1.0 if float(r) >= self._pass_threshold else 0.0)
+            for val in valid:
+                buf.append(1.0 if val >= self._pass_threshold else 0.0)
             return sum(buf) / len(buf)
 
     def solve_rate(self, task_id: str) -> float | None:
@@ -259,10 +275,10 @@ class DifficultyTracker:
 
     def summary(self) -> dict[str, int | float]:
         with self._lock:
-            total = len(self._history)
+            rates = [sum(b) / len(b) for b in self._history.values() if b]
+            total = len(rates)
             if total == 0:
                 return {"tracked_tasks": 0, "mastered": 0, "unsolved": 0, "active_band": 0}
-            rates = [sum(b) / len(b) for b in self._history.values() if b]
             mastered = sum(1 for r in rates if r >= self._max_rate)
             unsolved = sum(1 for r in rates if r <= self._min_rate)
             active = sum(1 for r in rates if self._min_rate < r < self._max_rate)
@@ -327,8 +343,10 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
         self._backoff_base = max(0.0, float(generator_backoff))
         self._backoff_max = max(self._backoff_base, float(generator_backoff_max))
         self._failure_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._consecutive_generator_failures = 0
         self._consecutive_gate_failures = 0
+        self._consecutive_infra_failures = 0
         self._last_generator_error: BaseException | None = None
         self._generator_fn = generator_fn
         self._gate = verification_gate
@@ -366,61 +384,76 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
             self._next_seed += 1
             return seed
 
-    def _ensure_started(self) -> None:
-        if self._started:
-            return
-        self._stop.clear()
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self._num_workers,
-            thread_name_prefix="ed-synth-task",
-        )
-        for _ in range(self._num_workers):
-            self._executor.submit(self._producer_loop)
-        self._started = True
+    def _ensure_started(self) -> threading.Event:
+        with self._lifecycle_lock:
+            if self._started:
+                return self._stop
+            # Allocate a fresh Event per start so workers from a previous closed executor stay permanently stopped.
+            stop_event = threading.Event()
+            self._stop = stop_event
+            with self._failure_lock:
+                self._consecutive_generator_failures = 0
+                self._consecutive_gate_failures = 0
+                self._consecutive_infra_failures = 0
+                self._last_generator_error = None
+                self._fatal_error = None
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._num_workers,
+                thread_name_prefix="ed-synth-task",
+            )
+            for _ in range(self._num_workers):
+                self._executor.submit(self._producer_loop, stop_event)
+            self._started = True
+            return stop_event
 
-    def _record_generator_failure(self, exc: BaseException) -> float:
+    def _record_generator_failure(self, exc: BaseException, stop_event: threading.Event) -> float:
         """Record a ``generator_fn`` failure and return the back-off delay before the next attempt.
 
         Failures are counted across all workers; after ``max_consecutive_generator_failures`` in a row the
         stream stops and keeps ``exc`` as its fatal error.
         """
         with self._failure_lock:
+            if stop_event.is_set():
+                return 0.0
             self._consecutive_generator_failures += 1
             self._last_generator_error = exc
             count = self._consecutive_generator_failures
             if count >= self._max_generator_failures:
                 if self._fatal_error is None:
                     self._fatal_error = exc
-                self._stop.set()
+                stop_event.set()
         return min(self._backoff_max, self._backoff_base * (2.0 ** (count - 1)))
 
-    def _record_gate_failure(self, exc: BaseException) -> float:
+    def _record_gate_failure(self, exc: BaseException, stop_event: threading.Event) -> float:
         """Record a ``verification_gate.verify`` exception and return the back-off delay before the next task.
 
         Uses the same consecutive-failure threshold as generator failures; any gate verdict (accepted or not)
         resets the count. Only once the threshold is reached does the stream stop with ``exc`` as its fatal error.
         """
         with self._failure_lock:
+            if stop_event.is_set():
+                return 0.0
             self._consecutive_gate_failures += 1
             self._last_generator_error = exc
             count = self._consecutive_gate_failures
             if count >= self._max_generator_failures:
                 if self._fatal_error is None:
                     self._fatal_error = exc
-                self._stop.set()
+                stop_event.set()
         return min(self._backoff_max, self._backoff_base * (2.0 ** (count - 1)))
 
-    def _producer_loop(self) -> None:
-        consecutive_infra = 0
-        while not self._stop.is_set():
+    def _producer_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             seed = self._claim_seed()
             try:
                 raw = self._generator_fn(seed)
             except Exception as exc:
-                delay = self._record_generator_failure(exc)
-                if self._stop.wait(delay):
+                delay = self._record_generator_failure(exc, stop_event)
+                if stop_event.wait(delay):
                     return
                 continue
+            if stop_event.is_set():
+                return
             with self._failure_lock:
                 self._consecutive_generator_failures = 0
             if raw is None:
@@ -438,50 +471,66 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
                 except Exception as exc:
                     # Transient gate failures are retried like generator failures; only a run of
                     # ``max_consecutive_generator_failures`` stops the stream with ``exc`` as its fatal error.
-                    delay = self._record_gate_failure(exc)
-                    if self._stop.wait(delay):
+                    delay = self._record_gate_failure(exc, stop_event)
+                    if stop_event.wait(delay):
                         return
                     continue
+                if stop_event.is_set():
+                    return
                 with self._failure_lock:
                     self._consecutive_gate_failures = 0
                 if not report.accepted:
                     if report.env_error:
-                        consecutive_infra += 1
-                        if consecutive_infra >= 8 and self._gate.stats().get("accepted", 0) == 0:
-                            from .runtime import SandboxInfraError
+                        with self._failure_lock:
+                            if stop_event.is_set():
+                                return
+                            self._consecutive_infra_failures += 1
+                            if self._consecutive_infra_failures >= 8 and self._gate.stats().get("accepted", 0) == 0:
+                                from .runtime import SandboxInfraError
 
-                            self._fatal_error = SandboxInfraError(report.reason)
-                            self._stop.set()
-                            return
+                                if self._fatal_error is None:
+                                    self._fatal_error = SandboxInfraError(report.reason)
+                                stop_event.set()
+                                return
+                    else:
+                        with self._failure_lock:
+                            self._consecutive_infra_failures = 0
                     continue
-                consecutive_infra = 0
+                with self._failure_lock:
+                    self._consecutive_infra_failures = 0
 
             if self._strip_reference:
                 task.pop("reference_solution", None)
                 task.pop("reference_actions", None)
 
-            while not self._stop.is_set():
+            while not stop_event.is_set():
                 try:
                     self._queue.put(task, timeout=0.1)
                     break
                 except queue.Full:
                     continue
 
+    def _get_fatal_error(self) -> BaseException | None:
+        with self._failure_lock:
+            return self._fatal_error
+
     def next_task(self, timeout: float = 30.0) -> dict[str, tp.Any]:
         """Return the next verified task dictionary, blocking up to ``timeout`` seconds."""
-        self._ensure_started()
+        stop_event = self._ensure_started()
         deadline = time.monotonic() + float(timeout)
         while True:
             try:
                 return self._queue.get(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
             except queue.Empty:
                 pass
-            if self._fatal_error is not None and self._stop.is_set() and self._queue.empty():
-                raise self._fatal_error
+            fatal = self._get_fatal_error()
+            if fatal is not None and stop_event.is_set() and self._queue.empty():
+                raise fatal
             if time.monotonic() >= deadline:
-                if self._fatal_error is not None:
-                    raise self._fatal_error
-                last = self._last_generator_error
+                if fatal is not None:
+                    raise fatal
+                with self._failure_lock:
+                    last = self._last_generator_error
                 message = f"SyntheticTaskStream produced no verified task within {timeout}s."
                 if last is not None:
                     raise TimeoutError(f"{message} Last generator error: {last!r}") from last
@@ -490,25 +539,27 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
     def open_shard(self, shard_name: str) -> collections.abc.Iterator[dict[str, tp.Any]]:
         if shard_name != "synthetic_stream_0":
             raise KeyError(f"Unknown shard {shard_name!r}")
-        self._ensure_started()
+        stop_event = self._ensure_started()
         count = 0
-        idle_polls = 0
-        while not self._stop.is_set():
+        while True:
             if self._max_tasks is not None and count >= self._max_tasks:
                 break
             try:
-                item = self._queue.get(timeout=0.5)
-                idle_polls = 0
+                item = self._queue.get(timeout=0.1)
             except queue.Empty:
-                idle_polls += 1
-                if self._fatal_error is not None and self._queue.empty() and idle_polls >= 4:
-                    break
-                continue
+                if stop_event.is_set():
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                else:
+                    continue
             count += 1
             self._emitted += 1
             yield item
-        if self._fatal_error is not None and count == 0:
-            raise self._fatal_error
+        fatal = self._get_fatal_error()
+        if fatal is not None and (self._max_tasks is None or count < self._max_tasks):
+            raise fatal
 
     def __iter__(self) -> collections.abc.Iterator[dict[str, tp.Any]]:
         return self.open_shard("synthetic_stream_0")
@@ -525,11 +576,12 @@ class SyntheticTaskStream(ShardedDataSource[dict[str, tp.Any]]):
         return out
 
     def close(self) -> None:
-        self._stop.set()
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
-        self._started = False
+        with self._lifecycle_lock:
+            self._stop.set()
+            if self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = None
+            self._started = False
 
     def __enter__(self) -> SyntheticTaskStream:
         self._ensure_started()

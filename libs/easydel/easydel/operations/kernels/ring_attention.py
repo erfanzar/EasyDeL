@@ -359,9 +359,21 @@ class RingAttn(OperationImpl):
             causal_computed = False
         if mask_info is not None and mask_info.sliding_window_baked_in:
             sliding_window = None
+        bias_spec = getattr(shardings, "bias", None)
         if dense_bias is not None:
             dense_bias = jnp.broadcast_to(dense_bias, (query.shape[0], query.shape[2], query.shape[1], key.shape[1]))
-        bias_sharding = self.create_stable_sharding(getattr(shardings, "bias", None), dep=dense_bias, tensor=dense_bias)
+            if query_sharding is not None:
+                # ``dense_bias`` is broadcast to global ``(batch, num_heads, q_len, kv_len)``, so its
+                # batch, head, and query-sequence axes must follow ``query_sharding`` (e.g. TP head
+                # sharding), while KV columns remain global for ring-step indexing.
+                q_axes = (*tuple(query_sharding), None, None, None, None)[:4]
+                bias_spec = jax.sharding.PartitionSpec(q_axes[0], q_axes[2], q_axes[1], None)
+        bias_sharding = self.create_stable_sharding(
+            bias_spec,
+            dep=dense_bias,
+            tensor=dense_bias,
+            preserved_indices=[0, 1, 2],
+        )
         outputs: Float[Array, "batch seq_len_q num_heads head_dim"] = ring_attention(
             query,
             key,

@@ -466,6 +466,7 @@ def _compute_grpo_policy_loss_terms(
     vespo_k_neg: float,
     vespo_lambda_neg: float,
     importance_sampling_ratio: jax.Array | None = None,
+    entropy_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute TRL-compatible GRPO/CISPO per-token surrogate terms."""
     log_ratio = per_token_logps - old_per_token_logps
@@ -497,11 +498,12 @@ def _compute_grpo_policy_loss_terms(
         )
         return -jax.lax.stop_gradient(phi_seq) * advantages * per_token_logps, coef_1
     if loss_type == "gmpo":
+        gmpo_mask = completion_mask if entropy_mask is None else completion_mask * entropy_mask
         sequence_ratio = _gmpo_sequence_ratio(
             per_token_logps=per_token_logps,
             old_per_token_logps=old_per_token_logps,
             advantages=advantages,
-            completion_mask=completion_mask,
+            completion_mask=gmpo_mask,
             epsilon=epsilon,
             epsilon_high=epsilon_high,
             delta=delta,
@@ -656,6 +658,29 @@ def get_per_token_logps(
     return token_log_probs
 
 
+_PREFIX_SHARED_UNSUPPORTED_MODEL_TYPES = frozenset(
+    {
+        "mamba",
+        "mamba2",
+        "falcon_mamba",
+        "falcon_h1",
+        "rwkv",
+        "mosaic_mpt",
+        "mpt",
+        "bloom",
+    }
+)
+_PREFIX_SHARED_DROPOUT_ATTRS = (
+    "attention_dropout",
+    "attn_pdrop",
+    "resid_pdrop",
+    "embd_pdrop",
+    "hidden_dropout",
+    "hidden_dropout_prob",
+    "attention_probs_dropout_prob",
+)
+
+
 def validate_prefix_shared_model(model) -> None:
     """Raise when ``model`` cannot run the prefix-shared group forward.
 
@@ -663,9 +688,10 @@ def validate_prefix_shared_model(model) -> None:
         model: The policy module (exposes ``config``).
 
     Raises:
-        NotImplementedError: For an unverified attention operation, quantized KV, attention dropout,
-            pipeline parallelism, sliding-window layers, or layer types other than full attention (plus
-            gated-delta ``linear_attention`` for model types in ``PREFIX_SHARED_RECURRENT_MODEL_TYPES``).
+        NotImplementedError: For an unverified attention operation, quantized KV, dropout,
+            pipeline parallelism, sliding-window layers, unsupported SSM/ALiBi architectures,
+            or layer types other than full attention (plus gated-delta ``linear_attention``
+            for model types in ``PREFIX_SHARED_RECURRENT_MODEL_TYPES``).
     """
     config = getattr(model, "config", None)
     if config is None:
@@ -679,16 +705,61 @@ def validate_prefix_shared_model(model) -> None:
         )
     if getattr(config, "kv_cache_quantization_config", None) is not None:
         raise NotImplementedError("Prefix-shared forward does not support a quantized KV cache.")
-    if float(getattr(text_config, "attention_dropout", 0.0) or 0.0) > 0.0:
-        raise NotImplementedError("Prefix-shared forward requires attention_dropout == 0.")
-    axis_dims = getattr(config, "sharding_axis_dims", None)
-    if axis_dims is not None and len(axis_dims) > 0 and int(axis_dims[0]) > 1:
+    for attr in _PREFIX_SHARED_DROPOUT_ATTRS:
+        if float(getattr(text_config, attr, 0.0) or 0.0) > 0.0:
+            raise NotImplementedError(f"Prefix-shared forward requires dropout to be disabled (`{attr}` == 0).")
+    attn_config = getattr(text_config, "attn_config", None)
+    if attn_config is not None and float(getattr(attn_config, "attn_pdrop", 0.0) or 0.0) > 0.0:
+        raise NotImplementedError(
+            "Prefix-shared forward requires dropout to be disabled (`attn_config.attn_pdrop` == 0)."
+        )
+
+    mesh = getattr(model, "mesh", None)
+    mesh_shape = getattr(mesh, "shape", None) if mesh is not None else None
+    if isinstance(mesh_shape, collections.abc.Mapping) and int(mesh_shape.get("pp", 1)) > 1:
         raise NotImplementedError("Prefix-shared forward does not support pipeline parallelism (pp > 1).")
+    axis_dims = getattr(config, "sharding_axis_dims", None)
+    if axis_dims is not None:
+        pp_dim: int | None = None
+        other_prod = 1
+        if isinstance(axis_dims, collections.abc.Mapping):
+            raw_pp = axis_dims.get("pp")
+            if raw_pp is not None:
+                pp_dim = int(raw_pp)
+                for axis_name, dim_val in axis_dims.items():
+                    if axis_name != "pp" and int(dim_val) > 0:
+                        other_prod *= int(dim_val)
+        elif len(axis_dims) > 0:
+            axis_names = getattr(config, "sharding_axis_names", None)
+            if axis_names is None:
+                pp_idx: int | None = 0
+            elif "pp" in axis_names:
+                pp_idx = list(axis_names).index("pp")
+            else:
+                pp_idx = None
+            if pp_idx is not None and pp_idx < len(axis_dims):
+                pp_dim = int(axis_dims[pp_idx])
+                for idx, dim_val in enumerate(axis_dims):
+                    if idx != pp_idx and int(dim_val) > 0:
+                        other_prod *= int(dim_val)
+        if pp_dim is not None:
+            if pp_dim > 1:
+                raise NotImplementedError("Prefix-shared forward does not support pipeline parallelism (pp > 1).")
+            if pp_dim == -1 and mesh_shape is None and jax.device_count() // max(other_prod, 1) > 1:
+                raise NotImplementedError("Prefix-shared forward does not support pipeline parallelism (pp > 1).")
+
     if getattr(text_config, "use_sliding_window", False):
         raise NotImplementedError("Prefix-shared forward does not support sliding-window attention.")
+    model_type = str(getattr(text_config, "model_type", "") or "").lower()
+    if model_type in _PREFIX_SHARED_UNSUPPORTED_MODEL_TYPES:
+        raise NotImplementedError(
+            f"Prefix-shared forward does not support model_type {model_type!r} "
+            "(recurrent/SSM and ALiBi architectures are unsupported)."
+        )
+    if getattr(text_config, "alibi", False) or (attn_config is not None and getattr(attn_config, "alibi", False)):
+        raise NotImplementedError("Prefix-shared forward does not support ALiBi positional bias.")
     layer_types = getattr(text_config, "layer_types", None)
     if layer_types is not None:
-        model_type = str(getattr(text_config, "model_type", ""))
         allowed = {"full_attention"}
         if model_type in PREFIX_SHARED_RECURRENT_MODEL_TYPES:
             allowed.add("linear_attention")
@@ -1298,13 +1369,41 @@ def grpo_step(
         state_model = getattr(state, "model", None)
         state_mesh = getattr(state_model, "mesh", None)
         model_callable = getattr(state_model, "forward", state_model) if state_model is not None else None
-        if not prefix_shared_forward or effective_ga_steps > 1:
+        prompt_group_size: int | None = None
+        if not prefix_shared_forward:
             batch = _expand_grpo_prompt_batch(batch, model_callable=model_callable)
+        elif effective_ga_steps > 1:
+            prompt_ids_full = batch.get("prompt_ids")
+            completion_ids_full = batch.get("completion_ids")
+            if prompt_ids_full is not None and completion_ids_full is not None:
+                prompt_rows = int(prompt_ids_full.shape[0])
+                completion_rows = int(completion_ids_full.shape[0])
+                if prompt_rows <= 0 or completion_rows % prompt_rows != 0:
+                    raise ValueError(
+                        f"GRPO prompt rows ({prompt_rows}) must match or evenly divide "
+                        f"completion rows ({completion_rows})."
+                    )
+                prompt_group_size = completion_rows // prompt_rows
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
             gradient_accumulation_steps=effective_ga_steps,
             batch_partition_spec=partition_spec,
         )
+        if prefix_shared_forward and effective_ga_steps > 1 and prompt_group_size is not None and prompt_group_size > 1:
+            completion_rows = int(batch["completion_ids"].shape[0])
+            if _batch_size != completion_rows:
+                raise ValueError(
+                    f"`prefix_shared_forward=True` with `gradient_accumulation_steps={effective_ga_steps}` "
+                    f"inferred batch size {_batch_size}, expected completion rows {completion_rows}."
+                )
+            if minibatch_size % prompt_group_size != 0:
+                prompt_rows = int(batch["prompt_ids"].shape[0])
+                raise ValueError(
+                    f"`prefix_shared_forward=True` with `gradient_accumulation_steps={effective_ga_steps}` "
+                    f"requires whole prompt groups per microbatch: `minibatch_size` ({minibatch_size}) must be "
+                    f"divisible by group size ({prompt_group_size}), i.e. prompt batch ({prompt_rows}) must be "
+                    f"divisible by `gradient_accumulation_steps` ({effective_ga_steps})."
+                )
         batch = with_sharding_constraint(batch, partition_spec, mesh=state_mesh, ignore_mpmd=True)
         # With ``difficulty_weights`` (dataset weights or discarded unscorable groups) every loss type
         # normalises by a weighted count. Under gradient accumulation a minibatch-local count would give a
@@ -1829,6 +1928,12 @@ def grpo_step(
             )
             if importance_sampling_ratio is not None:
                 importance_sampling_ratio = _sanitize_rollout_ratio(importance_sampling_ratio, behavior_terms.accept)
+        entropy_mask = None
+        if top_entropy_quantile < 1.0 and entropies is not None:
+            masked_entropies = jnp.where(completion_mask > 0, entropies, jnp.nan)
+            entropy_threshold = jnp.nanquantile(masked_entropies, 1 - top_entropy_quantile)
+            entropy_mask = (entropies >= entropy_threshold).astype(completion_mask.dtype) * completion_mask
+
         with jax.named_scope(scope_root + "/loss_fn/policy_objective"):
             dppo_divergence_mask = None
             if dppo_divergence_type is not None:
@@ -1869,6 +1974,7 @@ def grpo_step(
                     vespo_k_neg=vespo_k_neg,
                     vespo_lambda_neg=vespo_lambda_neg,
                     importance_sampling_ratio=importance_sampling_ratio,
+                    entropy_mask=entropy_mask,
                 )
 
         if _apply_rollout_is_ratio_post_hoc(loss_type, importance_sampling_ratio, per_token_logps):
@@ -1890,10 +1996,7 @@ def grpo_step(
             )
             per_token_loss = per_token_loss * off_policy_mask
 
-        if top_entropy_quantile < 1.0 and entropies is not None:
-            masked_entropies = jnp.where(completion_mask > 0, entropies, jnp.nan)
-            entropy_threshold = jnp.nanquantile(masked_entropies, 1 - top_entropy_quantile)
-            entropy_mask = (entropies >= entropy_threshold).astype(completion_mask.dtype) * completion_mask
+        if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
         if beta != 0.0:
@@ -1999,6 +2102,7 @@ def grpo_step(
                 batch=batch,
                 minibatch_size=minibatch_size,
                 grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+                prompt_group_size=prompt_group_size if prefix_shared_forward else None,
             )
         metrics, behavior_summary = _finalize_behavior_metrics(metrics, effective_ga_steps)
         contract_active = off_policy_min_acceptance is not None or startup_behavior_k3_max is not None
@@ -2406,7 +2510,8 @@ def _grpo_scheduled_finalize_aux(call, aux):
     tail_max = call.get("startup_behavior_tail_fraction_max", 0.01)
     parity_flag = call.batch.get("behavior_parity_gate")
     parity_pending = parity_flag is not None and int(np.asarray(jax.device_get(parity_flag))) > 0
-    if sums["has_behavior"] > 0.5:
+    has_behavior = sums["has_behavior"] > 0.5 or (call.batch.get("behavior_per_token_logps") is not None)
+    if has_behavior:
         eligible, tokens = sums["eligible_rows"], sums["tokens"]
         accepted_fraction = sums["accepted_rows"] / eligible if eligible > 0 else 1.0
         behavior_k3 = sums["k3_sum"] / tokens if tokens > 0 else 0.0

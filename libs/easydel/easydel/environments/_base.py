@@ -106,7 +106,10 @@ class SandboxBashTool(Tool):
 
         command: Shell command to execute inside the workspace.
         """
-        res = self._get_session().run_bash(command, timeout=self._timeout)
+        try:
+            res = self._get_session().run_bash(command, timeout=self._timeout)
+        except SandboxInfraError as exc:
+            return f"Sandbox infrastructure error: {exc}"
         return res.combined_output()
 
 
@@ -124,7 +127,10 @@ class SandboxPythonTool(Tool):
 
         code: Python source code to execute.
         """
-        res = self._get_session().run_python(code, timeout=self._timeout)
+        try:
+            res = self._get_session().run_python(code, timeout=self._timeout)
+        except SandboxInfraError as exc:
+            return f"Sandbox infrastructure error: {exc}"
         return res.combined_output()
 
 
@@ -144,6 +150,8 @@ class SandboxReadFileTool(Tool):
         """
         try:
             text = self._get_session().read_file(path, max_chars=self._max_chars)
+        except SandboxInfraError as exc:
+            return f"Sandbox infrastructure error: {exc}"
         except Exception as exc:
             return f"Error reading '{path}': {exc}"
         if len(text) > self._max_chars:
@@ -168,6 +176,8 @@ class SandboxWriteFileTool(Tool):
         try:
             self._get_session().write_files({path: content})
             return f"Wrote {len(content)} characters to {path}."
+        except SandboxInfraError as exc:
+            return f"Sandbox infrastructure error: {exc}"
         except Exception as exc:
             return f"Error writing '{path}': {exc}"
 
@@ -189,10 +199,12 @@ class SandboxEditFileTool(Tool):
         old_text: Exact existing text span (must appear exactly once).
         new_text: Replacement text.
         """
-        session = self._get_session()
         try:
+            session = self._get_session()
             # read_file returns at most max_chars + 1 characters, so a longer result means the file is too large.
             current = session.read_file(path, max_chars=self.max_file_chars)
+        except SandboxInfraError as exc:
+            return f"Sandbox infrastructure error: {exc}"
         except Exception as exc:
             return f"Error reading '{path}': {exc}"
         if len(current) > self.max_file_chars:
@@ -206,6 +218,8 @@ class SandboxEditFileTool(Tool):
         try:
             session.write_files({path: updated})
             return f"Updated {path}."
+        except SandboxInfraError as exc:
+            return f"Sandbox infrastructure error: {exc}"
         except Exception as exc:
             return f"Error writing '{path}': {exc}"
 

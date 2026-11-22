@@ -1126,8 +1126,13 @@ def blocksparse_attention(
             mask_info.kv_positions,
         )
 
+    local_mask_info = None
     if mask_info is not None:
-        q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+        # Operate on a shallow copy so lazy derivation of segment IDs, positions, or
+        # masks never mutates the caller's MaskInfo in place (mutating ``_attention_mask``
+        # or positions would flip ``uses_position_causality()`` on subsequent reuse).
+        local_mask_info = mask_info.replace()
+        q_segment_ids, kv_segment_ids = local_mask_info.get_or_compute_segment_ids()
         q_ids_for_mask = q_segment_ids
         if q_ids_for_mask is not None and q_ids_for_mask.ndim == 3:
             q_ids_for_mask = q_ids_for_mask[:, 0, :]
@@ -1135,14 +1140,17 @@ def blocksparse_attention(
             q_mask = q_ids_for_mask >= 0
 
         if q_positions is None or kv_positions is None:
-            mask_q_pos, mask_kv_pos = mask_info.get_or_compute_positions()
+            mask_q_pos, mask_kv_pos = local_mask_info.get_or_compute_positions()
             if q_positions is None:
                 q_positions = mask_q_pos
             if kv_positions is None:
                 kv_positions = mask_kv_pos
 
         if method is None and attention_mask is None:
-            attention_mask = mask_info.get_or_compute_attention_mask()
+            if local_mask_info._attention_mask is not None:
+                attention_mask = local_mask_info._attention_mask
+            elif q_segment_ids is None or kv_segment_ids is None:
+                attention_mask = local_mask_info.get_or_compute_attention_mask()
 
     if method == "shard_map":
         if attention_mask is not None:
@@ -1150,10 +1158,10 @@ def blocksparse_attention(
                 "`attention_mask` is not supported for shard_map blocksparse_attention; "
                 "pass `bias`/`mask_builder` instead."
             )
-        if mask_info is None:
+        if local_mask_info is None:
             in_specs = (*in_specs, None, None, None, None)
         else:
-            shardings = mask_info.get_shardings(False, mesh=mesh)
+            shardings = local_mask_info.get_shardings(False, mesh=mesh)
             in_specs = (
                 *in_specs,
                 shardings.q_segment_ids,

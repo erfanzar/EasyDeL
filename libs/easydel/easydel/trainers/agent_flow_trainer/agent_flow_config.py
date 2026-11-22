@@ -15,18 +15,60 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
+def _normalize_base_trainer_type(name: str) -> str:
+    """Normalize a base trainer name, resolving eLarge trainer-type aliases."""
+    normalized = str(name).strip().lower()
+    try:
+        from easydel.infra.elarge.types.training import _normalize_trainer_type
+
+        return _normalize_trainer_type(normalized)
+    except Exception:
+        return normalized
+
+
+def _reconstruct_base_config(cfg_cls: type, raw: collections.abc.Mapping[str, tp.Any]) -> tp.Any:
+    """Reconstruct an inner trainer config from a mapping via ``from_dict``, normalizing derived fields."""
+    payload = dict(raw)
+    # GRPOConfig.__post_init__ derives generation_batch_size = total_batch_size * steps_per_generation
+    # after rejecting both being set, so a full to_dict() snapshot carries both and would otherwise fail reload.
+    gen_bs = payload.get("generation_batch_size")
+    steps_per_gen = payload.get("steps_per_generation")
+    total_bs = payload.get("total_batch_size")
+    if (
+        gen_bs is not None
+        and steps_per_gen is not None
+        and total_bs is not None
+        and int(gen_bs) == int(total_bs) * int(steps_per_gen)
+    ):
+        payload.pop("generation_batch_size", None)
+    if hasattr(cfg_cls, "from_dict") and callable(cfg_cls.from_dict):
+        return cfg_cls.from_dict(payload)
+    return cfg_cls(**payload)
+
+
+def _is_json_serializable(value: tp.Any) -> bool:
+    """Return whether ``value`` is a pure JSON-serializable structure (not a runtime callable/instance)."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_serializable(item) for item in value)
+    if isinstance(value, collections.abc.Mapping):
+        return all(isinstance(k, str) and _is_json_serializable(v) for k, v in value.items())
+    return False
+
+
 @Registry.register("trainer-arguments", "agent_flow")
-@auto_pytree
+@dataclass
 class AgentFlowConfig(TrainingArguments):
     """Configuration for multi-turn :class:`AgentFlowTrainer` wrapping any RL/distillation trainer.
 
@@ -143,9 +185,12 @@ class AgentFlowConfig(TrainingArguments):
         metadata={"help": "Skip chat template formatting on prompts."},
     )
 
-    def __post_init__(self, *args: tp.Any, **kwargs: tp.Any) -> None:
-        if hasattr(super(), "__post_init__"):
-            super().__post_init__(*args, **kwargs)
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ) -> None:
+        super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
         if self.max_turns <= 0:
             raise ValueError(f"`max_turns` must be positive; got {self.max_turns}.")
         if self.context_mode not in {"append", "sliding_window", "reset_with_summary"}:
@@ -171,79 +216,96 @@ class AgentFlowConfig(TrainingArguments):
             raise ValueError(
                 f"`environment_backend` must be 'local', 'kiri', 'docker', or 'auto'; got {self.environment_backend!r}."
             )
-        self.base_trainer_type = str(self.base_trainer_type).strip().lower()
+        self.base_trainer_type = _normalize_base_trainer_type(self.base_trainer_type)
         if self.base_trainer_type in {"agent_flow", "agent-flow"}:
             raise ValueError("`base_trainer_type` cannot be 'agent_flow' (recursive wrapping is disallowed).")
         if not _is_supported_base_trainer_type(self.base_trainer_type):
             raise ValueError(
                 f"`base_trainer_type` {self.base_trainer_type!r} is not supported by AgentFlowTrainer. "
-                "AgentFlow adapts episodes for the GRPO family, the PPO family, online DPO, and the on-policy "
+                "AgentFlow adapts episodes for the GRPO family, the PPO/VAPO family, online DPO, and the supported "
                 f"distillation family; supported values: {sorted(AGENT_FLOW_BASE_TRAINER_TYPES)} "
-                "(or any registered subclass of those trainers)."
+                "(or any compatible registered subclass of those trainers)."
             )
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Serialize this config, omitting non-JSON-serializable runtime ``environment`` objects."""
+        result = super().to_dict()
+        if not _is_json_serializable(self.environment):
+            result.pop("environment", None)
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, tp.Any]) -> AgentFlowConfig:
+        """Deserialize an :class:`AgentFlowConfig`, reconstructing ``base_config`` via its ``from_dict``."""
+        payload = dict(data)
+        raw_base_cfg = payload.get("base_config")
+        if isinstance(raw_base_cfg, collections.abc.Mapping):
+            base_type = _normalize_base_trainer_type(payload.get("base_trainer_type", "grpo"))
+            cfg_cls = Registry.get("trainer-arguments", base_type)
+            if isinstance(cfg_cls, type):
+                payload["base_config"] = _reconstruct_base_config(cfg_cls, raw_base_cfg)
+        return super().from_dict(payload)
+
+    __hash__ = hash_fn
 
 
 # Registered trainer names whose classes ``AgentFlowTrainer._adapt_episodes_to_trainer`` knows how to feed:
-# OnlineDPOTrainer (preference pairs), PPOTrainer subclasses (returns/advantages/values), the on-policy
-# distillation family (GKD / OnPolicyDistillation / SDFT / SDPO / SeqKD / SSD), and GRPOTrainer subclasses
-# (the default advantage layout). Offline trainers (sft, dpo, kto, ...) would receive a batch they cannot use.
+# OnlineDPOTrainer (preference pairs), PPOTrainer / VAPOTrainer (returns/advantages/values), the supported
+# distillation family (GKD / OnPolicyDistillation / SeqKD / SSD), and compatible GRPOTrainer subclasses
+# (the default advantage layout). Offline trainers (sft, dpo, kto, ...) and custom-step trainers with
+# incompatible batch contracts (sdpo, sdft, nash-md, xpo, sao, compaction_rl, agentic-moshpit) are excluded.
 AGENT_FLOW_BASE_TRAINER_TYPES: frozenset[str] = frozenset(
     {
-        # GRPO family.
-        "agentic-moshpit",
+        # GRPO family (compatible with grpo_step).
         "async_grpo",
         "dppo",
         "gdpo",
         "gfpo",
         "gmpo",
         "grpo",
-        "grpo_replay_buffer",
         "grpo_with_replay_buffer",
         "gspo",
         "gspo_token",
         "minillm",
-        "nash-md",
-        "nash_md",
         "nemo_gym",
         "papo",
         "reinforce_plus_plus",
         "rloo",
         "rlvr",
-        "xpo",
-        # PPO family.
-        "compaction-rl",
-        "compaction_reinforcement_learning",
-        "compaction_rl",
+        # PPO family (compatible with ppo_step).
         "ppo",
-        "sao",
-        "single-rollout-asynchronous-optimization",
-        "single_rollout_asynchronous_optimization",
         "vapo",
         # Preference pairs.
         "online_dpo",
-        # On-policy distillation family.
+        # On-policy / sequence distillation family with implemented batch adapters.
         "gkd",
         "on_policy_distillation",
-        "sdft",
-        "sdpo",
-        "self_distillation",
         "seq_kd",
         "ssd",
     }
 )
 
 
-def _is_supported_base_trainer_type(name: str) -> bool:
-    """Return whether AgentFlow can adapt episodes for the trainer registered as ``name``.
+def _unsupported_base_trainer_classes() -> tuple[type, ...]:
+    """Return concrete trainer base classes whose custom steps/constructors are incompatible with AgentFlow."""
+    from .._online_rl.trainer import OnlineActorCriticTrainer
+    from ..agentic_moshpit import AgenticMoshPitTrainer
+    from ..nash_md_trainer import NashMDTrainer
+    from ..self_distillation_policy_optimization import SDPOTrainer
+    from ..xpo_trainer import XPOTrainer
 
-    Built-in names are checked against :data:`AGENT_FLOW_BASE_TRAINER_TYPES`. Any other name is accepted
-    only when it is registered as a trainer whose class subclasses one of the supported families, so
-    user-registered GRPO/PPO/OnlineDPO/distillation variants keep working.
-    """
-    if name in AGENT_FLOW_BASE_TRAINER_TYPES:
-        return True
-    trainer_cls = Registry.get("trainer", name)
-    if not isinstance(trainer_cls, type):
+    return (
+        AgenticMoshPitTrainer,
+        NashMDTrainer,
+        XPOTrainer,
+        SDPOTrainer,
+        OnlineActorCriticTrainer,
+    )
+
+
+def _is_supported_base_trainer_cls(trainer_cls: type) -> bool:
+    """Return whether ``trainer_cls`` is supported by :class:`AgentFlowTrainer`."""
+    if issubclass(trainer_cls, _unsupported_base_trainer_classes()):
         return False
     from ..generalized_knowledge_distillation_trainer import GKDTrainer
     from ..group_relative_policy_optimization import GRPOTrainer
@@ -251,11 +313,36 @@ def _is_supported_base_trainer_type(name: str) -> bool:
     from ..online_dpo_trainer import OnlineDPOTrainer
     from ..proximal_policy_optimization_trainer import PPOTrainer
     from ..seq_kd_trainer import SeqKDTrainer
+    from ..ssd_trainer import SSDTrainer
 
     return issubclass(
         trainer_cls,
-        (GRPOTrainer, PPOTrainer, OnlineDPOTrainer, GKDTrainer, OnPolicyDistillationTrainer, SeqKDTrainer),
+        (GRPOTrainer, PPOTrainer, OnlineDPOTrainer, GKDTrainer, OnPolicyDistillationTrainer, SeqKDTrainer, SSDTrainer),
     )
 
 
-__all__ = ["AGENT_FLOW_BASE_TRAINER_TYPES", "AgentFlowConfig"]
+def _is_supported_base_trainer_type(name: str) -> bool:
+    """Return whether AgentFlow can adapt episodes for the trainer registered as ``name``.
+
+    Built-in names are checked against :data:`AGENT_FLOW_BASE_TRAINER_TYPES`. Any other name is accepted
+    only when it is registered as a trainer whose class subclasses one of the supported families and is
+    not one of the explicitly incompatible custom-step trainers, so user-registered GRPO/PPO/OnlineDPO/
+    distillation variants keep working.
+    """
+    normalized = _normalize_base_trainer_type(name)
+    if normalized in AGENT_FLOW_BASE_TRAINER_TYPES:
+        return True
+    trainer_cls = Registry.get("trainer", normalized)
+    if not isinstance(trainer_cls, type):
+        return False
+    return _is_supported_base_trainer_cls(trainer_cls)
+
+
+__all__ = [
+    "AGENT_FLOW_BASE_TRAINER_TYPES",
+    "AgentFlowConfig",
+    "_is_supported_base_trainer_cls",
+    "_normalize_base_trainer_type",
+    "_reconstruct_base_config",
+    "_unsupported_base_trainer_classes",
+]

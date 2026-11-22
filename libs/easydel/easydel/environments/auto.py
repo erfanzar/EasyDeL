@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections.abc
 import concurrent.futures
 import inspect
+import math
 import typing as tp
 
 from easydel.trainers._shared.environment import AgenticEnvironment, StepResult
@@ -26,7 +27,47 @@ from easydel.utils import Registry
 
 from ._base import build_environment, list_environments, register_environment
 from .harnesses import HarnessPreset
-from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool
+from .runtime import ContainerConfig, KiriRuntime, SandboxPool
+
+
+def _extract_text(value: tp.Any) -> str:
+    """Extract plain text from a string, chat message mapping, or list of messages/content blocks."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, collections.abc.Mapping):
+        if "content" in value:
+            return _extract_text(value["content"])
+        if "text" in value:
+            return _extract_text(value["text"])
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            part = _extract_text(item)
+            if part:
+                parts.append(part)
+        return "\n".join(parts)
+    return str(value)
+
+
+def _as_column(val: tp.Any, n: int) -> list[tp.Any] | None:
+    """Return ``val`` as an ``n``-element list if it represents a per-sample column (including numpy arrays)."""
+    if val is None or isinstance(val, (str, bytes, collections.abc.Mapping)):
+        return None
+    if isinstance(val, (list, tuple)):
+        return list(val) if len(val) == n else None
+    if hasattr(val, "tolist") and hasattr(val, "shape"):
+        shape = getattr(val, "shape", ())
+        if isinstance(shape, tuple) and len(shape) >= 1 and shape[0] == n:
+            return list(val.tolist())
+        return None
+    if hasattr(val, "tolist"):
+        converted = val.tolist()
+        if isinstance(converted, list) and len(converted) == n:
+            return converted
+    return None
 
 
 def _row_prompt(row: collections.abc.Mapping[str, tp.Any]) -> str:
@@ -37,7 +78,7 @@ def _row_prompt(row: collections.abc.Mapping[str, tp.Any]) -> str:
         if isinstance(val, list) and val:
             last = val[-1]
             if isinstance(last, collections.abc.Mapping) and "content" in last:
-                return str(last["content"])
+                return _extract_text(last["content"])
     return ""
 
 
@@ -130,9 +171,12 @@ class AutoEnvironment:
         merged: dict[str, tp.Any] = dict(task)
         prompt = _row_prompt(task)
         if prompt:
-            merged.setdefault("prompt", prompt)
-            merged.setdefault("problem_statement", prompt)
-            merged.setdefault("task_prompt", prompt)
+            if not isinstance(merged.get("prompt"), str):
+                merged["prompt"] = prompt
+            if not isinstance(merged.get("problem_statement"), str):
+                merged["problem_statement"] = prompt
+            if not isinstance(merged.get("task_prompt"), str):
+                merged["task_prompt"] = prompt
 
         if runtime is not None:
             merged["runtime"] = runtime
@@ -195,34 +239,33 @@ class AutoEnvironment:
         container_config: ContainerConfig | None = None,
         **defaults: tp.Any,
     ) -> tp.Callable[..., AgenticEnvironment]:
-        """Create a trainer-compatible ``environment_factory(**task_or_empty)``."""
+        """Create a trainer-compatible ``environment_factory(**task_or_empty)``.
+
+        Factory ``defaults`` apply only when not overridden by per-call ``task`` keys or ``kwargs``
+        (precedence: ``defaults < task < kwargs``).
+        """
+        base_defaults: dict[str, tp.Any] = {
+            **{
+                k: v
+                for k, v in {
+                    "runtime": runtime,
+                    "backend": backend,
+                    "endpoint": endpoint,
+                    "container_config": container_config,
+                }.items()
+                if v is not None
+            },
+            **defaults,
+        }
 
         def _factory(task: collections.abc.Mapping[str, tp.Any] | None = None, **kwargs: tp.Any) -> AgenticEnvironment:
-            combined_task = {**(task or {}), **kwargs}
-            if environment == "auto" or combined_task:
+            combined_task = {**base_defaults, **(task or {}), **kwargs}
+            if environment == "auto" or task or kwargs:
                 return cls.from_task(
                     combined_task,
                     environment=None if environment == "auto" else environment,
-                    runtime=runtime,
-                    backend=backend,
-                    endpoint=endpoint,
-                    container_config=container_config,
-                    **defaults,
                 )
-            return cls.from_name(
-                environment,
-                **{
-                    k: v
-                    for k, v in {
-                        "runtime": runtime,
-                        "backend": backend,
-                        "endpoint": endpoint,
-                        "container_config": container_config,
-                        **defaults,
-                    }.items()
-                    if v is not None
-                },
-            )
+            return cls.from_name(environment, **base_defaults)
 
         return _factory
 
@@ -237,12 +280,15 @@ def is_unscorable(result: StepResult) -> bool:
     return bool(info.get("discard") or info.get("env_error"))
 
 
-def _grade_single_turn(env: AgenticEnvironment, completion: str) -> StepResult:
-    """Grade one completion terminally; environments with ``grade_single_turn`` never run tool turns."""
-    grader = getattr(env, "grade_single_turn", None)
-    if callable(grader):
-        return grader(completion)
-    return env.step(completion)
+def _grade_single_turn(env: AgenticEnvironment, completion: str) -> StepResult | None:
+    """Grade one completion terminally, isolating per-sample exceptions into ``None`` (unscorable)."""
+    try:
+        grader = getattr(env, "grade_single_turn", None)
+        if callable(grader):
+            return grader(completion)
+        return env.step(completion)
+    except Exception:
+        return None
 
 
 def _grade_single_turn_batch(
@@ -250,13 +296,19 @@ def _grade_single_turn_batch(
     completions: collections.abc.Sequence[str],
     *,
     max_workers: int,
-) -> list[StepResult]:
+) -> list[StepResult | None]:
     if len(envs) <= 1:
         return [_grade_single_turn(e, c) for e, c in zip(envs, completions, strict=True)]
     workers = min(max(1, max_workers), len(envs))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="edenv-grade") as pool:
         futs = [pool.submit(_grade_single_turn, e, c) for e, c in zip(envs, completions, strict=True)]
-        return [f.result() for f in futs]
+        results: list[StepResult | None] = []
+        for f in futs:
+            try:
+                results.append(f.result())
+            except Exception:
+                results.append(None)
+        return results
 
 
 def make_environment_reward_fn(
@@ -295,59 +347,89 @@ def make_environment_reward_fn(
         **kwargs: tp.Any,
     ) -> list[float | None]:
         if environment_rewards is not None:
-            return [None if r is None else float(r) for r in environment_rewards]
+            out_rewards: list[float | None] = []
+            for r in environment_rewards:
+                if r is None:
+                    out_rewards.append(None)
+                else:
+                    val = float(r)
+                    out_rewards.append(val if math.isfinite(val) else None)
+            return out_rewards
         if completions is None:
             return []
 
-        comp_texts = [c if isinstance(c, str) else str(c) for c in completions]
+        comp_texts = [_extract_text(c) for c in completions]
         n = len(comp_texts)
-        envs: list[AgenticEnvironment] = []
+        if n == 0:
+            return []
+
+        columns: dict[str, list[tp.Any]] = {}
+        batch_payload = kwargs.get("batch")
+        if isinstance(batch_payload, collections.abc.Mapping):
+            for key, val in batch_payload.items():
+                col = _as_column(val, n)
+                if col is not None:
+                    columns[key] = col
+        for key, val in kwargs.items():
+            if key == "batch":
+                continue
+            col = _as_column(val, n)
+            if col is not None:
+                columns[key] = col
+
+        envs: list[AgenticEnvironment | None] = []
         for idx in range(n):
-            row: dict[str, tp.Any] = {}
+            row: dict[str, tp.Any] = dict(defaults)
+            for key, col in columns.items():
+                row[key] = col[idx]
             if prompts is not None and idx < len(prompts):
-                row["prompt"] = prompts[idx] if isinstance(prompts[idx], str) else str(prompts[idx])
-            for key, val in kwargs.items():
-                if isinstance(val, (list, tuple)) and len(val) == n:
-                    row[key] = val[idx]
-            envs.append(
-                AutoEnvironment.from_task(
+                row["prompt"] = _extract_text(prompts[idx])
+            try:
+                env = AutoEnvironment.from_task(
                     row,
                     environment=None if environment == "auto" else environment,
                     runtime=runtime,
                     backend=backend,
                     container_config=container_config,
-                    **defaults,
                 )
-            )
+            except Exception:
+                envs.append(None)
+                continue
+            envs.append(env)
 
         try:
             active_envs: list[AgenticEnvironment] = []
             active_comps: list[str] = []
             active_indices: list[int] = []
-            reset_errors: list[str] = []
             for idx, (env, comp) in enumerate(zip(envs, comp_texts, strict=True)):
-                reset_res = env.reset()
-                if reset_res.info.get("env_error"):
-                    reset_errors.append(str(reset_res.info.get("env_error_message", "Environment reset failed.")))
-                else:
+                if env is None:
+                    continue
+                try:
+                    reset_res = env.reset()
+                except Exception:
+                    continue
+                if not reset_res.info.get("env_error"):
                     active_envs.append(env)
                     active_comps.append(comp)
                     active_indices.append(idx)
-            if not active_envs and reset_errors:
-                raise SandboxInfraError(reset_errors[0])
-            # A sample whose environment could not be reset or graded is unscorable: ``None``, never 0.0.
-            scores: list[float | None] = [None] * len(comp_texts)
+            # A sample whose environment could not be constructed, reset, or graded is unscorable: ``None``, never 0.0.
+            scores: list[float | None] = [None] * n
             if active_envs:
                 results = _grade_single_turn_batch(active_envs, active_comps, max_workers=max_workers)
                 for idx, res in zip(active_indices, results, strict=True):
-                    scores[idx] = None if is_unscorable(res) else float(res.reward)
+                    if res is None or is_unscorable(res):
+                        scores[idx] = None
+                    else:
+                        val = float(res.reward)
+                        scores[idx] = val if math.isfinite(val) else None
             return scores
         finally:
             for env in envs:
-                try:
-                    env.close()
-                except Exception:
-                    pass
+                if env is not None:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
 
     _reward_fn.__dict__["discard_unscorable"] = True
     return _reward_fn

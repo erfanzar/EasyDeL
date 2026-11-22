@@ -34,6 +34,7 @@ import asyncio
 import collections.abc
 import dataclasses
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -227,6 +228,52 @@ class ContainerConfig:
     max_file_size_mb: int = 1024
 
 
+def _parse_tmpfs_size_mb(raw: str) -> int | None:
+    """Parse a mount ``size=`` value (bytes, k/m/g suffix) into MiB, or ``None`` if invalid."""
+    text = raw.strip().lower()
+    if not text:
+        return None
+    if text.endswith("m") and text[:-1].isascii() and text[:-1].isdigit():
+        return int(text[:-1])
+    if text.endswith("g") and text[:-1].isascii() and text[:-1].isdigit():
+        return int(text[:-1]) * 1024
+    if text.endswith("k") and text[:-1].isascii() and text[:-1].isdigit():
+        kb = int(text[:-1])
+        return 0 if kb <= 0 else max(1, (kb + 1023) // 1024)
+    if text.isascii() and text.isdigit():
+        b = int(text)
+        return 0 if b <= 0 else max(1, (b + 1024 * 1024 - 1) // (1024 * 1024))
+    return None
+
+
+def _has_blocked_tmpfs_option(text: str) -> bool:
+    for part in text.split(","):
+        token = part.strip().lower()
+        if token in ("size", "nr_blocks") or token.startswith(("size=", "nr_blocks=")):
+            return True
+    return False
+
+
+def _filter_tmpfs_options(raw_opt_list: tp.Any) -> list[tp.Any]:
+    if not isinstance(raw_opt_list, list):
+        raise ValueError("TmpfsOptions.Options must be a list")
+    filtered: list[tp.Any] = []
+    for entry in raw_opt_list:
+        if isinstance(entry, list):
+            if not all(isinstance(item, str) for item in entry):
+                raise ValueError("TmpfsOptions.Options entries must be lists of strings")
+            if not entry or any(_has_blocked_tmpfs_option(item) for item in entry):
+                continue
+            filtered.append(entry)
+        elif isinstance(entry, str):
+            if _has_blocked_tmpfs_option(entry):
+                continue
+            filtered.append(entry)
+        else:
+            raise ValueError("TmpfsOptions.Options entries must be strings or lists of strings")
+    return filtered
+
+
 @dataclasses.dataclass(frozen=True)
 class KiriDaemonBudget:
     """Per-daemon resource budget for RAM-backed (``/dev/shm``) Kiri pools.
@@ -259,31 +306,97 @@ class KiriDaemonBudget:
         A missing, zero or negative limit (unlimited for the engine) is replaced by the cap.
 
         Raises:
-            ValueError: When a limit is not an integer.
+            ValueError: When a limit is not an integer or mount config has an invalid shape.
         """
         out = dict(host_config)
 
         def _capped(key: str, cap: int) -> int:
-            value = int(out.get(key) or 0)
+            raw = out.get(key)
+            if isinstance(raw, bool):
+                raise ValueError(f"{key} must be an integer, not bool")
+            if isinstance(raw, float) and not math.isfinite(raw):
+                raise ValueError(f"{key} must be finite")
+            value = int(raw or 0)
             return cap if value <= 0 else min(value, cap)
 
         if self.memory_mb > 0:
-            out["Memory"] = _capped("Memory", int(self.memory_mb) * 1024 * 1024)
+            mem_cap = int(self.memory_mb) * 1024 * 1024
+            out["Memory"] = _capped("Memory", mem_cap)
+            if "MemorySwap" in out and out["MemorySwap"] is not None:
+                out["MemorySwap"] = _capped("MemorySwap", out["Memory"])
         if self.cpus > 0:
             out["NanoCpus"] = _capped("NanoCpus", int(float(self.cpus) * 1_000_000_000))
         if self.pids_limit > 0:
             out["PidsLimit"] = _capped("PidsLimit", int(self.pids_limit))
+        if self.tmpfs_mb > 0 and "ShmSize" in out and out["ShmSize"] is not None:
+            out["ShmSize"] = _capped("ShmSize", int(self.tmpfs_mb) * 1024 * 1024)
+
         tmpfs = out.get("Tmpfs")
-        if isinstance(tmpfs, dict) and self.tmpfs_mb > 0:
+        if tmpfs is not None and self.tmpfs_mb > 0:
+            if not isinstance(tmpfs, dict):
+                raise ValueError("HostConfig.Tmpfs must be a mapping")
             capped: dict[str, str] = {}
             for mount, opts in tmpfs.items():
-                parts = [p for p in str(opts).split(",") if p and not p.startswith("size=")]
+                raw_parts = [p.strip() for p in str(opts).split(",") if p.strip()]
+                parts = [p for p in raw_parts if not p.lower().startswith(("size=", "nr_blocks="))]
                 size_mb = self.tmpfs_mb
-                for p in str(opts).split(","):
-                    if p.startswith("size=") and p.endswith("m") and p[5:-1].isdigit():
-                        size_mb = min(int(p[5:-1]), self.tmpfs_mb)
+                for p in raw_parts:
+                    if p.lower().startswith("size="):
+                        parsed_mb = _parse_tmpfs_size_mb(p[5:])
+                        size_mb = (
+                            self.tmpfs_mb if parsed_mb is None or parsed_mb <= 0 else min(parsed_mb, self.tmpfs_mb)
+                        )
                 capped[mount] = ",".join([*parts, f"size={size_mb}m"])
             out["Tmpfs"] = capped
+
+        mounts = out.get("Mounts")
+        if mounts is not None and self.tmpfs_mb > 0:
+            if not isinstance(mounts, list):
+                raise ValueError("HostConfig.Mounts must be a list")
+            max_tmpfs_bytes = int(self.tmpfs_mb) * 1024 * 1024
+            clamped_mounts: list[tp.Any] = []
+            for mount in mounts:
+                if not isinstance(mount, dict):
+                    raise ValueError("HostConfig.Mounts entries must be objects")
+                m = dict(mount)
+                m_type = next((v for k, v in m.items() if k.casefold() == "type"), "")
+                if str(m_type).lower() == "tmpfs":
+                    opts_keys = [k for k in list(m) if k.casefold() == "tmpfsoptions"]
+                    raw_opts = m.pop(opts_keys[-1]) if opts_keys else None
+                    for k in opts_keys[:-1]:
+                        m.pop(k, None)
+                    if raw_opts is None:
+                        t_opts: dict[str, tp.Any] = {}
+                    elif isinstance(raw_opts, dict):
+                        t_opts = dict(raw_opts)
+                    else:
+                        raise ValueError("HostConfig.Mounts TmpfsOptions must be an object")
+                    size_keys = [k for k in list(t_opts) if k.casefold() == "sizebytes"]
+                    raw_size = t_opts.pop(size_keys[-1]) if size_keys else None
+                    for k in size_keys[:-1]:
+                        t_opts.pop(k, None)
+                    if raw_size is None:
+                        clamped_size = max_tmpfs_bytes
+                    else:
+                        if isinstance(raw_size, bool):
+                            raise ValueError("TmpfsOptions.SizeBytes must be an integer, not bool")
+                        if isinstance(raw_size, float) and not math.isfinite(raw_size):
+                            raise ValueError("TmpfsOptions.SizeBytes must be finite")
+                        size_val = int(raw_size)
+                        clamped_size = max_tmpfs_bytes if size_val <= 0 else min(size_val, max_tmpfs_bytes)
+                    t_opts["SizeBytes"] = clamped_size
+                    opt_keys = [k for k in list(t_opts) if k.casefold() == "options"]
+                    if opt_keys:
+                        raw_opt_list = t_opts.pop(opt_keys[-1])
+                        for k in opt_keys[:-1]:
+                            t_opts.pop(k, None)
+                        if raw_opt_list is not None:
+                            filtered_opts = _filter_tmpfs_options(raw_opt_list)
+                            if filtered_opts:
+                                t_opts["Options"] = filtered_opts
+                    m["TmpfsOptions"] = t_opts
+                clamped_mounts.append(m)
+            out["Mounts"] = clamped_mounts
         return out
 
 
@@ -397,11 +510,30 @@ def _demux_docker_stream(payload: bytes, max_chars: int) -> tuple[str, str]:
     return stdout, stderr
 
 
+_TAR_META_TYPEFLAGS = (b"x", b"g", b"L", b"K", b"X")
+
+
+def _normalize_container_relpath(rel_path: str, base_dir: str) -> str:
+    """Validate and normalize ``rel_path`` relative to ``base_dir`` inside a container."""
+    base = posixpath.normpath(base_dir)
+    if posixpath.isabs(rel_path):
+        clean = posixpath.relpath(posixpath.normpath(rel_path), base)
+    else:
+        clean = rel_path.lstrip("/")
+    clean = posixpath.normpath(clean)
+    if clean in ("", ".", "..") or clean.startswith("../") or posixpath.isabs(clean):
+        raise ValueError(f"File path '{rel_path}' escapes base_dir '{base_dir}'.")
+    return clean
+
+
 def _first_regular_tar_member(archive: bytes, max_bytes: int | None) -> bytes | None:
     """Return the data of the first regular-file member of a (possibly truncated) ustar/pax archive.
 
     Parses tar headers directly so an archive cut short by a body cap still yields
     the leading ``max_bytes`` bytes of the file, which :mod:`tarfile` would reject.
+    Only PAX/GNU extended metadata headers are skipped; if the first real tar entry
+    is a directory, link, FIFO, or other non-file entry, ``None`` is returned rather
+    than descending into a directory's children.
     """
     pos = 0
     total = len(archive)
@@ -414,13 +546,17 @@ def _first_regular_tar_member(archive: bytes, max_bytes: int | None) -> bytes | 
             size = int(size_field or b"0", 8)
         except ValueError:
             return None
+        if size < 0:
+            return None
         typeflag = header[156:157]
         data_start = pos + 512
         if typeflag in (b"0", b"\0", b"7"):
             keep = size if max_bytes is None else min(size, max(0, int(max_bytes)))
             return bytes(archive[data_start : data_start + keep])
-        # Skip pax/GNU extension headers, directories, links and other non-file members.
-        pos = data_start + ((size + 511) // 512) * 512
+        if typeflag in _TAR_META_TYPEFLAGS:
+            pos = data_start + ((size + 511) // 512) * 512
+            continue
+        return None
     return None
 
 
@@ -542,7 +678,7 @@ class EngineSocketClient:
         if not status_line:
             raise SandboxInfraError("Empty HTTP status line from container engine.")
         parts = status_line.decode("latin-1", errors="replace").strip().split(" ", 2)
-        if len(parts) < 2 or not parts[1].isdigit():
+        if len(parts) < 2 or not parts[1].isascii() or not parts[1].isdigit():
             raise SandboxInfraError(f"Malformed HTTP status line: {status_line!r}")
         status = int(parts[1])
 
@@ -560,7 +696,7 @@ class EngineSocketClient:
         if status in (204, 304) or method == "HEAD":
             return _HTTPResponse(status=status, headers=resp_headers, body=b"")
 
-        cap = max_body_bytes
+        cap = None if max_body_bytes is None else max(0, int(max_body_bytes))
         transfer_encoding = resp_headers.get("transfer-encoding", "").lower()
         if "chunked" in transfer_encoding:
             chunks: list[bytes] = []
@@ -569,9 +705,11 @@ class EngineSocketClient:
                 size_line = reader.readline(65536)
                 if not size_line:
                     break
-                token = size_line.strip().split(b";", 1)[0]
+                token = size_line.strip().split(b";", 1)[0].strip()
                 if not token:
                     continue
+                if not token.isascii() or not all(ch in b"0123456789abcdefABCDEF" for ch in token):
+                    raise SandboxInfraError(f"Malformed HTTP chunk size from container engine: {token!r}")
                 chunk_len = int(token, 16)
                 if chunk_len == 0:
                     reader.readline(65536)
@@ -581,13 +719,18 @@ class EngineSocketClient:
                     chunks.append(keep)
                     return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks), truncated=True)
                 data = reader.read(chunk_len)
+                if not data:
+                    break
                 reader.read(2)
                 chunks.append(data)
                 collected += len(data)
             return _HTTPResponse(status=status, headers=resp_headers, body=b"".join(chunks))
 
         if "content-length" in resp_headers:
-            length = int(resp_headers["content-length"])
+            raw_len = resp_headers["content-length"].strip()
+            if not raw_len or not raw_len.isascii() or not raw_len.isdigit():
+                raise SandboxInfraError(f"Invalid Content-Length header from container engine: {raw_len!r}")
+            length = int(raw_len)
             if cap is not None and length > cap:
                 return _HTTPResponse(status=status, headers=resp_headers, body=reader.read(cap), truncated=True)
             return _HTTPResponse(status=status, headers=resp_headers, body=reader.read(length))
@@ -718,6 +861,13 @@ class EngineSocketClient:
         }
         query = f"?name={urllib.parse.quote(name)}" if name else ""
         resp = self._request("POST", f"{self.api_prefix}/containers/create{query}", body=payload, timeout=30.0)
+        if resp.status == 404 and config.pull_if_missing:
+            with self._images_lock:
+                was_cached = config.image in self._present_images
+                self._present_images.discard(config.image)
+            if was_cached:
+                self.ensure_image(config.image, pull=True)
+                resp = self._request("POST", f"{self.api_prefix}/containers/create{query}", body=payload, timeout=30.0)
         if resp.status != 201:
             raise SandboxInfraError(f"Container create failed: {self._error_message(resp)}")
         cid = json.loads(resp.body.decode("utf-8")).get("Id")
@@ -744,6 +894,7 @@ class EngineSocketClient:
         files: collections.abc.Mapping[str, bytes | str],
         *,
         base_dir: str = "/workspace",
+        timeout: float = 30.0,
     ) -> None:
         """Upload in-memory files into ``container_id`` via tar archive."""
         if not files:
@@ -753,10 +904,7 @@ class EngineSocketClient:
         with tarfile.open(fileobj=buf, mode="w") as tf:
             for rel_path, content in files.items():
                 raw = content.encode("utf-8") if isinstance(content, str) else bytes(content)
-                clean = rel_path.lstrip("/") if not posixpath.isabs(rel_path) else posixpath.relpath(rel_path, base_dir)
-                clean = posixpath.normpath(clean)
-                if clean == ".." or clean.startswith("../") or posixpath.isabs(clean):
-                    raise ValueError(f"File path '{rel_path}' escapes base_dir '{base_dir}'.")
+                clean = _normalize_container_relpath(rel_path, base_dir)
                 info = tarfile.TarInfo(name=clean)
                 info.size = len(raw)
                 info.mtime = now
@@ -768,7 +916,7 @@ class EngineSocketClient:
             f"{self.api_prefix}/containers/{container_id}/archive?path={encoded_path}",
             body=buf.getvalue(),
             content_type="application/x-tar",
-            timeout=30.0,
+            timeout=timeout,
         )
         if not (200 <= resp.status < 300):
             raise SandboxInfraError(f"Archive upload failed: {self._error_message(resp)}")
@@ -788,6 +936,7 @@ class EngineSocketClient:
 
         Raises:
             FileNotFoundError: When the path is missing or is not a regular file.
+            SandboxInfraError: When the container engine returns a server error or fails I/O.
         """
         encoded_path = urllib.parse.quote(path, safe="/")
         body_cap = None if max_bytes is None else max(0, int(max_bytes)) + _TAR_READ_SLACK_BYTES
@@ -797,6 +946,8 @@ class EngineSocketClient:
             timeout=30.0,
             max_body_bytes=body_cap,
         )
+        if resp.status >= 500:
+            raise SandboxInfraError(f"Engine error reading '{path}' from container: {self._error_message(resp)}")
         if not (200 <= resp.status < 300):
             raise FileNotFoundError(f"Cannot read '{path}' from container: {self._error_message(resp)}")
         data = _first_regular_tar_member(resp.body, max_bytes)
@@ -847,44 +998,62 @@ class EngineSocketClient:
             )
         stdin_path: str | None = None
         killed = False
+        exec_started = False
         pid_path = f"/tmp/.ed_pid_{uuid.uuid4().hex}"
-        if stdin is not None:
-            stdin_name = f".ed_stdin_{uuid.uuid4().hex}"
-            stdin_path = f"/tmp/{stdin_name}"
-            self.put_files(container_id, {stdin_name: stdin}, base_dir="/tmp")
-        # The in-container SIGKILL backstop fires a little after the client deadline,
-        # so the client normally observes the timeout first and kills via the pid file.
         backstop_s = max(1, math.ceil(float(timeout))) + 2
-        exec_cmd = [
-            "/bin/sh",
-            "-c",
-            _EXEC_WATCHDOG_SCRIPT,
-            "sh",
-            pid_path,
-            str(backstop_s),
-            stdin_path or "",
-            *cmd,
-        ]
-
-        create_payload: dict[str, tp.Any] = {
-            "AttachStdout": True,
-            "AttachStderr": True,
-            "AttachStdin": False,
-            "Tty": False,
-            "Cmd": exec_cmd,
-        }
-        if workdir:
-            create_payload["WorkingDir"] = workdir
-        if env:
-            create_payload["Env"] = [f"{k}={v}" for k, v in env.items()]
 
         try:
-            created = self._request(
-                "POST",
-                f"{self.api_prefix}/containers/{container_id}/exec",
-                body=create_payload,
-                timeout=15.0,
-            )
+            if stdin is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ExecResult(ok=False, stdout="", stderr="", returncode=None, timed_out=True)
+                stdin_name = f".ed_stdin_{uuid.uuid4().hex}"
+                stdin_path = f"/tmp/{stdin_name}"
+                try:
+                    if type(self).put_files is EngineSocketClient.put_files:
+                        self.put_files(container_id, {stdin_name: stdin}, base_dir="/tmp", timeout=remaining)
+                    else:
+                        self.put_files(container_id, {stdin_name: stdin}, base_dir="/tmp")
+                except TimeoutError:
+                    return ExecResult(ok=False, stdout="", stderr="", returncode=None, timed_out=True)
+
+            # The in-container SIGKILL backstop fires a little after the client deadline,
+            # so the client normally observes the timeout first and kills via the pid file.
+            exec_cmd = [
+                "/bin/sh",
+                "-c",
+                _EXEC_WATCHDOG_SCRIPT,
+                "sh",
+                pid_path,
+                str(backstop_s),
+                stdin_path or "",
+                *cmd,
+            ]
+
+            create_payload: dict[str, tp.Any] = {
+                "AttachStdout": True,
+                "AttachStderr": True,
+                "AttachStdin": False,
+                "Tty": False,
+                "Cmd": exec_cmd,
+            }
+            if workdir:
+                create_payload["WorkingDir"] = workdir
+            if env:
+                create_payload["Env"] = [f"{k}={v}" for k, v in env.items()]
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ExecResult(ok=False, stdout="", stderr="", returncode=None, timed_out=True)
+            try:
+                created = self._request(
+                    "POST",
+                    f"{self.api_prefix}/containers/{container_id}/exec",
+                    body=create_payload,
+                    timeout=min(15.0, remaining),
+                )
+            except TimeoutError:
+                return ExecResult(ok=False, stdout="", stderr="", returncode=None, timed_out=True)
             if not (200 <= created.status < 300):
                 return ExecResult(
                     ok=False,
@@ -893,7 +1062,16 @@ class EngineSocketClient:
                     returncode=None,
                     infra_error=f"exec create failed: {self._error_message(created)}",
                 )
-            exec_id = json.loads(created.body.decode("utf-8")).get("Id")
+            try:
+                exec_id = json.loads(created.body.decode("utf-8")).get("Id")
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+                return ExecResult(
+                    ok=False,
+                    stdout="",
+                    stderr="",
+                    returncode=None,
+                    infra_error=f"exec create returned invalid JSON: {exc}",
+                )
             if not exec_id:
                 return ExecResult(
                     ok=False,
@@ -907,6 +1085,7 @@ class EngineSocketClient:
             try:
                 if remaining <= 0:
                     raise TimeoutError("exec deadline expired before start")
+                exec_started = True
                 started = self._request(
                     "POST",
                     f"{self.api_prefix}/exec/{exec_id}/start",
@@ -918,6 +1097,11 @@ class EngineSocketClient:
                 killed = True
                 self._kill_exec(container_id, pid_path)
                 return ExecResult(ok=False, stdout="", stderr="", returncode=None, timed_out=True)
+            except BaseException:
+                if exec_started:
+                    killed = True
+                    self._kill_exec(container_id, pid_path)
+                raise
 
             if not (200 <= started.status < 300):
                 return ExecResult(
@@ -973,7 +1157,7 @@ class EngineSocketClient:
         finally:
             # After a kill the kill script removes the pid file itself; removing it here
             # concurrently could race the kill and leave the command running.
-            leftovers = [p for p in (stdin_path, None if killed else pid_path) if p]
+            leftovers = [p for p in (stdin_path, pid_path if (exec_started and not killed) else None) if p]
             if leftovers:
                 try:
                     self._cleanup_temp(container_id, *leftovers)
@@ -1003,7 +1187,10 @@ class EngineSocketClient:
         )
         if not (200 <= created.status < 300):
             return None
-        exec_id = json.loads(created.body.decode("utf-8")).get("Id")
+        try:
+            exec_id = json.loads(created.body.decode("utf-8")).get("Id")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return None
         if not exec_id:
             return None
         started = self._request(
@@ -1022,21 +1209,32 @@ class EngineSocketClient:
         finish. Only processes in the container's pid namespace are reachable.
 
         Raises:
-            SandboxInfraError: When the kill exec cannot be created or started.
+            SandboxInfraError: When the kill exec cannot be created, started, or
+                confirmed finished within ``wait`` seconds.
         """
         exec_id = self._detached_exec(container_id, ["/bin/sh", "-c", _KILL_ALL_SCRIPT], user="root")
         if exec_id is None:
             raise SandboxInfraError(f"Could not start the process-kill exec in container {container_id}.")
         deadline = time.monotonic() + max(0.0, float(wait))
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
             try:
-                resp = self._request("GET", f"{self.api_prefix}/exec/{exec_id}/json", timeout=2.0)
+                resp = self._request(
+                    "GET",
+                    f"{self.api_prefix}/exec/{exec_id}/json",
+                    timeout=max(0.05, min(2.0, remaining)) if remaining > 0 else 0.05,
+                )
                 meta = json.loads(resp.body.decode("utf-8", errors="replace")) if 200 <= resp.status < 300 else {}
             except (SandboxInfraError, TimeoutError, json.JSONDecodeError):
                 meta = {}
             if isinstance(meta, dict) and meta.get("Running") is False:
                 return
-            time.sleep(0.05)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        raise SandboxInfraError(
+            f"Timed out after {wait}s waiting for process-kill exec {exec_id} in container {container_id} to complete."
+        )
 
 
 _PRLIMIT_BIN: str | None = shutil.which("prlimit") if _POSIX else None
@@ -1178,15 +1376,28 @@ class ContainerSandboxSession(SandboxSession):
         self._container_id = client.create_container(config)
         self._closed = False
         try:
+            params = inspect.signature(client.exec_run).parameters
+            self._client_accepts_max_stdin = "max_stdin_bytes" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            self._client_accepts_max_stdin = isinstance(client, EngineSocketClient)
+        try:
             client.start_container(self._container_id)
-            client.exec_run(
+            res = client.exec_run(
                 self._container_id,
-                ["mkdir", "-p", config.workdir],
+                ["mkdir", "-p", "--", config.workdir],
                 workdir="/",
                 timeout=10.0,
             )
-        except Exception:
-            client.remove_container(self._container_id, force=True)
+            if res.infra_error or res.timed_out or (not res.ok and isinstance(client, EngineSocketClient)):
+                detail = res.infra_error or res.stderr or f"exit code {res.returncode}"
+                raise SandboxInfraError(f"Failed to prepare container workdir '{config.workdir}': {detail}")
+        except BaseException:
+            try:
+                client.remove_container(self._container_id, force=True)
+            except Exception:
+                pass
             raise
 
     @property
@@ -1223,6 +1434,9 @@ class ContainerSandboxSession(SandboxSession):
         merged_env = dict(self._config.env)
         if env:
             merged_env.update(env)
+        extra_kwargs: dict[str, tp.Any] = {}
+        if self._client_accepts_max_stdin:
+            extra_kwargs["max_stdin_bytes"] = self._config.max_stdin_bytes
         return self._client.exec_run(
             self._container_id,
             argv,
@@ -1231,17 +1445,30 @@ class ContainerSandboxSession(SandboxSession):
             stdin=stdin,
             timeout=float(timeout if timeout is not None else self._config.timeout),
             max_output_chars=self._config.max_output_chars,
+            **extra_kwargs,
         )
 
     def write_files(self, files: collections.abc.Mapping[str, bytes | str]) -> None:
         if self._closed:
             raise SandboxInfraError("Session is closed.")
-        dirs = sorted(
-            {posixpath.dirname(p.lstrip("/")) for p in files if posixpath.dirname(p.lstrip("/")) not in ("", ".")}
-        )
+        if not files:
+            return
+        normalized_paths = [_normalize_container_relpath(p, self._config.workdir) for p in files]
+        dirs = sorted({posixpath.dirname(c) for c in normalized_paths if posixpath.dirname(c) not in ("", ".")})
         if dirs:
             mkdir_targets = [posixpath.join(self._config.workdir, d) for d in dirs]
-            self._client.exec_run(self._container_id, ["mkdir", "-p", *mkdir_targets], workdir="/", timeout=10.0)
+            res = self._client.exec_run(
+                self._container_id,
+                ["mkdir", "-p", "--", *mkdir_targets],
+                workdir="/",
+                timeout=10.0,
+            )
+            if res.infra_error or res.timed_out:
+                detail = res.infra_error or "command timed out"
+                raise SandboxInfraError(f"Failed to create directories in container: {detail}")
+            if not res.ok:
+                detail = res.stderr or f"exit code {res.returncode}"
+                raise OSError(f"Failed to create directories in container: {detail}")
         self._client.put_files(self._container_id, files, base_dir=self._config.workdir)
 
     def read_file(self, path: str, *, max_chars: int | None = None) -> str:
@@ -1267,6 +1494,44 @@ class ContainerSandboxSession(SandboxSession):
                 self._client.remove_container(self._container_id, force=True)
             except Exception:
                 pass
+
+
+def _rmtree_force(root: str) -> None:
+    """Remove ``root``, restoring directory permissions (without following symlinks) if needed."""
+    abs_root = os.path.abspath(root)
+
+    def _within_root(p: str) -> bool:
+        ap = os.path.abspath(p)
+        return ap == abs_root or ap.startswith(abs_root + os.sep)
+
+    def _on_error(func: tp.Any, path: str, _exc: tp.Any) -> None:
+        try:
+            if _within_root(path) and not os.path.islink(path):
+                mode = stat.S_IMODE(os.lstat(path).st_mode)
+                os.chmod(path, mode | stat.S_IRWXU)
+            parent = os.path.dirname(path)
+            if parent and _within_root(parent) and not os.path.islink(parent):
+                pmode = stat.S_IMODE(os.lstat(parent).st_mode)
+                os.chmod(parent, pmode | stat.S_IRWXU)
+            if func in (os.unlink, os.remove, os.rmdir):
+                func(path)
+        except (OSError, TypeError):
+            pass
+
+    for attempt in range(5):
+        if not os.path.exists(root):
+            return
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(root, onexc=_on_error)
+            else:
+                shutil.rmtree(root, onerror=_on_error)
+        except OSError:
+            pass
+        if not os.path.exists(root):
+            return
+        if attempt < 4:
+            time.sleep(0.05)
 
 
 class LocalSandboxSession(SandboxSession):
@@ -1343,6 +1608,14 @@ class LocalSandboxSession(SandboxSession):
             raise ValueError(f"Path '{rel_or_abs}' escapes sandbox workspace.")
         return target
 
+    @staticmethod
+    def _sandbox_path() -> str:
+        py_dirs = [os.path.dirname(os.path.abspath(sys.executable))]
+        real_py_dir = os.path.dirname(os.path.realpath(sys.executable))
+        if real_py_dir not in py_dirs:
+            py_dirs.append(real_py_dir)
+        return f"{':'.join(py_dirs)}:{_DEFAULT_PATH}"
+
     def _build_bwrap_argv(self, argv: list[str], cwd: str) -> list[str]:
         assert self._bwrap is not None
         cmd = [
@@ -1356,22 +1629,36 @@ class LocalSandboxSession(SandboxSession):
             "--die-with-parent",
         ]
         runtime_dirs = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
-        base_prefix = os.path.realpath(sys.base_prefix)
-        if not any(base_prefix == d or base_prefix.startswith(d + "/") for d in runtime_dirs):
-            runtime_dirs.append(base_prefix)
+        for candidate in (
+            os.path.realpath(sys.base_prefix),
+            os.path.abspath(sys.prefix),
+            os.path.realpath(sys.prefix),
+        ):
+            if candidate and not any(candidate == d or candidate.startswith(d + "/") for d in runtime_dirs):
+                runtime_dirs.append(candidate)
         for d in runtime_dirs:
             if os.path.exists(d):
                 cmd += ["--ro-bind", d, d]
-        cmd += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+        cmd += ["--dev", "/dev", "--proc", "/proc"]
+        if self._config.tmpfs_mb > 0:
+            tmpfs_bytes = int(self._config.tmpfs_mb) * 1024 * 1024
+            cmd += ["--size", str(tmpfs_bytes), "--tmpfs", "/tmp"]
+        else:
+            cmd += ["--dir", "/tmp"]
         if not self._config.network:
             cmd.append("--unshare-net")
         else:
             for p in ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"):
                 if os.path.exists(p):
                     cmd += ["--ro-bind", p, p]
-        resolved_exe = shutil.which(argv[0]) or argv[0]
-        if os.path.exists(resolved_exe):
-            resolved_exe = os.path.realpath(resolved_exe)
+        exe_arg = argv[0]
+        if os.path.isabs(exe_arg):
+            resolved_exe = exe_arg
+        elif os.sep in exe_arg or (os.altsep and os.altsep in exe_arg):
+            # Relative path (e.g. "./run.sh" or "sub/tool"): resolve against sandbox cwd, never host cwd.
+            resolved_exe = exe_arg
+        else:
+            resolved_exe = shutil.which(exe_arg, path=self._sandbox_path()) or exe_arg
         return [*cmd, "--bind", self._root, self._root, "--chdir", cwd, "--", resolved_exe, *argv[1:]]
 
     def exec(
@@ -1427,7 +1714,7 @@ class LocalSandboxSession(SandboxSession):
 
         proc_env = {k: os.environ[k] for k in _SAFE_ENV_KEYS if k in os.environ}
         proc_env.update(
-            PATH=f"{os.path.dirname(os.path.realpath(sys.executable))}:{_DEFAULT_PATH}",
+            PATH=self._sandbox_path(),
             HOME=self._root,
             TMPDIR=self._root,
             PYTHONDONTWRITEBYTECODE="1",
@@ -1492,20 +1779,7 @@ class LocalSandboxSession(SandboxSession):
                 except (BrokenPipeError, OSError, ValueError):
                     pass
 
-        t_out = threading.Thread(target=_drain, args=(proc.stdout, out_buf), daemon=True)
-        t_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf), daemon=True)
-        t_out.start()
-        t_err.start()
-        t_in: threading.Thread | None = None
-        if stdin_bytes is not None and proc.stdin is not None:
-            t_in = threading.Thread(target=_feed, args=(proc.stdin, stdin_bytes), daemon=True)
-            t_in.start()
-
-        timed_out = False
-        try:
-            proc.wait(timeout=budget)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        def _kill_proc_group() -> None:
             if _POSIX:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -1513,12 +1787,55 @@ class LocalSandboxSession(SandboxSession):
                     proc.kill()
             else:
                 proc.kill()
-            proc.wait()
 
-        if t_in is not None:
-            t_in.join(timeout=1.0)
-        t_out.join(timeout=1.0)
-        t_err.join(timeout=1.0)
+        t_out: threading.Thread | None = None
+        t_err: threading.Thread | None = None
+        t_in: threading.Thread | None = None
+        timed_out = False
+        killed_group = False
+        try:
+            t_out = threading.Thread(target=_drain, args=(proc.stdout, out_buf), daemon=True)
+            t_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf), daemon=True)
+            t_out.start()
+            t_err.start()
+            if stdin_bytes is not None and proc.stdin is not None:
+                t_in = threading.Thread(target=_feed, args=(proc.stdin, stdin_bytes), daemon=True)
+                t_in.start()
+
+            try:
+                proc.wait(timeout=budget)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                killed_group = True
+                _kill_proc_group()
+                proc.wait()
+        except BaseException:
+            killed_group = True
+            _kill_proc_group()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        finally:
+            for pipe, thread in ((proc.stdin, t_in), (proc.stdout, t_out), (proc.stderr, t_err)):
+                if pipe is not None and thread is None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            for thread in (t_in, t_out, t_err):
+                if thread is not None:
+                    thread.join(timeout=1.0)
+            if _POSIX:
+                if killed_group:
+                    kill_deadline = time.monotonic() + 0.5
+                    while _signal_group(proc.pid, 0) and time.monotonic() < kill_deadline:
+                        time.sleep(0.01)
+                if not _signal_group(proc.pid, 0):
+                    with self._pgid_lock:
+                        self._spawned_pgids.discard(proc.pid)
+
         timed_out |= _CPU_BUDGET_RETURNCODE is not None and proc.returncode == _CPU_BUDGET_RETURNCODE
         return ExecResult(
             ok=(proc.returncode == 0 and not timed_out),
@@ -1528,18 +1845,83 @@ class LocalSandboxSession(SandboxSession):
             timed_out=timed_out,
         )
 
+    def _resolve_local_write_relpath(self, rel_or_abs: str) -> str:
+        """Resolve ``rel_or_abs`` lexically relative to ``self._root`` without following symlinks."""
+        if os.path.isabs(rel_or_abs):
+            norm = os.path.normpath(rel_or_abs)
+            if norm == self._root:
+                return ""
+            if norm.startswith(self._root + os.sep):
+                return norm[len(self._root) + 1 :]
+            if rel_or_abs.startswith(self._root + os.sep):
+                raise ValueError(f"Path '{rel_or_abs}' escapes sandbox workspace.")
+            cfg_wd = self._config.workdir.rstrip("/")
+            if cfg_wd and rel_or_abs == cfg_wd:
+                return ""
+            if cfg_wd and rel_or_abs.startswith(cfg_wd + "/"):
+                stripped = rel_or_abs[len(cfg_wd) + 1 :]
+            else:
+                stripped = rel_or_abs.lstrip("/")
+            joined = os.path.normpath(os.path.join(self._root, stripped))
+        else:
+            joined = os.path.normpath(os.path.join(self._root, rel_or_abs))
+        if joined != self._root and not joined.startswith(self._root + os.sep):
+            raise ValueError(f"Path '{rel_or_abs}' escapes sandbox workspace.")
+        return "" if joined == self._root else joined[len(self._root) + 1 :]
+
     def write_files(self, files: collections.abc.Mapping[str, bytes | str]) -> None:
         if self._closed:
             raise SandboxInfraError("Session is closed.")
         for rel_path, content in files.items():
-            target = self._resolve_local_path(rel_path)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            if isinstance(content, str):
-                with open(target, "w", encoding="utf-8") as f:
-                    f.write(content)
+            rel = self._resolve_local_write_relpath(rel_path)
+            parts = [p for p in rel.split(os.sep) if p and p != "."]
+            if not parts:
+                raise IsADirectoryError(f"Cannot write '{rel_path}': destination is a directory.")
+            raw = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+            if _POSIX:
+                parent_parts, filename = parts[:-1], parts[-1]
+                dir_fd: int | None = None
+                try:
+                    dir_fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY)
+                    dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+                    for part in parent_parts:
+                        try:
+                            os.mkdir(part, 0o755, dir_fd=dir_fd)
+                        except FileExistsError:
+                            pass
+                        next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
+                        os.close(dir_fd)
+                        dir_fd = next_fd
+                    open_flags = (
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_TRUNC
+                        | getattr(os, "O_NONBLOCK", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    fd = os.open(filename, open_flags, 0o644, dir_fd=dir_fd)
+                    try:
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            raise OSError(f"Cannot write '{rel_path}': destination is not a regular file.")
+                        if hasattr(os, "set_blocking"):
+                            os.set_blocking(fd, True)
+                        f = os.fdopen(fd, "wb")
+                    except BaseException:
+                        os.close(fd)
+                        raise
+                    with f:
+                        f.write(raw)
+                finally:
+                    if dir_fd is not None:
+                        try:
+                            os.close(dir_fd)
+                        except OSError:
+                            pass
             else:
+                target = self._resolve_local_path(rel_path)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
                 with open(target, "wb") as f:
-                    f.write(content)
+                    f.write(raw)
 
     def read_file(self, path: str, *, max_chars: int | None = None) -> str:
         if self._closed:
@@ -1593,22 +1975,18 @@ class LocalSandboxSession(SandboxSession):
         if not self._closed:
             self._closed = True
             if _POSIX:
+                own = os.getpgrp()
                 with self._pgid_lock:
-                    pgids = list(self._spawned_pgids)
+                    pgids = [g for g in self._spawned_pgids if g > 0 and g != own]
                     self._spawned_pgids.clear()
-                for pgid in pgids:
-                    try:
-                        os.killpg(pgid, signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
                 if pgids:
-                    time.sleep(0.05)
-                for pgid in pgids:
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-            shutil.rmtree(self._root, ignore_errors=True)
+                    _terminate_process_groups(pgids, grace=0.05)
+                    live = [g for g in pgids if _signal_group(g, 0)]
+                    deadline = time.monotonic() + _KILL_ALL_WAIT_S
+                    while live and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                        live = [g for g in live if _signal_group(g, 0)]
+            _rmtree_force(self._root)
 
 
 def discover_engine_endpoint(backend: str = "kiri", *, auto_install: bool = False) -> tuple[str | None, str]:
@@ -1727,11 +2105,21 @@ class KiriRuntime:
         self._token = token
         self._owned_lock = threading.Lock()
         self._owned_daemons: list[str] = []
+        self._clients_lock = threading.Lock()
+        self._clients: dict[str, EngineSocketClient] = {}
 
     def _client(self, endpoint: str) -> EngineSocketClient:
         from .kiri_installer import kiri_daemon_budget
 
-        return EngineSocketClient(endpoint, token=self._token, budget=kiri_daemon_budget(endpoint))
+        budget = kiri_daemon_budget(endpoint)
+        with self._clients_lock:
+            client = self._clients.get(endpoint)
+            if client is None:
+                client = EngineSocketClient(endpoint, token=self._token, budget=budget)
+                self._clients[endpoint] = client
+            elif client.budget != budget:
+                client.budget = budget
+            return client
 
     def resolve(self) -> tuple[str | None, str]:
         """Return ``(endpoint, resolved_backend)`` for this runtime."""
@@ -1767,6 +2155,8 @@ class KiriRuntime:
 
     def close(self) -> None:
         """Stop the Kiri daemons this runtime booted (daemons it merely reused are left running)."""
+        with self._clients_lock:
+            self._clients.clear()
         with self._owned_lock:
             owned = list(self._owned_daemons)
             self._owned_daemons.clear()
@@ -1815,6 +2205,7 @@ class SandboxPool:
         self._token = token
         self._auto_install = bool(auto_install)
         self._owned_daemons: list[str] = []
+        self._owned_bridges: list[tuple[str, int]] = []
         resolved_endpoints: list[str] | None = None
         if isinstance(endpoints, str):
             resolved_endpoints = self._expand_endpoint_specs([endpoints])
@@ -1877,9 +2268,9 @@ class SandboxPool:
         Cross-host pools require ``expose_bridge=True`` and a ``bridge_token``
         shared by every host; see ``kiri_installer.ensure_kiri_pod_shm_pool``.
         """
-        from .kiri_installer import _ensure_pod_shm_pool
+        from .kiri_installer import _close_tcp_bridges, _ensure_pod_shm_pool, shutdown_kiri_daemons
 
-        endpoints, started = _ensure_pod_shm_pool(
+        endpoints, started, opened_bridges = _ensure_pod_shm_pool(
             num_daemons_per_host,
             data_dir=data_dir,
             base_port=base_port,
@@ -1890,8 +2281,16 @@ class SandboxPool:
             bridge_token=bridge_token,
             allowed_peers=list(allowed_peers) if allowed_peers is not None else None,
         )
-        pool = cls(endpoints=endpoints, backend="kiri", config=config, token=bridge_token)
+        try:
+            pool = cls(endpoints=endpoints, backend="kiri", config=config, token=bridge_token)
+        except BaseException:
+            if opened_bridges:
+                _close_tcp_bridges(opened_bridges)
+            if started:
+                shutdown_kiri_daemons(started)
+            raise
         pool._owned_daemons.extend(started)
+        pool._owned_bridges.extend(opened_bridges)
         return pool
 
     @classmethod
@@ -1906,7 +2305,7 @@ class SandboxPool:
         kiri_bin: str | None = None,
     ) -> SandboxPool:
         """Create a local RAM-backed Kiri pool in ``/dev/shm`` with zero external CPU VMs."""
-        from .kiri_installer import _ensure_shm_pool
+        from .kiri_installer import _ensure_shm_pool, shutdown_kiri_daemons
 
         endpoints, started = _ensure_shm_pool(
             num_daemons,
@@ -1915,7 +2314,12 @@ class SandboxPool:
             auto_install=auto_install,
             budget=budget,
         )
-        pool = cls(endpoints=endpoints, backend="kiri", config=config)
+        try:
+            pool = cls(endpoints=endpoints, backend="kiri", config=config)
+        except BaseException:
+            if started:
+                shutdown_kiri_daemons(started)
+            raise
         pool._owned_daemons.extend(started)
         return pool
 
@@ -1956,15 +2360,21 @@ class SandboxPool:
         return await self._runtimes[idx].create_session_async(config=config or self._config)
 
     def close(self) -> None:
-        """Stop the daemons this pool (or its runtimes) booted; reused daemons keep running."""
+        """Stop the daemons and TCP bridges this pool (or its runtimes) opened; reused daemons keep running."""
         for rt in getattr(self, "_runtimes", []):
             rt.close()
+        bridges = list(getattr(self, "_owned_bridges", []))
+        if hasattr(self, "_owned_bridges"):
+            self._owned_bridges.clear()
         owned = list(self._owned_daemons)
         self._owned_daemons.clear()
-        if owned:
-            from .kiri_installer import shutdown_kiri_daemons
+        if bridges or owned:
+            from .kiri_installer import _close_tcp_bridges, shutdown_kiri_daemons
 
-            shutdown_kiri_daemons(owned)
+            if bridges:
+                _close_tcp_bridges(bridges)
+            if owned:
+                shutdown_kiri_daemons(owned)
 
     def __enter__(self) -> SandboxPool:
         return self

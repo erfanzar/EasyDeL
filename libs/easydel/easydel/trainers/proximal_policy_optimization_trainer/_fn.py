@@ -93,13 +93,15 @@ def _token_normalizer(
         gradient_accumulation_steps: Number of accumulated microbatches.
 
     Returns:
-        A float32 scalar clamped to at least one.
+        A float32 scalar denominator. For local counts it is clamped to at
+        least ``1.0``; for global counts ``global_count`` is clamped to at
+        least ``1.0`` *before* dividing by ``gradient_accumulation_steps`` so
+        ``0 < global_count < gradient_accumulation_steps`` still recombines to
+        ``sum(loss) / global_count`` under ``1 / K`` averaging.
     """
     if token_level_loss and global_count is not None:
-        count = jnp.asarray(global_count, dtype=jnp.float32) / max(int(gradient_accumulation_steps), 1)
-    else:
-        count = jnp.sum(local_mask.astype(jnp.float32))
-    return jnp.maximum(count, 1.0)
+        return jnp.maximum(jnp.asarray(global_count, dtype=jnp.float32), 1.0) / max(int(gradient_accumulation_steps), 1)
+    return jnp.maximum(jnp.sum(local_mask.astype(jnp.float32)), 1.0)
 
 
 def compute_gae(

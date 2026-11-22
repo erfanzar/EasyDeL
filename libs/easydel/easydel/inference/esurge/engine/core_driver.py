@@ -234,6 +234,8 @@ class EngineCoreDriver:
         self._kv_versions: dict[str, int] = {}
         """Live request id -> oldest weight version its live KV was computed with; filled only by
         :meth:`mark_kv_weight_version` (empty, and never consulted, until a between-steps weight swap)."""
+        self._preempted_kv_requests: set[str] = set()
+        """Request ids whose live KV was freed by preemption and have not yet been propagated to the output pipeline."""
 
     def set_verify_budget(
         self,
@@ -559,6 +561,11 @@ class EngineCoreDriver:
             return None
         return int(current_version)
 
+    def drain_preempted_kv_requests(self) -> set[str]:
+        """Return and clear request ids whose KV was freed by preemption since the previous drain."""
+        pending, self._preempted_kv_requests = self._preempted_kv_requests, set()
+        return pending
+
     def stale_kv_parent_ids(self, min_version: int, current_version: int) -> list[str]:
         """Parent ids of live requests holding KV computed with a weight version below ``min_version``.
 
@@ -570,13 +577,15 @@ class EngineCoreDriver:
             Parent request ids (the request id when it has no parent) in admission order, without duplicates.
         """
         out: list[str] = []
+        seen: set[str] = set()
         for rid, h in self._handles.items():
             version = self.oldest_kv_weight_version(rid, current_version)
             if version is None or version >= int(min_version):
                 continue
             rec = self._records.get(h)
             parent = (rec.parent_request_id if rec is not None else None) or rid
-            if parent not in out:
+            if parent not in seen:
+                seen.add(parent)
                 out.append(parent)
         return out
 
@@ -818,6 +827,8 @@ class EngineCoreDriver:
         )
         if n or zero_schedule_needs_update(so):
             self._steps[id(so)] = _Step(so, plan, handles, rids, step_empty)
+        elif preempted:
+            self._preempted_kv_requests.update(preempted)
         collector = get_metrics_collector()
         if collector:
             collector.record_scheduler_metrics(
@@ -859,6 +870,8 @@ class EngineCoreDriver:
         step = self._steps.pop(id(scheduler_output), None)
         if step is None or step.so is not scheduler_output:
             raise RuntimeError("commit() of a schedule this engine core did not return, or that was already committed")
+        if step.so.preempted_req_ids:
+            self._preempted_kv_requests.update(step.so.preempted_req_ids)
         index = model_output.req_id_to_index or {}
         sampled = model_output.sampled_token_ids
         spec = model_output.spec_token_ids
@@ -1012,6 +1025,7 @@ class EngineCoreDriver:
             self._empty.clear()
             self._empty_freed.clear()
             self._kv_versions.clear()
+            self._preempted_kv_requests.clear()
             self.image_expander = None
 
 

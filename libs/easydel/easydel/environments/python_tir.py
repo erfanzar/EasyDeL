@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import typing as tp
 
 from easydel.trainers._shared.environment import ResetResult, StepResult, create_tool_call_parser
-from easydel.trainers.rlvr_trainer.reward_verifiers import _extract_answer, _normalize_number
+from easydel.trainers.rlvr_trainer.reward_verifiers import _extract_answer, _extract_boxed_contents, _normalize_number
 
 from ._base import SandboxEnvironment, register_environment
 from .runtime import ContainerConfig, KiriRuntime, SandboxInfraError, SandboxPool
@@ -30,19 +31,24 @@ from .swe_repo import unscorable_step
 _PY_BLOCK_RE = re.compile(r"```python\s*\n(.*?)```|<code>\s*(.*?)\s*</code>", re.DOTALL)
 
 _REPL_RUNNER = r"""
-import importlib, os, pickle, sys, traceback, types
+import importlib, os, pickle, sys, tempfile, traceback, types
 
 STATE_FILE = ".ed_tir_state.pkl"
 ns = {"__name__": "__main__"}
-if os.path.exists(STATE_FILE):
-    with open(STATE_FILE, "rb") as _f:
-        saved = pickle.load(_f)
-    for mod_alias, mod_name in saved.get("modules", {}).items():
-        try:
-            ns[mod_alias] = importlib.import_module(mod_name)
-        except Exception:
-            pass
-    ns.update(saved.get("values", {}))
+if os.path.exists(STATE_FILE) and not os.path.islink(STATE_FILE):
+    try:
+        with open(STATE_FILE, "rb") as _f:
+            saved = pickle.load(_f)
+        if isinstance(saved, dict):
+            for mod_alias, mod_name in saved.get("modules", {}).items():
+                try:
+                    ns[mod_alias] = importlib.import_module(mod_name)
+                except Exception:
+                    pass
+            if isinstance(saved.get("values"), dict):
+                ns.update(saved["values"])
+    except Exception:
+        pass
 
 code = sys.stdin.read()
 try:
@@ -66,8 +72,16 @@ for k, v in list(ns.items()):
     except Exception:
         pass
 
-with open(STATE_FILE, "wb") as _f:
-    pickle.dump({"modules": modules, "values": values}, _f)
+_fd, _tmp_path = tempfile.mkstemp(prefix=".ed_tir_state.", dir=".")
+try:
+    with os.fdopen(_fd, "wb") as _f:
+        pickle.dump({"modules": modules, "values": values}, _f)
+    os.replace(_tmp_path, STATE_FILE)
+except Exception:
+    try:
+        os.unlink(_tmp_path)
+    except OSError:
+        pass
 """
 
 
@@ -134,9 +148,9 @@ class StatefulPythonEnvironment(SandboxEnvironment):
 
     def reset(self, seed: int | None = None) -> ResetResult:
         try:
-            session = self._open_session(seed=seed)
-            session.write_files({".ed_tir_runner.py": _REPL_RUNNER})
+            self._open_session(seed=seed)
         except SandboxInfraError as exc:
+            self.close()
             return ResetResult(
                 observation=self._prompt,
                 info={"env_error": True, "env_error_message": str(exc)},
@@ -145,14 +159,17 @@ class StatefulPythonEnvironment(SandboxEnvironment):
 
     def _grade_final_answer(self, action: str) -> float:
         if self._verifier is not None:
-            return float(self._verifier(action))
+            score = float(self._verifier(action))
+            if not math.isfinite(score):
+                raise ValueError(f"verifier returned non-finite reward: {score!r}")
+            return score
         if self._answer is None:
             return 0.0
         gold_num = _normalize_number(self._answer)
         if gold_num is not None:
             pred_num = _extract_answer(action)
             return 1.0 if pred_num == gold_num else 0.0
-        boxed = re.findall(r"\\boxed\{([^}]+)\}", action)
+        boxed = _extract_boxed_contents(action)
         candidate = boxed[-1].strip() if boxed else action.strip()
         return 1.0 if candidate == self._answer.strip() else 0.0
 
@@ -187,13 +204,27 @@ class StatefulPythonEnvironment(SandboxEnvironment):
         if snippets and self._step_count < self._max_steps:
             outputs: list[str] = []
             for code in snippets:
-                res = self.session.run_python(
-                    "import runpy; runpy.run_path('.ed_tir_runner.py')",
-                    stdin=code,
-                    timeout=self._snippet_timeout,
-                )
+                try:
+                    res = self.session.run_python(
+                        _REPL_RUNNER,
+                        stdin=code,
+                        timeout=self._snippet_timeout,
+                    )
+                except SandboxInfraError as exc:
+                    return self._infra_failure_step(exc)
                 if res.infra_error:
                     return self._infra_failure_step(res.infra_error)
+                if res.timed_out:
+                    killer = getattr(self.session, "kill_sandbox_processes", None)
+                    if callable(killer):
+                        try:
+                            killer()
+                        except SandboxInfraError as exc:
+                            return self._infra_failure_step(exc)
+                        except Exception as exc:
+                            return self._infra_failure_step(
+                                f"failed to clean up timed-out snippet processes: {exc}"
+                            )
                 outputs.append(res.combined_output(4096))
             return StepResult(
                 observation="\n\n".join(outputs),
