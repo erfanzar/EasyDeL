@@ -128,6 +128,9 @@ class EsurgeGenerationArrays(tp.NamedTuple):
         completion_prompts: Prompt objects aligned one-to-one with completions.
         sampling_per_token_logps: Behaviour log-probability of each sampled completion token, zero-padded, or
             ``None`` when the engine returned no sampled-token scores.
+        completion_weight_versions: ``int32`` engine weight version that produced each completion token, aligned
+            with ``completion_ids`` (``-1`` on padding and on completions without version provenance), or ``None``
+            when no completion carried ``weight_version_segments``.
     """
 
     prompt_ids: jax.Array
@@ -142,6 +145,28 @@ class EsurgeGenerationArrays(tp.NamedTuple):
     finish_reason_records: list[str | None]
     completion_prompts: list[str | list[dict[str, str]]]
     sampling_per_token_logps: jax.Array | None = None
+    completion_weight_versions: jax.Array | None = None
+
+
+def expand_weight_version_segments(segments: tp.Sequence[tp.Sequence[int]] | None, length: int) -> list[int] | None:
+    """Expand ``(start_token_index, version)`` segments into one version per token.
+
+    Args:
+        segments: Run-length segments in token order, as on ``CompletionOutput.weight_version_segments``.
+        length: Number of tokens to cover.
+
+    Returns:
+        ``length`` versions (``-1`` before the first segment), or ``None`` when ``segments`` is ``None``.
+    """
+    if segments is None:
+        return None
+    versions = [-1] * length
+    ordered = sorted((int(start), int(version)) for start, version in segments)
+    for position, (start, version) in enumerate(ordered):
+        stop = ordered[position + 1][0] if position + 1 < len(ordered) else length
+        for index in range(max(0, start), min(stop, length)):
+            versions[index] = version
+    return versions
 
 
 def _collect_sampling_mapping(
@@ -551,6 +576,7 @@ def outputs_to_arrays(
     completion_id_rows: list[list[int]] = []
     completion_mask_rows: list[list[int]] = []
     sampling_logps_rows: list[list[float] | None] = []
+    weight_version_rows: list[list[int] | None] = []
     output_records: list[str] = []
     reasoning_records: list[str | None] = []
     tool_call_records: list[list | None] = []
@@ -662,6 +688,10 @@ def outputs_to_arrays(
             completion_padding = max_new_tokens - completion_len
             completion_id_rows.append(completion_tokens + [pad_token_id] * completion_padding)
             completion_mask_rows.append([1] * completion_len + [0] * completion_padding)
+            token_versions = expand_weight_version_segments(
+                getattr(completion, "weight_version_segments", None), completion_len
+            )
+            weight_version_rows.append(None if token_versions is None else token_versions + [-1] * completion_padding)
             token_logprobs = getattr(completion, "logprobs", None)
             if token_logprobs is None:
                 sampling_logps_rows.append(None)
@@ -699,6 +729,13 @@ def outputs_to_arrays(
             np.asarray(sampling_logps_rows, dtype=np.float32),
             mesh,
         )
+    completion_weight_versions = None
+    if any(row is not None for row in weight_version_rows):
+        filled = [row if row is not None else [-1] * max_new_tokens for row in weight_version_rows]
+        completion_weight_versions = _materialize_rollout_array(
+            np.asarray(filled, dtype=np.int32),
+            mesh,
+        )
     return EsurgeGenerationArrays(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
@@ -712,6 +749,7 @@ def outputs_to_arrays(
         finish_reason_records=finish_reason_records,
         completion_prompts=completion_prompts,
         sampling_per_token_logps=sampling_per_token_logps,
+        completion_weight_versions=completion_weight_versions,
     )
 
 
@@ -721,6 +759,7 @@ __all__ = (
     "apply_sampling_overrides",
     "clamp_new_tokens_to_bound",
     "engine_kwargs",
+    "expand_weight_version_segments",
     "generation_length_bound",
     "outputs_to_arrays",
     "prompt_token_id_rows",

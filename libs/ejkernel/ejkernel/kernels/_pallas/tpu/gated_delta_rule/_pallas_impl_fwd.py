@@ -40,6 +40,31 @@ _P = lax.Precision.DEFAULT
 _N_FUSE = 8
 
 
+@jax.tree_util.register_pytree_node_class
+class _PrimalDTypes:
+    """Zero-leaf static pytree storing primal input dtypes for custom_vjp backward."""
+
+    __slots__ = ("beta", "decay", "initial_state")
+
+    def __init__(self, *, initial_state=None, beta=None, decay=None):
+        self.initial_state = None if initial_state is None else jnp.dtype(initial_state)
+        self.beta = None if beta is None else jnp.dtype(beta)
+        self.decay = None if decay is None else jnp.dtype(decay)
+
+    @property
+    def dtype(self):
+        return self.initial_state
+
+    def tree_flatten(self):
+        return (), (self.initial_state, self.beta, self.decay)
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        del children
+        initial_state, beta, decay = aux
+        return cls(initial_state=initial_state, beta=beta, decay=decay)
+
+
 def _dot(a, b):
     """2-D matrix multiply with the module-level ``_P`` precision setting."""
     return lax.dot(a, b, precision=_P)
@@ -1194,6 +1219,11 @@ def _chunk_gdr_fwd_core(
     input_dtype = query.dtype
     decay_was_none = decay is None
     initial_state_was_none = initial_state is None
+    primal_dtypes = _PrimalDTypes(
+        initial_state=None if initial_state is None else initial_state.dtype,
+        beta=beta.dtype,
+        decay=None if decay is None else decay.dtype,
+    )
 
     q_inv_norm = k_inv_norm = None
     if use_qk_l2norm:
@@ -1404,7 +1434,7 @@ def _chunk_gdr_fwd_core(
         beta_c.squeeze(-2),
         decay_c.squeeze(-2),
         state_pre_all,
-        initial_state,
+        primal_dtypes,
         q_inv_norm,
         k_inv_norm,
         L,
@@ -1557,6 +1587,11 @@ def _chunk_gdr_grouped_fwd_train_core(
     input_dtype = query.dtype
     decay_was_none = decay is None
     initial_state_was_none = initial_state is None
+    primal_dtypes = _PrimalDTypes(
+        initial_state=None if initial_state is None else initial_state.dtype,
+        beta=beta.dtype,
+        decay=None if decay is None else decay.dtype,
+    )
 
     q_inv_norm = k_inv_norm = None
     if use_qk_l2norm:
@@ -1644,7 +1679,7 @@ def _chunk_gdr_grouped_fwd_train_core(
         beta_c,
         decay_c,
         state_group_pre,
-        initial_state,
+        primal_dtypes,
         q_inv_norm,
         k_inv_norm,
         L,
@@ -1681,6 +1716,11 @@ def _chunk_gdr_grouped_segmented_fwd_train_core(
     input_dtype = query.dtype
     decay_was_none = decay is None
     initial_state_was_none = initial_state is None
+    primal_dtypes = _PrimalDTypes(
+        initial_state=None if initial_state is None else initial_state.dtype,
+        beta=beta.dtype,
+        decay=None if decay is None else decay.dtype,
+    )
 
     q_inv_norm = k_inv_norm = None
     if use_qk_l2norm:
@@ -1801,7 +1841,7 @@ def _chunk_gdr_grouped_segmented_fwd_train_core(
         beta_c,
         decay_c,
         state_group_pre,
-        initial_state,
+        primal_dtypes,
         q_inv_norm,
         k_inv_norm,
         L,
@@ -2387,6 +2427,11 @@ def _single_step_gdr_fwd_impl(query, key, value, beta, decay, recurrent_state, u
     """
     input_dtype = query.dtype
     decay_was_none = decay is None
+    primal_dtypes = _PrimalDTypes(
+        initial_state=recurrent_state.dtype,
+        beta=beta.dtype,
+        decay=None if decay is None else decay.dtype,
+    )
     q_inv_norm = k_inv_norm = None
     query = query.astype(input_dtype)
     key = key.astype(input_dtype)
@@ -2403,7 +2448,7 @@ def _single_step_gdr_fwd_impl(query, key, value, beta, decay, recurrent_state, u
         decay = decay.astype(input_dtype)
     recurrent_state = recurrent_state.astype(input_dtype)
     output, final_state = _run_single_step_forward(query, key, value, beta, decay, recurrent_state)
-    residual = (query, key, value, beta, decay, recurrent_state, q_inv_norm, k_inv_norm, decay_was_none)
+    residual = (query, key, value, beta, decay, recurrent_state, q_inv_norm, k_inv_norm, decay_was_none, primal_dtypes)
     return output, final_state, residual
 
 

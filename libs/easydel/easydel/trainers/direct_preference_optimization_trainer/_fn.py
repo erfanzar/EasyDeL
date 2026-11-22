@@ -520,6 +520,13 @@ def _compute_f_divergence_scores(
     raise ValueError(f"Unknown f_divergence_type: {f_divergence_type}")
 
 
+def _sort_valid_prefix(values: Array, valid: Array) -> Array:
+    """Sort valid rows ascending into ``[0, num_valid)`` without injecting ``inf`` into differentiated values."""
+    sort_keys = jnp.where(valid, jax.lax.stop_gradient(values), jnp.inf)
+    order = jnp.argsort(sort_keys, axis=0)
+    return jnp.take_along_axis(values, order, axis=0)
+
+
 def compute_dpo_losses(
     chosen_logps: Array,
     rejected_logps: Array,
@@ -537,12 +544,14 @@ def compute_dpo_losses(
     rejected_lengths: Array | None = None,
     wpo_weights: Array | None = None,
     rpo_alpha: float | None = None,
+    pair_valid: Array | None = None,
 ) -> Array:
     """Compute weighted single- or multi-objective DPO losses."""
     loss_types = _as_loss_type_tuple(loss_type)
     weights = _as_loss_weight_tuple(loss_weights, len(loss_types))
     chosen_lengths = jnp.ones_like(chosen_logps) if chosen_lengths is None else jnp.maximum(chosen_lengths, 1.0)
     rejected_lengths = jnp.ones_like(rejected_logps) if rejected_lengths is None else jnp.maximum(rejected_lengths, 1.0)
+    valid_mask = None if pair_valid is None else (pair_valid > 0)
 
     chosen_logratios = chosen_logps - ref_chosen_logps
     rejected_logratios = rejected_logps - ref_rejected_logps
@@ -588,22 +597,65 @@ def compute_dpo_losses(
         elif single_loss_type == "sppo_hard":
             per_sequence_loss = (chosen_scores - 0.5 / beta) ** 2 + (rejected_scores + 0.5 / beta) ** 2
         elif single_loss_type == "aot":
-            if f_divergence_type == "reverse_kl":
-                logratios_sorted = jnp.sort(chosen_logps - rejected_logps, axis=0)
-                ref_logratios_sorted = jnp.sort(ref_chosen_logps - ref_rejected_logps, axis=0)
-                delta = logratios_sorted - ref_logratios_sorted
+            if valid_mask is not None:
+                num_valid = jnp.sum(valid_mask.astype(jnp.int32))
+                sorted_valid = jnp.arange(chosen_logps.shape[0]) < num_valid
+                if f_divergence_type == "reverse_kl":
+                    logratios_sorted = _sort_valid_prefix(chosen_logps - rejected_logps, valid_mask)
+                    ref_logratios_sorted = _sort_valid_prefix(ref_chosen_logps - ref_rejected_logps, valid_mask)
+                    delta = jnp.where(sorted_valid, logratios_sorted - ref_logratios_sorted, 0.0)
+                else:
+                    delta = jnp.where(
+                        sorted_valid,
+                        _sort_valid_prefix(chosen_scores, valid_mask) - _sort_valid_prefix(rejected_scores, valid_mask),
+                        0.0,
+                    )
+                sorted_loss = jnp.where(
+                    sorted_valid,
+                    -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing,
+                    0.0,
+                )
+                valid_slot = jnp.clip(
+                    jnp.cumsum(valid_mask.astype(jnp.int32), axis=0) - 1,
+                    0,
+                    max(chosen_logps.shape[0] - 1, 0),
+                )
+                per_sequence_loss = jnp.where(valid_mask, jnp.take_along_axis(sorted_loss, valid_slot, axis=0), 0.0)
             else:
-                delta = jnp.sort(chosen_scores, axis=0) - jnp.sort(rejected_scores, axis=0)
-            per_sequence_loss = (
-                -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
-            )
+                if f_divergence_type == "reverse_kl":
+                    logratios_sorted = jnp.sort(chosen_logps - rejected_logps, axis=0)
+                    ref_logratios_sorted = jnp.sort(ref_chosen_logps - ref_rejected_logps, axis=0)
+                    delta = logratios_sorted - ref_logratios_sorted
+                else:
+                    delta = jnp.sort(chosen_scores, axis=0) - jnp.sort(rejected_scores, axis=0)
+                per_sequence_loss = (
+                    -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
+                )
         elif single_loss_type in {"aot_pair", "aot_unpaired"}:
-            chosen_scores_sorted = jnp.sort(chosen_scores, axis=0)
-            rejected_scores_sorted = jnp.sort(rejected_scores, axis=0)
-            delta = chosen_scores_sorted - rejected_scores_sorted
-            per_sequence_loss = (
-                -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
-            )
+            if valid_mask is not None:
+                num_valid = jnp.sum(valid_mask.astype(jnp.int32))
+                sorted_valid = jnp.arange(chosen_logps.shape[0]) < num_valid
+                chosen_scores_sorted = _sort_valid_prefix(chosen_scores, valid_mask)
+                rejected_scores_sorted = _sort_valid_prefix(rejected_scores, valid_mask)
+                delta = jnp.where(sorted_valid, chosen_scores_sorted - rejected_scores_sorted, 0.0)
+                sorted_loss = jnp.where(
+                    sorted_valid,
+                    -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing,
+                    0.0,
+                )
+                valid_slot = jnp.clip(
+                    jnp.cumsum(valid_mask.astype(jnp.int32), axis=0) - 1,
+                    0,
+                    max(chosen_logps.shape[0] - 1, 0),
+                )
+                per_sequence_loss = jnp.where(valid_mask, jnp.take_along_axis(sorted_loss, valid_slot, axis=0), 0.0)
+            else:
+                chosen_scores_sorted = jnp.sort(chosen_scores, axis=0)
+                rejected_scores_sorted = jnp.sort(rejected_scores, axis=0)
+                delta = chosen_scores_sorted - rejected_scores_sorted
+                per_sequence_loss = (
+                    -logsigmoid(beta * delta) * (1 - label_smoothing) - logsigmoid(-beta * delta) * label_smoothing
+                )
         elif single_loss_type == "apo_zero":
             per_sequence_loss = 1 - sigmoid(beta * chosen_scores) + sigmoid(beta * rejected_scores)
         elif single_loss_type == "apo_down":
@@ -615,8 +667,14 @@ def compute_dpo_losses(
             exp_term = jnp.exp(jnp.minimum(-logits + logsigmoid(logits * inv_tau), 80.0))
             per_sequence_loss = -logsigmoid(logits) * one_minus_modulation + exp_term
         elif single_loss_type == "sft":
-            sft_loss = -jnp.sum(chosen_logps) / jnp.maximum(jnp.sum(chosen_lengths), 1.0)
-            per_sequence_loss = jnp.broadcast_to(sft_loss, chosen_logps.shape)
+            if valid_mask is not None:
+                valid_chosen_logps = jnp.where(valid_mask, chosen_logps, 0.0)
+                valid_chosen_lengths = jnp.where(valid_mask, chosen_lengths, 0.0)
+                sft_loss = -jnp.sum(valid_chosen_logps) / jnp.maximum(jnp.sum(valid_chosen_lengths), 1.0)
+                per_sequence_loss = jnp.where(valid_mask, sft_loss, 0.0)
+            else:
+                sft_loss = -jnp.sum(chosen_logps) / jnp.maximum(jnp.sum(chosen_lengths), 1.0)
+                per_sequence_loss = jnp.broadcast_to(sft_loss, chosen_logps.shape)
         elif single_loss_type == "sigmoid_norm":
             delta = chosen_scores / chosen_lengths - rejected_scores / rejected_lengths
             per_sequence_loss = -logsigmoid(beta * delta)
@@ -628,7 +686,10 @@ def compute_dpo_losses(
         losses = losses + per_sequence_loss * float(loss_weight)
 
     if rpo_alpha is not None and rpo_alpha > 0.0:
-        losses = losses + float(rpo_alpha) * (-chosen_logps / chosen_lengths)
+        rpo_term = float(rpo_alpha) * (-chosen_logps / chosen_lengths)
+        if valid_mask is not None:
+            rpo_term = jnp.where(valid_mask, rpo_term, 0.0)
+        losses = losses + rpo_term
 
     return losses
 
@@ -720,6 +781,7 @@ def get_loss_function(
             rejected_lengths=kwargs.get("rejected_lengths"),
             wpo_weights=kwargs.get("wpo_weights"),
             rpo_alpha=kwargs.get("rpo_alpha"),
+            pair_valid=kwargs.get("pair_valid"),
         )
 
     return _combined_loss
@@ -814,6 +876,15 @@ def concatenated_forward(
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
     completion_input_ids = concatenated_batch["completion_input_ids"]
     completion_attention_mask = concatenated_batch["completion_attention_mask"]
+    # Optional explicit loss mask (from ``chosen_loss_mask``/``rejected_loss_mask``) selects which attended
+    # completion tokens enter the log-prob sums; without it every attended completion token is scored.
+    completion_loss_mask = concatenated_batch.get("completion_loss_mask")
+    if completion_loss_mask is None:
+        completion_scoring_mask = completion_attention_mask
+    else:
+        completion_scoring_mask = completion_attention_mask * completion_loss_mask.astype(
+            completion_attention_mask.dtype
+        )
     lmhead_chunksize = None
 
     if is_encoder_decoder:
@@ -834,7 +905,7 @@ def concatenated_forward(
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
-        loss_mask = completion_attention_mask.astype(bool)
+        loss_mask = completion_scoring_mask.astype(bool)
     else:
         # For decoder-only models, concatenate prompt and completion.
         input_ids = jnp.concatenate(
@@ -848,7 +919,7 @@ def concatenated_forward(
         loss_mask = jnp.concatenate(
             [
                 jnp.zeros_like(prompt_attention_mask),
-                completion_attention_mask,
+                completion_scoring_mask,
             ],
             axis=1,
         )
@@ -937,10 +1008,157 @@ def concatenated_forward(
                 jnp.where(loss_mask[num_examples:], token_logit_means[num_examples:], 0.0).sum() / rejected_denom
             )
 
+    if completion_loss_mask is not None:
+        # A pair whose chosen or rejected side scores no token (e.g. a placeholder row kept to hold the
+        # batch shape fixed) carries no preference signal; the loss reductions exclude it.
+        scored_tokens = loss_mask.astype(jnp.int32).sum(-1)
+        output["pair_valid"] = ((scored_tokens[:num_examples] > 0) & (scored_tokens[num_examples:] > 0)).astype(
+            jnp.float32
+        )
     aux_loss = getattr(outputs, "aux_loss", None)
     if aux_loss_enabled and aux_loss is not None:
         output["aux_loss"] = aux_loss
     return output
+
+
+def _reduce_pair_losses(losses: Array, model_output: dict) -> Array:
+    """Mean of the per-pair DPO losses.
+
+    Without explicit loss masks this is ``losses.mean()``. With them, only pairs that score at
+    least one token on both sides (``pair_valid``) enter the mean, so placeholder rows add neither
+    a constant to the reported loss nor dilute the gradient.
+
+    Args:
+        losses: Per-pair losses, shape ``[num_pairs]``.
+        model_output: Output of :func:`concatenated_forward`.
+
+    Returns:
+        Scalar loss.
+    """
+    pair_valid = model_output.get("pair_valid")
+    if pair_valid is None:
+        return losses.mean()
+    valid = pair_valid > 0
+    return jnp.sum(jnp.where(valid, losses, 0.0)) / jnp.maximum(jnp.sum(pair_valid), 1.0)
+
+
+def _resolve_dpo_forward_mask_config(
+    concatenated_forward_fn: tp.Callable | None,
+) -> tuple[bool, int | None, str]:
+    """Extract static mask/truncation knobs bound onto ``concatenated_forward_fn``."""
+    fn: tp.Any = concatenated_forward_fn
+    seen: set[int] = set()
+    while fn is not None and id(fn) not in seen:
+        seen.add(id(fn))
+        keywords = getattr(fn, "keywords", None)
+        if isinstance(keywords, dict) and any(
+            k in keywords for k in ("is_encoder_decoder", "max_length", "truncation_mode")
+        ):
+            return (
+                bool(keywords.get("is_encoder_decoder", False)),
+                keywords.get("max_length", None),
+                str(keywords.get("truncation_mode", "keep_end")),
+            )
+        fn = getattr(fn, "__wrapped__", None) or getattr(fn, "func", None)
+    return False, None, "keep_end"
+
+
+def _compute_dpo_microbatch_weight(
+    minibatch: dict,
+    *,
+    is_encoder_decoder: bool,
+    max_length: int | None,
+    truncation_mode: str,
+    weight_by_chosen_tokens: bool = False,
+) -> Array:
+    """Compute the valid-pair (or valid-chosen-token for pure SFT) weight of a DPO microbatch from masks alone.
+
+    Mirrors the exact padding, paired truncation, and causal-shift mask construction in
+    :func:`concatenated_forward` without running a model forward pass, so ``minibatch_call`` and
+    scheduled MPMD accumulation combine microbatches proportionally to valid pair counts.
+    """
+    from ..utils import pad_to_length
+
+    num_examples = minibatch["prompt_input_ids"].shape[0]
+    chosen_attn = minibatch["chosen_attention_mask"]
+    rejected_attn = minibatch["rejected_attention_mask"]
+    chosen_loss = minibatch.get("chosen_loss_mask")
+    rejected_loss = minibatch.get("rejected_loss_mask")
+    if chosen_loss is None:
+        chosen_loss = jnp.ones_like(chosen_attn)
+    if rejected_loss is None:
+        rejected_loss = jnp.ones_like(rejected_attn)
+
+    max_comp_len = max(chosen_attn.shape[1], rejected_attn.shape[1])
+    comp_attn = jnp.concatenate(
+        (
+            pad_to_length(chosen_attn, max_comp_len, pad_value=0),
+            pad_to_length(rejected_attn, max_comp_len, pad_value=0),
+        ),
+        axis=0,
+    )
+    comp_loss = jnp.concatenate(
+        (
+            pad_to_length(jnp.asarray(chosen_loss), max_comp_len, pad_value=0),
+            pad_to_length(jnp.asarray(rejected_loss), max_comp_len, pad_value=0),
+        ),
+        axis=0,
+    )
+    comp_scoring = comp_attn * comp_loss.astype(comp_attn.dtype)
+
+    if is_encoder_decoder:
+        loss_mask = comp_scoring.astype(jnp.bool_)
+    else:
+        prompt_attn = jnp.concatenate(
+            [minibatch["prompt_attention_mask"], minibatch["prompt_attention_mask"]],
+            axis=0,
+        )
+        loss_mask = jnp.concatenate([jnp.zeros_like(prompt_attn), comp_scoring], axis=1)
+        (loss_mask,) = apply_paired_truncation(
+            loss_mask,
+            max_length=max_length,
+            truncation_mode=truncation_mode,
+        )
+        loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype(jnp.bool_).at[:, -1].set(False)
+
+    scored_tokens = loss_mask.astype(jnp.int32).sum(-1)
+    chosen_scored = scored_tokens[:num_examples]
+    rejected_scored = scored_tokens[num_examples:]
+    pair_valid = ((chosen_scored > 0) & (rejected_scored > 0)).astype(jnp.float32)
+    if weight_by_chosen_tokens:
+        return jnp.sum(chosen_scored.astype(jnp.float32) * pair_valid)
+    return jnp.sum(pair_valid)
+
+
+def _make_dpo_microbatch_weight_fn(
+    batch: dict,
+    *,
+    concatenated_forward_fn: tp.Callable | None,
+    loss_type: str | tuple[str, ...] | list[str],
+    use_weighting: bool,
+    rpo_alpha: float | None,
+) -> tp.Callable[[tp.Any, dict], Array] | None:
+    """Build a valid-pair microbatch weight function when explicit preference loss masks are present."""
+    if batch.get("chosen_loss_mask") is None and batch.get("rejected_loss_mask") is None:
+        return None
+    is_encoder_decoder, max_length, truncation_mode = _resolve_dpo_forward_mask_config(concatenated_forward_fn)
+    loss_types = _as_loss_type_tuple(loss_type)
+    weight_by_chosen_tokens = (
+        loss_types == ("sft",)
+        and not use_weighting
+        and not (rpo_alpha is not None and float(rpo_alpha) > 0.0)
+    )
+
+    def _weight_fn(_tree: tp.Any, minibatch: dict) -> Array:
+        return _compute_dpo_microbatch_weight(
+            minibatch,
+            is_encoder_decoder=is_encoder_decoder,
+            max_length=max_length,
+            truncation_mode=truncation_mode,
+            weight_by_chosen_tokens=weight_by_chosen_tokens,
+        )
+
+    return _weight_fn
 
 
 def training_step(
@@ -1137,6 +1355,7 @@ def training_step(
                     rejected_lengths=model_output.get("rejected_lengths"),
                     wpo_weights=model_output.get("wpo_weights") if use_weighting else None,
                     rpo_alpha=rpo_alpha,
+                    pair_valid=model_output.get("pair_valid"),
                 )
 
             with jax.named_scope(scope_root + "/loss_fn/rewards_and_metrics"):
@@ -1147,11 +1366,23 @@ def training_step(
                     losses = losses + aux_loss
 
                 metrics = LossMetrics(
-                    loss=losses.mean(),
+                    loss=_reduce_pair_losses(losses, model_output),
                     rejected_rewards=rejected_rewards,
                     chosen_rewards=chosen_rewards,
                 )
             return metrics.loss, metrics
+
+    dpo_microbatch_weight_fn = (
+        _make_dpo_microbatch_weight_fn(
+            batch,
+            concatenated_forward_fn=concatenated_forward,
+            loss_type=loss_type,
+            use_weighting=use_weighting,
+            rpo_alpha=rpo_alpha,
+        )
+        if gradient_accumulation_steps > 1
+        else None
+    )
 
     with jax.named_scope(scope_root + "/grad_and_minibatch"):
         gradients, metrics = minibatch_call(
@@ -1159,6 +1390,7 @@ def training_step(
             batch=batch,
             minibatch_size=minibatch_size,
             grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
+            microbatch_weight_fn=dpo_microbatch_weight_fn,
         )
 
     with jax.named_scope(scope_root + "/update_state"):
@@ -1223,7 +1455,7 @@ def _dpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         ``reference_free``, partition spec, and forward fn / quantizer
         identities).
     """
-    return scheduled_loss_cache_key(
+    base_key = scheduled_loss_cache_key(
         call,
         value_fields=(
             "beta",
@@ -1240,6 +1472,21 @@ def _dpo_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "partition_spec",
         ),
         object_fields=("concatenated_forward", "straight_through_emulator"),
+    )
+    has_explicit_loss_mask = (call.batch.get("chosen_loss_mask") is not None) or (
+        call.batch.get("rejected_loss_mask") is not None
+    )
+    return (*base_key, ("has_explicit_loss_mask", has_explicit_loss_mask))
+
+
+def _make_dpo_scheduled_weight(call):
+    """Build a valid-pair microbatch weight callable for scheduled MPMD DPO accumulation."""
+    return _make_dpo_microbatch_weight_fn(
+        call.batch,
+        concatenated_forward_fn=call.get("concatenated_forward"),
+        loss_type=call.get("loss_type", "sigmoid"),
+        use_weighting=bool(call.get("use_weighting", False)),
+        rpo_alpha=call.get("rpo_alpha"),
     )
 
 
@@ -1327,11 +1574,12 @@ def _make_dpo_scheduled_loss(call):
                     rejected_lengths=model_output.get("rejected_lengths"),
                     wpo_weights=model_output.get("wpo_weights") if use_weighting else None,
                     rpo_alpha=rpo_alpha,
+                    pair_valid=model_output.get("pair_valid"),
                 )
                 aux_loss = model_output.get("aux_loss")
                 if aux_loss is not None:
                     losses = losses + aux_loss
-            return losses.mean()
+            return _reduce_pair_losses(losses, model_output)
 
     return scheduled_loss
 
@@ -1343,6 +1591,7 @@ register_scheduled_loss_adapter(
         make_loss=_make_dpo_scheduled_loss,
         make_cache_key=_dpo_scheduled_loss_cache_key,
         prepare_batch=_prepare_dpo_scheduled_batch,
+        make_microbatch_weight=_make_dpo_scheduled_weight,
     ),
 )
 
@@ -1459,6 +1708,7 @@ def evaluation_step(
                     rejected_lengths=model_output.get("rejected_lengths"),
                     wpo_weights=model_output.get("wpo_weights") if use_weighting else None,
                     rpo_alpha=rpo_alpha,
+                    pair_valid=model_output.get("pair_valid"),
                 )
 
             with jax.named_scope(eval_scope + "/loss_fn/rewards_and_metrics"):
@@ -1466,7 +1716,7 @@ def evaluation_step(
                 rejected_rewards = beta * (rejected_logps - ref_rejected_for_loss)
 
                 metrics = LossMetrics(
-                    loss=losses.mean(),
+                    loss=_reduce_pair_losses(losses, model_output),
                     rejected_rewards=rejected_rewards,
                     chosen_rewards=chosen_rewards,
                 )

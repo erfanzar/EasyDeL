@@ -583,7 +583,20 @@ def scaled_dot_product_attention(
     attention_mask = None
 
     if mask_info is not None:
-        attention_mask = mask_info.get_or_compute_attention_mask()
+        if (
+            mask_info.uses_position_causality()
+            and query.shape[1] != key.shape[1]
+            and (causal or sliding_window is not None)
+        ):
+            # Queries that continue a key/value prefix (q_len != kv_len): the backend's index-based
+            # triangle/window would be aligned to the wrong columns, so derive causality and the
+            # window from the absolute positions and bake them into the dense mask instead.
+            attention_mask = mask_info.get_position_aware_attention_mask(causal=causal, sliding_window=sliding_window)
+            mask_info = mask_info.replace(attention_mask=attention_mask)
+            causal = False
+            sliding_window = None
+        else:
+            attention_mask = mask_info.get_or_compute_attention_mask()
 
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:

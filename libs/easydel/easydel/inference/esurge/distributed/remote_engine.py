@@ -847,6 +847,8 @@ class RemoteEngineHandle:
                                     tool_calls=completion.tool_calls,
                                     reasoning_content=completion.reasoning_content,
                                     raw_text=completion.raw_text,
+                                    weight_version_segments=completion.weight_version_segments,
+                                    oldest_kv_weight_version=completion.oldest_kv_weight_version,
                                 )
                                 for completion in output.outputs
                             ],

@@ -260,6 +260,14 @@ class CompletionOutput:
         cumulative_logprob: Cumulative log probability of the generated sequence.
         logprobs: Per-token log probabilities as dict mapping token_id to logprob.
         finish_reason: Reason for completion termination ('stop', 'length', 'eos_token', etc.).
+        weight_version_segments: Policy-version provenance of ``token_ids`` as ``(start_token_index, version)``
+            pairs in token order: token ``i`` was sampled from logits computed with the engine weight version of the
+            last segment whose start is ``<= i``. ``None`` when the producer did not record versions.
+        oldest_kv_weight_version: Oldest engine weight version that computed any KV entry this completion attended to
+            (prompt prefill, earlier decode steps): set to the sampling version at the first token, and lowered to
+            the outgoing version when an ``update_model_weights(keep_requests=True)`` swap happens while the request
+            holds KV. KV freed by preemption and recomputed counts as new. ``None`` before any KV or token was
+            recorded, or when the producer did not record versions.
     """
 
     index: int
@@ -271,6 +279,20 @@ class CompletionOutput:
     tool_calls: list | None = None
     reasoning_content: str | None = None
     raw_text: str | None = None
+    weight_version_segments: list[tuple[int, int]] | None = None
+    oldest_kv_weight_version: int | None = None
+
+    @property
+    def oldest_weight_version(self) -> int | None:
+        """Oldest engine weight version that produced any token of this completion, or ``None``."""
+        segments = self.weight_version_segments
+        return min(version for _, version in segments) if segments else None
+
+    @property
+    def newest_weight_version(self) -> int | None:
+        """Newest engine weight version that produced any token of this completion, or ``None``."""
+        segments = self.weight_version_segments
+        return max(version for _, version in segments) if segments else None
 
 
 @dataclass
@@ -324,6 +346,27 @@ class RequestOutput:
     reasoning_content: str | None = None
     delta_reasoning_content: str | None = None
     tool_call_delta_history: list | None = field(default_factory=list, repr=False, compare=False)
+
+    @property
+    def oldest_weight_version(self) -> int | None:
+        """Oldest engine weight version behind any generated token of any sample, or ``None`` before the first."""
+        versions = [comp.oldest_weight_version for comp in self.outputs]
+        versions = [version for version in versions if version is not None]
+        return min(versions) if versions else None
+
+    @property
+    def newest_weight_version(self) -> int | None:
+        """Newest engine weight version behind any generated token of any sample, or ``None`` before the first."""
+        versions = [comp.newest_weight_version for comp in self.outputs]
+        versions = [version for version in versions if version is not None]
+        return max(versions) if versions else None
+
+    @property
+    def oldest_kv_weight_version(self) -> int | None:
+        """Oldest engine weight version behind any KV entry of any sample, or ``None`` when none was recorded."""
+        versions = [comp.oldest_kv_weight_version for comp in self.outputs]
+        versions = [version for version in versions if version is not None]
+        return min(versions) if versions else None
 
     def get_text(self) -> str:
         """Get the generated text from the first completion output.
@@ -750,6 +793,8 @@ class eSurge:
         self._scheduler_running = False
         self._kv_cache_valid = True
         self._paused = False
+        # Monotonic policy version of the installed weights; every emitted token is tagged with it.
+        self._weight_version = 0
 
         self._failed_detokenizer_resets: set[str] = set()
         self._detokenizer_cleanup_threshold = 100  # Clean up after this many failures
@@ -2799,7 +2844,20 @@ class eSurge:
         plane = getattr(self, "_request_plane", None)
         if plane is not None and plane.owns_scheduling and plane.needs_tee:
             plane.tee_outputs(engine_outputs)
-        self._output_pipeline.submit(engine_outputs)
+        # Propagate any pre-token preemptions (freed KV) ahead of the step's outputs so
+        # OutputPipeline clears stale pre-token oldest_kv_weight_version before new tokens land.
+        core = getattr(self, "core", None)
+        drain_preempted = getattr(core, "drain_preempted_kv_requests", None)
+        if callable(drain_preempted):
+            preempted_kv = drain_preempted()
+            if preempted_kv:
+                clear_kv = getattr(self._output_pipeline, "clear_kv_versions", None)
+                if callable(clear_kv):
+                    clear_kv(preempted_kv)
+        # Every weight install happens while no step is in flight (the loop is stopped, or the swap runs between
+        # steps on the loop thread after draining), so the version read here is the one whose weights ran the
+        # forward that produced these tokens, including steps harvested one iteration late under overlap.
+        self._output_pipeline.submit(engine_outputs, weight_version=int(getattr(self, "_weight_version", 0)))
 
     def _stop_engine_output_worker(self) -> None:
         """Drain and stop the asynchronous parser/output worker."""
@@ -3209,12 +3267,29 @@ class eSurge:
         graphstate=None,
         graphother=None,
         restart_scheduler: bool = True,
-    ) -> None:
-        """Hot-swap the underlying model weights/graphs.
+        version: int | None = None,
+        keep_requests: bool = False,
+    ) -> int:
+        """Hot-swap the underlying model weights/graphs and advance the engine weight version.
 
-        The engine must be idle (no pending or running requests) before calling
-        this method. It temporarily stops the scheduler loop, refreshes runner
-        state, rebuilds the engine core, and optionally restarts background serving.
+        By default the engine must be idle (no pending or running requests): this method never drains or aborts
+        requests, it raises instead. It stops the scheduler loop, refreshes runner state, rebuilds the engine core
+        (which drops every prefix-cache entry computed with the old weights) and optionally restarts serving.
+
+        With ``keep_requests=True`` the swap runs on the scheduler thread between two model steps and nothing else is
+        reset: in-flight and queued requests continue, and the tokens they sample after the swap carry the new
+        version in ``CompletionOutput.weight_version_segments``. Their KV entries computed before the swap are kept
+        (not recomputed); every request holding computed KV at the swap records the outgoing version in
+        ``CompletionOutput.oldest_kv_weight_version`` (a request already carrying an older one keeps it), so a
+        request prefilled, fully or partly, under the old weights and sampled under the new ones reports the old
+        version there, and :meth:`abort_requests_before_version` aborts it. Requests not yet scheduled, or preempted
+        (their KV freed) and not resumed, record nothing: all their KV will be computed with the new weights.
+        Because a live prefix cache cannot be flushed while requests hold its pages, this mode requires
+        ``enable_prefix_caching=False``; it is also limited to single-host engines and to a graph whose compiled
+        programs the runner already holds (same structure and shapes).
+
+        Concurrent calls are serialised: version validation and installation happen under one per-engine lock, so
+        the installed version never decreases and two updates never share a version.
 
         Args:
             model: Optional EasyDeLBaseModule carrying the new weights.
@@ -3222,15 +3297,38 @@ class eSurge:
             graphstate: Optional graphstate override.
             graphother: Optional graphother override.
             restart_scheduler: Restart the scheduler thread if it was previously
-                running (default: True).
+                running (default: True). Ignored with ``keep_requests``.
+            version: Weight version to install; must exceed the current one. ``None`` installs current + 1.
+            keep_requests: Swap between steps without stopping the loop or touching requests.
+
+        Returns:
+            The installed weight version.
 
         Raises:
-            RuntimeError: If there are active or pending requests.
-            ValueError: If no model/graph data is provided or partial graph
-                components cannot be resolved from existing runner state.
+            RuntimeError: If requests are active or pending and ``keep_requests`` is false.
+            ValueError: If no model/graph data is provided, partial graph components cannot be resolved from
+                existing runner state, ``version`` does not increase, or ``keep_requests`` is requested on an
+                engine with prefix caching or multi-host coordination.
         """
+        # One update at a time per engine: the version is validated and installed inside the same critical
+        # section, so concurrent callers can never install a duplicate or a lower version.
+        update_lock = self.__dict__.setdefault("_weight_update_lock", threading.Lock())
+        with update_lock:
+            return self._update_model_weights_locked(
+                model, graphdef, graphstate, graphother, restart_scheduler, version, keep_requests
+            )
+
+    def _update_model_weights_locked(
+        self, model, graphdef, graphstate, graphother, restart_scheduler, version, keep_requests
+    ) -> int:
+        """Body of :meth:`update_model_weights`; the caller holds the engine's weight-update lock."""
+        if getattr(self, "_closed", False) or getattr(self, "runner", None) is None:
+            raise RuntimeError("Cannot update model weights on a closed eSurge engine")
+        new_version = self._next_weight_version(version)
         if model is None and graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No new model or graph components provided for update")
+        if keep_requests:
+            return self._install_weights_between_steps(model, graphdef, graphstate, graphother, new_version)
 
         step_coordinator = getattr(self, "_step_coordinator", None)
         is_worker_rank = step_coordinator is not None and not step_coordinator.is_leader
@@ -3263,61 +3361,9 @@ class eSurge:
                 if _has_inflight_requests():
                     raise RuntimeError("Cannot update model weights while requests are active or pending")
 
-                split_graphdef = None
-                split_graphstate = None
-                split_graphother = None
-                if model is not None and (graphdef is None or graphstate is None or graphother is None):
-                    _split_model, split_graphdef, split_graphstate, split_graphother = (
-                        self._split_graph_components_for_weight_update(model)
-                    )
-
-                if model is None:
-                    em = getattr(self.runner, "executor_manager", None)
-                    existing_model = getattr(self.runner, "model", None)
-                    if graphdef is None:
-                        graphdef = getattr(em, "graphdef", None)
-                    if graphstate is None:
-                        graphstate = getattr(em, "graphstate", None)
-                    if graphother is None:
-                        graphother = getattr(em, "graphother", None)
-                    if (graphdef is None or graphstate is None or graphother is None) and existing_model is not None:
-                        try:
-                            _, ex_gd, ex_gs, ex_go = self._split_graph_components_for_weight_update(existing_model)
-                            if graphdef is None:
-                                graphdef = ex_gd
-                            if graphstate is None:
-                                graphstate = ex_gs
-                            if graphother is None:
-                                graphother = ex_go
-                        except Exception:
-                            pass
-                    missing = [
-                        name
-                        for name, val in (
-                            ("graphdef", graphdef),
-                            ("graphstate", graphstate),
-                            ("graphother", graphother),
-                        )
-                        if val is None
-                    ]
-                    if missing:
-                        raise ValueError(
-                            f"Cannot update model weights with model=None: missing {', '.join(missing)} "
-                            "and could not resolve them from existing runner state."
-                        )
-                    model = spx.bind(graphdef, graphstate.overlay(graphother))
-                if graphstate is None:
-                    graphstate = split_graphstate
-                if graphother is None:
-                    graphother = split_graphother
-                if graphdef is None:
-                    graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
-                if getattr(self, "decoding_engine", None) is not None:
-                    # Graph-component callers must honor the same explicit selection as
-                    # model callers, including refreshes with a training attention graph.
-                    replacement = spx.bind(graphdef, graphstate.overlay(graphother))
-                    replacement = select_decoding_engine(replacement, self.decoding_engine)
-                    graphdef = replacement.graphdef
+                graphdef, graphstate, graphother = self._resolve_weight_update_components(
+                    model, graphdef, graphstate, graphother
+                )
 
                 self.runner.update_model_weights(
                     graphdef=graphdef,
@@ -3328,6 +3374,13 @@ class eSurge:
                 mm_manager = getattr(self, "_multimodal_manager", None)
                 if mm_manager is not None:
                     refreshed_model = getattr(self.runner, "model", None) or model
+                    if (
+                        refreshed_model is None
+                        and graphdef is not None
+                        and graphstate is not None
+                        and graphother is not None
+                    ):
+                        refreshed_model = spx.bind(graphdef, graphstate.overlay(graphother))
                     if callable(getattr(mm_manager, "set_model", None)):
                         mm_manager.set_model(refreshed_model)
                     elif hasattr(mm_manager, "model"):
@@ -3364,12 +3417,201 @@ class eSurge:
 
                 self.core.shutdown()
                 self.core = self._build_core()
+                # The fresh core holds no prefix-cache entries, so no KV computed under the old weights can seed a request.
+                self._weight_version = new_version
         finally:
             with lock_ctx:
                 self._updating_weights = False
 
         if restart_scheduler and was_running:
             self.initiate()
+        return new_version
+
+    @property
+    def weight_version(self) -> int:
+        """Monotonic version of the installed weights (0 at construction, advanced by :meth:`update_model_weights`)."""
+        return int(getattr(self, "_weight_version", 0))
+
+    def _next_weight_version(self, version: int | None) -> int:
+        """Validate a requested weight version, or derive current + 1.
+
+        Raises:
+            ValueError: If ``version`` does not exceed the current weight version.
+        """
+        current = int(getattr(self, "_weight_version", 0))
+        if version is None:
+            return current + 1
+        if int(version) <= current:
+            raise ValueError(f"Weight version must increase: got {int(version)}, current is {current}")
+        return int(version)
+
+    def _resolve_weight_update_components(self, model, graphdef, graphstate, graphother):
+        """Resolve ``(graphdef, graphstate, graphother)`` for a weight update from a model and/or explicit parts."""
+        split_graphdef = None
+        split_graphstate = None
+        split_graphother = None
+        if model is not None and (graphdef is None or graphstate is None or graphother is None):
+            _split_model, split_graphdef, split_graphstate, split_graphother = (
+                self._split_graph_components_for_weight_update(model)
+            )
+
+        if model is None:
+            em = getattr(self.runner, "executor_manager", None)
+            existing_model = getattr(self.runner, "model", None)
+            if graphdef is None:
+                graphdef = getattr(em, "graphdef", None)
+            if graphstate is None:
+                graphstate = getattr(em, "graphstate", None)
+            if graphother is None:
+                graphother = getattr(em, "graphother", None)
+            if (graphdef is None or graphstate is None or graphother is None) and existing_model is not None:
+                try:
+                    _, ex_gd, ex_gs, ex_go = self._split_graph_components_for_weight_update(existing_model)
+                    if graphdef is None:
+                        graphdef = ex_gd
+                    if graphstate is None:
+                        graphstate = ex_gs
+                    if graphother is None:
+                        graphother = ex_go
+                except Exception:
+                    pass
+            missing = [
+                name
+                for name, val in (
+                    ("graphdef", graphdef),
+                    ("graphstate", graphstate),
+                    ("graphother", graphother),
+                )
+                if val is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Cannot update model weights with model=None: missing {', '.join(missing)} "
+                    "and could not resolve them from existing runner state."
+                )
+            model = spx.bind(graphdef, graphstate.overlay(graphother))
+        if graphstate is None:
+            graphstate = split_graphstate
+        if graphother is None:
+            graphother = split_graphother
+        if graphdef is None:
+            graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
+        if getattr(self, "decoding_engine", None) is not None:
+            # Graph-component callers must honor the same explicit selection as
+            # model callers, including refreshes with a training attention graph.
+            replacement = spx.bind(graphdef, graphstate.overlay(graphother))
+            replacement = select_decoding_engine(replacement, self.decoding_engine)
+            graphdef = replacement.graphdef
+        return graphdef, graphstate, graphother
+
+    def _install_weights_between_steps(self, model, graphdef, graphstate, graphother, new_version: int) -> int:
+        """Swap weights between two model steps, keeping every request scheduled (``keep_requests=True``).
+
+        Raises:
+            ValueError: With prefix caching enabled, multi-host coordination, or no compiled programs to reuse.
+        """
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "update_model_weights(keep_requests=True) requires enable_prefix_caching=False: published prefix pages "
+                "computed under the old weights cannot be flushed while live requests hold them."
+            )
+        if self.distributed_mode or getattr(self, "_request_plane", None) is not None:
+            raise ValueError("update_model_weights(keep_requests=True) is supported on single-host engines only.")
+        if not self.runner.executor_manager.has_compiled_variants():
+            raise ValueError("update_model_weights(keep_requests=True) needs an engine with compiled programs.")
+
+        graphdef, graphstate, graphother = self._resolve_weight_update_components(
+            model, graphdef, graphstate, graphother
+        )
+
+        def _swap() -> None:
+            with self._scheduler_lock:
+                if getattr(self, "_closed", False) or getattr(self, "runner", None) is None:
+                    raise RuntimeError("Cannot update model weights on a closed eSurge engine")
+                # No step is in flight: every KV entry held now was computed with the outgoing weights. The pipeline
+                # update is queued behind the tokens already emitted, so it lands before any new-weight token.
+                marked = self.core.mark_kv_weight_version(int(getattr(self, "_weight_version", 0)))
+                self._output_pipeline.submit_kv_versions(marked)
+                # reset_state=False keeps the runner's sequence buffer and page tables for the live requests.
+                self.runner.update_model_weights(
+                    graphdef=graphdef,
+                    graphstate=graphstate,
+                    graphother=graphother,
+                    reset_state=False,
+                )
+                mm_manager = getattr(self, "_multimodal_manager", None)
+                if mm_manager is not None:
+                    refreshed_model = getattr(self.runner, "model", None) or model
+                    if (
+                        refreshed_model is None
+                        and graphdef is not None
+                        and graphstate is not None
+                        and graphother is not None
+                    ):
+                        refreshed_model = spx.bind(graphdef, graphstate.overlay(graphother))
+                    if callable(getattr(mm_manager, "set_model", None)):
+                        mm_manager.set_model(refreshed_model)
+                    elif hasattr(mm_manager, "model"):
+                        mm_manager.model = refreshed_model
+                    if callable(getattr(mm_manager, "clear_cache", None)):
+                        mm_manager.clear_cache()
+                    elif getattr(mm_manager, "cache", None) is not None:
+                        mm_manager.cache.clear()
+                self._weight_version = new_version
+
+        # Always route through the engine loop whenever one exists, even if terminate() has already
+        # cleared _scheduler_running while the final step is still in flight; run_between_steps()
+        # falls back inline only once the loop thread is no longer alive.
+        engine_loop = self._engine_loop
+        if engine_loop is not None:
+            engine_loop.run_between_steps(_swap)
+        else:
+            _swap()
+        self._info("Installed weight version %d between steps (requests kept)", new_version)
+        return new_version
+
+    def abort_requests_before_version(self, min_version: int) -> list[str]:
+        """Abort unfinished requests that sampled a token, or hold KV, from weights older than ``min_version``.
+
+        Two filters, unioned: a request that emitted a token whose ``weight_version_segments`` version is below
+        ``min_version``, and a live request whose currently held KV (prompt prefill or decode, fully or partly) was
+        computed with a version below ``min_version``, as tracked across ``update_model_weights(keep_requests=True)``
+        swaps. Kept requests therefore sample and attend only to weights ``>= min_version`` from here on. Requests
+        holding no KV (never scheduled, or preempted and not resumed: their KV was freed and will be recomputed) are
+        kept. Finished requests are untouched.
+
+        Args:
+            min_version: Oldest weight version a kept request may contain.
+
+        Returns:
+            Parent request ids that were aborted, in admission order.
+        """
+        # Drain queued output bundles and KV-version updates before reading RequestOutputs or aborting, so:
+        # (a) _KVVersionUpdate items from an earlier swap land before abort_request() clears _active_requests, and
+        # (b) tokens already emitted before a preemption are visible on output.oldest_weight_version.
+        pipeline = getattr(self, "_output_pipeline", None)
+        flush = getattr(pipeline, "flush", None)
+        if callable(flush):
+            flush()
+        stale: list[str] = []
+        stale_seen: set[str] = set()
+        min_v = int(min_version)
+        with self._scheduler_lock, self._output_lock:
+            for request_id, output in self._request_outputs.items():
+                if output.finished:
+                    continue
+                oldest = output.oldest_weight_version
+                if oldest is not None and oldest < min_v and request_id not in stale_seen:
+                    stale_seen.add(request_id)
+                    stale.append(request_id)
+            stale_kv = self.core.stale_kv_parent_ids(min_v, int(getattr(self, "_weight_version", 0)))
+            for request_id in stale_kv:
+                if request_id not in stale_seen:
+                    stale_seen.add(request_id)
+                    stale.append(request_id)
+        for request_id in stale:
+            self.abort_request(request_id)
+        return stale
 
     def _reset_runner_state_if_idle(self, reason: str) -> None:
         """Reset runner buffers when there are no active/pending requests.
@@ -4526,6 +4768,8 @@ class eSurge:
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,
                                     raw_text=comp.raw_text,
+                                    weight_version_segments=comp.weight_version_segments,
+                                    oldest_kv_weight_version=comp.oldest_kv_weight_version,
                                 )
                             )
 

@@ -43,8 +43,10 @@ import typing as tp
 # imports this package to discover built-in trainers. Non-registry utilities and
 # optional integrations (e.g. Ray, eSurge rollout, prompt transforms, PoSE/YaRN/
 # ProcessEncoder configs) are loaded lazily via PEP 562 ``__getattr__``.
+from .agent_flow_trainer import AgentFlowConfig, AgentFlowTrainer
 from .agentic_moshpit import AgenticMoshPitConfig, AgenticMoshPitTrainer
 from .async_grpo_trainer import AsyncGRPOConfig, AsyncGRPOTrainer
+from .async_rollout_mixin import AsyncRolloutMixin, AsyncRolloutResult
 from .base_trainer import BaseTrainer
 from .bema_trainer import BEMACallback, BEMAConfig, BEMADPOTrainer
 from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
@@ -54,7 +56,9 @@ from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
 from .dppo_trainer import DPPOConfig, DPPOTrainer
 from .embedding_trainer import EmbeddingConfig, EmbeddingTrainer
+from .gdpo_trainer import GDPOConfig, GDPOTrainer
 from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
+from .gmpo_trainer import GMPOConfig, GMPOTrainer
 from .gold_trainer import GOLDConfig, GOLDTrainer
 from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
@@ -76,6 +80,7 @@ from .online_dpo_trainer import OnlineDPOConfig, OnlineDPOTrainer
 from .papo_trainer import PAPOConfig, PAPOTrainer
 from .prm_trainer import PRMConfig, PRMTrainer
 from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
+from .reinforce_plus_plus_trainer import ReinforcePlusPlusConfig, ReinforcePlusPlusTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
 from .rloo_trainer import RLOOConfig, RLOOTrainer
 from .rlvr_trainer import RLVRConfig, RLVRTrainer
@@ -90,6 +95,7 @@ from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .tpo_trainer import TPOConfig, TPOTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
+from .vapo_trainer import VAPOConfig, VAPOTrainer
 from .xpo_trainer import XPOConfig, XPOTrainer
 
 if tp.TYPE_CHECKING:
@@ -169,10 +175,14 @@ def __dir__() -> list[str]:
 
 
 __all__ = (
+    "AgentFlowConfig",
+    "AgentFlowTrainer",
     "AgenticMoshPitConfig",
     "AgenticMoshPitTrainer",
     "AsyncGRPOConfig",
     "AsyncGRPOTrainer",
+    "AsyncRolloutMixin",
+    "AsyncRolloutResult",
     "BCOConfig",
     "BCOPreprocessTransform",
     "BCOTrainer",
@@ -195,10 +205,14 @@ __all__ = (
     "EmbeddingConfig",
     "EmbeddingPreprocessTransform",
     "EmbeddingTrainer",
+    "GDPOConfig",
+    "GDPOTrainer",
     "GFPOConfig",
     "GFPOTrainer",
     "GKDConfig",
     "GKDTrainer",
+    "GMPOConfig",
+    "GMPOTrainer",
     "GOLDConfig",
     "GOLDTrainer",
     "GRPOConfig",
@@ -248,6 +262,8 @@ __all__ = (
     "RLVRTrainer",
     "RandomizedYaRNConfig",
     "RayDistributedTrainer",
+    "ReinforcePlusPlusConfig",
+    "ReinforcePlusPlusTrainer",
     "RewardConfig",
     "RewardPreprocessTransform",
     "RewardProtocol",
@@ -275,6 +291,8 @@ __all__ = (
     "TPOTrainer",
     "Trainer",
     "TrainingArguments",
+    "VAPOConfig",
+    "VAPOTrainer",
     "XPOConfig",
     "XPOTrainer",
     "eSurgeRolloutConfig",

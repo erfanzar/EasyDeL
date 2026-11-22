@@ -283,11 +283,17 @@ class RewardProtocol:
             ``reward_weights`` in the trainer config still overrides these.
         name: Optional display name used for logged metrics; falls back to the
             class name.
+        discard_unscorable: When ``True``, a ``None`` score from this reward marks
+            the sample unscorable and (under the GRPO default
+            ``discard_unscorable_groups=None``) drops its whole prompt group from
+            the update. Defaults to ``False``: a ``None`` is skipped by the
+            nan-aware reward statistics instead.
     """
 
     reduction: Reduction = "mean"
     weight: float = 1.0
     name: str | None = None
+    discard_unscorable: bool = False
 
     def __init__(
         self,

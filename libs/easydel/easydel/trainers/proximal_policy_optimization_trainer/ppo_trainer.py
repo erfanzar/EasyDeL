@@ -55,6 +55,7 @@ from .._logprob_utils import (
 )
 from .._shared import copy_frozen_policy, drop_optimizer_state
 from .._shared.policy_losses import _MAX_SAFE_LOG_RATIO, _MIN_SAFE_LOG_RATIO
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
@@ -65,7 +66,7 @@ from ..training_utils import (
     compile_trainer_step,
     resolve_straight_through_emulator,
 )
-from ._fn import ppo_step
+from ._fn import compute_gae, length_adaptive_gae_lambda, ppo_step
 from .modeling_value_head import CausalLMWithValueHead
 from .ppo_config import PPOConfig
 
@@ -79,7 +80,7 @@ RewardFunc = EasyDeLBaseModule | EasyDeLState | RewardProtocol | tp.Callable[[li
 
 
 @Registry.register("trainer", "ppo")
-class PPOTrainer(Trainer):
+class PPOTrainer(AsyncRolloutMixin, Trainer):
     """Proximal Policy Optimization trainer for RLHF.
 
     PPO is a policy gradient method that uses clipped surrogate objectives to
@@ -479,8 +480,9 @@ class PPOTrainer(Trainer):
             self.arguments.gradient_accumulation_steps,
             True,  # is_train
             straight_through_emulator,
+            *self._vapo_static_args(),
         )
-        static_argnums = tuple(range(2, 14))
+        static_argnums = tuple(range(2, 2 + len(self._train_shared_fn_static_args)))
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
             ppo_step,
@@ -507,6 +509,7 @@ class PPOTrainer(Trainer):
             1,
             False,  # is_train
             straight_through_emulator,
+            *self._vapo_static_args(),
         )
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
@@ -716,6 +719,10 @@ class PPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _optimizer_steps_per_rollout(self) -> int:
+        """Each rollout is replayed for ``num_ppo_epochs`` optimizer steps."""
+        return max(1, int(self.arguments.num_ppo_epochs))
+
     def _should_run_evaluation(self, current_step: int) -> bool:
         """Trigger evaluation even if multi-epoch PPO steps jumped over an exact multiple."""
         eval_steps = self.arguments.evaluation_steps
@@ -764,7 +771,42 @@ class PPOTrainer(Trainer):
         if self.arguments.num_ppo_epochs == 1:
             self._last_train_step_prev = int(jax.device_get(state.step))
             return super()._execute_train_step(state=state, batch=batch)
+        return self._run_ppo_epochs(state=state, batch=batch, informations=None)
 
+    def _execute_preprocessed_train_step(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        informations: dict[str, float | int | str],
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
+        """Run ``num_ppo_epochs`` updates on a rollout preprocessed by the async rollout worker.
+
+        Async mode hands over a batch that is already scored and carries advantages, so
+        preprocessing is skipped; the epoch loop is the one :meth:`_execute_train_step` uses.
+        """
+        return self._run_ppo_epochs(state=state, batch=batch, informations=informations)
+
+    def _run_ppo_epochs(
+        self,
+        state: EasyDeLState,
+        batch,
+        informations: dict[str, tp.Any] | None,
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
+        """Replay one rollout batch for ``num_ppo_epochs`` compiled PPO updates.
+
+        PPO supports a single minibatch per rollout batch (``num_mini_batches=1``), so each
+        epoch is one compiled call over the whole batch in its original order.
+
+        Args:
+            state: Current training state.
+            batch: Raw batch when ``informations`` is ``None`` (it is preprocessed here, as in
+                the synchronous path); otherwise an already-preprocessed rollout batch.
+            informations: Rollout metrics produced by an earlier preprocessing step, or
+                ``None`` to run :meth:`_preprocess_batch_input` first.
+
+        Returns:
+            ``(state, metrics, exception)`` with the same contract as :meth:`_execute_train_step`.
+        """
         if self.pruning_module is not None:
             state = state.replace(
                 graphstate=self.pruning_module.pre_forward_update(
@@ -774,17 +816,19 @@ class PPOTrainer(Trainer):
             )
         metrics = LossMetrics()
         try:
-            self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
-            batch, informations = self._preprocess_batch_input(
-                state=state,
-                batch=batch,
-                is_train=True,
-            )
-            self._runtime_trace(
-                "execute_train_step.preprocess.end",
-                batch=self._runtime_batch_summary(batch),
-                information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
-            )
+            if informations is None:
+                self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
+                batch, informations = self._preprocess_batch_input(
+                    state=state,
+                    batch=batch,
+                    is_train=True,
+                )
+                self._runtime_trace(
+                    "execute_train_step.preprocess.end",
+                    batch=self._runtime_batch_summary(batch),
+                    information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
+                )
+            informations = dict(informations)
 
             prev_step = int(jax.device_get(state.step))
             self._last_train_step_prev = prev_step
@@ -887,6 +931,7 @@ class PPOTrainer(Trainer):
         rewards: jax.Array,
         values: jax.Array,
         mask: jax.Array,
+        lam: float | jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """Estimate per-token advantages and returns via Generalised Advantage Estimation.
 
@@ -913,51 +958,84 @@ class PPOTrainer(Trainer):
                 predictions ``V_t`` aligned with ``rewards``.
             mask: Same-shape binary mask selecting valid completion
                 positions; positions past EOS are zero.
+            lam: Optional trace decay overriding :class:`PPOConfig.lam`;
+                a scalar or one value per trajectory row.
 
         Returns:
             ``(advantages, returns)`` -- both ``(batch, completion_len)``.
             ``advantages`` carries ``A_t`` (zeroed outside the mask) and
             ``returns`` carries ``A_t + V_t``.
         """
-        rewards = rewards.astype(jnp.float32)
-        values = values.astype(jnp.float32)
-        mask = mask.astype(jnp.float32)
-
-        batch_size, _gen_len = rewards.shape
-        values_next = jnp.concatenate([values[:, 1:], jnp.zeros((batch_size, 1), dtype=values.dtype)], axis=1)
-        mask_next = jnp.concatenate([mask[:, 1:], jnp.zeros((batch_size, 1), dtype=mask.dtype)], axis=1)
-
-        gamma = float(self.arguments.gamma)
-        lam = float(self.arguments.lam)
-
-        def scan_fn(adv_next, inputs):
-            """Single backward GAE recursion step.
-
-            Args:
-                adv_next: Advantage at the next timestep ``A_{t+1}``.
-                inputs: Tuple ``(r_t, v_t, v_{t+1}, m_t, m_{t+1})`` for the
-                    current step.
-
-            Returns:
-                tuple: ``(A_t, A_t)`` -- carry and stacked output for ``scan``.
-            """
-            r_t, v_t, v_next_t, m_t, m_next_t = inputs
-            delta = r_t + gamma * v_next_t * m_next_t - v_t
-            adv_t = delta + gamma * lam * adv_next * m_next_t
-            adv_t = adv_t * m_t
-            return adv_t, adv_t
-
-        inputs = (
-            rewards[:, ::-1].T,
-            values[:, ::-1].T,
-            values_next[:, ::-1].T,
-            mask[:, ::-1].T,
-            mask_next[:, ::-1].T,
+        return compute_gae(
+            rewards,
+            values,
+            mask,
+            gamma=float(self.arguments.gamma),
+            lam=float(self.arguments.lam) if lam is None else lam,
         )
-        _, adv_rev = jax.lax.scan(scan_fn, jnp.zeros((batch_size,), dtype=values.dtype), inputs)
-        advantages = adv_rev.T[:, ::-1]
-        returns = advantages + values
-        return advantages, returns
+
+    def _compute_advantages_and_returns(
+        self,
+        rewards: jax.Array,
+        values: jax.Array,
+        mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Build policy advantages and critic targets with decoupled lambdas.
+
+        The policy and the critic can use different GAE trace decays (VAPO's
+        decoupled GAE):
+
+        * policy advantages use ``lam``, or the per-trajectory length-adaptive
+          lambda ``clip(1 - 1 / (alpha * l), 0, 1)`` when
+          :attr:`PPOConfig.length_adaptive_gae` is set;
+        * critic returns use :attr:`PPOConfig.gae_lambda_critic`, or ``lam``
+          when it is ``None``.
+
+        With every VAPO knob at its default, the result is identical to
+        :meth:`_compute_gae`.
+
+        Args:
+            rewards: ``(batch, completion_len)`` per-token rewards.
+            values: ``(batch, completion_len)`` rollout value predictions.
+            mask: Same-shape completion mask.
+
+        Returns:
+            ``(advantages, returns, policy_lambdas)``. ``policy_lambdas`` is
+            ``(batch,)`` and is only used for diagnostics.
+        """
+        batch_size = rewards.shape[0]
+        lam = float(self.arguments.lam)
+        if self.arguments.length_adaptive_gae:
+            lengths = jnp.sum(mask.astype(jnp.float32), axis=1)
+            policy_lam: float | jax.Array = length_adaptive_gae_lambda(
+                lengths,
+                alpha=float(self.arguments.length_adaptive_gae_alpha),
+            )
+        else:
+            policy_lam = lam
+        advantages, returns = self._compute_gae(rewards, values, mask, lam=policy_lam)
+
+        critic_lam = self.arguments.gae_lambda_critic
+        critic_lam = lam if critic_lam is None else float(critic_lam)
+        if self.arguments.length_adaptive_gae or critic_lam != lam:
+            _, returns = self._compute_gae(rewards, values, mask, lam=critic_lam)
+        policy_lambdas = jnp.broadcast_to(jnp.asarray(policy_lam, dtype=jnp.float32), (batch_size,))
+        return advantages, returns, policy_lambdas
+
+    def _vapo_static_args(self) -> tuple[float | None, bool, float, int]:
+        """Return the VAPO trailing static arguments of :func:`ppo_step`.
+
+        Returns:
+            ``(cliprange_high, token_level_loss, positive_nll_coef,
+            value_pretrain_steps)`` as hashable Python scalars.
+        """
+        cliprange_high = self.arguments.cliprange_high
+        return (
+            None if cliprange_high is None else float(cliprange_high),
+            bool(self.arguments.token_level_loss),
+            float(self.arguments.positive_nll_coef),
+            int(self.arguments.value_pretrain_steps),
+        )
 
     def _score_rollout_policy_and_values(
         self,
@@ -1267,10 +1345,22 @@ class PPOTrainer(Trainer):
                 rewards = self._masked_whiten(rewards, completion_mask, shift_mean=False)
                 rewards = rewards * completion_mask
 
-            advantages, returns = self._compute_gae(rewards, old_values, completion_mask)
+            advantages, returns, policy_lambdas = self._compute_advantages_and_returns(
+                rewards,
+                old_values,
+                completion_mask,
+            )
             if self.arguments.whiten_advantages:
                 advantages = self._masked_whiten(advantages, completion_mask, shift_mean=True)
                 advantages = advantages * completion_mask
+
+            vapo_batch: dict[str, jax.Array] = {}
+            if self.arguments.token_level_loss:
+                vapo_batch["num_items_in_batch"] = jnp.sum(completion_mask.astype(jnp.float32))
+            if self.arguments.positive_nll_coef > 0.0:
+                positive_mask = (scores > float(self.arguments.positive_reward_threshold)).astype(jnp.float32)
+                vapo_batch["positive_mask"] = positive_mask
+                vapo_batch["num_positive_tokens"] = jnp.sum(completion_mask.astype(jnp.float32) * positive_mask[:, None])
 
         preprocessing_time = preprocessing_time_fn()
 
@@ -1286,6 +1376,10 @@ class PPOTrainer(Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
+        if self.arguments.length_adaptive_gae:
+            metrics_dict["policy_gae_lambda_mean"] = _host_scalar_float(jnp.mean(policy_lambdas))
+        if "positive_mask" in vapo_batch:
+            metrics_dict["positive_fraction"] = _host_scalar_float(jnp.mean(vapo_batch["positive_mask"]))
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
         self._log_training_generations_to_wandb(
@@ -1308,6 +1402,7 @@ class PPOTrainer(Trainer):
                 "old_values": old_values,
                 "advantages": advantages,
                 "returns": returns,
+                **vapo_batch,
             },
             metrics_dict,
         )

@@ -38,6 +38,7 @@ import time
 import traceback
 import typing
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from easydel.inference.stream_protocol import compute_stream_delta_text
 from easydel.workers.esurge.pipeline import DetokenizerResult
@@ -78,6 +79,59 @@ def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_cach
         "cache_written": cache_written,
         "uncached_input": uncached_input,
     }
+
+
+def _record_weight_version(comp, start_token_index: int, weight_version: int) -> None:
+    """Open a ``(start_token_index, weight_version)`` segment on ``comp`` when the version changes.
+
+    Segments stay run-length encoded: consecutive steps under the same version extend the last segment
+    instead of adding one. The list is replaced rather than mutated so snapshots already handed to
+    consumers keep their own value.
+
+    Args:
+        comp: Completion output receiving tokens starting at ``start_token_index``.
+        start_token_index: Index of the first new token within the completion.
+        weight_version: Engine weight version whose forward produced the new tokens.
+    """
+    segments = comp.weight_version_segments
+    if segments and segments[-1][1] == weight_version:
+        return
+    comp.weight_version_segments = [*(segments or ()), (int(start_token_index), int(weight_version))]
+
+
+def _record_kv_weight_version(comp, weight_version: int) -> None:
+    """Lower ``comp.oldest_kv_weight_version`` to ``weight_version`` (set it when unset).
+
+    Args:
+        comp: Completion output of the request whose KV was computed with ``weight_version``.
+        weight_version: Engine weight version that computed some of the request's KV.
+    """
+    current = comp.oldest_kv_weight_version
+    if current is None or int(weight_version) < current:
+        comp.oldest_kv_weight_version = int(weight_version)
+
+
+@dataclass(frozen=True)
+class _KVVersionUpdate:
+    """Queue item: requests whose live KV was computed with an older weight version (see ``submit_kv_versions``)."""
+
+    versions: dict[str, int]
+    targets: dict[str, tuple[str, int]] | None = None
+
+
+@dataclass(frozen=True)
+class _KVVersionClear:
+    """Queue item: requests whose live KV was freed by preemption (clear pre-token ``oldest_kv_weight_version``)."""
+
+    request_ids: frozenset[str]
+
+
+@dataclass
+class _Barrier:
+    """Queue item: signals ``event`` once all earlier items in ``OutputPipeline.queue`` have been processed."""
+
+    event: threading.Event
+    completed: bool = False
 
 
 class _PrefixView(Sequence):
@@ -232,7 +286,7 @@ class OutputPipeline:
         self._thread = threading.Thread(target=self._loop, name="eSurgeOutputWorker", daemon=True)
         self._thread.start()
 
-    def submit(self, engine_outputs) -> None:
+    def submit(self, engine_outputs, weight_version: int | None = None) -> None:
         """Queue a bundle for ordered processing; process inline if stopped.
 
         The inline fallback keeps lightweight harnesses (and the window
@@ -242,13 +296,137 @@ class OutputPipeline:
         Args:
             engine_outputs: Scheduler-produced output bundle from
                 ``update_from_output``. Falsy bundles are ignored.
+            weight_version: Engine weight version whose forward produced the
+                bundle's tokens; recorded on each completion's
+                ``weight_version_segments``. ``None`` records nothing.
         """
         if not engine_outputs:
             return
         if not self.running:
-            self._process_engine_outputs(engine_outputs)
+            self._process_engine_outputs(engine_outputs, weight_version=weight_version)
             return
-        self.queue.put(engine_outputs)
+        self.queue.put((engine_outputs, weight_version))
+
+    def submit_kv_versions(
+        self,
+        versions: dict[str, int],
+        *,
+        targets: dict[str, tuple[str, int]] | None = None,
+    ) -> None:
+        """Queue KV weight versions for requests, in order with the token bundles; apply inline if stopped.
+
+        Each request's completion lowers ``oldest_kv_weight_version`` to the given version. Queued with the bundles,
+        the update lands after every token sampled before it and before every token sampled after it.
+
+        Args:
+            versions: Engine request id (an ``n>1`` child id for samples) -> weight version that computed some of
+                its live KV. Unknown ids are ignored; an empty mapping does nothing.
+            targets: Optional mapping from engine request id to ``(parent_request_id, sample_index)`` so updates can
+                still be applied to ``_request_outputs`` if the request is aborted before the worker drains.
+        """
+        if not versions:
+            return
+        item = _KVVersionUpdate(dict(versions), dict(targets) if targets else None)
+        if not self.running:
+            self._apply_kv_versions(item)
+            return
+        self.queue.put(item)
+
+    def clear_kv_versions(self, request_ids: typing.Iterable[str]) -> None:
+        """Queue clearing pre-token ``oldest_kv_weight_version`` for preempted requests whose KV was freed.
+
+        Ordered in FIFO with token bundles and KV version updates; applies inline when the worker is stopped.
+        Completions that already emitted at least one token keep their ``oldest_kv_weight_version``.
+        """
+        frozen = frozenset(request_ids)
+        if not frozen:
+            return
+        item = _KVVersionClear(frozen)
+        if not self.running:
+            self._clear_kv_versions(item)
+            return
+        self.queue.put(item)
+
+    def flush(self, timeout: float | None = 5.0) -> bool:
+        """Wait until all items already queued on the output worker have been processed.
+
+        Returns ``True`` if the barrier completed (or the worker is not running), ``False`` on timeout or if the
+        worker exited before reaching the barrier.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        if threading.current_thread() is thread:
+            return True
+        barrier = _Barrier(threading.Event())
+        self.queue.put(barrier)
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        while True:
+            if deadline is None:
+                step = 0.05
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return barrier.event.is_set() and barrier.completed
+                step = min(0.05, remaining)
+            if barrier.event.wait(timeout=step):
+                return barrier.completed
+            if not thread.is_alive():
+                return barrier.event.is_set() and barrier.completed
+
+    def _resolve_output_slot_locked(
+        self,
+        request_id: str,
+        targets: dict[str, tuple[str, int]] | None = None,
+    ) -> tuple[typing.Any, int] | None:
+        """Resolve ``(RequestOutput, sample_index)`` even if ``abort_request`` already cleared ``_active_requests``."""
+        rd = self._active_requests.get(request_id)
+        if rd is not None:
+            parent_id = rd.parent_request_id or request_id
+            sample_index = rd.sample_index
+        elif targets is not None and request_id in targets:
+            parent_id, sample_index = targets[request_id]
+        elif request_id in self._request_outputs:
+            parent_id, sample_index = request_id, 0
+        else:
+            parent_id, sep, idx_str = request_id.rpartition("-")
+            if sep and idx_str.isdigit() and parent_id in self._request_outputs:
+                sample_index = int(idx_str)
+            else:
+                return None
+        ro = self._request_outputs.get(parent_id)
+        if ro is None or not 0 <= sample_index < len(ro.outputs):
+            return None
+        return ro, sample_index
+
+    def _apply_kv_versions(self, item: _KVVersionUpdate) -> None:
+        with self._request_lock, self._output_lock:
+            for request_id, version in item.versions.items():
+                slot = self._resolve_output_slot_locked(request_id, item.targets)
+                if slot is None:
+                    continue
+                ro, sample_index = slot
+                _record_kv_weight_version(ro.outputs[sample_index], int(version))
+                ro.update_seq += 1
+
+    def _clear_kv_versions(self, item: _KVVersionClear) -> None:
+        with self._request_lock, self._output_lock:
+            for request_id in item.request_ids:
+                rd = self._active_requests.get(request_id)
+                if rd is None:
+                    continue
+                # Once a completion has emitted any token, that token attended to the earlier KV; never clear it.
+                if rd.generated_tokens:
+                    continue
+                ro = self._request_outputs.get(rd.parent_request_id or request_id)
+                if ro is None or not 0 <= rd.sample_index < len(ro.outputs):
+                    continue
+                comp = ro.outputs[rd.sample_index]
+                if comp.weight_version_segments:
+                    continue
+                if comp.oldest_kv_weight_version is not None:
+                    comp.oldest_kv_weight_version = None
+                    ro.update_seq += 1
 
     def stop(self, timeout: float = 5.0) -> None:
         """Drain the queue and stop the worker via the ``None`` sentinel."""
@@ -273,18 +451,41 @@ class OutputPipeline:
 
     def _loop(self) -> None:
         """Drain bundles in FIFO order until the sentinel or a fatal error."""
-        while True:
-            engine_outputs = self.queue.get()
-            try:
-                if engine_outputs is _STOP_SENTINEL:
-                    return
-                self._process_engine_outputs(engine_outputs)
-            except Exception as exc:
-                traceback.print_exc()
-                logger.error("Engine output worker failed: %s", exc)
-                self._on_fatal(exc, traceback.format_exc())
-            finally:
-                self.queue.task_done()
+        try:
+            while True:
+                item = self.queue.get()
+                try:
+                    if item is _STOP_SENTINEL:
+                        return
+                    if isinstance(item, _Barrier):
+                        item.completed = True
+                        item.event.set()
+                        continue
+                    if isinstance(item, _KVVersionUpdate):
+                        self._apply_kv_versions(item)
+                        continue
+                    if isinstance(item, _KVVersionClear):
+                        self._clear_kv_versions(item)
+                        continue
+                    engine_outputs, weight_version = item
+                    self._process_engine_outputs(engine_outputs, weight_version=weight_version)
+                except Exception as exc:
+                    traceback.print_exc()
+                    logger.error("Engine output worker failed: %s", exc)
+                    self._on_fatal(exc, traceback.format_exc())
+                finally:
+                    self.queue.task_done()
+        finally:
+            while True:
+                try:
+                    pending = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if isinstance(pending, _Barrier):
+                        pending.event.set()
+                finally:
+                    self.queue.task_done()
 
     # Decode helpers
 
@@ -1368,7 +1569,9 @@ class OutputPipeline:
 
         return text_changed, structured_changed
 
-    def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
+    def _process_engine_outputs(
+        self, engine_outputs: dict[int, EngineCoreOutputs], weight_version: int | None = None
+    ) -> None:
         """Process engine outputs and update request outputs (thread-safe).
 
         Decodes tokens, runs reasoning + tool parsers, updates metrics, and
@@ -1416,6 +1619,11 @@ class OutputPipeline:
 
                     if new_tokens:
                         comp = ro.outputs[sample_index]
+                        if weight_version is not None:
+                            _record_weight_version(comp, len(rd.generated_tokens), int(weight_version))
+                            if comp.oldest_kv_weight_version is None:
+                                # No swap reported older KV, so the weights that sampled this token computed it all.
+                                comp.oldest_kv_weight_version = int(weight_version)
                         self._append_token_logprobs(
                             comp, new_tokens, engine_output.new_logprobs, len(rd.generated_tokens)
                         )

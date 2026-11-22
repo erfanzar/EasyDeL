@@ -34,7 +34,12 @@ def concatenated_inputs(
             ``prompt_attention_mask``, ``chosen_input_ids``,
             ``chosen_attention_mask``, ``rejected_input_ids``, and
             ``rejected_attention_mask``. Optionally includes ``pixel_values``,
-            ``pixel_attention_mask``, and ``image_sizes`` for VLM training.
+            ``pixel_attention_mask``, and ``image_sizes`` for VLM training,
+            and ``chosen_loss_mask`` / ``rejected_loss_mask`` (same shape as
+            the completion ids) selecting which attended completion tokens
+            enter the log-prob sums. When either loss mask is present the
+            output carries ``completion_loss_mask`` (a missing side defaults
+            to all ones); otherwise the output is unchanged.
         padding_value: Padding token id used to right-pad completions.
 
     Returns:
@@ -102,4 +107,27 @@ def concatenated_inputs(
             ),
         ),
     )
+    chosen_loss_mask = batch.get("chosen_loss_mask")
+    rejected_loss_mask = batch.get("rejected_loss_mask")
+    if chosen_loss_mask is not None or rejected_loss_mask is not None:
+        # A side without an explicit loss mask scores every attended completion token.
+        if chosen_loss_mask is None:
+            chosen_loss_mask = jnp.ones_like(batch["chosen_attention_mask"])
+        if rejected_loss_mask is None:
+            rejected_loss_mask = jnp.ones_like(batch["rejected_attention_mask"])
+        for name, mask, ids in (
+            ("chosen_loss_mask", chosen_loss_mask, batch["chosen_input_ids"]),
+            ("rejected_loss_mask", rejected_loss_mask, batch["rejected_input_ids"]),
+        ):
+            if tuple(mask.shape) != tuple(ids.shape):
+                raise ValueError(
+                    f"`{name}` must have the same shape as its completion ids {tuple(ids.shape)}, "
+                    f"got {tuple(mask.shape)}."
+                )
+        output["completion_loss_mask"] = jnp.concatenate(
+            (
+                pad_to_length(jnp.asarray(chosen_loss_mask), max_completion_length, pad_value=0),
+                pad_to_length(jnp.asarray(rejected_loss_mask), max_completion_length, pad_value=0),
+            ),
+        )
     return output

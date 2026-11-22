@@ -61,6 +61,7 @@ References:
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import typing
@@ -70,7 +71,7 @@ from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     BwdParams,
@@ -880,6 +881,87 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
     candidate_cfgs_shard_map_xla = candidate_cfgs_xla
 
 
+def _position_offset_mask_builder(
+    q_len: int,
+    kv_len: int,
+    num_heads: int,
+    head_idx: int,
+    num_reps: int,
+    *,
+    causal: bool,
+    sliding_window: int | tuple[int, int] | None,
+) -> "Mask":
+    """Pallas TPU block mask for queries that continue a key/value prefix (``q_len != kv_len``).
+
+    The kernel's default causal triangle and window are top-left aligned (query row ``i`` sees key
+    column ``j <= i``). Queries that continue a prefix sit at absolute positions offset by
+    ``kv_len - q_len``, so the triangle and window are shifted by that offset (bottom-right
+    alignment); :func:`_position_offset_consistent` checks the positions actually follow it.
+    """
+    from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import CausalMask, LocalMask
+
+    offset = kv_len - q_len
+    mask = None
+    if sliding_window is not None:
+        if isinstance(sliding_window, int):
+            # An int is a window *size* (HF convention): the query plus its ``W - 1`` neighbours.
+            left_window = right_window = max(sliding_window - 1, 0)
+        else:
+            left_window, right_window = sliding_window
+        mask = LocalMask(shape=(q_len, kv_len), window_size=(left_window, right_window), offset=offset)
+    if causal:
+        causal_mask = CausalMask((q_len, kv_len), offset=offset)
+        mask = causal_mask if mask is None else causal_mask & mask
+    return mask
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_position_offset_mask_builder(causal: bool, sliding_window: int | tuple[int, int] | None):
+    """One stable builder object per (causal, window), so the jitted kernel's static-arg cache hits."""
+    return functools.partial(_position_offset_mask_builder, causal=causal, sliding_window=sliding_window)
+
+
+def _position_offset_consistent(
+    q_segment_ids: Int[Array, "..."],
+    kv_segment_ids: Int[Array, "..."],
+    q_positions: Int[Array, "batch seq_len"],
+    kv_positions: Int[Array, "batch kv_len"],
+) -> Bool[Array, "batch"]:
+    """Per batch row: do the valid tokens' positions follow the bottom-right index alignment?
+
+    True when ``q_pos[i] - i - (kv_len - q_len)`` and ``kv_pos[j] - j`` take one common value over
+    every valid (segment id >= 0) query and key/value token of the row, in which case
+    ``kv_pos <= q_pos`` is exactly ``j <= i + (kv_len - q_len)``.
+    """
+    if q_segment_ids.ndim == 3:
+        q_segment_ids = q_segment_ids[:, 0, :]
+    if kv_segment_ids.ndim == 3:
+        kv_segment_ids = kv_segment_ids[:, 0, :]
+    q_len = q_positions.shape[-1]
+    kv_len = kv_positions.shape[-1]
+    q_base = q_positions.astype(jnp.int32) - jnp.arange(q_len, dtype=jnp.int32) - (kv_len - q_len)
+    kv_base = kv_positions.astype(jnp.int32) - jnp.arange(kv_len, dtype=jnp.int32)
+    big = jnp.iinfo(jnp.int32).max
+    q_valid = q_segment_ids >= 0
+    kv_valid = kv_segment_ids >= 0
+    lo = jnp.minimum(
+        jnp.min(jnp.where(q_valid, q_base, big), axis=-1), jnp.min(jnp.where(kv_valid, kv_base, big), axis=-1)
+    )
+    hi = jnp.maximum(
+        jnp.max(jnp.where(q_valid, q_base, -big), axis=-1), jnp.max(jnp.where(kv_valid, kv_base, -big), axis=-1)
+    )
+    return hi <= lo
+
+
+def _resolves_to_pallas_tpu(platform, cfg: BlockSparseAttentionConfig | None) -> bool:
+    """Whether the call is routed to the Pallas TPU backend (whose mask builders take five ints)."""
+    requested = platform if platform is not None else (cfg.platform if cfg is not None else "auto")
+    try:
+        return detect_platform("blocksparse_attention", requested) == Platform.PALLAS
+    except Exception:
+        return False
+
+
 _executor: Executor[BlockSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
@@ -1005,9 +1087,52 @@ def blocksparse_attention(
     q_positions = None
     kv_positions = None
     q_mask = None
+    position_offset_check = None
 
+    if (
+        mask_info is not None
+        and mask_builder is None
+        and qkv_layouts is None
+        and chunk_size is None
+        and (causal or sliding_window is not None)
+        and query.shape[2] != key.shape[2]
+        and mask_info.uses_position_causality()
+        and _resolves_to_pallas_tpu(platform, cfg)
+    ):
+        # Queries continuing a key/value prefix (q_len != kv_len) with explicit positions: the
+        # Pallas TPU kernel's default triangle/window are top-left aligned by index. Shift them by
+        # ``kv_len - q_len`` (bottom-right), and poison rows whose positions do not follow that
+        # alignment instead of silently attending to the wrong keys. Execution is pinned to the
+        # Pallas backend so the selector cannot run an XLA config (which masks by positions and
+        # would be correct) and still have its rows poisoned.
+        if isinstance(sliding_window, list):
+            sliding_window = tuple(sliding_window)
+        if method == "shard_map":
+            # The offset is derived from the shard-local lengths, so the sequence axes must not be split.
+            for name, spec in (("query", in_specs[0]), ("key", in_specs[1])):
+                axes = spec[2] if spec is not None and len(spec) > 2 else None
+                axes = () if axes is None else (axes if isinstance(axes, tuple) else (axes,))
+                if math.prod(int(mesh.shape[a]) for a in axes) != 1:
+                    raise NotImplementedError(
+                        "Pallas TPU blocksparse_attention with explicit q/kv positions and q_len != kv_len "
+                        f"does not support a sharded {name} sequence axis ({spec})."
+                    )
+        platform = "pallas"
+        mask_builder = _cached_position_offset_mask_builder(bool(causal), sliding_window)
+        position_offset_check = _position_offset_consistent(
+            mask_info._q_segment_ids,
+            mask_info._kv_segment_ids,
+            mask_info.q_positions,
+            mask_info.kv_positions,
+        )
+
+    local_mask_info = None
     if mask_info is not None:
-        q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+        # Operate on a shallow copy so lazy derivation of segment IDs, positions, or
+        # masks never mutates the caller's MaskInfo in place (mutating ``_attention_mask``
+        # or positions would flip ``uses_position_causality()`` on subsequent reuse).
+        local_mask_info = mask_info.replace()
+        q_segment_ids, kv_segment_ids = local_mask_info.get_or_compute_segment_ids()
         q_ids_for_mask = q_segment_ids
         if q_ids_for_mask is not None and q_ids_for_mask.ndim == 3:
             q_ids_for_mask = q_ids_for_mask[:, 0, :]
@@ -1015,14 +1140,17 @@ def blocksparse_attention(
             q_mask = q_ids_for_mask >= 0
 
         if q_positions is None or kv_positions is None:
-            mask_q_pos, mask_kv_pos = mask_info.get_or_compute_positions()
+            mask_q_pos, mask_kv_pos = local_mask_info.get_or_compute_positions()
             if q_positions is None:
                 q_positions = mask_q_pos
             if kv_positions is None:
                 kv_positions = mask_kv_pos
 
         if method is None and attention_mask is None:
-            attention_mask = mask_info.get_or_compute_attention_mask()
+            if local_mask_info._attention_mask is not None:
+                attention_mask = local_mask_info._attention_mask
+            elif q_segment_ids is None or kv_segment_ids is None:
+                attention_mask = local_mask_info.get_or_compute_attention_mask()
 
     if method == "shard_map":
         if attention_mask is not None:
@@ -1030,10 +1158,10 @@ def blocksparse_attention(
                 "`attention_mask` is not supported for shard_map blocksparse_attention; "
                 "pass `bias`/`mask_builder` instead."
             )
-        if mask_info is None:
+        if local_mask_info is None:
             in_specs = (*in_specs, None, None, None, None)
         else:
-            shardings = mask_info.get_shardings(False, mesh=mesh)
+            shardings = local_mask_info.get_shardings(False, mesh=mesh)
             in_specs = (
                 *in_specs,
                 shardings.q_segment_ids,
@@ -1075,6 +1203,9 @@ def blocksparse_attention(
         out_specs=out_specs,
         _cfg=cfg,
     )
+
+    if position_offset_check is not None:
+        out = jnp.where(position_offset_check[:, None, None, None], out, jnp.asarray(jnp.nan, out.dtype))
 
     if q_mask is not None and purify:
         out = out * q_mask[:, None, :, None].astype(out.dtype)

@@ -75,6 +75,7 @@ if TYPE_CHECKING:
 # hyphen) to be transparently normalized to canonical trainer type identifiers.
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
+    "agent-flow": "agent_flow",
     "agentic_moshpit": "agentic-moshpit",
     "async-grpo": "async_grpo",
     "compaction-rl": "compaction_rl",
@@ -87,6 +88,7 @@ _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "grpo_replay_buffer_trainer": "grpo_with_replay_buffer",
     "nemo-gym": "nemo_gym",
     "online-dpo": "online_dpo",
+    "reinforce++": "reinforce_plus_plus",
     "rlvr_trainer": "rlvr",
     "self_distillation": "sdft",
     "single-rollout-asynchronous-optimization": "sao",
@@ -484,6 +486,8 @@ class BaseTrainerCfg(TypedDict, total=False):
             "speculative-decoding",
             "speculative_decoding",
             "agentic-moshpit",
+            "agent_flow",
+            "agent-flow",
             "agentic_moshpit",
             "async-grpo",
             "async_grpo",
@@ -493,6 +497,8 @@ class BaseTrainerCfg(TypedDict, total=False):
             "compaction_reinforcement_learning",
             "dppo",
             "dppo-trainer",
+            "gdpo",
+            "gmpo",
             "gold",
             "grpo-replay-buffer",
             "grpo-with-replay-buffer",
@@ -511,11 +517,14 @@ class BaseTrainerCfg(TypedDict, total=False):
             "rlvr",
             "rlvr_trainer",
             "rloo",
+            "reinforce_plus_plus",
+            "reinforce++",
             "sao",
             "sdft",
             "self_distillation",
             "ssd",
             "tpo",
+            "vapo",
             "embedding",
             "single-rollout-asynchronous-optimization",
             "single_rollout_asynchronous_optimization",
@@ -685,6 +694,17 @@ class BaseTrainerCfg(TypedDict, total=False):
     esurge_async_scheduling: NotRequired[bool | None]
     esurge_overlap_execution: NotRequired[bool | None]
     esurge_max_num_seq_buckets: NotRequired[list[int] | None]
+    async_mode: NotRequired[bool]
+    max_inflight_tasks: NotRequired[int]
+    max_staleness: NotRequired[int]
+    queue_maxsize: NotRequired[int]
+    weight_sync_steps: NotRequired[int]
+    request_timeout: NotRequired[float]
+    first_rollout_timeout: NotRequired[float]
+    heartbeat_stale_after_s: NotRequired[float]
+    environment: NotRequired[str | dict[str, Any] | None]
+    environment_backend: NotRequired[str]
+    environment_endpoints: NotRequired[list[str] | str | None]
     sequence_packing: NotRequired[bool]
     bucket_configs: NotRequired[list[dict[str, Any]] | None]
     bucket_rule: NotRequired[dict[str, Any] | None]
@@ -977,6 +997,12 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     tools: NotRequired[list[dict | Any] | None]
     skip_apply_chat_template: NotRequired[bool]
     num_return_sequences: NotRequired[int]
+    kl_estimator: NotRequired[Literal["k1", "k2", "k3", "l2"]]
+    decouple_reward_normalization: NotRequired[bool]
+    toggle_budget_interval: NotRequired[int]
+    toggle_max_completion_length: NotRequired[int | None]
+    dynamic_sampling: NotRequired[bool]
+    dynamic_sampling_max_attempts: NotRequired[int]
     ref_logps_chunk_size: NotRequired[int | None]
     completion_chunk_size: NotRequired[int | None]
     max_loss_completion_tokens: NotRequired[int | None]
@@ -990,12 +1016,17 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     epsilon: NotRequired[float]
     epsilon_high: NotRequired[float | None]
     delta: NotRequired[float | None]
-    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo"]]
+    loss_type: NotRequired[Literal["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "dppo", "gmpo"]]
     importance_sampling_level: NotRequired[Literal["token", "sequence", "sequence_token"]]
     num_iterations: NotRequired[int]
     num_generations: NotRequired[int | None]
     reward_weights: NotRequired[list[float] | None]
-    scale_rewards: NotRequired[Literal["group", "batch", "none"] | bool]
+    scale_rewards: NotRequired[Literal["group", "batch", "batch_advantage", "none"] | bool]
+    discard_unscorable_groups: NotRequired[bool | None]
+    off_policy_k3_threshold: NotRequired[float | None]
+    off_policy_min_acceptance: NotRequired[float | None]
+    startup_behavior_k3_max: NotRequired[float | None]
+    startup_behavior_tail_fraction_max: NotRequired[float]
     mask_truncated_completions: NotRequired[bool]
     top_entropy_quantile: NotRequired[float]
     min_p: NotRequired[float | None]
@@ -1005,6 +1036,7 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     disable_dropout: NotRequired[bool]
     environment_factory: NotRequired[Any]
     esurge_importance_sampling_cap: NotRequired[float]
+    esurge_importance_sampling_cap_low: NotRequired[float | None]
     esurge_importance_sampling_correction: NotRequired[bool]
     esurge_importance_sampling_mode: NotRequired[str]
     generation_batch_size: NotRequired[int | None]
@@ -1296,6 +1328,14 @@ class PPOTrainerCfg(BaseTrainerCfg):
     kl_coef: NotRequired[float]
     kl_estimator: NotRequired[Literal["k1", "k3"]]
     cliprange: NotRequired[float]
+    gae_lambda_critic: NotRequired[float | None]
+    length_adaptive_gae: NotRequired[bool]
+    length_adaptive_gae_alpha: NotRequired[float]
+    cliprange_high: NotRequired[float | None]
+    token_level_loss: NotRequired[bool]
+    positive_nll_coef: NotRequired[float]
+    positive_reward_threshold: NotRequired[float]
+    value_pretrain_steps: NotRequired[int]
     vf_coef: NotRequired[float]
     cliprange_value: NotRequired[float]
     gamma: NotRequired[float]
@@ -2265,7 +2305,21 @@ class TrainerConfig(
 # bucket wiring in eLarge's own vocabulary (plain dicts and a serialized rule)
 # rather than the dataclass field names, so they must never be forwarded as kwargs.
 # Kept here so the builder and the config-compat tests agree on one list.
-ELARGE_ONLY_TRAINER_KEYS: tuple[str, ...] = ("bucket_configs", "bucket_rule", "bucket_datasets")
+ELARGE_ONLY_TRAINER_KEYS: tuple[str, ...] = (
+    "bucket_configs",
+    "bucket_rule",
+    "bucket_datasets",
+    "environment",
+    "environment_backend",
+    "environment_endpoints",
+)
+
+# Subset of ``ELARGE_ONLY_TRAINER_KEYS`` that some trainer-arguments classes declare as their own
+# fields (AgentFlow, AsyncGRPO). The builder forwards these keys only to argument classes whose
+# signature accepts them, so a YAML-only ``environment`` reaches those trainers.
+ELARGE_ENVIRONMENT_TRAINER_KEYS: frozenset[str] = frozenset(
+    {"environment", "environment_backend", "environment_endpoints"}
+)
 
 BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "learning_rate": 5e-5,
@@ -2354,6 +2408,17 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "esurge_async_scheduling": None,
     "esurge_overlap_execution": None,
     "esurge_max_num_seq_buckets": None,
+    "async_mode": False,
+    "max_inflight_tasks": 32,
+    "max_staleness": 1,
+    "queue_maxsize": 0,
+    "weight_sync_steps": 1,
+    "request_timeout": 120.0,
+    "first_rollout_timeout": 3600.0,
+    "heartbeat_stale_after_s": 120.0,
+    "environment": None,
+    "environment_backend": "kiri",
+    "environment_endpoints": None,
     "bucket_configs": None,
     "bucket_rule": None,
     "bucket_datasets": None,
@@ -2800,11 +2865,15 @@ TRAINER_SPECIFIC_DEFAULTS.update(
         "async_grpo": {
             **TRAINER_SPECIFIC_DEFAULTS["grpo"],
             "trainer_prefix": "AsyncGRPO",
+            "async_mode": True,
             "max_inflight_tasks": 32,
             "max_staleness": 1,
             "queue_maxsize": 0,
             "weight_sync_steps": 1,
             "request_timeout": 120.0,
+            "environment": None,
+            "environment_backend": "kiri",
+            "environment_endpoints": None,
         },
         "compaction_rl": {
             **TRAINER_SPECIFIC_DEFAULTS["ppo"],
@@ -2875,6 +2944,47 @@ TRAINER_SPECIFIC_DEFAULTS.update(
             **TRAINER_SPECIFIC_DEFAULTS["grpo"],
             "trainer_prefix": "GRPOWithReplayBuffer",
             "replay_buffer_size": 64,
+        },
+        "agent_flow": {
+            **BASE_TRAINER_DEFAULTS,
+            "trainer_prefix": "AgentFlow",
+            "base_trainer_type": "grpo",
+            "environment_backend": "local",
+            "max_turns": 8,
+            "context_mode": "append",
+            "reward_mode": "sum",
+            "max_workers": 8,
+            "max_prompt_length": 1024,
+            "max_completion_length": 1024,
+        },
+        "gmpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "GMPO",
+            "loss_type": "gmpo",
+            "epsilon": 0.4,
+            "epsilon_high": 0.4,
+        },
+        "gdpo": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "GDPO",
+            "decouple_reward_normalization": True,
+            "multi_objective_aggregation": "normalize_then_sum",
+        },
+        "reinforce_plus_plus": {
+            **TRAINER_SPECIFIC_DEFAULTS["grpo"],
+            "trainer_prefix": "ReinforcePlusPlus",
+            "scale_rewards": "batch_advantage",
+            "kl_estimator": "k2",
+        },
+        "vapo": {
+            **TRAINER_SPECIFIC_DEFAULTS["ppo"],
+            "trainer_prefix": "VAPO",
+            "gae_lambda_critic": 1.0,
+            "length_adaptive_gae": True,
+            "length_adaptive_gae_alpha": 0.05,
+            "cliprange_high": 0.28,
+            "token_level_loss": True,
+            "positive_nll_coef": 0.1,
         },
         "gspo_token": {
             **TRAINER_SPECIFIC_DEFAULTS["gspo"],
@@ -3007,11 +3117,14 @@ _TRAINERS_WITH_COMPLETION_LENGTH = frozenset(
     {
         "async_grpo",
         "bco",
+        "agent_flow",
         "compaction_rl",
         "cpo",
         "dpo",
         "dppo",
         "gfpo",
+        "gdpo",
+        "gmpo",
         "grpo",
         "grpo_with_replay_buffer",
         "gspo",
@@ -3023,12 +3136,14 @@ _TRAINERS_WITH_COMPLETION_LENGTH = frozenset(
         "orpo",
         "papo",
         "ppo",
+        "reinforce_plus_plus",
         "rloo",
         "sao",
         "sdft",
         "sdpo",
         "ssd",
         "tpo",
+        "vapo",
     }
 )
 

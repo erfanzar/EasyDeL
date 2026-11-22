@@ -29,6 +29,7 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from .._shared import drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..direct_preference_optimization_trainer import DPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..reward_protocol import (
@@ -43,7 +44,7 @@ from .online_dpo_config import OnlineDPOConfig
 
 
 @Registry.register("trainer", "online_dpo")
-class OnlineDPOTrainer(DPOTrainer):
+class OnlineDPOTrainer(AsyncRolloutMixin, DPOTrainer):
     """Online DPO trainer using eSurge generation and EasyDeL's JAX DPO loss.
 
     The trainer accepts raw prompt batches, generates two completions per prompt
