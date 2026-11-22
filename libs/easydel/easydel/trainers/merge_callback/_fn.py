@@ -91,10 +91,22 @@ def merge_pytrees(policy_tree: object, target_tree: object, config: "MergeConfig
     merge_method = get_merge_method(config.method)
     densities = tuple(float(density) for density in config.target_model_density) or (1.0,)
     for index, (policy_leaf, target_leaf) in enumerate(zip(policy_leaves, target_leaves, strict=True)):
-        if not hasattr(policy_leaf, "shape") or not hasattr(target_leaf, "shape"):
+        if (
+            isinstance(policy_leaf, jax.ShapeDtypeStruct)
+            or isinstance(target_leaf, jax.ShapeDtypeStruct)
+            or not hasattr(policy_leaf, "shape")
+            or not hasattr(target_leaf, "shape")
+            or not hasattr(policy_leaf, "dtype")
+            or not hasattr(target_leaf, "dtype")
+        ):
             continue
-        policy_arr = jnp.asarray(policy_leaf)
-        target_arr = jnp.asarray(target_leaf)
+        if not (
+            jnp.issubdtype(policy_leaf.dtype, jnp.floating)
+            and jnp.issubdtype(target_leaf.dtype, jnp.floating)
+        ):
+            continue
+        policy_arr = policy_leaf if isinstance(policy_leaf, jax.Array) else jnp.asarray(policy_leaf)
+        target_arr = target_leaf if isinstance(target_leaf, jax.Array) else jnp.asarray(target_leaf)
         if policy_arr.shape != target_arr.shape:
             continue
         ctx = MergeLeafContext(

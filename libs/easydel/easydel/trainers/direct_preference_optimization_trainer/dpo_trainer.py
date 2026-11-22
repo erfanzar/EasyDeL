@@ -144,7 +144,6 @@ class DPOTrainer(Trainer):
         self.arguments = arguments
         self.truncation_mode = arguments.truncation_mode
         self.processing_class = processing_class
-        self.is_encoder_decoder = arguments.is_encoder_decoder
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
         self._apply_pad_token_override(processing_class, arguments.pad_token)
@@ -166,13 +165,25 @@ class DPOTrainer(Trainer):
                 )
         arguments.padding_value = self.padding_value
 
+        if isinstance(model, str):
+            reject_string_model_id(model, role="policy model")
+        reference_model = self._resolve_reference_model(reference_model)
+        if not isinstance(model, EasyDeLState):
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
+
+        if arguments.is_encoder_decoder is not None:
+            self.is_encoder_decoder = arguments.is_encoder_decoder
+        else:
+            self.is_encoder_decoder = bool(getattr(getattr(model.model, "config", None), "is_encoder_decoder", False))
+            self.arguments.is_encoder_decoder = self.is_encoder_decoder
+
         self.input_data_collator_tfds = (
             DataCollatorForPreferenceTFDS(
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,
                 pad_token_id=self.padding_value,
                 label_pad_token_id=arguments.label_pad_token_id,
-                is_encoder_decoder=arguments.is_encoder_decoder,
+                is_encoder_decoder=self.is_encoder_decoder,
                 pad_to_multiple_of=arguments.pad_to_multiple_of,
             )
             if data_collator is None
@@ -184,24 +195,19 @@ class DPOTrainer(Trainer):
                 max_completion_length=arguments.max_completion_length,
                 pad_token_id=self.padding_value,
                 label_pad_token_id=arguments.label_pad_token_id,
-                is_encoder_decoder=arguments.is_encoder_decoder,
+                is_encoder_decoder=self.is_encoder_decoder,
                 pad_to_multiple_of=arguments.pad_to_multiple_of,
             )
             if data_collator is None
             else data_collator
         )
 
-        if isinstance(model, str):
-            reject_string_model_id(model, role="policy model")
-        reference_model = self._resolve_reference_model(reference_model)
-        if not isinstance(model, EasyDeLState):
-            model = model.to_state(trainable_selector=arguments.trainable_selector)
-        if reference_model is None:
+        if reference_model is None and not self._effective_reference_free():
             reference_model = copy_frozen_policy(model)
-        if not isinstance(reference_model, EasyDeLState):
-            reference_model = reference_model.to_state(trainable_selector=arguments.trainable_selector)
-
-        reference_model = drop_optimizer_state(reference_model)
+        if reference_model is not None:
+            if not isinstance(reference_model, EasyDeLState):
+                reference_model = reference_model.to_state(trainable_selector=arguments.trainable_selector)
+            reference_model = drop_optimizer_state(reference_model)
         self.reference_state: EasyDeLState | None = reference_model
         if arguments.disable_dropout:
             model, reference_model = self._disable_state_dropout(model, reference_model)
@@ -357,6 +363,54 @@ class DPOTrainer(Trainer):
         """
         return self._source_is_pretokenized(self._train_source)
 
+    def _build_partial_concatenated_forward(self) -> tp.Callable:
+        """Bind static DPO tokenization and scoring knobs onto :func:`concatenated_forward`."""
+        return partial(
+            concatenated_forward,
+            is_encoder_decoder=self.arguments.is_encoder_decoder,
+            label_pad_token_id=self.arguments.label_pad_token_id,
+            padding_value=self.padding_value,
+            max_length=self.arguments.max_length,
+            truncation_mode=self.arguments.truncation_mode,
+            aux_loss_enabled=self.arguments.aux_loss_enabled,
+            loss_type=self.arguments.loss_type,
+            logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+            use_weighting=self.arguments.use_weighting,
+            ld_alpha=self.arguments.ld_alpha,
+            return_mean_logits=False,
+        )
+
+    def _compile_concatenated_forward(
+        self,
+        *,
+        partial_forward: tp.Callable | None = None,
+        mesh: tp.Any = None,
+        empty_sharding: tp.Any = None,
+    ) -> tp.Callable:
+        """Compile the standalone DPO concatenated forward auxiliary scorer."""
+        if partial_forward is None:
+            partial_forward = self._build_partial_concatenated_forward()
+        compile_kwargs: dict[str, tp.Any] = {
+            "mesh": mesh,
+            "static_argnames": (
+                "is_encoder_decoder",
+                "label_pad_token_id",
+                "padding_value",
+                "max_length",
+                "truncation_mode",
+                "aux_loss_enabled",
+                "loss_type",
+                "logprob_vocab_chunk_size",
+                "vocab_shard_stage",
+                "use_weighting",
+                "ld_alpha",
+                "return_mean_logits",
+            ),
+        }
+        if empty_sharding is not None:
+            compile_kwargs["out_shardings"] = empty_sharding
+        return compile_trainer_auxiliary(partial_forward, **compile_kwargs)
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled DPO training/evaluation step functions.
 
@@ -384,36 +438,16 @@ class DPOTrainer(Trainer):
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
 
-        partial_concatenated_forward = partial(
-            concatenated_forward,
-            is_encoder_decoder=self.arguments.is_encoder_decoder,
-            label_pad_token_id=self.arguments.label_pad_token_id,
-            padding_value=self.padding_value,
-            max_length=self.arguments.max_length,
-            truncation_mode=self.arguments.truncation_mode,
-            aux_loss_enabled=self.arguments.aux_loss_enabled,
-            loss_type=self.arguments.loss_type,
-            logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
-            use_weighting=self.arguments.use_weighting,
-            ld_alpha=self.arguments.ld_alpha,
-        )
-
-        jited_concatenated_forward = compile_trainer_auxiliary(
-            partial_concatenated_forward,
+        partial_concatenated_forward = self._build_partial_concatenated_forward()
+        jited_concatenated_forward = self._compile_concatenated_forward(
+            partial_forward=partial_concatenated_forward,
             mesh=mesh,
-            out_shardings=(empty_sharding,),
-            static_argnames=(
-                "is_encoder_decoder",
-                "label_pad_token_id",
-                "padding_value",
-                "max_length",
-                "truncation_mode",
-                "aux_loss_enabled",
-                "loss_type",
-                "use_weighting",
-            ),
+            empty_sharding=empty_sharding,
         )
         effective_reference_free = self._effective_reference_free()
+        ref_sharding = self.reference_state.shardings if self.reference_state is not None else empty_sharding
+        eval_ref_state = self._eval_shared_fn_extra_args[0]
+        eval_ref_sharding = eval_ref_state.shardings if eval_ref_state is not None else empty_sharding
 
         self._train_shared_fn_static_args = (
             self.scheduler,
@@ -442,7 +476,7 @@ class DPOTrainer(Trainer):
             in_shardings=(
                 self.state_shardings,
                 empty_sharding,
-                self.reference_state.shardings,
+                ref_sharding,
             ),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
@@ -476,7 +510,7 @@ class DPOTrainer(Trainer):
             in_shardings=(
                 self.eval_state_shardings,
                 empty_sharding,
-                self._eval_shared_fn_extra_args[0].shardings,
+                eval_ref_sharding,
             ),
             out_shardings=empty_sharding,
             static_argnums=sharded_evaluation_static_argnums,
@@ -493,9 +527,12 @@ class DPOTrainer(Trainer):
         self.concatenated_forward = jited_concatenated_forward
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
 
-        flops_per_tkn = self.reference_state.model.flops_per_token(include_loss=True, include_backward=True)
-        self._extra_forward_flops_per_token = flops_per_tkn
-        self._extra_backward_flops_per_token = flops_per_tkn
+        if not effective_reference_free and self.reference_state is not None:
+            flops_per_tkn = self.reference_state.model.flops_per_token(include_loss=True, include_backward=False)
+            self._extra_forward_flops_per_token = flops_per_tkn
+        else:
+            self._extra_forward_flops_per_token = 0.0
+        self._extra_backward_flops_per_token = 0.0
 
         return TrainerConfigureFunctionOutput(
             sharded_training_step_function=sharded_training_step_function,
@@ -544,6 +581,15 @@ class DPOTrainer(Trainer):
         """
         return self.input_data_collator_tfds
 
+    def _needs_runtime_reference_state(self) -> bool:
+        """Return whether ``self.reference_state`` is still required at runtime."""
+        if getattr(self.arguments, "sync_ref_model", False):
+            return True
+        bema_callback = getattr(self, "bema_callback", None)
+        if bema_callback is not None and getattr(bema_callback, "update_ref_model", False):
+            return True
+        return False
+
     def configure_dataloaders(self):
         """Build train/eval dataloaders, optionally caching reference logps.
 
@@ -582,6 +628,20 @@ class DPOTrainer(Trainer):
                     is_train=False,
                     desc="Eval dataset reference log probs",
                 )
+
+        has_any_split = self.dataset_train is not None or self.dataset_eval is not None
+        train_ready = self.dataset_train is None or bool(self._precomputed_train_ref_log_probs)
+        eval_ready = self.dataset_eval is None or bool(self._precomputed_eval_ref_log_probs)
+        if (
+            self.arguments.precompute_ref_log_probs
+            and not self._needs_runtime_reference_state()
+            and has_any_split
+            and train_ready
+            and eval_ready
+            and getattr(self, "reference_state", None) is not None
+        ):
+            self.reference_state = None
+            self._eval_reference_graphdef = None
 
         return super().configure_dataloaders()
 
@@ -628,6 +688,18 @@ class DPOTrainer(Trainer):
                 f"falling back to on-the-fly reference scoring for `{dataset_attr}`."
             )
             return False
+
+        if getattr(self, "concatenated_forward", None) is None:
+            ref_state = getattr(self, "reference_state", None)
+            if ref_state is None:
+                ref_state = getattr(self, "model_state", None)
+            ref_model = getattr(ref_state, "model", None) if ref_state is not None else None
+            mesh = getattr(ref_model, "mesh", None)
+            if mesh is not None:
+                self.concatenated_forward = self._compile_concatenated_forward(
+                    mesh=mesh,
+                    empty_sharding=replicated_named_sharding(mesh),
+                )
 
         ref_chosen_logps: list[np.ndarray] = []
         ref_rejected_logps: list[np.ndarray] = []
@@ -715,7 +787,7 @@ class DPOTrainer(Trainer):
         """Use the live reference buffers with evaluation-only static metadata."""
         graphdef = getattr(self, "_eval_reference_graphdef", None)
         reference = self.reference_state
-        if graphdef is not None:
+        if graphdef is not None and reference is not None:
             reference = reference.replace(graphdef=graphdef)
         return (reference,)
 
@@ -723,15 +795,29 @@ class DPOTrainer(Trainer):
         """Apply evaluation config overrides to the reference forward as well."""
         super()._configure_eval_config_override()
         self._eval_reference_graphdef = None
-        if self._eval_graphdef is not None and self.reference_state is not None:
-            self._eval_reference_graphdef = self._build_config_override_graphdef(
-                model=self.reference_state.model,
-                overrides=self.arguments.eval_config_overrides,
-                reference_graphstate=self.reference_state.graphstate,
-                trainable_selector=None,
-                label="eval_config_overrides (reference)",
-                eval_mode=True,
-            )
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is not None and overrides and self.reference_state is not None:
+            selector = getattr(self.arguments, "trainable_selector", None)
+            try:
+                self._eval_reference_graphdef = self._build_config_override_graphdef(
+                    model=self.reference_state.model,
+                    overrides=overrides,
+                    reference_graphstate=self.reference_state.graphstate,
+                    trainable_selector=selector,
+                    label="eval_config_overrides (reference)",
+                    eval_mode=True,
+                )
+            except ValueError:
+                if selector is None:
+                    raise
+                self._eval_reference_graphdef = self._build_config_override_graphdef(
+                    model=self.reference_state.model,
+                    overrides=overrides,
+                    reference_graphstate=self.reference_state.graphstate,
+                    trainable_selector=None,
+                    label="eval_config_overrides (reference)",
+                    eval_mode=True,
+                )
 
     def _preprocess_batch_input(self, state, batch, is_train):
         """Do not use immutable cached scores for a moving reference model."""

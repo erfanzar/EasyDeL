@@ -121,12 +121,20 @@ class WindowPlanner:
             padding_gap: Gap between padding sizes (0 for exponential growth)
 
         Returns:
-            List of padding sizes
+            Strictly ascending list of padding sizes <= ``max_token_size``, ending at ``max_token_size``.
         """
+        min_token_size = int(min_token_size)
+        max_token_size = int(max_token_size)
+        padding_gap = int(padding_gap)
         if not ((min_token_size & (min_token_size - 1) == 0) and min_token_size > 0):
             logger.error(f"Invalid min_token_size={min_token_size}, must be power of 2")
             raise ValueError(f"min_token_size must be a power of 2, got {min_token_size}")
-        paddings = []
+        if max_token_size <= 0:
+            raise ValueError(f"max_token_size must be positive, got {max_token_size}")
+        if padding_gap < 0:
+            raise ValueError(f"padding_gap must be non-negative, got {padding_gap}")
+
+        paddings: list[int] = []
         num = min_token_size
 
         if padding_gap == 0:
@@ -134,14 +142,21 @@ class WindowPlanner:
                 paddings.append(num)
                 num *= 2
         else:
-            while num <= padding_gap:
+            exp_limit = min(padding_gap, max_token_size)
+            while num <= exp_limit:
                 paddings.append(num)
                 num *= 2
-            num //= 2
-            while num < max_token_size:
+            if paddings:
+                num = paddings[-1]
+            else:
+                num = min_token_size
+                if num <= max_token_size:
+                    paddings.append(num)
+            while num + padding_gap <= max_token_size:
                 num += padding_gap
                 paddings.append(num)
-        if paddings[-1] != max_token_size:
+
+        if not paddings or paddings[-1] != max_token_size:
             paddings.append(max_token_size)
         return paddings
 

@@ -141,7 +141,7 @@ class SAOConfig(OnlineActorCriticConfig):
         metadata={"help": "SAO requires exactly one rollout per prompt."},
     )
     num_generations: int | None = field(
-        default=1,
+        default=None,
         metadata={"help": "Alias for num_return_sequences; fixed to one by SAO."},
     )
     num_ppo_epochs: int = field(

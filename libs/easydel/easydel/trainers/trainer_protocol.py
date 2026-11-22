@@ -227,11 +227,11 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     _extra_forward_flops_per_token: int | float
     _extra_backward_flops_per_token: int | float
 
-    _train_shared_fn_static_args_: dict[str, tp.Any]
-    _train_shared_fn_extra_args_: tuple[tp.Any]
+    _train_shared_fn_static_args_: tuple[tp.Any, ...]
+    _train_shared_fn_extra_args_: tuple[tp.Any, ...]
 
-    _eval_shared_fn_static_args_: dict[str, tp.Any]
-    _eval_shared_fn_extra_args_: tuple[tp.Any]
+    _eval_shared_fn_static_args_: tuple[tp.Any, ...]
+    _eval_shared_fn_extra_args_: tuple[tp.Any, ...]
 
     _resumed_from_checkpoint: bool
     state_shardings: tp.Any
@@ -243,7 +243,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         arguments: TrainingArguments | None = None,
         model_state: EasyDeLState | None = None,
-        model: tp.type[EasyDeLBaseModule] | None = None,
+        model: EasyDeLBaseModule | None = None,
         dataset_train: Dataset | None = None,
         dataset_eval: Dataset | None = None,
         data_collator: tp.Callable | None = None,
@@ -611,7 +611,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _save_readme(self, checkpoint_dir):
+    def _save_readme(self, save_directory):
         """Emit a Markdown README into a checkpoint directory.
 
         Subclasses should render a human-readable model card summarising
@@ -619,7 +619,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         information useful for reproducibility.
 
         Args:
-            checkpoint_dir: Destination directory for the README file.
+            save_directory: Destination directory for the README file.
         """
         ...
 
@@ -973,8 +973,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         state: EasyDeLState,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
-        start_time: float,
-    ):
+    ) -> collections.abc.Iterator[dict]:
         """
         Execute the core evaluation loop.
 
@@ -982,10 +981,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
             state: Current model state.
             metrics_tracker: Tracker for accumulating metrics.
             step_metrics: Calculator for per-step metrics.
-            start_time: Evaluation start timestamp.
 
-        Returns:
-            tuple: (final_state, metrics) containing evaluation results.
+        Yields:
+            dict: Evaluation metrics for each evaluation step.
 
         Note:
             Runs evaluation on the entire eval dataset without updating parameters.
@@ -1056,26 +1054,26 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
         """Return extra positional args appended to the shared training step."""
         ...
 
     @property
     @abstractmethod
-    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
         """Return extra positional args appended to the shared evaluation step."""
         ...
 
     @property
     @abstractmethod
-    def _train_shared_fn_static_args(self) -> dict[str, tp.Any]:
-        """Return static (compile-time) keyword args for the shared training step."""
+    def _train_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        """Return static (compile-time) positional args for the shared training step."""
         ...
 
     @property
     @abstractmethod
-    def _eval_shared_fn_static_args(self) -> dict[str, tp.Any]:
-        """Return static (compile-time) keyword args for the shared evaluation step."""
+    def _eval_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        """Return static (compile-time) positional args for the shared evaluation step."""
         ...
 
     @abstractmethod
@@ -1243,8 +1241,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         """
         ...
 
+    @staticmethod
     @abstractmethod
-    def finish(self):
+    def finish():
         """Release trainer resources and finalize external logging backends.
 
         Closes progress bars, flushes TensorBoard writers, finishes the

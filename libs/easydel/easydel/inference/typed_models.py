@@ -54,6 +54,7 @@ from .openai_api_modules import (
     FunctionCall,
     FunctionDefinition,
     OpenAIBaseModel,
+    ResponsesToolChoice,
     ToolCall,
     ToolChoiceOption,
     ToolDefinition,
@@ -296,7 +297,7 @@ class ResponsesResponse(OpenAIBaseModel):
     temperature: float | None = None
     top_p: float | None = None
     truncation: str | None = None
-    tool_choice: str | ToolChoiceOption | None = None
+    tool_choice: str | ResponsesToolChoice | ToolChoiceOption | None = None
     tools: list[ToolDefinition | FunctionDefinition | tp.Any] = Field(default_factory=list)
     parallel_tool_calls: bool | None = None
     metadata: dict[str, tp.Any] = Field(default_factory=dict)
@@ -342,7 +343,7 @@ class ResponsesFinalizationOptions(OpenAIBaseModel):
     temperature: float | None = None
     top_p: float | None = None
     truncation: str | None = None
-    tool_choice: str | ToolChoiceOption | None = None
+    tool_choice: str | ResponsesToolChoice | ToolChoiceOption | None = None
     tools: list[ToolDefinition | FunctionDefinition | tp.Any] = Field(default_factory=list)
     parallel_tool_calls: bool | None = None
     metadata: dict[str, tp.Any] = Field(default_factory=dict)

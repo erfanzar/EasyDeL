@@ -39,6 +39,11 @@ from easydel.trainers._logprob_utils import (
     resolve_lmhead_chunksize,
 )
 
+from .._shared.policy_losses import (
+    _MAX_SAFE_LOG_RATIO,
+    _MIN_SAFE_LOG_RATIO,
+    clipped_ppo_policy_loss,
+)
 from ..training_utils import (
     make_assertions_and_get_sizes,
     minibatch_call,
@@ -279,10 +284,11 @@ def ppo_step(
         only the :class:`LossMetrics`.
     """
     scope_root = "easydel/trainer/ppo/" + ("train_step" if is_training else "eval_step")
+    effective_accum_steps = max(int(gradient_accumulation_steps), 1) if is_training else 1
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=effective_accum_steps,
             batch_partition_spec=partition_spec,
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
@@ -311,11 +317,12 @@ def ppo_step(
             input_ids = minibatch["input_ids"]
             attention_mask = minibatch["attention_mask"]
             completion_mask = minibatch["completion_mask"].astype(jnp.float32)
+            mask_bool = completion_mask > 0.0
 
-            old_logps = minibatch["old_logps"]
-            old_values = minibatch["old_values"]
-            advantages = jax.lax.stop_gradient(minibatch["advantages"])
-            returns = jax.lax.stop_gradient(minibatch["returns"])
+            old_logps = jax.lax.stop_gradient(minibatch["old_logps"].astype(jnp.float32))
+            old_values = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["old_values"].astype(jnp.float32), 0.0))
+            advantages = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["advantages"].astype(jnp.float32), 0.0))
+            returns = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["returns"].astype(jnp.float32), 0.0))
 
             with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
                 new_logps, new_values, entropies = get_per_token_logps_values_entropies(
@@ -327,26 +334,35 @@ def ppo_step(
                 )
 
             with jax.named_scope(scope_root + "/loss_fn/policy_loss"):
-                log_ratio = new_logps - old_logps
-                ratio = jnp.exp(log_ratio)
-
-                pg_losses = -advantages * ratio
-                pg_losses2 = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
-                pg_loss = _masked_mean(jnp.maximum(pg_losses, pg_losses2), completion_mask)
+                safe_log_ratio = jnp.where(mask_bool, (new_logps - old_logps).astype(jnp.float32), 0.0)
+                safe_ratio = jnp.where(
+                    mask_bool,
+                    jnp.exp(jnp.clip(safe_log_ratio, _MIN_SAFE_LOG_RATIO, _MAX_SAFE_LOG_RATIO)),
+                    0.0,
+                )
+                pg_loss, pg_clipfrac = clipped_ppo_policy_loss(
+                    new_logps,
+                    old_logps,
+                    advantages,
+                    completion_mask,
+                    cliprange=cliprange,
+                    normalizer=None,
+                    return_clip_fraction=True,
+                )
 
             with jax.named_scope(scope_root + "/loss_fn/value_loss"):
-                values_clipped = old_values + jnp.clip(new_values - old_values, -cliprange_value, cliprange_value)
-                vf_losses1 = jnp.square(new_values - returns)
+                safe_new_values = jnp.where(mask_bool, new_values.astype(jnp.float32), 0.0)
+                values_clipped = old_values + jnp.clip(safe_new_values - old_values, -cliprange_value, cliprange_value)
+                vf_losses1 = jnp.square(safe_new_values - returns)
                 vf_losses2 = jnp.square(values_clipped - returns)
                 vf_loss = 0.5 * _masked_mean(jnp.maximum(vf_losses1, vf_losses2), completion_mask)
 
             with jax.named_scope(scope_root + "/loss_fn/entropy_and_combine"):
-                entropy = _masked_mean(entropies, completion_mask)
+                entropy = _masked_mean(jnp.where(mask_bool, entropies.astype(jnp.float32), 0.0), completion_mask)
                 loss = pg_loss + vf_coef * vf_loss - entropy_coef * entropy
 
             with jax.named_scope(scope_root + "/loss_fn/diagnostics"):
-                approx_kl = 0.5 * _masked_mean(jnp.square(log_ratio), completion_mask)
-                pg_clipfrac = _masked_mean(((pg_losses2 > pg_losses).astype(jnp.float32)), completion_mask)
+                approx_kl = 0.5 * _masked_mean(jnp.square(safe_log_ratio), completion_mask)
                 vf_clipfrac = _masked_mean(((vf_losses2 > vf_losses1).astype(jnp.float32)), completion_mask)
 
                 other_metrics: dict[str, jax.Array] = {
@@ -356,7 +372,7 @@ def ppo_step(
                     "approx_kl": approx_kl,
                     "pg_clipfrac": pg_clipfrac,
                     "vf_clipfrac": vf_clipfrac,
-                    "ratio_mean": _masked_mean(ratio, completion_mask),
+                    "ratio_mean": _masked_mean(safe_ratio, completion_mask),
                     "advantages_mean": _masked_mean(advantages, completion_mask),
                     "returns_mean": _masked_mean(returns, completion_mask),
                 }

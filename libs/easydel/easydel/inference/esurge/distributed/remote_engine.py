@@ -43,6 +43,7 @@ a router in front (``RoutedEngine``) simply stops picking this handle.
 from __future__ import annotations
 
 import copy
+import itertools
 import queue
 import threading
 import time
@@ -57,13 +58,16 @@ from ..engine.admission import RequestAdmission
 from ..engine.output_pipeline import OutputPipeline
 from ..engine.registry import RequestRegistry
 from ..logger import logger
+from ..metrics import get_metrics_collector
 from . import wire
+from .coordinator import format_tcp_endpoint
 from .request_plane import OriginRequestPlane, RequestPlaneError, RequestPlaneUnavailable
 
 if typing.TYPE_CHECKING:
     from ..esurge_engine import RequestOutput
 
 _POLL_MS = 50
+_CLIENT_WAKE_IDS = itertools.count()
 
 #: Inbound frames handled per IO round before outbound traffic and heartbeats get a turn again.
 _MAX_FRAMES_PER_ROUND = 256
@@ -153,7 +157,7 @@ class _ClientChannel:
         heartbeat_timeout_s: float = 10.0,
         on_dead: typing.Callable[[str], None],
     ) -> None:
-        self._endpoint = f"tcp://{leader_addr}:{int(control_port)}"
+        self._endpoint = format_tcp_endpoint(leader_addr, int(control_port))
         self._auth_token = str(auth_token)
         self.client_id = str(client_id)
         self._connect_timeout_s = float(connect_timeout_s)
@@ -168,7 +172,7 @@ class _ClientChannel:
         self._sock = None
         self._ctx = None
         self._outbox: queue.Queue = queue.Queue()
-        self._wake_endpoint = f"inproc://esurge-client-wake-{id(self)}"
+        self._wake_endpoint = f"inproc://esurge-client-wake-{next(_CLIENT_WAKE_IDS)}"
         self._wake_push = None
         self._wake_lock = threading.Lock()
         self._stop = threading.Event()
@@ -207,40 +211,69 @@ class _ClientChannel:
             return
         self._ctx = zmq.Context.instance()
         sock = self._ctx.socket(zmq.DEALER)
-        sock.setsockopt(zmq.IDENTITY, self.client_id.encode())
-        sock.setsockopt(zmq.LINGER, 500)
-        sock.connect(self._endpoint)
-        sock.send_multipart(
-            [
-                wire.encode_message(
-                    wire.Hello(
-                        rank=_CLIENT_RANK,
-                        world_size=0,
-                        config_fingerprint="",
-                        auth=self._auth_token,
-                        role=wire.ROLE_CLIENT,
-                        client_id=self.client_id,
+        try:
+            sock.setsockopt(zmq.IDENTITY, self.client_id.encode())
+            sock.setsockopt(zmq.LINGER, 500)
+            sock.setsockopt(zmq.SNDHWM, 0)
+            sock.setsockopt(zmq.RCVHWM, 0)
+            try:
+                sock.setsockopt(zmq.IPV6, 1)
+            except zmq.ZMQError:
+                pass
+            sock.connect(self._endpoint)
+            sock.send_multipart(
+                [
+                    wire.encode_message(
+                        wire.Hello(
+                            rank=_CLIENT_RANK,
+                            world_size=0,
+                            config_fingerprint="",
+                            auth=self._auth_token,
+                            role=wire.ROLE_CLIENT,
+                            client_id=self.client_id,
+                        )
                     )
-                )
-            ]
-        )
-        if not sock.poll(int(self._connect_timeout_s * 1000)):
-            sock.close(linger=0)
-            raise RequestPlaneUnavailable(
-                f"no HelloOk from engine owner at {self._endpoint} within {self._connect_timeout_s}s"
+                ]
             )
-        message = wire.decode_message(sock.recv_multipart()[0])
-        if not isinstance(message, wire.HelloOk):
-            sock.close(linger=0)
-            raise RequestPlaneError(f"unexpected handshake reply {type(message).__name__}")
-        self.engine_spec = message.engine_spec
-        self._sock = sock
-        self._io_thread = threading.Thread(target=self._io_loop, name="eSurgeRemoteEngineIO", daemon=True)
-        self._io_thread.start()
+            if not sock.poll(int(self._connect_timeout_s * 1000)):
+                raise RequestPlaneUnavailable(
+                    f"no HelloOk from engine owner at {self._endpoint} within {self._connect_timeout_s}s"
+                )
+            frames = sock.recv_multipart()
+            if not frames:
+                raise RequestPlaneError(f"empty handshake reply from {self._endpoint}")
+            try:
+                message = wire.decode_message(frames[0])
+            except Exception as exc:
+                raise RequestPlaneError(f"undecodable handshake reply from {self._endpoint}: {exc}") from exc
+            if not isinstance(message, wire.HelloOk):
+                raise RequestPlaneError(f"unexpected handshake reply {type(message).__name__}")
+            self.engine_spec = message.engine_spec
+            thread = threading.Thread(target=self._io_loop, args=(sock,), name="eSurgeRemoteEngineIO", daemon=True)
+            self._sock = sock
+            self._io_thread = thread
+            started = False
+            try:
+                thread.start()
+                started = True
+            finally:
+                if not started:
+                    self._io_thread = None
+                    self._sock = None
+        except BaseException:
+            if self._sock is None:
+                sock.close(linger=0)
+            raise
 
     def close(self) -> None:
         """Stop the IO thread and close the socket."""
         self._stop.set()
+        with self._wake_lock:
+            if self._wake_push is not None:
+                try:
+                    self._wake_push.send(b"", flags=1)  # zmq.DONTWAIT
+                except Exception:
+                    pass
         thread = self._io_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=5.0)
@@ -257,21 +290,25 @@ class _ClientChannel:
         except Exception:
             logger.exception("Remote engine handle: on_dead callback failed")
 
-    def _io_loop(self) -> None:
+    def _io_loop(self, sock=None) -> None:
         import zmq
 
-        sock = self._sock
-        wake_pull = self._ctx.socket(zmq.PULL)
-        wake_pull.bind(self._wake_endpoint)
-        with self._wake_lock:
-            self._wake_push = self._ctx.socket(zmq.PUSH)
-            self._wake_push.connect(self._wake_endpoint)
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-        poller.register(wake_pull, zmq.POLLIN)
-        last_owner_beat = time.monotonic()
-        last_beat_sent = 0.0
+        if sock is None:
+            sock = self._sock
+        wake_pull = None
+        wake_push = None
         try:
+            wake_pull = self._ctx.socket(zmq.PULL)
+            wake_pull.bind(self._wake_endpoint)
+            wake_push = self._ctx.socket(zmq.PUSH)
+            wake_push.connect(self._wake_endpoint)
+            with self._wake_lock:
+                self._wake_push = wake_push
+            poller = zmq.Poller()
+            poller.register(sock, zmq.POLLIN)
+            poller.register(wake_pull, zmq.POLLIN)
+            last_owner_beat = time.monotonic()
+            last_beat_sent = 0.0
             while not self._stop.is_set():
                 try:
                     while True:
@@ -306,13 +343,24 @@ class _ClientChannel:
                     return
         finally:
             with self._wake_lock:
-                if self._wake_push is not None:
-                    self._wake_push.close(linger=0)
+                if self._wake_push is wake_push:
                     self._wake_push = None
-            wake_pull.close(linger=0)
+            if wake_push is not None:
+                try:
+                    wake_push.close(linger=0)
+                except Exception:
+                    pass
+            if wake_pull is not None:
+                try:
+                    wake_pull.close(linger=0)
+                except Exception:
+                    pass
 
     def _handle_inbound(self, frames: list[bytes]) -> bool:
         """Dispatch one inbound frame set; returns ``True`` when the link is over (owner shut down)."""
+        if not frames:
+            logger.warning("Remote engine handle: dropping empty frame set")
+            return False
         try:
             message = wire.decode_message(frames[0])
         except Exception:
@@ -380,6 +428,19 @@ class RemoteEngineHandle:
         reasoning_parser: str | None = None,
         model_type: str | None = None,
     ) -> None:
+        # Pre-initialize attributes touched by _on_owner_dead and cleanup before
+        # starting the channel IO thread, so an early owner death never raises AttributeError.
+        self._spec: wire.EngineSpec | None = None
+        self._registry: RequestRegistry | None = None
+        self._worker_manager: WorkerManager | None = None
+        self._tokenizer_client = None
+        self._detokenizer_client = None
+        self.tokenizer = None
+        self._plane: OriginRequestPlane | None = None
+        self._output_pipeline: OutputPipeline | None = None
+        self._admission: RequestAdmission | None = None
+        self._fatal: tuple[BaseException, str] | None = None
+
         self._channel = _ClientChannel(
             leader_addr=leader_addr,
             control_port=control_port,
@@ -389,20 +450,22 @@ class RemoteEngineHandle:
             heartbeat_timeout_s=heartbeat_timeout_s,
             on_dead=self._on_owner_dead,
         )
-        self._channel.start()
-        spec = self._channel.engine_spec
-        if spec is None or (not spec.tokenizer_source and not tokenizer_source):
-            self._channel.close()
-            raise RequestPlaneError(
-                "engine owner returned no usable EngineSpec (missing tokenizer source); cannot bootstrap a remote handle"
-            )
-        self._spec = spec
-
-        # Bootstrap failures after a successful handshake (bad tokenizer id,
-        # worker spawn trouble) are permanent — close the transport and
-        # re-raise as a plane error so callers don't retry them as
-        # not-ready-yet.
+        source_label = tokenizer_source
+        # Bootstrap failures (including channel start interruption, bad tokenizer id,
+        # worker spawn trouble, pipeline/parser/admission init errors, or owner
+        # death mid-bootstrap) close every acquired resource; RequestPlaneUnavailable
+        # and other RequestPlaneErrors propagate unchanged so callers can retry
+        # unavailable endpoints without masking permanent failures.
         try:
+            self._channel.start()
+            spec = self._channel.engine_spec
+            source_label = tokenizer_source or (spec.tokenizer_source if spec is not None else None)
+            if spec is None or (not spec.tokenizer_source and not tokenizer_source):
+                raise RequestPlaneError(
+                    "engine owner returned no usable EngineSpec (missing tokenizer source); "
+                    "cannot bootstrap a remote handle"
+                )
+            self._spec = spec
             self._registry = RequestRegistry()
             self._worker_manager = WorkerManager(tokenizer_source or spec.tokenizer_source)
             self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
@@ -412,79 +475,136 @@ class RemoteEngineHandle:
             from transformers import AutoTokenizer
 
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source or spec.tokenizer_source)
-        except Exception as exc:
-            self._channel.close()
-            manager = getattr(self, "_worker_manager", None)
-            if manager is not None:
-                try:
-                    manager.shutdown()
-                except Exception:
-                    pass
+            self._plane = OriginRequestPlane(
+                coordinator=self._channel,
+                submit_outputs=self._submit_outputs,
+                alive=lambda: self._channel.alive,
+                rank=_CLIENT_RANK,
+                admit_timeout_s=admit_timeout_s,
+                info=logger.debug,
+            )
+            self._output_pipeline = OutputPipeline(
+                registry=self._registry,
+                detokenizer_client=self._detokenizer_client,
+                eos_token_ids=list(spec.eos_token_ids),
+                decode_interval_tokens=decode_interval_tokens,
+                decode_interval_secs=decode_interval_secs,
+                on_stop_strings=self._on_stop_strings,
+                on_activity=lambda: None,
+                on_fatal=self._on_pipeline_fatal,
+            )
+            self._output_pipeline.start()
+            # The handle renders outputs itself, so it runs the tool/reasoning parsers the owner engine would.
+            self.tool_parser, tool_parser_class, self.reasoning_parser_name, reasoning_parser_class = (
+                resolve_handle_parsers(
+                    tokenizer=self.tokenizer,
+                    tool_parser=tool_parser,
+                    reasoning_parser=reasoning_parser,
+                    model_type=model_type,
+                )
+            )
+            self._admission = RequestAdmission(
+                registry=self._registry,
+                scheduler_submit=self._plane.submit_remote,
+                tokenizer_client=self._tokenizer_client,
+                tokenizer=self.tokenizer,
+                context_config=eSurgeContextConfig.coerce_config(None),
+                reserve_tokens=int(spec.reserve_tokens),
+                max_model_len=int(spec.max_model_len),
+                tool_parser_class=tool_parser_class,
+                reasoning_parser_class=reasoning_parser_class,
+                sampling_params_callback=lambda: None,
+                generation_config_dict=None,
+                primary_eos_token_id=(int(spec.eos_token_ids[0]) if spec.eos_token_ids else None),
+                eos_token_ids=list(spec.eos_token_ids),
+                extra_stops=[],
+                ignore_stop_strings_in_reasoning=False,
+                on_activity=lambda: None,
+                info=logger.debug,
+                # Tag requests with the served engine name: ``/metrics`` summarizes the collector per engine name, so
+                # untagged requests never show up in it.
+                model_name=spec.esurge_name,
+            )
+            if not self._channel.alive:
+                raise RequestPlaneError(
+                    f"engine owner died during remote handle bootstrap: {self._channel.dead_reason or 'link closed'}"
+                )
+        except BaseException as exc:
+            self._cleanup_resources()
+            if isinstance(exc, RequestPlaneError) or not isinstance(exc, Exception):
+                raise
             raise RequestPlaneError(
-                f"remote handle bootstrap failed (tokenizer source "
-                f"{(tokenizer_source or spec.tokenizer_source)!r}): {exc}"
+                f"remote handle bootstrap failed (tokenizer source {source_label!r}): {exc}"
             ) from exc
 
-        self._plane = OriginRequestPlane(
-            coordinator=self._channel,
-            submit_outputs=self._submit_outputs,
-            alive=lambda: self._channel.alive,
-            rank=_CLIENT_RANK,
-            admit_timeout_s=admit_timeout_s,
-            info=logger.debug,
-        )
-        self._output_pipeline = OutputPipeline(
-            registry=self._registry,
-            detokenizer_client=self._detokenizer_client,
-            eos_token_ids=list(spec.eos_token_ids),
-            decode_interval_tokens=decode_interval_tokens,
-            decode_interval_secs=decode_interval_secs,
-            on_stop_strings=self._on_stop_strings,
-            on_activity=lambda: None,
-            on_fatal=self._on_pipeline_fatal,
-        )
-        self._output_pipeline.start()
-        # The handle renders outputs itself, so it runs the tool/reasoning parsers the owner engine would.
-        self.tool_parser, tool_parser_class, self.reasoning_parser_name, reasoning_parser_class = resolve_handle_parsers(
-            tokenizer=self.tokenizer, tool_parser=tool_parser, reasoning_parser=reasoning_parser, model_type=model_type
-        )
-        self._admission = RequestAdmission(
-            registry=self._registry,
-            scheduler_submit=self._plane.submit_remote,
-            tokenizer_client=self._tokenizer_client,
-            tokenizer=self.tokenizer,
-            context_config=eSurgeContextConfig.coerce_config(None),
-            reserve_tokens=int(spec.reserve_tokens),
-            max_model_len=int(spec.max_model_len),
-            tool_parser_class=tool_parser_class,
-            reasoning_parser_class=reasoning_parser_class,
-            sampling_params_callback=lambda: None,
-            generation_config_dict=None,
-            primary_eos_token_id=(int(spec.eos_token_ids[0]) if spec.eos_token_ids else None),
-            eos_token_ids=list(spec.eos_token_ids),
-            extra_stops=[],
-            ignore_stop_strings_in_reasoning=False,
-            on_activity=lambda: None,
-            info=logger.debug,
-            # Tag requests with the served engine name: ``/metrics`` summarizes the collector per engine name, so
-            # untagged requests never show up in it.
-            model_name=spec.esurge_name,
-        )
-        self._fatal: tuple[BaseException, str] | None = None
+    def _cleanup_resources(self) -> None:
+        """Best-effort teardown of any resources initialized so far."""
+        channel = getattr(self, "_channel", None)
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                logger.debug("Remote engine handle channel close failed", exc_info=True)
+        pipeline = getattr(self, "_output_pipeline", None)
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except Exception:
+                logger.debug("Remote engine handle pipeline stop failed", exc_info=True)
+        registry = getattr(self, "_registry", None)
+        if registry is not None:
+            aborted_parent_ids: list[str] = []
+            try:
+                with registry.request_lock, registry.output_lock:
+                    for parent_id, output in registry.outputs.items():
+                        if output.finished:
+                            continue
+                        output.finished = True
+                        aborted_parent_ids.append(parent_id)
+                        for completion in output.outputs:
+                            if completion.finish_reason is None:
+                                completion.finish_reason = "abort"
+                    registry.records.clear()
+            except Exception:
+                logger.debug("Remote engine handle registry cleanup failed", exc_info=True)
+            if aborted_parent_ids:
+                metrics_collector = get_metrics_collector()
+                if metrics_collector is not None:
+                    for parent_id in aborted_parent_ids:
+                        metrics_collector.complete_request(parent_id, finish_reason="abort")
+        manager = getattr(self, "_worker_manager", None)
+        if manager is not None:
+            try:
+                manager.shutdown()
+            except Exception:
+                logger.debug("Remote engine handle worker shutdown failed", exc_info=True)
 
     def _on_owner_dead(self, reason: str) -> None:
-        self._plane.fail_pending(reason)
-        with self._registry.request_lock, self._registry.output_lock:
-            for output in self._registry.outputs.values():
-                if output.finished:
-                    continue
-                output.finished = True
-                for completion in output.outputs:
-                    if completion.finish_reason is None:
-                        completion.finish_reason = "abort"
-            self._registry.records.clear()
-        self._registry.signal_all()
-        logger.error("Remote engine handle %s lost its owner: %s", self._channel.client_id, reason)
+        plane = getattr(self, "_plane", None)
+        if plane is not None:
+            plane.fail_pending(reason)
+        registry = getattr(self, "_registry", None)
+        aborted_parent_ids: list[str] = []
+        if registry is not None:
+            with registry.request_lock, registry.output_lock:
+                for parent_id, output in registry.outputs.items():
+                    if output.finished:
+                        continue
+                    output.finished = True
+                    aborted_parent_ids.append(parent_id)
+                    for completion in output.outputs:
+                        if completion.finish_reason is None:
+                            completion.finish_reason = "abort"
+                registry.records.clear()
+            registry.signal_all()
+        if aborted_parent_ids:
+            metrics_collector = get_metrics_collector()
+            if metrics_collector is not None:
+                for parent_id in aborted_parent_ids:
+                    metrics_collector.complete_request(parent_id, finish_reason="abort")
+        channel = getattr(self, "_channel", None)
+        client_id = getattr(channel, "client_id", "<uninitialized>") if channel is not None else "<uninitialized>"
+        logger.error("Remote engine handle %s lost its owner: %s", client_id, reason)
 
     def _on_pipeline_fatal(self, exc: BaseException, tb: str) -> None:
         self._fatal = (exc, tb)
@@ -587,34 +707,62 @@ class RemoteEngineHandle:
                 raise ValueError("Length of request_id list must match number of prompts.")
 
         base_params = sampling_params or SamplingParams(max_tokens=128)
-        for prompt, rid in zip(prompts, request_ids, strict=True):
-            params = self._admission.prepare_sampling_params_for_request(base_params, request_id=rid, prompt=prompt)
-            extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
-            self._admission.add_request(rid, prompt, params, **extra)
-
+        admitted_ids: list[str] = []
         outputs: dict[str, RequestOutput] = {}
         try:
+            for prompt, rid in zip(prompts, request_ids, strict=True):
+                params = self._admission.prepare_sampling_params_for_request(base_params, request_id=rid, prompt=prompt)
+                extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
+                admitted_ids.append(rid)
+                self._admission.add_request(rid, prompt, params, **extra)
+
             for rid in request_ids:
                 # Wait on this request's own event: a shared wakeup would rouse every waiting caller on every
                 # token update of any request, which at hundreds in flight costs the front a core by itself.
                 while True:
+                    self._raise_if_unusable()
                     with self._registry.output_lock:
                         output = self._registry.outputs.get(rid)
-                        if output is not None and output.finished:
-                            outputs[rid] = output
-                            break
-                    self._raise_if_unusable()
+                        finished = output is not None and output.finished
+                    if finished:
+                        # Re-check liveness after observing finished: _on_owner_dead marks in-flight outputs
+                        # finished with finish_reason="abort", which must surface as RequestPlaneError.
+                        self._raise_if_unusable()
+                        outputs[rid] = output
+                        break
                     self._registry.wait_request(rid, timeout=0.5)
         finally:
-            self._forget(request_ids)
+            unfinished_ids: list[str] = []
+            with self._registry.output_lock:
+                for rid in admitted_ids:
+                    output = self._registry.outputs.get(rid)
+                    if output is not None and not output.finished:
+                        unfinished_ids.append(rid)
+            for rid in unfinished_ids:
+                try:
+                    self.abort_request(rid)
+                except Exception:
+                    logger.debug("Failed to abort unfinished remote request %s", rid, exc_info=True)
+            self._forget(admitted_ids)
         return [outputs[rid] for rid in request_ids]
 
     def _forget(self, request_ids: typing.Iterable[str]) -> None:
         """Drop a caller's finished (or abandoned) requests from the handle: nothing else ever reads them again."""
         with self._registry.request_lock, self._registry.output_lock:
             for rid in request_ids:
+                output = self._registry.outputs.pop(rid, None)
                 self._registry.events.pop(rid, None)
-                self._registry.outputs.pop(rid, None)
+                if output is not None:
+                    for completion in output.outputs:
+                        self._registry.events.pop(f"{rid}-{completion.index}", None)
+                else:
+                    # Clean up any child event or partial record entries left by a failed admission.
+                    prefix = f"{rid}-"
+                    for key in [k for k in self._registry.events if k.startswith(prefix) and k[len(prefix) :].isdigit()]:
+                        self._registry.events.pop(key, None)
+                    self._registry.records.pop(rid, None)
+                    for key in [k for k in self._registry.records if k.startswith(prefix) and k[len(prefix) :].isdigit()]:
+                        self._registry.records.pop(key, None)
 
     def stream(
         self,
@@ -641,19 +789,24 @@ class RemoteEngineHandle:
         from ..esurge_engine import CompletionOutput, RequestOutput
 
         self._raise_if_unusable()
-        prompt = prompts[0] if isinstance(prompts, list) else prompts
+        if isinstance(prompts, list):
+            if len(prompts) == 0:
+                raise ValueError("Empty prompt list provided")
+            prompt = prompts[0]
+        else:
+            prompt = prompts
         rid = request_id or self._admission.generate_request_id()
         params = self._admission.prepare_sampling_params_for_request(
             sampling_params or SamplingParams(max_tokens=128), request_id=rid, prompt=prompt
         )
         extra = {} if tool_parser_request is None else {"tool_parser_request": tool_parser_request}
-        self._admission.add_request(rid, prompt, params, **extra)
 
         last_update_seq = -1
         last_accumulated_text = ""
         last_raw_accumulated_text = ""
         last_accumulated_reasoning = ""
         try:
+            self._admission.add_request(rid, prompt, params, **extra)
             while True:
                 self._registry.wait_request(rid, timeout=0.5)
                 self._raise_if_unusable()
@@ -776,7 +929,6 @@ class RemoteEngineHandle:
         params = clone_sampling_params(sampling_params or SamplingParams(max_tokens=128))
         if tools:
             params.skip_special_tokens = False
-            params.logit_bias = None
         else:
             params.skip_special_tokens = True
         prompt = format_chat_prompt(
@@ -864,6 +1016,7 @@ class RemoteEngineHandle:
     def abort_request(self, request_id: str) -> None:
         """Cancel a request: notify the owner, render the abort locally."""
         self._plane.notify_abort(request_id)
+        completed_parent_id: str | None = None
         with self._registry.request_lock, self._registry.output_lock:
             record = self._registry.records.get(request_id)
             parent_id = (record.parent_request_id or request_id) if record is not None else request_id
@@ -888,8 +1041,14 @@ class RemoteEngineHandle:
                         completion.finish_reason = "abort"
                         changed = True
                 output.finished = all(completion.finish_reason is not None for completion in output.outputs)
+                if output.finished:
+                    completed_parent_id = parent_id
                 if changed:
                     output.update_seq += 1
+        if completed_parent_id is not None:
+            metrics_collector = get_metrics_collector()
+            if metrics_collector is not None:
+                metrics_collector.complete_request(completed_parent_id, finish_reason="abort")
         for rid in child_ids:
             try:
                 self._detokenizer_client.reset(rid)
@@ -899,9 +1058,4 @@ class RemoteEngineHandle:
 
     def close(self) -> None:
         """Tear down the transport, pipeline, and tokenizer workers."""
-        self._channel.close()
-        self._output_pipeline.stop()
-        try:
-            self._worker_manager.shutdown()
-        except Exception:
-            logger.debug("Remote engine handle worker shutdown failed", exc_info=True)
+        self._cleanup_resources()

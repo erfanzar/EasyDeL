@@ -74,7 +74,11 @@ class _ReplayBuffer:
 
         If the requested count exceeds the number of stored groups, sampling is
         performed with replacement. Non-finite, all-zero, or negative-only score
-        sets fall back to NumPy's uniform sampling behavior.
+        sets fall back to NumPy's uniform sampling behavior. When sampling
+        without replacement and fewer than ``num_samples`` entries have strictly
+        positive probability, all positive-score entries are selected and the
+        remaining slots are drawn uniformly without replacement from the
+        zero-score entries rather than failing ``rng.choice``.
         """
         if not self._heap or num_samples <= 0:
             return []
@@ -84,5 +88,14 @@ class _ReplayBuffer:
         else:
             probabilities = scores / scores.sum()
         replace = num_samples > len(self._heap)
+        if probabilities is not None and not replace:
+            nonzero_indices = np.flatnonzero(probabilities > 0.0)
+            if len(nonzero_indices) < num_samples:
+                zero_indices = np.flatnonzero(probabilities <= 0.0)
+                needed = num_samples - len(nonzero_indices)
+                extra = self._rng.choice(zero_indices, size=needed, replace=False)
+                indices = np.concatenate([nonzero_indices, np.atleast_1d(extra)])
+                self._rng.shuffle(indices)
+                return [self._heap[int(index)][2] for index in indices]
         indices = self._rng.choice(len(self._heap), size=num_samples, replace=replace, p=probabilities)
         return [self._heap[int(index)][2] for index in np.atleast_1d(indices)]

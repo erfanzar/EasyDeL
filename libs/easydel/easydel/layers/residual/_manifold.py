@@ -60,10 +60,14 @@ class HyperStreamSharding(common_types.DynamicShardingAxes):
     mode: tp.ClassVar = 1
 
 
-def _stream_layout(mesh_source: object | None, shape: tuple[int, ...]):
-    """Resolve the current mesh and optional logical stream layout dynamically."""
-    mesh = getattr(mesh_source, "mesh", mesh_source)
-    mesh = getattr(mesh, "jax_mesh", mesh)
+def _stream_layout(mesh_source: object | None, shape: tuple[int, ...], *, arr: Array | None = None):
+    """Resolve the current stage-local mesh and optional logical stream layout dynamically."""
+    raw_mesh = getattr(mesh_source, "mesh", mesh_source)
+    if raw_mesh is None:
+        return None, None
+    mesh = spx.get_current_stage_mesh(raw_mesh, arr=arr, raise_error=False)
+    if mesh is None:
+        mesh = getattr(raw_mesh, "jax_mesh", raw_mesh)
     resolver = getattr(mesh_source, "runtime_sharding_resolver", None)
     if mesh is None or resolver is None:
         return mesh, None
@@ -317,7 +321,7 @@ class ManifoldHyperConnection(spx.Module):
         if hidden_streams.ndim != 4:
             return None
         batch, seq, hc, width = hidden_streams.shape
-        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
         manual = None
         if jax_mesh is not None and getattr(jax_mesh, "size", 1) > 1:
             manual = Ps(*(tuple(stream_spec or ()) + (None,) * (4 - len(stream_spec or ()))))
@@ -434,7 +438,7 @@ class ManifoldHyperConnection(spx.Module):
         if hidden_streams.ndim != 4:
             return None
         batch, seq, hc, width = hidden_streams.shape
-        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
         if jax_mesh is None or getattr(jax_mesh, "size", 1) <= 1:
             return (None, None, ()) if mhc_prefill_supports(batch * seq, hc, width) else None
         manual = Ps(*(tuple(stream_spec or ()) + (None,) * (4 - len(stream_spec or ()))))
@@ -550,7 +554,7 @@ class ManifoldHyperConnection(spx.Module):
 
     def _fused_specs(self, hidden_streams: Array):
         """``(jax_mesh, stream_spec)`` when the streams must run under ``shard_map``, else ``(None, None)``."""
-        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
         if jax_mesh is None or getattr(jax_mesh, "size", 1) <= 1:
             return None, None
         if stream_spec is None:
@@ -582,10 +586,33 @@ class ManifoldHyperConnection(spx.Module):
             **kwargs,
         )
 
+    def fused_post_write_gate(
+        self,
+        hidden_streams: Float[Array, "batch seq hc hidden"],
+        post: Float[Array, "batch seq hc"],
+        comb: Float[Array, "batch seq hc hc"] | None,
+    ) -> Float[Array, "batch seq hc"] | None:
+        """Return ``post`` cast to stream dtype when a sublayer may fuse ``post * output``, else ``None``.
+
+        Sublayers such as :meth:`~easydel.layers.BaseMoeModule.moe_call` can fold the write expansion
+        ``post * output`` into their chunked custom-VJP backward so outer layer remat does not replay the
+        sublayer forward solely to recover ``output`` for ``d_post``. Returns ``None`` when ``comb`` is a
+        fused decode/prefill gate table, when this connection uses the Pallas mHC kernel, or on an MPMD
+        pipeline mesh (``pp > 1``).
+        """
+        if comb is None or self.fused_kernel == "pallas":
+            return None
+        from easydel.infra.sharding import is_mpmd_mesh
+
+        raw_mesh = getattr(self.mesh_source, "mesh", self.mesh_source)
+        if is_mpmd_mesh(raw_mesh):
+            return None
+        return post.astype(hidden_streams.dtype)
+
     def residual_write(
         self,
         hidden_streams: Float[Array, "batch seq hc hidden"],
-        sublayer_output: Float[Array, "batch seq hidden"],
+        sublayer_output: Float[Array, "batch seq hidden"] | Float[Array, "batch seq hc hidden"],
         post: Float[Array, "batch seq hc"],
         comb: Float[Array, "batch seq hc hc"],
     ) -> Float[Array, "batch seq hc hidden"]:
@@ -593,10 +620,12 @@ class ManifoldHyperConnection(spx.Module):
 
         With ``fused_kernel="none"`` this is exactly :func:`manifold_residual_write` at this module's
         ``precision``; with ``"pallas"`` it runs ejkernel ``mhc_expand`` (Pallas TPU), sharded like the streams.
+        When a sublayer has already fused ``post * output`` and returns a 4-D ``[B, S, hc, D]`` contribution,
+        this adds ``comb.T @ hidden_streams`` without re-applying ``post``.
 
         Args:
             hidden_streams: Original residual streams ``[B, S, hc, D]``.
-            sublayer_output: Sub-layer result ``[B, S, D]``.
+            sublayer_output: Sub-layer result ``[B, S, D]`` or pre-expanded ``post * output`` ``[B, S, hc, D]``.
             post: Write gates ``[B, S, hc]``.
             comb: Stream mixer ``[B, S, hc, hc]``, indexed ``[source, target]``.
 
@@ -609,7 +638,7 @@ class ManifoldHyperConnection(spx.Module):
         if comb is None:
             # ``post`` is the gate table of the APPROXIMATE decode read (see :meth:`_decode_read`).
             return self._decode_write(hidden_streams, sublayer_output, post)
-        if self.fused_kernel != "pallas":
+        if self.fused_kernel != "pallas" or sublayer_output.ndim == hidden_streams.ndim:
             return manifold_residual_write(hidden_streams, sublayer_output, post, comb, precision=self.precision)
         jax_mesh, spec = self._fused_specs(hidden_streams)
         if jax_mesh is None:
@@ -642,7 +671,7 @@ class ManifoldHyperConnection(spx.Module):
         hc = self.hc_mult
         eps = self.hc_eps
         batch, seq = hidden_streams.shape[:2]
-        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
         mix_logits = _project_streams(
             hidden_streams, self.fn.value, self.rms_norm_eps, self.precision, jax_mesh, stream_spec
         )
@@ -665,7 +694,7 @@ class ManifoldHyperConnection(spx.Module):
                     mesh=jax_mesh,
                     in_specs=(token_spec, Ps(), Ps()),
                     out_specs=(token_spec, token_spec, matrix_spec),
-                    check_vma=True,
+                    check_vma=False,
                 )(mix_logits, base, scale)
             else:
                 pre, post, comb = coefficients(mix_logits, base, scale)
@@ -793,7 +822,7 @@ class MeanHyperHead(spx.Module):
 
 def manifold_residual_write(
     hidden_streams: Float[Array, "batch seq hc hidden"],
-    sublayer_output: Float[Array, "batch seq hidden"],
+    sublayer_output: Float[Array, "batch seq hidden"] | Float[Array, "batch seq hc hidden"],
     post: Float[Array, "batch seq hc"],
     comb: Float[Array, "batch seq hc hc"],
     *,
@@ -803,7 +832,9 @@ def manifold_residual_write(
 
     Args:
         hidden_streams: Original residual streams ``[B, S, hc, D]``.
-        sublayer_output: Sub-layer result ``[B, S, D]``.
+        sublayer_output: Sub-layer result ``[B, S, D]``, or an already-expanded
+            ``post * output`` tensor ``[B, S, hc, D]`` produced by a sublayer
+            that fused the write gate into its own backward pass.
         post: Scalar write gates ``[B, S, hc]``.
         comb: Stream mixer ``[B, S, hc, hc]``, indexed as ``[source, target]``.
         precision: Einsum precision for the transposed stream mix.
@@ -814,6 +845,7 @@ def manifold_residual_write(
         arithmetic rather than computing in fp32 and casting the result.
     """
     dtype = hidden_streams.dtype
-    return post.astype(dtype)[..., None] * sublayer_output[..., None, :] + jnp.einsum(
-        "bsji,bsjd->bsid", comb.astype(dtype), hidden_streams, precision=precision
-    )
+    mixed = jnp.einsum("bsji,bsjd->bsid", comb.astype(dtype), hidden_streams, precision=precision)
+    if sublayer_output.ndim == hidden_streams.ndim:
+        return sublayer_output.astype(dtype) + mixed
+    return post.astype(dtype)[..., None] * sublayer_output[..., None, :] + mixed

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from jax import numpy as jnp
+import numpy as np
 
 from ..prompt_transforms import (
     extract_prompt_from_preference,
@@ -26,7 +26,7 @@ from ..prompt_transforms import (
     purify_example,
     resolve_example_tools,
 )
-from ..utils import DataCollatorForPreferenceGrain, DataCollatorForPreferenceTFDS, pad
+from ..utils import DataCollatorForPreferenceGrain, DataCollatorForPreferenceTFDS, pad, pad_single
 
 
 class TPOPreprocessTransform:
@@ -134,7 +134,10 @@ class TPOPreprocessTransform:
         reference_completion_ids = self._tokenizer(reference, add_special_tokens=False)["input_ids"]
 
         eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0] if eos_token_id else None
         if eos_token_id is not None:
+            eos_token_id = int(eos_token_id)
             chosen_completion_ids = [*chosen_completion_ids, eos_token_id]
             rejected_completion_ids = [*rejected_completion_ids, eos_token_id]
             reference_completion_ids = [*reference_completion_ids, eos_token_id]
@@ -284,14 +287,14 @@ class DataCollatorForTriplePreferenceGrain(DataCollatorForPreferenceGrain):
             [chosen_input_ids, rejected_input_ids, reference_input_ids],
             self.max_completion_length,
         )
-        output["reference_input_ids"] = pad(
-            [jnp.asarray(reference_input_ids)],
+        output["reference_input_ids"] = pad_single(
+            np.asarray(reference_input_ids, dtype=np.int32),
             completion_pad_length,
             padding_value=self.pad_token_id,
-        )[0]
-        output["reference_attention_mask"] = pad(
-            [jnp.asarray(reference_attention_mask)],
+        )
+        output["reference_attention_mask"] = pad_single(
+            np.asarray(reference_attention_mask, dtype=np.int32),
             completion_pad_length,
             padding_value=0,
-        )[0]
+        )
         return output

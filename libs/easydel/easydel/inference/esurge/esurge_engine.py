@@ -68,6 +68,7 @@ Technical Details:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import os
 import queue
@@ -77,9 +78,11 @@ import threading
 import time
 import traceback
 import typing
+import weakref
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
+from types import SimpleNamespace
 from typing import Any, Literal, overload
 
 import jax
@@ -320,6 +323,7 @@ class RequestOutput:
     delta_tool_calls: list | None = None
     reasoning_content: str | None = None
     delta_reasoning_content: str | None = None
+    tool_call_delta_history: list | None = field(default_factory=list, repr=False, compare=False)
 
     def get_text(self) -> str:
         """Get the generated text from the first completion output.
@@ -950,7 +954,7 @@ class eSurge:
                 "chunked_prefill_enabled": self.runtime_config.chunked_prefill_enabled,
                 "token_safety_margin": self.runtime_config.token_safety_margin,
                 "dp_admission_hold": self.runtime_config.dp_admission_hold,
-                "include_finished_set": self.runtime_config.include_finished_set,
+                "include_finished_set": self._effective_include_finished_set(self.runtime_config),
                 "spec_debug_max_traces": self.spec_debug_max_traces,
                 "spec_adaptive_conf_threshold": self.spec_adaptive_conf_threshold,
                 "scheduler_policy": str(self.core.policy),
@@ -1349,28 +1353,146 @@ class eSurge:
 
         Unlike :meth:`terminate` (which only stops the scheduler or replay loop and can be undone with
         :meth:`initiate`), this also stops monitoring and profiling, the tokenizer/detokenizer workers, the
-        step coordinator and the runner. Works on leader and worker ranks and on partially constructed
-        engines. Idempotent; each step is attempted even if an earlier one fails.
+        step coordinator, the runner (releasing KV pages, model weights, and compiled executables),
+        multimodal caches, drafter target references, request registry entries, and cyclic engine
+        back-references so closed engines are collectable even while ``gc.freeze()`` is held by another
+        engine. Works on leader and worker ranks and on partially constructed engines. Idempotent; each
+        step is attempted even if an earlier one fails.
         """
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        self._close_step("restore signal diagnostics", self._uninstall_signal_diagnostics)
         if getattr(self, "_scheduler_running", False) or getattr(self, "_worker_replay_thread", None) is not None:
             self._close_step("terminate", self.terminate)
+        idle_monitor = getattr(self, "_idle_monitor", None)
+        if idle_monitor is not None:
+            if hasattr(idle_monitor, "close"):
+                self._close_step("idle monitor close", idle_monitor.close)
+            elif hasattr(idle_monitor, "stop"):
+                self._close_step("idle monitor stop", idle_monitor.stop)
+        output_pipeline = getattr(self, "_output_pipeline", None)
+        if output_pipeline is not None:
+            if hasattr(output_pipeline, "close"):
+                self._close_step("output pipeline close", output_pipeline.close)
+            elif hasattr(output_pipeline, "stop"):
+                self._close_step("output pipeline stop", output_pipeline.stop)
+        request_plane = getattr(self, "_request_plane", None)
+        if request_plane is not None:
+            if getattr(request_plane, "owns_scheduling", False) and hasattr(request_plane, "shutdown"):
+                self._close_step("request plane shutdown", request_plane.shutdown)
+            elif hasattr(request_plane, "fail_pending"):
+                self._close_step("request plane fail_pending", lambda: request_plane.fail_pending("engine closed"))
         monitoring = getattr(self, "_monitoring", None)
-        if monitoring is not None and monitoring.monitoring_active:
-            self._close_step("stop monitoring", self.stop_monitoring)
+        if monitoring is not None:
+            if getattr(monitoring, "monitoring_active", False) or getattr(monitoring, "has_active_resources", False):
+                self._close_step("stop monitoring", self.stop_monitoring)
+            if hasattr(monitoring, "close"):
+                self._close_step("monitoring close", monitoring.close)
         if getattr(self, "_profiling_active", False):
             self._close_step("stop profiling", self.stop_profiling)
+        registry = getattr(self, "_registry", None)
+        if registry is not None:
+            def _clear_registry_and_metrics() -> None:
+                metrics_collector = get_metrics_collector()
+                if metrics_collector is not None:
+                    with registry.output_lock:
+                        unfinished_ids = [
+                            rid for rid, ro in registry.outputs.items() if not getattr(ro, "finished", False)
+                        ]
+                    for rid in unfinished_ids:
+                        metrics_collector.complete_request(rid, finish_reason="abort")
+                if hasattr(registry, "clear_all"):
+                    registry.clear_all()
+
+            self._close_step("registry clear", _clear_registry_and_metrics)
+        core = getattr(self, "core", None)
+        if core is not None and hasattr(core, "shutdown"):
+            self._close_step("core shutdown", core.shutdown)
         worker_manager = getattr(self, "_worker_manager", None)
-        if worker_manager is not None:
+        if worker_manager is not None and hasattr(worker_manager, "shutdown"):
             self._close_step("worker shutdown", worker_manager.shutdown)
         coordinator = getattr(self, "_step_coordinator", None)
         if coordinator is not None:
-            self._close_step("coordinator shutdown", lambda: coordinator.shutdown("engine closed"))
+            if hasattr(coordinator, "shutdown"):
+                self._close_step("coordinator shutdown", lambda: coordinator.shutdown("engine closed"))
+            if hasattr(coordinator, "set_stats_provider"):
+                self._close_step("coordinator clear stats provider", lambda: coordinator.set_stats_provider(None))
+            if hasattr(coordinator, "set_plane_handler"):
+                self._close_step("coordinator clear plane handler", lambda: coordinator.set_plane_handler(None))
+            if hasattr(coordinator, "set_client_evict_handler"):
+                self._close_step(
+                    "coordinator clear client evict handler", lambda: coordinator.set_client_evict_handler(None)
+                )
         runner = getattr(self, "runner", None)
-        if runner is not None and hasattr(runner, "shutdown"):
-            self._close_step("runner shutdown", runner.shutdown)
+        if runner is not None:
+            if callable(getattr(runner, "reset_state", None)):
+                self._close_step("runner reset_state", runner.reset_state)
+            if callable(getattr(runner, "destroy_kv_cache", None)):
+                def _destroy_kv() -> None:
+                    runner.destroy_kv_cache()
+                    self._kv_cache_valid = False
+
+                self._close_step("runner destroy_kv_cache", _destroy_kv)
+            if callable(getattr(runner, "release_model_state", None)):
+                self._close_step(
+                    "runner release_model_state",
+                    lambda: runner.release_model_state(clear_compiled_cache=True),
+                )
+            if hasattr(runner, "shutdown"):
+                self._close_step("runner shutdown", runner.shutdown)
+            if callable(getattr(runner, "close", None)):
+                self._close_step("runner close", runner.close)
+            self.runner = None
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            if callable(getattr(drafter, "release_target_model", None)):
+                self._close_step("drafter release_target_model", drafter.release_target_model)
+            self.drafter = None
+        mm_manager = getattr(self, "_multimodal_manager", None)
+        if mm_manager is not None:
+            def _close_mm() -> None:
+                if callable(getattr(mm_manager, "close", None)):
+                    mm_manager.close()
+                else:
+                    if callable(getattr(mm_manager, "set_model", None)):
+                        mm_manager.set_model(None)
+                    elif hasattr(mm_manager, "model"):
+                        mm_manager.model = None
+                    if callable(getattr(mm_manager, "clear_cache", None)):
+                        mm_manager.clear_cache()
+                    elif getattr(mm_manager, "cache", None) is not None:
+                        mm_manager.cache.clear()
+
+            self._close_step("multimodal close", _close_mm)
+            self._multimodal_manager = None
+
+        # Break all cyclic engine back-references so closed engines are reclaimed by
+        # refcounting even when another live engine holds gc.freeze().
+        engine_loop = getattr(self, "_engine_loop", None)
+        if engine_loop is not None and callable(getattr(engine_loop, "close", None)):
+            self._close_step("engine loop close", engine_loop.close)
+        if hasattr(self, "_engine_loop"):
+            self._engine_loop = None
+        admission = getattr(self, "_admission", None)
+        if admission is not None:
+            if callable(getattr(admission, "close", None)):
+                self._close_step("admission close", admission.close)
+            elif hasattr(admission, "_callback_engine"):
+                admission._callback_engine = None
+            self._admission = None
+        if hasattr(self, "_idle_monitor"):
+            self._idle_monitor = None
+        if hasattr(self, "_output_pipeline"):
+            self._output_pipeline = None
+        if hasattr(self, "_request_plane"):
+            self._request_plane = None
+        if hasattr(self, "_monitoring"):
+            self._monitoring = None
+        if hasattr(self, "_step_coordinator"):
+            self._step_coordinator = None
+        if hasattr(self, "_sampling_params_callback"):
+            self._sampling_params_callback = None
         self._close_step("heap unfreeze", self._drop_heap_freeze)
 
     @staticmethod
@@ -1503,6 +1625,9 @@ class eSurge:
 
     def _perform_idle_reset(self) -> None:
         """Idle-watchdog reset action: drain via :meth:`pause` then :meth:`resume`."""
+        if self.distributed_mode:
+            logger.debug("Skipping autonomous IdleMonitor reset in multi-host ZMQ mode.")
+            return
         self.pause()
         self.resume()
 
@@ -1547,6 +1672,8 @@ class eSurge:
             scheduler_requests: Fully-formed :class:`AdmissionRecord` objects.
         """
         with self._scheduler_lock:
+            if getattr(self, "_updating_weights", False):
+                raise RuntimeError("Cannot admit requests while model weights are being updated")
             self.core.add_requests(list(scheduler_requests))
 
     def _submit_scheduler_requests(self, scheduler_requests: list[AdmissionRecord]) -> None:
@@ -1587,6 +1714,8 @@ class eSurge:
         pixel_values_videos: Any | None = None,
         video_grid_thw: Any | None = None,
         mm_features: list | None = None,
+        *,
+        track_tool_call_delta_history: bool = True,
     ) -> list[AdmissionRecord] | None:
         """Admit a request via :meth:`RequestAdmission.add_request` (see there for details)."""
         if self._registry.output_is_retained(request_id):
@@ -1605,6 +1734,7 @@ class eSurge:
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
                 mm_features=mm_features,
+                track_tool_call_delta_history=track_tool_call_delta_history,
             )
         except BaseException:
             self._registry.release_output(request_id)
@@ -1658,6 +1788,64 @@ class eSurge:
         self._tool_protocol_token_cache = (tokenizer, ids)
         return ids
 
+    def _reasoning_parser_requires_special_tokens(self) -> bool:
+        """Whether the active reasoning parser depends on tokenizer special-token delimiters."""
+        parser_cls = getattr(self, "_reasoning_parser_class", None)
+        tokenizer = getattr(self, "tokenizer", None)
+        if parser_cls is None or tokenizer is None:
+            return False
+
+        cached = getattr(self, "_reasoning_special_tokens_cache", None)
+        if cached is not None and cached[0] is parser_cls and cached[1] is tokenizer:
+            return cached[2]
+
+        parser = self._instantiate_reasoning_parser_for_metadata()
+        requires = False
+        if parser is not None and hasattr(parser, "adjust_request"):
+            probe = SimpleNamespace(skip_special_tokens=True)
+            try:
+                parser.adjust_request(probe)
+                if probe.skip_special_tokens is False:
+                    requires = True
+            except Exception:
+                pass
+
+        if not requires:
+            delimiters: set[str] = set()
+            for candidate in (parser, getattr(parser, "_delegate", None), parser_cls):
+                if candidate is None:
+                    continue
+                for attr in ("start_token", "end_token", "CHANNEL_START", "CHANNEL_END"):
+                    val = getattr(candidate, attr, None)
+                    if isinstance(val, str) and val:
+                        delimiters.add(val)
+                for seq_attr in ("reasoning_start_tokens", "reasoning_end_tokens"):
+                    vals = getattr(candidate, seq_attr, None)
+                    if isinstance(vals, (tuple, list, set, frozenset)):
+                        for val in vals:
+                            if isinstance(val, str) and val:
+                                delimiters.add(val)
+
+            if delimiters:
+                special_tokens: set[str] = set()
+                all_special = getattr(tokenizer, "all_special_tokens", None)
+                if isinstance(all_special, (list, tuple, set, frozenset)):
+                    special_tokens.update(str(t) for t in all_special if t)
+                added_decoder = getattr(tokenizer, "added_tokens_decoder", None)
+                if isinstance(added_decoder, dict):
+                    for added_tok in added_decoder.values():
+                        if getattr(added_tok, "special", False):
+                            content = getattr(added_tok, "content", None)
+                            if isinstance(content, str) and content:
+                                special_tokens.add(content)
+                for delim in delimiters:
+                    if delim in special_tokens or any(st and st in delim for st in special_tokens):
+                        requires = True
+                        break
+
+        self._reasoning_special_tokens_cache = (parser_cls, tokenizer, requires)
+        return requires
+
     def _prepare_chat_sampling_params(
         self,
         sampling_params: SamplingParams | None,
@@ -1665,10 +1853,11 @@ class eSurge:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
     ) -> SamplingParams:
-        """Prepare sampling params with tool-token awareness.
+        """Prepare sampling params with tool-token and reasoning-delimiter awareness.
 
         When no tools are active, tool-related special tokens are suppressed
-        via ``logit_bias`` and ``skip_special_tokens`` is enabled. When tools
+        via ``logit_bias`` and ``skip_special_tokens`` is enabled unless the
+        active reasoning parser relies on special-token delimiters. When tools
         are present, the protocol tokens are left untouched so the model can
         emit tool calls.
 
@@ -1700,7 +1889,7 @@ class eSurge:
             for tid in tool_token_ids:
                 merged_logit_bias[tid] = min(float(merged_logit_bias.get(tid, 0.0)), -100.0)
             sampling_params.logit_bias = merged_logit_bias
-        sampling_params.skip_special_tokens = True
+        sampling_params.skip_special_tokens = not self._reasoning_parser_requires_special_tokens()
         return sampling_params
 
     @staticmethod
@@ -1951,6 +2140,8 @@ class eSurge:
                     if ro.finished and metrics_collector:
                         metrics_collector.complete_request(parent_request_id, finish_reason="abort")
                 ro.update_seq += 1
+            elif ro is None and rd_present and metrics_collector:
+                metrics_collector.complete_request(parent_request_id, finish_reason="abort")
 
             # Get event while still holding lock (streaming uses parent event)
             ev = self._request_events.get(parent_request_id)
@@ -1974,7 +2165,11 @@ class eSurge:
 
         if ev:
             ev.set()
-        self._output_event.set()
+        registry_for_notify = getattr(self, "_registry", None)
+        if registry_for_notify is not None and hasattr(registry_for_notify, "notify_output_change"):
+            registry_for_notify.notify_output_change()
+        else:
+            self._output_event.set()
         if abort_ids:
             logger.warning(
                 "Aborted request %s: matched_scheduler_ids=%s parent_request_id=%s "
@@ -2007,6 +2202,10 @@ class eSurge:
         log_metrics_summary()
         registry = getattr(self, "_registry", None)
         if ro is not None and ro.finished and (registry is None or not registry.output_is_retained(parent_request_id)):
+            with self._output_lock:
+                history = getattr(ro, "tool_call_delta_history", None)
+                if isinstance(history, list):
+                    history.clear()
             with self._request_lock:
                 self._request_events.pop(parent_request_id, None)
                 if n_samples > 1:
@@ -2289,11 +2488,15 @@ class eSurge:
 
         # Stop the scheduler and wake up any waiters (generate/stream/chat).
         self._scheduler_running = False
-        self._output_event.set()
-        with self._request_lock:
-            events = list(self._request_events.values())
-        for ev in events:
-            ev.set()
+        registry = getattr(self, "_registry", None)
+        if registry is not None and hasattr(registry, "signal_all"):
+            registry.signal_all()
+        else:
+            self._output_event.set()
+            with self._request_lock:
+                events = list(self._request_events.values())
+            for ev in events:
+                ev.set()
 
     def _raise_if_scheduler_failed(self) -> None:
         """Check for scheduler failure and raise if one occurred.
@@ -2315,43 +2518,57 @@ class eSurge:
     def _install_signal_diagnostics(self) -> None:
         """Install signal handlers that log engine state before exit.
 
-        Registers handlers for SIGTERM and SIGUSR1 (where available) to
-        dump scheduler/request state before the process is killed. This
-        makes OOM-kills and external termination diagnosable.
+        Registers handlers for SIGTERM to dump scheduler/request state before
+        the process is killed without acquiring locks or retaining a strong
+        reference to ``self``.
         """
+        engine_ref = weakref.ref(self)
 
         def _dump_state(signum, frame):
-            """Signal handler that logs engine state and re-raises with the default handler.
-
-            Captures running/pending request counts and the last scheduler
-            heartbeat age into a CRITICAL log line so post-mortem diagnosis
-            of OOM-kills and external SIGTERMs has actionable context. After
-            logging it restores the default signal handler and re-sends the
-            signal so the process actually terminates instead of swallowing
-            the kill.
-            """
+            """Async-signal-safe diagnostic dump that never blocks on locks."""
+            del frame
             sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+            engine = engine_ref()
+            if engine is None:
+                msg = f"eSurge received signal {sig_name} (engine already finalized)\n"
+            else:
+                try:
+                    running: Any = "<locked>"
+                    pending: Any = "<locked>"
+                    lock = getattr(engine, "_scheduler_lock", None)
+                    core = getattr(engine, "core", None)
+                    if lock is not None and core is not None and lock.acquire(blocking=False):
+                        try:
+                            counts = core.counts()
+                            running = int(counts[0])
+                            pending = int(counts[1])
+                        except Exception:
+                            running = "?"
+                            pending = "?"
+                        finally:
+                            lock.release()
+                    sched_alive = getattr(engine, "_scheduler_running", "?")
+                    heartbeat = getattr(engine, "_scheduler_heartbeat", None)
+                    hb_age = f"{time.monotonic() - heartbeat:.1f}s ago" if heartbeat else "never"
+                    msg = (
+                        f"CRITICAL: eSurge received signal {sig_name} — dumping state before exit: "
+                        f"scheduler_running={sched_alive} running_reqs={running} pending_reqs={pending} "
+                        f"last_heartbeat={hb_age}\n"
+                    )
+                except Exception:
+                    msg = f"CRITICAL: eSurge received signal {sig_name} (state dump failed)\n"
             try:
-                running = getattr(self, "num_running_requests", "?")
-                pending = getattr(self, "num_pending_requests", "?")
-                sched_alive = getattr(self, "_scheduler_running", "?")
-                heartbeat = getattr(self, "_scheduler_heartbeat", None)
-                hb_age = f"{time.monotonic() - heartbeat:.1f}s ago" if heartbeat else "never"
-                logger.critical(
-                    "eSurge received signal %s — dumping state before exit: "
-                    "scheduler_running=%s running_reqs=%s pending_reqs=%s "
-                    "last_heartbeat=%s",
-                    sig_name,
-                    sched_alive,
-                    running,
-                    pending,
-                    hb_age,
-                )
-            except Exception:
-                logger.critical("eSurge received signal %s (state dump failed)", signum)
+                os.write(2, msg.encode("utf-8", errors="replace"))
+            except OSError:
+                pass
             # Re-raise with default handler so the process actually terminates.
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
+
+        installed = getattr(self, "_installed_signal_handlers", None)
+        if installed is None:
+            installed = {}
+            self._installed_signal_handlers = installed
 
         for sig in (signal.SIGTERM,):
             try:
@@ -2359,8 +2576,22 @@ class eSurge:
                 # Only install if the current handler is the default.
                 if prev in (signal.SIG_DFL, None):
                     signal.signal(sig, _dump_state)
+                    installed[sig] = _dump_state
             except (OSError, ValueError):
                 pass  # Not main thread or signal not available
+
+    def _uninstall_signal_diagnostics(self) -> None:
+        """Restore SIG_DFL for any diagnostic signal handlers owned by this engine."""
+        installed = getattr(self, "_installed_signal_handlers", None)
+        if not installed:
+            return
+        for sig, handler in list(installed.items()):
+            try:
+                if signal.getsignal(sig) is handler:
+                    signal.signal(sig, signal.SIG_DFL)
+            except (OSError, ValueError):
+                pass
+            installed.pop(sig, None)
 
     def _update_scheduler_heartbeat(self) -> None:
         """Stamp the scheduler-loop progress watermark with the current monotonic time.
@@ -2408,15 +2639,21 @@ class eSurge:
         if registry is None or not registry.output_is_retained(request_id):
             return
         registry.release_output(request_id)
-        output = registry.get_output(request_id)
-        if output is None:
-            return
-        if not output.finished:
+        with self._output_lock:
+            output = registry.outputs.get(request_id)
+            if output is None:
+                return
+            history = getattr(output, "tool_call_delta_history", None)
+            if isinstance(history, list):
+                history.clear()
+            finished = bool(output.finished)
+            n_outputs = len(output.outputs)
+        if not finished:
             self.abort_request(request_id)
             return
         with self._request_lock:
             self._request_events.pop(request_id, None)
-            for index in range(len(output.outputs)):
+            for index in range(n_outputs):
                 self._request_events.pop(f"{request_id}-{index}", None)
         registry.track_finished(request_id)
 
@@ -2430,6 +2667,12 @@ class eSurge:
         Args:
             request_id: ID of the request that just finished.
         """
+        with self._output_lock:
+            output = self._registry.outputs.get(request_id)
+            if output is not None:
+                history = getattr(output, "tool_call_delta_history", None)
+                if isinstance(history, list):
+                    history.clear()
         self._registry.release_output(request_id)
         self._registry.track_finished(request_id)
 
@@ -2467,12 +2710,17 @@ class eSurge:
             self._scheduler_exception_tb = traceback.format_exc()
             self._registry.signal_all()
 
-    def _stop_worker_replay_loop(self) -> None:
-        """Cooperatively stop the ZMQ worker replay thread, if running."""
+    def _stop_worker_replay_loop(self) -> bool:
+        """Cooperatively stop the ZMQ worker replay thread, if running.
+
+        Returns:
+            ``True`` if a worker replay thread was present (running or exited),
+            else ``False``.
+        """
         stop_event = getattr(self, "_worker_stop_event", None)
         thread = getattr(self, "_worker_replay_thread", None)
         if stop_event is None or thread is None:
-            return
+            return False
         plane = getattr(self, "_request_plane", None)
         if plane is not None and not plane.owns_scheduling:
             # The replay thread is the origin's receive path; admissions
@@ -2483,9 +2731,47 @@ class eSurge:
             thread.join(timeout=5.0)
             if thread.is_alive():
                 logger.warning("Worker replay thread did not stop gracefully")
-                return
+                return True
         if getattr(self, "_worker_replay_thread", None) is thread:
             self._worker_replay_thread = None
+        return True
+
+    def _reset_or_reconcile_core_for_kv_cache(self, *, reason: str) -> None:
+        """Invalidate EngineCore prefix cache and rebuild ``self.core`` if ``num_pages`` changed.
+
+        Called whenever KV cache buffers are destroyed or re-allocated (e.g.
+        ``pause()``, ``resume()``, ``initiate()``) so subsequent requests never
+        get phantom prefix-cache hits against zeroed KV pages / dropped
+        recurrent snapshots, and so PP HBM-OOM ``num_pages`` shrinks never
+        desync ``self.core``'s page pool from the runner.
+        """
+        core = getattr(self, "core", None)
+        if core is None:
+            return
+        with self._scheduler_lock:
+            runner_metadata = getattr(getattr(self, "runner", None), "metadata", None)
+            runner_num_pages = getattr(runner_metadata, "num_pages", None)
+            core_num_pages = getattr(core, "num_pages", None)
+            if (
+                runner_num_pages is not None
+                and core_num_pages is not None
+                and int(runner_num_pages) != int(core_num_pages)
+            ):
+                logger.info(
+                    "Rebuilding EngineCoreDriver (%s): runner num_pages changed (%s -> %s).",
+                    reason,
+                    core_num_pages,
+                    runner_num_pages,
+                )
+                if hasattr(core, "shutdown"):
+                    try:
+                        core.shutdown()
+                    except Exception:
+                        logger.debug("EngineCoreDriver shutdown failed during %s rebuild", reason, exc_info=True)
+                self.core = self._build_core()
+                return
+            if hasattr(core, "reset_prefix_cache"):
+                core.reset_prefix_cache()
 
     def _start_engine_output_worker(self) -> None:
         """Start the background parser/output worker.
@@ -2552,6 +2838,7 @@ class eSurge:
                 if self.runner.executor_manager.kv_pages is None:
                     self.runner.initialize_kv_cache()
                     self._kv_cache_valid = True
+                    self._reset_or_reconcile_core_for_kv_cache(reason="initiate")
                 replay_thread = getattr(self, "_worker_replay_thread", None)
                 if replay_thread is not None and replay_thread.is_alive():
                     self._info("Worker replay loop is already running")
@@ -2583,11 +2870,17 @@ class eSurge:
             if self.runner.executor_manager.kv_pages is None:
                 self.runner.initialize_kv_cache()
                 self._kv_cache_valid = True
+                self._reset_or_reconcile_core_for_kv_cache(reason="initiate")
 
             if step_coordinator is not None:
                 # Leader (or single host, where this is a no-op): block until
                 # every worker rank has connected and finished initializing.
+                # If a caller explicitly kept the coordinator alive across a
+                # pause (shutdown_coordinator=False), fail fast on any worker
+                # loss instead of resetting mid-handshake.
                 step_coordinator.start()
+                if hasattr(step_coordinator, "check_health"):
+                    step_coordinator.check_health()
 
             request_plane = getattr(self, "_request_plane", None)
             if request_plane is not None and request_plane.owns_scheduling:
@@ -2628,44 +2921,55 @@ class eSurge:
             self._start_idle_monitor()
             self._paused = False
 
-    def terminate(self) -> None:
-        """Tear down the scheduler loop and release subordinate resources.
+    def terminate(self, *, shutdown_coordinator: bool = True) -> None:
+        """Tear down the scheduler loop (or worker replay loop) and release subordinate resources.
 
         Engine-stop path. Steps:
 
         1. Stop the idle-reset watchdog so it cannot fire mid-shutdown.
-        2. Ask the :class:`EngineLoop` to stop under ``_scheduler_lock``,
-           then release the lock before joining its thread. The release is
-           important because the scheduler may need the same lock to apply the
-           final runner output before it can exit. Workers in distributed mode
-           are also asked to shut down their control servers here.
+        2. Stop any ZMQ worker replay thread, and ask the :class:`EngineLoop`
+           to stop under ``_scheduler_lock``, then release the lock before
+           joining its thread. The release is important because the scheduler
+           may need the same lock to apply the final runner output before it
+           can exit.
         3. If a profiler trace is active, stop it via
            :meth:`stop_profiling` (best-effort; failures are demoted to
            DEBUG).
         4. Forward to :meth:`eSurgeRunner.shutdown` so resident PP-stage
            worker threads inside the :class:`ModelStepExecutor` are
            joined.
-        5. Clear runner buffers via :meth:`_reset_runner_state_if_idle`
+        5. Optionally shut down the step coordinator (skipped during leader
+           ``pause()`` so worker ranks stay alive across pause/resume).
+        6. Clear runner buffers via :meth:`_reset_runner_state_if_idle`
            when the engine is genuinely idle, so a subsequent
            :meth:`initiate` starts from a clean slate.
 
-        State on exit: the scheduler thread is gone, the runner has no
-        in-flight state, and no background timers are active. Idempotent
-        — calling it on an already-terminated engine logs an info line
-        and returns.
+        Args:
+            shutdown_coordinator: When ``True`` (default), shut down the step
+                coordinator and request plane. Pass ``False`` during leader
+                ``pause()`` so ZMQ workers are not killed by a ``Shutdown``
+                broadcast.
+
+        State on exit: the scheduler / replay thread is gone, the runner has
+        no in-flight state, and no background timers are active. Idempotent —
+        calling it on an already-terminated engine logs an info line and
+        returns.
         """
         self._stop_idle_monitor()
-        self._stop_worker_replay_loop()
+        worker_was_running = self._stop_worker_replay_loop()
         self._drop_heap_freeze()
         engine_loop: EngineLoop | None = None
         with self._scheduler_lock:
-            if not self._scheduler_running:
+            scheduler_was_running = bool(self._scheduler_running)
+            if not scheduler_was_running:
                 self._stop_engine_output_worker()
-                self._info("Scheduler loop is not running")
-                return
-            self._info("Stopping background scheduler loop...")
-            engine_loop = self._engine_loop
-            self._scheduler_running = False
+                if not worker_was_running:
+                    self._info("Scheduler loop is not running")
+                    return
+            else:
+                self._info("Stopping background scheduler loop...")
+                engine_loop = self._engine_loop
+                self._scheduler_running = False
 
         if engine_loop is not None:
             engine_loop.join(timeout=5.0)
@@ -2675,7 +2979,7 @@ class eSurge:
 
         self._stop_engine_output_worker()
         self._info("Background scheduler terminated")
-        if self._profiling_active:
+        if getattr(self, "_profiling_active", False):
             try:
                 self.stop_profiling()
             except Exception:
@@ -2686,13 +2990,13 @@ class eSurge:
             except Exception:
                 logger.debug("Runner shutdown encountered an error", exc_info=True)
         step_coordinator = getattr(self, "_step_coordinator", None)
-        if step_coordinator is not None:
+        if shutdown_coordinator and step_coordinator is not None:
             try:
                 step_coordinator.shutdown("engine terminate")
             except Exception:
                 logger.debug("Step coordinator shutdown encountered an error", exc_info=True)
         request_plane = getattr(self, "_request_plane", None)
-        if request_plane is not None:
+        if shutdown_coordinator and request_plane is not None:
             try:
                 if request_plane.owns_scheduling:
                     request_plane.shutdown()
@@ -2703,34 +3007,68 @@ class eSurge:
         # Clear runner buffers if idle to avoid stale state on next start.
         self._reset_runner_state_if_idle("terminate")
 
-    def pause(self) -> None:
-        """Stop the scheduler loop while preserving request bookkeeping.
+    def pause(self, *, shutdown_coordinator: bool | None = None) -> None:
+        """Stop the scheduler (or worker replay) loop while preserving request bookkeeping.
 
         Suspended state is intentionally non-destructive for requests:
         the waiting and running queues survive, and active streaming
         clients merely stop receiving updates until :meth:`resume`.
-        Internally this terminates the scheduler thread (so any
-        in-flight model step is drained), drains the resident PP worker
-        pool, and — when ``cache_config.destroy_pages_on_pause`` is set
-        — frees the KV pages to reclaim HBM (skipped if requests are
-        still active to avoid corrupting their state). Finally,
-        :meth:`_reset_runner_state_if_idle` clears the runner's
-        sequence buffer if the engine is genuinely idle.
+        Internally this stops the scheduler or worker replay thread, tears
+        down the step coordinator symmetrically across leader and worker
+        ranks by default (so lockstep ``pause()`` → ``resume()`` never trips
+        leader heartbeat timeouts or skips the ``Ready`` barrier), drains
+        the resident PP worker pool, and — when
+        ``cache_config.destroy_pages_on_pause`` is set — frees the KV pages
+        to reclaim HBM and resets the prefix cache so resumed requests never
+        attend over zero-filled KV/recurrent pages.
+
+        Args:
+            shutdown_coordinator: Controls whether to shut down the step
+                coordinator and request plane. Defaults to ``True`` for
+                symmetric lockstep teardown on both leader and worker ranks;
+                callers performing an explicit leader-only pause without
+                pausing workers may pass ``False``.
 
         Sets ``_paused=True``. Idempotent — pausing an already-paused
         engine logs an info line and returns.
         """
-        if not self._scheduler_running:
+        step_coordinator = getattr(self, "_step_coordinator", None)
+        is_worker_rank = step_coordinator is not None and not step_coordinator.is_leader
+        should_shutdown_coordinator = True if shutdown_coordinator is None else bool(shutdown_coordinator)
+        was_alive = self._generation_alive
+        worker_has_replay_handle = is_worker_rank and getattr(self, "_worker_replay_thread", None) is not None
+
+        if not was_alive and not worker_has_replay_handle:
+            if (
+                should_shutdown_coordinator
+                and is_worker_rank
+                and step_coordinator is not None
+                and getattr(step_coordinator, "_sock", None) is not None
+            ):
+                try:
+                    step_coordinator.shutdown("engine pause")
+                except Exception:
+                    logger.debug("Step coordinator shutdown encountered an error during pause", exc_info=True)
+            # Even if already paused / worker replay not started, ensure KV pages are
+            # destroyed if destroy_pages_on_pause is set and pages are still allocated.
+            if self.cache_config.destroy_pages_on_pause and getattr(self, "_kv_cache_valid", False):
+                if is_worker_rank or (self.num_running_requests == 0 and self.num_pending_requests == 0):
+                    self._drain_pipeline_workers("pause")
+                    self.runner.destroy_kv_cache()
+                    self._kv_cache_valid = False
+                    self._reset_or_reconcile_core_for_kv_cache(reason="pause")
+                    self._log_cache_event("kv_cache_destroyed", {"reason": "pause"})
+                    self._reset_runner_state_if_idle("pause")
             self._info("Scheduler loop already paused or not running")
             self._paused = True
             return
 
         self._info("Pausing eSurge scheduler loop...")
-        self.terminate()
+        self.terminate(shutdown_coordinator=should_shutdown_coordinator)
         self._paused = True
         self._drain_pipeline_workers("pause")
         if self.cache_config.destroy_pages_on_pause:
-            if self.num_running_requests > 0 or self.num_pending_requests > 0:
+            if not is_worker_rank and (self.num_running_requests > 0 or self.num_pending_requests > 0):
                 logger.warning(
                     f"Active or pending requests detected; skipping KV cache destruction (num running requests "
                     f"{self.num_running_requests} | num pending requests {self.num_pending_requests})."
@@ -2738,6 +3076,7 @@ class eSurge:
             else:
                 self.runner.destroy_kv_cache()
                 self._kv_cache_valid = False
+                self._reset_or_reconcile_core_for_kv_cache(reason="pause")
                 self._log_cache_event("kv_cache_destroyed", {"reason": "pause"})
         # Always try to clear runner buffers when idle to avoid stale state.
         self._reset_runner_state_if_idle("pause")
@@ -2746,20 +3085,22 @@ class eSurge:
         """Reopen the engine for inference after a :meth:`pause`.
 
         Drains any leftover PP-worker state, reinitializes the KV cache
-        when ``destroy_pages_on_pause`` had freed it, and delegates to
-        :meth:`initiate` to spin a fresh scheduler thread. Requests that
-        were waiting before the pause are immediately considered for
-        scheduling on the next iteration. Idempotent for already-running
-        engines.
+        when ``destroy_pages_on_pause`` had freed it (or ``kv_pages`` is
+        ``None``), reconciles ``self.core`` if ``num_pages`` shrank on OOM
+        retry and resets the prefix cache, and delegates to :meth:`initiate`
+        to spin a fresh scheduler or worker replay thread. Idempotent for
+        already-running engines.
         """
-        if self._scheduler_running:
+        if self._generation_alive:
             self._info("Scheduler loop already running")
             return
         self._info("Resuming eSurge scheduler loop...")
         self._drain_pipeline_workers("resume")
-        if self.cache_config.destroy_pages_on_pause and not self._kv_cache_valid:
+        kv_missing = getattr(getattr(self.runner, "executor_manager", None), "kv_pages", None) is None
+        if kv_missing or (self.cache_config.destroy_pages_on_pause and not self._kv_cache_valid):
             self.runner.initialize_kv_cache()
             self._kv_cache_valid = True
+            self._reset_or_reconcile_core_for_kv_cache(reason="resume")
             self._log_cache_event("kv_cache_reinitialized", {"reason": "resume"})
         self.initiate()
 
@@ -2767,12 +3108,17 @@ class eSurge:
         """Release runner-held model weights/state references to reduce memory.
 
         The engine remains reusable. Call `update_model_weights(...)` before
-        serving again.
+        serving again. Works cleanly on both leader and ZMQ worker ranks:
+        quiesces any running scheduler or worker replay thread and destroys
+        KV pages (when ``destroy_pages_on_pause`` is enabled) before dropping
+        model state.
 
         Args:
             clear_compiled_cache: Whether to clear compiled model/sampler caches.
         """
-        if self.num_running_requests > 0 or self.num_pending_requests > 0:
+        step_coordinator = getattr(self, "_step_coordinator", None)
+        is_worker_rank = step_coordinator is not None and not step_coordinator.is_leader
+        if not is_worker_rank and (self.num_running_requests > 0 or self.num_pending_requests > 0):
             logger.warning(
                 "Skipping model-state release because requests are active or pending (running=%d, pending=%d).",
                 self.num_running_requests,
@@ -2780,13 +3126,53 @@ class eSurge:
             )
             return
 
-        if self._scheduler_running:
+        worker_has_replay_handle = is_worker_rank and getattr(self, "_worker_replay_thread", None) is not None
+        if self._generation_alive or worker_has_replay_handle:
             self.pause()
         else:
+            self._stop_worker_replay_loop()
             self._drain_pipeline_workers("release_model_state")
+            if self.cache_config.destroy_pages_on_pause and getattr(self, "_kv_cache_valid", False):
+                self.runner.destroy_kv_cache()
+                self._kv_cache_valid = False
+                self._reset_or_reconcile_core_for_kv_cache(reason="release_model_state")
+                self._log_cache_event("kv_cache_destroyed", {"reason": "release_model_state"})
+
+        # In multi-host ZMQ RL loops, releasing model state transitions into a
+        # potentially long training phase where workers are paused; shut down
+        # the coordinator so heartbeat sweeps don't trip while training runs.
+        if step_coordinator is not None and self.distributed_mode:
+            try:
+                step_coordinator.shutdown("release_model_state")
+            except Exception:
+                logger.debug("Step coordinator shutdown encountered an error during release_model_state", exc_info=True)
 
         self.runner.release_model_state(clear_compiled_cache=clear_compiled_cache)
+        mm_manager = getattr(self, "_multimodal_manager", None)
+        if mm_manager is not None:
+            if callable(getattr(mm_manager, "set_model", None)):
+                mm_manager.set_model(None)
+            elif hasattr(mm_manager, "model"):
+                mm_manager.model = None
+            if callable(getattr(mm_manager, "clear_cache", None)):
+                mm_manager.clear_cache()
+            elif getattr(mm_manager, "cache", None) is not None:
+                mm_manager.cache.clear()
         self._paused = True
+
+    def _effective_include_finished_set(self, runtime: eSurgeRuntimeConfig | None = None) -> bool:
+        """Return whether ``EngineCoreDriver`` must emit ``finished_requests`` every step.
+
+        Always enabled when ZMQ coordination is active so ``OwnerRequestPlane`` observes
+        every terminal request (including stop-string finishes and local coalesced aborts),
+        while keeping the distributed config fingerprint identical across leader and workers.
+        """
+        cfg = eSurgeRuntimeConfig.coerce_config(
+            runtime if runtime is not None else getattr(self, "runtime_config", None)
+        )
+        dist = eSurgeDistributedConfig.coerce_config(getattr(self, "distributed_config", None))
+        coordination = str(getattr(dist, "coordination", "replicated") or "replicated")
+        return bool(cfg.include_finished_set or coordination == "zmq")
 
     def _build_core(self) -> EngineCoreDriver:
         """Construct the engine core from the runner and the engine's resolved settings.
@@ -2809,10 +3195,10 @@ class eSurge:
             num_draft_tokens=self.runner.num_draft_tokens,
             chunked_prefill_enabled=runtime.chunked_prefill_enabled,
             token_safety_margin=runtime.token_safety_margin,
-            include_finished_set=runtime.include_finished_set,
+            include_finished_set=self._effective_include_finished_set(runtime),
             dp_admission_hold=runtime.dp_admission_hold,
-            decode_snapshots=bool(self.cache_config.decode_prefix_snapshots),
-            snapshot_routing=bool(self.cache_config.snapshot_aware_routing),
+            decode_snapshots=bool(getattr(self.cache_config, "decode_prefix_snapshots", False)),
+            snapshot_routing=bool(getattr(self.cache_config, "snapshot_aware_routing", False)),
         )
 
     def update_model_weights(
@@ -2840,91 +3226,147 @@ class eSurge:
 
         Raises:
             RuntimeError: If there are active or pending requests.
-            ValueError: If no model/graph data is provided.
+            ValueError: If no model/graph data is provided or partial graph
+                components cannot be resolved from existing runner state.
         """
-        if self.num_running_requests > 0 or self.num_pending_requests > 0:
-            raise RuntimeError("Cannot update model weights while requests are active or pending")
-
         if model is None and graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No new model or graph components provided for update")
 
         step_coordinator = getattr(self, "_step_coordinator", None)
         is_worker_rank = step_coordinator is not None and not step_coordinator.is_leader
+        scheduler_lock = getattr(self, "_scheduler_lock", None)
+        lock_ctx = scheduler_lock if scheduler_lock is not None else contextlib.nullcontext()
 
-        # A ZMQ worker rank runs a replay thread, not the scheduler loop, so
-        # `_scheduler_running` is always False there; gate on the liveness
-        # property that covers both flavours so the worker actually tears
-        # down and rejoins the (restarted) leader across the swap.
-        was_running = self._generation_alive
-        if was_running:
-            self.terminate()
-            if is_worker_rank and step_coordinator is not None:
-                # Worker `terminate()` stops the replay loop but returns
-                # before the step-coordinator shutdown (there is no scheduler
-                # loop to drain), leaving the DEALER connected to the
-                # pre-restart leader. Force it closed so the re-`initiate()`
-                # below re-handshakes with the leader — which resets its
-                # authed set and ledger when the leader rank re-`start()`s in
-                # lockstep — instead of replaying on a stale connection whose
-                # frames are dropped as unauthenticated.
-                try:
-                    step_coordinator.shutdown("update_model_weights")
-                except Exception:
-                    logger.debug("Worker step coordinator shutdown failed", exc_info=True)
+        def _has_inflight_requests() -> bool:
+            if is_worker_rank:
+                return False
+            core = getattr(self, "core", None)
+            if core is not None and hasattr(core, "num_running") and hasattr(core, "num_waiting"):
+                return bool(core.num_running > 0 or core.num_waiting > 0)
+            return bool(self.num_running_requests > 0 or self.num_pending_requests > 0)
 
-        self._drain_pipeline_workers("update_model_weights")
+        # Atomically verify idle and fence off new admissions under _scheduler_lock
+        # before releasing the lock to join the running loop thread.
+        with lock_ctx:
+            if _has_inflight_requests():
+                raise RuntimeError("Cannot update model weights while requests are active or pending")
+            self._updating_weights = True
+            was_running = self._generation_alive
 
-        split_graphdef = None
-        split_graphstate = None
-        split_graphother = None
-        if model is not None and (graphdef is None or graphstate is None or graphother is None):
-            _split_model, split_graphdef, split_graphstate, split_graphother = (
-                self._split_graph_components_for_weight_update(model)
-            )
+        try:
+            if was_running:
+                self.terminate()
 
-        if model is None:
-            model = spx.bind(graphdef, graphstate.overlay(graphother))
-        if graphstate is None:
-            graphstate = split_graphstate
-        if graphother is None:
-            graphother = split_graphother
-        if graphdef is None:
-            graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
-        if getattr(self, "decoding_engine", None) is not None:
-            # Graph-component callers must honor the same explicit selection as
-            # model callers, including refreshes with a training attention graph.
-            replacement = spx.bind(graphdef, graphstate.overlay(graphother))
-            replacement = select_decoding_engine(replacement, self.decoding_engine)
-            graphdef = replacement.graphdef
+            self._drain_pipeline_workers("update_model_weights")
 
-        self.runner.update_model_weights(
-            graphdef=graphdef,
-            graphstate=graphstate,
-            graphother=graphother,
-            reset_state=True,
-        )
-        if not self.runner.executor_manager.has_compiled_variants():
-            # Compilation uses the current KV pages as a template for sharding/shape.
-            # Ensure pages exist when coming back from a released model state.
-            if self.runner.executor_manager.kv_pages is None:
-                self.runner.initialize_kv_cache()
-            self.runner.compile(max_num_batched_tokens=self._scheduler_max_num_batched_tokens)
-        self._kv_cache_valid = self.runner.executor_manager.kv_pages is not None
-        cache_event = "kv_cache_reinitialized" if self._kv_cache_valid else "kv_cache_destroyed"
-        self._log_cache_event(cache_event, {"reason": "update_model_weights"})
+            with lock_ctx:
+                if _has_inflight_requests():
+                    raise RuntimeError("Cannot update model weights while requests are active or pending")
 
-        with self._request_lock, self._output_lock:
-            self._active_requests.clear()
-            self._request_outputs.clear()
-            self._finished_request_ids.clear()
-            self._request_events.clear()
+                split_graphdef = None
+                split_graphstate = None
+                split_graphother = None
+                if model is not None and (graphdef is None or graphstate is None or graphother is None):
+                    _split_model, split_graphdef, split_graphstate, split_graphother = (
+                        self._split_graph_components_for_weight_update(model)
+                    )
 
-        request_plane = getattr(self, "_request_plane", None)
-        if request_plane is not None and request_plane.owns_scheduling:
-            request_plane.reset()
+                if model is None:
+                    em = getattr(self.runner, "executor_manager", None)
+                    existing_model = getattr(self.runner, "model", None)
+                    if graphdef is None:
+                        graphdef = getattr(em, "graphdef", None)
+                    if graphstate is None:
+                        graphstate = getattr(em, "graphstate", None)
+                    if graphother is None:
+                        graphother = getattr(em, "graphother", None)
+                    if (graphdef is None or graphstate is None or graphother is None) and existing_model is not None:
+                        try:
+                            _, ex_gd, ex_gs, ex_go = self._split_graph_components_for_weight_update(existing_model)
+                            if graphdef is None:
+                                graphdef = ex_gd
+                            if graphstate is None:
+                                graphstate = ex_gs
+                            if graphother is None:
+                                graphother = ex_go
+                        except Exception:
+                            pass
+                    missing = [
+                        name
+                        for name, val in (
+                            ("graphdef", graphdef),
+                            ("graphstate", graphstate),
+                            ("graphother", graphother),
+                        )
+                        if val is None
+                    ]
+                    if missing:
+                        raise ValueError(
+                            f"Cannot update model weights with model=None: missing {', '.join(missing)} "
+                            "and could not resolve them from existing runner state."
+                        )
+                    model = spx.bind(graphdef, graphstate.overlay(graphother))
+                if graphstate is None:
+                    graphstate = split_graphstate
+                if graphother is None:
+                    graphother = split_graphother
+                if graphdef is None:
+                    graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
+                if getattr(self, "decoding_engine", None) is not None:
+                    # Graph-component callers must honor the same explicit selection as
+                    # model callers, including refreshes with a training attention graph.
+                    replacement = spx.bind(graphdef, graphstate.overlay(graphother))
+                    replacement = select_decoding_engine(replacement, self.decoding_engine)
+                    graphdef = replacement.graphdef
 
-        self.core.shutdown()
-        self.core = self._build_core()
+                self.runner.update_model_weights(
+                    graphdef=graphdef,
+                    graphstate=graphstate,
+                    graphother=graphother,
+                    reset_state=True,
+                )
+                mm_manager = getattr(self, "_multimodal_manager", None)
+                if mm_manager is not None:
+                    refreshed_model = getattr(self.runner, "model", None) or model
+                    if callable(getattr(mm_manager, "set_model", None)):
+                        mm_manager.set_model(refreshed_model)
+                    elif hasattr(mm_manager, "model"):
+                        mm_manager.model = refreshed_model
+                    if callable(getattr(mm_manager, "clear_cache", None)):
+                        mm_manager.clear_cache()
+                    elif getattr(mm_manager, "cache", None) is not None:
+                        mm_manager.cache.clear()
+                if not self.runner.executor_manager.has_compiled_variants():
+                    # Compilation uses the current KV pages as a template for sharding/shape.
+                    # Ensure pages exist when coming back from a released model state.
+                    if self.runner.executor_manager.kv_pages is None:
+                        self.runner.initialize_kv_cache()
+                    self.runner.compile(max_num_batched_tokens=self._scheduler_max_num_batched_tokens)
+                self._kv_cache_valid = self.runner.executor_manager.kv_pages is not None
+                cache_event = "kv_cache_reinitialized" if self._kv_cache_valid else "kv_cache_destroyed"
+                self._log_cache_event(cache_event, {"reason": "update_model_weights"})
+
+                registry = getattr(self, "_registry", None)
+                if registry is not None and hasattr(registry, "clear_all"):
+                    registry.clear_all()
+                else:
+                    with self._request_lock, self._output_lock:
+                        self._active_requests.clear()
+                        self._request_outputs.clear()
+                        self._finished_request_ids.clear()
+                        self._request_events.clear()
+                        if registry is not None and hasattr(registry, "_output_leases"):
+                            registry._output_leases.clear()
+
+                request_plane = getattr(self, "_request_plane", None)
+                if request_plane is not None and request_plane.owns_scheduling:
+                    request_plane.reset()
+
+                self.core.shutdown()
+                self.core = self._build_core()
+        finally:
+            with lock_ctx:
+                self._updating_weights = False
 
         if restart_scheduler and was_running:
             self.initiate()
@@ -3306,34 +3748,56 @@ class eSurge:
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
         defer_batch_enqueue = len(prompts) > 1
-        deferred_scheduler_requests = []
+        deferred_scheduler_requests: list[AdmissionRecord] = []
+        admitted_deferred_parents: list[tuple[str, list[str]]] = []
         if prompt_token_ids is None:
             prompt_token_ids = self._tokenize_prompts(request_ids, prompts)
-        for index, (prompt, req_id) in enumerate(zip(prompts, request_ids, strict=True)):
-            prompt_tokens = prompt_token_ids[index]
-            effective_params = self._prepare_sampling_params_for_request(
-                base_sampling_params,
-                request_id=req_id,
-                prompt=prompt,
-            )
-            maybe_scheduler_requests = self._add_request(
-                req_id,
-                prompt,
-                effective_params,
-                prompt_token_ids=prompt_tokens,
-                tool_parser_request=tool_parser_request,
-                defer_scheduler_enqueue=defer_batch_enqueue,
-            )
-            if maybe_scheduler_requests:
-                deferred_scheduler_requests.extend(maybe_scheduler_requests)
+        try:
+            for index, (prompt, req_id) in enumerate(zip(prompts, request_ids, strict=True)):
+                prompt_tokens = prompt_token_ids[index]
+                effective_params = self._prepare_sampling_params_for_request(
+                    base_sampling_params,
+                    request_id=req_id,
+                    prompt=prompt,
+                )
+                add_kwargs: dict[str, Any] = {
+                    "prompt_token_ids": prompt_tokens,
+                    "tool_parser_request": tool_parser_request,
+                    "defer_scheduler_enqueue": defer_batch_enqueue,
+                }
+                if getattr(self._add_request, "__func__", None) is eSurge._add_request:
+                    add_kwargs["track_tool_call_delta_history"] = False
+                maybe_scheduler_requests = self._add_request(
+                    req_id,
+                    prompt,
+                    effective_params,
+                    **add_kwargs,
+                )
+                if getattr(self._add_request, "__func__", None) is not eSurge._add_request:
+                    output_lock = getattr(self, "_output_lock", None)
+                    request_outputs = getattr(self, "_request_outputs", None)
+                    if output_lock is not None and request_outputs is not None:
+                        with output_lock:
+                            ro = request_outputs.get(req_id)
+                            if ro is not None:
+                                ro.tool_call_delta_history = None
+                if maybe_scheduler_requests:
+                    deferred_scheduler_requests.extend(maybe_scheduler_requests)
+                    child_ids = [rec.request_id for rec in maybe_scheduler_requests if rec.request_id != req_id]
+                    admitted_deferred_parents.append((req_id, child_ids))
 
-        if deferred_scheduler_requests:
-            self._submit_scheduler_requests(deferred_scheduler_requests)
-            logger.info(
-                "Queued generate batch: parent_requests=%d scheduler_requests=%d",
-                len(prompts),
-                len(deferred_scheduler_requests),
-            )
+            if deferred_scheduler_requests:
+                self._submit_scheduler_requests(deferred_scheduler_requests)
+                logger.info(
+                    "Queued generate batch: parent_requests=%d scheduler_requests=%d",
+                    len(prompts),
+                    len(deferred_scheduler_requests),
+                )
+        except BaseException:
+            if defer_batch_enqueue and admitted_deferred_parents:
+                for parent_id, child_ids in admitted_deferred_parents:
+                    self._admission.rollback_request(parent_id, child_ids)
+            raise
 
         outputs_by_id: dict[str, RequestOutput] = {}
         pbar = None
@@ -3346,9 +3810,11 @@ class eSurge:
 
         self._ensure_scheduler_running(context="generate-start")
 
+        registry = getattr(self, "_registry", None)
+        use_versioned_wait = registry is not None and hasattr(registry, "wait_for_output_change")
+        seen_version = registry.output_version() if use_versioned_wait else 0
+
         while len(completed) < len(prompts):
-            self._output_event.wait(timeout=0.1)
-            self._output_event.clear()
             self._raise_if_scheduler_failed()
             if not self._generation_alive:
                 pending_ids = [rid for rid in request_ids if rid not in completed]
@@ -3359,6 +3825,8 @@ class eSurge:
                 if req_id not in completed:
                     self._recover_orphaned_request(req_id)
             with self._output_lock:
+                if use_versioned_wait:
+                    seen_version = registry.output_version()
                 for req_id in request_ids:
                     if req_id not in completed and req_id not in self._request_outputs:
                         raise RuntimeError(f"Output for admitted request {req_id!r} disappeared")
@@ -3369,6 +3837,13 @@ class eSurge:
                             outputs_by_id[req_id] = output
                             if pbar:
                                 pbar.update(1)
+            if len(completed) >= len(prompts):
+                break
+            if use_versioned_wait:
+                _, seen_version = registry.wait_for_output_change(seen_version, 0.1)
+            else:
+                self._output_event.wait(timeout=0.1)
+                self._output_event.clear()
 
         if pbar:
             pbar.close()
@@ -3869,6 +4344,9 @@ class eSurge:
             videos=videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            tools=tools,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         prompt = self._format_chat_prompt(
@@ -3890,29 +4368,59 @@ class eSurge:
             tool_choice=tool_choice,
         )
 
-        self._add_request(
-            request_id=request_id,
-            prompt=prompt,
-            sampling_params=effective_params,
-            prompt_token_ids=prompt_token_ids,
-            tool_parser_request=tool_parser_request,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-            mm_features=mm_features,
-        )
+        if stream:
+
+            def _admit_and_stream() -> Iterator[RequestOutput]:
+                self._add_request(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params=effective_params,
+                    prompt_token_ids=prompt_token_ids,
+                    tool_parser_request=tool_parser_request,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    mm_features=mm_features,
+                )
+                try:
+                    self._ensure_scheduler_running(context="multimodal-chat-start")
+                    yield from self._stream_multimodal_request(request_id)
+                finally:
+                    self._release_output_consumer(request_id)
+
+            return _admit_and_stream()
+
+        add_kwargs_mm: dict[str, Any] = {
+            "request_id": request_id,
+            "prompt": prompt,
+            "sampling_params": effective_params,
+            "prompt_token_ids": prompt_token_ids,
+            "tool_parser_request": tool_parser_request,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "mm_features": mm_features,
+        }
+        if getattr(self._add_request, "__func__", None) is eSurge._add_request:
+            add_kwargs_mm["track_tool_call_delta_history"] = False
+        self._add_request(**add_kwargs_mm)
+        if getattr(self._add_request, "__func__", None) is not eSurge._add_request:
+            output_lock = getattr(self, "_output_lock", None)
+            request_outputs = getattr(self, "_request_outputs", None)
+            if output_lock is not None and request_outputs is not None:
+                with output_lock:
+                    ro = request_outputs.get(request_id)
+                    if ro is not None:
+                        ro.tool_call_delta_history = None
 
         try:
             self._ensure_scheduler_running(context="multimodal-chat-start")
+            return self._wait_for_request(request_id)
         except BaseException:
             self._release_output_consumer(request_id)
             raise
-
-        if stream:
-            return self._stream_multimodal_request(request_id)
-        else:
-            return self._wait_for_request(request_id)
 
     def _stream_multimodal_request(self, request_id: str) -> Iterator[RequestOutput]:
         """Stream :class:`RequestOutput` snapshots for an already-admitted multimodal request.
@@ -3974,6 +4482,8 @@ class eSurge:
         last_accumulated_text = ""
         last_raw_accumulated_text = ""
         last_accumulated_reasoning = ""
+        saw_tool_delta_history = False
+        last_fallback_delta_tool_calls: Any = None
         try:
             while True:
                 woke = req_event.wait(timeout=1.0)
@@ -4035,6 +4545,30 @@ class eSurge:
                             ro.delta_reasoning_content or "",
                         )
 
+                        history = getattr(ro, "tool_call_delta_history", None)
+                        if isinstance(history, list):
+                            if history:
+                                # Drain consumed deltas in place under _output_lock so long
+                                # streams keep O(1) memory while coalescing missed steps.
+                                snapshot_delta_tool_calls = list(history)
+                                history.clear()
+                                saw_tool_delta_history = True
+                            elif (
+                                not saw_tool_delta_history
+                                and ro.delta_tool_calls
+                                and ro.delta_tool_calls is not last_fallback_delta_tool_calls
+                            ):
+                                snapshot_delta_tool_calls = ro.delta_tool_calls
+                                last_fallback_delta_tool_calls = ro.delta_tool_calls
+                            else:
+                                snapshot_delta_tool_calls = None
+                        else:
+                            if ro.delta_tool_calls and ro.delta_tool_calls is not last_fallback_delta_tool_calls:
+                                snapshot_delta_tool_calls = ro.delta_tool_calls
+                                last_fallback_delta_tool_calls = ro.delta_tool_calls
+                            else:
+                                snapshot_delta_tool_calls = None
+
                         snapshot = RequestOutput(
                             request_id=ro.request_id,
                             prompt=ro.prompt,
@@ -4056,7 +4590,7 @@ class eSurge:
                             update_seq=ro.update_seq,
                             delta_seq=ro.delta_seq,
                             tool_calls=ro.tool_calls,
-                            delta_tool_calls=ro.delta_tool_calls,
+                            delta_tool_calls=snapshot_delta_tool_calls,
                             reasoning_content=ro.reasoning_content,
                             delta_reasoning_content=snapshot_reasoning_delta or None,
                         )
@@ -4084,6 +4618,10 @@ class eSurge:
                 registry.release_output(request_id)
             with self._output_lock:
                 ro = self._request_outputs.get(request_id)
+                if ro is not None:
+                    history = getattr(ro, "tool_call_delta_history", None)
+                    if isinstance(history, list):
+                        history.clear()
                 n_samples = len(ro.outputs) if ro is not None else 0
                 finished = ro.finished if ro is not None else True
             if finished:
@@ -4189,7 +4727,9 @@ class eSurge:
         Gracefully shuts down Prometheus server and console monitor
         if they are running.
         """
-        self._monitoring.stop_monitoring()
+        monitoring = getattr(self, "_monitoring", None)
+        if monitoring is not None:
+            monitoring.stop_monitoring()
 
     def get_metrics_summary(self) -> dict[str, Any]:
         """Get current performance metrics summary.
@@ -4231,4 +4771,5 @@ class eSurge:
         Returns:
             True if monitoring has been initialized and is running.
         """
-        return self._monitoring.monitoring_active
+        monitoring = getattr(self, "_monitoring", None)
+        return bool(monitoring is not None and monitoring.monitoring_active)

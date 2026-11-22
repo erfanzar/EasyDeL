@@ -96,33 +96,55 @@ def test_scheduled_distillation_includes_aux_and_z_loss(monkeypatch, chunk_size)
 
 
 def test_cached_gkd_loss_uses_current_batch_teacher(monkeypatch):
+    def _student_forward(model, batch):
+        del model
+        x = batch["input_ids"].astype(jnp.float32)
+        return jnp.stack((x, -x), axis=-1), None
+
+    def _teacher_forward(model, batch):
+        del model
+        x = batch["input_ids"].astype(jnp.float32)
+        return jnp.stack((x * 2.0 - 1.0, 1.0 - x * 2.0), axis=-1)
+
     student = Model(jnp.asarray([[[1.0, 0.0], [0.0, 1.0]]]))
-    monkeypatch.setattr(gkd, "bind_scheduled_module", lambda call, tree: student)
-    monkeypatch.setattr(gkd, "_gkd_forward_logits", lambda model, batch: model.logits)
-    monkeypatch.setattr(gkd.spx, "jit", lambda fn, **kwargs: fn)
     teacher = Model(student.logits)
+    teacher_state = SimpleNamespace(model=teacher, graphstate={}, merge=lambda tree: teacher)
+    monkeypatch.setattr(gkd, "bind_scheduled_module", lambda call, tree: student)
+    monkeypatch.setattr(gkd, "_gkd_forward_outputs", _student_forward)
+    monkeypatch.setattr(gkd, "_gkd_forward_logits", _teacher_forward)
+
+    first_batch_in = {"input_ids": jnp.asarray([[1, 0]], dtype=jnp.int32)}
+    second_batch_in = {"input_ids": jnp.asarray([[0, 1]], dtype=jnp.int32)}
     kwargs = dict(
         beta=0.0,
         temperature=1.0,
         loss_config=LossConfig(shift_tokens=False),
-        teacher_state=SimpleNamespace(model=teacher),
-        batch={"input_ids": jnp.asarray([[0, 1]])},
+        teacher_state=teacher_state,
+        batch=first_batch_in,
     )
     first_call = Call(**kwargs)
     first_batch = gkd._prepare_gkd_scheduled_batch(first_call)
+    assert "teacher_logits" not in first_batch
     loss_fn = jax.jit(gkd._make_gkd_scheduled_loss(first_call))
-    np.testing.assert_allclose(loss_fn({}, first_batch), 0.0, atol=1e-6)
-    teacher.logits = -student.logits
-    second_batch = gkd._prepare_gkd_scheduled_batch(Call(**kwargs))
-    expected = np.sum(
-        np.exp(_logsoftmax(np.asarray(-student.logits)))
-        * (_logsoftmax(np.asarray(-student.logits)) - _logsoftmax(np.asarray(student.logits))),
+    s1, _ = _student_forward(student, first_batch_in)
+    t1 = _teacher_forward(teacher, first_batch_in)
+    expected1 = np.sum(
+        np.exp(_logsoftmax(np.asarray(t1))) * (_logsoftmax(np.asarray(t1)) - _logsoftmax(np.asarray(s1))),
         axis=-1,
     ).mean()
-    np.testing.assert_allclose(loss_fn({}, second_batch), expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_allclose(loss_fn({}, first_batch), expected1, rtol=2e-5, atol=2e-5)
+
+    second_batch = gkd._prepare_gkd_scheduled_batch(Call(**{**kwargs, "batch": second_batch_in}))
+    s2, _ = _student_forward(student, second_batch_in)
+    t2 = _teacher_forward(teacher, second_batch_in)
+    expected2 = np.sum(
+        np.exp(_logsoftmax(np.asarray(t2))) * (_logsoftmax(np.asarray(t2)) - _logsoftmax(np.asarray(s2))),
+        axis=-1,
+    ).mean()
+    np.testing.assert_allclose(loss_fn({}, second_batch), expected2, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("variant", ["sigmoid", "kto", "hinge"])
+@pytest.mark.parametrize("variant", ["sigmoid", "hinge"])
 def test_dpo_compatibility_closure_preserves_objectives(variant):
     chosen = jnp.asarray([0.5, -0.5])
     rejected = jnp.asarray([-0.5, 0.5])
@@ -131,3 +153,8 @@ def test_dpo_compatibility_closure_preserves_objectives(variant):
     z = np.asarray([0.2, -0.2])
     expected = np.maximum(1 - z, 0) if variant == "hinge" else 0.9 * np.logaddexp(0, -z) + 0.1 * np.logaddexp(0, z)
     np.testing.assert_allclose(loss, expected, rtol=1e-6)
+
+
+def test_dpo_compatibility_closure_rejects_removed_kto_variant():
+    with pytest.raises(ValueError, match="not valid"):
+        get_loss_function("kto", 0.2, 0.1)

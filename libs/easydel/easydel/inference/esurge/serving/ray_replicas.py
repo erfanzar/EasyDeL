@@ -266,8 +266,12 @@ def _run_replica(cfg: dict[str, tp.Any], plan: tp.Any, timeout_s: float) -> None
     try:
         if engine.is_coordination_leader:
             # The request plane is served by the coordinator's IO thread; the front reaches the engine through it.
-            while True:
+            while getattr(engine, "alive", True):
                 time.sleep(1.0)
+            failure = getattr(engine, "_scheduler_exception", None)
+            if failure is not None:
+                raise RuntimeError(f"replica {plan.index} leader engine failed") from failure
+            raise RuntimeError(f"replica {plan.index} leader engine is no longer alive")
         engine.wait_for_shutdown()
     finally:
         engine.close()
@@ -315,10 +319,9 @@ def maybe_launch_replicas(cfg: Mapping[str, tp.Any]) -> tp.Any | None:
 def _launch(ray: tp.Any, cfg: Mapping[str, tp.Any], nodes: list[dict[str, tp.Any]]) -> tp.Any:
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
     from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
 
-    from .app import ReplicaAttacher, replica_candidates
+    from .app import ReplicaAttacher, elarge_replica_connector, replica_candidates
 
     dims, names = mesh_of(cfg)
     port = control_port_of(cfg)
@@ -342,21 +345,11 @@ def _launch(ray: tp.Any, cfg: Mapping[str, tp.Any], nodes: list[dict[str, tp.Any
     leaders = planned[0][0].leaders
     count = len(leaders)
     token = secrets.token_hex(32)
-    model = cfg.get("model") or {}
-    tokenizer = model.get("tokenizer") or model.get("name_or_path")
+
+    connect = elarge_replica_connector(cfg, control_port=port, token=token)
 
     replica = ray.remote(max_calls=1)(_run_replica)
     tasks = []
-    for node, (plan, env) in zip(nodes, planned, strict=True):
-        node_cfg = replica_config(cfg, count=count, token=token, control_port=port, bind_host=node["NodeManagerAddress"])
-        options = placed(node)
-        options["runtime_env"] = {"env_vars": replica_task_env(env)}
-        tasks.append(replica.options(**options).remote(node_cfg, plan, PLAN_TIMEOUT_S))
-    logger.info("started %d replica tasks; replica leaders %s", len(tasks), list(leaders))
-
-    def connect(addr: str):
-        return RemoteEngineHandle(addr, port, auth_token=token, tokenizer_source=tokenizer, connect_timeout_s=10.0)
-
     attacher: ReplicaAttacher | None = None
 
     def stop() -> None:
@@ -368,11 +361,26 @@ def _launch(ray: tp.Any, cfg: Mapping[str, tp.Any], nodes: list[dict[str, tp.Any
             except Exception:
                 pass
 
+    try:
+        for node, (plan, env) in zip(nodes, planned, strict=True):
+            node_cfg = replica_config(
+                cfg, count=count, token=token, control_port=port, bind_host=node["NodeManagerAddress"]
+            )
+            options = placed(node)
+            options["runtime_env"] = {"env_vars": replica_task_env(env)}
+            tasks.append(replica.options(**options).remote(node_cfg, plan, PLAN_TIMEOUT_S))
+    except BaseException:
+        stop()
+        raise
+    logger.info("started %d replica tasks; replica leaders %s", len(tasks), list(leaders))
+
     class RayRoutedEngine(RoutedEngine):
-        """The front's router; ``close()`` also stops the replica tasks."""
+        """The front's router; ``close()`` stops attaching, closes member handles, then cancels replica tasks."""
 
         def close(self) -> None:
             try:
+                if attacher is not None:
+                    attacher.stop()
                 super().close()
             finally:
                 stop()
@@ -388,8 +396,13 @@ def _launch(ray: tp.Any, cfg: Mapping[str, tp.Any], nodes: list[dict[str, tp.Any
                 if done:
                     ray.get(done[0])  # raises the replica's error
                     raise RuntimeError("a replica task exited before any replica came up")
+        attacher.start()
     except BaseException:
-        stop()
+        try:
+            attacher.stop()
+            if attacher.router is not None:
+                attacher.router.close()
+        finally:
+            stop()
         raise
-    attacher.start()
     return attacher.router

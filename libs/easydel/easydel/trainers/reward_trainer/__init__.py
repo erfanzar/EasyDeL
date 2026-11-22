@@ -37,7 +37,7 @@ Example:
     >>> config = RewardConfig(
     ...     max_length=512,
     ...     learning_rate=2e-5,
-    ...     use_margin_loss=True
+    ...     center_rewards_coefficient=0.01,
     ... )
     >>> trainer = RewardTrainer(
     ...     arguments=config,

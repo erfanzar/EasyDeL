@@ -192,25 +192,46 @@ class RLVRTrainer(GRPOTrainer):
         if external_rewards:
             verifiers.extend(external_rewards)
             if external_reward_weights is not None:
-                user_weights = list(external_reward_weights)
+                user_weights = [float(w) for w in external_reward_weights]
+                if len(user_weights) != len(external_rewards):
+                    raise ValueError(
+                        "The number of external reward weights must match the number of external reward functions."
+                    )
+                if arguments.reward_weights is not None:
+                    if verifier_count > 0 and len(arguments.reward_weights) == verifier_count:
+                        weights = [float(w) for w in arguments.reward_weights]
+                    else:
+                        raise ValueError(
+                            "Cannot combine `external_reward_weights` with `arguments.reward_weights` unless "
+                            "`arguments.reward_weights` has one entry per built-in verifier "
+                            f"(expected {verifier_count}, got {len(arguments.reward_weights)})."
+                        )
             elif arguments.reward_weights is not None and len(arguments.reward_weights) == len(verifiers):
                 # GRPO's reward_weights describes the complete ensemble. Also retain the legacy
                 # external-only form when the number of weights matches only the external rewards.
-                weights = list(arguments.reward_weights[:verifier_count])
-                user_weights = list(arguments.reward_weights[verifier_count:])
+                weights = [float(w) for w in arguments.reward_weights[:verifier_count]]
+                user_weights = [float(w) for w in arguments.reward_weights[verifier_count:]]
             else:
-                user_weights = list(
-                    arguments.reward_weights if arguments.reward_weights is not None else [1.0] * len(external_rewards)
-                )
-            if len(user_weights) != len(external_rewards):
-                raise ValueError(
-                    "The number of external reward weights must match the number of external reward functions."
-                )
+                user_weights = [
+                    float(w)
+                    for w in (
+                        arguments.reward_weights
+                        if arguments.reward_weights is not None
+                        else [1.0] * len(external_rewards)
+                    )
+                ]
+                if len(user_weights) != len(external_rewards):
+                    raise ValueError(
+                        "The number of external reward weights must match the number of external reward functions."
+                    )
             weights.extend(user_weights)
-        elif arguments.reward_weights is not None:
-            if len(arguments.reward_weights) != verifier_count:
-                raise ValueError("The number of reward weights must match the number of configured verifiers.")
-            weights = list(arguments.reward_weights)
+        else:
+            if external_reward_weights is not None and len(external_reward_weights) > 0:
+                raise ValueError("`external_reward_weights` was provided without any external reward functions.")
+            if arguments.reward_weights is not None:
+                if len(arguments.reward_weights) != verifier_count:
+                    raise ValueError("The number of reward weights must match the number of configured verifiers.")
+                weights = [float(w) for w in arguments.reward_weights]
 
         if not verifiers:
             raise ValueError(
@@ -270,7 +291,13 @@ class RLVRTrainer(GRPOTrainer):
             weights.append(config.format_reward_weight)
 
         if config.length_penalty_target is not None and config.length_penalty_weight > 0:
-            verifiers.append(LengthPenaltyVerifier(target_length=config.length_penalty_target))
+            verifiers.append(
+                LengthPenaltyVerifier(
+                    target_length=config.length_penalty_target,
+                    min_length=config.length_penalty_min_length,
+                    max_length=config.length_penalty_max_length,
+                )
+            )
             weights.append(config.length_penalty_weight)
 
         return verifiers, weights

@@ -23,6 +23,8 @@ from functools import partial
 import jax
 from jax import numpy as jnp
 
+from easydel.inference.sampling_processors import apply_sparse_sampling_constraints
+
 from ...core.binary_search import apply_topk_mask, apply_topk_mask_bf16, apply_topp_mask, apply_topp_mask_bf16
 from ...core.sampler import apply_history_penalties
 
@@ -61,14 +63,17 @@ def score_sampled_tokens(
     repetition_penalty,
     *,
     num_logprobs: int,
+    sparse_constraints=None,
 ):
-    """Score normal sampler output with its exact dtype, penalties and filters.
+    """Score normal sampler output with its exact dtype, constraints, penalties and filters.
 
     Parameter casts and filter order mirror SamplerExecutor and core.sampler:
-    history penalties, top-k, top-p, temperature, min-p. Greedy rows are a
-    point mass, so their emitted token has behavior log probability zero.
-    All probability reductions accumulate in float32.
+    sparse sampling constraints, history penalties, top-k, top-p, temperature,
+    min-p. Greedy rows are a point mass, so their emitted token has behavior
+    log probability zero. All probability reductions accumulate in float32.
     """
+    if sparse_constraints is not None:
+        logits = apply_sparse_sampling_constraints(logits, *sparse_constraints)
     active = jnp.ones((logits.shape[0],), dtype=jnp.bool_)
     logits = apply_history_penalties(
         logits,

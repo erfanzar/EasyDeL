@@ -614,13 +614,11 @@ class Llama4TextMoe(BaseMoeModule):
         """
         del training
 
-        shared_out = self.shared_expert(hidden_states)
-
         def ffn_activation(gate, up):
             """Llama4 SwiGLU expert nonlinearity: ``act_fn(gate) * up``."""
             return self.experts.act_fn(gate) * up
 
-        expert_out, router_logits = self.moe_call(
+        out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.router,
             expert_layer=self.experts,
@@ -629,9 +627,10 @@ class Llama4TextMoe(BaseMoeModule):
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             layer_idx=layer_idx,
+            shared_expert=self.shared_expert,
         )
 
-        final_output = checkpoint_name(shared_out + expert_out, "moe_expert_output")
+        final_output = checkpoint_name(out, "moe_expert_output")
         return final_output, checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
 
 

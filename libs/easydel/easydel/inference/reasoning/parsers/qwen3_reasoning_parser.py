@@ -70,35 +70,13 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Split a complete Qwen3 generation into reasoning and content.
 
-        Applies Qwen3's stricter tag rules before delegating to the base
-        ``<think>``/``</think>`` parser.
-
-        Args:
-            model_output: Full decoded text produced by the model.
-            request: Optional request context (unused here, accepted for
-                interface compatibility).
-
-        Returns:
-            Tuple ``(reasoning_content, visible_content)``. Either element
-            may be ``None`` when that portion is absent. When neither tag
-            is present and prompt-gated mode is off, the whole output is
-            returned as ``visible_content``.
+        Delegates to :class:`BaseThinkingReasoningParser`, which enforces
+        leading-only ``<think>`` detection (unless prompt context or
+        ``assume_reasoning`` indicates thinking already opened) and keeps
+        unfinished ``<think>...`` segments hidden as reasoning.
         """
-        if self.end_token not in model_output:
-            # If an explicit reasoning start tag is present, keep the whole
-            # unfinished segment hidden as reasoning rather than surfacing it
-            # as visible content.
-            if self.start_token in model_output or self._is_prompt_reasoning_active():
-                return super().extract_reasoning(model_output, request)
+        if not model_output:
             return None, model_output
-
-        # Missing start tag is only allowed when prompt context indicates
-        # reasoning already started in the prompt.
-        if self.start_token not in model_output:
-            if self._is_prompt_reasoning_active():
-                return super().extract_reasoning(model_output, request)
-            return None, model_output
-
         return super().extract_reasoning(model_output, request)
 
     def extract_reasoning_streaming(
@@ -113,35 +91,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     ) -> DeltaMessage | None:
         """Stream-aware reasoning extraction with Qwen3 strict-tag rules.
 
-        If no ``<think>`` start tag has been observed and prompt-gated
-        mode is inactive once the cumulative text exceeds the start tag's
-        length, the output is conclusively classified as content and
-        forwarded as such. Otherwise the base ``<think>``/``</think>``
-        streaming state machine handles the chunk.
-
-        Args:
-            previous_text: Cumulative text seen before this chunk.
-            current_text: Cumulative text including the new chunk.
-            delta_text: Newly produced text in the current chunk.
-            previous_token_ids: Token IDs prior to the chunk.
-            current_token_ids: Token IDs after the chunk has been added.
-            delta_token_ids: Token IDs corresponding to ``delta_text``.
-            request: Optional request context.
-
-        Returns:
-            A :class:`DeltaMessage` carrying ``reasoning_content`` and/or
-            ``content``, or ``None`` when only a boundary token arrived
-            and there is nothing meaningful to emit yet.
+        Delegates directly to :class:`BaseThinkingReasoningParser`, which
+        handles leading-only ``<think>`` detection, split-prefix withholding,
+        and monotonic ``_emitted_content`` tracking without dropping withheld
+        prefixes or replaying content when literal ``<think>`` appears mid-text.
         """
-        # Strict behavior: if no start tag is observed and we are not in prompt-aware
-        # asymmetric mode, treat streaming output as content.
-        if not self._is_prompt_reasoning_active():
-            has_start_in_current = self.start_token in current_text or (
-                self._start_token_id is not None and self._start_token_id in current_token_ids
-            )
-            if current_text and not has_start_in_current and len(current_text) > len(self.start_token):
-                return DeltaMessage(content=delta_text) if delta_text else None
-
         return super().extract_reasoning_streaming(
             previous_text,
             current_text,

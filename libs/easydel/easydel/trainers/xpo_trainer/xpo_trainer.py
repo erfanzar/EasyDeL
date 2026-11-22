@@ -95,7 +95,7 @@ class XPOTrainer(GRPOTrainer):
 
        where ``L_DPO`` is the standard ``"sigmoid"`` Bradley-Terry log-
        sigmoid surrogate (or the IPO squared-margin loss when
-       ``loss_type="ipo"``), ``L_exp`` is the negative mean policy
+       ``loss_type="ipo"``), ``L_exp`` is the summed policy
        log-probability of the *reference* completion, and both ``beta``
        and ``alpha`` come from the schedules in :class:`XPOConfig`.
 
@@ -180,7 +180,11 @@ class XPOTrainer(GRPOTrainer):
 
         self._beta_schedule = arguments.beta
         self._alpha_schedule = arguments.alpha
+        if arguments.loss_type not in ("sigmoid", "ipo"):
+            raise ValueError(f"Unsupported XPO `loss_type`: {arguments.loss_type!r}. Expected 'sigmoid' or 'ipo'.")
         self.loss_type_id = 0 if arguments.loss_type == "sigmoid" else 1
+        self._current_step = 0
+        self._eval_ref_graphdef = None
 
         if reward_funcs is not None:
             reward_funcs_list = (
@@ -190,7 +194,10 @@ class XPOTrainer(GRPOTrainer):
             )
             if len(reward_funcs_list) != 1:
                 raise ValueError("XPOTrainer only supports a single reward function/model.")
-            reward_funcs = reward_funcs_list
+            reward_funcs = [
+                drop_optimizer_state(rf) if isinstance(rf, EasyDeLState) else rf
+                for rf in reward_funcs_list
+            ]
 
         super().__init__(
             arguments=arguments,
@@ -204,6 +211,7 @@ class XPOTrainer(GRPOTrainer):
         # Only ref_state owns the frozen reference after initialization. In
         # particular, do not retain an explicit state's old optimizer slots.
         self._provided_reference_state = None
+        self._sync_current_step(getattr(self, "model_state", None))
 
     def _create_reference_state(self, model: EasyDeLState) -> EasyDeLState:
         """Resolve XPO's reference before GRPO configures auxiliary forwards.
@@ -212,7 +220,8 @@ class XPOTrainer(GRPOTrainer):
         and its exploration schedule is independent of beta.
         """
         if self._provided_reference_state is not None:
-            return drop_optimizer_state(self._provided_reference_state)
+            ref_state = drop_optimizer_state(self._provided_reference_state)
+            return self._share_esurge_cache_scope_if_compatible(ref_state, primary_state=model)
         return copy_frozen_policy(model)
 
     def _get_reward_processing_classes(self) -> list[ProcessingClassType | None]:
@@ -240,12 +249,25 @@ class XPOTrainer(GRPOTrainer):
             return list(reward_processing_classes)
         return [reward_processing_classes] * len(self.reward_funcs)
 
-    def _schedule_value(self, schedule: tp.Any, default: float) -> float:
+    def _sync_current_step(self, state: EasyDeLState | None) -> None:
+        """Record the host-side step counter from a live (non-donated) state."""
+        step = getattr(state, "step", None)
+        if step is None:
+            return
+        try:
+            self._current_step = int(jax.device_get(step))
+        except Exception:
+            pass
+
+    def _schedule_value(self, schedule: tp.Any, default: float, *, step: int | None = None) -> float:
         """Resolve a scheduled value based on current training progress.
 
         Args:
             schedule: Either a float value or sequence of floats for epoch-wise scheduling.
             default: Default value to use if schedule is empty or None.
+            step: Optional explicit step override; defaults to the host-side
+                ``_current_step`` counter (avoiding reads on donated
+                ``self.model_state.step`` buffers).
 
         Returns:
             Current scheduled value based on training progress.
@@ -256,10 +278,33 @@ class XPOTrainer(GRPOTrainer):
             if self.max_training_steps is None or self.arguments.num_train_epochs <= 0:
                 return float(schedule[0])
             steps_per_epoch = max(self.max_training_steps // self.arguments.num_train_epochs, 1)
-            step = int(jax.device_get(self.model_state.step)) if self.model_state is not None else 0
-            idx = min(step // steps_per_epoch, len(schedule) - 1)
+            current_step = int(getattr(self, "_current_step", 0)) if step is None else int(step)
+            idx = min(max(current_step, 0) // steps_per_epoch, len(schedule) - 1)
             return float(schedule[idx])
         return float(schedule if schedule is not None else default)
+
+    def _configure_eval_config_override(self):
+        """Apply evaluation config overrides to the reference forward as well."""
+        super()._configure_eval_config_override()
+        self._eval_ref_graphdef = None
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is not None and overrides and self.ref_state is not None:
+            ref_graphstate = self.ref_state.graphstate
+            if hasattr(ref_graphstate, "items"):
+                selected_keys = {(collection, path) for collection, path, _ in ref_graphstate.items()}
+
+                def ref_selector(v, path):
+                    return (v.kind, path) in selected_keys
+            else:
+                ref_selector = None
+            self._eval_ref_graphdef = self._build_config_override_graphdef(
+                model=self.ref_state.model,
+                overrides=overrides,
+                reference_graphstate=ref_graphstate,
+                trainable_selector=ref_selector,
+                label="eval_config_overrides (reference)",
+                eval_mode=True,
+            )
 
     def _current_beta_value(self) -> float:
         """Get the current beta (KL penalty scaling) value based on training progress.
@@ -356,9 +401,10 @@ class XPOTrainer(GRPOTrainer):
         )
         self._runtime_trace("train.compile_wrapper.end")
         self._runtime_trace("eval.compile_wrapper.begin")
+        eval_ref_state = self._eval_shared_fn_extra_args[0]
         sharded_evaluation_step_function = compile_trainer_step(
             xpo_step,
-            in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
+            in_shardings=(self.eval_state_shardings, empty_sharding, eval_ref_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
             mesh=self.model.mesh,
@@ -515,6 +561,7 @@ class XPOTrainer(GRPOTrainer):
             all necessary tensors for the XPO step and metrics_dict contains
             generation times, rewards, and other preprocessing metrics.
         """
+        self._sync_current_step(state)
         batch = self._apply_user_data_collator(batch)
         # Purify batch first to handle list of dicts (uncollated batch)
         batch = self._purify_batch(batch)
@@ -547,11 +594,15 @@ class XPOTrainer(GRPOTrainer):
                 ref_completion_mask = policy_completion_mask
                 ref_generation_time = 0.0
             else:
+                active_ref_state = self.ref_state
+                eval_ref_graphdef = getattr(self, "_eval_ref_graphdef", None)
+                if not is_train and eval_ref_graphdef is not None and active_ref_state is not None:
+                    active_ref_state = active_ref_state.replace(graphdef=eval_ref_graphdef)
                 with capture_time() as ref_time_fn:
                     ref_results = self.rollout(
                         input_ids=prompt_ids,
                         attention_mask=prompt_mask,
-                        state=self.ref_state,
+                        state=active_ref_state,
                         apply_chat_template=False,
                         shard_inputs=False,
                         all_gather=False,
@@ -661,11 +712,16 @@ class XPOTrainer(GRPOTrainer):
                 ref_scores = ref_scores - jnp.where(ref_eos, 0.0, penalty)
 
         chosen_mask = policy_scores >= ref_scores
+        chosen_scores = jnp.where(chosen_mask, policy_scores, ref_scores)
+        rejected_scores = jnp.where(chosen_mask, ref_scores, policy_scores)
 
         metrics_dict: dict[str, float | int | str] = {
-            "rewards/chosen": _host_mean_float(policy_scores),
-            "rewards/rejected": _host_mean_float(ref_scores),
+            "rewards/chosen": _host_mean_float(chosen_scores),
+            "rewards/rejected": _host_mean_float(rejected_scores),
+            "rewards/policy": _host_mean_float(policy_scores),
+            "rewards/reference": _host_mean_float(ref_scores),
             "rewards/margins": _host_mean_float(policy_scores - ref_scores),
+            "rewards/chosen_margins": _host_mean_float(chosen_scores - rejected_scores),
             "policy_generation_time": policy_generation_time,
             "reference_generation_time": ref_generation_time,
             "preprocessing_time": preprocessing_time,
@@ -674,28 +730,31 @@ class XPOTrainer(GRPOTrainer):
         }
         for name, value in reward_breakdown.items():
             metrics_dict[f"reward/{name}"] = _host_mean_float(value)
-        self._log_training_generations_to_wandb(
-            state=state,
-            prompts=prompt_texts if prompt_texts is not None else prompt_ids,
-            prompt_mask=None if prompt_texts is not None else prompt_mask,
-            completions=policy_texts,
-            completion_mask=policy_completion_mask,
-            generation_time=policy_generation_time,
-            reasoning=policy_reasoning,
-            tool_calls=policy_tool_calls,
-            source="policy",
-        )
-        self._log_training_generations_to_wandb(
-            state=state,
-            prompts=prompt_texts if prompt_texts is not None else prompt_ids,
-            prompt_mask=None if prompt_texts is not None else prompt_mask,
-            completions=ref_texts,
-            completion_mask=ref_completion_mask,
-            generation_time=ref_generation_time,
-            reasoning=ref_reasoning,
-            tool_calls=ref_tool_calls,
-            source="reference",
-        )
+        if is_train:
+            self._log_training_generations_to_wandb(
+                state=state,
+                prompts=prompt_texts if prompt_texts is not None else prompt_ids,
+                prompt_mask=None if prompt_texts is not None else prompt_mask,
+                completions=policy_texts,
+                completion_ids=policy_completion_ids,
+                completion_mask=policy_completion_mask,
+                generation_time=policy_generation_time,
+                reasoning=policy_reasoning,
+                tool_calls=policy_tool_calls,
+                source="policy",
+            )
+            self._log_training_generations_to_wandb(
+                state=state,
+                prompts=prompt_texts if prompt_texts is not None else prompt_ids,
+                prompt_mask=None if prompt_texts is not None else prompt_mask,
+                completions=ref_texts,
+                completion_ids=ref_completion_ids,
+                completion_mask=ref_completion_mask,
+                generation_time=ref_generation_time,
+                reasoning=ref_reasoning,
+                tool_calls=ref_tool_calls,
+                source="reference",
+            )
 
         processed_batch = {
             "prompt_ids": self._all_gather(prompt_ids),
@@ -724,5 +783,14 @@ class XPOTrainer(GRPOTrainer):
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
-        """Forward the live reference state alongside the shared evaluation step."""
-        return (self.ref_state,)
+        """Forward the live reference state (with eval graphdef when active)."""
+        ref_state = self.ref_state
+        graphdef = getattr(self, "_eval_ref_graphdef", None)
+        if graphdef is not None and ref_state is not None:
+            ref_state = ref_state.replace(graphdef=graphdef)
+        return (ref_state,)
+
+    def on_step_end(self, state: EasyDeLState, metrics, step: int):
+        """Track host-side step progress and delegate reference syncing to GRPO."""
+        self._current_step = int(step)
+        return super().on_step_end(state=state, metrics=metrics, step=step)

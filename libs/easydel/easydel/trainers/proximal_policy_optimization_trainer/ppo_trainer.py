@@ -53,7 +53,8 @@ from .._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
-from .._shared import copy_frozen_policy
+from .._shared import copy_frozen_policy, drop_optimizer_state
+from .._shared.policy_losses import _MAX_SAFE_LOG_RATIO, _MIN_SAFE_LOG_RATIO
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
@@ -249,7 +250,7 @@ class PPOTrainer(Trainer):
             if isinstance(reward_func, EasyDeLBaseModule | EasyDeLState):
                 if isinstance(reward_func, EasyDeLBaseModule):
                     reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
-                reward_func = normalize_reward_state(reward_func)
+                reward_func = drop_optimizer_state(normalize_reward_state(reward_func))
 
                 if reward_processing_class is None:
                     reward_processing_class = AutoTokenizer.from_pretrained(reward_func.model.config._name_or_path)
@@ -503,14 +504,14 @@ class PPOTrainer(Trainer):
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
-            self.arguments.gradient_accumulation_steps,
+            1,
             False,  # is_train
             straight_through_emulator,
         )
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             ppo_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
             mesh=self.model.mesh,
@@ -557,15 +558,20 @@ class PPOTrainer(Trainer):
                     ignore_mpmd=True,
                 )
                 target_ids = ids[:, prompt_length:]
-                call_kwargs = {"input_ids": ids, "attention_mask": mask}
+                call_kwargs: dict[str, tp.Any] = {"input_ids": ids, "attention_mask": mask}
                 lmhead_chunksize = resolve_lmhead_chunksize(apply)
                 if lmhead_chunksize is not None:
                     call_kwargs["apply_lm_head"] = False
+                    call_kwargs["output_hidden_states"] = True
                 outputs = apply(**call_kwargs)
                 if outputs.logits is None and lmhead_chunksize is not None:
-                    hidden_states = outputs.last_hidden_state
+                    hidden_states = getattr(outputs, "last_hidden_state", None)
                     if hidden_states is None:
-                        raise ValueError("Reference model outputs do not provide last_hidden_state for PPO scoring.")
+                        all_hidden_states = getattr(outputs, "hidden_states", None)
+                        if all_hidden_states is not None:
+                            hidden_states = all_hidden_states[-1]
+                    if hidden_states is None:
+                        raise ValueError("Reference model outputs do not provide hidden states for PPO scoring.")
                     score_hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
                     token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
                         apply,
@@ -710,6 +716,45 @@ class PPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _should_run_evaluation(self, current_step: int) -> bool:
+        """Trigger evaluation even if multi-epoch PPO steps jumped over an exact multiple."""
+        eval_steps = self.arguments.evaluation_steps
+        if eval_steps is None or eval_steps <= 0 or current_step <= 0:
+            return False
+        prev_step = getattr(self, "_last_train_step_prev", None)
+        if prev_step is not None and current_step > prev_step:
+            return (current_step // eval_steps) > (prev_step // eval_steps)
+        return (current_step % eval_steps) == 0
+
+    def _save_checkpoint_for_step(
+        self,
+        state: EasyDeLState,
+        *,
+        step: int,
+        force: bool = False,
+        merge_lora_before_save: bool = False,
+    ) -> str | None:
+        """Ensure ``save_steps`` milestones crossed during multi-epoch PPO updates still save."""
+        if not force:
+            save_steps = getattr(self.arguments, "save_steps", None)
+            prev_step = getattr(self, "_last_train_step_prev", None)
+            if (
+                save_steps is not None
+                and save_steps > 0
+                and step > 0
+                and prev_step is not None
+                and step > prev_step
+                and (step % save_steps) != 0
+                and (step // save_steps) > (prev_step // save_steps)
+            ):
+                force = True
+        return super()._save_checkpoint_for_step(
+            state=state,
+            step=step,
+            force=force,
+            merge_lora_before_save=merge_lora_before_save,
+        )
+
     def _execute_train_step(
         self,
         state: EasyDeLState,
@@ -717,6 +762,7 @@ class PPOTrainer(Trainer):
     ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
         """Execute one PPO update, including multiple PPO epochs when configured."""
         if self.arguments.num_ppo_epochs == 1:
+            self._last_train_step_prev = int(jax.device_get(state.step))
             return super()._execute_train_step(state=state, batch=batch)
 
         if self.pruning_module is not None:
@@ -740,7 +786,14 @@ class PPOTrainer(Trainer):
                 information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
             )
 
-            for ppo_epoch in range(self.arguments.num_ppo_epochs):
+            prev_step = int(jax.device_get(state.step))
+            self._last_train_step_prev = prev_step
+            epochs_to_run = max(int(self.arguments.num_ppo_epochs), 1)
+            max_steps = getattr(self, "max_training_steps", None)
+            if max_steps is not None and prev_step < int(max_steps):
+                epochs_to_run = min(epochs_to_run, int(max_steps) - prev_step)
+
+            for ppo_epoch in range(epochs_to_run):
                 self._runtime_trace("execute_train_step.compiled_call.begin", ppo_epoch=ppo_epoch)
                 state, metrics = jax.block_until_ready(
                     self.sharded_training_step_function(
@@ -1188,14 +1241,19 @@ class PPOTrainer(Trainer):
                 has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
                 scores = scores - (~has_eos).astype(scores.dtype) * float(self.arguments.missing_eos_penalty)
 
+            mask_bool = completion_mask.astype(jnp.bool_)
+            old_logps = jnp.where(mask_bool, old_logps.astype(jnp.float32), 0.0)
+            old_values = jnp.where(mask_bool, old_values.astype(jnp.float32), 0.0)
             if ref_per_token_logps is None:
                 kl = jnp.zeros_like(old_logps)
             else:
-                logr = ref_per_token_logps - old_logps
+                ref_per_token_logps = jnp.where(mask_bool, ref_per_token_logps.astype(jnp.float32), 0.0)
+                logr = jnp.where(mask_bool, ref_per_token_logps - old_logps, 0.0)
                 if self.arguments.kl_estimator == "k1":
                     kl = -logr
                 else:
-                    kl = jnp.exp(logr) - 1.0 - logr
+                    safe_logr = jnp.clip(logr, _MIN_SAFE_LOG_RATIO, _MAX_SAFE_LOG_RATIO)
+                    kl = jnp.where(mask_bool, jnp.exp(safe_logr) - 1.0 - logr, 0.0)
             non_score_reward = -float(self.arguments.kl_coef) * kl
             rewards = non_score_reward
 

@@ -127,9 +127,15 @@ class PageTable:
         if not page_ids:
             return
         num_pages = len(page_ids)
-        start = self.num_pages_per_row[row_idx]
-        self.num_pages_per_row[row_idx] += num_pages
-        self.page_table_cpu[row_idx, start : start + num_pages] = page_ids
+        start = int(self.num_pages_per_row[row_idx])
+        end = start + num_pages
+        if end > self.max_num_pages_per_req:
+            raise ValueError(
+                f"Cannot append {num_pages} pages to row {row_idx} at offset {start}: "
+                f"exceeds max_num_pages_per_req ({self.max_num_pages_per_req})."
+            )
+        self.page_table_cpu[row_idx, start:end] = page_ids
+        self.num_pages_per_row[row_idx] = end
         self.cpu_version += 1
 
     def clear_row(self, row_idx: int) -> None:

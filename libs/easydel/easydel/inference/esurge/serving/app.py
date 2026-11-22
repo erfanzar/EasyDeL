@@ -122,9 +122,14 @@ def build_loading_kwargs(
 
 
 def build_engine_sections(
-    config: ServingConfig, *, world_size: int, token: str | None, control_bind_host: str | None
+    config: ServingConfig,
+    *,
+    world_size: int,
+    token: str | None,
+    control_bind_host: str | None,
+    enable_request_plane: bool = False,
 ) -> dict[str, tp.Any]:
-    """Per-section eSurge kwargs; adds the ZMQ ``distributed`` section for a multi-host world.
+    """Per-section eSurge kwargs; adds the ZMQ ``distributed`` section for multi-host worlds or request-plane replicas.
 
     Raises:
         ValueError: On an ``esurge`` section eSurge does not accept here.
@@ -133,9 +138,9 @@ def build_engine_sections(
     if unknown:
         raise ValueError(f"`esurge` has unknown sections {unknown}; allowed: {sorted(ENGINE_SECTIONS)}")
     sections = {name: dict(value or {}) for name, value in config.esurge.items()}
-    if world_size > 1:
+    if world_size > 1 or enable_request_plane:
         if not token or not control_bind_host:
-            raise ValueError("a multi-host world needs a coordination token and a control bind host")
+            raise ValueError("a multi-host world or request-plane replica needs a coordination token and a control bind host")
         sections["distributed"] = {
             "coordination": "zmq",
             "distributed_auth_token": token,
@@ -252,6 +257,29 @@ def _split_into_replicas(config: ServingConfig, rank: int, token: str | None, ed
     reexec_into_replica(plan, env, token)
 
 
+def _terminate_fronts(fronts: tp.Mapping[int, tp.Any], *, timeout_s: float = 10.0) -> None:
+    """Terminate and reap spawned front subprocesses so none stay orphaned holding SO_REUSEPORT."""
+    import subprocess
+
+    live = [front for front in fronts.values() if front is not None and front.poll() is None]
+    for front in live:
+        try:
+            front.terminate()
+        except OSError:
+            pass
+    deadline = time.monotonic() + float(timeout_s)
+    for front in live:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            front.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            try:
+                front.kill()
+                front.wait(timeout=5.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
 def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
     if plan is not None and plan.is_front:
         _serve_front(config, plan)
@@ -299,7 +327,13 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
     text_config = None
     if config.model.quantization is not None and config.model.quantization.pattern is None:
         text_config = ed.AutoEasyDeLConfig.from_pretrained(config.model.checkpoint).get_text_config()
-    sections = build_engine_sections(config, world_size=world_size, token=token, control_bind_host=control_host)
+    sections = build_engine_sections(
+        config,
+        world_size=world_size,
+        token=token,
+        control_bind_host=control_host,
+        enable_request_plane=(plan is not None),
+    )
     if plan is None:
         loading = build_loading_kwargs(config, text_config, ed=ed)
     else:
@@ -319,11 +353,12 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
             _log(rank, f"replica {plan.index} model-step ms per token bucket: {steps}")
     dashboard = None
     front_socket_dir = ""
+    fronts: dict[int, tp.Any] = {}
+    keep_fronts_alive = False
     try:
         if plan is not None and engine.is_coordination_leader:
             # A replica leader: the front's router reaches its engine over its request plane.
             _log(rank, f"replica {plan.index} leader serving its request plane on {control_host}")
-            fronts: dict[int, tp.Any] = {}
             started_at: dict[int, float] = {}
             restarts: dict[int, int] = {}
             due: dict[int, float] = {}
@@ -347,7 +382,7 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
                 )
                 # The fronts share this host and port; the dashboard reads their merged /metrics.
                 dashboard = start_dashboard(config, resolve_bind_host(config.server.host), rank)
-            while True:
+            while getattr(engine, "alive", True):
                 now = time.monotonic()
                 for index, front in list(fronts.items()):
                     if front is None:
@@ -369,6 +404,17 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
                     )
                     fronts[index], due[index] = None, now + wait
                 time.sleep(1.0)
+            # Engine stopped/died (not SIGTERM). Keep already-running fronts decoupled per replicas.py so they
+            # continue routing to the remaining healthy replicas, and preserve front_socket_dir for their /metrics.
+            if any(front is not None and front.poll() is None for front in fronts.values()):
+                keep_fronts_alive = True
+                _log(
+                    rank,
+                    f"replica {plan.index} engine is no longer alive; leaving running fronts up to serve remaining replicas",
+                )
+            else:
+                _log(rank, f"replica {plan.index} engine is no longer alive; exiting leader loop")
+            return
         if not engine.is_coordination_leader:
             try:
                 engine.wait_for_shutdown()
@@ -383,7 +429,9 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
     finally:
         if dashboard is not None:
             dashboard.stop()
-        if front_socket_dir:
+        if fronts and not keep_fronts_alive:
+            _terminate_fronts(fronts)
+        if front_socket_dir and not keep_fronts_alive:
             import shutil
 
             shutil.rmtree(front_socket_dir, ignore_errors=True)
@@ -403,13 +451,16 @@ def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
     attacher = ReplicaAttacher(
         replica_candidates(plan), connect=_replica_connector(config, token), log=lambda m: _log(0, f"{tag}: {m}")
     )
-    routed = attacher.wait_for_first()
-    attacher.start()
+    routed = None
     try:
+        routed = attacher.wait_for_first()
+        attacher.start()
         _serve_http(config, routed, 0, ed, front=(plan.front_index, FRONT_PROCESSES, plan.front_socket_dir))
     finally:
         attacher.stop()
-        routed.close()
+        router = routed or attacher.router
+        if router is not None:
+            router.close()
 
 
 def replica_candidates(plan: tp.Any) -> tuple[tuple[str, ...], ...]:
@@ -430,44 +481,93 @@ def port_open(addr: str, port: int, timeout_s: float = 1.0) -> bool:
         return False
 
 
-def _served_model_type(config: ServingConfig) -> str | None:
+def _checkpoint_model_type(checkpoint: str | None) -> str | None:
     """The checkpoint's (text) ``model_type``, the parser auto-detection hint; ``None`` when it cannot be read."""
+    if not checkpoint:
+        return None
     try:
         import easydel as ed
 
-        return getattr(
-            ed.AutoEasyDeLConfig.from_pretrained(config.model.checkpoint).get_text_config(), "model_type", None
-        )
+        return getattr(ed.AutoEasyDeLConfig.from_pretrained(checkpoint).get_text_config(), "model_type", None)
     except Exception as exc:
         _log(0, f"could not read the checkpoint's model_type for parser auto-detection: {exc!r}")
         return None
 
 
-def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], tp.Any]:
-    """Open a request-plane client to one replica leader; raises ``RequestPlaneUnavailable`` while it is not up."""
+def _served_model_type(config: ServingConfig) -> str | None:
+    """The checkpoint's (text) ``model_type``, the parser auto-detection hint; ``None`` when it cannot be read."""
+    return _checkpoint_model_type(config.model.checkpoint)
+
+
+def make_replica_connector(
+    *,
+    control_port: int,
+    token: str,
+    tokenizer_source: str | None,
+    tool_parser: str | None = None,
+    reasoning_parser: str | None = None,
+    model_type: str | None = None,
+    connect_timeout_s: float = 10.0,
+) -> tp.Callable[[str], tp.Any]:
+    """Build a request-plane connector with fast TCP probing and tool/reasoning parser forwarding."""
     from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
     from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
 
-    # The front renders every reply itself, so it runs the same tool/reasoning parsers the engines would.
-    parsing = dict(config.esurge.get("parsing") or {})
-    model_type = _served_model_type(config)
+    port = int(control_port)
 
     def connect(addr: str) -> tp.Any:
         # Only a replica's engine leader listens on the control port; skip the others without a handshake wait.
-        if not port_open(addr, config.coordination.control_port):
-            raise RequestPlaneUnavailable(f"nothing listening on {addr}:{config.coordination.control_port}")
+        if not port_open(addr, port):
+            raise RequestPlaneUnavailable(f"nothing listening on {addr}:{port}")
         return RemoteEngineHandle(
             addr,
-            config.coordination.control_port,
+            port,
             auth_token=str(token),
-            tokenizer_source=config.model.tokenizer_source,
-            connect_timeout_s=10.0,
-            tool_parser=parsing.get("tool_parser"),
-            reasoning_parser=parsing.get("reasoning_parser"),
+            tokenizer_source=tokenizer_source,
+            connect_timeout_s=float(connect_timeout_s),
+            tool_parser=tool_parser,
+            reasoning_parser=reasoning_parser,
             model_type=model_type,
         )
 
     return connect
+
+
+def elarge_replica_connector(
+    cfg: tp.Mapping[str, tp.Any], *, control_port: int, token: str
+) -> tp.Callable[[str], tp.Any]:
+    """Open a request-plane client for an eLarge ``build_esurge(cfg)`` DP-replica launch."""
+    from easydel.infra.elarge.builders import normalize_esurge_sections
+
+    model = cfg.get("model") or {}
+    checkpoint = model.get("name_or_path")
+    tokenizer_source = model.get("tokenizer") or checkpoint
+    sections = normalize_esurge_sections(cfg.get("esurge"))
+    parsing = dict(sections.get("parsing") or {})
+    model_type = model.get("model_type") or _checkpoint_model_type(checkpoint)
+    return make_replica_connector(
+        control_port=control_port,
+        token=token,
+        tokenizer_source=tokenizer_source,
+        tool_parser=parsing.get("tool_parser"),
+        reasoning_parser=parsing.get("reasoning_parser"),
+        model_type=model_type,
+    )
+
+
+def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], tp.Any]:
+    """Open a request-plane client to one replica leader; raises ``RequestPlaneUnavailable`` while it is not up."""
+    # The front renders every reply itself, so it runs the same tool/reasoning parsers the engines would.
+    parsing = dict(config.esurge.get("parsing") or {})
+    model_type = _served_model_type(config)
+    return make_replica_connector(
+        control_port=config.coordination.control_port,
+        token=token,
+        tokenizer_source=config.model.tokenizer_source,
+        tool_parser=parsing.get("tool_parser"),
+        reasoning_parser=parsing.get("reasoning_parser"),
+        model_type=model_type,
+    )
 
 
 class ReplicaAttacher:
@@ -507,12 +607,24 @@ class ReplicaAttacher:
         self._slots: dict[int, int] = {}  # replica index -> router member index
         self.router: tp.Any | None = None
         self._stop = threading.Event()
+        self._state_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _close_handle(handle: tp.Any) -> None:
+        close = getattr(handle, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
 
     def _try(self, index: int) -> tp.Any | None:
         from easydel.inference.esurge.distributed.request_plane import RequestPlaneError, RequestPlaneUnavailable
 
         for addr in self.candidates[index]:
+            if self._stop.is_set():
+                return None
             try:
                 handle = self._connect(addr)
             except RequestPlaneUnavailable:
@@ -521,6 +633,9 @@ class ReplicaAttacher:
                 # Up but refusing (its world failed and the process has not exited yet): try again next round.
                 self._log(f"replica {index} at {addr} refused: {exc}")
                 continue
+            if self._stop.is_set():
+                self._close_handle(handle)
+                return None
             self.leaders[index] = addr
             return handle
         return None
@@ -531,6 +646,8 @@ class ReplicaAttacher:
 
         attached = 0
         for index in range(len(self.leaders)):
+            if self._stop.is_set():
+                break
             slot = self._slots.get(index)
             old = None if slot is None or self.router is None else self.router.members[slot]
             if old is not None and getattr(old, "alive", True):
@@ -538,17 +655,29 @@ class ReplicaAttacher:
             handle = self._try(index)
             if handle is None:
                 continue
-            if self.router is None:
-                factory = self._router_factory or RoutedEngine
-                self.router = factory([handle], planned_members=len(self.leaders))
-                self._slots[index] = 0
-            elif slot is None:
-                self._slots[index] = self.router.add_member(handle)
-            else:
-                self.router.replace_member(slot, handle)
-                close = getattr(old, "close", None)
-                if close is not None:
-                    close()
+            to_close = None
+            with self._state_lock:
+                if self._stop.is_set():
+                    to_close = handle
+                else:
+                    try:
+                        if self.router is None:
+                            factory = self._router_factory or RoutedEngine
+                            self.router = factory([handle], planned_members=len(self.leaders))
+                            self._slots[index] = 0
+                        elif slot is None:
+                            self._slots[index] = self.router.add_member(handle)
+                        else:
+                            self.router.replace_member(slot, handle)
+                            to_close = old
+                    except BaseException:
+                        self._close_handle(handle)
+                        raise
+            if to_close is handle:
+                self._close_handle(handle)
+                break
+            if to_close is not None:
+                self._close_handle(to_close)
             attached += 1
             verb = "re-attached" if old is not None else "attached"
             self._log(f"replica {index} {verb} at {self.leaders[index]} ({len(self._slots)}/{len(self.leaders)})")
@@ -582,7 +711,8 @@ class ReplicaAttacher:
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
+        with self._state_lock:
+            self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=30.0)
 
@@ -593,11 +723,15 @@ def reuse_port_socket(host: str, port: int) -> tp.Any:
 
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind((host, int(port)))
-    sock.listen(2048)
-    return sock
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind((host, int(port)))
+        sock.listen(2048)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
 
 
 def _serve_http(
@@ -650,44 +784,52 @@ def _serve_http(
     from .dashboard import FrontMetricsMiddleware, bind_unix_socket, front_socket_path
 
     index, count, socket_dir = front
-    sock = reuse_port_socket(host, config.server.port)
-    listeners = [sock]
-    if socket_dir:
-        own_socket = front_socket_path(socket_dir, index)
-        listeners.append(bind_unix_socket(own_socket))
-        peers = [front_socket_path(socket_dir, i) for i in range(count)]
-    else:
-        # A leader that handed over no socket directory: serve, with /metrics covering this front only.
-        _log(0, f"front {index}: no private socket directory in the plan; /metrics covers this front only")
-        own_socket, peers = "", []
-    engine_name = engine.esurge_name
-
-    def request_rows(_served_name: str) -> list[dict]:
-        collector = get_metrics_collector()
-        return [] if collector is None else collector.request_rows(engine_name, window_seconds=_METRICS_WINDOW_S)
-
-    app = FrontMetricsMiddleware(
-        server.app,
-        own_socket=own_socket,
-        sockets=peers,
-        local_metrics=server.metrics_payload,
-        request_rows=request_rows,
-        window_seconds=_METRICS_WINDOW_S,
-    )
+    listeners: list[tp.Any] = []
     try:
-        import uvloop
+        sock = reuse_port_socket(host, config.server.port)
+        listeners.append(sock)
+        if socket_dir:
+            own_socket = front_socket_path(socket_dir, index)
+            listeners.append(bind_unix_socket(own_socket))
+            peers = [front_socket_path(socket_dir, i) for i in range(count)]
+        else:
+            # A leader that handed over no socket directory: serve, with /metrics covering this front only.
+            _log(0, f"front {index}: no private socket directory in the plan; /metrics covers this front only")
+            own_socket, peers = "", []
+        engine_name = engine.esurge_name
 
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
-        pass
-    uv_config = uvicorn.Config(
-        app,
-        log_level=config.server.log_level,
-        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-        server_header=False,
-        date_header=True,
-    )
-    uvicorn.Server(uv_config).run(sockets=listeners)
+        def request_rows(_served_name: str) -> list[dict]:
+            collector = get_metrics_collector()
+            return [] if collector is None else collector.request_rows(engine_name, window_seconds=_METRICS_WINDOW_S)
+
+        app = FrontMetricsMiddleware(
+            server.app,
+            own_socket=own_socket,
+            sockets=peers,
+            local_metrics=server.metrics_payload,
+            request_rows=request_rows,
+            window_seconds=_METRICS_WINDOW_S,
+        )
+        try:
+            import uvloop
+
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        except ImportError:
+            pass
+        uv_config = uvicorn.Config(
+            app,
+            log_level=config.server.log_level,
+            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+            server_header=False,
+            date_header=True,
+        )
+        uvicorn.Server(uv_config).run(sockets=listeners)
+    finally:
+        for listener in listeners:
+            try:
+                listener.close()
+            except OSError:
+                pass
 
 
 def start_dashboard(config: ServingConfig, host: str, rank: int) -> tp.Any:

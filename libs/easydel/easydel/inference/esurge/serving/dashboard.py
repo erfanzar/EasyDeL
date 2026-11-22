@@ -116,15 +116,17 @@ def find_dashboard_binary(
 
 
 def _host_port(host: str, port: int) -> str:
-    return f"[{host}]:{int(port)}" if ":" in host else f"{host}:{int(port)}"
+    bare = host.strip("[]")
+    return f"[{bare}]:{int(port)}" if ":" in bare else f"{bare}:{int(port)}"
 
 
 def _port_free(host: str, port: int) -> bool:
     """Whether ``host:port`` can be bound right now (nothing else listens there)."""
-    probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+    bare = host.strip("[]") or "0.0.0.0"
+    probe = socket.socket(socket.AF_INET6 if ":" in bare else socket.AF_INET, socket.SOCK_STREAM)
     try:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind((host, int(port)))
+        probe.bind((bare, int(port)))
         return True
     except OSError:
         return False
@@ -181,9 +183,16 @@ class DashboardSupervisor:
         max_backoff_s: float = DASHBOARD_MAX_BACKOFF_S,
         missing_retry_s: float = DASHBOARD_MISSING_RETRY_S,
     ) -> None:
-        upstream_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-        self.host, self.port = host, int(port)
-        self.listen = _host_port(host, port)
+        bare = str(host).strip().strip("[]")
+        listen_host = bare or "0.0.0.0"
+        if bare == "::":
+            upstream_host = "::1"
+        elif bare in {"0.0.0.0", ""}:
+            upstream_host = "127.0.0.1"
+        else:
+            upstream_host = bare
+        self.host, self.port = listen_host, int(port)
+        self.listen = _host_port(listen_host, port)
         self.upstream = f"http://{_host_port(upstream_host, endpoint_port)}"
         self._log = log
         self._find_binary = find_binary
@@ -283,10 +292,19 @@ def bind_unix_socket(path: str) -> socket.socket:
     if os.path.lexists(path):
         os.unlink(path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(path)
-    os.chmod(path, 0o600)
-    sock.listen(64)
-    return sock
+    try:
+        sock.bind(path)
+        os.chmod(path, 0o600)
+        sock.listen(64)
+        return sock
+    except BaseException:
+        sock.close()
+        try:
+            if os.path.lexists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 def merge_front_metrics(
@@ -303,7 +321,10 @@ def merge_front_metrics(
     row_fields = {field.name for field in dataclasses.fields(RequestMetrics)}
     merged: dict[str, tp.Any] = {
         "uptime_seconds": max((float(p.get("uptime_seconds") or 0.0) for p in payloads), default=0.0),
-        "status": next((p["status"] for p in payloads if p.get("status") == "ready"), payloads[0].get("status")),
+        "status": next(
+            (p["status"] for p in payloads if p.get("status") == "ready"),
+            payloads[0].get("status") if payloads else None,
+        ),
         "models_loaded": max((int(p.get("models_loaded") or 0) for p in payloads), default=0),
         "fronts": len(payloads),
         "fronts_expected": len(payloads) if expected is None else int(expected),
@@ -361,10 +382,14 @@ async def _fetch_peer(path: str) -> dict | None:
     reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), _PEER_TIMEOUT_S)
     try:
         writer.write(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        await writer.drain()
+        await asyncio.wait_for(writer.drain(), _PEER_TIMEOUT_S)
         raw = await asyncio.wait_for(reader.read(), _PEER_TIMEOUT_S)
     finally:
         writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), _PEER_TIMEOUT_S)
+        except Exception:
+            pass
     head, _, body = raw.partition(b"\r\n\r\n")
     if head.split(b" ", 2)[1:2] != [b"200"]:
         return None
@@ -454,8 +479,26 @@ class FrontMetricsMiddleware:
             return
         peers = [path for path in self.sockets if path != self.own_socket]
         results = await asyncio.gather(*(_fetch_peer(path) for path in peers), return_exceptions=True)
+        include_auth_stats = "auth_stats" in own
+        own_engines = own.get("engine_metrics") if isinstance(own.get("engine_metrics"), dict) else None
         payloads = [self._with_rows(own)] + [r for r in results if isinstance(r, dict)]
-        merged = _dumps(merge_front_metrics(payloads, window_seconds=self.window_seconds, expected=len(self.sockets)))
+        expected = max(len(self.sockets), len(payloads))
+        merged_dict = merge_front_metrics(payloads, window_seconds=self.window_seconds, expected=expected)
+        if not include_auth_stats:
+            merged_dict.pop("auth_stats", None)
+        if own_engines is not None and isinstance(merged_dict.get("engine_metrics"), dict):
+            filtered_engines: dict[str, tp.Any] = {}
+            for name, own_view in own_engines.items():
+                merged_view = merged_dict["engine_metrics"].get(name)
+                if not isinstance(merged_view, dict):
+                    continue
+                if isinstance(own_view, dict) and "recent_requests" not in own_view:
+                    merged_view = {k: v for k, v in merged_view.items() if k != "recent_requests"}
+                filtered_engines[name] = merged_view
+            merged_dict["engine_metrics"] = filtered_engines
+            if "models_loaded" in own:
+                merged_dict["models_loaded"] = len(filtered_engines)
+        merged = _dumps(merged_dict)
         # Keep the app's own response headers (CORS, ...); only the length changes.
         headers = [(k, v) for k, v in start.get("headers", ()) if k.lower() != b"content-length"]
         headers.append((b"content-length", str(len(merged)).encode()))

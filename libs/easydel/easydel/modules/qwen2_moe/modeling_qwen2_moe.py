@@ -473,8 +473,6 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
                 - router_logits (Array): Router logits of shape (batch_size * sequence_length, num_experts)
                   representing the gating scores for each expert.
         """
-        B, S, H = hidden_states.shape
-
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -483,14 +481,8 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             output_metrics=False,
+            shared_expert=self.gated_shared_expert_call(self.shared_expert, self.shared_expert_gate),
         )
-
-        hs_flat = hidden_states.reshape(-1, H)
-        shared_out = self.shared_expert(hs_flat)
-        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hs_flat))
-        shared_out = shared_gate * shared_out
-        shared_out = shared_out.reshape(B, S, H)
-        out = out + shared_out
 
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 

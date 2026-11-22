@@ -206,6 +206,10 @@ def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
     return dashboard
 
 
+def _noop_info(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
 class MonitoringStack:
     """Prometheus/Grafana/console-monitor process management for eSurge.
 
@@ -222,6 +226,7 @@ class MonitoringStack:
     def __init__(self, *, info: typing.Callable[..., None]) -> None:
         self._info = info
         self._monitoring_server = None
+        self._console_monitor_active = False
         self._monitoring_urls: dict[str, str] | None = None
         self._monitoring_initialized = False
         self._grafana_container_name: str | None = None
@@ -240,6 +245,28 @@ class MonitoringStack:
             True if monitoring has been initialized and is running.
         """
         return self._monitoring_initialized
+
+    @property
+    def has_active_resources(self) -> bool:
+        """Return whether any monitoring service, lease, process, or temp dir is currently live."""
+        return bool(
+            self._monitoring_initialized
+            or self._monitoring_server is not None
+            or self._console_monitor_active
+            or self._grafana_container_name is not None
+            or self._grafana_container_id is not None
+            or self._grafana_process is not None
+            or self._grafana_temp_dir is not None
+            or self._prometheus_process is not None
+            or self._prometheus_temp_dir is not None
+        )
+
+    def close(self) -> None:
+        """Stop any active/partial monitoring resources and break engine logger references."""
+        try:
+            self.stop_monitoring()
+        finally:
+            self._info = _noop_info
 
     @property
     def monitoring_urls(self) -> dict[str, str] | None:
@@ -532,14 +559,16 @@ providers:
 
     def _stop_prometheus_server(self) -> None:
         """Stop the Prometheus server if it was started by the engine."""
-        if self._prometheus_process:
+        proc = self._prometheus_process
+        if proc is not None:
             try:
-                self._prometheus_process.terminate()
-                self._prometheus_process.wait(timeout=5)
+                proc.terminate()
+                proc.wait(timeout=5)
                 self._info(" Prometheus server stopped")
             except Exception:
                 try:
-                    self._prometheus_process.kill()
+                    proc.kill()
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
             self._prometheus_process = None
@@ -575,7 +604,8 @@ providers:
 
         try:
             req = urllib.request.Request(f"{grafana_base}/api/health", headers=headers)
-            urllib.request.urlopen(req, timeout=3)
+            with urllib.request.urlopen(req, timeout=3):
+                pass
         except Exception:
             return None
 
@@ -600,7 +630,8 @@ providers:
                 headers=headers,
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=5)
+            with urllib.request.urlopen(req, timeout=5):
+                pass
             self._info("  Datasource '%s' created", datasource_name)
             datasource_provisioned = True
         except urllib.error.HTTPError as e:
@@ -612,7 +643,8 @@ providers:
                         headers=headers,
                         method="PUT",
                     )
-                    urllib.request.urlopen(req, timeout=5)
+                    with urllib.request.urlopen(req, timeout=5):
+                        pass
                     self._info("  Datasource '%s' updated", datasource_name)
                     datasource_provisioned = True
                 except Exception as update_exc:
@@ -637,8 +669,8 @@ providers:
                 headers=headers,
                 method="POST",
             )
-            resp = urllib.request.urlopen(req, timeout=5)
-            resp_data = json.loads(resp.read().decode())
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp_data = json.loads(resp.read().decode())
             dashboard_url = f"{grafana_base}{resp_data.get('url', '/d/esurge-overview')}"
             self._info("  Dashboard provisioned: %s", dashboard_url)
         except Exception as e:
@@ -707,11 +739,14 @@ providers:
             scrape_target = f"localhost:{exporter_port}"
 
         prom_server_url = datasource_url  # user override
+        started_prom = False
         if not prom_server_url:
+            had_prom = self._prometheus_process is not None
             prom_server_url = self._start_prometheus_server(
                 scrape_target=scrape_target,
                 prometheus_server_port=9090,
             )
+            started_prom = bool(not had_prom and prom_server_url and self._prometheus_process is not None)
         if not prom_server_url:
             self._info(
                 " Grafana autostart skipped: could not start Prometheus server "
@@ -726,63 +761,73 @@ providers:
             .replace("127.0.0.1", "host.docker.internal")
         )
 
-        api_url = self._provision_running_grafana(
-            grafana_host=grafana_host,
-            grafana_port=grafana_port,
-            grafana_admin_user=grafana_admin_user,
-            grafana_admin_password=grafana_admin_password,
-            datasource_name=datasource_name,
-            datasource_uid=datasource_uid,
-            datasource_url=prom_server_url,
-        )
-        if api_url:
-            return api_url
+        def _cleanup_spawned_prom() -> None:
+            if started_prom:
+                self._stop_prometheus_server()
 
-        # Try local grafana-server first — always use host-local URL
-        local_provisioning = self._prepare_grafana_provisioning(
-            datasource_name=datasource_name,
-            datasource_uid=datasource_uid,
-            datasource_url=prom_server_url,
-            for_docker=False,
-        )
-        local_url = self._start_local_grafana_service(
-            provisioning_root=local_provisioning,
-            grafana_host=grafana_host,
-            grafana_port=grafana_port,
-            grafana_admin_user=grafana_admin_user,
-            grafana_admin_password=grafana_admin_password,
-            allow_anonymous=allow_anonymous,
-        )
-        if local_url:
-            return local_url
-        shutil.rmtree(local_provisioning, ignore_errors=True)
+        try:
+            api_url = self._provision_running_grafana(
+                grafana_host=grafana_host,
+                grafana_port=grafana_port,
+                grafana_admin_user=grafana_admin_user,
+                grafana_admin_password=grafana_admin_password,
+                datasource_name=datasource_name,
+                datasource_uid=datasource_uid,
+                datasource_url=prom_server_url,
+            )
+            if api_url:
+                return api_url
 
-        if not use_docker:
-            self._info(" Grafana autostart skipped: local server unavailable and Docker disabled")
+            # Try local grafana-server first — always use host-local URL
+            local_provisioning = self._prepare_grafana_provisioning(
+                datasource_name=datasource_name,
+                datasource_uid=datasource_uid,
+                datasource_url=prom_server_url,
+                for_docker=False,
+            )
+            local_url = self._start_local_grafana_service(
+                provisioning_root=local_provisioning,
+                grafana_host=grafana_host,
+                grafana_port=grafana_port,
+                grafana_admin_user=grafana_admin_user,
+                grafana_admin_password=grafana_admin_password,
+                allow_anonymous=allow_anonymous,
+            )
+            if local_url:
+                return local_url
+            shutil.rmtree(local_provisioning, ignore_errors=True)
+
+            if not use_docker:
+                self._info(" Grafana autostart skipped: local server unavailable and Docker disabled")
+                _cleanup_spawned_prom()
+                return None
+
+            # Docker fallback — use container-relative paths and Docker URLs
+            docker_provisioning = self._prepare_grafana_provisioning(
+                datasource_name=datasource_name,
+                datasource_uid=datasource_uid,
+                datasource_url=docker_prom_url,
+                for_docker=True,
+            )
+            docker_url = self._start_docker_grafana_service(
+                provisioning_root=docker_provisioning,
+                grafana_host=grafana_host,
+                grafana_port=grafana_port,
+                grafana_image=grafana_image,
+                grafana_admin_user=grafana_admin_user,
+                grafana_admin_password=grafana_admin_password,
+                allow_anonymous=allow_anonymous,
+                datasource_url=docker_prom_url,
+            )
+            if docker_url:
+                return docker_url
+
+            shutil.rmtree(docker_provisioning, ignore_errors=True)
+            _cleanup_spawned_prom()
             return None
-
-        # Docker fallback — use container-relative paths and Docker URLs
-        docker_provisioning = self._prepare_grafana_provisioning(
-            datasource_name=datasource_name,
-            datasource_uid=datasource_uid,
-            datasource_url=docker_prom_url,
-            for_docker=True,
-        )
-        docker_url = self._start_docker_grafana_service(
-            provisioning_root=docker_provisioning,
-            grafana_host=grafana_host,
-            grafana_port=grafana_port,
-            grafana_image=grafana_image,
-            grafana_admin_user=grafana_admin_user,
-            grafana_admin_password=grafana_admin_password,
-            allow_anonymous=allow_anonymous,
-            datasource_url=docker_prom_url,
-        )
-        if docker_url:
-            return docker_url
-
-        shutil.rmtree(docker_provisioning, ignore_errors=True)
-        return None
+        except BaseException:
+            _cleanup_spawned_prom()
+            raise
 
     def _stop_grafana_service(self) -> None:
         """Stop the Grafana container/process if it was started by the engine.
@@ -805,10 +850,18 @@ providers:
                 self._info(" Failed to stop Grafana container %s", container)
 
         if self._grafana_process:
+            proc = self._grafana_process
             try:
-                self._grafana_process.terminate()
-                self._grafana_process.wait(timeout=2)
+                proc.terminate()
+                proc.wait(timeout=2)
                 self._info(" Grafana process stopped")
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                    self._info(" Grafana process killed after terminate timeout")
+                except Exception:
+                    self._info(" Failed to kill Grafana process after terminate timeout")
             except Exception:
                 self._info(" Failed to stop Grafana process gracefully")
             self._grafana_process = None
@@ -918,75 +971,82 @@ providers:
 
         urls: dict[str, str] = {}
 
-        if enable_prometheus:
-            try:
-                from ..monitoring import start_monitoring_server
+        try:
+            if enable_prometheus:
+                try:
+                    from ..monitoring import start_monitoring_server
 
-                self._monitoring_server = start_monitoring_server(
-                    prometheus_port=prometheus_port, update_interval=1.0, owner=self
+                    self._monitoring_server = start_monitoring_server(
+                        prometheus_port=prometheus_port, update_interval=1.0, owner=self
+                    )
+                    actual_port = getattr(self._monitoring_server, "prometheus_port", None)
+                    effective_port = int(actual_port) if actual_port is not None else int(prometheus_port)
+                    host_for_logs = dashboard_host or "0.0.0.0"
+                    urls["prometheus"] = f"http://{host_for_logs}:{effective_port}/metrics"
+                    self._info(f" Prometheus metrics: {urls['prometheus']}")
+                    self._info(" Point Grafana at the Prometheus endpoint to visualize eSurge metrics.")
+                except ImportError:
+                    self._info(" Prometheus monitoring unavailable (install prometheus-client)")
+                except Exception as e:
+                    self._info(f" Failed to start Prometheus server: {e}")
+            elif start_grafana:
+                self._info(" Grafana autostart skipped because Prometheus exporter is disabled")
+
+            if enable_dashboard or dashboard_port or dashboard_host:
+                self._info(
+                    " The built-in web dashboard has been removed. "
+                    "Use Prometheus + Grafana (or another Prometheus UI) for charts."
                 )
-                host_for_logs = dashboard_host or "0.0.0.0"
-                urls["prometheus"] = f"http://{host_for_logs}:{prometheus_port}/metrics"
-                self._info(f" Prometheus metrics: {urls['prometheus']}")
-                self._info(" Point Grafana at the Prometheus endpoint to visualize eSurge metrics.")
-            except ImportError:
-                self._info(" Prometheus monitoring unavailable (install prometheus-client)")
-            except Exception as e:
-                self._info(f" Failed to start Prometheus server: {e}")
-        elif start_grafana:
-            self._info(" Grafana autostart skipped because Prometheus exporter is disabled")
 
-        if enable_dashboard or dashboard_port or dashboard_host:
-            self._info(
-                " The built-in web dashboard has been removed. "
-                "Use Prometheus + Grafana (or another Prometheus UI) for charts."
-            )
+            if start_grafana and enable_prometheus:
+                grafana_url = self._start_grafana_service(
+                    prometheus_url=urls.get("prometheus"),
+                    grafana_host=grafana_host or dashboard_host,
+                    grafana_port=grafana_port,
+                    grafana_image=grafana_image,
+                    grafana_admin_user=grafana_admin_user,
+                    grafana_admin_password=grafana_admin_password,
+                    allow_anonymous=grafana_allow_anonymous,
+                    datasource_name=grafana_datasource_name,
+                    datasource_uid=grafana_datasource_uid,
+                    datasource_url=grafana_datasource_url,
+                    use_docker=grafana_use_docker,
+                )
+                if grafana_url:
+                    urls["grafana"] = grafana_url
+                    self._info(f" Grafana UI: {grafana_url}")
 
-        if start_grafana and enable_prometheus:
-            grafana_url = self._start_grafana_service(
-                prometheus_url=urls.get("prometheus"),
-                grafana_host=grafana_host or dashboard_host,
-                grafana_port=grafana_port,
-                grafana_image=grafana_image,
-                grafana_admin_user=grafana_admin_user,
-                grafana_admin_password=grafana_admin_password,
-                allow_anonymous=grafana_allow_anonymous,
-                datasource_name=grafana_datasource_name,
-                datasource_uid=grafana_datasource_uid,
-                datasource_url=grafana_datasource_url,
-                use_docker=grafana_use_docker,
-            )
-            if grafana_url:
-                urls["grafana"] = grafana_url
-                self._info(f" Grafana UI: {grafana_url}")
+            if enable_console:
+                try:
+                    from ..monitoring import start_console_monitor
 
-        if enable_console:
-            try:
-                from ..monitoring import start_console_monitor
+                    self._info(" Starting console monitor...")
+                    start_console_monitor(refresh_rate=1.0, owner=self)
+                    self._console_monitor_active = True
+                except ImportError:
+                    self._info(" Console monitor unavailable (install rich)")
+                except Exception as e:
+                    self._info(f" Failed to start console monitor: {e}")
 
-                self._info(" Starting console monitor...")
-                start_console_monitor(refresh_rate=1.0, owner=self)
-            except ImportError:
-                self._info(" Console monitor unavailable (install rich)")
-            except Exception as e:
-                self._info(f" Failed to start console monitor: {e}")
-
-        self._monitoring_initialized = True
-        if urls:
-            self._info(" Monitoring services started successfully!")
-            self._info(" Metrics will be automatically collected during inference")
-        else:
-            self._info(" No monitoring services were started successfully")
-        self._monitoring_urls = urls
-        return urls
+            self._monitoring_initialized = True
+            if urls:
+                self._info(" Monitoring services started successfully!")
+                self._info(" Metrics will be automatically collected during inference")
+            else:
+                self._info(" No monitoring services were started successfully")
+            self._monitoring_urls = urls
+            return urls
+        except BaseException:
+            self.stop_monitoring()
+            raise
 
     def stop_monitoring(self) -> None:
         """Stop all monitoring services.
 
-        Gracefully shuts down Prometheus server and console monitor
-        if they are running.
+        Gracefully shuts down Prometheus server, Grafana, and console monitor
+        if they are running or were partially initialized.
         """
-        if not self._monitoring_initialized:
+        if not self.has_active_resources:
             self._info("No monitoring services to stop")
             return
         self._info("Stopping eSurge monitoring services...")
@@ -1003,6 +1063,7 @@ providers:
         except Exception as e:
             self._info(f" Error stopping monitoring services: {e}")
         self._monitoring_server = None
+        self._console_monitor_active = False
 
         self._stop_grafana_service()
 

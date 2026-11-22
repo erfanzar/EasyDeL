@@ -118,7 +118,7 @@ def _configure_without_compiling(monkeypatch, module):
     monkeypatch.setattr(module, "compile_trainer_step", compile_wrapper)
 
 
-@pytest.mark.parametrize("context, cap, expected", [(10, 6, 7), (32, 2, 6)])
+@pytest.mark.parametrize("context, cap, expected", [(10, 6, 6), (32, 2, 4)])
 def test_sdpo_configured_step_uses_capped_teacher_prefix(monkeypatch, context, cap, expected):
     _configure_without_compiling(monkeypatch, sdpo_module)
     trainer = _trainer(SDPOTrainer, _arguments(max_reprompt_len=cap), context=context)

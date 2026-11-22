@@ -517,9 +517,8 @@ class Glm4MoeMoE(BaseMoeModule):
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             hooks=hooks,
+            shared_expert=self.shared_experts,
         )
-        shared_output, _ = self.shared_experts(hidden_states)
-        out = out + shared_output
 
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 

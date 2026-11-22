@@ -64,7 +64,7 @@ from ..prompt_utils import apply_chat_template
 from ..reward_protocol import RewardProtocol
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
-from ._fn import sdpo_step
+from ._fn import _apply_completion_loss_token_skip, _sdpo_step_with_teacher_state, sdpo_step
 from .sdpo_config import SDPOConfig
 
 if tp.TYPE_CHECKING:
@@ -172,6 +172,22 @@ def _as_chat_history(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]
     return list(prompt)
 
 
+def _prompt_to_text(prompt: tp.Any) -> str:
+    """Coerce a prompt (raw text or chat message list) into a plain string."""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        parts: list[str] = []
+        for item in prompt:
+            if isinstance(item, dict):
+                content = item.get("content", "")
+                parts.append(content if isinstance(content, str) else str(content))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(prompt)
+
+
 @Registry.register("trainer", "sdpo")
 class SDPOTrainer(GRPOTrainer):
     """Self-Distillation Policy Optimization trainer.
@@ -277,16 +293,70 @@ class SDPOTrainer(GRPOTrainer):
             reward_processing_classes=reward_processing_classes,
             data_tokenize_fn=data_tokenize_fn,
         )
-        # GRPO skips the reference state when ``beta == 0``. Features that need a frozen/EMA copy of the policy
-        # (EMA teacher regularization syncing, SDFT's ``generate_from_teacher``) would then silently do nothing, so
-        # materialize an independent copy for them.
-        needs_teacher_reference = arguments.teacher_regularization == "ema" or bool(
-            getattr(arguments, "generate_from_teacher", False)
+        # Ensure EMA / generate-from-teacher reference state exists even if a
+        # subclass overrode configure_functions().
+        self._ensure_teacher_ref_state()
+
+    def _ensure_teacher_ref_state(self) -> None:
+        """Materialize an independent policy copy when EMA teacher or teacher rollout is enabled."""
+        needs_teacher_reference = getattr(self.arguments, "teacher_regularization", "none") == "ema" or bool(
+            getattr(self.arguments, "generate_from_teacher", False)
         )
-        if needs_teacher_reference and self.ref_state is None:
+        if (
+            needs_teacher_reference
+            and getattr(self, "ref_state", None) is None
+            and getattr(self, "model_state", None) is not None
+        ):
             self.ref_state = copy_frozen_policy(self.model_state)
-            if arguments.disable_dropout:
+            if self.arguments.disable_dropout:
                 (self.ref_state,) = self._disable_state_dropout(self.ref_state)
+
+    @property
+    def _uses_ema_teacher(self) -> bool:
+        """Return whether ``sdpo_step`` should score the teacher with ``self.ref_state``."""
+        return (
+            getattr(self.arguments, "teacher_regularization", "none") == "ema"
+            and getattr(self, "ref_state", None) is not None
+        )
+
+    @property
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Forward the live EMA teacher state into ``sdpo_step`` when EMA regularization is enabled."""
+        if self._uses_ema_teacher:
+            return (self.ref_state,)
+        return ()
+
+    @property
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Forward the live EMA teacher state (with eval graphdef override when configured)."""
+        if not self._uses_ema_teacher:
+            return ()
+        ref_state = self.ref_state
+        graphdef = getattr(self, "_eval_ref_graphdef", None)
+        if graphdef is not None and ref_state is not None:
+            ref_state = ref_state.replace(graphdef=graphdef)
+        return (ref_state,)
+
+    def _configure_eval_config_override(self) -> None:
+        """Apply evaluation config overrides to the EMA teacher state as well."""
+        super()._configure_eval_config_override()
+        self._eval_ref_graphdef = None
+        # BaseTrainer.__init__ runs _configure_eval_config_override() BEFORE
+        # configure_functions(), so materialize ref_state here when EMA teacher
+        # regularization is active under beta == 0.0.
+        self._ensure_teacher_ref_state()
+        if self._eval_graphdef is not None and getattr(self, "ref_state", None) is not None:
+            selector = getattr(self.arguments, "trainable_selector", None)
+            try:
+                self._eval_ref_graphdef = self._build_config_override_graphdef(
+                    model=self.ref_state.model,
+                    overrides=self.arguments.eval_config_overrides,
+                    reference_graphstate=self.ref_state.graphstate,
+                    trainable_selector=selector,
+                    label="eval_config_overrides (sdpo_teacher)",
+                )
+            except Exception:
+                self._eval_ref_graphdef = None
 
     @staticmethod
     def _resolve_model_context_window(config: tp.Any) -> int | None:
@@ -329,8 +399,10 @@ class SDPOTrainer(GRPOTrainer):
             ValueError: If the model context window cannot accommodate
                 even the prompt and completion (without any feedback).
         """
-        base_len = int(self.arguments.max_prompt_length + self.arguments.max_completion_length)
-        requested_feedback_len = min(int(self.arguments.max_feedback_length), int(self.arguments.max_reprompt_len))
+        max_prompt_len = int(self.arguments.max_prompt_length)
+        base_len = int(max_prompt_len + self.arguments.max_completion_length)
+        max_feedback_from_reprompt = max(int(self.arguments.max_reprompt_len) - max_prompt_len, 0)
+        requested_feedback_len = min(int(self.arguments.max_feedback_length), max_feedback_from_reprompt)
         requested_teacher_len = base_len + requested_feedback_len
 
         model_config = getattr(self.model_state.model, "config", None)
@@ -400,6 +472,11 @@ class SDPOTrainer(GRPOTrainer):
             compiled training step, the compiled evaluation step, the
             active mesh, and the streaming checkpoint manager.
         """
+        # Materialize EMA / teacher reference state BEFORE compiling step
+        # functions (configure_functions runs inside super().__init__ before
+        # SDPOTrainer.__init__ resumes).
+        self._ensure_teacher_ref_state()
+
         # Resolve the effective feedback budget / teacher prefix length BEFORE they are frozen into the static
         # args below (this method runs inside ``super().__init__``, so resolving afterwards would leave the
         # compiled step slicing completions at a stale ``teacher_prompt_length``).
@@ -416,7 +493,7 @@ class SDPOTrainer(GRPOTrainer):
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
 
-        shared_static = (
+        shared_static_prefix = (
             self.num_generations,
             self.teacher_prompt_length,
             self.arguments.beta,
@@ -428,17 +505,20 @@ class SDPOTrainer(GRPOTrainer):
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
-            self.arguments.gradient_accumulation_steps,
         )
         num_loss_tokens_to_skip = int(getattr(self.arguments, "num_loss_tokens_to_skip", 0) or 0)
         full_logit_distillation = bool(self.arguments.full_logit_distillation)
         distillation_topk = self.arguments.distillation_topk
         distillation_is_clip = self.arguments.distillation_is_clip
         distillation_add_tail = bool(self.arguments.distillation_add_tail)
-        static_argnames = tuple(range(2, 21))
+
+        uses_ema_teacher = self._uses_ema_teacher
+        step_fn = _sdpo_step_with_teacher_state if uses_ema_teacher else sdpo_step
+        static_argnames = tuple(range(3, 22)) if uses_ema_teacher else tuple(range(2, 21))
 
         self._train_shared_fn_static_args = (
-            *shared_static,
+            *shared_static_prefix,
+            self.arguments.gradient_accumulation_steps,
             True,
             straight_through_emulator,
             num_loss_tokens_to_skip,
@@ -448,10 +528,15 @@ class SDPOTrainer(GRPOTrainer):
             distillation_add_tail,
         )
 
+        train_in_shardings = (
+            (self.state_shardings, empty_sharding, self.ref_state.shardings)
+            if uses_ema_teacher
+            else (self.state_shardings, empty_sharding)
+        )
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
-            sdpo_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            step_fn,
+            in_shardings=train_in_shardings,
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
             static_argnums=static_argnames,
@@ -462,7 +547,8 @@ class SDPOTrainer(GRPOTrainer):
         self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
-            *shared_static,
+            *shared_static_prefix,
+            1,
             False,
             straight_through_emulator,
             num_loss_tokens_to_skip,
@@ -472,10 +558,15 @@ class SDPOTrainer(GRPOTrainer):
             distillation_add_tail,
         )
 
+        if uses_ema_teacher:
+            eval_teacher_state = self._eval_shared_fn_extra_args[0]
+            eval_in_shardings = (self.eval_state_shardings, empty_sharding, eval_teacher_state.shardings)
+        else:
+            eval_in_shardings = (self.eval_state_shardings, empty_sharding)
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
-            sdpo_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            step_fn,
+            in_shardings=eval_in_shardings,
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
             mesh=self.model.mesh,
@@ -484,7 +575,7 @@ class SDPOTrainer(GRPOTrainer):
         )
         self._runtime_trace("eval.compile_wrapper.end")
 
-        def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+        def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef, prompt_length=None):
             """Compute frozen reference-model per-token log probabilities.
 
             Args:
@@ -493,6 +584,8 @@ class SDPOTrainer(GRPOTrainer):
                 ids (jax.Array): Concatenated prompt+completion token ids.
                 mask (jax.Array): Concatenated attention mask.
                 graphdef: Reference-model graph definition for binding.
+                prompt_length (int | None): Dynamic prompt width. Defaults to
+                    ``self.arguments.max_prompt_length``.
 
             Returns:
                 jax.Array: Per-token log probabilities for the completion
@@ -503,6 +596,9 @@ class SDPOTrainer(GRPOTrainer):
                 graphother,
             )
             apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
+            effective_prompt_length = (
+                self.arguments.max_prompt_length if prompt_length is None else int(prompt_length)
+            )
             with apply.mesh:
                 ids = with_sharding_constraint(
                     ids,
@@ -520,22 +616,26 @@ class SDPOTrainer(GRPOTrainer):
                     apply,
                     ids,
                     mask,
-                    self.arguments.max_prompt_length,
+                    effective_prompt_length,
                     logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                 )
 
-        self.compute_refmodel_logps = compile_trainer_step(
-            partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
-            mesh=mesh,
-            static_argnames=("graphdef",),
-            in_shardings=(
-                self.model_state.shardings.graphstate,
-                self.model_state.shardings.graphother,
-                empty_sharding,
-                empty_sharding,
-            ),
-            out_shardings=empty_sharding,
-        )
+        ref_state = getattr(self, "ref_state", None)
+        if ref_state is not None and self.arguments.beta != 0.0:
+            self.compute_refmodel_logps = compile_trainer_step(
+                partial(_compute_refmodel_logps, graphdef=ref_state.graphdef),
+                mesh=mesh,
+                static_argnames=("graphdef", "prompt_length"),
+                in_shardings=(
+                    ref_state.shardings.graphstate,
+                    ref_state.shardings.graphother,
+                    empty_sharding,
+                    empty_sharding,
+                ),
+                out_shardings=empty_sharding,
+            )
+        else:
+            self.compute_refmodel_logps = None
 
         sharded_training_step_function.static_argnums_ = static_argnames
         sharded_evaluation_step_function.static_argnums_ = static_argnames
@@ -632,6 +732,8 @@ class SDPOTrainer(GRPOTrainer):
         Returns:
             List of feedback separator strings, one per completion.
         """
+        if not completions or not completion_prompts:
+            return []
         rewards_list = [float(r) for r in jax.device_get(rewards)]
         arguments = getattr(self, "arguments", None)
         threshold = float(getattr(arguments, "success_reward_threshold", 0.0))
@@ -640,10 +742,8 @@ class SDPOTrainer(GRPOTrainer):
         reprompt_template = getattr(arguments, "reprompt_template", "{solution}{feedback}" + _FEEDBACK_TEMPLATE_SOLVE)
         dont_reprompt_on_self_success = bool(getattr(arguments, "dont_reprompt_on_self_success", False))
         raw_feedbacks = self.feedback_func(
-            prompts=(
-                completion_prompts if isinstance(completion_prompts[0], str) else [str(p) for p in completion_prompts]
-            ),
-            completions=completions if isinstance(completions[0], str) else [str(c) for c in completions],
+            prompts=[p if isinstance(p, str) else str(p) for p in completion_prompts],
+            completions=[c if isinstance(c, str) else str(c) for c in completions],
             rewards=rewards_list,
         )
         solution_template = getattr(arguments, "solution_template", _FEEDBACK_TEMPLATE_SOLUTION)
@@ -651,9 +751,9 @@ class SDPOTrainer(GRPOTrainer):
         feedback_only_without_solution = bool(getattr(arguments, "environment_feedback_only_without_solution", False))
         use_successful_as_teacher = bool(getattr(arguments, "use_successful_as_teacher", True))
 
-        # Per-completion same-group demonstration (only resolved when the option that needs it is active).
+        # Per-completion same-group demonstration whenever use_successful_as_teacher is active.
         group_solutions: list[str | None] = [None] * len(rewards_list)
-        if feedback_only_without_solution and use_successful_as_teacher and generation_factor:
+        if use_successful_as_teacher and generation_factor:
             group_size = int(generation_factor)
             for start in range(0, len(rewards_list), group_size):
                 end = min(start + group_size, len(rewards_list))
@@ -723,7 +823,7 @@ class SDPOTrainer(GRPOTrainer):
         self,
         feedback_texts: list[str],
     ) -> tuple[jax.Array, jax.Array]:
-        """Tokenise feedback separator strings and pad to effective feedback length.
+        """Tokenise feedback separator strings and left-pad to effective feedback length.
 
         Args:
             feedback_texts: List of ``B*G`` feedback separator strings.
@@ -736,15 +836,83 @@ class SDPOTrainer(GRPOTrainer):
             empty = jnp.zeros((batch_size, 0), dtype=jnp.int32)
             return empty, empty
 
-        enc = self.processing_class(
-            feedback_texts,
-            add_special_tokens=False,
-            max_length=self._effective_feedback_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="np",
-        )
+        call_kwargs: dict[str, tp.Any] = {
+            "add_special_tokens": False,
+            "max_length": self._effective_feedback_length,
+            "truncation": True,
+            "padding": "max_length",
+            "padding_side": "left",
+            "return_tensors": "np",
+        }
+        try:
+            enc = self.processing_class(feedback_texts, **call_kwargs)
+        except TypeError:
+            call_kwargs.pop("padding_side", None)
+            tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+            had_padding_side = hasattr(tokenizer, "padding_side")
+            previous_padding_side = getattr(tokenizer, "padding_side", None)
+            if had_padding_side:
+                tokenizer.padding_side = "left"
+            try:
+                enc = self.processing_class(feedback_texts, **call_kwargs)
+            finally:
+                if had_padding_side:
+                    tokenizer.padding_side = previous_padding_side
         return jnp.asarray(enc["input_ids"]), jnp.asarray(enc["attention_mask"])
+
+    def _build_teacher_prefix(
+        self,
+        prompt_ids: jax.Array,
+        prompt_mask: jax.Array,
+        feedback_ids: jax.Array,
+        feedback_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Pack active prompt + feedback tokens per row and left-pad the combined prefix.
+
+        Concatenating ``[prompt_ids, feedback_ids]`` directly places ``PAD``
+        tokens at ``teacher_prompt_length - 1`` whenever feedback is shorter
+        than ``_effective_feedback_length`` (or empty under
+        ``dont_reprompt_on_self_success=True``) and leaves mid-sequence ``PAD``
+        holes between prompt and feedback. Packing active prompt tokens
+        followed immediately by active feedback tokens and left-padding the
+        combined sequence guarantees that ``teacher_prompt_length - 1`` is
+        always the final real token before ``completion_ids[:, 0]``.
+        """
+        prompt_ids_np = np.asarray(jax.device_get(prompt_ids))
+        prompt_mask_np = np.asarray(jax.device_get(prompt_mask))
+        feedback_ids_np = np.asarray(jax.device_get(feedback_ids))
+        feedback_mask_np = np.asarray(jax.device_get(feedback_mask))
+
+        batch_size = int(prompt_ids_np.shape[0])
+        target_len = int(prompt_ids_np.shape[1]) + int(feedback_ids_np.shape[1])
+        pad_id = getattr(self, "_pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self, "padding_value", 0)
+        pad_id = 0 if pad_id is None else int(pad_id)
+
+        out_ids = np.full((batch_size, target_len), pad_id, dtype=prompt_ids_np.dtype)
+        out_mask = np.zeros((batch_size, target_len), dtype=prompt_mask_np.dtype)
+
+        for row in range(batch_size):
+            active_prompt = prompt_ids_np[row][prompt_mask_np[row] > 0]
+            active_feedback = (
+                feedback_ids_np[row][feedback_mask_np[row] > 0]
+                if feedback_ids_np.shape[1] > 0
+                else np.empty((0,), dtype=prompt_ids_np.dtype)
+            )
+            if active_prompt.size and active_feedback.size:
+                combined = np.concatenate([active_prompt, active_feedback], axis=0)
+            elif active_feedback.size:
+                combined = active_feedback
+            else:
+                combined = active_prompt
+            if combined.size > target_len:
+                combined = combined[-target_len:]
+            if combined.size > 0:
+                out_ids[row, target_len - combined.size :] = combined
+                out_mask[row, target_len - combined.size :] = 1
+
+        return jnp.asarray(out_ids), jnp.asarray(out_mask)
 
     def _ensure_non_empty_prompts(
         self,
@@ -852,10 +1020,25 @@ class SDPOTrainer(GRPOTrainer):
             generation_time = generation_time_fn()
 
             completion_mask = self._make_attn_mask(completion_ids)
+            if results.completion_mask is not None:
+                completion_mask = completion_mask * results.completion_mask.astype(completion_mask.dtype)
+            unmasked_completion_mask = completion_mask
             if self.arguments.mask_truncated_completions:
                 eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
-                has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
-                completion_mask = completion_mask * has_eos[:, None].astype(completion_mask.dtype)
+                active_counts = jnp.sum(completion_mask > 0, axis=1)
+                last_active_idx = jnp.maximum(active_counts - 1, 0)
+                last_active_token = jnp.take_along_axis(completion_ids, last_active_idx[:, None], axis=1).squeeze(-1)
+                ends_with_eos = (active_counts > 0) & jnp.isin(last_active_token, eos_tokens)
+                finish_reasons = getattr(results, "finish_reason", None)
+                if isinstance(finish_reasons, (list, tuple)) and len(finish_reasons) == int(completion_ids.shape[0]):
+                    not_length_truncated = jnp.asarray(
+                        [str(r or "").lower() != "length" for r in finish_reasons],
+                        dtype=jnp.bool_,
+                    )
+                    keep_row = ends_with_eos & not_length_truncated
+                else:
+                    keep_row = ends_with_eos
+                completion_mask = completion_mask * keep_row[:, None].astype(completion_mask.dtype)
 
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
             generation_factor = max(generation_factor, 1)
@@ -872,7 +1055,7 @@ class SDPOTrainer(GRPOTrainer):
             if not raw_completions_text or not completions_text:
                 # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
                 completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
-                completion_mask_for_decode = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                completion_mask_for_decode = np.asarray(jax.device_get(unmasked_completion_mask), dtype=np.int32)
                 completion_ids_array = np.asarray(completion_ids_for_decode, dtype=np.int64)
                 if not raw_completions_text:
                     raw_completions_text = self._decode_prompt_batch(
@@ -955,7 +1138,10 @@ class SDPOTrainer(GRPOTrainer):
                                 for x in messages
                             ]
                         else:
-                            texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
+                            texts = [
+                                f"{_prompt_to_text(p)}{c if isinstance(c, str) else str(c)}"
+                                for p, c in zip(completion_prompts, completions, strict=False)
+                            ]
                         rew = reward_func.apply_fn(
                             reward_func.graphdef,
                             reward_func.graphstate,
@@ -1015,41 +1201,50 @@ class SDPOTrainer(GRPOTrainer):
                 feedback_ids, feedback_mask = self._tokenize_feedback_separators(feedback_texts)
 
                 rids = prompt_ids.repeat(generation_factor, 0)
+                teacher_prefix_ids, teacher_prefix_mask = self._build_teacher_prefix(
+                    rids,
+                    ridmask,
+                    feedback_ids,
+                    feedback_mask,
+                )
 
-                teacher_ids = jnp.concatenate([rids, feedback_ids, completion_ids], axis=1)
-                teacher_mask = jnp.concatenate([ridmask, feedback_mask, completion_mask], axis=1)
+                teacher_ids = jnp.concatenate([teacher_prefix_ids, completion_ids], axis=1)
+                teacher_mask = jnp.concatenate([teacher_prefix_mask, completion_mask], axis=1)
             teacher_build_time = teacher_build_time_fn()
 
             prompt_completion_ids = sequences
             with capture_time() as token_logps_time_fn:
-                if self.arguments.beta != 0.0:
+                if self.arguments.beta != 0.0 and self.compute_refmodel_logps is not None:
                     ref_per_token_logps = self.compute_refmodel_logps(
                         self.ref_state.graphstate,
                         self.ref_state.graphother,
                         prompt_completion_ids,
                         jnp.concatenate([ridmask, completion_mask], -1),
+                        prompt_length=int(prompt_ids.shape[-1]),
                     )
                 else:
                     ref_per_token_logps = None
             token_logps_time = token_logps_time_fn()
-            log_completion_length = jnp.sum(completion_mask, -1)
+            log_completion_length = jnp.sum(unmasked_completion_mask, -1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
             completion_ids = self._all_gather(completion_ids)
             completion_mask = self._all_gather(completion_mask)
+            unmasked_completion_mask = self._all_gather(unmasked_completion_mask)
             teacher_ids = self._all_gather(teacher_ids)
             teacher_mask = self._all_gather(teacher_mask)
             rewards_per_func = self._all_gather(rewards_per_func)
+            gathered_rewards = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
             if ref_per_token_logps is not None:
                 ref_per_token_logps = self._all_gather(ref_per_token_logps)
 
         preprocessing_time = preprocessing_time_fn()
-        completion_length = jnp.sum(completion_mask, -1)
+        completion_length = jnp.sum(unmasked_completion_mask, -1)
 
         metrics_dict: dict[str, float | int | str] = {
-            "reward_mean": _host_scalar_float(jnp.nanmean(rewards)),
-            "reward_std": _host_scalar_float(jnp.nanstd(rewards)),
+            "reward_mean": _host_scalar_float(jnp.nanmean(gathered_rewards)),
+            "reward_std": _host_scalar_float(jnp.nanstd(gathered_rewards)),
             "completion_length": _host_mean_float(completion_length),
             "generation_time": generation_time,
             "rewarding_time": rewarding_time,
@@ -1070,6 +1265,8 @@ class SDPOTrainer(GRPOTrainer):
             source="policy",
         )
 
+        skip_tokens = int(getattr(self.arguments, "num_loss_tokens_to_skip", 0) or 0)
+        effective_loss_mask = _apply_completion_loss_token_skip(completion_mask, skip_tokens)
         out_batch: dict[str, jax.Array] = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1077,7 +1274,7 @@ class SDPOTrainer(GRPOTrainer):
             "completion_mask": completion_mask,
             "teacher_ids": teacher_ids,
             "teacher_mask": teacher_mask,
-            "num_items_in_batch": jnp.sum(completion_mask),
+            "num_items_in_batch": jnp.sum(effective_loss_mask),
         }
         if ref_per_token_logps is not None:
             out_batch["ref_per_token_logps"] = ref_per_token_logps

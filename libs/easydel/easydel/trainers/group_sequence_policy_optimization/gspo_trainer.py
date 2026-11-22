@@ -100,6 +100,8 @@ class GSPOTrainer(GRPOTrainer):
         processing_class: ProcessingClassType = None,
         reward_processing_classes: ProcessingClassType = None,
         data_tokenize_fn: tp.Callable | None = None,
+        tools: list[dict | str | tp.Callable[..., object]] | None = None,
+        environment_factory: tp.Callable[[], object] | None = None,
     ):
         """Initialize the GSPO trainer.
 
@@ -117,6 +119,10 @@ class GSPOTrainer(GRPOTrainer):
             reward_processing_classes: Optional separate tokenizers for reward
                 models if they differ from the policy model tokenizer.
             data_tokenize_fn: Optional custom tokenization function.
+            tools: Optional tool definitions exposed to GRPO generation and
+                environment feedback.
+            environment_factory: Optional callable creating an environment per
+                generated completion.
 
         Raises:
             TypeError: If arguments is not a GSPOConfig instance.
@@ -135,4 +141,6 @@ class GSPOTrainer(GRPOTrainer):
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
             data_tokenize_fn=data_tokenize_fn,
+            tools=tools,
+            environment_factory=environment_factory,
         )

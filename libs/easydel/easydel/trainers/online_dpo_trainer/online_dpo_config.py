@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..direct_preference_optimization_trainer import DPOConfig
 
@@ -66,3 +67,5 @@ class OnlineDPOConfig(DPOConfig):
         if self.missing_eos_penalty is not None and self.missing_eos_penalty <= 0.0:
             raise ValueError("`missing_eos_penalty` must be positive when set.")
         super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
+
+    __hash__ = hash_fn

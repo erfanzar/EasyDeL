@@ -425,7 +425,12 @@ class ModelStepExecutor:
             and not self._lm_head_uses_tied_projection
             and not self._model_uses_hybrid_linear_attention()
         )
-        self._pipeline_model_step_templates = (kv_pages_template, graphstate_template, graphother_template)
+        self._pipeline_model_step_templates: tuple[tp.Any, tp.Any, tp.Any] = (
+            self._resolve_sharding_structure(kv_pages_template),
+            self._resolve_sharding_structure(graphstate_template),
+            self._resolve_sharding_structure(graphother_template),
+        )
+        self._weight_generation: int = 0
         self._lm_head_fn = self._build_lm_head_fn(
             graphstate_template=graphstate_template,
             graphother_template=graphother_template,
@@ -435,7 +440,9 @@ class ModelStepExecutor:
         # LM-head cache: keyed by (padded_num_reqs, "lm_head", mode)
         self._lm_head_cache: OrderedDict[tuple[int, str, str], tp.Any] = OrderedDict()
         self._pipeline_model_step_fn_cache: OrderedDict[tuple[int, str], tp.Any] = OrderedDict()
-        self._pipeline_lm_head_cache: OrderedDict[tuple[int, tuple[int, ...], str, str], tp.Any] = OrderedDict()
+        self._pipeline_lm_head_cache: OrderedDict[tuple[int, tuple[int, ...], tuple[int, ...], str, str], tp.Any] = (
+            OrderedDict()
+        )
         # Legacy combined cache (kept for backward compat with tests)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
         # (num_tokens, padded_num_reqs) pairs whose general SPMD trace asked for the single-token promise. A property
@@ -810,10 +817,16 @@ class ModelStepExecutor:
         return model_inputs, position_ids, external_inputs
 
     def clear_runtime_graph_args(self) -> None:
-        """Drop cached graph-state call arguments."""
+        """Drop cached graph-state call arguments, exported LM-head state, and PP prepare cache."""
         self._runtime_graphstate_arg = None
         self._runtime_graphother_arg = None
         self._packed_source_leaves = None
+        self._lm_head_state = None
+        self._lm_head_graphdef = None
+        self._lm_head_postprocess = None
+        pipeline_runtime = getattr(self, "_pipeline_runtime", None)
+        if pipeline_runtime is not None and hasattr(pipeline_runtime, "clear_prepare_cache"):
+            pipeline_runtime.clear_prepare_cache()
 
     def _graph_arg_sharding(self, state: tp.Any, packer: StatePacker | None = None) -> tp.Any:
         """Resolve the in-shardings tuple for a graph-state argument.
@@ -890,20 +903,74 @@ class ModelStepExecutor:
         if self._pipeline_runtime is not None:
             self._pipeline_runtime.clear_prepare_cache()
 
+    @staticmethod
+    def _is_sharding_structure(tree: tp.Any) -> bool:
+        """Whether every non-``None`` leaf of ``tree`` is already a ``jax.sharding.Sharding``."""
+        leaves = jax.tree_util.tree_leaves(tree)
+        return all(isinstance(leaf, jax.sharding.Sharding) for leaf in leaves)
+
+    def _resolve_sharding_structure(self, tree_or_sharding: tp.Any) -> tp.Any:
+        """Return a sharding-only pytree with zero live array references."""
+        if tree_or_sharding is None:
+            return None
+        if self._is_sharding_structure(tree_or_sharding):
+            return tree_or_sharding
+        return spx.extract_sharding_structure(tree_or_sharding, mesh=self.mesh)
+
+    def on_graphs_updated(self, graphdef_changed: bool = False) -> None:
+        """Invalidate MPMD prepare/compiled caches after weights or ``graphdef`` change.
+
+        Increments the weight generation embedded in SpectraX ``prepare_cache_key``
+        tuples and clears ``pipeline_runtime``'s prepare cache so runtime-static
+        weight leaves are never replayed stale (or pinned in HBM) across weight
+        hot-swaps. When ``graphdef_changed`` is ``True``, also drops fused PP
+        model-step closures that closed over the previous ``graphdef``.
+        """
+        self._weight_generation = int(getattr(self, "_weight_generation", 0)) + 1
+        pipeline_runtime = getattr(self, "_pipeline_runtime", None)
+        if pipeline_runtime is not None and hasattr(pipeline_runtime, "clear_prepare_cache"):
+            pipeline_runtime.clear_prepare_cache()
+        if graphdef_changed:
+            fn_cache = getattr(self, "_pipeline_model_step_fn_cache", None)
+            if fn_cache is not None:
+                fn_cache.clear()
+            carry_cache = getattr(self, "_pipeline_kv_carry_map_cache", None)
+            if carry_cache is not None:
+                carry_cache.clear()
+            cache = getattr(self, "_cache", None)
+            if cache is not None:
+                for key in [k for k in cache if len(k) >= 4 and k[3] == "mpmd"]:
+                    cache.pop(key, None)
+
     def refresh_kv_pages_template(
         self,
-        kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
+        kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache | None,
     ) -> None:
-        """Refresh the cache template held for late-built PP model-step functions.
+        """Refresh the KV sharding template held for late-built PP model-step functions.
 
-        MPMD compile warm-ups donate KV/cache buffers just like real decode steps.
-        After the execution manager replaces its warm-up scratch cache with a
-        fresh runtime cache, this method updates the template tuple so any
-        future fused PP function uses live arrays for sharding extraction instead
-        of a donated/deleted warm-up object.
+        Stores only the extracted sharding structure (never live KV arrays) so
+        cache destruction or reallocation cannot be pinned in HBM.
         """
-        _, graphstate_template, graphother_template = self._pipeline_model_step_templates
-        self._pipeline_model_step_templates = (kv_pages_template, graphstate_template, graphother_template)
+        templates = getattr(self, "_pipeline_model_step_templates", (None, None, None))
+        _, graphstate_template, graphother_template = templates
+        kv_sharding = self._resolve_sharding_structure(kv_pages_template)
+        self._pipeline_model_step_templates = (kv_sharding, graphstate_template, graphother_template)
+
+    def refresh_graph_templates(
+        self,
+        graphstate_template: tp.Any = None,
+        graphother_template: tp.Any = None,
+    ) -> None:
+        """Refresh graphstate/graphother sharding templates without retaining live arrays."""
+        templates = getattr(self, "_pipeline_model_step_templates", (None, None, None))
+        kv_template, old_gs, old_go = templates
+        new_gs = self._resolve_sharding_structure(graphstate_template) if graphstate_template is not None else old_gs
+        new_go = self._resolve_sharding_structure(graphother_template) if graphother_template is not None else old_go
+        self._pipeline_model_step_templates = (kv_template, new_gs, new_go)
+
+    def clear_pipeline_templates(self) -> None:
+        """Clear stored PP sharding templates."""
+        self._pipeline_model_step_templates = (None, None, None)
 
     def shutdown(self) -> None:
         """Join the resident PP-stage worker threads, if any.
@@ -1600,9 +1667,11 @@ class ModelStepExecutor:
         tokens or four one-token decode requests. The resident stage runtime is
         valid for the decode wavefront, while prefill chunks need the direct
         SpectraX dispatch. Keeping the mode in the cache key lets both variants
-        coexist.
+        coexist. When no resident ``pipeline_runtime`` is attached, runtime
+        dispatch collapses to ``False`` so lookups match the direct variant.
         """
-        return (int(num_tokens), "backbone", self._compile_mode(), bool(use_pipeline_runtime))
+        effective_use_runtime = bool(use_pipeline_runtime) and getattr(self, "_pipeline_runtime", None) is not None
+        return (int(num_tokens), "backbone", self._compile_mode(), effective_use_runtime)
 
     def _backbone_decode_only(self, num_tokens: int, *, use_pipeline_runtime: bool) -> bool:
         """Whether a backbone bucket traces under the decode-layout scope.
@@ -1789,7 +1858,13 @@ class ModelStepExecutor:
         mode = self._compile_mode()
         return self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
 
-    def get_pipeline_lm_head(self, *, padded_num_reqs: int, part_rows: tuple[int, ...]) -> tp.Any:
+    def get_pipeline_lm_head(
+        self,
+        *,
+        padded_num_reqs: int,
+        part_rows: tuple[int, ...],
+        part_token_shapes: tuple[int, ...] | None = None,
+    ) -> tp.Any:
         """Return a PP decode LM-head that gathers/concats microbatch hidden rows.
 
         The normal PP microbatch path used to launch a separate combine kernel
@@ -1797,10 +1872,26 @@ class ModelStepExecutor:
         ``[padded_num_reqs, hidden]`` tensor, then launch the LM head.  This
         variant folds that gather/concat directly into the final-stage LM-head
         executable, which removes one device dispatch from every decode step.
+
+        Args:
+            padded_num_reqs: Padded request-count bucket for output logits.
+            part_rows: Number of gathered rows (index vector length) per microbatch.
+            part_token_shapes: Optional leading token dimension of each microbatch's
+                backbone ``hidden_states`` tensor (``microbatch_num_tokens``). When
+                supplied, warm-up traces the exact runtime tensor shapes instead of
+                ``part_rows``, avoiding a redundant first-call recompile.
         """
         mode = self._compile_mode()
         part_rows = tuple(int(x) for x in part_rows)
-        key = (int(padded_num_reqs), part_rows, "pipeline_lm_head", mode)
+        if part_token_shapes is None:
+            resolved_token_shapes = tuple(max(1, int(rows)) for rows in part_rows)
+        else:
+            resolved_token_shapes = tuple(max(1, int(tokens)) for tokens in part_token_shapes)
+            if len(resolved_token_shapes) != len(part_rows):
+                raise ValueError(
+                    f"part_token_shapes length ({len(resolved_token_shapes)}) must match part_rows ({len(part_rows)})."
+                )
+        key = (int(padded_num_reqs), part_rows, resolved_token_shapes, "pipeline_lm_head", mode)
         cached = self._pipeline_lm_head_cache.get(key)
         if cached is not None:
             return cached
@@ -1813,9 +1904,10 @@ class ModelStepExecutor:
         dtype = self.model.dtype
         dummy_parts = []
         dummy_indices = []
-        for rows in part_rows:
+        for rows, token_rows in zip(part_rows, resolved_token_shapes, strict=True):
             rows = max(1, int(rows))
-            dummy_hs = jnp.zeros((rows, hidden_dim), dtype=dtype)
+            token_rows = max(rows, int(token_rows))
+            dummy_hs = jnp.zeros((token_rows, hidden_dim), dtype=dtype)
             part_sharding = self._lm_head_hidden_sharding(tuple(dummy_hs.shape))
             if part_sharding is not None:
                 dummy_hs = jax.device_put(dummy_hs, part_sharding)
@@ -2139,6 +2231,11 @@ class ModelStepExecutor:
             return None
 
         pnr = int(padded_num_reqs)
+        kv_t, gs_t, go_t = getattr(self, "_pipeline_model_step_templates", (None, None, None))
+        if kv_t is None and inputs is not None:
+            self.refresh_kv_pages_template(inputs.kv_pages)
+        if gs_t is None or go_t is None:
+            self.refresh_graph_templates(graphstate, graphother)
         pipeline_model_step_fn = self._get_pipeline_model_step_fn(pnr, graphdef=self.graphdef)
 
         def wrapped_pipeline_model_step(graphstate_, graphother_, kv_pages_, metadata_):
@@ -2216,7 +2313,8 @@ class ModelStepExecutor:
             paths (no eager call) and when the bucket was already cached.
         """
         self.graphdef = graphdef
-        key = self._backbone_cache_key(num_tokens, use_pipeline_runtime=use_pipeline_runtime)
+        effective_use_runtime = bool(use_pipeline_runtime) and getattr(self, "_pipeline_runtime", None) is not None
+        key = self._backbone_cache_key(num_tokens, use_pipeline_runtime=effective_use_runtime)
         if key in self._backbone_cache:
             return None
 
@@ -2224,14 +2322,14 @@ class ModelStepExecutor:
         # layout scope. The condition is derived from the cache key rather
         # than from `padded_num_reqs`, so every caller compiling this bucket
         # agrees on the layout — see _backbone_decode_only.
-        decode_only = self._backbone_decode_only(num_tokens, use_pipeline_runtime=use_pipeline_runtime)
+        decode_only = self._backbone_decode_only(num_tokens, use_pipeline_runtime=effective_use_runtime)
         backbone_fn = self._backbone_fn_decode if decode_only else self._backbone_fn
 
         if self._uses_mpmd_mesh():
 
             def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
                 """MPMD backbone wrapper using resident PP or direct sxjit dispatch."""
-                if use_pipeline_runtime:
+                if effective_use_runtime:
                     return self._dispatch_pipeline_backbone(
                         graphstate_, graphother_, kv_pages_, metadata_, backbone_fn=backbone_fn
                     )
@@ -2309,6 +2407,7 @@ class ModelStepExecutor:
                 int(metadata_.input_ids_buf.shape[0]),
                 self._kv_prepare_signature(kv_pages_, metadata_),
                 id(self.graphdef),
+                int(getattr(self, "_weight_generation", 0)),
             ),
             runtime_static_argnums=(0, 1, 2),
         )
@@ -2350,6 +2449,7 @@ class ModelStepExecutor:
                 int(padded_num_reqs),
                 self._kv_prepare_signature(kv_pages_, metadata_),
                 id(self.graphdef),
+                int(getattr(self, "_weight_generation", 0)),
             ),
             runtime_static_argnums=(0, 1),
         )
@@ -2508,6 +2608,7 @@ class ModelStepExecutor:
                 int(num_tokens),
                 self._kv_prepare_signature(kv_pages0, metadata0),
                 id(self.graphdef),
+                int(getattr(self, "_weight_generation", 0)),
             ),
             runtime_static_argnums=(0, 1, 2),
         )
@@ -2859,7 +2960,7 @@ class ModelStepExecutor:
 
         metadata_sharding = self._metadata_sharding_template()
 
-        kv_pages_sharding = spx.extract_sharding_structure(kv_pages_template, mesh=self.mesh)
+        kv_pages_sharding = self._resolve_sharding_structure(kv_pages_template)
         hidden_size = self._lm_head_input_dim()
         hidden_out_sharding = self._lm_head_hidden_sharding((max(1, max_num_reqs), hidden_size)) or self._empty_sharding
         logits_out_sharding = self._lm_head_replicated_sharding() or self._empty_sharding
@@ -2873,8 +2974,8 @@ class ModelStepExecutor:
             "donate_argnums": (2,),
             "mesh": self.mesh,
             "in_shardings": (
-                spx.extract_sharding_structure(graphstate_template, mesh=self.mesh),
-                spx.extract_sharding_structure(graphother_template, mesh=self.mesh),
+                self._resolve_sharding_structure(graphstate_template),
+                self._resolve_sharding_structure(graphother_template),
                 kv_pages_sharding,
                 metadata_sharding,
             ),

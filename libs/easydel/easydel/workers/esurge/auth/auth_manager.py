@@ -669,6 +669,23 @@ class EnhancedApiKeyManager:
                 )
                 raise PermissionDenied(f"Access denied from IP address: {ip_address}")
 
+            if metadata.role == ApiKeyRole.READONLY and not self._check_readonly_permissions(
+                endpoint=endpoint,
+                requested_tokens=requested_tokens,
+                stream=stream,
+                uses_tools=uses_tools,
+            ):
+                self._log_audit(
+                    action="request_denied",
+                    key_id=metadata.key_id,
+                    ip_address=ip_address,
+                    details={"reason": "readonly_role_restricted", "endpoint": endpoint},
+                    success=False,
+                )
+                raise PermissionDenied(
+                    f"Read-only API key is not permitted to access endpoint: {endpoint or 'unknown'}"
+                )
+
             if not self._check_endpoint_permissions(metadata, endpoint):
                 self._log_audit(
                     action="request_denied",
@@ -762,6 +779,53 @@ class EnhancedApiKeyManager:
 
         return True
 
+    _READONLY_ALLOWED_ENDPOINTS: tp.ClassVar[frozenset[str]] = frozenset(
+        {
+            "/health",
+            "/liveness",
+            "/readiness",
+            "/metrics",
+            "/v1/models",
+            "/v1/models/{model_id}",
+            "/v1/tools",
+        }
+    )
+
+    @staticmethod
+    def _endpoint_matches(pattern: str, endpoint: str) -> bool:
+        """Return True if ``endpoint`` matches ``pattern`` (exact or ``{param}`` template)."""
+        if pattern == endpoint:
+            return True
+        if "{" not in pattern:
+            return False
+        pattern_parts = pattern.split("/")
+        endpoint_parts = endpoint.split("/")
+        if len(pattern_parts) != len(endpoint_parts):
+            return False
+        for p_part, e_part in zip(pattern_parts, endpoint_parts, strict=True):
+            if p_part.startswith("{") and p_part.endswith("}") and len(p_part) > 2:
+                if not e_part:
+                    return False
+                continue
+            if p_part != e_part:
+                return False
+        return True
+
+    def _check_readonly_permissions(
+        self,
+        *,
+        endpoint: str | None,
+        requested_tokens: int,
+        stream: bool,
+        uses_tools: bool,
+    ) -> bool:
+        """Restrict ``ApiKeyRole.READONLY`` keys to read-only metadata/monitoring endpoints."""
+        if requested_tokens > 0 or stream or uses_tools:
+            return False
+        if not endpoint:
+            return False
+        return any(self._endpoint_matches(pattern, endpoint) for pattern in self._READONLY_ALLOWED_ENDPOINTS)
+
     def _check_endpoint_permissions(self, metadata: ApiKeyMetadata, endpoint: str | None) -> bool:
         """Decide whether ``endpoint`` is permitted by the key.
 
@@ -780,7 +844,7 @@ class EnhancedApiKeyManager:
         if permissions.allowed_endpoints is None:
             return True
 
-        return endpoint in permissions.allowed_endpoints
+        return any(self._endpoint_matches(pattern, endpoint) for pattern in permissions.allowed_endpoints)
 
     def _check_model_permissions(self, metadata: ApiKeyMetadata, model: str | None) -> bool:
         """Decide whether ``model`` is permitted by the key.

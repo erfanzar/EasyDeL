@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import abc
 import json
+import re
 import typing as tp
+import uuid
 from dataclasses import dataclass, field
 
 from ..agentic_rollout.dispatcher import ToolDispatcher
@@ -131,6 +133,14 @@ class AgenticEnvironment(abc.ABC):
         """Attach optional generation services used by model-backed environments."""
         return None
 
+    def record_tool_turn(self, action: str, tool_result: StepResult) -> None:  # noqa: B027
+        """Observe an assistant turn intercepted by :class:`ToolEnvWrapper`.
+
+        Wrapped environments that accumulate multi-turn history (such as
+        :class:`SelfPlayEnvironment`) can override this hook to record
+        assistant turns and tool results without terminating verification early.
+        """
+
     def close(self) -> None:  # noqa: B027
         """Clean up any resources held by the environment."""
 
@@ -180,26 +190,24 @@ def create_tool_call_parser(
 
 def _default_tool_call_parser(action: str) -> list[tuple[str, str]]:
     """Parse tool calls in hermes format: <tool_call>{"name": "...", "arguments": ...}</tool_call>."""
-    import json
-    import re
-
-    results = []
-    for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", action, re.DOTALL):
+    results: list[tuple[str, str]] = []
+    for match in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", action, re.DOTALL):
         try:
             data = json.loads(match.group(1))
-            name = data.get("name", "")
-            args = json.dumps(data.get("arguments", {}))
-            results.append((name, args))
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, ValueError, TypeError):
             continue
+        if not isinstance(data, dict):
+            continue
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        args = json.dumps(data.get("arguments", {}))
+        results.append((name.strip(), args))
     return results
 
 
 def _make_regex_parser(pattern: str) -> tp.Callable[[str], list[tuple[str, str]]]:
     """Create a parser from a regex pattern."""
-    import json
-    import re
-
     compiled = re.compile(pattern, re.DOTALL)
 
     def parser(action: str) -> list[tuple[str, str]]:
@@ -212,16 +220,20 @@ def _make_regex_parser(pattern: str) -> tp.Callable[[str], list[tuple[str, str]]
             A list of ``(name, args_json_string)`` tuples for every
             successful match; malformed JSON entries are skipped.
         """
-        results = []
+        results: list[tuple[str, str]] = []
         for match in compiled.finditer(action):
             try:
                 text = match.group(1) if match.lastindex else match.group(0)
                 data = json.loads(text)
-                name = data.get("name", "")
-                args = json.dumps(data.get("arguments", {}))
-                results.append((name, args))
-            except (json.JSONDecodeError, KeyError, IndexError):
+            except (json.JSONDecodeError, ValueError, TypeError, IndexError):
                 continue
+            if not isinstance(data, dict):
+                continue
+            name = data.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            args = json.dumps(data.get("arguments", {}))
+            results.append((name.strip(), args))
         return results
 
     return parser
@@ -255,11 +267,13 @@ def _make_inference_tool_parser(
         result = parser_instance.extract_tool_calls(action, request=None)
         if not result.tools_called:
             return []
-        calls = []
+        calls: list[tuple[str, str]] = []
         for tc in result.tool_calls:
-            name = tc.function.name or ""
-            args = tc.function.arguments or "{}"
-            calls.append((name, args))
+            name = tc.function.name
+            if not isinstance(name, str) or not name.strip():
+                continue
+            args = ToolEnvWrapper._coerce_tool_args_json(tc.function.arguments)
+            calls.append((name.strip(), args))
         return calls
 
     return parser
@@ -301,12 +315,29 @@ class ToolEnvWrapper(AgenticEnvironment):
         self.tool_call_parser = tool_call_parser or _default_tool_call_parser
         self.max_tool_calls_per_step = max_tool_calls_per_step
         self._tool_calls_this_step = 0
-        self.guard_context = GuardContext(episode_id="uninitialized")
+        self._wrapper_id = uuid.uuid4().hex
+        self._episode_seq = 0
+        self.guard_context = GuardContext(episode_id=f"uninitialized:{self._wrapper_id}:0")
 
         def executor(tool):
             return lambda **kwargs: tool.execute(json.dumps(kwargs))
 
         self.dispatcher = ToolDispatcher({name: executor(tool) for name, tool in self.tools.items()}, guard=tool_guard)
+
+    def _next_episode_id(self, seed: int | None) -> str:
+        """Build a unique episode ID preventing GuardContext collisions across group siblings."""
+        self._episode_seq += 1
+        return f"{seed}:{self._wrapper_id}:{self._episode_seq}"
+
+    @staticmethod
+    def _extract_reset_intent(result: tp.Any) -> str:
+        """Extract string intent safely even when inner ``reset()`` returns ``None``."""
+        if result is None:
+            return ""
+        obs = getattr(result, "observation", "")
+        if obs is None:
+            return ""
+        return obs if isinstance(obs, str) else str(obs)
 
     def reset_batch(self, environments: list[AgenticEnvironment], seeds: list[int | None]) -> list[ResetResult]:
         """Preserve inner batching and reset wrapper-local episode state."""
@@ -319,7 +350,10 @@ class ToolEnvWrapper(AgenticEnvironment):
         for env, seed, result in zip(environments, seeds, results, strict=True):
             env._tool_calls_this_step = 0
             env._reset_tools()
-            env.guard_context = GuardContext(episode_id=str(seed), intent=result.observation)
+            env.guard_context = GuardContext(
+                episode_id=env._next_episode_id(seed),
+                intent=self._extract_reset_intent(result),
+            )
         return results
 
     def finalize_batch(self, environments: list[AgenticEnvironment]) -> list[StepResult | None]:
@@ -342,19 +376,34 @@ class ToolEnvWrapper(AgenticEnvironment):
             if callable(reset):
                 reset()
 
-    def reset(self, seed: int | None = None) -> ResetResult:
+    def reset(self, seed: int | None = None, **kwargs: tp.Any) -> ResetResult:
         """Reset the wrapped environment, episode-local tools and per-turn counters.
 
         Args:
             seed: Optional seed forwarded to the inner environment.
+            **kwargs: Optional extra reset kwargs forwarded when accepted by
+                the inner environment.
 
         Returns:
             The :class:`ResetResult` produced by the inner environment.
         """
         self._tool_calls_this_step = 0
         self._reset_tools()
-        result = self.env.reset(seed=seed)
-        self.guard_context = GuardContext(episode_id=str(seed), intent=result.observation)
+        if kwargs:
+            from ..training_utils import filter_kwargs_for_callable
+
+            inner_reset = self.env.reset
+            payload = dict(kwargs)
+            if seed is not None:
+                payload["seed"] = seed
+            filtered = filter_kwargs_for_callable(inner_reset, payload)
+            result = inner_reset(**filtered)
+        else:
+            result = self.env.reset(seed=seed)
+        self.guard_context = GuardContext(
+            episode_id=self._next_episode_id(seed),
+            intent=self._extract_reset_intent(result),
+        )
         return result
 
     @staticmethod
@@ -379,7 +428,7 @@ class ToolEnvWrapper(AgenticEnvironment):
 
         normalized: list[tuple[str, str]] = []
         for call in tool_calls:
-            name = ""
+            name: tp.Any = ""
             args: tp.Any = "{}"
             if isinstance(call, tuple) and len(call) == 2:
                 name, args = call
@@ -406,58 +455,134 @@ class ToolEnvWrapper(AgenticEnvironment):
                     name = getattr(call, "name", "") or ""
                     args = getattr(call, "arguments", getattr(call, "args", "{}"))
 
-            if name:
-                normalized.append((name, self._coerce_tool_args_json(args)))
+            if isinstance(name, str) and name.strip():
+                normalized.append((name.strip(), self._coerce_tool_args_json(args)))
         return normalized
 
     def _execute_tool_calls(self, parsed_calls: list[tuple[str, str]]) -> StepResult | None:
-        """Execute up to the per-turn cap and return a tool-result observation."""
+        """Execute up to the per-turn cap and return a tool-result observation.
+
+        Unknown tool names are never silently dropped: they are still normalized
+        and routed through :attr:`dispatcher` (and any configured ``tool_guard``)
+        so auditing runs before returning a per-call error observation. Tool
+        argument and execution errors are isolated per call rather than masking
+        guard bugs or discarding outputs from earlier calls in the same turn.
+        """
         if not parsed_calls or self._tool_calls_this_step >= self.max_tool_calls_per_step:
             return None
 
-        selected = [(name, args) for name, args in parsed_calls if name in self.tools][
-            : self.max_tool_calls_per_step - self._tool_calls_this_step
-        ]
+        budget = self.max_tool_calls_per_step - self._tool_calls_this_step
+        selected = list(parsed_calls[:budget])
         if not selected:
             return None
-        try:
-            canonical_calls = []
-            for index, (name, args) in enumerate(selected):
-                tool = self.tools[name]
+
+        # Track each slot in order: either an invalid non-string name error or a
+        # canonical NormalizedToolCall dispatched through ToolDispatcher.
+        canonical_calls: list[NormalizedToolCall] = []
+        prepared: dict[int, tuple[str, str, Exception | None]] = {}
+        invalid_slots: dict[int, tuple[tp.Any, str]] = {}
+        recorded_calls: list[dict[str, tp.Any]] = []
+
+        for slot_idx, raw_entry in enumerate(selected):
+            raw_name, raw_args = raw_entry
+            args_str = self._coerce_tool_args_json(raw_args)
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                invalid_slots[slot_idx] = (raw_name, f"Error: invalid tool name {raw_name!r}.")
+                recorded_calls.append({"name": str(raw_name), "args": args_str})
+                continue
+
+            name = raw_name.strip()
+            recorded_calls.append({"name": name, "args": args_str})
+            tool = self.tools.get(name)
+            prep_error: Exception | None = None
+            arguments: tp.Any
+            if tool is not None:
                 normalize = getattr(tool, "normalize_arguments", None)
                 if callable(normalize):
-                    arguments = normalize(args)
+                    try:
+                        arguments = normalize(args_str)
+                    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                        prep_error = exc
+                        arguments = {"arguments": args_str}
                 else:
                     # Structural tools own their serialized-argument protocol.
                     # The schema supplies a meaningful guard key for raw/scalar
                     # inputs, but execution must still receive the original text.
                     try:
-                        arguments = json.loads(args)
-                    except json.JSONDecodeError:
-                        arguments = args
+                        arguments = json.loads(args_str)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        arguments = args_str
                     if not isinstance(arguments, dict):
                         properties = tool.chat_schema.get("parameters", {}).get("properties", {})
                         arguments = {next(iter(properties), "arguments"): arguments}
-                canonical_calls.append(NormalizedToolCall.create(name, arguments, call_id=str(index)))
+            else:
+                try:
+                    arguments = json.loads(args_str)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    arguments = args_str
+                if not isinstance(arguments, dict):
+                    arguments = {"arguments": arguments}
 
-            def execute(call):
-                name, args = selected[int(call.call_id)]
-                return self.tools[name].execute(args)
+            try:
+                canonical = NormalizedToolCall.create(name, arguments, call_id=str(slot_idx))
+            except (ValueError, TypeError) as exc:
+                prep_error = prep_error or exc
+                canonical = NormalizedToolCall.create(name, {"raw_arguments": args_str}, call_id=str(slot_idx))
 
+            prepared[slot_idx] = (name, args_str, prep_error)
+            canonical_calls.append(canonical)
+
+        def execute(call: NormalizedToolCall):
+            slot = int(call.call_id)
+            name, args_str, prep_error = prepared[slot]
+            if prep_error is not None:
+                return f"Error: invalid tool arguments: {prep_error}"
+            tool = self.tools.get(name)
+            if tool is None:
+                return f"Error: unknown tool '{name}'."
+            try:
+                return tool.execute(args_str)
+            except Exception as exc:
+                return f"Error executing tool '{name}': {exc}"
+
+        dispatched_by_slot: dict[int, tp.Any] = {}
+        if canonical_calls:
             dispatched = self.dispatcher.dispatch_many(canonical_calls, self.guard_context, execute=execute)
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            return StepResult(observation=f"Error: invalid tool arguments: {exc}")
-        self._tool_calls_this_step += len(dispatched)
+            for result in dispatched:
+                dispatched_by_slot[int(result.call.call_id)] = result
+
+        observations: list[str] = []
+        total_reward = 0.0
+        any_terminated = False
+        any_truncated = False
+        for slot_idx in range(len(selected)):
+            if slot_idx in invalid_slots:
+                _, err_msg = invalid_slots[slot_idx]
+                observations.append(f"[invalid_tool_call]: {err_msg}")
+            elif slot_idx in dispatched_by_slot:
+                result = dispatched_by_slot[slot_idx]
+                observations.append(f"[{result.call.name}]: {result.observation}")
+                total_reward += float(result.execution.reward)
+                any_terminated = any_terminated or bool(result.terminated)
+                any_truncated = any_truncated or bool(result.truncated)
+
+        self._tool_calls_this_step += len(selected)
         return StepResult(
-            observation="\n".join(f"[{result.call.name}]: {result.observation}" for result in dispatched),
-            reward=sum(result.execution.reward for result in dispatched),
-            terminated=any(result.terminated for result in dispatched),
-            truncated=any(result.truncated for result in dispatched),
+            observation="\n".join(observations),
+            reward=total_reward,
+            terminated=any_terminated,
+            truncated=any_truncated,
             info={
-                "tool_calls": [{"name": name, "args": args} for name, args in selected],
+                "tool_calls": recorded_calls,
                 "guard_events": tuple(self.guard_context.events),
             },
         )
+
+    def _notify_inner_tool_turn(self, action: str, step_result: StepResult) -> None:
+        """Notify wrapped environments of an intercepted tool-call turn."""
+        record_tool_turn = getattr(self.env, "record_tool_turn", None)
+        if callable(record_tool_turn):
+            record_tool_turn(action, step_result)
 
     def step_with_tool_calls(
         self,
@@ -479,14 +604,22 @@ class ToolEnvWrapper(AgenticEnvironment):
         parsed_calls = self._normalize_structured_tool_calls(tool_calls)
         step_result = self._execute_tool_calls(parsed_calls)
         if step_result is not None:
+            self._notify_inner_tool_turn(action, step_result)
             return step_result
 
         parsed_calls = self.tool_call_parser(action)
         step_result = self._execute_tool_calls(parsed_calls)
         if step_result is not None:
+            self._notify_inner_tool_turn(action, step_result)
             return step_result
 
-        return self.env.step(action)
+        step = getattr(self.env, "step", None)
+        if callable(step):
+            return step(action)
+        run = getattr(self.env, "run", None)
+        if callable(run):
+            return run(action)
+        raise TypeError("Wrapped environment must provide step(action) or run(action).")
 
     def step(self, action: str) -> StepResult:
         """Step without pre-parsed tool-call hints."""

@@ -19,10 +19,24 @@ from __future__ import annotations
 import typing as tp
 
 
+def _is_json_like(value: tp.Any, depth: int) -> bool:
+    """Whether ``value`` is recursively composed of JSON-like primitives/containers within the depth bound."""
+    if depth > 4:
+        return False
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_like(v, depth + 1) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_like(v, depth + 1) for k, v in value.items())
+    return False
+
+
 def is_reward_sideband(value: tp.Any, depth: int = 0) -> bool:
     """Whether ``value`` is JSON-like metadata containing text (strings, or lists/dicts holding strings).
 
     Bare numeric columns are excluded so nothing new reaches the purified, model-facing batch.
+    All sibling elements in lists, tuples, and dicts must also be valid JSON-like values.
 
     Args:
         value: Column value for one example.
@@ -37,8 +51,10 @@ def is_reward_sideband(value: tp.Any, depth: int = 0) -> bool:
         return True
     if isinstance(value, (list, tuple)):
         return any(is_reward_sideband(v, depth + 1) for v in value) and all(
-            v is None or isinstance(v, (str, int, float, bool, list, tuple, dict)) for v in value
+            _is_json_like(v, depth + 1) for v in value
         )
     if isinstance(value, dict):
-        return all(isinstance(k, str) for k in value) and any(is_reward_sideband(v, depth + 1) for v in value.values())
+        return all(isinstance(k, str) and _is_json_like(v, depth + 1) for k, v in value.items()) and any(
+            is_reward_sideband(v, depth + 1) for v in value.values()
+        )
     return False

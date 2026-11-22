@@ -86,3 +86,10 @@ class Glm47MoeModelToolParser(Glm4MoeModelToolParser):
             r"<arg_key>(.*?)</arg_key>(?:\n|\s)*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
         )
+
+    def _extract_func_detail(self, block_body: str) -> tuple[str, str]:
+        """Split a GLM-4.7 tool-call body into ``(function_name, args_section)``."""
+        arg_idx = block_body.find("<arg_key>")
+        if arg_idx == -1:
+            return block_body.strip(), ""
+        return block_body[:arg_idx].strip(), block_body[arg_idx:]

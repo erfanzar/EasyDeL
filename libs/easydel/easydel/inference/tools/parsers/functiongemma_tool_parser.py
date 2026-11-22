@@ -27,6 +27,7 @@ Example format parsed:
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Sequence
 from functools import cached_property
@@ -45,8 +46,38 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ._schema_params import lookup_tool_properties
 
 logger = get_logger(__name__)
+
+_STRING_SCHEMA_TYPES = frozenset({"string", "str", "text"})
+_FUNC_NAME_RE = re.compile(r"^[\w\-\.]+$")
+
+
+def _strip_trailing_partial_marker(text: str, marker: str) -> str:
+    """Withhold any trailing non-empty proper prefix of *marker* from *text*."""
+    max_len = min(len(marker) - 1, len(text))
+    for k in range(max_len, 0, -1):
+        if text.endswith(marker[:k]):
+            return text[:-k]
+    return text
+
+
+def _has_open_marker_or_trailing_prefix(text: str, start_token: str, end_token: str) -> bool:
+    """Return True if *text* has an unclosed block or ends with a partial start marker."""
+    pos = 0
+    n = len(text)
+    start_len = len(start_token)
+    end_len = len(end_token)
+    while pos < n:
+        start_idx = text.find(start_token, pos)
+        if start_idx == -1:
+            return ToolParser._has_trailing_marker_prefix(text[pos:], (start_token,))
+        end_idx = text.find(end_token, start_idx + start_len)
+        if end_idx == -1:
+            return True
+        pos = end_idx + end_len
+    return False
 
 
 @ToolParserManager.register_module("functiongemma")  # pyright: ignore[reportUntypedClassDecorator]
@@ -99,15 +130,66 @@ class FunctionGemmaToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
+        self._tool_name_sent: list[bool] = []
+        self._tool_call_ids: list[str] = []
+        self._emitted_content_pos: int | None = None
+        self._pending_tail_start: int | None = None
+        self._last_current_text: str = ""
+        self._streaming_initialized: bool = False
+        self._in_open_call: bool = False
+        self._scan_pos: int = 0
+        self._closed_emitted_idx: int = 0
 
         start_token = re.escape(self.tool_call_start_token)
         end_token = re.escape(self.tool_call_end_token)
         self.tool_call_regex = re.compile(
-            rf"{start_token}call:(\w+)\{{(.*?)\}}{end_token}|{start_token}call:(\w+)\{{(.*)",
+            rf"{start_token}call:([\w\-\.]+)\{{(.*?)\}}{end_token}|{start_token}call:([\w\-\.]+)\{{(.*)",
             re.DOTALL,
         )
 
         self.buffered_delta_text = ""
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether a ``<start_function_call>`` block or partial start marker is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return self._in_open_call or self._pending_tail_start is not None
+        return _has_open_marker_or_trailing_prefix(
+            current_text,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+        )
+
+    def _reset_streaming_state(self, emitted_pos: int = 0) -> None:
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.current_tool_id = -1
+        self.streamed_args_for_tool = []
+        self._tool_name_sent = []
+        self._tool_call_ids = []
+        self._emitted_content_pos = emitted_pos
+        self._pending_tail_start = None
+        self._last_current_text = ""
+        self.buffered_delta_text = ""
+        self._streaming_initialized = False
+        self._in_open_call = False
+        self._scan_pos = 0
+        self._closed_emitted_idx = 0
+
+    def flush_streaming_content(self) -> str | None:
+        """Flush any trailing partial ``<start_function_call>`` prefix withheld at EOS."""
+        flushed: str | None = None
+        if self._pending_tail_start is not None and self._pending_tail_start < len(self._last_current_text):
+            flushed = self._last_current_text[self._pending_tail_start :] or None
+            self._emitted_content_pos = len(self._last_current_text)
+            self._pending_tail_start = None
+        self._last_current_text = ""
+        return flushed
 
     @cached_property
     def tool_call_start_token_ids(self) -> list[int]:
@@ -127,6 +209,13 @@ class FunctionGemmaToolParser(ToolParser):
             else []
         )
 
+    def _match_escape_token(self, text: str, index: int) -> str | None:
+        """Return the configured escape token starting at ``index``, or ``None``."""
+        for token in self.escape_tokens:
+            if text.startswith(token, index):
+                return token
+        return None
+
     def _scan_escape_token(self, text: str, index: int) -> tuple[int, bool]:
         """Advance across a configured escape token if present at ``index``.
 
@@ -139,19 +228,17 @@ class FunctionGemmaToolParser(ToolParser):
             characters to consume past ``index`` (0 if no match) and
             ``matched`` is ``True`` when an escape token started at ``index``.
         """
-
-        for token in self.escape_tokens:
-            if text.startswith(token, index):
-                return len(token), True
+        token = self._match_escape_token(text, index)
+        if token is not None:
+            return len(token), True
         return 0, False
 
     def _split_top_level(self, text: str, separator: str, *, complete_only: bool = False) -> list[str]:
         """Split ``text`` on ``separator`` while respecting nested JSON-like syntax.
 
         Brace / bracket nesting depth and escape-delimited string regions are
-        tracked so the separator is only honoured at the top level. Used to
-        carve a parameter blob like ``a:<escape>{"x":1}<escape>,b:2`` into
-        individual ``key:value`` segments without splitting inside the JSON.
+        tracked with the active opening delimiter so different escape tokens
+        cannot prematurely close one another.
 
         Args:
             text: Argument-block text to segment.
@@ -162,23 +249,25 @@ class FunctionGemmaToolParser(ToolParser):
         Returns:
             List of top-level segments in their original order.
         """
-
         segments: list[str] = []
         depth_brace = 0
         depth_bracket = 0
-        in_escaped_string = False
+        active_escape: str | None = None
         start = 0
         index = 0
 
         while index < len(text):
-            advance, is_escape = self._scan_escape_token(text, index)
-            if is_escape:
-                in_escaped_string = not in_escaped_string
-                index += advance
+            matched_escape = self._match_escape_token(text, index)
+            if matched_escape is not None:
+                if active_escape is None:
+                    active_escape = matched_escape
+                elif active_escape == matched_escape:
+                    active_escape = None
+                index += len(matched_escape)
                 continue
 
             char = text[index]
-            if not in_escaped_string:
+            if active_escape is None:
                 if char == "{":
                     depth_brace += 1
                 elif char == "}":
@@ -202,8 +291,8 @@ class FunctionGemmaToolParser(ToolParser):
     def _split_key_value(self, text: str) -> tuple[str, str] | None:
         """Split a single top-level ``key:value`` segment.
 
-        Locates the first top-level ``:`` (outside braces/brackets and escape
-        regions) and partitions the segment into key and value strings.
+        Locates the first top-level ``:`` (outside braces/brackets and active
+        escape regions) and partitions the segment into key and value strings.
 
         Args:
             text: A single segment produced by :meth:`_split_top_level`.
@@ -212,21 +301,23 @@ class FunctionGemmaToolParser(ToolParser):
             A ``(key, value)`` tuple, or ``None`` if no top-level ``:`` was
             found in the segment.
         """
-
         depth_brace = 0
         depth_bracket = 0
-        in_escaped_string = False
+        active_escape: str | None = None
         index = 0
 
         while index < len(text):
-            advance, is_escape = self._scan_escape_token(text, index)
-            if is_escape:
-                in_escaped_string = not in_escaped_string
-                index += advance
+            matched_escape = self._match_escape_token(text, index)
+            if matched_escape is not None:
+                if active_escape is None:
+                    active_escape = matched_escape
+                elif active_escape == matched_escape:
+                    active_escape = None
+                index += len(matched_escape)
                 continue
 
             char = text[index]
-            if not in_escaped_string:
+            if active_escape is None:
                 if char == "{":
                     depth_brace += 1
                 elif char == "}":
@@ -241,54 +332,111 @@ class FunctionGemmaToolParser(ToolParser):
 
         return None
 
-    def _normalize_argument_value(self, value: str) -> object:
+    @staticmethod
+    def _is_string_schema(param_schema: object) -> bool:
+        """Return whether a parameter JSON schema explicitly declares a string type."""
+        if not isinstance(param_schema, dict):
+            return False
+        declared = param_schema.get("type")
+        if isinstance(declared, str):
+            return declared.strip().lower() in _STRING_SCHEMA_TYPES
+        if isinstance(declared, list):
+            return any(isinstance(kind, str) and kind.strip().lower() in _STRING_SCHEMA_TYPES for kind in declared)
+        return False
+
+    def _normalize_argument_value(self, value: str, *, param_schema: dict | None = None) -> object:
         """Convert Gemma/FunctionGemma escaped argument syntax into Python values.
 
-        Strips outer ``<escape>...<escape>`` wrappers, swaps ``<|"|>`` for
-        ``"``, and then attempts to ``json.loads`` the result. Falls back to
-        the cleaned string on JSON decode failure.
+        Preserves ``<|"|>...<|"|>`` as literal strings (even when containing
+        embedded quotes), respects string schemas on ``<escape>...<escape>``
+        values, and recursively parses nested ``{...}`` / ``[...]`` structures
+        that contain escaped inner values.
 
         Args:
             value: Raw value substring extracted from the call payload.
+            param_schema: Optional parameter JSON Schema dict for this argument.
 
         Returns:
-            A JSON-decoded Python object (``dict``, ``list``, ``int``, etc.)
-            when decoding succeeds; otherwise the unescaped string.
+            Parsed Python value (``str``, ``dict``, ``list``, ``int``, ``float``,
+            ``bool``, ``None``).
         """
-
         normalized = value.strip()
         if not normalized:
             return ""
 
-        if "<escape>" in normalized and '<|"|>' not in normalized:
-            stripped = normalized
-            if stripped.startswith("<escape>") and stripped.endswith("<escape>") and len(stripped) >= 16:
-                stripped = stripped[len("<escape>") : -len("<escape>")]
-            try:
-                return json.loads(stripped)
-            except json.JSONDecodeError:
-                return stripped
+        # Outer <|"|>...<|"|> is always a literal string (keep embedded quotes intact).
+        if (
+            normalized.startswith('<|"|>')
+            and normalized.endswith('<|"|>')
+            and len(normalized) >= 10
+            and '<|"|>' not in normalized[5:-5]
+        ):
+            return normalized[5:-5]
 
-        normalized = normalized.replace('<|"|>', '"')
-        normalized = normalized.replace("<escape>", "")
+        # Outer <escape>...<escape> value.
+        if (
+            normalized.startswith("<escape>")
+            and normalized.endswith("<escape>")
+            and len(normalized) >= 16
+            and "<escape>" not in normalized[8:-8]
+        ):
+            inner = normalized[8:-8]
+            if self._is_string_schema(param_schema):
+                return inner
+            if inner.startswith('"') and inner.endswith('"'):
+                try:
+                    parsed_str = json.loads(inner)
+                    if isinstance(parsed_str, str):
+                        return parsed_str
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    pass
+            try:
+                parsed = json.loads(inner)
+                if isinstance(parsed, float) and not math.isfinite(parsed):
+                    return inner
+                return parsed
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                return inner
+
+        # Nested object: {...}
+        if normalized.startswith("{") and normalized.endswith("}"):
+            try:
+                return json.loads(normalized)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                return self._parse_arguments(normalized[1:-1])
+
+        # Nested array: [...]
+        if normalized.startswith("[") and normalized.endswith("]"):
+            try:
+                return json.loads(normalized)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                items = []
+                for elem in self._split_top_level(normalized[1:-1], ","):
+                    elem = elem.strip()
+                    if elem:
+                        items.append(self._normalize_argument_value(elem))
+                return items
 
         try:
-            return json.loads(normalized)
-        except json.JSONDecodeError:
+            parsed = json.loads(normalized)
+            if isinstance(parsed, float) and not math.isfinite(parsed):
+                return normalized
+            return parsed
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return normalized
 
-    def _parse_arguments(self, args_str: str) -> dict:
+    def _parse_arguments(self, args_str: str, *, param_schemas: dict | None = None) -> dict:
         """Parse the argument string into a dictionary.
 
         Extracts parameter key-value pairs from the escape-delimited format
-        and attempts JSON conversion for each value.
+        and normalizes each value.
 
         Args:
             args_str: The argument string in format "key:<escape>value<escape>...".
+            param_schemas: Optional mapping of parameter names to JSON Schema dicts.
 
         Returns:
             Dictionary mapping parameter names to their parsed values.
-            Values are JSON-parsed if possible, otherwise kept as strings.
         """
         arguments: dict[str, object] = {}
         if not args_str:
@@ -305,8 +453,46 @@ class FunctionGemmaToolParser(ToolParser):
             key = key.strip()
             if not key:
                 continue
-            arguments[key] = self._normalize_argument_value(value)
+            schema = param_schemas.get(key) if isinstance(param_schemas, dict) else None
+            arguments[key] = self._normalize_argument_value(value, param_schema=schema if isinstance(schema, dict) else None)
         return arguments
+
+    def _split_call_body(self, body: str) -> tuple[str | None, str, bool]:
+        """Parse ``call:name{args[}]`` into ``(func_name, args_body, args_closed)``."""
+        if not body.startswith("call:"):
+            return None, "", False
+        func_part = body[5:]
+        brace_pos = func_part.find("{")
+        if brace_pos == -1:
+            return None, "", False
+        func_name = func_part[:brace_pos].strip()
+        if not func_name or _FUNC_NAME_RE.fullmatch(func_name) is None:
+            return None, "", False
+
+        args_raw = func_part[brace_pos + 1 :]
+        depth = 1
+        active_escape: str | None = None
+        i = 0
+        n = len(args_raw)
+        while i < n:
+            matched_escape = self._match_escape_token(args_raw, i)
+            if matched_escape is not None:
+                if active_escape is None:
+                    active_escape = matched_escape
+                elif active_escape == matched_escape:
+                    active_escape = None
+                i += len(matched_escape)
+                continue
+            if active_escape is None:
+                ch = args_raw[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return func_name, args_raw[:i], True
+            i += 1
+        return func_name, args_raw, False
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         """Adjust the request to ensure special tokens are not skipped.
@@ -350,19 +536,32 @@ class FunctionGemmaToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
         try:
-            matches = self.tool_call_regex.findall(model_output)
-            if not matches:
+            pos = 0
+            spans: list[str] = []
+            while pos < len(model_output):
+                call_start = model_output.find(self.tool_call_start_token, pos)
+                if call_start == -1:
+                    break
+                body_start = call_start + len(self.tool_call_start_token)
+                call_end = model_output.find(self.tool_call_end_token, body_start)
+                if call_end == -1:
+                    spans.append(model_output[body_start:])
+                    break
+                spans.append(model_output[body_start:call_end])
+                pos = call_end + len(self.tool_call_end_token)
+
+            if not spans:
                 return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
             tool_calls: list[ToolCall] = []
-            for match in matches:
-                func_name = match[0] if match[0] else match[2]
-                args_str = match[1] if match[1] else match[3]
-
+            tools = getattr(request, "tools", None)
+            for body in spans:
+                func_name, args_str, _ = self._split_call_body(body)
                 if not func_name:
                     continue
 
-                arguments = self._parse_arguments(args_str)
+                param_schemas = lookup_tool_properties(func_name, tools)
+                arguments = self._parse_arguments(args_str, param_schemas=param_schemas)
 
                 tool_calls.append(
                     ToolCall(
@@ -445,117 +644,144 @@ class FunctionGemmaToolParser(ToolParser):
                 - tool_calls: Delta with function name or argument fragments
                 - None if more data needed or at tool call boundaries
         """
-        delta_text = self._buffer_delta_text(delta_text)
-        current_text = previous_text + delta_text
+        if not previous_text:
+            self._reset_streaming_state(0)
+        elif self._emitted_content_pos is None:
+            self._reset_streaming_state(len(previous_text))
+        elif self._scan_pos > len(current_text):
+            self._reset_streaming_state(0)
 
-        if self.tool_call_start_token not in current_text:
-            return DeltaMessage(content=delta_text) if delta_text else None
+        # Keep cumulative raw current_text intact (never rebuild it from buffered deltas).
+        self._streaming_initialized = True
+        self._last_current_text = current_text
+        self._pending_tail_start = None
+        self._in_open_call = False
 
         try:
-            start_count = current_text.count(self.tool_call_start_token)
-            end_count = current_text.count(self.tool_call_end_token)
-            prev_start_count = previous_text.count(self.tool_call_start_token)
-            prev_end_count = previous_text.count(self.tool_call_end_token)
+            pos = self._scan_pos
+            next_scan_pos = pos
+            spans: list[tuple[str, bool]] = []
+            visible_parts: list[tuple[int, int]] = []
+            while pos < len(current_text):
+                call_start = current_text.find(self.tool_call_start_token, pos)
+                if call_start == -1:
+                    tail = current_text[pos:]
+                    safe_tail = _strip_trailing_partial_marker(tail, self.tool_call_start_token)
+                    safe_end = pos + len(safe_tail)
+                    if safe_tail:
+                        visible_parts.append((pos, safe_end))
+                    if len(safe_tail) < len(tail):
+                        self._pending_tail_start = safe_end
+                    next_scan_pos = safe_end
+                    break
+                if call_start > pos:
+                    visible_parts.append((pos, call_start))
+                body_start = call_start + len(self.tool_call_start_token)
+                call_end = current_text.find(self.tool_call_end_token, body_start)
+                if call_end == -1:
+                    spans.append((current_text[body_start:], False))
+                    self._in_open_call = True
+                    next_scan_pos = call_start
+                    break
+                spans.append((current_text[body_start:call_end], True))
+                pos = call_end + len(self.tool_call_end_token)
+                next_scan_pos = pos
 
-            if start_count > prev_start_count and start_count > end_count:
-                self.current_tool_id += 1
-                self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr.append({})
-                logger.debug("Starting new tool call %d", self.current_tool_id)
-                return None
+            content_chunks: list[str] = []
+            emitted_pos = self._emitted_content_pos or 0
+            for seg_start, seg_end in visible_parts:
+                if seg_end > emitted_pos:
+                    content_chunks.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                    emitted_pos = seg_end
+            self._emitted_content_pos = emitted_pos
+            content_out = "".join(content_chunks)
 
-            if start_count > end_count:
-                last_start = current_text.rfind(self.tool_call_start_token)
-                partial_call = current_text[last_start + len(self.tool_call_start_token) :]
+            tools = getattr(request, "tools", None)
+            deltas: list[DeltaToolCall] = []
+            emitted_idx = self._closed_emitted_idx
+            next_closed_emitted_idx = self._closed_emitted_idx
+            for body, is_closed in spans:
+                clean_body = body if is_closed else _strip_trailing_partial_marker(body, self.tool_call_end_token)
+                func_name, args_part, args_closed = self._split_call_body(clean_body)
+                if func_name is None:
+                    continue
 
-                if partial_call.startswith("call:"):
-                    func_part = partial_call[5:]
+                idx = emitted_idx
+                emitted_idx += 1
+                if is_closed:
+                    next_closed_emitted_idx = emitted_idx
+                while len(self.prev_tool_call_arr) <= idx:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= idx:
+                    self.streamed_args_for_tool.append("")
+                while len(self._tool_name_sent) <= idx:
+                    self._tool_name_sent.append(False)
+                while len(self._tool_call_ids) <= idx:
+                    self._tool_call_ids.append("")
 
-                    if "{" in func_part:
-                        func_name = func_part.split("{")[0]
-                        args_part = func_part.split("{", 1)[1] if "{" in func_part else ""
+                if idx > self.current_tool_id:
+                    self.current_tool_id = idx
+                    self.current_tool_name_sent = self._tool_name_sent[idx]
 
-                        if not self.current_tool_name_sent and func_name:
-                            self.current_tool_name_sent = True
-                            self.prev_tool_call_arr[self.current_tool_id] = {"name": func_name, "arguments": {}}
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_id,
-                                        type="function",
-                                        id=f"chatcmpl-tool-{uuid4()}",
-                                        function=DeltaFunctionCall(name=func_name).model_dump(exclude_none=True),
-                                    )
-                                ]
-                            )
+                first = not self._tool_name_sent[idx]
+                if first:
+                    self._tool_call_ids[idx] = f"chatcmpl-tool-{uuid4()}"
+                    self._tool_name_sent[idx] = True
+                    if idx == self.current_tool_id:
+                        self.current_tool_name_sent = True
 
-                        if self.current_tool_name_sent and args_part:
-                            # Wait for a top-level delimiter before normalizing
-                            # a value: bare prefixes like "t", "-", or "1e"
-                            # otherwise change from strings/numbers into different
-                            # JSON types or representations as more text arrives.
-                            segments = self._split_top_level(args_part, ",", complete_only=True)
-                            current_args = self._parse_arguments(",".join(segments))
-                            if current_args:
-                                current_args_json = json.dumps(current_args, ensure_ascii=False)
-                                # Completed values are stable. Withhold only the
-                                # outer object brace so later arguments can extend
-                                # this exact JSON prefix without replacing text.
-                                safe_json = current_args_json[:-1]
+                param_schemas = lookup_tool_properties(func_name, tools)
+                prev_streamed = self.streamed_args_for_tool[idx]
+                diff = ""
 
-                                prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                                if safe_json and safe_json.startswith(prev_streamed):
-                                    diff = safe_json[len(prev_streamed) :]
-                                    if diff:
-                                        self.streamed_args_for_tool[self.current_tool_id] = safe_json
-                                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = current_args
-                                        return DeltaMessage(
-                                            tool_calls=[
-                                                DeltaToolCall(
-                                                    index=self.current_tool_id,
-                                                    function=DeltaFunctionCall(arguments=diff).model_dump(
-                                                        exclude_none=True
-                                                    ),
-                                                )
-                                            ]
-                                        )
-
-                return None
-
-            # Function call just ended
-            if end_count > prev_end_count:
-                if 0 <= self.current_tool_id < len(self.prev_tool_call_arr):
-                    all_calls = self.tool_call_regex.findall(current_text)
-                    args = {}
-                    if self.current_tool_id < len(all_calls):
-                        match = all_calls[self.current_tool_id]
-                        if match[0]:
-                            args_str = match[1]
-                            args = self._parse_arguments(args_str)
-                            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = args
-
-                    if args:
-                        args_json = json.dumps(args, ensure_ascii=False)
-                        prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                        # Only ever extend what was already streamed. If the final
-                        # arguments are not an extension, re-sending them here would
-                        # concatenate into invalid JSON; the terminal catch-up
-                        # (DelegatingParser / the mixin's finished=True) reconciles.
-                        diff = args_json[len(prev_streamed) :] if args_json.startswith(prev_streamed) else ""
+                if is_closed or args_closed:
+                    final_args = self._parse_arguments(args_part, param_schemas=param_schemas)
+                    args_json = json.dumps(final_args, ensure_ascii=False)
+                    self.prev_tool_call_arr[idx] = {"name": func_name, "arguments": final_args}
+                    if args_json.startswith(prev_streamed):
+                        diff = args_json[len(prev_streamed) :]
                         if diff:
-                            self.streamed_args_for_tool[self.current_tool_id] = args_json
-                            return DeltaMessage(
-                                tool_calls=[
-                                    DeltaToolCall(
-                                        index=self.current_tool_id,
-                                        function=DeltaFunctionCall(arguments=diff).model_dump(exclude_none=True),
-                                    )
-                                ]
-                            )
-                return None
+                            self.streamed_args_for_tool[idx] = args_json
+                else:
+                    self.prev_tool_call_arr[idx].setdefault("name", func_name)
+                    if args_part:
+                        # Wait for a top-level delimiter before normalizing a value:
+                        # bare prefixes like "t", "-", or "1e" otherwise change type
+                        # as more characters arrive.
+                        segments = self._split_top_level(args_part, ",", complete_only=True)
+                        current_args = self._parse_arguments(",".join(segments), param_schemas=param_schemas)
+                        if current_args:
+                            current_args_json = json.dumps(current_args, ensure_ascii=False)
+                            safe_json = current_args_json[:-1]
+                            if safe_json and safe_json.startswith(prev_streamed):
+                                diff = safe_json[len(prev_streamed) :]
+                                if diff:
+                                    self.streamed_args_for_tool[idx] = safe_json
+                                    self.prev_tool_call_arr[idx] = {"name": func_name, "arguments": current_args}
 
-            return DeltaMessage(content=delta_text) if delta_text else None
+                if first or diff:
+                    deltas.append(
+                        DeltaToolCall(
+                            index=idx,
+                            type="function" if first else None,
+                            id=self._tool_call_ids[idx] if first else None,
+                            function=DeltaFunctionCall(
+                                name=func_name if first else None,
+                                arguments=diff if diff else None,
+                            ).model_dump(exclude_none=True),
+                        )
+                    )
+
+            self._scan_pos = next_scan_pos
+            self._closed_emitted_idx = next_closed_emitted_idx
+
+            if content_out and deltas:
+                return DeltaMessage(content=content_out, tool_calls=deltas)
+            if deltas:
+                return DeltaMessage(tool_calls=deltas)
+            if content_out:
+                return DeltaMessage(content=content_out)
+            return None
 
         except Exception:
             logger.exception("Error in streaming tool call extraction")

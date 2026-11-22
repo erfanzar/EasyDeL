@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..direct_preference_optimization_trainer import DPOConfig
 
@@ -52,9 +53,14 @@ class TPOConfig(DPOConfig):
             self.loss_type = self.loss_type[0]
         if self.loss_type not in {"sigmoid", "hinge", "ipo", "tpo-l"}:
             raise ValueError("TPO `loss_type` must be one of 'sigmoid', 'hinge', 'ipo', or 'tpo-l'.")
+        if self.beta <= 0.0:
+            raise ValueError(f"`beta` must be positive; got {self.beta}.")
         if self.tpo_alpha < 0.0:
             raise ValueError("`tpo_alpha` must be non-negative.")
         if self.tpo_l_gamma < 0.0:
             raise ValueError("`tpo_l_gamma` must be non-negative.")
         self.reference_free = True
+        self.force_use_ref_model = False
         self.precompute_ref_log_probs = False
+
+    __hash__ = hash_fn

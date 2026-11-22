@@ -80,7 +80,6 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     ModelOutput,
 )
-from easydel.infra.sharding import resolve_stage_mesh
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import (
     BaseMoeModule,
@@ -1609,7 +1608,12 @@ class Qwen4ExpSparseMoeBlock(BaseMoeModule):
             source_per_expert=self.config.num_experts,
         ).reform_param(config=self.config)
 
-    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        *,
+        post_write_gate: Float[Array, "batch seq_len hc"] | None = None,
+    ) -> tuple[Array, Array]:
         """Route + combine; returns ``(output, router_logits)``."""
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
@@ -1618,14 +1622,13 @@ class Qwen4ExpSparseMoeBlock(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            shared_expert=self.gated_shared_expert_call(
+                self.shared_expert,
+                self.shared_expert_gate,
+                fp32_combine=True,
+            ),
+            post_write_gate=post_write_gate,
         )
-        stage_mesh = resolve_stage_mesh(self.config.mesh, arr=hidden_states)
-        with spx.use_mesh(stage_mesh):
-            shared_out = self.shared_expert(hidden_states)
-            gate_input = self.shared_expert_gate(hidden_states)
-        gate = jax.nn.sigmoid(gate_input.astype(jnp.float32))
-        shared_out = shared_out.astype(jnp.float32) * gate
-        out = (out.astype(jnp.float32) + shared_out).astype(self.dtype)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
@@ -2252,7 +2255,12 @@ class Qwen4ExpDecoderLayer(spx.Module):
         hidden_states = inject_streams(hyper_input, attn_outputs.attention_output, injection)
 
         mixed, hyper_input, injection = self.mlp_hyper_connection(hidden_states)
-        mlp_output, router_logits = self.mlp(mixed)
+        mlp_output, router_logits = self.mlp(
+            mixed,
+            post_write_gate=self.mlp_hyper_connection.fused_post_write_gate(
+                hyper_input, injection, mesh=self.config.mesh
+            ),
+        )
         hidden_states = inject_streams(hyper_input, mlp_output, injection)
 
         return Qwen4ExpDecoderOutput(
@@ -2390,7 +2398,12 @@ class Qwen4ExpMTPLayer(spx.Module):
         )
         hidden_states = inject_streams(hyper_input, attn_outputs.attention_output, injection)
         mixed, hyper_input, injection = self.mlp_hyper_connection(hidden_states)
-        mlp_output, _router = self.mlp(mixed)
+        mlp_output, _router = self.mlp(
+            mixed,
+            post_write_gate=self.mlp_hyper_connection.fused_post_write_gate(
+                hyper_input, injection, mesh=self.config.mesh
+            ),
+        )
         hidden_states = inject_streams(hyper_input, mlp_output, injection)
         return hidden_states, attn_outputs.cache_view
 

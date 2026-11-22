@@ -22,15 +22,278 @@ from __future__ import annotations
 
 import abc
 import copy
+import http.client
 import inspect
+import ipaddress
 import json
+import math
+import os
 import re
+import socket
+import stat
 import types
 import typing as tp
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Union, get_args, get_origin
 
 _TOOL_REGISTRY: dict[str, type[Tool]] = {}
+
+_BUILTIN_TYPE_NAMES: dict[str, type] = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "list": list,
+    "dict": dict,
+    "tuple": tuple,
+    "set": set,
+    "bytes": bytes,
+    "None": type(None),
+}
+
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_BLOCKED_FETCH_HOSTNAMES = frozenset(
+    {
+        "localhost",
+        "metadata",
+        "metadata.google.internal",
+        "metadata.goog",
+        "instance-data",
+    }
+)
+_WIKIPEDIA_LANG_RE = re.compile(r"^[a-zA-Z0-9-]+$")
+
+
+def _is_blocked_ip(ip_str: str) -> bool:
+    """Return True if ``ip_str`` is non-public, internal, loopback, or metadata."""
+    clean = ip_str.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(clean)
+    except ValueError:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return _is_blocked_ip(str(ip.ipv4_mapped))
+        if ip.sixtofour is not None and _is_blocked_ip(str(ip.sixtofour)):
+            return True
+        if ip.teredo is not None:
+            server, client = ip.teredo
+            if _is_blocked_ip(str(server)) or _is_blocked_ip(str(client)):
+                return True
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK:
+        return True
+    return (
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+_PinnedTarget = tuple[int, int, int, tuple[tp.Any, ...]]
+_PinnedAddrMap = dict[tuple[str, int], list[_PinnedTarget]]
+
+
+def _validate_and_resolve_fetch_url(url: str) -> tuple[str, tuple[str, int], list[_PinnedTarget]]:
+    """Validate an HTTP(S) URL and return pinned public socket targets (single DNS lookup)."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL must be a non-empty string.")
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("URL must start with http:// or https://")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must include a valid hostname.")
+    if "%" in hostname:
+        raise ValueError(f"Blocked access to scoped/link-local host {hostname!r}.")
+    port = int(parsed.port or (443 if scheme == "https" else 80))
+
+    host_lower = hostname.rstrip(".").lower()
+    if (
+        not host_lower
+        or host_lower in _BLOCKED_FETCH_HOSTNAMES
+        or host_lower.endswith(".localhost")
+        or host_lower.endswith(".internal")
+    ):
+        raise ValueError(f"Blocked access to internal or metadata host {hostname!r}.")
+
+    # Check literal IP addresses directly before DNS resolution.
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if _is_blocked_ip(str(literal_ip)):
+            raise ValueError(f"Blocked access to non-public IP address {hostname!r}.")
+        if literal_ip.version == 6:
+            target: _PinnedTarget = (socket.AF_INET6, socket.SOCK_STREAM, 0, (str(literal_ip), port, 0, 0))
+        else:
+            target = (socket.AF_INET, socket.SOCK_STREAM, 0, (str(literal_ip), port))
+        return url, (hostname.lower(), port), [target]
+
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve host {hostname!r}: {exc}") from exc
+    if not infos:
+        raise ValueError(f"Could not resolve host {hostname!r}.")
+
+    pinned_targets: list[_PinnedTarget] = []
+    for family, socktype, proto, _canonname, sockaddr in infos:
+        addr = sockaddr[0]
+        if _is_blocked_ip(addr):
+            raise ValueError(f"Blocked access to non-public address {addr!r} resolved for host {hostname!r}.")
+        pinned_targets.append((family, socktype, proto, sockaddr))
+    return url, (hostname.lower(), port), pinned_targets
+
+
+def _validate_fetch_url(url: str) -> str:
+    """Validate an HTTP(S) URL and block SSRF targets (private/loopback/metadata IPs)."""
+    validated_url, _, _ = _validate_and_resolve_fetch_url(url)
+    return validated_url
+
+
+def _connect_pinned_socket(
+    targets: tp.Sequence[_PinnedTarget],
+    *,
+    timeout: tp.Any,
+    source_address: tuple[str, int] | None = None,
+) -> socket.socket:
+    """Connect directly to pre-validated socket targets without re-resolving DNS."""
+    last_exc: OSError | None = None
+    for family, socktype, proto, sockaddr in targets:
+        addr = sockaddr[0]
+        if _is_blocked_ip(str(addr)):
+            raise ValueError(f"Blocked connection to non-public address {addr!r}.")
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            peer = sock.getpeername()
+            if peer and _is_blocked_ip(str(peer[0])):
+                raise ValueError(f"Blocked connection to non-public peer IP {peer[0]!r}.")
+            return sock
+        except ValueError:
+            sock.close()
+            raise
+        except OSError as exc:
+            sock.close()
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise OSError("No pinned addresses available to connect.")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection connecting only to validated pinned IPs (blocks DNS rebinding)."""
+
+    def __init__(self, host, port=None, *args, pinned_addrs: _PinnedAddrMap | None = None, **kwargs):
+        self._pinned_addrs = pinned_addrs
+        super().__init__(host, port, *args, **kwargs)
+
+    def _resolve_pinned_targets(self, scheme: str) -> list[_PinnedTarget]:
+        key = (self.host.lower(), int(self.port))
+        if self._pinned_addrs is not None and key in self._pinned_addrs:
+            return self._pinned_addrs[key]
+        host_fmt = f"[{self.host}]" if ":" in self.host else self.host
+        _, _, targets = _validate_and_resolve_fetch_url(f"{scheme}://{host_fmt}:{int(self.port)}/")
+        if self._pinned_addrs is not None:
+            self._pinned_addrs[key] = targets
+        return targets
+
+    def connect(self) -> None:
+        if getattr(self, "_tunnel_host", None):
+            raise ValueError("HTTP proxy tunneling is disabled for WebFetchTool.")
+        targets = self._resolve_pinned_targets("http")
+        self.sock = _connect_pinned_socket(
+            targets,
+            timeout=self.timeout,
+            source_address=self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection connecting to validated pinned IPs while preserving TLS SNI."""
+
+    def __init__(self, host, port=None, *args, pinned_addrs: _PinnedAddrMap | None = None, **kwargs):
+        self._pinned_addrs = pinned_addrs
+        super().__init__(host, port, *args, **kwargs)
+
+    def _resolve_pinned_targets(self, scheme: str) -> list[_PinnedTarget]:
+        key = (self.host.lower(), int(self.port))
+        if self._pinned_addrs is not None and key in self._pinned_addrs:
+            return self._pinned_addrs[key]
+        host_fmt = f"[{self.host}]" if ":" in self.host else self.host
+        _, _, targets = _validate_and_resolve_fetch_url(f"{scheme}://{host_fmt}:{int(self.port)}/")
+        if self._pinned_addrs is not None:
+            self._pinned_addrs[key] = targets
+        return targets
+
+    def connect(self) -> None:
+        if getattr(self, "_tunnel_host", None):
+            raise ValueError("HTTPS proxy tunneling is disabled for WebFetchTool.")
+        targets = self._resolve_pinned_targets("https")
+        raw_sock = _connect_pinned_socket(
+            targets,
+            timeout=self.timeout,
+            source_address=self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
+        except BaseException:
+            raw_sock.close()
+            raise
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    """urllib HTTP handler using :class:`_PinnedHTTPConnection`."""
+
+    def __init__(self, pinned_addrs: _PinnedAddrMap, debuglevel: int = 0):
+        super().__init__(debuglevel=debuglevel)
+        self._pinned_addrs = pinned_addrs
+
+    def http_open(self, req):
+        return self.do_open(partial(_PinnedHTTPConnection, pinned_addrs=self._pinned_addrs), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """urllib HTTPS handler using :class:`_PinnedHTTPSConnection`."""
+
+    def __init__(self, pinned_addrs: _PinnedAddrMap, debuglevel: int = 0, context=None):
+        super().__init__(debuglevel=debuglevel, context=context)
+        self._pinned_addrs = pinned_addrs
+
+    def https_open(self, req):
+        return self.do_open(
+            partial(_PinnedHTTPSConnection, pinned_addrs=self._pinned_addrs),
+            req,
+            context=self._context,
+        )
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that re-validates and pins every redirect target against SSRF rules."""
+
+    def __init__(self, pinned_addrs: _PinnedAddrMap | None = None):
+        super().__init__()
+        self._pinned_addrs = pinned_addrs
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        _, host_port, targets = _validate_and_resolve_fetch_url(target)
+        if self._pinned_addrs is not None:
+            self._pinned_addrs[host_port] = targets
+        return super().redirect_request(req, fp, code, msg, headers, target)
 
 _TYPE_MAP: dict[type, str] = {
     str: "string",
@@ -104,10 +367,27 @@ def function_to_json(func: tp.Callable) -> dict[str, tp.Any]:
 
     try:
         signature = inspect.signature(func)
-        type_hints = tp.get_type_hints(func)
     except (ValueError, TypeError) as e:
         fn_name = getattr(func, "__name__", repr(func))
         raise ValueError(f"Failed to get signature for {fn_name}: {e}") from e
+
+    try:
+        type_hints = tp.get_type_hints(func)
+    except (NameError, TypeError, AttributeError):
+        # Gracefully fall back when forward references (e.g. under
+        # `from __future__ import annotations` or local types) cannot be resolved.
+        type_hints = {}
+        globalns = getattr(func, "__globals__", None) or {}
+        for pname, param in signature.parameters.items():
+            ann = param.annotation
+            if isinstance(ann, str):
+                resolved = _BUILTIN_TYPE_NAMES.get(ann.strip())
+                if resolved is None and ann.strip() in globalns:
+                    resolved = globalns[ann.strip()]
+                if resolved is not None:
+                    type_hints[pname] = resolved
+            elif ann is not inspect.Parameter.empty:
+                type_hints[pname] = ann
 
     docstring = func.__doc__ or ""
     first_line = docstring.strip().split("\n")[0] if docstring.strip() else ""
@@ -117,8 +397,12 @@ def function_to_json(func: tp.Callable) -> dict[str, tp.Any]:
         param_descriptions[param_name.strip()] = description.strip()
 
     parameters: dict[str, dict[str, tp.Any]] = {}
+    required: list[str] = []
     for param in signature.parameters.values():
-        if param.name == "self":
+        if param.name == "self" or param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
             continue
         param_info: dict[str, tp.Any] = {"type": "string"}
         annotation = type_hints.get(param.name, param.annotation)
@@ -127,10 +411,8 @@ def function_to_json(func: tp.Callable) -> dict[str, tp.Any]:
         if param.name in param_descriptions:
             param_info["description"] = param_descriptions[param.name]
         parameters[param.name] = param_info
-
-    required = [
-        p.name for p in signature.parameters.values() if p.name != "self" and p.default == inspect.Parameter.empty
-    ]
+        if param.default == inspect.Parameter.empty:
+            required.append(param.name)
     fn_name = getattr(func, "__name__", "unknown")
     if fn_name == "call":
         fn_name = getattr(getattr(func, "__self__", None), "name", fn_name)
@@ -237,19 +519,27 @@ class Tool(abc.ABC):
 class PythonCodeTool(Tool):
     """Execute Python in a resource-limited, timed, out-of-process sandbox."""
 
-    def __init__(self, timeout: float = 10.0, max_output_length: int = 4096):
-        """Configure the wall-clock timeout and captured output length."""
+    def __init__(self, timeout: float = 10.0, max_output_length: int = 4096, use_jail: str = "auto"):
+        """Configure the wall-clock timeout, captured output length, and jail policy."""
+        from .sandbox import Sandbox
+
         self._timeout = timeout
-        self._max_output_length = max_output_length
+        self._max_output_length = max(0, int(max_output_length))
+        self._use_jail = use_jail
+        self._sandbox = Sandbox(
+            timeout=self._timeout,
+            max_output=self._max_output_length + 1,
+            use_jail=self._use_jail,
+        )
 
     def call(self, code: str) -> str:
         """Execute a Python code snippet and return everything printed to stdout/stderr. Use print() to produce output. You have access to the full Python standard library including math, json, re, itertools, collections, fractions, decimal, statistics, etc. For example: 'import math; print(math.factorial(10))' or 'print(sum(range(1, 101)))'.
 
         code: Complete Python code to execute. Must use print() to produce visible output.
         """
-        from .sandbox import Sandbox
-
-        res = Sandbox(timeout=self._timeout, max_output=self._max_output_length).run_python(code)
+        if not isinstance(code, str):
+            return "Error: code must be a string."
+        res = self._sandbox.run_python(code)
         output = res.stdout
         if res.stderr:
             output += ("\n" if output else "") + res.stderr
@@ -264,17 +554,27 @@ class PythonCodeTool(Tool):
 class CalculatorTool(Tool):
     """Evaluate arithmetic and math functions inside a bounded child process."""
 
-    def __init__(self, timeout: float = 2.0, max_output_length: int = 4096):
+    def __init__(self, timeout: float = 2.0, max_output_length: int = 4096, use_jail: str = "auto"):
         """Configure resource limits without restricting supported math functions."""
+        from .sandbox import Sandbox
+
         self._timeout = timeout
-        self._max_output_length = max_output_length
+        self._max_output_length = max(0, int(max_output_length))
+        self._use_jail = use_jail
+        self._sandbox = Sandbox(
+            timeout=self._timeout,
+            memory_mb=256,
+            max_output=self._max_output_length + 1,
+            use_jail=self._use_jail,
+        )
 
     def call(self, expression: str) -> str:
         """Evaluate a mathematical expression and return the numeric result. Supports all standard arithmetic (+, -, *, /, //, %, **), comparisons, and math functions: abs, round, min, max, pow, sqrt, sin, cos, tan, asin, acos, atan, atan2, log, log2, log10, exp, ceil, floor, factorial, gcd, lcm, comb, perm, degrees, radians, hypot, isqrt. Constants: pi, e, tau, inf, nan.
 
         expression: Mathematical expression to evaluate, e.g. 'sqrt(2) * pi', 'factorial(10)', 'log2(1024)', '3**4 + sin(0.5)'.
         """
-        import math
+        if not isinstance(expression, str):
+            return "Error: expression must be a string."
 
         allowed_names: dict[str, tp.Any] = {
             "abs": abs,
@@ -323,7 +623,6 @@ class CalculatorTool(Tool):
         ):
             if hasattr(math, name):
                 allowed_names[name] = getattr(math, name)
-        from .sandbox import Sandbox
 
         code = (
             "import ast, builtins, math\n"
@@ -335,32 +634,49 @@ class CalculatorTool(Tool):
             "allowed = {name: getattr(math, name, getattr(builtins, name, None)) for name in names}\n"
             "print(eval(compile(tree, '<calculator>', 'eval'), {'__builtins__': {}}, allowed))\n"
         )
-        result = Sandbox(timeout=self._timeout, memory_mb=256, max_output=self._max_output_length).run_python(code)
+        result = self._sandbox.run_python(code)
         if result.timed_out:
             return f"Error: calculation timed out after {self._timeout}s"
         if not result.ok:
             return f"Error: {result.stderr.strip() or f'calculator exited with code {result.returncode}'}"
-        return result.stdout.strip()
+        output = result.stdout.strip()
+        if len(output) > self._max_output_length:
+            return output[: self._max_output_length] + "\n... (output truncated)"
+        return output
 
 
 @register_tool("bash")
 class BashTool(Tool):
     """Run shell commands, including pipes and redirects, in a timed sandbox."""
 
-    def __init__(self, timeout: float = 30.0, max_output_length: int = 8192, shell: str = "/bin/bash"):
-        """Configure wall-clock timeout, captured output length, and shell."""
+    def __init__(
+        self,
+        timeout: float = 30.0,
+        max_output_length: int = 8192,
+        shell: str = "/bin/bash",
+        use_jail: str = "auto",
+    ):
+        """Configure wall-clock timeout, captured output length, shell, and jail policy."""
+        from .sandbox import Sandbox
+
         self._timeout = timeout
-        self._max_output_length = max_output_length
+        self._max_output_length = max(0, int(max_output_length))
         self._shell = shell
+        self._use_jail = use_jail
+        self._sandbox = Sandbox(
+            timeout=self._timeout,
+            max_output=self._max_output_length + 1,
+            use_jail=self._use_jail,
+        )
 
     def call(self, command: str) -> str:
         """Run a bash shell command and return its stdout and stderr output. Supports pipes, redirects, environment variables, and all standard Unix utilities (grep, awk, sed, curl, find, etc.).
 
         command: The shell command to execute, e.g. 'ls -la /tmp', 'echo hello | wc -c', 'curl -s https://example.com'.
         """
-        from .sandbox import Sandbox
-
-        res = Sandbox(timeout=self._timeout, max_output=self._max_output_length).run_bash(command, shell=self._shell)
+        if not isinstance(command, str):
+            return "Error: command must be a string."
+        res = self._sandbox.run_bash(command, shell=self._shell)
         if res.timed_out:
             output = f"Error: command timed out after {self._timeout}s"
         else:
@@ -378,10 +694,19 @@ class BashTool(Tool):
 class RegexTool(Tool):
     """Extract full Python regular-expression matches in a bounded child process."""
 
-    def __init__(self, timeout: float = 2.0, max_output_length: int = 4096):
-        """Configure the matching deadline and maximum returned output length."""
+    def __init__(self, timeout: float = 2.0, max_output_length: int = 4096, use_jail: str = "auto"):
+        """Configure the matching deadline, maximum returned output length, and jail policy."""
+        from .sandbox import Sandbox
+
         self._timeout = timeout
-        self._max_output_length = max_output_length
+        self._max_output_length = max(0, int(max_output_length))
+        self._use_jail = use_jail
+        self._sandbox = Sandbox(
+            timeout=self._timeout,
+            memory_mb=256,
+            max_output=self._max_output_length + 1,
+            use_jail=self._use_jail,
+        )
 
     def call(self, pattern: str, text: str) -> str:
         """Search text with a Python regular expression and return all matches as a JSON array. Uses re.findall(), so if the pattern contains capture groups, only the captured portions are returned. Supports the full Python regex syntax including lookaheads, named groups, etc.
@@ -389,7 +714,8 @@ class RegexTool(Tool):
         pattern: Python regular expression pattern, e.g. r'\\d+' for numbers, r'(\\w+)@(\\w+\\.\\w+)' for emails, r'(?<=price: )\\$[\\d.]+' for prices after 'price: '.
         text: The text to search through.
         """
-        from .sandbox import Sandbox
+        if not isinstance(pattern, str) or not isinstance(text, str):
+            return "Regex error: pattern and text must be strings."
 
         code = (
             "import json, re, sys\n"
@@ -400,9 +726,7 @@ class RegexTool(Tool):
             "except re.error as exc:\n"
             "    print(f'Regex error: {exc}')\n"
         )
-        result = Sandbox(timeout=self._timeout, memory_mb=256, max_output=self._max_output_length + 1).run_python(
-            code, stdin=json.dumps([pattern, text])
-        )
+        result = self._sandbox.run_python(code, stdin=json.dumps([pattern, text]))
         if result.timed_out:
             return f"Regex error: matching timed out after {self._timeout}s"
         if not result.ok:
@@ -417,6 +741,16 @@ class RegexTool(Tool):
 class JSONProcessorTool(Tool):
     """Parse JSON, list object keys, and query nested values by dotted paths."""
 
+    def __init__(self, max_input_length: int = 1_048_576, max_output_length: int = 16384):
+        """Configure maximum input and output character sizes."""
+        self._max_input_length = max(1, int(max_input_length))
+        self._max_output_length = max(1, int(max_output_length))
+
+    def _cap_output(self, text: str) -> str:
+        if len(text) > self._max_output_length:
+            return text[: self._max_output_length] + "\n... (truncated)"
+        return text
+
     def call(self, operation: str, data: str, path: str = "") -> str:
         """Process JSON data. Three operations are available: 'parse' validates and pretty-prints the JSON; 'query' extracts a nested value by dot-separated key path (use numeric indices for arrays, e.g. 'results.0.name'); 'keys' lists all top-level keys of a JSON object.
 
@@ -424,18 +758,39 @@ class JSONProcessorTool(Tool):
         data: The JSON string to process.
         path: Dot-separated key path for the 'query' operation, e.g. 'user.address.city' or 'items.2.price'. Not needed for 'parse' or 'keys'.
         """
-        try:
-            parsed = json.loads(data) if isinstance(data, str) else data
-        except json.JSONDecodeError as e:
-            return f"JSON parse error: {e}"
+        if not isinstance(operation, str):
+            return f"Error: operation must be a string, got {type(operation).__name__}."
+        if not isinstance(path, str):
+            return f"Error: path must be a string, got {type(path).__name__}."
+        if isinstance(data, str):
+            if len(data) > self._max_input_length:
+                return f"Error: JSON input exceeds maximum allowed size of {self._max_input_length} characters."
+            try:
+                parsed = json.loads(data)
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as e:
+                return f"JSON parse error: {e}"
+        else:
+            if not isinstance(data, (dict, list, int, float, bool, type(None))):
+                return f"Error: unsupported data type {type(data).__name__}."
+            try:
+                serialized = json.dumps(data, ensure_ascii=False)
+            except (TypeError, ValueError, RecursionError) as e:
+                return f"JSON parse error: {e}"
+            if len(serialized) > self._max_input_length:
+                return f"Error: JSON input exceeds maximum allowed size of {self._max_input_length} characters."
+            parsed = data
+
         if operation == "parse":
-            return json.dumps(parsed, indent=2, ensure_ascii=False)
+            try:
+                return self._cap_output(json.dumps(parsed, indent=2, ensure_ascii=False))
+            except (TypeError, ValueError, RecursionError) as e:
+                return f"JSON serialization error: {e}"
         elif operation == "keys":
             if isinstance(parsed, dict):
-                return json.dumps(list(parsed.keys()))
+                return self._cap_output(json.dumps(list(parsed.keys()), ensure_ascii=False))
             return "Error: data is not a JSON object."
         elif operation == "query":
-            return self._query(parsed, path)
+            return self._cap_output(self._query(parsed, path))
         else:
             return f"Unknown operation: {operation}. Use 'parse', 'query', or 'keys'."
 
@@ -454,31 +809,42 @@ class JSONProcessorTool(Tool):
                     return f"Error: invalid index '{key}' for list of length {len(current)}."
             else:
                 return f"Error: key '{key}' not found."
-        return json.dumps(current, indent=2, ensure_ascii=False) if not isinstance(current, str) else current
+        if isinstance(current, str):
+            return current
+        try:
+            return json.dumps(current, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError, RecursionError) as e:
+            return f"JSON serialization error: {e}"
 
 
 @register_tool("wikipedia")
 class WikipediaTool(Tool):
     """Look up Wikipedia summaries in a configurable language."""
 
-    def __init__(self, language: str = "en", max_length: int = 4096):
-        """Configure the API language and response character limit."""
+    def __init__(self, language: str = "en", max_length: int = 4096, max_bytes: int = 1_048_576):
+        """Configure the API language, response character limit, and max download bytes."""
+        if not isinstance(language, str) or not _WIKIPEDIA_LANG_RE.fullmatch(language):
+            raise ValueError(f"Invalid Wikipedia language code: {language!r}.")
         self._language = language
-        self._max_length = max_length
+        self._max_length = max(1, int(max_length))
+        self._max_bytes = max(1, int(max_bytes))
 
     def call(self, query: str) -> str:
         """Look up a topic on Wikipedia and return a summary of the article. Returns the article title and the first few paragraphs (the extract). Useful for factual questions about people, places, events, science, history, etc.
 
         query: The topic to look up, e.g. 'Albert Einstein', 'Python programming language', 'Pythagorean theorem'.
         """
-        import urllib.parse
-        import urllib.request
+        if not isinstance(query, str) or not query.strip():
+            return "Wikipedia lookup failed: query must be a non-empty string."
 
-        url = f"https://{self._language}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
+        url = f"https://{self._language}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query, safe='')}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "EasyDeL-AgenticTool/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
+                raw = resp.read(self._max_bytes + 1)
+            if len(raw) > self._max_bytes:
+                return f"Wikipedia lookup failed: response exceeded maximum size limit ({self._max_bytes} bytes)."
+            data = json.loads(raw.decode("utf-8", errors="replace"))
             title = data.get("title", query)
             extract = data.get("extract", "No summary available.")
             result = f"# {title}\n\n{extract}"
@@ -491,65 +857,112 @@ class WikipediaTool(Tool):
 
 @register_tool("web_fetch")
 class WebFetchTool(Tool):
-    """Fetch HTTP(S) content and strip scripts, styles, and HTML markup."""
+    """Fetch HTTP(S) content with SSRF protection and strip scripts, styles, and HTML markup."""
 
-    def __init__(self, timeout: float = 15.0, max_length: int = 8192):
-        """Configure the HTTP timeout and response character limit."""
+    def __init__(self, timeout: float = 15.0, max_length: int = 8192, max_bytes: int = 1_048_576):
+        """Configure the HTTP timeout, response character limit, and max download bytes."""
         self._timeout = timeout
-        self._max_length = max_length
+        self._max_length = max(1, int(max_length))
+        self._max_bytes = max(1, int(max_bytes))
 
     def call(self, url: str) -> str:
         """Fetch a URL via HTTP GET and return the page content as plain text with HTML tags stripped. Useful for reading web pages, API endpoints that return HTML, documentation pages, etc.
 
         url: Full URL to fetch, must start with http:// or https://, e.g. 'https://example.com/page'.
         """
-        import urllib.request
-
-        if not url.startswith(("http://", "https://")):
-            return "Error: URL must start with http:// or https://"
         try:
+            _, host_port, targets = _validate_and_resolve_fetch_url(url)
+            pinned_addrs: _PinnedAddrMap = {host_port: targets}
             req = urllib.request.Request(url, headers={"User-Agent": "EasyDeL-AgenticTool/1.0"})
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                content = resp.read().decode("utf-8", errors="replace")
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                _PinnedHTTPHandler(pinned_addrs),
+                _PinnedHTTPSHandler(pinned_addrs),
+                _SafeRedirectHandler(pinned_addrs),
+            )
+            with opener.open(req, timeout=self._timeout) as resp:
+                raw = resp.read(self._max_bytes + 1)
+            truncated_bytes = len(raw) > self._max_bytes
+            if truncated_bytes:
+                raw = raw[: self._max_bytes]
+            content = raw.decode("utf-8", errors="replace")
             content = re.sub(r"<script[^>]*>.*?</script>", "", content, flags=re.DOTALL)
             content = re.sub(r"<style[^>]*>.*?</style>", "", content, flags=re.DOTALL)
             content = re.sub(r"<[^>]+>", " ", content)
             content = re.sub(r"\s+", " ", content).strip()
             if len(content) > self._max_length:
                 content = content[: self._max_length] + "\n... (truncated)"
+            elif truncated_bytes:
+                content = (content or "(empty page)") + "\n... (truncated)"
             return content or "(empty page)"
+        except ValueError as e:
+            return f"Error: {e}"
         except Exception as e:
             return f"Fetch failed: {type(e).__name__}: {e}"
 
 
 @register_tool("file_read")
 class FileReadTool(Tool):
-    """Read local text with optional realpath-based directory restrictions."""
+    """Read local regular text files restricted to explicit allowed directories."""
 
-    def __init__(self, allowed_dirs: list[str] | None = None, max_length: int = 16384):
-        """Configure allowed directories (empty permits all) and read limit."""
-        self._allowed_dirs = allowed_dirs or []
-        self._max_length = max_length
+    def __init__(self, allowed_dirs: tp.Sequence[str] | None = None, max_length: int = 16384):
+        """Configure explicit allowed directories and read limit.
+
+        Raises:
+            ValueError: If ``allowed_dirs`` is missing, empty, or a bare string.
+        """
+        if allowed_dirs is None or isinstance(allowed_dirs, (str, bytes)):
+            raise ValueError(
+                "FileReadTool requires an explicit non-empty sequence of `allowed_dirs` "
+                "to prevent unrestricted host file reads."
+            )
+        roots = [os.path.realpath(os.path.expanduser(str(d))) for d in allowed_dirs if str(d).strip()]
+        if not roots:
+            raise ValueError(
+                "FileReadTool requires at least one non-empty directory path in `allowed_dirs`."
+            )
+        self._allowed_dirs = roots
+        self._max_length = max(1, int(max_length))
 
     def call(self, path: str) -> str:
         """Read and return the contents of a local file. Supports any text file format. Tilde (~) is expanded to the home directory.
 
         path: Absolute or relative path to the file, e.g. '/tmp/data.csv', '~/notes.txt', 'src/main.py'.
         """
-        import os
-
-        path = os.path.expanduser(path)
-        if self._allowed_dirs:
-            resolved_path = os.path.realpath(path)
-            allowed_roots = [os.path.realpath(os.path.expanduser(d)) for d in self._allowed_dirs]
-            if not any(os.path.commonpath((resolved_path, root)) == root for root in allowed_roots):
-                return f"Error: path '{path}' is outside allowed directories."
-            path = resolved_path
+        if not isinstance(path, str) or not path.strip():
+            return "Error: path must be a non-empty string."
         try:
-            with open(path) as f:
-                content = f.read(self._max_length)
-            if len(content) == self._max_length:
-                content += "\n... (truncated)"
+            expanded = os.path.expanduser(path)
+            resolved_path = os.path.realpath(expanded)
+        except (ValueError, OSError) as e:
+            return f"Error: invalid path '{path}': {e}"
+
+        allowed = False
+        for root in self._allowed_dirs:
+            try:
+                if os.path.commonpath((resolved_path, root)) == root:
+                    allowed = True
+                    break
+            except ValueError:
+                continue
+        if not allowed:
+            return f"Error: path '{path}' is outside allowed directories."
+
+        try:
+            open_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(resolved_path, open_flags)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    return f"Error: path '{path}' is not a regular file."
+                with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+                    fd = -1  # ownership transferred to file object
+                    content = f.read(self._max_length + 1)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            if len(content) > self._max_length:
+                content = content[: self._max_length] + "\n... (truncated)"
             return content
         except Exception as e:
             return f"Error reading file: {type(e).__name__}: {e}"
@@ -599,11 +1012,31 @@ class UnitConverterTool(Tool):
         from_unit: The source unit, e.g. 'km', 'lb', 'c', 'gal'.
         to_unit: The target unit to convert to, e.g. 'mi', 'kg', 'f', 'l'.
         """
+        if not isinstance(from_unit, str) or not isinstance(to_unit, str):
+            return "Error: 'from_unit' and 'to_unit' must be strings."
+        if len(from_unit) > 64 or len(to_unit) > 64:
+            return "Error: unit name is too long."
+        if isinstance(value, bool):
+            return "Error: 'value' must be a finite number, not bool."
+        if isinstance(value, str) and len(value) > 128:
+            return "Error: 'value' string is too long."
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError, OverflowError) as e:
+            return f"Error: invalid numeric value {value!r}: {e}"
+        if not math.isfinite(numeric_value):
+            return f"Error: 'value' must be a finite number, got {value!r}."
+
         from_unit = from_unit.lower().strip()
         to_unit = to_unit.lower().strip()
         key = (from_unit, to_unit)
         if key in self._CONVERSIONS:
-            result = self._CONVERSIONS[key](float(value))
+            try:
+                result = self._CONVERSIONS[key](numeric_value)
+            except OverflowError as e:
+                return f"Error: numeric overflow during conversion: {e}"
+            if not math.isfinite(result):
+                return "Error: conversion resulted in a non-finite number."
             return f"{value} {from_unit} = {result:.6g} {to_unit}"
         if from_unit == to_unit:
             return f"{value} {from_unit} (no conversion needed)"
@@ -615,9 +1048,10 @@ class UnitConverterTool(Tool):
 class NotepadTool(Tool):
     """Persistent per-instance scratchpad with write/append/read/clear actions."""
 
-    def __init__(self):
-        """Initialize an empty scratchpad."""
+    def __init__(self, max_length: int = 65536):
+        """Initialize an empty scratchpad with a bounded character capacity."""
         self._content: str = ""
+        self._max_length: int = max(1, int(max_length))
 
     def reset_episode(self) -> None:
         """Discard this scratchpad's notes at an episode boundary."""
@@ -629,10 +1063,21 @@ class NotepadTool(Tool):
         action: One of 'write' (replace content), 'append' (add to end), 'read' (retrieve current content), or 'clear' (erase all).
         text: The text to write or append. Not needed for 'read' or 'clear'.
         """
+        if not isinstance(action, str):
+            return f"Error: action must be a string, got {type(action).__name__}."
         if action == "write":
+            if not isinstance(text, str):
+                return f"Error: text must be a string, got {type(text).__name__}."
+            if len(text) > self._max_length:
+                return f"Error: text exceeds maximum notepad size of {self._max_length} characters."
             self._content = text
             return "Notes saved."
         elif action == "append":
+            if not isinstance(text, str):
+                return f"Error: text must be a string, got {type(text).__name__}."
+            sep_len = 1 if self._content else 0
+            if len(self._content) + sep_len + len(text) > self._max_length:
+                return f"Error: appending would exceed maximum notepad size of {self._max_length} characters."
             self._content += ("\n" if self._content else "") + text
             return "Notes appended."
         elif action == "read":

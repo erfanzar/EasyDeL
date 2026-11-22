@@ -213,7 +213,8 @@ impl KvCore {
         self.reqs.iter().filter(|r| r.is_some()).count()
     }
 
-    fn chain_page_size(&self) -> usize {
+    /// Page size of the chained page-key hash (group 0's page size).
+    pub fn chain_page_size(&self) -> usize {
         self.groups.first().map_or(1, |g| g.page_size as usize)
     }
 
@@ -222,14 +223,31 @@ impl KvCore {
         Ok(self.req(slot)?.keys.len())
     }
 
-    /// The request's page keys; computes them from `tokens` (all of the request's tokens) when none are known.
+    /// The request's page keys; computes or extends them incrementally from `tokens` whenever `tokens` covers
+    /// more full pages than are currently cached.
     pub fn ensure_keys(&mut self, slot: usize, tokens: Option<Tokens<'_>>) -> Result<&[PageKey], KvError> {
         let ps = self.chain_page_size();
-        if self.req(slot)?.keys.is_empty() {
-            if let Some(t) = tokens {
-                let extra = self.req(slot)?.extra;
-                let keys = self.hasher.chain(t.tokens, ps, extra);
-                self.req_mut(slot)?.keys = keys;
+        if let Some(t) = tokens {
+            if let Some(full_pages) = (t.offset + t.tokens.len()).checked_div(ps) {
+                let have = self.req(slot)?.keys.len();
+                if full_pages > have {
+                    let extra = self.req(slot)?.extra;
+                    let mut parent = self.req(slot)?.keys.last().copied().unwrap_or(ROOT);
+                    let mut new_keys = Vec::with_capacity(full_pages - have);
+                    for page in have..full_pages {
+                        let start = page * ps;
+                        let Some(rel_start) = start.checked_sub(t.offset) else {
+                            return Err(KvError::Value("tokens do not cover the pages to key".into()));
+                        };
+                        let rel_end = rel_start + ps;
+                        if rel_end > t.tokens.len() {
+                            return Err(KvError::Value("tokens do not cover the pages to key".into()));
+                        }
+                        parent = self.hasher.page_key(parent, &t.tokens[rel_start..rel_end], extra);
+                        new_keys.push(parent);
+                    }
+                    self.req_mut(slot)?.keys.extend(new_keys);
+                }
             }
         }
         Ok(&self.req(slot)?.keys)
@@ -276,15 +294,35 @@ impl KvCore {
         if !self.caching {
             return Ok(0);
         }
+        let ps = self.chain_page_size();
         let req = slot.and_then(|s| self.get(s));
         let extra = req.map_or(extra, |r| r.extra);
         let known = req.map(|r| &r.keys).filter(|k| !k.is_empty());
         let scratch;
-        let keys: &[PageKey] = match known {
-            Some(k) => k,
-            None => {
+        let keys: &[PageKey] = match (known, tokens) {
+            (Some(k), Some(t)) if ps > 0 && (t.offset + t.tokens.len()) / ps > k.len() => {
+                let full_pages = (t.offset + t.tokens.len()) / ps;
+                let mut extended = k.clone();
+                let mut parent = extended.last().copied().unwrap_or(ROOT);
+                for page in k.len()..full_pages {
+                    let start = page * ps;
+                    let Some(rel_start) = start.checked_sub(t.offset) else {
+                        return Err(KvError::Value("tokens do not cover the pages to key".into()));
+                    };
+                    let rel_end = rel_start + ps;
+                    if rel_end > t.tokens.len() {
+                        return Err(KvError::Value("tokens do not cover the pages to key".into()));
+                    }
+                    parent = self.hasher.page_key(parent, &t.tokens[rel_start..rel_end], extra);
+                    extended.push(parent);
+                }
+                scratch = extended;
+                &scratch
+            }
+            (Some(k), _) => k,
+            (None, _) => {
                 let t = tokens.ok_or_else(|| KvError::Value("tokens are needed to compute the page keys".into()))?;
-                scratch = self.hasher.chain(t.tokens, self.chain_page_size(), extra);
+                scratch = self.hasher.chain(t.tokens, ps, extra);
                 &scratch
             }
         };
@@ -399,35 +437,45 @@ impl KvCore {
                     .iter()
                     .filter(|&&p| p != NULL_PAGE && self.pool.ref_cnt(p) == 0)
                     .count() as i64;
-                to_alloc += cdiv(need, group.page_size) - hits[g].len() as i64 - req.pages[g].len() as i64 + evictable;
+                to_alloc +=
+                    (cdiv(need, group.page_size) - hits[g].len() as i64 - req.pages[g].len() as i64).max(0) + evictable;
             }
         }
         if to_alloc > self.pool.num_free() as i64 {
             return Ok(None);
         }
-        if self.caching {
-            self.pool.touch(hits);
-        } else if hits.iter().any(|h| !h.is_empty()) {
+        if !self.caching && hits.iter().any(|h| !h.is_empty()) {
             return Err(KvError::Assertion(
                 "Computed pages should be empty when prefix caching is disabled".into(),
             ));
         }
+        // Validate every group's prefix-hit attachment invariants BEFORE touching pool refcounts or mutating req.
         {
-            let req = self.req_mut(slot)?;
+            let req = self.req(slot)?;
             for (g, hit) in hits.iter().enumerate() {
                 match req.cached[g] {
                     None => {
                         if !req.pages[g].is_empty() {
                             return Err(KvError::Assertion("pages attached before the prefix hit".into()));
                         }
-                        req.pages[g].extend_from_slice(hit);
-                        req.cached[g] = Some(hit.len() as i64);
                     }
                     Some(_) => {
                         if !hit.is_empty() {
                             return Err(KvError::Assertion("a prefix hit for a request that holds pages".into()));
                         }
                     }
+                }
+            }
+        }
+        if self.caching {
+            self.pool.touch(hits);
+        }
+        {
+            let req = self.req_mut(slot)?;
+            for (g, hit) in hits.iter().enumerate() {
+                if req.cached[g].is_none() {
+                    req.pages[g].extend_from_slice(hit);
+                    req.cached[g] = Some(hit.len() as i64);
                 }
             }
         }
@@ -648,7 +696,7 @@ impl KvCore {
                 }
                 parent = key;
             }
-            req.cached[g] = Some(full);
+            req.cached[g] = Some(end.max(cached as usize) as i64);
         }
         Ok(())
     }

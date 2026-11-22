@@ -48,6 +48,7 @@ from ..training_utils import (
     bind_scheduled_module,
     constrain_scheduled_batch,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
@@ -67,6 +68,26 @@ def _reward_scores_from_logits(logits: jax.Array) -> jax.Array:
     raise ValueError(f"Reward trainer expects scalar or binary classifier logits; got shape {logits.shape}.")
 
 
+def _align_sequence_pair(
+    chosen: jax.Array,
+    rejected: jax.Array,
+    pad_value: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Right-pad the shorter branch so chosen and rejected share sequence length."""
+    chosen_len = chosen.shape[-1]
+    rejected_len = rejected.shape[-1]
+    if chosen_len == rejected_len:
+        return chosen, rejected
+    max_len = max(chosen_len, rejected_len)
+    if chosen_len < max_len:
+        pad_width = [(0, 0)] * (chosen.ndim - 1) + [(0, max_len - chosen_len)]
+        chosen = jax.numpy.pad(chosen, pad_width, constant_values=pad_value)
+    if rejected_len < max_len:
+        pad_width = [(0, 0)] * (rejected.ndim - 1) + [(0, max_len - rejected_len)]
+        rejected = jax.numpy.pad(rejected, pad_width, constant_values=pad_value)
+    return chosen, rejected
+
+
 def _reward_pair_loss(
     rewards_chosen: jax.Array,
     rewards_rejected: jax.Array,
@@ -76,7 +97,10 @@ def _reward_pair_loss(
     """Compute Bradley-Terry reward loss from per-example scalar rewards."""
     reward_margin = rewards_chosen - rewards_rejected
     if margin is not None:
-        reward_margin = reward_margin - margin
+        margin_arr = jax.numpy.asarray(margin, dtype=reward_margin.dtype)
+        if margin_arr.ndim > 0:
+            margin_arr = margin_arr.reshape(-1)
+        reward_margin = reward_margin - margin_arr
     loss = -jax.numpy.mean(jax.nn.log_sigmoid(reward_margin))
     if center_rewards_coefficient is not None:
         loss += center_rewards_coefficient * jax.numpy.mean((rewards_chosen + rewards_rejected) ** 2)
@@ -260,6 +284,7 @@ def _make_reward_scheduled_loss(call):
     """
     partition_spec = call.get("partition_spec")
     center_rewards_coefficient = call.get("center_rewards_coefficient")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
 
     def scheduled_loss(tree: spx.State, batch: collections.abc.Mapping[str, jax.Array]):
         """Compute the reward-model scalar loss for the scheduled-loss adapter.
@@ -274,18 +299,24 @@ def _make_reward_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/reward/scheduled_loss"):
             with jax.named_scope("easydel/trainer/reward/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 call_batch = constrain_scheduled_batch(module, batch, partition_spec)
 
             with jax.named_scope("easydel/trainer/reward/scheduled_loss/concat_inputs"):
-                input_ids = jax.numpy.concatenate(
-                    [call_batch["input_ids_chosen"], call_batch["input_ids_rejected"]],
-                    axis=0,
+                pad_token_id = getattr(getattr(module, "config", None), "pad_token_id", None)
+                pad_value = 0 if pad_token_id is None else int(pad_token_id)
+                chosen_ids, rejected_ids = _align_sequence_pair(
+                    call_batch["input_ids_chosen"],
+                    call_batch["input_ids_rejected"],
+                    pad_value=pad_value,
                 )
-                attention_mask = jax.numpy.concatenate(
-                    [call_batch["attention_mask_chosen"], call_batch["attention_mask_rejected"]],
-                    axis=0,
+                chosen_mask, rejected_mask = _align_sequence_pair(
+                    call_batch["attention_mask_chosen"],
+                    call_batch["attention_mask_rejected"],
+                    pad_value=0,
                 )
+                input_ids = jax.numpy.concatenate([chosen_ids, rejected_ids], axis=0)
+                attention_mask = jax.numpy.concatenate([chosen_mask, rejected_mask], axis=0)
             with jax.named_scope("easydel/trainer/reward/scheduled_loss/forward"):
                 rewards = _reward_scores_from_logits(module(input_ids=input_ids, attention_mask=attention_mask).logits)
                 rewards_chosen, rewards_rejected = jax.numpy.split(rewards, 2, axis=0)
@@ -376,6 +407,8 @@ def evaluation_step(
         with jax.named_scope(eval_scope + "/loss_fn"):
             with jax.named_scope(eval_scope + "/loss_fn/merge_state"):
                 module = state.merge(tree)
+                if getattr(module, "training", True):
+                    module.eval()
 
             with jax.named_scope(eval_scope + "/loss_fn/forward_chosen"):
                 rewards_chosen = _reward_scores_from_logits(

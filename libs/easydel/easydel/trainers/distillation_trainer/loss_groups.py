@@ -67,8 +67,12 @@ def loss_supervision_mask(batch: collections.abc.Mapping[str, tp.Any], *, shift_
     ``completion_mask`` > ``attention_mask`` > all-ones, AND ``labels != -100``; under ``shift_tokens``
     column 0 is zeroed because token 0 is never a prediction target.
     """
-    ids = batch.get("input_ids", batch.get("inputs_embeds"))
-    mask = batch.get("completion_mask", batch.get("attention_mask"))
+    ids = batch.get("input_ids")
+    if ids is None:
+        ids = batch.get("inputs_embeds")
+    mask = batch.get("completion_mask")
+    if mask is None:
+        mask = batch.get("attention_mask")
     if mask is None:
         mask = np.ones(tuple(np.shape(ids)[:2]), np.float64)
     mask = np.asarray(mask).astype(np.float64)

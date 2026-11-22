@@ -777,12 +777,17 @@ def test_no_content_after_end_tag(dummy_tokenizer):
 
 def test_content_before_start_tag(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
-    output = "prefix <think>reasoning</think>response"
-    reasoning, content = parser.extract_reasoning(output)
+    # Non-whitespace prose before <think> keeps literal <think> tags in content.
+    literal_output = "prefix <think>reasoning</think>response"
+    reasoning, content = parser.extract_reasoning(literal_output)
+    assert reasoning is None
+    assert content == literal_output
+
+    # Leading whitespace before <think> still opens reasoning and preserves whitespace in content.
+    ws_output = "  <think>reasoning</think>response"
+    reasoning, content = parser.extract_reasoning(ws_output)
     assert reasoning == "reasoning"
-    assert content is not None
-    assert "prefix" in content
-    assert "response" in content
+    assert content == "  response"
 
 
 @pytest.mark.parametrize(
@@ -1261,25 +1266,34 @@ def test_esurge_output_parsers_do_not_expose_reasoning_token_ids_to_tool_parser(
 
     first = engine._run_output_parsers(
         rd=rd,
-        accumulated_text="hello",
-        delta_text="hello",
-        token_ids=[10],
+        accumulated_text="<think>",
+        delta_text="<think>",
+        token_ids=[1],
         finished=False,
     )
     assert first["delta_tool_calls"] is None
 
     second = engine._run_output_parsers(
         rd=rd,
-        accumulated_text="hello<think><tool_call>",
-        delta_text="<think><tool_call>",
-        token_ids=[10, 1, 99],
+        accumulated_text="<think><tool_call>",
+        delta_text="<tool_call>",
+        token_ids=[1, 99],
         finished=False,
     )
 
     assert second["delta_reasoning"] == "<tool_call>"
     assert second["delta_tool_calls"] is None
-    assert tool_parser.seen_previous_text == "hello"
+
+    third = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text="<think><tool_call></think>hello",
+        delta_text="</think>hello",
+        token_ids=[1, 99, 2, 10],
+        finished=False,
+    )
+    assert third["delta_tool_calls"] is None
     assert tool_parser.seen_current_text == "hello"
+    assert 99 not in tool_parser.seen_current_token_ids
 
 
 def test_esurge_output_parsers_minimax_tool_calls_survive_finished_parse_without_end_tag():

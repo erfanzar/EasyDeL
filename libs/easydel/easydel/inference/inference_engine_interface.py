@@ -29,12 +29,15 @@ Classes:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import math
 import queue as queue_lib
 import threading
 import time
 import traceback
 import typing as tp
+import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
@@ -148,7 +151,7 @@ class RequestTrackingMiddleware:
             await self.app(scope, receive, send)
             return
         server = self.server
-        request_id = f"req_{int(time.time() * 1000000)}"
+        request_id = f"req_{uuid.uuid4().hex}"
         scope.setdefault("state", {})["request_id"] = request_id
         tracked = scope.get("path") not in MONITORING_PATHS
         status: int | None = None
@@ -157,7 +160,9 @@ class RequestTrackingMiddleware:
             nonlocal status
             if message["type"] == "http.response.start":
                 status = int(message["status"])
-                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+                headers = MutableHeaders(scope=message)
+                if "x-request-id" not in headers:
+                    headers["X-Request-ID"] = request_id
                 if tracked:
                     if status < 400:
                         server.metrics.successful_requests += 1
@@ -561,7 +566,8 @@ class BaseInferenceApiServer(ABC):
                 routes=self.app.routes,
             )
 
-            openapi_schema["components"]["securitySchemes"] = {
+            components = openapi_schema.setdefault("components", {})
+            components["securitySchemes"] = {
                 "BearerAuth": {
                     "type": "http",
                     "scheme": "bearer",
@@ -597,10 +603,12 @@ class BaseInferenceApiServer(ABC):
         Args:
             origins: List of allowed origin URLs. Defaults to ["*"] (all origins)
         """
+        resolved_origins = list(origins) if origins else ["*"]
+        allow_credentials = "*" not in resolved_origins
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=origins or ["*"],
-            allow_credentials=True,
+            allow_origins=resolved_origins,
+            allow_credentials=allow_credentials,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -802,7 +810,9 @@ class BaseInferenceApiServer(ABC):
             logger.warning(f"Force closing {len(self._active_requests)} active requests")
 
         self.thread_pool.shutdown(wait=True)
-        stream_pool = self._stream_pool
+        with self._stream_pool_lock:
+            stream_pool = self._stream_pool
+            self._stream_pool = None
         if stream_pool is not None:
             # Producers may be blocked inside the engine iterator; do not wait on them.
             stream_pool.shutdown(wait=False, cancel_futures=True)
@@ -904,6 +914,7 @@ class BaseInferenceApiServer(ABC):
         model: str | None = None,
         raw_request: Request | None = None,
         stream: bool | None = None,
+        count: int = 1,
     ) -> None:
         """Reject an overloaded server with HTTP 503 without consuming a slot.
 
@@ -919,15 +930,22 @@ class BaseInferenceApiServer(ABC):
             model: Requested model name (diagnostics only).
             raw_request: Raw FastAPI request, used for client attribution.
             stream: Whether the request streams (diagnostics only).
+            count: Number of slots the request will need (capped at
+                ``_max_generation_slots``).
 
         Raises:
-            HTTPException: With ``503`` when every generation slot is taken.
+            HTTPException: With ``503`` when not enough generation slots are free.
         """
 
         queue = getattr(self, "_generation_slots", None)
-        if queue is None or queue.qsize() > 0:
+        if queue is None:
             return
         max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+        required = max(1, int(count))
+        if max_generation_slots > 0:
+            required = min(required, max_generation_slots)
+        if queue.qsize() >= required:
+            return
         logger.warning(
             "Rejecting request with HTTP 503 before streaming because all generation slots are busy. "
             "endpoint=%s request_id=%s model=%s stream=%s max_generation_slots=%s "
@@ -951,12 +969,14 @@ class BaseInferenceApiServer(ABC):
         model: str | None = None,
         raw_request: Request | None = None,
         stream: bool | None = None,
+        count: int = 1,
     ) -> AsyncIterator[None]:
-        """Acquire a generation slot or raise HTTP 503 when the server is saturated.
+        """Acquire one or more generation slots or raise HTTP 503 when saturated.
 
         When ``max_concurrent_generations`` was configured during init, this
-        context manager pulls a token from the slot queue before yielding.
-        If the queue is empty it logs detailed context and raises a 503.
+        context manager pulls ``min(count, max_concurrent_generations)`` tokens
+        from the slot queue before yielding. If fewer tokens are available it
+        rolls back any acquired tokens, logs detailed context, and raises 503.
 
         Args:
             endpoint: Endpoint name (for diagnostics only).
@@ -964,12 +984,14 @@ class BaseInferenceApiServer(ABC):
             model: Requested model name (for diagnostics only).
             raw_request: The raw FastAPI request (used to extract client info).
             stream: Whether the request is streaming (for diagnostics only).
+            count: Desired number of slots (e.g. batch prompt count), capped at
+                ``_max_generation_slots``.
 
         Yields:
-            None: While the caller holds an exclusive generation slot.
+            None: While the caller holds the acquired generation slots.
 
         Raises:
-            HTTPException: With ``503`` status when no slot is available.
+            HTTPException: With ``503`` status when insufficient slots are available.
         """
 
         queue = self._generation_slots
@@ -977,9 +999,21 @@ class BaseInferenceApiServer(ABC):
             yield
             return
 
+        max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+        required = max(1, int(count))
+        if max_generation_slots > 0:
+            required = min(required, max_generation_slots)
+
+        acquired_tokens: list[int] = []
         try:
-            token = queue.get_nowait()
+            for _ in range(required):
+                acquired_tokens.append(queue.get_nowait())
         except asyncio.QueueEmpty as e:
+            for token in acquired_tokens:
+                try:
+                    queue.put_nowait(token)
+                except asyncio.QueueFull:
+                    logger.warning("Generation slot queue overfilled while rolling back token")
             client = getattr(raw_request, "client", None)
             client_host = getattr(client, "host", None)
             client_port = getattr(client, "port", None)
@@ -989,7 +1023,6 @@ class BaseInferenceApiServer(ABC):
                 forwarded_for = headers.get("x-forwarded-for")
 
             available_generation_slots = queue.qsize()
-            max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
             active_generation_slots = (
                 max(0, max_generation_slots - available_generation_slots) if max_generation_slots > 0 else None
             )
@@ -1022,10 +1055,11 @@ class BaseInferenceApiServer(ABC):
         try:
             yield
         finally:
-            try:
-                queue.put_nowait(token)
-            except asyncio.QueueFull:
-                logger.warning("Generation slot queue overfilled while releasing token")
+            for token in acquired_tokens:
+                try:
+                    queue.put_nowait(token)
+                except asyncio.QueueFull:
+                    logger.warning("Generation slot queue overfilled while releasing token")
 
     @staticmethod
     def _close_stream_queue(stream_queue: tp.Any) -> None:
@@ -1152,14 +1186,16 @@ class BaseInferenceApiServer(ABC):
                         waiter[0] = registered
                 event = registered[1]
                 while True:
-                    # Clear before checking: an enqueue after this point sets the event again, so no wakeup is lost.
+                    # Clear before checking: an enqueue or close after this point sets the event again, so no wakeup is lost.
                     event.clear()
                     try:
                         return queue.get_nowait()
                     except queue_lib.Empty:
                         pass
+                    if closed.is_set():
+                        return ("end", None)
                     try:
-                        # The timeout is only a safety net; every enqueue wakes the waiter directly.
+                        # The timeout is only a safety net; every enqueue/close wakes the waiter directly.
                         await asyncio.wait_for(event.wait(), timeout=1.0)
                     except TimeoutError:
                         continue
@@ -1183,7 +1219,8 @@ class BaseInferenceApiServer(ABC):
                     try:
                         queue.get_nowait()
                     except queue_lib.Empty:
-                        return
+                        break
+                _wake_consumer()
 
         def _enqueue(kind: str, payload: tp.Any) -> bool:
             """Push ``(kind, payload)``, waiting for space; ``False`` once the consumer closed."""
@@ -1219,18 +1256,17 @@ class BaseInferenceApiServer(ABC):
                 exc.__stream_producer_traceback__ = traceback.format_exc()
                 _enqueue("error", exc)
             finally:
-                if closed.is_set() and started:
+                if closed.is_set() and started and not exhausted:
                     # Retry after a blocked next(): the request may have registered
                     # only after close() sent its first abort. A stream that ended
                     # normally has nothing to abort.
-                    if not exhausted:
-                        _notify_abandon()
-                    close_iterator = getattr(iterator, "close", None)
-                    if callable(close_iterator):
-                        try:
-                            close_iterator()
-                        except Exception:
-                            logger.debug("Failed to close abandoned stream iterator", exc_info=True)
+                    _notify_abandon()
+                close_iterator = getattr(iterator, "close", None)
+                if callable(close_iterator):
+                    try:
+                        close_iterator()
+                    except Exception:
+                        logger.debug("Failed to close stream iterator", exc_info=True)
                 _enqueue("end", None)
 
         producer_future = self._get_stream_pool().submit(_producer)
@@ -1506,11 +1542,18 @@ class BaseInferenceApiServer(ABC):
                 function_payload.pop("type", None)
                 tools_for_template.append({"type": "function", "function": function_payload})
             else:
-                payload = tool.model_dump(exclude_none=True)
+                if hasattr(tool, "model_dump"):
+                    payload = tool.model_dump(exclude_none=True)
+                elif isinstance(tool, dict):
+                    payload = dict(tool)
+                else:
+                    continue
                 if isinstance(payload, dict) and isinstance(payload.get("function"), dict):
                     tools_for_template.append(payload)
-                else:
-                    tools_for_template.append({"type": "function", "function": payload})
+                elif isinstance(payload, dict):
+                    function_payload = dict(payload)
+                    tool_type = str(function_payload.pop("type", None) or "function")
+                    tools_for_template.append({"type": tool_type, "function": function_payload})
 
         return list(raw_tools), tools_for_template or None
 
@@ -1564,13 +1607,16 @@ class BaseInferenceApiServer(ABC):
 
         try:
             parsed = int(raw_value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid max_output_tokens value: {raw_value!r}") from exc
+
+        if parsed == -1:
             return self._infer_sequence_length_from_engine(engine), None
 
-        if parsed < 0:
-            return self._infer_sequence_length_from_engine(engine), None
+        if parsed <= 0:
+            raise ValueError(f"max_output_tokens must be >= 1 or -1 (unlimited), got {parsed}.")
 
-        return parsed, parsed or None
+        return parsed, parsed
 
     @staticmethod
     def _create_sampling_params_from_responses(request: ResponsesRequest, max_tokens: int | None) -> SamplingParams:
@@ -1594,37 +1640,62 @@ class BaseInferenceApiServer(ABC):
 
         try:
             temperature_f = float(temperature)
-        except (TypeError, ValueError):
-            temperature_f = 1.0
-        temperature_f = max(0.0, min(temperature_f, 2.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid temperature: {temperature!r}") from exc
+        if not math.isfinite(temperature_f):
+            raise ValueError(f"temperature must be finite, got {temperature!r}")
+        if temperature_f < 0.0 or temperature_f > 2.0:
+            raise ValueError(f"temperature must be in [0.0, 2.0], got {temperature_f}")
 
         try:
             top_p_f = float(top_p)
-        except (TypeError, ValueError):
-            top_p_f = 1.0
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid top_p: {top_p!r}") from exc
+        if not math.isfinite(top_p_f):
+            raise ValueError(f"top_p must be finite, got {top_p!r}")
 
         stop = request.stop
-        n = 1 if request.n is None else request.n
+        n = 1 if request.n is None else int(request.n)
 
         raw_top_k = request.top_k
-        try:
-            top_k = int(raw_top_k) if raw_top_k is not None else 0
-        except (TypeError, ValueError):
+        if raw_top_k is None:
             top_k = 0
-        if top_k < 0:
-            top_k = 0
+        else:
+            try:
+                top_k = int(raw_top_k)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid top_k: {raw_top_k!r}") from exc
+            if top_k < 0:
+                raise ValueError(f"top_k must be >= 0, got {top_k}")
+
+        presence_penalty = float(0.0 if request.presence_penalty is None else request.presence_penalty)
+        frequency_penalty = float(0.0 if request.frequency_penalty is None else request.frequency_penalty)
+        repetition_penalty = float(1.0 if request.repetition_penalty is None else request.repetition_penalty)
+        min_p = float(0.0 if request.min_p is None else request.min_p)
+        for field_name, field_val in (
+            ("presence_penalty", presence_penalty),
+            ("frequency_penalty", frequency_penalty),
+            ("repetition_penalty", repetition_penalty),
+            ("min_p", min_p),
+        ):
+            if not math.isfinite(field_val):
+                raise ValueError(f"{field_name} must be finite, got {field_val!r}")
+        if not -2.0 <= frequency_penalty <= 2.0:
+            raise ValueError(f"frequency_penalty must be in [-2, 2], got {frequency_penalty}.")
+        if not 0.0 <= min_p <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {min_p}.")
 
         return SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature_f,
             top_p=top_p_f,
-            presence_penalty=float(request.presence_penalty or 0.0),
-            frequency_penalty=float(request.frequency_penalty or 0.0),
-            repetition_penalty=float(request.repetition_penalty or 1.0),
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
             top_k=top_k,
-            min_p=float(request.min_p or 0.0),
-            n=int(n or 1),
-            stop=stop,
+            min_p=min_p,
+            n=n,
+            stop=stop or [],
         )
 
     @classmethod
@@ -1776,16 +1847,21 @@ class BaseInferenceApiServer(ABC):
             response_id: Identifier returned by a previous call.
 
         Returns:
-            The stored record dict or ``None`` if absent or storage is off.
+            Deep copy of the stored record dict or ``None`` if absent or storage is off.
         """
         if not self._enable_response_store:
             return None
 
         if self._response_store_client is not None:
-            return await asyncio.to_thread(self._response_store_client.get_response, response_id)
+            record = await asyncio.to_thread(self._response_store_client.get_response, response_id)
+            return copy.deepcopy(record) if record is not None else None
 
         async with self._response_store_lock:
-            return self._stored_responses.get(response_id)
+            record = self._stored_responses.get(response_id)
+            if record is None:
+                return None
+            self._stored_responses.move_to_end(response_id)
+            return copy.deepcopy(record)
 
     async def _response_store_put_response(self, response_id: str, record: dict[str, tp.Any]) -> None:
         """Persist a Responses record under ``response_id``.
@@ -1797,12 +1873,13 @@ class BaseInferenceApiServer(ABC):
         if not self._enable_response_store:
             return
 
+        stored = copy.deepcopy(record)
         if self._response_store_client is not None:
-            await asyncio.to_thread(self._response_store_client.put_response, response_id, record)
+            await asyncio.to_thread(self._response_store_client.put_response, response_id, stored)
             return
 
         async with self._response_store_lock:
-            self._lru_set(self._stored_responses, response_id, record, self._max_stored_responses)
+            self._lru_set(self._stored_responses, response_id, stored, self._max_stored_responses)
 
     async def _response_store_get_conversation(self, conversation_id: str) -> list[dict[str, tp.Any]] | None:
         """Fetch the cached conversation history for a conversation ID.
@@ -1811,17 +1888,22 @@ class BaseInferenceApiServer(ABC):
             conversation_id: Conversation identifier to look up.
 
         Returns:
-            The list of historical messages or ``None`` when storage is off
+            Deep copy of the list of historical messages or ``None`` when storage is off
             or no matching record exists.
         """
         if not self._enable_response_store:
             return None
 
         if self._response_store_client is not None:
-            return await asyncio.to_thread(self._response_store_client.get_conversation, conversation_id)
+            history = await asyncio.to_thread(self._response_store_client.get_conversation, conversation_id)
+            return copy.deepcopy(history) if history is not None else None
 
         async with self._response_store_lock:
-            return self._stored_conversations.get(conversation_id)
+            history = self._stored_conversations.get(conversation_id)
+            if history is None:
+                return None
+            self._stored_conversations.move_to_end(conversation_id)
+            return copy.deepcopy(history)
 
     async def _response_store_put_conversation(
         self,
@@ -1837,12 +1919,13 @@ class BaseInferenceApiServer(ABC):
         if not self._enable_response_store:
             return
 
+        stored = copy.deepcopy(history)
         if self._response_store_client is not None:
-            await asyncio.to_thread(self._response_store_client.put_conversation, conversation_id, history)
+            await asyncio.to_thread(self._response_store_client.put_conversation, conversation_id, stored)
             return
 
         async with self._response_store_lock:
-            self._lru_set(self._stored_conversations, conversation_id, history, self._max_stored_conversations)
+            self._lru_set(self._stored_conversations, conversation_id, stored, self._max_stored_conversations)
 
     async def responses(self, request: ResponsesRequest, raw_request: Request) -> JSONResponse:
         """Handle OpenAI Responses API requests (default: not implemented).

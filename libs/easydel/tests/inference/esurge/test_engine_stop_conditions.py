@@ -238,7 +238,7 @@ def test_prepare_sampling_params_respects_ignore_eos_for_generation_config_ids()
     )
 
     assert set(prepared.stop_token_ids) == {777}
-    assert prepared.all_stop_token_ids == {777, 154820}
+    assert prepared.all_stop_token_ids == {777}
 
 
 def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():

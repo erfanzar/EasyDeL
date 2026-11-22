@@ -26,6 +26,8 @@ from .pipeline_plan import PipelineInferencePlan
 
 logger = get_logger("eSurge-PipelineRuntime")
 
+_MAX_LOGGED_PLAN_KEYS = 256
+
 
 @dataclasses.dataclass(frozen=True)
 class PipelineDispatchStats:
@@ -101,12 +103,14 @@ class PipelineStageRuntime:
         """Stop resident SpectraX stage workers and reset visible metrics."""
         self._inline_executor.shutdown()
         self._wavefront_executor.shutdown()
+        self._logged_plan_keys.clear()
         self._last_stats = PipelineDispatchStats(0, 0.0, 0.0)
 
     def clear_prepare_cache(self) -> None:
         """Drop cached SpectraX prepare plans after graph/cache shape changes."""
         self._inline_executor.clear_prepare_cache()
         self._wavefront_executor.clear_prepare_cache()
+        self._logged_plan_keys.clear()
 
     def dispatch(
         self,
@@ -245,6 +249,8 @@ class PipelineStageRuntime:
         )
         if summary is None:
             return
+        if len(self._logged_plan_keys) >= _MAX_LOGGED_PLAN_KEYS:
+            self._logged_plan_keys.clear()
         self._logged_plan_keys.add(logged_key)
 
         logger.debug(

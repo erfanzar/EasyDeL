@@ -97,16 +97,48 @@ def device_put_equality_check_redundant(host_payloads_replicated: bool | None = 
 def _place_identical_host_value(value: tp.Any, sharding: tp.Any) -> tp.Any:
     """Place one host value that every process holds identically, from this process's local copy.
 
-    Device arrays, Python scalars and targets that are not a ``jax.sharding.Sharding`` (``None``, a ``Device``)
-    go through ``jax.device_put`` unchanged.
+    ``None`` is returned unchanged. Already-placed device arrays matching ``sharding`` are returned as-is;
+    other device arrays, Python scalars and targets that are not a ``jax.sharding.Sharding`` (``None``, a
+    ``Device``) go through ``jax.device_put`` unchanged.
     """
-    if isinstance(value, jax.Array) or not hasattr(value, "dtype") or not isinstance(sharding, jax.sharding.Sharding):
+    if value is None:
+        return None
+    if isinstance(value, jax.Array):
+        if isinstance(sharding, jax.sharding.Sharding) and getattr(value, "sharding", None) == sharding:
+            return value
+        return jax.device_put(value, sharding)
+    if not hasattr(value, "dtype") or not isinstance(sharding, jax.sharding.Sharding):
         return jax.device_put(value, sharding)
     host = np.asarray(value)
     dtype = jax.dtypes.canonicalize_dtype(host.dtype)
     if host.dtype != dtype:
         host = host.astype(dtype)
     return jax.make_array_from_callback(host.shape, sharding, lambda index: np.asarray(host[index]), dtype=dtype)
+
+
+def _place_identical_host_tree(values: tp.Any, shardings: tp.Any) -> tp.Any:
+    """Recursively place nested ``dict``, ``tuple`` and ``list`` containers of identical host values."""
+    if isinstance(values, dict):
+        if isinstance(shardings, dict):
+            if set(shardings.keys()) != set(values.keys()):
+                raise ValueError(
+                    f"Mismatched dict keys for put_host_payload: {sorted(values.keys())} vs {sorted(shardings.keys())}."
+                )
+            return {k: _place_identical_host_tree(v, shardings[k]) for k, v in values.items()}
+        return {k: _place_identical_host_tree(v, shardings) for k, v in values.items()}
+    if isinstance(values, tuple | list):
+        if isinstance(shardings, tuple | list):
+            if len(shardings) != len(values):
+                raise ValueError(
+                    f"Mismatched container lengths for put_host_payload: {len(values)} values vs {len(shardings)} shardings."
+                )
+            placed = [_place_identical_host_tree(v, s) for v, s in zip(values, shardings, strict=True)]
+        else:
+            placed = [_place_identical_host_tree(v, shardings) for v in values]
+        if isinstance(values, tuple):
+            return type(values)(*placed) if hasattr(values, "_fields") else tuple(placed)
+        return placed
+    return _place_identical_host_value(values, shardings)
 
 
 def put_host_payload(values: tp.Any, shardings: tp.Any, *, host_payloads_replicated: bool | None = None) -> tp.Any:
@@ -124,21 +156,16 @@ def put_host_payload(values: tp.Any, shardings: tp.Any, *, host_payloads_replica
     In every other case this is exactly ``jax.device_put``.
 
     Args:
-        values: One host value, or a tuple/list of them. ``jax.Array`` and Python-scalar entries, and entries
-            whose target is not a ``jax.sharding.Sharding`` (``None``, a ``Device``), go through
-            ``jax.device_put`` unchanged.
-        shardings: One sharding (or ``None``) for all values, or one per value.
+        values: One host value, or arbitrarily nested ``dict``/``tuple``/``list`` containers of them. ``None``,
+            ``jax.Array`` and Python-scalar entries, and entries whose target is not a ``jax.sharding.Sharding``
+            (``None``, a ``Device``), are preserved or placed via ``jax.device_put`` unchanged.
+        shardings: One sharding (or ``None``) for all values, or a matching container of shardings.
         host_payloads_replicated: The owning runner's replication guarantee (see
             :func:`device_put_equality_check_redundant`).
 
     Returns:
-        The placed value(s): a tuple or list when ``values`` is one, otherwise a single array.
+        The placed value(s), preserving container structure.
     """
     if not device_put_equality_check_redundant(host_payloads_replicated):
         return jax.device_put(values, shardings)
-    if isinstance(values, tuple | list):
-        if not isinstance(shardings, tuple | list):
-            shardings = [shardings] * len(values)
-        placed = [_place_identical_host_value(v, s) for v, s in zip(values, shardings, strict=True)]
-        return tuple(placed) if isinstance(values, tuple) else placed
-    return _place_identical_host_value(values, shardings)
+    return _place_identical_host_tree(values, shardings)

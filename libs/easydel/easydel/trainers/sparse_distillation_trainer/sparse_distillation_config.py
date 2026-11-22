@@ -59,6 +59,13 @@ class SparseDistillationConfig(DistillationConfig):
         default="SparseDistillation",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
+    alpha: float = field(
+        default=1.0,
+        metadata={
+            "help": "Weight applied to the partial KL loss when hard labels are also provided "
+            "(defaults to 1.0 for pure on-policy sparse distillation)."
+        },
+    )
     remove_unused_columns: bool | None = field(
         default=False,
         metadata={"help": "Whether to remove unused columns from the dataset."},
@@ -141,6 +148,7 @@ class SparseDistillationConfig(DistillationConfig):
         if self.top_k_teacher < 1:
             raise ValueError(f"`top_k_teacher` must be >= 1, got {self.top_k_teacher}.")
 
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         default_prompt = type(self).__dataclass_fields__["max_prompt_length"].default
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_prompt_length is None:
@@ -170,6 +178,11 @@ class SparseDistillationConfig(DistillationConfig):
             "top_p": self.top_p,
             "top_k": self.top_k,
         }
+        # Preserve user sampling defaults before offline DistillationConfig validation neutralizes them.
+        if self.generation_top_p is None:
+            self.generation_top_p = self.top_p
+        if self.generation_top_k is None:
+            self.generation_top_k = 0 if self.top_k is None else self.top_k
         self.max_prompt_length = None  # type: ignore[assignment]
         self.max_completion_length = None  # type: ignore[assignment]
         self.top_p = 1.0

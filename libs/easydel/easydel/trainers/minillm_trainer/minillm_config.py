@@ -40,7 +40,7 @@ class MiniLLMConfig(GRPOConfig):
     rkl_advantage: bool = field(default=True)
     single_step_decomposition: bool = field(default=False)
     kd_temperature: float = field(default=1.0)
-    gamma: float = field(default=0.0)
+    gamma: float = field(default=1.0)
     length_normalization: bool = field(default=True)
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None) -> None:
@@ -49,8 +49,8 @@ class MiniLLMConfig(GRPOConfig):
         The base GRPO config validates rollout, batching, and optimizer fields.
         This hook checks the teacher-advantage parameters that are consumed
         during preprocessing: ``kd_temperature`` must be positive because it
-        divides log-probability deltas, and ``gamma`` must be non-negative
-        because it is used as a suffix-return discount.
+        scales teacher and student logits prior to log-softmax, and ``gamma``
+        must be non-negative because it is used as a suffix-return discount.
         """
         super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
         if self.kd_temperature <= 0.0:

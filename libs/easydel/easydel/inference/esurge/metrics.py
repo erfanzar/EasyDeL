@@ -446,11 +446,34 @@ class MetricsCollector:
         self.last_log_time = time.time()
 
         self.logger = logging.getLogger("eSurge.metrics")
+        self._file_handler: logging.FileHandler | None = None
         if log_file:
             handler = logging.FileHandler(log_file)
             handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+            self._file_handler = handler
+
+    def close(self) -> None:
+        """Detach and close any FileHandler owned by this collector."""
+        handler = getattr(self, "_file_handler", None)
+        if handler is not None:
+            try:
+                self.logger.removeHandler(handler)
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+            self._file_handler = None
+
+    def cancel_request(self, request_id: str) -> None:
+        """Remove an admitted request whose enqueue failed without counting it as completed or failed."""
+        with self._lock:
+            removed = self.request_metrics.pop(request_id, None)
+            if removed is not None and self.counters["total_requests"] > 0:
+                self.counters["total_requests"] -= 1
 
     def start_request(self, request_id: str, prompt_tokens: int = 0, model_name: str | None = None) -> None:
         """Start tracking metrics for a new request.
@@ -774,18 +797,20 @@ class MetricsCollector:
         if not recent_requests:
             return SystemMetrics(timestamp=current_time)
 
-        total_completed = len(recent_requests)
-        total_failed = len([req for req in recent_requests if req.error])
-        total_tokens = sum(req.generated_tokens for req in recent_requests)
+        failed_requests = [req for req in recent_requests if req.error]
+        succeeded_requests = [req for req in recent_requests if not req.error]
+        total_completed = len(succeeded_requests)
+        total_failed = len(failed_requests)
+        total_tokens = sum(req.generated_tokens for req in succeeded_requests)
 
-        latencies = [req.total_latency for req in recent_requests if req.total_latency]
-        ttfts = [req.time_to_first_token for req in recent_requests if req.time_to_first_token]
-        throughputs = [req.tokens_per_second for req in recent_requests if req.tokens_per_second > 0]
+        latencies = [req.total_latency for req in succeeded_requests if req.total_latency]
+        ttfts = [req.time_to_first_token for req in succeeded_requests if req.time_to_first_token]
+        throughputs = [req.tokens_per_second for req in succeeded_requests if req.tokens_per_second > 0]
 
         avg_latency = fmean(latencies) if latencies else 0.0
         avg_ttft = fmean(ttfts) if ttfts else 0.0
         avg_throughput = fmean(throughputs) if throughputs else 0.0
-        requests_per_second = total_completed / window_seconds
+        requests_per_second = total_completed / window_seconds if window_seconds > 0 else 0.0
 
         return SystemMetrics(
             timestamp=current_time,
@@ -979,6 +1004,8 @@ def initialize_metrics(
         ... )
     """
     global _global_metrics_collector
+    if _global_metrics_collector is not None:
+        _global_metrics_collector.close()
     _global_metrics_collector = MetricsCollector(
         log_file=log_file,
         log_interval=log_interval,

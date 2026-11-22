@@ -179,7 +179,7 @@ class AuthWorkerManager:
             self._auth_process = self._spawn_auth_worker(auth_endpoint)
             try:
                 self._wait_for_endpoint(auth_endpoint, self._auth_process)
-            except Exception:
+            except BaseException:
                 self._terminate_process()
                 self._cleanup_ipc_file(auth_endpoint)
                 raise
@@ -187,7 +187,15 @@ class AuthWorkerManager:
         # Ownership must reflect *this* start(): a previous owned run must not leak into an attach-mode run.
         self._auth_owned = needs_auth_spawn
         self._auth_endpoint = auth_endpoint
-        self._auth_client = AuthWorkerClient(self._auth_endpoint)
+        try:
+            self._auth_client = AuthWorkerClient(self._auth_endpoint)
+        except BaseException:
+            if needs_auth_spawn:
+                self._terminate_process()
+                self._cleanup_ipc_file(auth_endpoint)
+            self._auth_endpoint = None
+            self._auth_owned = False
+            raise
         return self._auth_client
 
     def shutdown(self) -> None:
@@ -199,18 +207,19 @@ class AuthWorkerManager:
         file when ownership was retained. Idempotent: subsequent calls
         are no-ops.
         """
-        if self._auth_client is None:
+        if self._auth_client is None and self._auth_process is None and not self._auth_owned:
             return
 
-        try:
-            if self._auth_owned:
-                self._auth_client.shutdown()
-            else:
-                self._auth_client.close()
-        except Exception:
-            pass
-        finally:
-            self._auth_client = None
+        if self._auth_client is not None:
+            try:
+                if self._auth_owned:
+                    self._auth_client.shutdown()
+                else:
+                    self._auth_client.close()
+            except Exception:
+                pass
+            finally:
+                self._auth_client = None
 
         self._terminate_process()
         if self._auth_owned:
@@ -285,9 +294,13 @@ class AuthWorkerManager:
         try:
             process.stdin.write(self._admin_key)
             process.stdin.close()
-        except Exception:
+        except BaseException:
             process.terminate()
-            process.wait(timeout=5)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
             raise
         return process
 
@@ -347,20 +360,26 @@ class AuthWorkerManager:
         """Best-effort termination of the auth worker subprocess.
 
         Sends ``SIGTERM``, waits up to 5 seconds for a clean exit, then
-        escalates to ``SIGKILL`` if the process is still running.
+        escalates to ``SIGKILL`` if the process is still running, always
+        reaping the child to avoid zombies.
         No-op when the process has already exited or was never spawned.
         """
         if not self._auth_process:
             return
-        if self._auth_process.poll() is None:
-            logger.info("Terminating auth worker process")
-            self._auth_process.terminate()
-            try:
-                self._auth_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning("Auth worker didn't terminate, killing")
-                self._auth_process.kill()
-        self._auth_process = None
+        try:
+            if self._auth_process.poll() is None:
+                logger.info("Terminating auth worker process")
+                self._auth_process.terminate()
+                try:
+                    self._auth_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning("Auth worker didn't terminate, killing")
+                    self._auth_process.kill()
+                    self._auth_process.wait()
+            else:
+                self._auth_process.wait()
+        finally:
+            self._auth_process = None
 
     def _cleanup_ipc_file(self, endpoint: str | None) -> None:
         """Unlink the IPC socket file backing ``endpoint``, if any.

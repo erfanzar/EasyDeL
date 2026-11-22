@@ -116,7 +116,8 @@ def rejection_sample_from_uniforms(
     if k > 0:
         t_lp = jnp.take_along_axis(target[:, :k, :], tokens[:, :, None], axis=-1)[..., 0]
         d_lp = jnp.take_along_axis(draft, tokens[:, :, None], axis=-1)[..., 0]
-        accept_lp = jnp.where(t_lp == -jnp.inf, -jnp.inf, jnp.minimum(t_lp - d_lp, 0.0))
+        zero_target_mass = (t_lp == -jnp.inf) | (jnp.exp(t_lp) == 0.0) | ~jnp.isfinite(t_lp)
+        accept_lp = jnp.where(zero_target_mass, -jnp.inf, jnp.minimum(t_lp - d_lp, 0.0))
         steps = jnp.arange(k, dtype=jnp.int32)[None, :]
         accept = (accept_uniforms.astype(jnp.float32) < jnp.exp(accept_lp)) & (steps < verified[:, None])
         accepted = jnp.sum(jnp.cumprod(accept.astype(jnp.int32), axis=-1), axis=-1).astype(jnp.int32)

@@ -28,6 +28,7 @@ handles.
 
 from __future__ import annotations
 
+import copy
 import typing
 
 import numpy as np
@@ -180,13 +181,32 @@ class SequenceStateSync:
             self.slot_pool.dp_rank_by_req[str(req_id)] = int(dp_rank)
 
         removed_recurrent_slots: list[int] = []
+        finished_reqs: list[CachedRequestState] = []
         for req_id in sorted(scheduler_output.finished_req_ids):
             slot = self.slot_pool.release_slot(str(req_id), forget_rank=True)
             if slot is not None:
                 # Every slot of the request's group is cleared for the group's next owner.
                 removed_recurrent_slots.extend(self.slot_pool.group_slots(int(slot)))
-            self.requests.pop(req_id, None)
+            finished_req = self.requests.pop(req_id, None)
+            if finished_req is not None:
+                finished_reqs.append(finished_req)
             self.pending_spec_recurrent_commit_by_req.pop(str(req_id), None)
+
+        if finished_reqs:
+            for finished_req in finished_reqs:
+                if isinstance(finished_req, CachedRequestState):
+                    # Detach this request's feature list instead of mutating feature
+                    # objects in place, so siblings still waiting in EngineCoreDriver
+                    # (not yet visible in self.requests) never lose raw vision data.
+                    finished_req.clear_vision_data(detach_features=True)
+                elif hasattr(finished_req, "clear_vision_data"):
+                    finished_req.clear_vision_data()
+                finished_req.prefill_inputs_embeds = None
+                finished_req.prefill_position_ids = None
+                finished_req.prefill_rope_deltas = None
+                finished_req.prefill_visual_pos_masks = None
+                finished_req.prefill_deepstack_visual_embeds = None
+                finished_req.token_types = None
 
         # 2) Remove finished from sequence buffer (functional)
         removed_req_indices: list[int] = []
@@ -216,13 +236,12 @@ class SequenceStateSync:
         # assigned to the same slot starts from a clean state. Slot-pooled
         # runners clear physical slots; row-identity runners clear buffer rows.
         slots_to_clear = removed_recurrent_slots if self.slot_pool.is_enabled() else removed_req_indices
-        if slots_to_clear:
-            if self.slot_pool.is_enabled() or not self.defer_row_clears:
-                self.executor_manager.clear_recurrent_slots(slots_to_clear)
-            if self.spec_decode_recurrent_candidates:
-                for req_index in removed_req_indices:
-                    if 0 <= int(req_index) < int(self.spec_recurrent_commit_cpu.shape[1]):
-                        self.spec_recurrent_commit_cpu[:, int(req_index)] = 0
+        if slots_to_clear and (self.slot_pool.is_enabled() or not self.defer_row_clears):
+            self.executor_manager.clear_recurrent_slots(slots_to_clear)
+        if self.spec_decode_recurrent_candidates and removed_req_indices:
+            for req_index in removed_req_indices:
+                if 0 <= int(req_index) < int(self.spec_recurrent_commit_cpu.shape[1]):
+                    self.spec_recurrent_commit_cpu[:, int(req_index)] = 0
 
         # 4) Add new requests to tracking
         req_ids_to_add: list[str] = []
@@ -237,7 +256,7 @@ class SequenceStateSync:
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 sampling_params=new_req_data.sampling_params,
                 generator=None,
-                page_ids=new_req_data.page_ids,
+                page_ids=tuple(list(ids) for ids in new_req_data.page_ids),
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 # Vision-language model data
@@ -245,7 +264,7 @@ class SequenceStateSync:
                 image_grid_thw=new_req_data.image_grid_thw,
                 pixel_values_videos=new_req_data.pixel_values_videos,
                 video_grid_thw=new_req_data.video_grid_thw,
-                mm_features=new_req_data.mm_features,
+                mm_features=[copy.copy(feat) for feat in new_req_data.mm_features] if new_req_data.mm_features else [],
             )
             req_ids_to_add.append(req_id)
 
@@ -272,7 +291,19 @@ class SequenceStateSync:
                 for page_ids, new_ids in zip(req_state.page_ids, new_page_ids, strict=False):
                     page_ids.extend(new_ids)
             else:
-                req_state.page_ids = new_page_ids
+                req_state.page_ids = tuple(list(ids) for ids in new_page_ids)
+                if int(nct) < int(req_state.num_prompt_tokens):
+                    needs_vision_reprefill = req_state.prefill_inputs_embeds is None or (
+                        req_state.prefill_rope_deltas is not None and req_state.prefill_position_ids is None
+                    )
+                    if needs_vision_reprefill:
+                        req_state._vision_processed = False
+                        req_state.prefill_rope_deltas = None
+                        req_state.prefill_inputs_embeds = None
+                        req_state.prefill_position_ids = None
+                        req_state.prefill_visual_pos_masks = None
+                        req_state.prefill_deepstack_visual_embeds = None
+                        req_state.token_types = None
 
             req_index = self.sequence_buffer.req_id_to_index.get(req_id)
             if req_index is None:
@@ -384,10 +415,15 @@ class SequenceStateSync:
                 self.slot_pool.assign_slot(req_id, target_shard)
             self.sequence_buffer.add_request(req_state, reuse_index)
 
-        if removed_pool and not use_dp_local_rows:
-            self.sequence_buffer.condense(sorted(removed_pool))
+        if removed_pool:
+            if not use_dp_local_rows:
+                self.sequence_buffer.condense(sorted(removed_pool))
+            else:
+                self._compact_dp_shards(dp_size, rows_per_shard)
 
         # Drop cached VLM prompt helpers once prefill is complete to free host RAM.
+        # Raw media / cached mm_features are retained until finish so preemption
+        # re-prefill can recompute embeddings and mRoPE positions cleanly.
         for req_state in self.requests.values():
             if (
                 req_state.prefill_inputs_embeds is not None
@@ -398,8 +434,28 @@ class SequenceStateSync:
                 req_state.prefill_visual_pos_masks = None
                 req_state.prefill_deepstack_visual_embeds = None
 
-        has_changes = len(scheduler_output.preempted_req_ids) > 0 or len(req_ids_to_add) > 0
+        has_changes = (
+            len(scheduler_output.finished_req_ids) > 0
+            or len(scheduler_output.preempted_req_ids) > 0
+            or len(req_ids_to_add) > 0
+        )
         return has_changes
+
+    def _compact_dp_shards(self, dp_size: int, rows_per_shard: int) -> None:
+        """Compact intra-shard holes and trim trailing empty slots for DP-local rows."""
+        if self.sequence_buffer.num_reqs > 0 and rows_per_shard > 1:
+            num_slots = self.sequence_buffer.num_slots
+            for shard in range(dp_size):
+                lo = shard * rows_per_shard
+                if lo >= num_slots:
+                    break
+                hi = min(lo + rows_per_shard, num_slots)
+                self.sequence_buffer.compact_holes_in_range(lo, hi)
+        if hasattr(self.sequence_buffer, "trim_trailing_empty_slots"):
+            self.sequence_buffer.trim_trailing_empty_slots()
+        elif self.sequence_buffer.num_reqs == 0:
+            self.sequence_buffer.req_ids.clear()
+            self.sequence_buffer.req_output_token_ids.clear()
 
     def _rewind_to_committed(
         self,
@@ -483,10 +539,9 @@ class SequenceStateSync:
         if placeholder_idx < 0 or placeholder_idx + 1 > max_model_len:
             raise ValueError(f"Token position {placeholder_idx} exceeds max_model_len {max_model_len}")
         output_pos = placeholder_idx - int(req_state.num_prompt_tokens)
-        if 0 <= output_pos < len(req_state.output_token_ids):
-            req_state.output_token_ids[output_pos] = token
-        elif req_state.output_token_ids:
-            req_state.output_token_ids[-1] = token
+        if not (0 <= output_pos < len(req_state.output_token_ids)):
+            return
+        req_state.output_token_ids[output_pos] = token
         req_idx = sequence_buffer.req_id_to_index.get(req_id)
         if req_idx is not None:
             sequence_buffer.token_ids[req_idx, placeholder_idx] = token
@@ -645,6 +700,10 @@ class SequenceStateSync:
         max_reqs = self.sequence_buffer.max_num_reqs
         if max_reqs <= 1 or dp_size <= 1:
             return
+        if self.sequence_buffer.num_reqs == 0:
+            if hasattr(self.sequence_buffer, "trim_trailing_empty_slots"):
+                self.sequence_buffer.trim_trailing_empty_slots()
+            return
         rows_per_shard = max_reqs // dp_size
         if rows_per_shard <= 1 or max_reqs % dp_size != 0:
             return
@@ -652,6 +711,8 @@ class SequenceStateSync:
         num_slots = self.sequence_buffer.num_slots
         for shard in range(dp_size):
             lo = shard * rows_per_shard
+            if lo >= num_slots:
+                break
             hi = min(lo + rows_per_shard, num_slots)
 
             # 1) Compact holes (None slots) to the end of the shard range.
@@ -697,3 +758,6 @@ class SequenceStateSync:
                     self.sequence_buffer.swap_states(i, j)
                     i += 1
                     j -= 1
+
+        if hasattr(self.sequence_buffer, "trim_trailing_empty_slots"):
+            self.sequence_buffer.trim_trailing_empty_slots()

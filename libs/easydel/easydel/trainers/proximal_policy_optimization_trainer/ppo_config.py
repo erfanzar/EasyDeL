@@ -420,6 +420,8 @@ class PPOConfig(TrainingArguments):
             )
         if self.model_adapter_name is not None or self.ref_adapter_name is not None:
             raise ValueError("PPO adapter switching is not supported by EasyDeL yet.")
+        if self.kl_estimator not in ("k1", "k3"):
+            raise ValueError(f"`kl_estimator` must be 'k1' or 'k3', got {self.kl_estimator!r}.")
         if self.stop_token is not None and self.stop_token != "eos":
             raise ValueError("`stop_token` must be either None or 'eos'.")
         if self.stop_token is not None and self.stop_token_id is not None:
@@ -427,10 +429,19 @@ class PPOConfig(TrainingArguments):
         if self.stop_token_id is not None and self.stop_token_id < 0:
             raise ValueError("`stop_token_id` must be non-negative when set.")
 
+        if self.num_return_sequences < 1:
+            raise ValueError("`num_return_sequences` must be at least 1.")
+        if self.num_generations is not None and self.num_generations < 1:
+            raise ValueError("`num_generations` must be at least 1 when set.")
         if self.num_generations is None:
             self.num_generations = self.num_return_sequences
-        else:
+        elif self.num_return_sequences == 1:
             self.num_return_sequences = self.num_generations
+        elif self.num_return_sequences != self.num_generations:
+            raise ValueError(
+                "`num_return_sequences` and `num_generations` are aliases and must match when both are set; "
+                f"got num_return_sequences={self.num_return_sequences} and num_generations={self.num_generations}."
+            )
         self.world_size = 1 if self.world_size is None else int(self.world_size)
         if self.world_size != 1:
             raise ValueError("`world_size` is a TRL multi-process bookkeeping field; EasyDeL PPO expects 1.")

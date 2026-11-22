@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from .abstract_reasoning import ReasoningParserManager, ReasoningParserName
+from .abstract_reasoning import ReasoningParserManager, ReasoningParserName, shared_vocab
 
 # MODEL_TYPE_TO_REASONING_PARSER: Mapping from ``config.model_type`` to the
 # canonical reasoning parser name. The keys are matched as prefixes
@@ -135,6 +135,7 @@ _VOCAB_HINTS: list[tuple[str, ReasoningParserName]] = [
     ("[THINK]", "mistral"),
     ("<|channel>", "gemma4"),
     ("<|channel|>", "gptoss"),
+    ("<seed:think>", "seed_oss"),
     ("<think>", "deepseek_r1"),
 ]
 
@@ -142,6 +143,25 @@ _VOCAB_HINTS: list[tuple[str, ReasoningParserName]] = [
 # ``<think>``/``</think>`` is by far the most common reasoning format
 # (Qwen3, DeepSeek-R1, OLMo-3, ERNIE, etc.).
 _DEFAULT_PARSER: ReasoningParserName = "deepseek_r1"
+
+
+def _model_type_matches(mt: str, prefix: str) -> bool:
+    """Match ``prefix`` against ``mt`` at string-start or separator token boundaries."""
+    if mt == prefix:
+        return True
+    if mt.startswith(prefix):
+        nxt = mt[len(prefix)]
+        if prefix[-1].isdigit() or nxt in "_-./" or nxt.isdigit():
+            return True
+    idx = mt.find(prefix)
+    while idx != -1:
+        before_ok = idx == 0 or mt[idx - 1] in "_-./"
+        end = idx + len(prefix)
+        after_ok = end == len(mt) or mt[end] in "_-./" or mt[end].isdigit() or prefix[-1].isdigit()
+        if before_ok and after_ok:
+            return True
+        idx = mt.find(prefix, idx + 1)
+    return False
 
 
 def detect_reasoning_parser(
@@ -171,7 +191,7 @@ def detect_reasoning_parser(
     if model_type is not None:
         mt = model_type.lower()
         for prefix in sorted(MODEL_TYPE_TO_REASONING_PARSER, key=len, reverse=True):
-            if mt.startswith(prefix) or prefix in mt:
+            if _model_type_matches(mt, prefix):
                 return MODEL_TYPE_TO_REASONING_PARSER[prefix]
 
     if tokenizer is not None:
@@ -181,7 +201,7 @@ def detect_reasoning_parser(
                 if hint in template:
                     return name
 
-        vocab = getattr(tokenizer, "get_vocab", lambda: {})()
+        vocab = shared_vocab(tokenizer)
         if isinstance(vocab, dict):
             for token, name in _VOCAB_HINTS:
                 if token in vocab:

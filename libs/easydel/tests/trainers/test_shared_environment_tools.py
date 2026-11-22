@@ -121,3 +121,23 @@ def test_grpo_uses_shared_environment_and_tools():
     assert grpo_trainer.create_tool_call_parser is environment.create_tool_call_parser
     assert grpo_trainer.make_tool is tools.make_tool
     assert grpo_trainer.function_to_json is tools.function_to_json
+
+
+def test_tool_parsers_reject_non_dict_json_and_unhashable_names():
+    default_parser = environment.create_tool_call_parser(None)
+    regex_parser = environment.create_tool_call_parser(r"regex:<call>(.*?)</call>")
+
+    malformed_hermes = (
+        '<tool_call>[1, 2]</tool_call>'
+        '<tool_call>{"name": ["python_code"], "arguments": {}}</tool_call>'
+        '<tool_call>{"name": 123, "arguments": {}}</tool_call>'
+        '<tool_call>{"name": "ok_tool", "arguments": {"a": 1}}</tool_call>'
+    )
+    assert default_parser(malformed_hermes) == [("ok_tool", '{"a": 1}')]
+
+    malformed_regex = (
+        '<call>[1, 2]</call>'
+        '<call>{"name": ["python_code"], "arguments": {}}</call>'
+        '<call>{"name": "ok_tool", "arguments": {"a": 1}}</call>'
+    )
+    assert regex_parser(malformed_regex) == [("ok_tool", '{"a": 1}')]

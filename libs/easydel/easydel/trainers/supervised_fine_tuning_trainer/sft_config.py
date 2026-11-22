@@ -19,6 +19,7 @@ sequence packing (``bfd`` / ``wrapped``), assistant-only loss masking,
 and dataset-preprocessing worker controls.
 """
 
+import copy
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -270,10 +271,21 @@ class SFTConfig(TrainingArguments):
             self.packing = True
         if self.padding_free and not self.packing:
             self.packing = True
-        if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:
+        if self.pad_to_multiple_of is not None and (
+            isinstance(self.pad_to_multiple_of, bool) or self.pad_to_multiple_of <= 0
+        ):
             raise ValueError("`pad_to_multiple_of` must be a positive integer when set.")
+        if self.completion_loss_chunk_size is not None and (
+            isinstance(self.completion_loss_chunk_size, bool) or self.completion_loss_chunk_size <= 0
+        ):
+            raise ValueError("`completion_loss_chunk_size` must be a positive integer when set.")
         if self.packing_strategy == "bfd_split":
             self.packing_strategy = "bfd"
+        valid_packing_strategies = ("bfd", "wrapped", "first_fit", "greedy", "pool")
+        if self.packing_strategy not in valid_packing_strategies:
+            raise ValueError(
+                f"`packing_strategy` must be one of {valid_packing_strategies}; got {self.packing_strategy!r}."
+            )
         if self.dataset_kwargs is not None:
             unsupported_dataset_kwargs = set(self.dataset_kwargs) - {"skip_prepare_dataset"}
             if unsupported_dataset_kwargs:
@@ -282,7 +294,7 @@ class SFTConfig(TrainingArguments):
                     f"got unsupported keys: {sorted(unsupported_dataset_kwargs)}."
                 )
         if self.loss_type == "chunked_nll" and self.completion_loss_chunk_size is not None:
-            loss_config = self.loss_config or LossConfig()
+            loss_config = copy.deepcopy(self.loss_config) if self.loss_config is not None else LossConfig()
             loss_config.chunk_token_size = int(self.completion_loss_chunk_size)
             self.loss_config = loss_config
         if hasattr(super(), "__post_init__"):

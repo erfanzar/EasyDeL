@@ -182,7 +182,11 @@ class ApiKeyPermissions:
     max_tokens_per_request: int | None = None
 
     def __post_init__(self) -> None:
-        """Validate the optional per-request token ceiling."""
+        """Validate boolean permissions and optional per-request token ceiling."""
+        if not isinstance(self.enable_streaming, bool):
+            raise ValueError("enable_streaming must be a boolean")
+        if not isinstance(self.enable_function_calling, bool):
+            raise ValueError("enable_function_calling must be a boolean")
         if self.max_tokens_per_request is not None and self.max_tokens_per_request < 0:
             raise ValueError("max_tokens_per_request must be nonnegative or None")
 

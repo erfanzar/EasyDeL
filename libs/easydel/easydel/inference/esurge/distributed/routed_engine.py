@@ -119,6 +119,68 @@ class PrefixAffinityMap:
                 self._map.pop(key, None)
 
 
+class _SlotCounter:
+    """Per-member-instance in-flight request counter.
+
+    Pinned to the member instance rather than its slot index so that
+    :meth:`RoutedEngine.replace_member` gives the replacement a fresh counter
+    and unwinding requests from the old member never decrement the replacement.
+    """
+
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+
+class _ReleasedIterator:
+    """Iterator wrapper releasing a router in-flight slot on exhaustion, close, or GC.
+
+    Unlike a generator function, closing or discarding this wrapper before the
+    first ``next()`` still closes the wrapped iterator and releases the slot.
+    """
+
+    def __init__(self, iterator: typing.Iterator, release: typing.Callable[[], None]) -> None:
+        self._iterator = iterator
+        self._release = release
+        self._closed = False
+
+    def __iter__(self) -> _ReleasedIterator:
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._iterator)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            inner_close = getattr(self._iterator, "close", None)
+            if inner_close is not None:
+                inner_close()
+        finally:
+            self._release()
+
+    def __enter__(self) -> _ReleasedIterator:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def _member_alive(member) -> bool:
     """Read public liveness metadata, assuming unknown engine-shaped members are alive."""
     alive = getattr(member, "alive", None)
@@ -178,10 +240,17 @@ class RoutedEngine:
             affinity_block_chars = page_size * 4 if page_size > 0 else _DEFAULT_BLOCK_CHARS
         self.affinity = PrefixAffinityMap(block_chars=affinity_block_chars)
         self._route_lock = threading.Lock()
-        # Router-local in-flight counts: the JSQ primary signal. Remote
-        # QueueStats ride 1s heartbeats, so a burst arriving between beats
-        # would otherwise dump entirely on the lowest-indexed member.
-        self._inflight = [0] * len(self.members)
+        # Router-local in-flight counts (one _SlotCounter per member instance):
+        # the JSQ primary signal. Remote QueueStats ride 1s heartbeats, so a
+        # burst arriving between beats would otherwise dump entirely on the
+        # lowest-indexed member.
+        self._slot_counters: list[_SlotCounter] = [_SlotCounter() for _ in self.members]
+
+    @property
+    def _inflight(self) -> list[int]:
+        """Snapshot of router-local in-flight request counts per slot."""
+        with self._route_lock:
+            return [counter.count for counter in self._slot_counters]
 
     def add_member(self, member) -> int:
         """Attach a member that came up after the router started serving (a late replica).
@@ -191,7 +260,7 @@ class RoutedEngine:
         """
         with self._route_lock:
             # In-flight first: a reader that sees the member under the lock also sees its counter.
-            self._inflight.append(0)
+            self._slot_counters.append(_SlotCounter())
             self.members.append(member)
             return len(self.members) - 1
 
@@ -199,34 +268,82 @@ class RoutedEngine:
         """Put a fresh member in a dead member's slot (a replica that came back on the same address)."""
         with self._route_lock:
             self.members[index] = member
-            self._inflight[index] = 0
+            self._slot_counters[index] = _SlotCounter()
         self.affinity.drop_member(index)
 
-    def _alive_indices(self) -> list[int]:
-        alive = []
+    def _pick_member_locked(self, pinned: int | None) -> tuple[int | None, list[int]]:
+        """Pick the best live member index under ``self._route_lock``.
+
+        Returns:
+            ``(chosen_index | None, dead_indices)``; ``chosen_index`` is ``None``
+            when no member is alive.
+        """
+        alive: list[int] = []
+        dead: list[int] = []
         for index, member in enumerate(self.members):
             if _member_alive(member):
                 alive.append(index)
             else:
-                self.affinity.drop_member(index)
+                dead.append(index)
+        if not alive:
+            return None, dead
+        if pinned is not None and pinned in alive:
+            least = min(self._slot_counters[index].count for index in alive)
+            if self._slot_counters[pinned].count - least <= self.affinity_max_imbalance:
+                return pinned, dead
+        chosen = min(
+            alive,
+            key=lambda index: (
+                self._slot_counters[index].count,
+                _member_pending_prefill_tokens(self.members[index]),
+                index,
+            ),
+        )
+        return chosen, dead
+
+    def _alive_indices(self) -> list[int]:
+        with self._route_lock:
+            alive: list[int] = []
+            dead: list[int] = []
+            for index, member in enumerate(self.members):
+                if _member_alive(member):
+                    alive.append(index)
+                else:
+                    dead.append(index)
+        for index in dead:
+            self.affinity.drop_member(index)
         if not alive:
             raise RequestPlaneError("no live replica: every routed engine member is down")
         return alive
 
     def _acquire(self, member_index: int) -> None:
         with self._route_lock:
-            self._inflight[member_index] += 1
+            self._slot_counters[member_index].count += 1
 
     def _release(self, member_index: int) -> None:
         with self._route_lock:
-            self._inflight[member_index] = max(0, self._inflight[member_index] - 1)
+            counter = self._slot_counters[member_index]
+            counter.count = max(0, counter.count - 1)
 
-    def _released_iterator(self, iterator: typing.Iterator, member_index: int) -> typing.Iterator:
-        """Wrap a streaming result so its in-flight slot frees when it ends."""
-        try:
-            yield from iterator
-        finally:
-            self._release(member_index)
+    def _release_counter(self, counter: _SlotCounter) -> None:
+        with self._route_lock:
+            counter.count = max(0, counter.count - 1)
+
+    def _select_and_acquire(self, prompt: str) -> tuple[int, typing.Any, _SlotCounter]:
+        """Atomically select a live member, increment its counter, and record prefix affinity."""
+        pinned, _depth = self.affinity.lookup(prompt)
+        with self._route_lock:
+            member_index, dead = self._pick_member_locked(pinned)
+            if member_index is not None:
+                member = self.members[member_index]
+                counter = self._slot_counters[member_index]
+                counter.count += 1
+        for index in dead:
+            self.affinity.drop_member(index)
+        if member_index is None:
+            raise RequestPlaneError("no live replica: every routed engine member is down")
+        self.affinity.record(prompt, member_index)
+        return member_index, member, counter
 
     def select_member(self, prompt: str) -> int:
         """Pick the member for one prompt: bounded prefix affinity, then JSQ.
@@ -245,18 +362,14 @@ class RoutedEngine:
         Returns:
             Index into :attr:`members`.
         """
-        alive = self._alive_indices()
         pinned, _depth = self.affinity.lookup(prompt)
         with self._route_lock:
-            inflight = list(self._inflight)
-        if pinned is not None and pinned in alive:
-            least = min(inflight[index] for index in alive)
-            if inflight[pinned] - least <= self.affinity_max_imbalance:
-                return pinned
-        return min(
-            alive,
-            key=lambda index: (inflight[index], _member_pending_prefill_tokens(self.members[index]), index),
-        )
+            member_index, dead = self._pick_member_locked(pinned)
+        for index in dead:
+            self.affinity.drop_member(index)
+        if member_index is None:
+            raise RequestPlaneError("no live replica: every routed engine member is down")
+        return member_index
 
     @property
     def esurge_name(self) -> str:
@@ -288,12 +401,16 @@ class RoutedEngine:
     @property
     def num_pending_requests(self) -> int:
         """Aggregate waiting-queue depth across live members."""
-        return sum(int(getattr(member, "num_pending_requests", 0)) for member in self.members)
+        with self._route_lock:
+            members = list(self.members)
+        return sum(int(getattr(member, "num_pending_requests", 0)) for member in members if _member_alive(member))
 
     @property
     def num_running_requests(self) -> int:
         """Aggregate running-set size across live members."""
-        return sum(int(getattr(member, "num_running_requests", 0)) for member in self.members)
+        with self._route_lock:
+            members = list(self.members)
+        return sum(int(getattr(member, "num_running_requests", 0)) for member in members if _member_alive(member))
 
     def generate(
         self,
@@ -320,12 +437,18 @@ class RoutedEngine:
         """
         if isinstance(prompts, str):
             prompts = [prompts]
+        elif len(prompts) == 0:
+            raise ValueError("Empty prompt list provided")
         if request_id is None:
             request_ids: list[str | None] = [None] * len(prompts)
         elif isinstance(request_id, str):
+            if len(prompts) != 1:
+                raise ValueError("request_id must be a list when providing multiple prompts.")
             request_ids = [request_id]
         else:
             request_ids = list(request_id)
+            if len(request_ids) != len(prompts):
+                raise ValueError("Length of request_id list must match number of prompts.")
 
         # Validate the explicit/auto id mix up front, on the caller's thread.
         # A mixed batch used to raise inside a daemon `_run` thread before its
@@ -335,22 +458,31 @@ class RoutedEngine:
         if provided and len(provided) != len(request_ids):
             raise ValueError("Mix of explicit and auto request ids in one routed batch is unsupported")
 
-        by_member: dict[int, list[int]] = {}
-        for position, prompt in enumerate(prompts):
-            member_index = self.select_member(prompt)
-            by_member.setdefault(member_index, []).append(position)
-            self.affinity.record(prompt, member_index)
-            self._acquire(member_index)
+        by_counter: dict[int, tuple[typing.Any, _SlotCounter, list[int]]] = {}
+        acquired: list[_SlotCounter] = []
+        try:
+            for position, prompt in enumerate(prompts):
+                _member_index, member, counter = self._select_and_acquire(prompt)
+                acquired.append(counter)
+                key = id(counter)
+                if key not in by_counter:
+                    by_counter[key] = (member, counter, [position])
+                else:
+                    by_counter[key][2].append(position)
+        except BaseException:
+            for counter in acquired:
+                self._release_counter(counter)
+            raise
 
         results: list[RequestOutput | None] = [None] * len(prompts)
         errors: list[Exception] = []
         threads: list[threading.Thread] = []
+        groups = list(by_counter.values())
 
-        def _run(member_index: int, positions: list[int]) -> None:
+        def _run(member, counter: _SlotCounter, positions: list[int]) -> None:
             # The whole body runs under the release-protecting try/finally so
             # the acquired in-flight slots free on every exit path.
             try:
-                member = self.members[member_index]
                 member_prompts = [prompts[p] for p in positions]
                 member_ids = [request_ids[p] for p in positions]
                 explicit = [rid for rid in member_ids if rid is not None]
@@ -370,17 +502,28 @@ class RoutedEngine:
                 errors.append(exc)
             finally:
                 for _ in positions:
-                    self._release(member_index)
+                    self._release_counter(counter)
 
-        for member_index, positions in by_member.items():
-            if len(by_member) == 1:
-                _run(member_index, positions)
-            else:
-                thread = threading.Thread(target=_run, args=(member_index, positions), daemon=True)
-                thread.start()
-                threads.append(thread)
-        for thread in threads:
-            thread.join()
+        if len(groups) == 1:
+            member, counter, positions = groups[0]
+            _run(member, counter, positions)
+        else:
+            started_count = 0
+            try:
+                for member, counter, positions in groups:
+                    thread = threading.Thread(target=_run, args=(member, counter, positions), daemon=True)
+                    thread.start()
+                    threads.append(thread)
+                    started_count += 1
+            except BaseException:
+                for _member, counter, positions in groups[started_count:]:
+                    for _ in positions:
+                        self._release_counter(counter)
+                for thread in threads:
+                    thread.join()
+                raise
+            for thread in threads:
+                thread.join()
         if errors:
             raise errors[0]
         return typing.cast("list[RequestOutput]", results)
@@ -393,20 +536,23 @@ class RoutedEngine:
         tool_parser_request: typing.Any | None = None,
     ) -> typing.Iterator[RequestOutput]:
         """Route one streaming request to its member and relay its updates."""
-        prompt = prompts[0] if isinstance(prompts, list) else prompts
-        member_index = self.select_member(prompt)
-        self.affinity.record(prompt, member_index)
-        self._acquire(member_index)
-        member = self.members[member_index]
-        yield from self._released_iterator(
-            member.stream(
+        if isinstance(prompts, list):
+            if len(prompts) == 0:
+                raise ValueError("Empty prompt list provided")
+            prompt = prompts[0]
+        else:
+            prompt = prompts
+        _member_index, member, counter = self._select_and_acquire(prompt)
+        try:
+            iterator = member.stream(
                 prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tool_parser_request=tool_parser_request,
-            ),
-            member_index,
-        )
+            )
+            yield from iterator
+        finally:
+            self._release_counter(counter)
 
     def _chat_routing_key(self, messages: list[dict]) -> str:
         """A stable prompt-shaped key for affinity routing of chat calls."""
@@ -415,24 +561,18 @@ class RoutedEngine:
         except Exception:
             return repr(messages)
 
-    def _route_for_key(self, routing_key: str) -> int:
-        member_index = self.select_member(routing_key)
-        self.affinity.record(routing_key, member_index)
-        self._acquire(member_index)
-        return member_index
-
     def chat(self, messages: list[dict], *args, **kwargs):
         """Route a chat call to one member (affinity by templated prompt)."""
-        member_index = self._route_for_key(self._chat_routing_key(messages))
+        _member_index, member, counter = self._select_and_acquire(self._chat_routing_key(messages))
         try:
-            result = self.members[member_index].chat(messages, *args, **kwargs)
-        except Exception:
-            self._release(member_index)
+            result = member.chat(messages, *args, **kwargs)
+        except BaseException:
+            self._release_counter(counter)
             raise
         if hasattr(result, "__next__"):
-            # Streaming chat: the slot frees when the iterator ends.
-            return self._released_iterator(result, member_index)
-        self._release(member_index)
+            # Streaming chat: the slot frees when the iterator ends, closes, or is GC'd.
+            return _ReleasedIterator(result, lambda: self._release_counter(counter))
+        self._release_counter(counter)
         return result
 
     @staticmethod
@@ -462,12 +602,12 @@ class RoutedEngine:
         **kwargs,
     ):
         """Route chat chunks and optional cumulative usage progress to one member."""
-        member_index = self._route_for_key(self._chat_routing_key(messages))
+        _member_index, member, counter = self._select_and_acquire(self._chat_routing_key(messages))
         try:
-            stream_fn = self.members[member_index].iter_chat_completion_stream
+            stream_fn = member.iter_chat_completion_stream
             yield from stream_fn(messages=messages, **kwargs, **self._stream_usage_kwargs(stream_fn, usage_callback))
         finally:
-            self._release(member_index)
+            self._release_counter(counter)
 
     def iter_responses_stream(
         self,
@@ -477,12 +617,12 @@ class RoutedEngine:
         **kwargs,
     ):
         """Route Responses frames and optional cumulative usage progress to one member."""
-        member_index = self._route_for_key(self._chat_routing_key(messages))
+        _member_index, member, counter = self._select_and_acquire(self._chat_routing_key(messages))
         try:
-            stream_fn = self.members[member_index].iter_responses_stream
+            stream_fn = member.iter_responses_stream
             yield from stream_fn(messages=messages, **kwargs, **self._stream_usage_kwargs(stream_fn, usage_callback))
         finally:
-            self._release(member_index)
+            self._release_counter(counter)
 
     def abort_request(self, request_id: str) -> None:
         """Cancel a request wherever it landed (no-op on non-owners)."""

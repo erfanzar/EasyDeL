@@ -18,11 +18,16 @@ from __future__ import annotations
 import jax
 from jax import numpy as jnp
 
+_MIN_SAFE_LOG_RATIO: float = -80.0
+_MAX_SAFE_LOG_RATIO: float = 30.0
+
 
 def _normalizer(action_mask: jax.Array, normalizer: jax.Array | float | None) -> jax.Array:
     """Resolve a local or explicitly accumulation-correct token denominator."""
-    count = jnp.sum(action_mask) if normalizer is None else jnp.asarray(normalizer, dtype=jnp.float32)
-    return jnp.maximum(count, 1.0)
+    if normalizer is None:
+        return jnp.maximum(jnp.sum(action_mask), 1.0)
+    count = jnp.asarray(normalizer, dtype=jnp.float32)
+    return jnp.where(count > 0.0, count, 1.0)
 
 
 def clipped_ppo_policy_loss(
@@ -52,13 +57,28 @@ def clipped_ppo_policy_loss(
         Scalar policy loss, or ``(loss, clip_fraction)`` when requested.
     """
     action_mask = action_mask.astype(jnp.float32)
-    advantages = jax.lax.stop_gradient(advantages)
-    ratio = jnp.exp(current_logps - behavior_logps)
-    unclipped = -advantages * ratio
-    clipped = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
-    loss = jnp.sum(jnp.maximum(unclipped, clipped) * action_mask) / _normalizer(action_mask, normalizer)
+    mask_bool = action_mask > 0.0
+    advantages = jax.lax.stop_gradient(jnp.where(mask_bool, advantages.astype(jnp.float32), 0.0))
+    log_ratio = (current_logps - behavior_logps).astype(jnp.float32)
+    # Mask non-action positions and clamp before exp() so masked or outlier
+    # tokens never overflow to inf and poison reductions or VJP with NaN.
+    safe_log_ratio = jnp.clip(
+        jnp.where(mask_bool, log_ratio, 0.0),
+        _MIN_SAFE_LOG_RATIO,
+        _MAX_SAFE_LOG_RATIO,
+    )
+    ratio = jnp.exp(safe_log_ratio)
+    low = 1.0 - cliprange
+    high = 1.0 + cliprange
+    use_clipped = ((advantages > 0.0) & (ratio > high)) | ((advantages < 0.0) & (ratio < low))
+    safe_unclipped_ratio = jnp.where(mask_bool & ~use_clipped, ratio, 1.0)
+    unclipped = -advantages * safe_unclipped_ratio
+    clipped_bound = jnp.where(advantages > 0.0, high, low)
+    clipped = -advantages * clipped_bound
+    surrogate = jnp.where(mask_bool, jnp.where(use_clipped, clipped, unclipped), 0.0)
+    loss = jnp.sum(surrogate) / _normalizer(action_mask, normalizer)
     if return_clip_fraction:
-        clip_fraction = jnp.sum((clipped > unclipped).astype(jnp.float32) * action_mask) / _normalizer(action_mask, None)
+        clip_fraction = jnp.sum(use_clipped.astype(jnp.float32) * action_mask) / _normalizer(action_mask, None)
         return loss, clip_fraction
     return loss
 
@@ -90,9 +110,10 @@ def direct_importance_sampling_mask(
         raise ValueError("`epsilon_low` must be in (0, 1].")
     if epsilon_high <= 0.0:
         raise ValueError("`epsilon_high` must be positive.")
-    log_ratio = current_logps - behavior_logps
-    lower = jnp.log1p(-jnp.asarray(epsilon_low, dtype=log_ratio.dtype))
-    upper = jnp.log1p(jnp.asarray(epsilon_high, dtype=log_ratio.dtype))
+    action_mask = action_mask.astype(jnp.float32)
+    log_ratio = (current_logps - behavior_logps).astype(jnp.float32)
+    lower = jnp.log1p(-jnp.asarray(epsilon_low, dtype=jnp.float32))
+    upper = jnp.log1p(jnp.asarray(epsilon_high, dtype=jnp.float32))
     return ((log_ratio > lower) & (log_ratio < upper)).astype(jnp.float32) * action_mask
 
 
@@ -132,8 +153,17 @@ def sao_policy_loss(
         epsilon_low=epsilon_low,
         epsilon_high=epsilon_high,
     )
-    ratio = jnp.exp(current_logps - behavior_logps)
-    weight = jax.lax.stop_gradient(ratio * keep)
-    advantages = jax.lax.stop_gradient(advantages)
-    loss = -jnp.sum(weight * advantages * current_logps * action_mask) / _normalizer(action_mask, normalizer)
+    keep_bool = keep > 0.0
+    log_ratio = (current_logps - behavior_logps).astype(jnp.float32)
+    # Mask rejected/non-action positions before exp() to prevent exp(large) * 0 = NaN.
+    safe_log_ratio = jnp.clip(
+        jnp.where(keep_bool, log_ratio, 0.0),
+        _MIN_SAFE_LOG_RATIO,
+        _MAX_SAFE_LOG_RATIO,
+    )
+    ratio = jnp.where(keep_bool, jnp.exp(safe_log_ratio), 0.0)
+    weight = jax.lax.stop_gradient(ratio)
+    advantages = jax.lax.stop_gradient(jnp.where(keep_bool, advantages.astype(jnp.float32), 0.0))
+    safe_current_logps = jnp.where(keep_bool, current_logps.astype(jnp.float32), 0.0)
+    loss = -jnp.sum(weight * advantages * safe_current_logps) / _normalizer(action_mask, normalizer)
     return (loss, keep) if return_keep_mask else loss

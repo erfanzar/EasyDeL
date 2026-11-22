@@ -28,6 +28,7 @@ log probabilities are computed under ``stop_gradient``.
 
 from __future__ import annotations
 
+import functools
 import typing as tp
 
 import jax
@@ -43,9 +44,12 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
+    cached_scheduled_auxiliary,
     constrain_scheduled_batch,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
@@ -54,7 +58,7 @@ from ..training_utils import (
     update_state_respectfully,
 )
 
-_XPO_REFERENCE_FORWARD_CACHE: dict[int, tp.Callable[..., tp.Any]] = {}
+_XPO_REFERENCE_PAIR_FN_CACHE: dict[int | None, tp.Callable[..., tp.Any]] = {}
 
 
 def _compute_logps(
@@ -64,6 +68,7 @@ def _compute_logps(
     completion_ids: jax.Array,
     completion_mask: jax.Array,
     logprob_vocab_chunk_size: int | None,
+    vocab_shard_stage: int | None = None,
 ) -> jax.Array:
     """Compute per-token log probabilities for completion tokens.
 
@@ -84,6 +89,8 @@ def _compute_logps(
         logprob_vocab_chunk_size: Optional vocabulary-axis chunk size
             forwarded to :func:`get_per_token_logps` to bound peak
             memory. ``None`` disables chunking.
+        vocab_shard_stage: Optional MPMD terminal pipeline stage rank used
+            when vocab-sharded LM head projection is active.
 
     Returns:
         jax.Array: Per-token log probabilities aligned to the completion
@@ -98,6 +105,7 @@ def _compute_logps(
         attention_mask,
         prompt_length,
         logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+        vocab_shard_stage=vocab_shard_stage,
     )
 
 
@@ -110,12 +118,14 @@ def _compute_pair_logps(
     ref_completion_ids: jax.Array,
     ref_completion_mask: jax.Array,
     logprob_vocab_chunk_size: int | None,
+    vocab_shard_stage: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Score policy and reference completions in a single concatenated forward.
 
     Doubles the prompt batch and concatenates the policy and reference
-    completions along the batch axis so that one model call returns
-    per-token log probabilities for both samples.
+    completions along the batch axis (right-padding the shorter side when
+    their widths differ) so that one model call returns per-token log
+    probabilities for both samples, sliced back to their original widths.
 
     Args:
         module (spx.Module): Bound model module.
@@ -129,11 +139,24 @@ def _compute_pair_logps(
         ref_completion_mask (jax.Array): Reference completion mask.
         logprob_vocab_chunk_size (int | None): Optional vocabulary
             chunking size used inside :func:`get_per_token_logps`.
+        vocab_shard_stage (int | None): Optional MPMD terminal stage rank.
 
     Returns:
         tuple[jax.Array, jax.Array]: ``(policy_token_logps,
-        ref_token_logps)`` both shaped ``[B, completion_len]``.
+        ref_token_logps)`` shaped ``[B, C_pol]`` and ``[B, C_ref]``.
     """
+    policy_len = policy_completion_ids.shape[1]
+    ref_len = ref_completion_ids.shape[1]
+    max_len = max(policy_len, ref_len)
+    if policy_len < max_len:
+        pad_width = max_len - policy_len
+        policy_completion_ids = jnp.pad(policy_completion_ids, ((0, 0), (0, pad_width)), constant_values=0)
+        policy_completion_mask = jnp.pad(policy_completion_mask, ((0, 0), (0, pad_width)), constant_values=0)
+    if ref_len < max_len:
+        pad_width = max_len - ref_len
+        ref_completion_ids = jnp.pad(ref_completion_ids, ((0, 0), (0, pad_width)), constant_values=0)
+        ref_completion_mask = jnp.pad(ref_completion_mask, ((0, 0), (0, pad_width)), constant_values=0)
+
     prompt_ids = jnp.concatenate([prompt_ids, prompt_ids], axis=0)
     prompt_mask = jnp.concatenate([prompt_mask, prompt_mask], axis=0)
     completion_ids = jnp.concatenate([policy_completion_ids, ref_completion_ids], axis=0)
@@ -145,9 +168,10 @@ def _compute_pair_logps(
         completion_ids,
         completion_mask,
         logprob_vocab_chunk_size,
+        vocab_shard_stage=vocab_shard_stage,
     )
     split = policy_completion_ids.shape[0]
-    return token_logps[:split], token_logps[split:]
+    return token_logps[:split, :policy_len], token_logps[split:, :ref_len]
 
 
 def _sum_logps(token_logps: jax.Array, completion_mask: jax.Array) -> jax.Array:
@@ -198,23 +222,36 @@ def _xpo_pair_forward(module: spx.Module, batch: dict[str, tp.Any], logprob_voca
     )
 
 
-def _cached_xpo_reference_forward(mesh: spx.SpxMesh) -> tp.Callable[..., tp.Any]:
-    """Return a JIT-cached reference-model pair forward keyed by mesh identity.
+def _cached_xpo_reference_forward(
+    mesh: spx.SpxMesh,
+    *,
+    logprob_vocab_chunk_size: int | None = None,
+    microbatches: int = 1,
+) -> tp.Callable[..., tp.Any]:
+    """Return a JIT-cached, microbatch-aware reference-model pair forward.
 
     Args:
         mesh (spx.SpxMesh): The Spectrax device mesh used as the cache
             key. Different meshes get different specializations.
+        logprob_vocab_chunk_size (int | None): Optional vocabulary
+            chunking size bound into the cached forward callable.
+        microbatches (int): Number of leading-axis microbatches to split
+            the reference forward across.
 
     Returns:
         tp.Callable: Cached ``spx.jit``-compiled wrapper around
-        :func:`_xpo_pair_forward`.
+        :func:`_xpo_pair_forward` (microbatched when ``microbatches > 1``).
     """
-    key = id(mesh)
-    cached = _XPO_REFERENCE_FORWARD_CACHE.get(key)
-    if cached is None:
-        cached = spx.jit(_xpo_pair_forward, mesh=mesh, static_argnums=(2,))
-        _XPO_REFERENCE_FORWARD_CACHE[key] = cached
-    return cached
+    bound_fn = _XPO_REFERENCE_PAIR_FN_CACHE.get(logprob_vocab_chunk_size)
+    if bound_fn is None:
+        bound_fn = functools.partial(_xpo_pair_forward, logprob_vocab_chunk_size=logprob_vocab_chunk_size)
+        _XPO_REFERENCE_PAIR_FN_CACHE[logprob_vocab_chunk_size] = bound_fn
+    return cached_scheduled_auxiliary(
+        bound_fn,
+        mesh,
+        microbatches=max(1, int(microbatches)),
+        batch_argnums=1,
+    )
 
 
 def xpo_step(
@@ -416,9 +453,10 @@ def xpo_step(
             margin = chosen_rewards - rejected_rewards
             accuracy = jnp.mean(margin > 0)
 
-            kl_policy = ((policy_on_policy - ref_on_policy) * policy_completion_mask).sum(axis=1)
-            kl_ref = ((policy_on_ref - ref_on_ref) * ref_completion_mask).sum(axis=1)
-            mean_kl = jnp.mean((kl_policy + kl_ref) / 2)
+            kl_policy = _sum_logps(policy_on_policy - ref_on_policy, policy_completion_mask)
+            kl_ref = _sum_logps(policy_on_ref - ref_on_ref, ref_completion_mask)
+            # Symmetric (Jeffreys) KL: E_{y~pi}[log(pi/ref)] + E_{y~ref}[log(ref/pi)]
+            mean_kl = jnp.mean((kl_policy - kl_ref) / 2.0)
 
             entropy_policy = -_sum_logps(policy_on_policy, policy_completion_mask)
             entropy_ref = -_sum_logps(policy_on_ref, ref_completion_mask)
@@ -553,8 +591,17 @@ def _prepare_xpo_scheduled_batch(call) -> dict[str, tp.Any]:
     with sync_module_physical_stage_config(ref_module):
         partition_spec = call.get("partition_spec")
         batch_for_ref = constrain_scheduled_batch(ref_module, batch, partition_spec)
-        ref_forward = _cached_xpo_reference_forward(ref_module.mesh)
-        ref_on_policy, ref_on_ref = ref_forward(ref_module, batch_for_ref, call.get("logprob_vocab_chunk_size"))
+        schedule_microbatches = getattr(call.schedule, "microbatches", None)
+        microbatches = max(
+            1,
+            int(schedule_microbatches or call.get("gradient_accumulation_steps", 1) or 1),
+        )
+        ref_forward = _cached_xpo_reference_forward(
+            ref_module.mesh,
+            logprob_vocab_chunk_size=call.get("logprob_vocab_chunk_size"),
+            microbatches=microbatches,
+        )
+        ref_on_policy, ref_on_ref = ref_forward(ref_module, batch_for_ref)
     batch["_ref_on_policy"] = jax.lax.stop_gradient(ref_on_policy)
     batch["_ref_on_ref"] = jax.lax.stop_gradient(ref_on_ref)
     return batch
@@ -591,6 +638,8 @@ def _make_xpo_scheduled_loss(call):
     """
     logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
     partition_spec = call.get("partition_spec")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the XPO scalar loss for the scheduled-loss adapter.
@@ -605,8 +654,9 @@ def _make_xpo_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/xpo/scheduled_loss"):
             with jax.named_scope("easydel/trainer/xpo/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 batch = constrain_scheduled_batch(module, batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, schedule)
             with jax.named_scope("easydel/trainer/xpo/scheduled_loss/policy_forward"):
                 policy_on_policy, policy_on_ref = _compute_pair_logps(
                     module,
@@ -617,6 +667,7 @@ def _make_xpo_scheduled_loss(call):
                     batch["ref_completion_ids"],
                     batch["ref_completion_mask"],
                     logprob_vocab_chunk_size,
+                    vocab_shard_stage=_terminal_rank,
                 )
             with jax.named_scope("easydel/trainer/xpo/scheduled_loss/compute_xpo_loss"):
                 return _xpo_loss_from_logps(

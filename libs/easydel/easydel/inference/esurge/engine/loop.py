@@ -145,6 +145,21 @@ class EngineLoop:
         """Ask the loop to exit after its current iteration."""
         self._running = False
 
+    def close(self) -> None:
+        """Break engine callback references after the loop has stopped."""
+        self._running = False
+        self.core = None
+        self.runner = None
+        self._coordinator = None
+        self._emit_outputs = None
+        self._drain_parser_stops = None
+        self._on_fatal = None
+        self._heartbeat = None
+        self._handle_profiling_step = None
+        self._is_nonrecoverable = None
+        self._info = None
+        self._on_stopped = None
+
     def join(self, timeout: float | None = None) -> None:
         """Join the loop thread; clears the thread reference once it exits."""
         thread = self._thread
@@ -521,10 +536,28 @@ class EngineLoop:
 
                         if next_sched_out.total_num_scheduled_tokens > 0:
                             next_pending: tuple[typing.Any, SchedulerOutput] | None = None
-                            if self.runner.can_dispatch_next_before_async_drain(next_sched_out):
-                                next_pending = (coordinator.execute_async(next_sched_out), next_sched_out)
+                            try:
+                                if self.runner.can_dispatch_next_before_async_drain(next_sched_out):
+                                    next_pending = (coordinator.execute_async(next_sched_out), next_sched_out)
+                            except self._closed_error:
+                                raise
+                            except Exception as e:
+                                pending_execution = None
+                                prefetched_schedule = None
+                                logger.critical(
+                                    "Async dispatch failed after scheduler state advanced with an in-flight step. "
+                                    "Attempting best-effort drain of the in-flight step before aborting scheduler."
+                                )
+                                try:
+                                    self._drain(future, prev_sched_out)
+                                except Exception:
+                                    logger.debug("Best-effort drain of in-flight step failed during abort", exc_info=True)
+                                self._on_fatal(e)
+                                break
                             try:
                                 self._drain(future, prev_sched_out)
+                            except self._closed_error:
+                                raise
                             except Exception as e:
                                 pending_execution = None
                                 prefetched_schedule = None
@@ -535,7 +568,19 @@ class EngineLoop:
                                 self._on_fatal(e)
                                 break
                             if next_pending is None:
-                                next_pending = _execute_positive_schedule(next_sched_out)
+                                try:
+                                    next_pending = _execute_positive_schedule(next_sched_out)
+                                except self._closed_error:
+                                    raise
+                                except Exception as e:
+                                    pending_execution = None
+                                    prefetched_schedule = None
+                                    logger.critical(
+                                        "Follow-up schedule execution failed after scheduler state advanced. "
+                                        "Aborting scheduler instead of retrying with an uncommitted schedule."
+                                    )
+                                    self._on_fatal(e)
+                                    break
                             pending_execution = next_pending
                             consecutive_errors = 0
                             self._heartbeat()
@@ -545,6 +590,8 @@ class EngineLoop:
                             self._drain(future, prev_sched_out)
                             if self._zero_schedule_needs_update(next_sched_out):
                                 _execute_zero_token_schedule(next_sched_out)
+                        except self._closed_error:
+                            raise
                         except Exception as e:
                             pending_execution = None
                             prefetched_schedule = None
@@ -566,17 +613,17 @@ class EngineLoop:
 
                     try:
                         self._drain(future, prev_sched_out)
-                    except Exception as e:
-                        if prefetched_schedule is not None:
-                            pending_execution = None
-                            prefetched_schedule = None
-                            logger.critical(
-                                "Overlap drain failed after speculatively advancing scheduler state. "
-                                "Aborting scheduler instead of retrying with an unexecuted prefetched batch."
-                            )
-                            self._on_fatal(e)
-                            break
+                    except self._closed_error:
                         raise
+                    except Exception as e:
+                        pending_execution = None
+                        prefetched_schedule = None
+                        logger.critical(
+                            "Overlap drain failed after scheduler state advanced. "
+                            "Aborting scheduler instead of retrying with uncommitted schedule(s)."
+                        )
+                        self._on_fatal(e)
+                        break
                     pending_execution = None
 
                 if prefetched_schedule is not None:
@@ -601,12 +648,36 @@ class EngineLoop:
 
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     if self._zero_schedule_needs_update(scheduler_output):
-                        _execute_zero_token_schedule(scheduler_output)
+                        try:
+                            _execute_zero_token_schedule(scheduler_output)
+                        except self._closed_error:
+                            raise
+                        except Exception as e:
+                            pending_execution = None
+                            prefetched_schedule = None
+                            logger.critical(
+                                "Zero-token schedule execution failed after scheduler state advanced. "
+                                "Aborting scheduler instead of retrying with an uncommitted schedule."
+                            )
+                            self._on_fatal(e)
+                            break
                     else:
                         self._idle_scheduler_tick()
                         pending_execution = None
                 else:
-                    pending_execution = _execute_positive_schedule(scheduler_output)
+                    try:
+                        pending_execution = _execute_positive_schedule(scheduler_output)
+                    except self._closed_error:
+                        raise
+                    except Exception as e:
+                        pending_execution = None
+                        prefetched_schedule = None
+                        logger.critical(
+                            "Schedule dispatch/execution failed after scheduler state advanced. "
+                            "Aborting scheduler instead of retrying with an uncommitted schedule."
+                        )
+                        self._on_fatal(e)
+                        break
 
                 consecutive_errors = 0
                 self._heartbeat()

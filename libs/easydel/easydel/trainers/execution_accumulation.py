@@ -31,6 +31,7 @@ accepting the keyword-only arguments ``accumulate_into`` and ``apply_accumulated
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax
@@ -46,6 +47,50 @@ from .training_utils import (
 )
 
 logger = get_logger(__name__)
+
+
+class _LazyMicrobatchSequence(collections.abc.Sequence):
+    """Stream host-sliced and optionally placed microbatches on demand.
+
+    Avoids materializing all ``num_steps`` device microbatches in HBM upfront
+    while remaining indexable/sized for callers that inspect ``microbatches[0]``.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch: tp.Any,
+        batch_size: int,
+        num_steps: int,
+        batch_spec: tp.Any,
+        mesh: tp.Any,
+    ) -> None:
+        self._batch = batch
+        self._batch_size = int(batch_size)
+        self._num_steps = int(num_steps)
+        self._micro_size = self._batch_size // self._num_steps
+        self._batch_spec = batch_spec
+        self._mesh = mesh
+
+    def __len__(self) -> int:
+        return self._num_steps
+
+    def __getitem__(self, index: int | slice) -> tp.Any:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._num_steps))]
+        idx = int(index)
+        if idx < 0:
+            idx += self._num_steps
+        if idx < 0 or idx >= self._num_steps:
+            raise IndexError(f"microbatch index {index} out of range for {self._num_steps} microbatches.")
+        part = slice_host_minibatch(self._batch, self._batch_size, idx * self._micro_size, self._micro_size)
+        if self._batch_spec is None:
+            return part
+        return place_batch(part, self._batch_spec, self._mesh)
+
+    def __iter__(self) -> collections.abc.Iterator[tp.Any]:
+        for k in range(self._num_steps):
+            yield self[k]
 
 
 class ExecutionAccumulation:
@@ -129,8 +174,8 @@ class ExecutionAccumulation:
             self._zeros_fn = jax.jit(lambda: zero_gradient_accumulator(shapes), out_shardings=self._acc_shardings)
         return self._zeros_fn()
 
-    def microbatches(self, batch) -> list[tp.Any]:
-        """Host-sliced microbatches of ``batch`` (views for numpy leaves).
+    def microbatches(self, batch) -> collections.abc.Sequence[tp.Any]:
+        """Lazy sequence yielding host-sliced (and placed) microbatches one at a time.
 
         Raises:
             ValueError: When the batch does not divide into ``num_steps`` microbatches.
@@ -138,11 +183,13 @@ class ExecutionAccumulation:
         batch_size = _infer_batch_size(batch)
         if batch_size % self.num_steps:
             raise ValueError(f"batch of {batch_size} rows is not divisible by {self.num_steps} microbatches.")
-        size = batch_size // self.num_steps
-        parts = [slice_host_minibatch(batch, batch_size, k * size, size) for k in range(self.num_steps)]
-        if self._batch_spec is None:
-            return parts
-        return [place_batch(part, self._batch_spec, self._mesh) for part in parts]
+        return _LazyMicrobatchSequence(
+            batch=batch,
+            batch_size=batch_size,
+            num_steps=self.num_steps,
+            batch_spec=self._batch_spec,
+            mesh=self._mesh,
+        )
 
     def run(self, state, batch, extra_args: tuple[tp.Any, ...], static_args: tuple[tp.Any, ...]):
         """One optimizer step: ``num_steps`` grad executions, then the apply execution.

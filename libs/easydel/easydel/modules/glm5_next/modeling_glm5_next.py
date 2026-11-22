@@ -557,17 +557,27 @@ class Glm5NextTextMoE(BaseMoeModule):
             routed_scaling_factor=self.config.routed_scaling_factor,
         )
 
-    def forward(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        *,
+        post_write_gate: Float[Array, "batch seq_len hc"] | None = None,
+    ) -> tuple[Array, Array]:
         """Routes tokens through selected experts and combines outputs, plus the shared experts.
 
         The shared experts go to ``moe_call``, which runs them inside the fused dispatch where it can (the
-        inference-mode deferred dispatch with W8A8 shared experts) and adds them after the routed experts otherwise.
+        inference-mode deferred dispatch with W8A8 shared experts, or fused mHC ``post_write_gate`` backward) and adds
+        them after the routed experts otherwise.
 
         Args:
             hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
+            post_write_gate: Optional mHC write gate ``[batch, seq_len, hc]`` (already cast to stream dtype). When the
+                chunked fused MoE path fuses it, returns the 4-D ``post * (routed + shared)`` stream contribution so
+                outer layer remat does not re-run the MoE forward solely to recover ``feed_forward_hidden_states`` for
+                ``d_post``.
 
         Returns:
-            Tuple of (combined expert output, router logits).
+            Tuple of (combined expert output or 4-D expanded stream write, router logits).
         """
         hooks = self.moe_hooks.replace(select_hook=self._select_hook())
         limit = self.config.swiglu_limit
@@ -595,6 +605,7 @@ class Glm5NextTextMoE(BaseMoeModule):
             ffn_activation=ffn_activation,
             hooks=hooks,
             shared_expert=self.shared_experts,
+            post_write_gate=post_write_gate,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
@@ -1059,17 +1070,22 @@ class Glm5NextDecoderLayer(spx.Module):
 
         post, comb, collapsed = self.ffn_hc(hidden_states)
         mlp_input = self.post_attention_layernorm(collapsed)
+        router_logits = None
         if self.config.use_scan_mlp and isinstance(self.mlp, Glm5NextTextMLP):
             feed_forward_hidden_states = blockwise_ffn(
                 self.mlp,
                 mlp_input,
                 self.config.scan_mlp_chunk_size,
             )
+        elif isinstance(self.mlp, Glm5NextTextMoE):
+            feed_forward_hidden_states, router_logits = self.mlp(
+                mlp_input,
+                post_write_gate=self.ffn_hc.fused_post_write_gate(hidden_states, post, comb),
+            )
         else:
             feed_forward_hidden_states = self.mlp(mlp_input)
-        router_logits = None
-        if isinstance(feed_forward_hidden_states, tuple):
-            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
+            if isinstance(feed_forward_hidden_states, tuple):
+                feed_forward_hidden_states, router_logits = feed_forward_hidden_states
         hidden_states = self.ffn_hc.residual_write(hidden_states, feed_forward_hidden_states, post, comb)
         hidden_states = apply_logical_sharding(
             hidden_states,

@@ -131,9 +131,10 @@ class DPOConfig(TrainingArguments):
             and reference models. Default: 0.9
         ref_model_sync_steps (int): Number of steps between reference model syncs.
             Default: 64
-        rpo_alpha (float | None): Reserved compatibility field for Relative
-            Preference Optimization. EasyDeL DPO does not currently implement
-            this loss term; leave as ``None``.
+        rpo_alpha (float | None): Weight for the Relative Preference Optimization
+            (RPO) chosen-completion NLL regularization term
+            ``rpo_alpha * (-chosen_logps / chosen_lengths)``. Set to ``None`` or
+            ``0.0`` to disable. Default: ``None``.
         logprob_vocab_chunk_size (int | None): Vocabulary chunk size used when
             computing selected-token log probabilities for DPO. Set to ``None``
             to disable chunking and use the full vocab in one pass.
@@ -319,8 +320,9 @@ class DPOConfig(TrainingArguments):
         default=None,
         metadata={
             "help": (
-                "Reserved compatibility field for Relative Preference Optimization. "
-                "EasyDeL DPO does not currently implement this loss term."
+                "Weight for the Relative Preference Optimization (RPO) chosen-completion NLL "
+                "regularization term `rpo_alpha * (-chosen_logps / chosen_lengths)`. "
+                "Set to None or 0.0 to disable."
             )
         },
     )
@@ -364,7 +366,9 @@ class DPOConfig(TrainingArguments):
                 group/block size, forwarded to the base class.
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
-        if self.max_completion_length is None and self.max_length is not None:
+        if self.beta <= 0.0:
+            raise ValueError(f"`beta` must be positive; got {self.beta}.")
+        if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = self.max_length - self.max_prompt_length
         if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:
             raise ValueError("`pad_to_multiple_of` must be a positive integer when set.")
@@ -374,6 +378,8 @@ class DPOConfig(TrainingArguments):
             self.loss_type = (self.loss_type,)
         else:
             self.loss_type = tuple(self.loss_type)
+        if not self.loss_type:
+            raise ValueError("`loss_type` must contain at least one DPO loss variant.")
         if self.loss_weights is not None:
             self.loss_weights = tuple(float(weight) for weight in self.loss_weights)
             if len(self.loss_weights) != len(self.loss_type):
@@ -392,10 +398,10 @@ class DPOConfig(TrainingArguments):
                 "`f_divergence_type` must be one of 'reverse_kl', 'forward_kl', 'js_divergence', "
                 f"or 'alpha_divergence'; got {self.f_divergence_type!r}."
             )
-        if "exo_pair" in self.loss_type and self.label_smoothing == 0.0:
+        if "exo_pair" in self.loss_type and not (0.0 < self.label_smoothing < 1.0):
             raise ValueError(
-                "Label smoothing must be greater than 0.0 when using 'exo_pair' loss. "
-                "The EXO paper recommends a value of 1e-3."
+                "Label smoothing must be greater than 0.0 and less than 1.0 when using 'exo_pair' loss. "
+                f"The EXO paper recommends a value of 1e-3; got {self.label_smoothing}."
             )
         if "robust" in self.loss_type and not (0.0 <= self.label_smoothing < 0.5):
             raise ValueError(

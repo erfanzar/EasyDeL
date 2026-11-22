@@ -306,6 +306,41 @@ def segment_pool_max_documents(seq_len: int) -> int:
     return max(int(seq_len) // 128, 64)
 
 
+@jax.custom_vjp
+def _segment_pool_gather(order: Array, rank: Array, x: Array) -> Array:
+    """Gather ``x[b, order[b, g]]`` with an exact gather-by-``rank`` reverse-mode VJP.
+
+    ``SegmentPoolLayout`` places each fitted valid token into at most one pool-grid slot
+    (``order[b, rank[b, s]] == s`` when ``rank[b, s] >= 0``, and ``rank[b, s] == -1`` otherwise),
+    so the transpose of gathering by ``order`` is one gather of ``dy`` by ``rank`` masked on
+    ``rank >= 0`` rather than a ``[batch, grid, ...]`` scatter-add.
+    """
+    idx = jnp.maximum(order, 0)
+    out = jax.vmap(lambda row, i: jnp.take(row, i, axis=0))(x, idx)
+    filled = (order >= 0).reshape(order.shape + (1,) * (x.ndim - 2))
+    return jnp.where(filled, out, jnp.zeros((), out.dtype))
+
+
+def _segment_pool_gather_fwd(order: Array, rank: Array, x: Array):
+    return _segment_pool_gather(order, rank, x), (order.shape, rank)
+
+
+def _segment_pool_gather_bwd(residuals, dy: Array):
+    order_shape, rank = residuals
+    r_idx = jnp.maximum(rank, 0)
+    dx = jax.vmap(lambda drow, i: jnp.take(drow, i, axis=0))(dy, r_idx)
+    valid_r = (rank >= 0).reshape(rank.shape + (1,) * (dy.ndim - 2))
+    dx = jnp.where(valid_r, dx, jnp.zeros((), dx.dtype))
+    return (
+        jnp.zeros(order_shape, dtype=jax.dtypes.float0),
+        jnp.zeros(rank.shape, dtype=jax.dtypes.float0),
+        dx,
+    )
+
+
+_segment_pool_gather.defvjp(_segment_pool_gather_fwd, _segment_pool_gather_bwd)
+
+
 class SegmentPoolLayout(tp.NamedTuple):
     """Packed documents on a pool-aligned key grid (see :func:`segment_pool_layout`).
 
@@ -325,10 +360,7 @@ class SegmentPoolLayout(tp.NamedTuple):
 
     def gather(self, x: Array) -> Array:
         """``x[b, order[b, g]]`` along the sequence axis of ``x [batch, seq, ...]``, zeros in empty slots."""
-        idx = jnp.maximum(self.order, 0)
-        out = jax.vmap(lambda row, i: jnp.take(row, i, axis=0))(x, idx)
-        filled = (self.order >= 0).reshape(self.order.shape + (1,) * (x.ndim - 2))
-        return jnp.where(filled, out, jnp.zeros((), out.dtype))
+        return _segment_pool_gather(self.order, self.rank, x)
 
 
 def segment_pool_layout(
@@ -377,9 +409,8 @@ def segment_pool_layout(
     gpos = slots + jnp.cumsum(pad, axis=1, dtype=jnp.int32) - pad
     fits = cvalid & (gpos < grid)
     target = jnp.where(fits, gpos, grid)
-    rows = jnp.arange(batch, dtype=jnp.int32)[:, None]
-    order = jnp.full((batch, grid), -1, jnp.int32).at[rows, target].set(base.order, mode="drop")
-    key_segments = jnp.full((batch, grid), -1, jnp.int32).at[rows, target].set(cseg, mode="drop")
+    order = jax.vmap(lambda t, o: jnp.full((grid,), -1, jnp.int32).at[t].set(o, mode="drop"))(target, base.order)
+    key_segments = jax.vmap(lambda t, s: jnp.full((grid,), -1, jnp.int32).at[t].set(s, mode="drop"))(target, cseg)
     rank = jnp.take_along_axis(jnp.where(fits, gpos, -1), base.inverse, axis=1)
     rank = jnp.where(valid, rank, -1).astype(jnp.int32)
     query_segments = jnp.where(rank >= 0, segment_ids, -1)

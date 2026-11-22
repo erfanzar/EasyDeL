@@ -335,7 +335,8 @@ class SamplerExecutor:
         if key in self._cache:
             return
 
-        vocab_size = int(self.model.config.get_text_config().vocab_size)
+        text_config = self.model.config.get_text_config()
+        vocab_size = int(getattr(text_config, "total_vocab_size", None) or text_config.vocab_size)
         # ``device`` accepts the full Sharding API promised by this executor;
         # array-creation ``out_sharding`` rejects SingleDeviceSharding.
         dummy_logits = jnp.zeros(
@@ -901,7 +902,7 @@ class SamplerRuntime:
         self._sampler_vocab_size = int(vocab_size)
         self._sampler_min_input_pad = int(min_input_pad)
 
-        self._sampler_zero_token_counts = jnp.zeros(
+        self._sampler_zero_token_counts: jax.Array | None = jnp.zeros(
             (self.max_num_reqs, self._sampler_vocab_size),
             dtype=jnp.uint32,
             device=self._sampler_sharding,
@@ -911,7 +912,7 @@ class SamplerRuntime:
             dtype=jnp.int32,
             device=self._sampler_sharding,
         )
-        self._sampler_token_counts = self._sampler_zero_token_counts
+        self._sampler_token_counts: jax.Array | None = self._sampler_zero_token_counts
         self._sampler_penalty_state_dirty = True
         self._sampler_penalty_state_ready = False
         self._sampler_penalty_rebuild_token_ids_cpu: numpy.ndarray | None = None
@@ -935,16 +936,18 @@ class SamplerRuntime:
         self._sampler_packed_misc_i32_cpu = numpy.zeros((2,), dtype=numpy.int32)
         self._sampler_prefix_cpu_by_reqs: dict[int, numpy.ndarray] = {}
 
+        rebuild_vocab_size = self._sampler_vocab_size
+
         @jax.jit
         def _rebuild_penalty_counts(token_history: jax.Array, seq_lens: jax.Array) -> jax.Array:
             """Rebuild per-request token-frequency counts for sampling penalties.
 
-            Closes over ``self._sampler_vocab_size`` and runs the JIT-compiled
-            :func:`build_history_token_counts` over a ``[max_num_reqs,
-            max_model_len]`` token-history buffer, treating only rows with
-            ``seq_lens > 0`` as active. Used to refresh the device-side counts
-            after a state mutation (request adds/removes, sequence drops) so
-            frequency / presence / repetition penalties stay correct.
+            Closes over ``rebuild_vocab_size`` (an immutable int, not ``self``) and
+            runs the JIT-compiled :func:`build_history_token_counts` over a
+            ``[max_num_reqs, max_model_len]`` token-history buffer, treating only
+            rows with ``seq_lens > 0`` as active. Used to refresh the device-side
+            counts after a state mutation (request adds/removes, sequence drops)
+            so frequency / presence / repetition penalties stay correct.
 
             Args:
                 token_history: Token-id buffer ``[max_num_reqs, max_model_len]``.
@@ -959,7 +962,7 @@ class SamplerRuntime:
                     token_history=token_history,
                     seq_lens=seq_lens.astype(jnp.int32),
                     active_mask=seq_lens > 0,
-                    vocab_size=self._sampler_vocab_size,
+                    vocab_size=rebuild_vocab_size,
                 )
 
         self._rebuild_penalty_counts = _rebuild_penalty_counts
@@ -1011,6 +1014,25 @@ class SamplerRuntime:
 
         self._scatter_sampler_outputs = _scatter_sampler_outputs
 
+    def _get_zero_token_counts(self) -> jax.Array:
+        """Return the zeroed ``[max_num_reqs, vocab_size]`` device array, allocating lazily after release."""
+        zeros = self._sampler_zero_token_counts
+        if zeros is None:
+            zeros = jnp.zeros(
+                (self.max_num_reqs, self._sampler_vocab_size),
+                dtype=jnp.uint32,
+                device=self._sampler_sharding,
+            )
+            self._sampler_zero_token_counts = zeros
+        return zeros
+
+    def release_device_buffers(self) -> None:
+        """Drop device-side token-count buffers to free HBM across KV destroy / model release."""
+        self._sampler_token_counts = None
+        self._sampler_zero_token_counts = None
+        self._sampler_penalty_state_dirty = True
+        self._sampler_penalty_state_ready = False
+
     def invalidate_sampler_penalty_state(
         self,
         token_ids_cpu: numpy.ndarray | None = None,
@@ -1056,7 +1078,11 @@ class SamplerRuntime:
                 :meth:`invalidate_sampler_penalty_state` call earlier in the
                 step.
         """
-        if self._sampler_penalty_state_ready and not self._sampler_penalty_state_dirty:
+        if (
+            self._sampler_penalty_state_ready
+            and not self._sampler_penalty_state_dirty
+            and self._sampler_token_counts is not None
+        ):
             return
         if self._sampler_penalty_rebuild_token_ids_cpu is None or self._sampler_penalty_rebuild_seq_lens_cpu is None:
             raise RuntimeError("Sampler penalty state rebuild requested without a full-sequence source.")
@@ -1500,9 +1526,10 @@ class SamplerRuntime:
         if token_counts_full is None:
             if need_penalties:
                 self._ensure_sampler_penalty_state()
-            token_counts_full = (
-                self._sampler_token_counts if self._sampler_penalty_state_ready else self._sampler_zero_token_counts
-            )
+            if self._sampler_penalty_state_ready and self._sampler_token_counts is not None:
+                token_counts_full = self._sampler_token_counts
+            else:
+                token_counts_full = self._get_zero_token_counts()
         sampler_packed_i32 = self._sampler_packed_i32_cpu_by_reqs.get(int(sampler_padded_num_reqs))
         if sampler_packed_i32 is None:
             sampler_packed_i32 = numpy.zeros((10, int(sampler_padded_num_reqs)), dtype=numpy.int32)
@@ -1554,7 +1581,14 @@ class SamplerRuntime:
                 packed_i32=sampler_packed_i32,
                 num_reqs=int(sampler_num_reqs),
             )
-        sampler_host_payload = (sampler_packed_f32, sampler_packed_i32, self._sampler_packed_misc_i32_cpu)
+        # Snapshot reused host scratch buffers before async device_put so an
+        # overlapped next step cannot overwrite bytes while PJRT/CPU transfer
+        # or execution is still reading them.
+        sampler_host_payload = (
+            sampler_packed_f32.copy(),
+            sampler_packed_i32.copy(),
+            self._sampler_packed_misc_i32_cpu.copy(),
+        )
         replicated = getattr(self, "host_payloads_replicated", False)
         if host_payload_broadcast_needed(replicated):
             sampler_host_payload = multihost_utils.broadcast_one_to_all(sampler_host_payload)
@@ -1586,7 +1620,7 @@ class SamplerRuntime:
             else:
                 logits_sharding = logits.sharding
                 gather_positions = put_host_payload(
-                    gather_positions_cpu[:sampler_padded_num_reqs],
+                    gather_positions_cpu[:sampler_padded_num_reqs].copy(),
                     sampler_sharding,
                     host_payloads_replicated=replicated,
                 )
@@ -1622,7 +1656,7 @@ class SamplerRuntime:
             return rng_key, compact_tokens, compact_valid_mask, token_counts_full
         with jax.named_scope("easydel/esurge/sampler/scatter_to_model_rows"):
             scatter_positions = put_host_payload(
-                scatter_positions_cpu[:sampler_padded_num_reqs],
+                scatter_positions_cpu[:sampler_padded_num_reqs].copy(),
                 sampler_sharding,
                 host_payloads_replicated=replicated,
             )

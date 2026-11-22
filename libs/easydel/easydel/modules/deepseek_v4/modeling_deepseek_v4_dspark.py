@@ -149,7 +149,10 @@ class DeepseekV4DSparkStage(spx.Module):
         attn_output = checkpoint_name(attn_output, "attn_output")
         hidden_streams = manifold_residual_write(hidden_streams, attn_output, post, comb, precision=self.precision)
         post, comb, collapsed = self.ffn_hc(hidden_streams)
-        mlp_output, _ = self.mlp(self.post_attention_layernorm(collapsed))
+        mlp_output, _ = self.mlp(
+            self.post_attention_layernorm(collapsed),
+            post_write_gate=self.ffn_hc.fused_post_write_gate(hidden_streams, post, comb),
+        )
         mlp_output = checkpoint_name(mlp_output, "mlp_output")
         hidden_streams = manifold_residual_write(hidden_streams, mlp_output, post, comb, precision=self.precision)
         return hidden_streams, None, ring

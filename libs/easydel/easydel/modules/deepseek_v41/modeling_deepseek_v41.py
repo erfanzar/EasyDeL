@@ -1107,6 +1107,8 @@ class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
         hidden_states: Float[Array, "batch seq hidden"],
         input_ids: Int[Array, "batch seq"] | None = None,
         image_mask: Bool[Array, "batch seq"] | None = None,
+        *,
+        post_write_gate: Float[Array, "batch seq hc"] | None = None,
     ) -> tuple[Array, Array]:
         """Route tokens through experts and add the shared expert.
 
@@ -1114,15 +1116,18 @@ class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
             hidden_states: Post-norm hidden states ``[B, S, D_model]``.
             input_ids: Unused (V4.1 has no hash routing); accepted for interface parity.
             image_mask: Optional ``[B, S]`` bool, True for tokens inside an image span (select ``bias_vl``).
+            post_write_gate: Optional mHC write gate ``[B, S, hc]`` (cast to stream dtype). When the chunked
+                fused MoE path fuses it, returns the 4-D ``post * (routed + shared)`` stream contribution.
 
         Returns:
-            Tuple of the MoE output ``[B, S, D_model]`` and the router scores ``[B * S, n_routed_experts]``.
+            Tuple of the MoE output (``[B, S, D_model]`` or 4-D expanded stream write) and the router scores
+            ``[B * S, n_routed_experts]``.
 
         Raises:
             ValueError: If ``image_mask`` is given but the block was built without ``image_router_bias``.
         """
         if image_mask is None:
-            return super().forward(hidden_states, input_ids)
+            return super().forward(hidden_states, input_ids, post_write_gate=post_write_gate)
         if not self.has_image_router_bias:
             raise ValueError("image_mask requires a block built with image_router_bias=True (vision enabled).")
         num_experts = self.config.n_routed_experts
@@ -1151,7 +1156,7 @@ class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
             """Clamped SwiGLU: ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``."""
             return clamped_swiglu(gate, up, limit=limit, act_fn=self.experts.act_fn)
 
-        routed, router_scores = self.moe_call(
+        out, router_scores = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=_image_gate,
             expert_layer=self.experts,
@@ -1162,9 +1167,10 @@ class DeepseekV41SparseMoeBlock(DeepseekV4SparseMoeBlock):
             ffn_activation=ffn_activation,
             hooks=hooks,
             layer_idx=self.layer_idx,
+            shared_expert=self.shared_experts,
+            post_write_gate=post_write_gate,
         )
         router_scores = router_scores[:, :num_experts]  # drop the carried image-flag column
-        out = routed + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_scores, "moe_router_logits")
 
 
@@ -1253,8 +1259,11 @@ class DeepseekV41DecoderLayer(spx.Module):
 
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc.coefficients(hidden_streams)
         mlp_input = self.post_attention_layernorm(manifold_collapse(attn_pre, hidden_streams))
+        post_write_gate = self.ffn_hc.fused_post_write_gate(hidden_streams, ffn_post, ffn_comb)
         mlp_output, router_logits = (
-            self.mlp(mlp_input) if image_mask is None else self.mlp(mlp_input, image_mask=image_mask)
+            self.mlp(mlp_input, post_write_gate=post_write_gate)
+            if image_mask is None
+            else self.mlp(mlp_input, image_mask=image_mask, post_write_gate=post_write_gate)
         )
         hidden_streams = manifold_residual_write(
             hidden_streams, mlp_output, ffn_post, ffn_comb, precision=self.precision

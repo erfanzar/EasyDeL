@@ -53,6 +53,7 @@ def generate_rollout_completions(
     *,
     generation_overrides: dict[str, object] | None = None,
     as_chat: bool | None = None,
+    release_runtime_after_generation: bool = True,
 ) -> list[dict[str, object]]:
     """Generate completions from an EasyDeL trainer through ``rollout``.
 
@@ -62,6 +63,9 @@ def generate_rollout_completions(
         generation_overrides: Optional generation config overrides passed to
             eSurge/local generation.
         as_chat: Whether the trainer should apply a chat template to prompts.
+        release_runtime_after_generation: Whether ``rollout`` should release
+            eSurge runtime resources once generation completes. Defaults to
+            ``True`` to avoid pinning KV caches on HBM.
 
     Returns:
         One dictionary per generated completion, carrying text plus available
@@ -76,7 +80,7 @@ def generate_rollout_completions(
         prompts=prompts,
         apply_chat_template=bool(as_chat),
         config_overrides=generation_overrides,
-        release_runtime_after_generation=False,
+        release_runtime_after_generation=release_runtime_after_generation,
     )
     texts = results.generation_results
     if isinstance(texts, str):
@@ -84,12 +88,31 @@ def generate_rollout_completions(
     prompt_ids = getattr(results, "prompt_ids", None)
     sequences = getattr(results, "sequences", None)
     rollout_rows: list[dict[str, object]] = []
+    num_texts = len(texts)
+    prompt_len = len(prompt_ids) if prompt_ids is not None else 0
+    seq_len = len(sequences) if sequences is not None else 0
+    prompt_repeat = (num_texts // prompt_len) if (prompt_len > 0 and num_texts % prompt_len == 0) else None
+    seq_repeat = (num_texts // seq_len) if (seq_len > 0 and num_texts % seq_len == 0) else None
     for idx, text in enumerate(texts):
         row: dict[str, object] = {"text": text}
         if prompt_ids is not None:
-            row["prompt_ids"] = prompt_ids[idx] if len(prompt_ids) == len(texts) else prompt_ids
+            if prompt_len == num_texts:
+                row["prompt_ids"] = prompt_ids[idx]
+            elif prompt_repeat is not None:
+                row["prompt_ids"] = prompt_ids[idx // prompt_repeat]
+            else:
+                raise ValueError(
+                    f"Cannot align prompt_ids of length {prompt_len} with {num_texts} generated completions."
+                )
         if sequences is not None:
-            row["sequences"] = sequences[idx] if len(sequences) == len(texts) else sequences
+            if seq_len == num_texts:
+                row["sequences"] = sequences[idx]
+            elif seq_repeat is not None:
+                row["sequences"] = sequences[idx // seq_repeat]
+            else:
+                raise ValueError(
+                    f"Cannot align sequences of length {seq_len} with {num_texts} generated completions."
+                )
         rollout_rows.append(row)
     return rollout_rows
 
@@ -105,6 +128,7 @@ class eSurgeRolloutConfig:
 
     generation_overrides: dict[str, object] | None = None
     as_chat: bool | None = None
+    release_runtime_after_generation: bool = True
 
 
 class eSurgeRolloutGenerator:
@@ -135,13 +159,15 @@ class eSurgeRolloutGenerator:
         *,
         generation_overrides: dict[str, object] | None = None,
         as_chat: bool | None = None,
+        release_runtime_after_generation: bool | None = None,
     ) -> list[dict[str, object]]:
         """Generate rollout rows using wrapper defaults and call overrides.
 
-        Explicit ``generation_overrides`` or ``as_chat`` arguments take
-        precedence over the defaults stored in ``self.config`` for this call
-        only. The returned rows preserve the text and token side data exposed by
-        EasyDeL generation.
+        Explicit ``generation_overrides``, ``as_chat``, or
+        ``release_runtime_after_generation`` arguments take precedence over the
+        defaults stored in ``self.config`` for this call only. The returned
+        rows preserve the text and token side data exposed by EasyDeL
+        generation.
         """
         return generate_rollout_completions(
             self.trainer,
@@ -150,6 +176,11 @@ class eSurgeRolloutGenerator:
                 self.config.generation_overrides if generation_overrides is None else generation_overrides
             ),
             as_chat=self.config.as_chat if as_chat is None else as_chat,
+            release_runtime_after_generation=(
+                self.config.release_runtime_after_generation
+                if release_runtime_after_generation is None
+                else release_runtime_after_generation
+            ),
         )
 
     __call__ = generate

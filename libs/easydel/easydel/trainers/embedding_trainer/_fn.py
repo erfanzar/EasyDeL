@@ -37,19 +37,28 @@ from jax.sharding import PartitionSpec
 from spectrax import with_sharding_constraint
 
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
     ScheduledLossAdapter,
     bind_scheduled_module,
     constrain_scheduled_batch,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
     update_metrics,
     update_state_respectfully,
 )
+
+
+def _l2_normalize(x: jax.Array, eps: float = 1e-12) -> jax.Array:
+    """L2-normalize embeddings along the last axis in at least float32 with zero-safe gradients."""
+    compute_dtype = jnp.promote_types(x.dtype, jnp.float32)
+    x_f = x.astype(compute_dtype)
+    norm = jnp.sqrt(jnp.sum(x_f**2, axis=-1, keepdims=True) + jnp.asarray(eps, dtype=compute_dtype))
+    return x_f / norm
 
 
 def infonce_loss(
@@ -74,13 +83,16 @@ def infonce_loss(
     Returns:
         Tuple of (scalar loss, metrics dict with accuracy).
     """
+    compute_dtype = jnp.promote_types(jnp.result_type(query_embeds, positive_embeds), jnp.float32)
+    query_f = query_embeds.astype(compute_dtype)
+    positive_f = positive_embeds.astype(compute_dtype)
     if negative_embeds is not None:
-        candidates = jnp.concatenate([positive_embeds, negative_embeds], axis=0)
+        candidates = jnp.concatenate([positive_f, negative_embeds.astype(compute_dtype)], axis=0)
     else:
-        candidates = positive_embeds
+        candidates = positive_f
 
-    similarity = query_embeds @ candidates.T / temperature
-    batch_size = query_embeds.shape[0]
+    similarity = (query_f @ candidates.T) / jnp.asarray(temperature, dtype=compute_dtype)
+    batch_size = query_f.shape[0]
     labels = jnp.arange(batch_size)
 
     loss = optax.softmax_cross_entropy_with_integer_labels(similarity, labels)
@@ -97,6 +109,7 @@ def triplet_loss(
     positive_embeds: jax.Array,
     negative_embeds: jax.Array,
     margin: float = 0.2,
+    eps: float = 1e-12,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compute triplet margin loss.
 
@@ -110,16 +123,27 @@ def triplet_loss(
         positive_embeds: Positive embeddings ``(batch, dim)``.
         negative_embeds: Negative embeddings ``(batch, dim)``.
         margin: Margin for triplet loss.
+        eps: Small positive stabilizer inside ``sqrt`` to keep gradients
+            finite when two embeddings coincide.
 
     Returns:
         Tuple of (scalar loss, metrics dict).
     """
-    pos_dist = jnp.sum((query_embeds - positive_embeds) ** 2, axis=-1)
-    neg_dist = jnp.sum((query_embeds - negative_embeds) ** 2, axis=-1)
-    loss = jnp.maximum(pos_dist - neg_dist + margin, 0.0)
-    loss = jnp.mean(loss)
+    compute_dtype = jnp.promote_types(
+        jnp.result_type(query_embeds, positive_embeds, negative_embeds),
+        jnp.float32,
+    )
+    q_f = query_embeds.astype(compute_dtype)
+    p_f = positive_embeds.astype(compute_dtype)
+    n_f = negative_embeds.astype(compute_dtype)
+    eps_arr = jnp.asarray(eps, dtype=compute_dtype)
 
-    fraction_active = jnp.mean((pos_dist - neg_dist + margin) > 0.0)
+    pos_dist = jnp.sqrt(jnp.sum((q_f - p_f) ** 2, axis=-1) + eps_arr)
+    neg_dist = jnp.sqrt(jnp.sum((q_f - n_f) ** 2, axis=-1) + eps_arr)
+    raw_margin = pos_dist - neg_dist + jnp.asarray(margin, dtype=compute_dtype)
+    loss = jnp.mean(jnp.maximum(raw_margin, 0.0))
+
+    fraction_active = jnp.mean(raw_margin > 0.0)
     return loss, {"fraction_active_triplets": fraction_active}
 
 
@@ -152,6 +176,7 @@ def matryoshka_loss(
     positive_embeds: jax.Array,
     negative_embeds: jax.Array | None,
     dims: list[int],
+    normalize: bool = True,
     **loss_kwargs,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compute Matryoshka Representation Learning loss.
@@ -165,12 +190,22 @@ def matryoshka_loss(
         query_embeds: Full-dimension query embeddings ``(batch, full_dim)``.
         positive_embeds: Full-dimension positive embeddings.
         negative_embeds: Optional full-dimension negative embeddings.
-        dims: List of truncation dimensions, e.g. ``[64, 128, 256, 768]``.
+        dims: Non-empty list of truncation dimensions, e.g. ``[64, 128, 256, 768]``.
+        normalize: Whether to L2-normalize truncated sub-embeddings before
+            calling ``loss_fn``.
         **loss_kwargs: Additional kwargs for the loss function.
 
     Returns:
         Tuple of (averaged scalar loss, metrics dict).
+
+    Raises:
+        ValueError: If ``dims`` is empty or contains non-positive dimensions.
     """
+    if not dims:
+        raise ValueError("`matryoshka_dims` must be a non-empty sequence of positive integers.")
+    if any(isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 for dim in dims):
+        raise ValueError("`matryoshka_dims` must contain only positive integers.")
+
     total_loss = jnp.float32(0.0)
     all_metrics: dict[str, jax.Array] = {}
 
@@ -179,10 +214,11 @@ def matryoshka_loss(
         p = positive_embeds[:, :dim]
         n = negative_embeds[:, :dim] if negative_embeds is not None else None
 
-        q = q / jnp.clip(jnp.linalg.norm(q, axis=-1, keepdims=True), min=1e-12)
-        p = p / jnp.clip(jnp.linalg.norm(p, axis=-1, keepdims=True), min=1e-12)
-        if n is not None:
-            n = n / jnp.clip(jnp.linalg.norm(n, axis=-1, keepdims=True), min=1e-12)
+        if normalize:
+            q = _l2_normalize(q)
+            p = _l2_normalize(p)
+            if n is not None:
+                n = _l2_normalize(n)
 
         dim_loss, dim_metrics = loss_fn(q, p, n, **loss_kwargs) if n is not None else loss_fn(q, p, **loss_kwargs)
         total_loss = total_loss + dim_loss
@@ -218,7 +254,7 @@ def _embed_batch(
     outputs = module(input_ids=input_ids, attention_mask=attention_mask)
     embeds = outputs.embeddings
     if normalize:
-        embeds = embeds / jnp.clip(jnp.linalg.norm(embeds, axis=-1, keepdims=True), min=1e-12)
+        embeds = _l2_normalize(embeds)
     return embeds
 
 
@@ -233,6 +269,8 @@ def embedding_training_step(
     learning_rate_fn: optax.Schedule | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    loss_config: LossConfig | None = None,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Run one contrastive embedding training step.
 
@@ -309,6 +347,9 @@ def embedding_training_step(
             recorded in ``metrics.accuracy``.
         """
         with jax.named_scope(scope_root + "/loss_fn"):
+            if straight_through_emulator is not None:
+                with jax.named_scope(scope_root + "/loss_fn/straight_through_emulator"):
+                    tree = straight_through_emulator(tree)
             with jax.named_scope(scope_root + "/loss_fn/merge_state"):
                 module = state.merge(tree)
 
@@ -353,6 +394,7 @@ def embedding_training_step(
                         p_embeds,
                         n_embeds,
                         matryoshka_dims,
+                        normalize=normalize,
                         **loss_kwargs,
                     )
                 elif n_embeds is not None:
@@ -379,7 +421,7 @@ def embedding_training_step(
         state = update_state_respectfully(
             state=state,
             gradients=gradients,
-            loss_config=None,
+            loss_config=loss_config,
             metrics=update_metrics(
                 metrics=metrics,
                 learning_rate_fn=learning_rate_fn,
@@ -463,6 +505,7 @@ def _embedding_loss_values(
             p_embeds,
             n_embeds,
             matryoshka_dims,
+            normalize=normalize,
             **loss_kwargs,
         )
     if n_embeds is not None:
@@ -530,6 +573,7 @@ def _embedding_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     return scheduled_loss_cache_key(
         call,
         value_fields=("loss_type", "temperature", "margin", "normalize", "matryoshka_dims", "partition_spec"),
+        object_fields=("straight_through_emulator",),
     )
 
 
@@ -549,6 +593,7 @@ def _make_embedding_scheduled_loss(call):
     normalize = call.get("normalize", True)
     matryoshka_dims = call.get("matryoshka_dims")
     partition_spec = call.get("partition_spec")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
 
     def scheduled_loss(tree, batch):
         """Compute the scalar contrastive loss inside the SpectraX scheduled VJP.
@@ -562,7 +607,7 @@ def _make_embedding_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/embedding/scheduled_loss"):
             with jax.named_scope("easydel/trainer/embedding/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 batch = constrain_scheduled_batch(module, batch, partition_spec)
             with jax.named_scope("easydel/trainer/embedding/scheduled_loss/compute_contrastive_loss"):
                 loss, _extra_metrics = _embedding_loss_values(

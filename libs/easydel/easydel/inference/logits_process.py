@@ -50,6 +50,30 @@ from easydel.utils.compiling_utils import hash_fn
 logger = get_logger(__name__)
 
 
+def _token_counts_from_ids(input_ids: jnp.ndarray, vocab_size: int, cur_len: int | jnp.ndarray) -> jnp.ndarray:
+    """Compute per-row token occurrence counts ``[B, V]`` in ``int32`` via sparse scatter.
+
+    Avoids materializing a dense ``[B, S, V]`` one-hot tensor and avoids ``bf16``
+    count saturation at 256. Negative or out-of-range token IDs and positions
+    ``>= cur_len`` are routed to slot ``vocab_size`` and dropped.
+    """
+    batch_size, seq_len = input_ids.shape
+    cur_len_arr = jnp.asarray(cur_len)
+    if cur_len_arr.ndim == 0:
+        valid = jnp.arange(seq_len)[None, :] < cur_len_arr
+    elif cur_len_arr.ndim == 1:
+        valid = jnp.arange(seq_len)[None, :] < cur_len_arr[:, None]
+    else:
+        valid = jnp.arange(seq_len)[None, :] < cur_len_arr
+    ids = input_ids.astype(jnp.int32)
+    in_bounds = valid & (ids >= 0) & (ids < vocab_size)
+    safe_ids = jnp.where(in_bounds, ids, vocab_size)
+    rows = jnp.broadcast_to(jnp.arange(batch_size, dtype=jnp.int32)[:, None], safe_ids.shape)
+    counts = jnp.zeros((batch_size, vocab_size + 1), dtype=jnp.int32)
+    counts = counts.at[rows, safe_ids].add(in_bounds.astype(jnp.int32), mode="drop")
+    return counts[:, :vocab_size]
+
+
 def _hash_processor_configuration(self) -> int:
     """Hash dataclass callables without contradicting their generated equality.
 
@@ -267,13 +291,20 @@ class TemperatureLogitsWarper(LogitsWarper):
         Returns:
             Temperature-scaled scores, or unmodified scores if temperature is -1.
         """
-        return jax.lax.cond(
-            self.temperature != -1,
-            lambda x, temp: x / temp.astype(x.dtype),
-            lambda *x: x[0],
-            scores,
-            self.temperature,
-        )
+        temp = jnp.asarray(self.temperature)
+        if temp.ndim == 0:
+            return jax.lax.cond(
+                temp > 0,
+                lambda x, t: (x.astype(jnp.float32) / t.astype(jnp.float32)).astype(x.dtype),
+                lambda x, _t: x,
+                scores,
+                temp,
+            )
+        temp_col = temp.reshape(scores.shape[0], 1).astype(jnp.float32)
+        active = temp_col > 0
+        safe_temp = jnp.where(active, temp_col, 1.0)
+        scaled = (scores.astype(jnp.float32) / safe_temp).astype(scores.dtype)
+        return jnp.where(active, scaled, scores)
 
 
 @auto_pytree
@@ -321,20 +352,31 @@ class TopPLogitsWarper(LogitsWarper):
         top_p = jnp.asarray(self.top_p)
         min_keep = self.min_tokens_to_keep
 
-        def _apply(x):
+        def _apply(x, top_p_thresh):
             """Mask logits below the top-p cumulative-probability cutoff."""
             topk_scores, topk_indices = lax.top_k(x, x.shape[-1])
             mask_scores = jnp.full_like(x, self.filter_value)
-            cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
-            score_mask = cumulative_probs < top_p
-            score_mask = jnp.roll(score_mask, 1)
-            score_mask |= score_mask.at[:, 0].set(True)
+            # Run softmax and cumulative sum in float32 to prevent bf16 saturation.
+            cumulative_probs = jax.nn.softmax(topk_scores.astype(jnp.float32), axis=-1).cumsum(axis=-1)
+            score_mask = cumulative_probs < top_p_thresh
+            score_mask = jnp.roll(score_mask, 1, axis=-1)
+            score_mask = score_mask.at[:, 0].set(True)
             score_mask = score_mask.at[:, :min_keep].set(True)
             topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
             x = jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
             return x
 
-        return jax.lax.cond((top_p > 0) & (top_p < 1), _apply, lambda x: x, scores)
+        if top_p.ndim == 0:
+            top_p_f32 = top_p.astype(jnp.float32)
+            return jax.lax.cond((top_p_f32 > 0) & (top_p_f32 < 1), lambda x: _apply(x, top_p_f32), lambda x: x, scores)
+        top_p_col = top_p.reshape(scores.shape[0], 1).astype(jnp.float32)
+        active = (top_p_col > 0) & (top_p_col < 1)
+        return jax.lax.cond(
+            jnp.any(active),
+            lambda x: jnp.where(active, _apply(x, top_p_col), x),
+            lambda x: x,
+            scores,
+        )
 
 
 @auto_pytree
@@ -376,29 +418,41 @@ class TopKLogitsWarper(LogitsWarper):
         """
         k_val = jnp.asarray(self.top_k)
         vocab_size = scores.shape[-1]
-        effective_k = jnp.maximum(k_val, self.min_tokens_to_keep)
-        effective_k = jnp.minimum(effective_k, vocab_size).astype(jnp.int32)
-
-        def _filter_scores(s: jnp.ndarray) -> jnp.ndarray:
-            """Applies the dynamic filtering logic."""
-            sorted_scores = jnp.sort(s, axis=-1)[:, ::-1]
-            k_index = effective_k - 1
-            k_index = jnp.maximum(0, k_index)
-            threshold = sorted_scores[:, k_index]
-            threshold = threshold[:, None]
-            mask = s >= threshold
-            return jnp.where(mask, s, self.filter_value)
 
         def _identity(s: jnp.ndarray) -> jnp.ndarray:
             """Returns scores unchanged."""
             return s
 
-        return lax.cond(
-            (k_val > 0) & (effective_k < vocab_size),
-            _filter_scores,  # Apply filtering
-            _identity,  # Pass through unchanged
-            scores,  # Operand
-        )
+        if k_val.ndim == 0:
+            effective_k = jnp.minimum(jnp.maximum(k_val, self.min_tokens_to_keep), vocab_size).astype(jnp.int32)
+
+            def _filter_scores(s: jnp.ndarray) -> jnp.ndarray:
+                """Applies the dynamic filtering logic."""
+                sorted_scores = jnp.sort(s, axis=-1)[:, ::-1]
+                k_index = jnp.maximum(0, effective_k - 1)
+                threshold = sorted_scores[:, k_index][:, None]
+                mask = s >= threshold
+                return jnp.where(mask, s, jnp.asarray(self.filter_value, dtype=s.dtype))
+
+            return lax.cond(
+                (k_val > 0) & (effective_k < vocab_size),
+                _filter_scores,
+                _identity,
+                scores,
+            )
+
+        k_col = k_val.reshape(scores.shape[0]).astype(jnp.int32)
+        effective_k = jnp.minimum(jnp.maximum(k_col, self.min_tokens_to_keep), vocab_size).astype(jnp.int32)
+        active = (k_col > 0) & (effective_k < vocab_size)
+
+        def _filter_batched(s: jnp.ndarray) -> jnp.ndarray:
+            sorted_scores = jnp.sort(s, axis=-1)[:, ::-1]
+            k_index = jnp.maximum(0, effective_k - 1)
+            threshold = sorted_scores[jnp.arange(s.shape[0]), k_index][:, None]
+            filtered = jnp.where(s >= threshold, s, jnp.asarray(self.filter_value, dtype=s.dtype))
+            return jnp.where(active[:, None], filtered, s)
+
+        return lax.cond(jnp.any(active), _filter_batched, _identity, scores)
 
 
 @auto_pytree
@@ -428,9 +482,13 @@ class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
         Returns:
             Modified scores forcing BOS at step 1, unchanged otherwise.
         """
-        new_scores = jnp.full(scores.shape, -float("inf"))
+        new_scores = jnp.full(scores.shape, -float("inf"), dtype=scores.dtype)
         apply_penalty = 1 - jnp.bool_(cur_len - 1)
-        scores = jnp.where(apply_penalty, new_scores.at[:, self.bos_token_id].set(0), scores)
+        scores = jnp.where(
+            apply_penalty,
+            new_scores.at[:, self.bos_token_id].set(jnp.asarray(0, dtype=scores.dtype)),
+            scores,
+        )
         return scores
 
 
@@ -463,9 +521,13 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
         Returns:
             Modified scores forcing EOS at max_length - 1, unchanged otherwise.
         """
-        new_scores = jnp.full(scores.shape, -float("inf"))
+        new_scores = jnp.full(scores.shape, -float("inf"), dtype=scores.dtype)
         apply_penalty = 1 - jnp.bool_(cur_len - self.max_length + 1)
-        scores = jnp.where(apply_penalty, new_scores.at[:, self.eos_token_id].set(0), scores)
+        scores = jnp.where(
+            apply_penalty,
+            new_scores.at[:, self.eos_token_id].set(jnp.asarray(0, dtype=scores.dtype)),
+            scores,
+        )
         return scores
 
 
@@ -547,8 +609,15 @@ class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
         Returns:
             Scores with suppressed tokens at begin_index, unchanged otherwise.
         """
+        if len(self.begin_suppress_tokens) == 0:
+            return scores
+        suppress_ids = jnp.asarray(self.begin_suppress_tokens, dtype=jnp.int32)
         apply_penalty = 1 - jnp.bool_(cur_len - self.begin_index)
-        scores = jnp.where(apply_penalty, scores.at[:, self.begin_suppress_tokens].set(-float("inf")), scores)
+        scores = jnp.where(
+            apply_penalty,
+            scores.at[:, suppress_ids].set(jnp.asarray(-float("inf"), dtype=scores.dtype)),
+            scores,
+        )
         return scores
 
 
@@ -611,10 +680,18 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
         """
         if not isinstance(force_token_map, dict):
             raise TypeError(f"force_token_map must be a dict, got {type(force_token_map)}")
-        force_token_array = jnp.ones((max(force_token_map.keys()) + 1), dtype=jnp.int32) * -1
-        for index, token in force_token_map.items():
-            if token is not None:
-                force_token_array = force_token_array.at[index].set(token)
+        valid_items = [
+            (int(index), int(token))
+            for index, token in force_token_map.items()
+            if token is not None and int(index) >= 0
+        ]
+        if not valid_items:
+            self.force_token_array = jnp.empty((0,), dtype=jnp.int32)
+            return
+        max_index = max(index for index, _ in valid_items)
+        force_token_array = jnp.full((max_index + 1,), -1, dtype=jnp.int32)
+        for index, token in valid_items:
+            force_token_array = force_token_array.at[index].set(token)
         self.force_token_array = jnp.int32(force_token_array)
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
@@ -628,25 +705,29 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
         Returns:
             Scores forcing the mapped token at matching steps, unchanged otherwise.
         """
+        if self.force_token_array.shape[0] == 0:
+            return scores
 
         def _force_token(generation_idx):
             """Replace logits with a one-hot force on the mapped token."""
             batch_size = scores.shape[0]
             current_token = self.force_token_array[generation_idx]
 
-            new_scores = jnp.ones_like(scores, dtype=scores.dtype) * -float("inf")
+            new_scores = jnp.full_like(scores, -float("inf"))
             updates = jnp.zeros((batch_size, 1), dtype=scores.dtype)
             new_scores = lax.dynamic_update_slice(new_scores, updates, (0, current_token))
             return new_scores
 
+        in_range = (cur_len >= 0) & (cur_len < self.force_token_array.shape[0])
+        safe_idx = jnp.clip(cur_len, 0, self.force_token_array.shape[0] - 1)
         scores = lax.cond(
-            cur_len >= self.force_token_array.shape[0],
-            lambda: scores,
+            in_range,
             lambda: lax.cond(
-                self.force_token_array[cur_len] >= 0,
-                lambda: _force_token(cur_len),
+                self.force_token_array[safe_idx] >= 0,
+                lambda: _force_token(safe_idx),
                 lambda: scores,
             ),
+            lambda: scores,
         )
         return scores
 
@@ -819,24 +900,34 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
             Penalized scores, or unmodified scores if presence_penalty is 0.
         """
 
+        penalty = jnp.asarray(self.presence_penalty)
+
         def _apply(x, ids, presence_penalty):
             """Subtract the presence penalty from logits of present tokens."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
-            valid = jnp.arange(ids.shape[1]) < jnp.asarray(cur_len)[..., None]
-            one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
-            presence_mask = jnp.sum(one_hot_presence * valid[..., None], axis=1) > 0
-            penalty_values = jnp.where(presence_mask, presence_penalty, 0.0)
-            x = x - penalty_values
-            return x.astype(org_dtype)
+            presence_mask = _token_counts_from_ids(ids, vocab_size, cur_len) > 0
+            penalty_values = jnp.where(presence_mask, presence_penalty.astype(jnp.float32), 0.0)
+            x_f32 = x.astype(jnp.float32) - penalty_values
+            return x_f32.astype(org_dtype)
 
+        if penalty.ndim == 0:
+            return jax.lax.cond(
+                penalty == 0.0,
+                lambda *x: x[0],
+                _apply,
+                scores,
+                input_ids,
+                penalty,
+            )
+        penalty_col = penalty.reshape(scores.shape[0], 1)
         return jax.lax.cond(
-            self.presence_penalty == 0.0,
+            jnp.all(penalty_col == 0.0),
             lambda *x: x[0],
             _apply,
             scores,
             input_ids,
-            self.presence_penalty,
+            penalty_col,
         )
 
 
@@ -869,24 +960,34 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
             Penalized scores, or unmodified scores if frequency_penalty is 0.
         """
 
+        penalty = jnp.asarray(self.frequency_penalty)
+
         def _apply(x, ids, frequency_penalty):
             """Subtract a count-proportional penalty from each token's logit."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
-            valid = jnp.arange(ids.shape[1]) < jnp.asarray(cur_len)[..., None]
-            one_hot_counts = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
-            token_counts = jnp.sum(one_hot_counts * valid[..., None], axis=1)
-            penalty_values = token_counts * frequency_penalty
-            x = x - penalty_values
-            return x.astype(org_dtype)
+            token_counts = _token_counts_from_ids(ids, vocab_size, cur_len).astype(jnp.float32)
+            penalty_values = token_counts * frequency_penalty.astype(jnp.float32)
+            x_f32 = x.astype(jnp.float32) - penalty_values
+            return x_f32.astype(org_dtype)
 
+        if penalty.ndim == 0:
+            return jax.lax.cond(
+                penalty == 0.0,
+                lambda *x: x[0],
+                _apply,
+                scores,
+                input_ids,
+                penalty,
+            )
+        penalty_col = penalty.reshape(scores.shape[0], 1)
         return jax.lax.cond(
-            self.frequency_penalty == 0.0,
+            jnp.all(penalty_col == 0.0),
             lambda *x: x[0],
             _apply,
             scores,
             input_ids,
-            self.frequency_penalty,
+            penalty_col,
         )
 
 
@@ -931,27 +1032,40 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
             Penalized scores, or unmodified scores if repetition_penalty is 1.0.
         """
 
+        penalty = jnp.asarray(self.repetition_penalty)
+
         def _apply(x, ids, repetition_penalty):
             """Apply CTRL-style multiplicative repetition penalty per token."""
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
-            valid = jnp.arange(ids.shape[1]) < jnp.asarray(cur_len)[..., None]
-            one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
-            presence_mask = jnp.sum(one_hot_presence * valid[..., None], axis=1) > 0
-            positive_penalized_scores = x / repetition_penalty
-            negative_penalized_scores = x * repetition_penalty
-            scores_intermediate = jnp.where(x > 0, positive_penalized_scores, x)
-            penalized_scores = jnp.where(x < 0, negative_penalized_scores, scores_intermediate)
-            x = jnp.where(presence_mask, penalized_scores, x)
-            return x.astype(org_dtype)
+            presence_mask = _token_counts_from_ids(ids, vocab_size, cur_len) > 0
+            rep_f32 = repetition_penalty.astype(jnp.float32)
+            safe_rep = jnp.where(rep_f32 > 0.0, rep_f32, 1.0)
+            x_f32 = x.astype(jnp.float32)
+            positive_penalized_scores = x_f32 / safe_rep
+            negative_penalized_scores = x_f32 * safe_rep
+            scores_intermediate = jnp.where(x_f32 > 0, positive_penalized_scores, x_f32)
+            penalized_scores = jnp.where(x_f32 < 0, negative_penalized_scores, scores_intermediate)
+            out = jnp.where(presence_mask & (rep_f32 > 0.0), penalized_scores, x_f32)
+            return out.astype(org_dtype)
 
+        if penalty.ndim == 0:
+            return jax.lax.cond(
+                (penalty == 1.0) | (penalty <= 0.0),
+                lambda *x: x[0],
+                _apply,
+                scores,
+                input_ids,
+                penalty,
+            )
+        penalty_col = penalty.reshape(scores.shape[0], 1)
         return jax.lax.cond(
-            self.repetition_penalty == 1.0,
+            jnp.all((penalty_col == 1.0) | (penalty_col <= 0.0)),
             lambda *x: x[0],
             _apply,
             scores,
             input_ids,
-            self.repetition_penalty,
+            penalty_col,
         )
 
 
@@ -995,13 +1109,13 @@ class MinPLogitsWarper(LogitsWarper):
         """
         min_p = jnp.asarray(self.min_p)
 
-        def _apply(x):
+        def _apply(x, min_p_thresh):
             """Mask logits whose probability is below ``min_p * max_prob``."""
             batch_size, vocab_size = x.shape
             sorted_logits, sorted_indices = lax.top_k(x, k=vocab_size)
-            sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+            sorted_probs = jax.nn.softmax(sorted_logits.astype(jnp.float32), axis=-1)
             max_prob = sorted_probs[:, 0:1]
-            threshold = min_p * max_prob
+            threshold = min_p_thresh * max_prob
             sorted_indices_to_remove_mask = sorted_probs < threshold
             min_keep_mask = jnp.arange(vocab_size) < self.min_tokens_to_keep
             sorted_indices_to_remove_mask = sorted_indices_to_remove_mask & (~min_keep_mask)
@@ -1009,10 +1123,20 @@ class MinPLogitsWarper(LogitsWarper):
             batch_idx_mesh, _ = jnp.meshgrid(jnp.arange(batch_size), jnp.arange(vocab_size), indexing="ij")
             update_indices = (batch_idx_mesh, sorted_indices)
             indices_to_remove_mask = indices_to_remove_mask.at[update_indices].set(sorted_indices_to_remove_mask)
-            final_scores = jnp.where(indices_to_remove_mask, self.filter_value, x)
+            final_scores = jnp.where(indices_to_remove_mask, jnp.asarray(self.filter_value, dtype=x.dtype), x)
             return final_scores
 
-        return jax.lax.cond((min_p > 0) & (min_p < 1), _apply, lambda x: x, scores)
+        if min_p.ndim == 0:
+            min_p_f32 = min_p.astype(jnp.float32)
+            return jax.lax.cond((min_p_f32 > 0) & (min_p_f32 < 1), lambda x: _apply(x, min_p_f32), lambda x: x, scores)
+        min_p_col = min_p.reshape(scores.shape[0], 1).astype(jnp.float32)
+        active = (min_p_col > 0) & (min_p_col < 1)
+        return jax.lax.cond(
+            jnp.any(active),
+            lambda x: jnp.where(active, _apply(x, min_p_col), x),
+            lambda x: x,
+            scores,
+        )
 
 
 @auto_pytree
@@ -1074,15 +1198,15 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
 
         matches = jnp.all(prefixes == suffix[:, None, :], axis=-1) & usable[None, :]
 
-        # Non-matching rows are steered one past the vocabulary and dropped, so
-        # the scatter stays [batch, vocab + 1] instead of materialising a
-        # [batch, seq_len, vocab] one-hot.
-        targets = jnp.where(matches, completions, vocab_size)
+        # Non-matching and out-of-range/negative completion IDs are steered one past the
+        # vocabulary and dropped (avoiding JAX negative-index wraparound on mode="drop").
+        valid_targets = matches & (completions >= 0) & (completions < vocab_size)
+        targets = jnp.where(valid_targets, completions, vocab_size)
         rows = jnp.broadcast_to(jnp.arange(batch_size)[:, None], targets.shape)
         banned = jnp.zeros((batch_size, vocab_size + 1), dtype=jnp.bool_)
         banned = banned.at[rows, targets].set(True, mode="drop")[:, :vocab_size]
 
-        return jnp.where(banned, -float("Inf"), scores)
+        return jnp.where(banned, jnp.asarray(-float("Inf"), dtype=scores.dtype), scores)
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         """Apply no-repeat n-gram filtering if ``ngram_size`` warrants it.

@@ -43,8 +43,35 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ..utils import stable_json_stream_prefix
 
 logger = get_logger(__name__)
+
+
+def _strip_trailing_partial_marker(text: str, marker: str) -> str:
+    """Withhold any trailing non-empty proper prefix of *marker* from *text*."""
+    max_len = min(len(marker) - 1, len(text))
+    for k in range(max_len, 0, -1):
+        if text.endswith(marker[:k]):
+            return text[:-k]
+    return text
+
+
+def _has_open_marker_or_trailing_prefix(text: str, start_token: str, end_token: str) -> bool:
+    """Return True if *text* has an unclosed outer section or ends with a partial start marker."""
+    pos = 0
+    n = len(text)
+    start_len = len(start_token)
+    end_len = len(end_token)
+    while pos < n:
+        start_idx = text.find(start_token, pos)
+        if start_idx == -1:
+            return ToolParser._has_trailing_marker_prefix(text[pos:], (start_token,))
+        end_idx = text.find(end_token, start_idx + start_len)
+        if end_idx == -1:
+            return True
+        pos = end_idx + end_len
+    return False
 
 
 @ToolParserManager.register_module("deepseek_v31")  # pyright: ignore[reportUntypedClassDecorator]
@@ -104,6 +131,15 @@ class DeepSeekV31ToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] | None = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
+        self._tool_name_sent: list[bool] = []
+        self._tool_call_ids: list[str] = []
+        self._emitted_content_pos: int | None = None
+        self._pending_tail_start: int | None = None
+        self._last_current_text: str = ""
+        self._streaming_initialized: bool = False
+        self._in_open_section: bool = False
+        self._scan_pos: int = 0
+        self._closed_span_count: int = 0
 
         self.tool_calls_start_token: str = "<｜tool▁calls▁begin｜>"
         self.tool_calls_end_token: str = "<｜tool▁calls▁end｜>"
@@ -117,11 +153,11 @@ class DeepSeekV31ToolParser(ToolParser):
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<function_name>.*)<｜tool▁sep｜>(?P<function_arguments>.*)",
+            r"(?P<function_name>.*?)<｜tool▁sep｜>(?P<function_arguments>.*)",
             re.DOTALL,
         )
 
-        self.stream_tool_call_name_regex = re.compile(r"(?P<function_name>.*)<｜tool▁sep｜>", re.DOTALL)
+        self.stream_tool_call_name_regex = re.compile(r"(?P<function_name>.*?)<｜tool▁sep｜>", re.DOTALL)
 
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
@@ -133,6 +169,55 @@ class DeepSeekV31ToolParser(ToolParser):
 
         if self.tool_calls_start_token_id is None or self.tool_calls_end_token_id is None:
             raise RuntimeError("DeepSeek-V3.1 Tool parser could not locate tool call start/end tokens in the tokenizer!")
+        if self.tool_call_start_token_id is None or self.tool_call_end_token_id is None:
+            logger.debug(
+                "DeepSeek-V3.1 Tool parser could not locate per-call start/end token IDs; using string markers."
+            )
+
+    def get_streaming_buffer_marker_pairs(self) -> Sequence[tuple[str, str | None]]:
+        """Scope protocol buffering strictly to outer ``<｜tool▁calls▁begin｜>`` sections."""
+        return ((self.tool_calls_start_token, self.tool_calls_end_token),)
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether an outer tool-calls section or partial start marker is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return self._in_open_section or self._pending_tail_start is not None
+        return _has_open_marker_or_trailing_prefix(
+            current_text,
+            self.tool_calls_start_token,
+            self.tool_calls_end_token,
+        )
+
+    def _reset_streaming_state(self, emitted_pos: int = 0) -> None:
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.current_tool_id = -1
+        self.streamed_args_for_tool = []
+        self._tool_name_sent = []
+        self._tool_call_ids = []
+        self._emitted_content_pos = emitted_pos
+        self._pending_tail_start = None
+        self._last_current_text = ""
+        self._streaming_initialized = False
+        self._in_open_section = False
+        self._scan_pos = 0
+        self._closed_span_count = 0
+
+    def flush_streaming_content(self) -> str | None:
+        """Flush any trailing partial marker prefix withheld at end-of-stream."""
+        flushed: str | None = None
+        if self._pending_tail_start is not None and self._pending_tail_start < len(self._last_current_text):
+            flushed = self._last_current_text[self._pending_tail_start :] or None
+            self._emitted_content_pos = len(self._last_current_text)
+            self._pending_tail_start = None
+        self._last_current_text = ""
+        return flushed
 
     def extract_tool_calls(
         self,
@@ -169,13 +254,34 @@ class DeepSeekV31ToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
         try:
-            function_call_tuples = self.tool_call_regex.findall(model_output)
-
+            sep_token = "<｜tool▁sep｜>"
+            start_len = len(self.tool_call_start_token)
+            sep_len = len(sep_token)
+            end_len = len(self.tool_call_end_token)
             tool_calls: list[ToolCall] = []
-            for function_name, function_args in function_call_tuples:
+            pos = 0
+            n = len(model_output)
+            while pos < n:
+                call_start = model_output.find(self.tool_call_start_token, pos)
+                if call_start == -1:
+                    break
+                body_start = call_start + start_len
+                sep_idx = model_output.find(sep_token, body_start)
+                if sep_idx == -1:
+                    break
+                args_start = sep_idx + sep_len
+                call_end = model_output.find(self.tool_call_end_token, args_start)
+                if call_end == -1:
+                    break
+                function_name = model_output[body_start:sep_idx]
+                function_args = model_output[args_start:call_end]
                 tool_calls.append(
                     ToolCall(type="function", function=FunctionCall(name=function_name, arguments=function_args))
                 )
+                pos = call_end + end_len
+
+            if not tool_calls:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
             content = model_output[: model_output.find(self.tool_calls_start_token)]
             return ExtractedToolCallInformation(
@@ -233,173 +339,149 @@ class DeepSeekV31ToolParser(ToolParser):
         logger.debug("delta_text: %s", delta_text)
         logger.debug("delta_token_ids: %s", delta_token_ids)
 
-        if self.tool_calls_start_token_id not in current_token_ids:
-            logger.debug("No tool call tokens found!")
-            return DeltaMessage(content=delta_text)
+        if not previous_text:
+            self._reset_streaming_state(0)
+        elif self._emitted_content_pos is None:
+            self._reset_streaming_state(len(previous_text))
+        elif self._scan_pos > len(current_text):
+            self._reset_streaming_state(0)
 
-        delta_text = delta_text.replace(self.tool_calls_start_token, "").replace(self.tool_calls_end_token, "")
+        self._streaming_initialized = True
+        self._last_current_text = current_text
+        self._pending_tail_start = None
+        self._in_open_section = False
 
         try:
-            delta: DeltaMessage | None = None
-            prev_tool_start_count = previous_token_ids.count(self.tool_call_start_token_id)
-            prev_tool_end_count = previous_token_ids.count(self.tool_call_end_token_id)
-            cur_tool_start_count = current_token_ids.count(self.tool_call_start_token_id)
-            cur_tool_end_count = current_token_ids.count(self.tool_call_end_token_id)
-            tool_call_portion = None
-            text_portion = None
+            pos = self._scan_pos
+            next_scan_pos = pos
+            next_closed_span_count = self._closed_span_count
+            spans: list[tuple[str, bool]] = []
+            visible_parts: list[tuple[int, int]] = []
+            while pos < len(current_text):
+                sec_start = current_text.find(self.tool_calls_start_token, pos)
+                if sec_start == -1:
+                    tail = current_text[pos:]
+                    safe_tail = _strip_trailing_partial_marker(tail, self.tool_calls_start_token)
+                    safe_end = pos + len(safe_tail)
+                    if safe_tail:
+                        visible_parts.append((pos, safe_end))
+                    if len(safe_tail) < len(tail):
+                        self._pending_tail_start = safe_end
+                    next_scan_pos = safe_end
+                    break
+                if sec_start > pos:
+                    visible_parts.append((pos, sec_start))
+                sec_body_start = sec_start + len(self.tool_calls_start_token)
+                sec_end = current_text.find(self.tool_calls_end_token, sec_body_start)
+                scan_limit = sec_end if sec_end != -1 else len(current_text)
 
-            if (
-                cur_tool_start_count == cur_tool_end_count
-                and prev_tool_end_count == cur_tool_end_count
-                and self.tool_call_end_token not in delta_text
-            ):
-                logger.debug("Generating text content! skipping tool parsing.")
-                return DeltaMessage(content=delta_text)
+                call_pos = sec_body_start
+                sec_span_count = 0
+                while call_pos < scan_limit:
+                    call_start = current_text.find(self.tool_call_start_token, call_pos, scan_limit)
+                    if call_start == -1:
+                        break
+                    body_start = call_start + len(self.tool_call_start_token)
+                    call_end = current_text.find(self.tool_call_end_token, body_start, scan_limit)
+                    if call_end == -1:
+                        spans.append((current_text[body_start:scan_limit], False))
+                        sec_span_count += 1
+                        break
+                    spans.append((current_text[body_start:call_end], True))
+                    sec_span_count += 1
+                    call_pos = call_end + len(self.tool_call_end_token)
 
-            if self.tool_call_end_token in delta_text:
-                logger.debug("tool_call_end_token in delta_text")
-                full_text = current_text + delta_text
-                tool_call_portion = (
-                    full_text.split(self.tool_call_start_token)[-1].split(self.tool_call_end_token)[0].rstrip()
-                )
-                delta_text = delta_text.split(self.tool_call_end_token)[0].rstrip()
-                text_portion = delta_text.split(self.tool_call_end_token)[-1].lstrip()
+                if sec_end == -1:
+                    self._in_open_section = True
+                    next_scan_pos = sec_start
+                    break
+                pos = sec_end + len(self.tool_calls_end_token)
+                next_scan_pos = pos
+                next_closed_span_count += sec_span_count
 
-            if cur_tool_start_count > cur_tool_end_count and cur_tool_start_count > prev_tool_start_count:
-                if len(delta_token_ids) > 1:
-                    tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+            content_chunks: list[str] = []
+            emitted_pos = self._emitted_content_pos or 0
+            for seg_start, seg_end in visible_parts:
+                if seg_end > emitted_pos:
+                    content_chunks.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                    emitted_pos = seg_end
+            self._emitted_content_pos = emitted_pos
+            content_out = "".join(content_chunks)
+
+            if self.prev_tool_call_arr is None:
+                self.prev_tool_call_arr = []
+
+            tool_deltas: list[DeltaToolCall] = []
+            sep_token = "<｜tool▁sep｜>"
+            base_idx = self._closed_span_count
+            for offset, (body, is_closed) in enumerate(spans):
+                idx = base_idx + offset
+                while len(self.prev_tool_call_arr) <= idx:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= idx:
+                    self.streamed_args_for_tool.append("")
+                while len(self._tool_name_sent) <= idx:
+                    self._tool_name_sent.append(False)
+                while len(self._tool_call_ids) <= idx:
+                    self._tool_call_ids.append("")
+
+                if idx > self.current_tool_id:
+                    self.current_tool_id = idx
+                    self.current_tool_name_sent = self._tool_name_sent[idx]
+
+                sep_idx = body.find(sep_token)
+                if sep_idx == -1:
+                    continue
+                func_name = body[:sep_idx]
+                raw_args = body[sep_idx + len(sep_token) :]
+                if not func_name:
+                    continue
+
+                if is_closed:
+                    target_args = raw_args
                 else:
-                    tool_call_portion = None
-                    delta = None
+                    cleaned_args = _strip_trailing_partial_marker(raw_args, self.tool_call_end_token)
+                    target_args = stable_json_stream_prefix(cleaned_args)
 
-                text_portion = None
+                self.prev_tool_call_arr[idx] = {"name": func_name, "arguments": target_args}
 
-                self.current_tool_id += 1
-                self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
-                logger.debug("Starting on a new tool %s", self.current_tool_id)
+                first = not self._tool_name_sent[idx]
+                if first:
+                    self._tool_call_ids[idx] = f"chatcmpl-tool-{uuid4()}"
+                    self._tool_name_sent[idx] = True
+                    if idx == self.current_tool_id:
+                        self.current_tool_name_sent = True
 
-            elif cur_tool_start_count > cur_tool_end_count and cur_tool_start_count == prev_tool_start_count:
-                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
-                text_portion = None
-
-            elif cur_tool_start_count == cur_tool_end_count and cur_tool_end_count >= prev_tool_end_count:
-                if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
-                    logger.debug("attempting to close tool call, but no tool call")
-                    return None
-                diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                streamed = self.streamed_args_for_tool[idx]
+                diff = ""
+                if target_args is not None and target_args.startswith(streamed):
+                    diff = target_args[len(streamed) :]
                 if diff:
-                    if isinstance(diff, str):
-                        diff = diff.encode("utf-8").decode("unicode_escape")
-                    if '"}' not in delta_text:
-                        return None
-                    end_loc = delta_text.rindex('"}')
-                    diff = delta_text[:end_loc] + '"}'
-                    logger.debug("Finishing tool and found diff that had not been streamed yet: %s", diff)
-                    self.streamed_args_for_tool[self.current_tool_id] += diff
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=diff).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
+                    self.streamed_args_for_tool[idx] = streamed + diff
 
-            # Otherwise, regular content tokens (strip tool call tokens if they leaked)
-            else:
-                text = delta_text.replace(self.tool_call_start_token, "")
-                text = text.replace(self.tool_call_end_token, "")
-                return DeltaMessage(tool_calls=[], content=text)
-
-            current_tool_call: dict[str, str] = {}
-            if tool_call_portion:
-                matches = self.stream_tool_call_portion_regex.match(tool_call_portion)
-                if matches:
-                    tool_name, tool_args = matches.groups()
-                    current_tool_call["name"] = tool_name
-                    current_tool_call["arguments"] = tool_args
-                else:
-                    name_matches = self.stream_tool_call_name_regex.match(tool_call_portion)
-                    if name_matches:
-                        (tool_name,) = name_matches.groups()
-                        current_tool_call["name"] = tool_name
-                        current_tool_call["arguments"] = ""
-                    else:
-                        logger.debug("Not enough token")
-                        return None
-
-            if not self.current_tool_name_sent:
-                function_name = current_tool_call.get("name")
-                if function_name:
-                    self.current_tool_name_sent = True
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                type="function",
-                                id=f"chatcmpl-tool-{uuid4()}",
-                                function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                return None
-
-            # If we don't have tool portion yet, pass through any text after tool closure
-            if tool_call_portion is None:
-                return DeltaMessage(content=delta_text) if text_portion is not None else None
-
-            logger.debug("Trying to parse current tool call with ID %s", self.current_tool_id)
-
-            assert self.prev_tool_call_arr is not None
-
-            if len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-
-            prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
-            cur_arguments = current_tool_call.get("arguments")
-
-            if not cur_arguments and not prev_arguments:
-                delta = None
-            elif not cur_arguments and prev_arguments:
-                logger.error("should be impossible to have arguments reset mid-call. skipping streaming anything.")
-                delta = None
-            elif cur_arguments and not prev_arguments:
-                delta = DeltaMessage(
-                    tool_calls=[
+                if first or diff:
+                    tool_deltas.append(
                         DeltaToolCall(
-                            index=self.current_tool_id,
-                            function=DeltaFunctionCall(arguments=cur_arguments).model_dump(exclude_none=True),
+                            index=idx,
+                            id=self._tool_call_ids[idx] if first else None,
+                            type="function" if first else None,
+                            function=DeltaFunctionCall(
+                                name=func_name if first else None,
+                                arguments=diff if diff else None,
+                            ).model_dump(exclude_none=True),
                         )
-                    ]
-                )
-                self.streamed_args_for_tool[self.current_tool_id] = cur_arguments
-            elif cur_arguments and prev_arguments:
-                if (
-                    isinstance(delta_text, str)
-                    and cur_arguments != prev_arguments
-                    and len(cur_arguments) > len(prev_arguments)
-                    and cur_arguments.startswith(prev_arguments)
-                ):
-                    delta_arguments = cur_arguments[len(prev_arguments) :]
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=delta_arguments).model_dump(exclude_none=True),
-                            )
-                        ]
                     )
-                    self.streamed_args_for_tool[self.current_tool_id] = cur_arguments
-                else:
-                    delta = None
 
-            if self.current_tool_id == len(self.prev_tool_call_arr) - 1:
-                self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
-            else:
-                self.prev_tool_call_arr.append(current_tool_call)
+            self._scan_pos = next_scan_pos
+            self._closed_span_count = next_closed_span_count
 
-            return delta
+            if content_out and tool_deltas:
+                return DeltaMessage(content=content_out, tool_calls=tool_deltas)
+            if tool_deltas:
+                return DeltaMessage(tool_calls=tool_deltas)
+            if content_out:
+                return DeltaMessage(content=content_out)
+            return None
 
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")

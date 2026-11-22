@@ -21,11 +21,16 @@ its own distribution and the teacher's sparse top-k distribution.
 
 from __future__ import annotations
 
+import contextlib
 import typing as tp
+from functools import partial
 
 import jax
+import numpy as np
+import spectrax as spx
 from eformer.loggings import get_logger
 from jax import numpy as jnp
+from spectrax import with_sharding_constraint
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -36,6 +41,7 @@ from easydel.utils.helpers import capture_time
 
 from .._shared import drop_optimizer_state
 from ..metrics import _host_mean_float
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -178,13 +184,33 @@ class SparseDistillationTrainer(Trainer):
 
         self.arguments = arguments
 
+        if isinstance(student_model, str):
+            reject_string_model_id(student_model, role="student model")
+        if student_model is None:
+            raise ValueError("`student_model` must be provided for SparseDistillationTrainer.")
+        if isinstance(teacher_model, str):
+            reject_string_model_id(teacher_model, role="teacher model")
+
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
+        if getattr(arguments, "disable_dropout", False):
+            student_model = disable_state_dropout(student_model)
 
-        if teacher_model is not None and not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+        if teacher_model is not None:
+            if not isinstance(teacher_model, EasyDeLState):
+                teacher_model.eval()
+                teacher_model = teacher_model.to_state()
+            teacher_model = disable_state_dropout(teacher_model)
 
-        self.teacher_state = drop_optimizer_state(teacher_model)
+        self.teacher_state = (
+            None
+            if teacher_model is None
+            else self._share_esurge_cache_scope_if_compatible(
+                drop_optimizer_state(teacher_model),
+                primary_state=student_model,
+            )
+        )
+        self._eval_teacher_graphdef = None
         self.teacher_fn = teacher_fn
         self.processing_class = processing_class
 
@@ -201,6 +227,11 @@ class SparseDistillationTrainer(Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+        if self.teacher_state is not None:
+            self.teacher_state = self._share_esurge_cache_scope_if_compatible(
+                self.teacher_state,
+                primary_state=self.model_state,
+            )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
         """Build the lazy prompt-only preprocessing transform for sparse distillation.
@@ -278,6 +309,29 @@ class SparseDistillationTrainer(Trainer):
             max_prompt_length=self.arguments.max_prompt_length,
             pad_token_id=self.padding_value,
         )
+
+    def _configure_eval_config_override(self):
+        """Apply evaluation config overrides to the local frozen teacher as well."""
+        super()._configure_eval_config_override()
+        self._eval_teacher_graphdef = None
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is not None and overrides and self.teacher_state is not None:
+            teacher_graphstate = self.teacher_state.graphstate
+            if hasattr(teacher_graphstate, "items"):
+                selected_keys = {(collection, path) for collection, path, _ in teacher_graphstate.items()}
+
+                def teacher_selector(v, path):
+                    return (v.kind, path) in selected_keys
+            else:
+                teacher_selector = None
+            self._eval_teacher_graphdef = self._build_config_override_graphdef(
+                model=self.teacher_state.model,
+                overrides=overrides,
+                reference_graphstate=teacher_graphstate,
+                trainable_selector=teacher_selector,
+                label="eval_config_overrides (teacher)",
+                eval_mode=True,
+            )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Compile the sparse-distillation training and evaluation step functions.
@@ -360,7 +414,7 @@ class SparseDistillationTrainer(Trainer):
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             sparse_distillation_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
             mesh=self.model.mesh,
@@ -369,9 +423,88 @@ class SparseDistillationTrainer(Trainer):
         )
         self._runtime_trace("eval.compile_wrapper.end")
 
+        self._compute_teacher_topk_train = None
+        self._compute_teacher_topk_eval = None
         if self.teacher_state is not None:
+            top_k_teacher = int(self.arguments.top_k_teacher)
+            teacher_mesh = self.teacher_state.model.mesh
+            teacher_empty_sharding = replicated_named_sharding(teacher_mesh)
+
+            def _score_teacher_topk(
+                graphtree: spx.State,
+                graphother: spx.State,
+                input_ids: jax.Array,
+                attention_mask: jax.Array,
+                graphdef: spx.GraphDef,
+            ) -> tuple[jax.Array, jax.Array]:
+                graphother = jax.tree_util.tree_map(
+                    lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                    graphother,
+                )
+                teacher_module = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
+                with teacher_module.mesh:
+                    input_ids = with_sharding_constraint(
+                        input_ids,
+                        self.arguments.step_partition_spec,
+                        mesh=teacher_module.mesh,
+                        ignore_mpmd=True,
+                    )
+                    attention_mask = with_sharding_constraint(
+                        attention_mask,
+                        self.arguments.step_partition_spec,
+                        mesh=teacher_module.mesh,
+                        ignore_mpmd=True,
+                    )
+                    teacher_kwargs: dict[str, tp.Any] = {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                    }
+                    teacher_kwargs = filter_kwargs_for_callable(
+                        getattr(teacher_module, "forward", teacher_module),
+                        teacher_kwargs,
+                    )
+                    teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
+                    teacher_outputs = teacher_module(**teacher_kwargs)
+                    teacher_log_probs = jax.nn.log_softmax(
+                        teacher_outputs.logits.astype(jnp.float32),
+                        axis=-1,
+                    )
+                    top_k_logprobs, top_k_indices = jax.lax.top_k(teacher_log_probs, top_k_teacher)
+                    return top_k_indices, top_k_logprobs
+
+            self._compute_teacher_topk_train = compile_trainer_step(
+                partial(_score_teacher_topk, graphdef=self.teacher_state.graphdef),
+                mesh=teacher_mesh,
+                static_argnames=("graphdef",),
+                in_shardings=(
+                    self.teacher_state.shardings.graphstate,
+                    self.teacher_state.shardings.graphother,
+                    teacher_empty_sharding,
+                    teacher_empty_sharding,
+                ),
+                out_shardings=(teacher_empty_sharding, teacher_empty_sharding),
+            )
+            eval_teacher_graphdef = getattr(self, "_eval_teacher_graphdef", None)
+            self._compute_teacher_topk_eval = (
+                compile_trainer_step(
+                    partial(_score_teacher_topk, graphdef=eval_teacher_graphdef),
+                    mesh=teacher_mesh,
+                    static_argnames=("graphdef",),
+                    in_shardings=(
+                        self.teacher_state.shardings.graphstate,
+                        self.teacher_state.shardings.graphother,
+                        teacher_empty_sharding,
+                        teacher_empty_sharding,
+                    ),
+                    out_shardings=(teacher_empty_sharding, teacher_empty_sharding),
+                )
+                if eval_teacher_graphdef is not None
+                else self._compute_teacher_topk_train
+            )
+
             flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=False)
             self._extra_forward_flops_per_token = flops_per_tkn
+            self._extra_backward_flops_per_token = 0.0
 
         self.arguments.ensure_checkpoint_path()
         return TrainerConfigureFunctionOutput(
@@ -436,6 +569,8 @@ class SparseDistillationTrainer(Trainer):
             generation_time = generation_time_fn()
 
             completion_mask = self._make_attn_mask(completion_ids)
+            if results.completion_mask is not None:
+                completion_mask = completion_mask * results.completion_mask.astype(completion_mask.dtype)
 
             # Handle generation factor (num_generations_per_prompt > 1)
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
@@ -453,7 +588,7 @@ class SparseDistillationTrainer(Trainer):
             with capture_time() as scoring_time_fn:
                 if self.teacher_fn is not None:
                     prompt_texts = self.processing_class.batch_decode(
-                        expanded_prompt_ids,
+                        np.asarray(jax.device_get(expanded_prompt_ids)),
                         skip_special_tokens=True,
                     )
                     top_k_indices, top_k_logprobs = self.teacher_fn(
@@ -464,23 +599,40 @@ class SparseDistillationTrainer(Trainer):
                     top_k_indices = jnp.asarray(top_k_indices)
                     top_k_logprobs = jnp.asarray(top_k_logprobs)
                 else:
-                    teacher_kwargs: dict[str, tp.Any] = {
-                        "input_ids": input_ids_full,
-                        "attention_mask": attention_mask_full,
-                    }
-                    teacher_kwargs = filter_kwargs_for_callable(
-                        self.teacher_state.model.forward,
-                        teacher_kwargs,
+                    scorer = getattr(
+                        self,
+                        "_compute_teacher_topk_train" if is_train else "_compute_teacher_topk_eval",
+                        None,
                     )
-                    teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
-                    teacher_outputs = self.teacher_state.model(**teacher_kwargs)
+                    if scorer is not None:
+                        top_k_indices, top_k_logprobs = scorer(
+                            self.teacher_state.graphstate,
+                            self.teacher_state.graphother,
+                            input_ids_full,
+                            attention_mask_full,
+                        )
+                    else:
+                        teacher_model = self.teacher_state.model
+                        teacher_mesh = getattr(teacher_model, "mesh", None)
+                        mesh_ctx = teacher_mesh if teacher_mesh is not None else contextlib.nullcontext()
+                        with mesh_ctx:
+                            teacher_kwargs: dict[str, tp.Any] = {
+                                "input_ids": input_ids_full,
+                                "attention_mask": attention_mask_full,
+                            }
+                            teacher_kwargs = filter_kwargs_for_callable(
+                                getattr(teacher_model, "forward", teacher_model),
+                                teacher_kwargs,
+                            )
+                            teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
+                            teacher_outputs = teacher_model(**teacher_kwargs)
 
-                    k = self.arguments.top_k_teacher
-                    teacher_log_probs = jax.nn.log_softmax(
-                        teacher_outputs.logits.astype(jnp.float32),
-                        axis=-1,
-                    )
-                    top_k_logprobs, top_k_indices = jax.lax.top_k(teacher_log_probs, k)  # both [B, L, K]
+                            k = self.arguments.top_k_teacher
+                            teacher_log_probs = jax.nn.log_softmax(
+                                teacher_outputs.logits.astype(jnp.float32),
+                                axis=-1,
+                            )
+                            top_k_logprobs, top_k_indices = jax.lax.top_k(teacher_log_probs, k)  # both [B, L, K]
             scoring_time = scoring_time_fn()
 
             # Gather to replicated sharding
@@ -499,15 +651,16 @@ class SparseDistillationTrainer(Trainer):
             "scoring_time": scoring_time,
             "preprocessing_time": preprocessing_time,
         }
-        self._log_training_generations_to_wandb(
-            state=state,
-            prompts=expanded_prompt_ids,
-            prompt_mask=expanded_prompt_mask,
-            completion_ids=completion_ids,
-            completion_mask=completion_mask,
-            generation_time=generation_time,
-            source="student",
-        )
+        if is_train:
+            self._log_training_generations_to_wandb(
+                state=state,
+                prompts=expanded_prompt_ids,
+                prompt_mask=expanded_prompt_mask,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                generation_time=generation_time,
+                source="student",
+            )
 
         return (
             {

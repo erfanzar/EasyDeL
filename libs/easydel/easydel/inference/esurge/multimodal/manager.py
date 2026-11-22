@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import weakref
 from collections.abc import Mapping
 from typing import Any
 
@@ -105,6 +106,39 @@ _PILLOW_INSTALL_MESSAGE = (
     "Pillow is required for eSurge multimodal image processing. "
     "Install it with `pip install easydel[mm]` or `pip install pillow`."
 )
+
+
+class _ModelMetadataView:
+    """Lightweight config/capability snapshot extracted from a model without pinning weights."""
+
+    __slots__ = ("config", "esurge_flat_patch_inputs", "supports_flat_patch_inputs")
+
+    def __init__(
+        self,
+        *,
+        config: Any | None = None,
+        esurge_flat_patch_inputs: bool | None = None,
+        supports_flat_patch_inputs: bool | None = None,
+    ) -> None:
+        self.config = config
+        self.esurge_flat_patch_inputs = esurge_flat_patch_inputs
+        self.supports_flat_patch_inputs = supports_flat_patch_inputs
+
+
+def _extract_model_metadata(model: Any | None) -> _ModelMetadataView | None:
+    """Extract only lightweight config and flat-patch flags without retaining model weights."""
+    if model is None:
+        return None
+    if isinstance(model, _ModelMetadataView):
+        return model
+    config = getattr(model, "config", None)
+    esurge_flat = getattr(model, "esurge_flat_patch_inputs", None)
+    supports_flat = getattr(model, "supports_flat_patch_inputs", None)
+    return _ModelMetadataView(
+        config=config,
+        esurge_flat_patch_inputs=esurge_flat if isinstance(esurge_flat, bool) else None,
+        supports_flat_patch_inputs=supports_flat if isinstance(supports_flat, bool) else None,
+    )
 
 
 def _require_pillow() -> Any:
@@ -200,9 +234,56 @@ class MultiModalManager:
             ... )
         """
         self.processor = processor
-        self.model = model
+        self._model_ref: weakref.ReferenceType[Any] | None = None
+        self._model_metadata: _ModelMetadataView | None = None
+        self.set_model(model)
         self.resolution_buckets = resolution_buckets or DEFAULT_RESOLUTION_BUCKETS
         self.cache = VisionEncoderCache(cache_capacity_mb) if enable_cache else None
+
+    @property
+    def model(self) -> Any | None:
+        """Return the live model (via weakref) or its lightweight metadata view without pinning weights."""
+        ref = getattr(self, "_model_ref", None)
+        if ref is not None:
+            live = ref()
+            if live is not None:
+                return live
+        return getattr(self, "_model_metadata", None)
+
+    @model.setter
+    def model(self, value: Any | None) -> None:
+        self.set_model(value)
+
+    def set_model(self, model: Any | None) -> None:
+        """Refresh lightweight config/capability metadata from ``model`` without holding a strong reference."""
+        self._model_metadata = _extract_model_metadata(model)
+        if model is None or isinstance(model, _ModelMetadataView):
+            self._model_ref = None
+            return
+        try:
+            self._model_ref = weakref.ref(model)
+        except TypeError:
+            self._model_ref = None
+
+    def _get_model_view(self) -> Any | None:
+        """Return live weakref target, extracted metadata, or fallback duck-typed ``.model``."""
+        ref = getattr(self, "_model_ref", None)
+        if ref is not None:
+            live = ref()
+            if live is not None:
+                return live
+        meta = getattr(self, "_model_metadata", None)
+        if meta is not None:
+            return meta
+        if isinstance(self, MultiModalManager):
+            return None
+        return getattr(self, "model", None)
+
+    def close(self) -> None:
+        """Release model metadata, cached vision outputs, and processor references."""
+        self.set_model(None)
+        self.clear_cache()
+        self.processor = None
 
     def resize_to_bucket(self, image: Any) -> Any:
         """Resize image to nearest resolution bucket.
@@ -503,10 +584,19 @@ class MultiModalManager:
                     text = item.get("text", "")
                     if isinstance(text, str) and text:
                         parts.append(text)
-                elif item_type in ("image", "image_url") or "image" in item or "image_url" in item:
+                elif item_type in ("image", "image_url", "input_image") or "image" in item or "image_url" in item:
+                    # Skip placeholder when caller explicitly passed None (matching extract_media_from_messages).
+                    if (
+                        ("image" in item or "image_url" in item)
+                        and item.get("image") is None
+                        and item.get("image_url") is None
+                    ):
+                        continue
                     if image_placeholder is not None:
                         parts.append(image_placeholder)
-                elif item_type == "video" or "video" in item:
+                elif item_type in ("video", "input_video") or "video" in item:
+                    if "video" in item and item.get("video") is None and item.get("video_url") is None:
+                        continue
                     if video_placeholder is not None:
                         parts.append(video_placeholder)
 
@@ -528,9 +618,10 @@ class MultiModalManager:
         Returns:
             Any | None: Vision config object if available, None otherwise.
         """
-        if self.model is None:
+        model_view = MultiModalManager._get_model_view(self)
+        if model_view is None:
             return None
-        cfg = getattr(self.model, "config", None)
+        cfg = getattr(model_view, "config", None)
         if cfg is None:
             return None
         if hasattr(cfg, "get_vision_config"):
@@ -579,11 +670,12 @@ class MultiModalManager:
         Returns:
             bool: True if the model expects flat-patch inputs, False otherwise.
         """
-        if self.model is None:
+        model_view = MultiModalManager._get_model_view(self)
+        if model_view is None:
             return False
-        config = getattr(self.model, "config", None)
+        config = getattr(model_view, "config", None)
         for attribute in ("esurge_flat_patch_inputs", "supports_flat_patch_inputs"):
-            for owner in (self.model, config):
+            for owner in (model_view, config):
                 declared = getattr(owner, attribute, None)
                 if isinstance(declared, bool):
                     return declared
@@ -1181,6 +1273,11 @@ class MultiModalManager:
         videos: list[np.ndarray] | None = None,
         image_grid_thw: np.ndarray | None = None,
         video_grid_thw: np.ndarray | None = None,
+        *,
+        tools: list[dict] | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        add_generation_prompt: bool = True,
     ) -> list[int]:
         """Tokenize multimodal messages with placeholder insertion.
 
@@ -1206,6 +1303,13 @@ class MultiModalManager:
             video_grid_thw (np.ndarray | None): Pre-computed grid shapes for
                 videos, used to determine placeholder counts. Shape [N, 3].
                 Defaults to None.
+            tools (list[dict] | None): Optional tool definitions forwarded to
+                chat template rendering.
+            chat_template (str | None): Optional custom Jinja2 chat template.
+            chat_template_kwargs (dict[str, Any] | None): Optional extra kwargs
+                forwarded to chat template rendering (e.g. ``enable_thinking``).
+            add_generation_prompt (bool): Whether to append the generation
+                prompt marker. Defaults to True.
 
         Returns:
             list[int]: List of token IDs with image/video placeholders
@@ -1225,13 +1329,16 @@ class MultiModalManager:
             ...     image_grid_thw=grid_thw
             ... )
         """
+        from ..engine.chat_templating import format_chat_prompt
+
         if images is None and videos is None:
             images, videos = self.extract_media_from_messages(messages)
 
         text_tokenizer = self._get_text_tokenizer()
         messages_for_template = messages
-        if self.model is not None:
-            cfg_for_template = getattr(self.model, "config", None)
+        model_view = MultiModalManager._get_model_view(self)
+        if model_view is not None:
+            cfg_for_template = getattr(model_view, "config", None)
             if cfg_for_template is not None:
                 messages_for_template = self._normalize_messages_for_chat_template(
                     messages_for_template,
@@ -1239,16 +1346,39 @@ class MultiModalManager:
                     text_tokenizer,
                 )
 
+        def _render_template_text() -> str:
+            if tools is not None or chat_template is not None or chat_template_kwargs:
+                return format_chat_prompt(
+                    text_tokenizer,
+                    messages_for_template,
+                    add_generation_prompt=add_generation_prompt,
+                    chat_template=chat_template,
+                    tools=tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+            try:
+                return format_chat_prompt(
+                    text_tokenizer,
+                    messages_for_template,
+                    add_generation_prompt=add_generation_prompt,
+                )
+            except TypeError:
+                return text_tokenizer.apply_chat_template(
+                    messages_for_template,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                )
+
         # Flat-patch VLMs (GLM/Qwen) must keep placeholder counts consistent with
         # the already-processed grid_thw/pixel_values; using an HF processor here
         # can re-run image resizing and drift the placeholder expansion.
         force_grid_fallback = (
-            self.model is not None
+            model_view is not None
             and self._supports_flat_patch_inputs()
             and (image_grid_thw is not None or video_grid_thw is not None)
         )
         if force_grid_fallback:
-            cfg = getattr(self.model, "config", None)
+            cfg = getattr(model_view, "config", None)
             if cfg is None:
                 raise ValueError("Tokenizer-only multimodal fallback requires model.config.")
         else:
@@ -1257,12 +1387,27 @@ class MultiModalManager:
         # Fast-path: HF processors that support multimodal tokenization.
         if cfg is None:
             try:
-                text = text_tokenizer.apply_chat_template(
-                    messages_for_template, tokenize=False, add_generation_prompt=True
-                )
+                text = _render_template_text()
+                processor_images = None
+                if images:
+                    # Apply the same resolution bucketing used by _preprocess_images so
+                    # dynamic-resolution/tiling VLMs emit matching placeholder counts.
+                    resize_buckets = self._get_resize_buckets_for_model()
+                    if resize_buckets:
+                        processor_images = [
+                            self._resize_to_buckets(
+                                img.convert("RGB") if hasattr(img, "convert") else img,
+                                resize_buckets,
+                            )
+                            if hasattr(img, "size")
+                            else img
+                            for img in images
+                        ]
+                    else:
+                        processor_images = images
                 inputs = self.processor(
                     text=text,
-                    images=images if images else None,
+                    images=processor_images,
                     videos=videos if videos else None,
                     return_tensors="np",
                     padding=False,
@@ -1275,14 +1420,14 @@ class MultiModalManager:
 
         # Fallback: tokenize with a tokenizer-only processing class and expand
         # placeholder runs based on computed grids.
-        if self.model is None:
+        if model_view is None:
             raise ValueError("Tokenizer-only multimodal fallback requires `model` to be provided.")
 
-        cfg = cfg or getattr(self.model, "config", None)
+        cfg = cfg or getattr(model_view, "config", None)
         if cfg is None:
             raise ValueError("Tokenizer-only multimodal fallback requires model.config.")
 
-        prompt = text_tokenizer.apply_chat_template(messages_for_template, tokenize=False, add_generation_prompt=True)
+        prompt = _render_template_text()
         encoded = text_tokenizer(prompt, add_special_tokens=False, return_attention_mask=False)
         ids = encoded.get("input_ids", [])
         if ids and isinstance(ids[0], list):
@@ -1453,16 +1598,32 @@ class MultiModalManager:
             for s in sizes[:-1]:
                 patch_offsets.append(patch_offsets[-1] + int(s))
 
+        if (
+            patch_offsets is None
+            and num_images > 1
+            and (pixel_values.ndim == 0 or (pixel_values.shape[0] != num_images and pixel_values.shape[0] % num_images != 0))
+        ):
+            return [
+                MultiModalFeature.from_image(
+                    pixel_values=pixel_values,
+                    grid_thw=image_grid_thw,
+                    request_idx=request_idx,
+                )
+            ]
+
         for i in range(num_images):
             if patch_offsets is not None:
                 assert image_grid_thw is not None
                 size = int(np.asarray(image_grid_thw[i]).prod())
                 start = int(patch_offsets[i])
                 single_pv = pixel_values[start : start + size]
-            elif pixel_values.ndim > 3:
+            elif num_images == 1:
+                single_pv = pixel_values
+            elif pixel_values.shape[0] == num_images:
                 single_pv = pixel_values[i : i + 1]
             else:
-                single_pv = pixel_values
+                chunk = pixel_values.shape[0] // num_images
+                single_pv = pixel_values[i * chunk : (i + 1) * chunk]
 
             single_grid = None
             if image_grid_thw is not None and i < len(image_grid_thw):
@@ -1535,16 +1696,35 @@ class MultiModalManager:
             for s in sizes[:-1]:
                 patch_offsets.append(patch_offsets[-1] + int(s))
 
+        if (
+            patch_offsets is None
+            and num_videos > 1
+            and (
+                pixel_values_videos.ndim == 0
+                or (pixel_values_videos.shape[0] != num_videos and pixel_values_videos.shape[0] % num_videos != 0)
+            )
+        ):
+            return [
+                MultiModalFeature.from_video(
+                    pixel_values=pixel_values_videos,
+                    grid_thw=video_grid_thw,
+                    request_idx=request_idx,
+                )
+            ]
+
         for i in range(num_videos):
             if patch_offsets is not None:
                 assert video_grid_thw is not None
                 size = int(np.asarray(video_grid_thw[i]).prod())
                 start = int(patch_offsets[i])
                 single_pv = pixel_values_videos[start : start + size]
-            elif pixel_values_videos.ndim > 4:
+            elif num_videos == 1:
+                single_pv = pixel_values_videos
+            elif pixel_values_videos.shape[0] == num_videos:
                 single_pv = pixel_values_videos[i : i + 1]
             else:
-                single_pv = pixel_values_videos
+                chunk = pixel_values_videos.shape[0] // num_videos
+                single_pv = pixel_values_videos[i * chunk : (i + 1) * chunk]
 
             single_grid = None
             if video_grid_thw is not None and i < len(video_grid_thw):

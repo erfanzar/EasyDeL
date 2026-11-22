@@ -270,7 +270,7 @@ class SequenceBuffer:
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
-        self.vocab_size = vocab_size
+        self.vocab_size = int(vocab_size)
 
         # Initialize all NumPy arrays (CPU-side)
         self.token_ids = np.zeros((max_num_reqs, max_model_len), dtype=np.int32)
@@ -647,6 +647,10 @@ class SequenceBuffer:
             lo: Start of the range (inclusive).
             hi: End of the range (exclusive).
         """
+        lo = max(0, int(lo))
+        hi = min(int(hi), len(self._req_ids))
+        if lo >= hi:
+            return
         write = lo
         vacated_sources: list[int] = []
         for read in range(lo, hi):
@@ -661,6 +665,17 @@ class SequenceBuffer:
             if row >= write:
                 self.token_ids[row] = 0
         if write < hi:
+            self._update_request_distribution()
+
+    def trim_trailing_empty_slots(self) -> None:
+        """Drop trailing empty (None) slots from the materialized slot lists."""
+        trimmed = False
+        while self._req_ids and self._req_ids[-1] is None:
+            self._req_ids.pop()
+            if self.req_output_token_ids:
+                self.req_output_token_ids.pop()
+            trimmed = True
+        if trimmed:
             self._update_request_distribution()
 
     def swap_states(self, i1: int, i2: int) -> None:
@@ -896,7 +911,7 @@ class SequenceBuffer:
             self.top_k[req_index] = 0
 
         self.min_p[req_index] = sampling_params.min_p
-        if sampling_params.min_p > 1e-5:
+        if sampling_params.min_p > 0.0:
             self.min_p_reqs.add(req_id)
 
         if sampling_params.frequency_penalty != 0.0:

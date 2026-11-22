@@ -12,40 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ray-based distributed trainer implementation for EasyDeL.
+"""Lightweight launcher wrapper for scaling and running EasyDeL trainers.
 
-This module provides a distributed training implementation using Ray for scaling
-language model training across multiple GPUs and nodes. It integrates Ray's
-distributed computing capabilities with EasyDeL's training infrastructure to
-enable efficient large-scale model training.
+This module defines :class:`RayDistributedConfig` and
+:class:`RayDistributedTrainer`, a thin pre-training orchestration layer that
+can be called from Ray worker entrypoints or standalone distributed jobs.
 
-The module includes:
-- RayDistributedTrainer: Main class for distributed training with Ray
-- Integration with Ray Train for distributed data loading and gradient synchronization
-- Support for both data and model parallelism strategies
-- Automatic resource management and fault tolerance
-- Checkpointing and recovery mechanisms for long-running training jobs
+What this module owns:
+- Resolving the EasyDeL model class from ``model_type`` / ``model_task`` or an
+  explicit ``model_class``
+- Scaling model configuration widths by ``scaling_index`` via
+  ``config_scaling_variables`` merged with fixed ``config_variables``
+- Persisting and reloading launcher configurations as JSON
+  (``save_config`` / ``from_config``)
+- Initializing fresh models on an ``offload_backend`` device or loading an
+  explicit checkpoint from ``bucket_path``
+- Instantiating the configured EasyDeL ``trainer_module`` (``Trainer``,
+  ``SFTTrainer``, ``DPOTrainer``, ``RewardTrainer``, ``EmbeddingTrainer``,
+  ``PRMTrainer``, etc.) by matching its constructor signature
 
-Key Components:
-- Automatic distribution of training data across workers
-- Gradient synchronization using Ray's collective communication
-- Dynamic resource allocation and load balancing
-- Integration with Ray Tune for hyperparameter optimization
-- Support for heterogeneous hardware configurations
-
-The trainer abstracts away the complexity of distributed training, allowing users
-to scale from single GPU to multi-node clusters with minimal code changes.
+All training loop execution, SPMD/MPMD sharding, gradient synchronization,
+data loading, and checkpoint resumption remain the responsibility of the inner
+EasyDeL trainer.
 """
 
 from __future__ import annotations
 
 import copy
+import dataclasses
+import inspect
 import json
 import os
 import typing as tp
 from functools import cached_property
 
 import jax
+import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
 from eformer.mpric import DTYPE_TO_STRING_MAP, STRING_TO_DTYPE_MAP
@@ -72,20 +74,108 @@ if tp.TYPE_CHECKING:
 logger = get_logger("RayTrainer")
 
 
+_SHARDING_TUPLE_KEYS = (
+    "sharding_axis_names",
+    "sharding_axis_dims",
+    "sharding_dcn_axis_dims",
+)
+
+
+def _dtype_to_string(value: tp.Any) -> str | None:
+    """Convert a supported JAX/NumPy dtype or scalar type to its canonical string."""
+    try:
+        if value in DTYPE_TO_STRING_MAP:
+            return DTYPE_TO_STRING_MAP[value]
+    except TypeError:
+        pass
+    if isinstance(value, (np.dtype, jnp.dtype)):
+        dtype_type = getattr(value, "type", None)
+        if dtype_type in DTYPE_TO_STRING_MAP:
+            return DTYPE_TO_STRING_MAP[dtype_type]
+        if value.name in STRING_TO_DTYPE_MAP:
+            return value.name
+    return None
+
+
+def _serialize_precision(value: tp.Any) -> tp.Any:
+    """Encode ``lax.Precision`` (or a 2-tuple of precisions) as JSON-safe strings."""
+    if isinstance(value, lax.Precision):
+        return value.name
+    if isinstance(value, (tuple, list)) and len(value) == 2 and any(isinstance(v, lax.Precision) for v in value):
+        return [v.name if isinstance(v, lax.Precision) else v for v in value]
+    return value
+
+
+def _deserialize_precision(value: tp.Any) -> tp.Any:
+    """Restore ``lax.Precision`` (or a 2-tuple of precisions) from JSON primitives."""
+    if isinstance(value, lax.Precision):
+        return value
+    if isinstance(value, str):
+        upper = value.upper()
+        if upper in lax.Precision.__members__:
+            return lax.Precision[upper]
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            return lax.Precision(value)
+        except ValueError:
+            return value
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return tuple(_deserialize_precision(item) for item in value)
+    return value
+
+
+def _resolve_trainer_init_params(trainer_module: tp.Any) -> tuple[dict[str, inspect.Parameter], bool]:
+    """Inspect ``trainer_module`` constructor parameters across its MRO."""
+    params: dict[str, inspect.Parameter] = {}
+    accepts_var_kw = False
+    if inspect.isclass(trainer_module):
+        for cls in trainer_module.__mro__:
+            if cls is object:
+                break
+            init_fn = cls.__dict__.get("__init__")
+            if init_fn is None:
+                continue
+            sig = inspect.signature(init_fn)
+            has_var_kw = False
+            for name, param in sig.parameters.items():
+                if name == "self":
+                    continue
+                if param.kind == inspect.Parameter.VAR_KEYWORD:
+                    has_var_kw = True
+                    continue
+                if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                    continue
+                params.setdefault(name, param)
+            accepts_var_kw = has_var_kw
+            if not has_var_kw:
+                break
+    else:
+        sig = inspect.signature(trainer_module)
+        for name, param in sig.parameters.items():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                accepts_var_kw = True
+            elif param.kind != inspect.Parameter.VAR_POSITIONAL:
+                params[name] = param
+    return params, accepts_var_kw
+
+
 @Registry.register("trainer-arguments", "ray_dist")
 class RayDistributedConfig(BaseModel):
     """JSON-persistable configuration payload for :class:`RayDistributedTrainer`.
 
     Captures the minimum identifying state of a Ray-orchestrated trainer (model
-    identity, scaling variables, fixed runtime knobs) so that a checkpoint of
-    the trainer object itself can be round-tripped through disk. Two preprocess
-    hooks (:meth:`_saving_preprocess` and :meth:`_loading_postprocess`) bridge
-    the JAX-native runtime types (JAX dtypes, :class:`PartitionAxis`) to and
-    from the JSON-safe primitives that Pydantic can serialise natively.
+    identity, optional checkpoint ``bucket_path``, scaling variables, fixed
+    runtime knobs) so that a launcher configuration can be round-tripped
+    through disk. Two preprocess hooks (:meth:`_saving_preprocess` and
+    :meth:`_loading_postprocess`) bridge the JAX-native runtime types (JAX
+    dtypes, :class:`PartitionAxis`, :class:`lax.Precision`, sharding tuples) to
+    and from the JSON-safe primitives that Pydantic can serialise natively.
 
     Attributes:
         pretrained_model_name_or_path (str): Path or identifier for the
             pretrained model.
+        bucket_path (str | None): Optional checkpoint directory / bucket path.
         model_task (TaskType | None): Task type for the model (for example
             ``CAUSAL_LM``, ``SEQ2SEQ``).
         model_type (str | None): Model architecture type (for example
@@ -98,13 +188,14 @@ class RayDistributedConfig(BaseModel):
             variables (for example ``dtype``, ``precision``).
 
     Note:
-        JAX dtype fields are converted to/from strings for JSON serialization,
-        and :class:`PartitionAxis` objects are converted to/from a dictionary
-        representation. Use :meth:`_saving_preprocess` before saving and
-        :meth:`_loading_postprocess` after loading.
+        JAX dtype fields, :class:`lax.Precision` values, sharding tuples, and
+        :class:`PartitionAxis` objects are converted to/from JSON-safe
+        representations via :meth:`_saving_preprocess` and
+        :meth:`_loading_postprocess` without mutating caller-owned dictionaries.
     """
 
     pretrained_model_name_or_path: str
+    bucket_path: str | None = None
     model_task: TaskType | None = None
     model_type: str | None = None
     offload_backend: str | None = None
@@ -112,73 +203,83 @@ class RayDistributedConfig(BaseModel):
     config_variables: dict[str, tp.Any] | None = None
 
     def _saving_preprocess(self):
-        """Replace non-JSON-friendly values in the config dicts with string surrogates.
+        """Replace non-JSON-friendly values in copies of the config dicts.
 
-        Pydantic dumps ``RayDistributedConfig`` to JSON, but two of the
-        nested values are not naturally JSON-encodable:
+        Works on deep copies of ``config_variables`` and
+        ``config_scaling_variables`` so caller-owned dictionaries are never
+        mutated in-place. Converts:
 
-        * **JAX dtypes** stored in ``config_variables`` /
-          ``config_scaling_variables``. Each occurrence is replaced with
-          its canonical string representation from
-          ``DTYPE_TO_STRING_MAP`` (e.g. ``jnp.bfloat16`` becomes
-          ``"bfloat16"``). The reverse mapping happens in
-          :meth:`_loading_postprocess`.
-        * **PartitionAxis** under
-          ``config_variables["partition_axis"]``. The dataclass instance
-          is converted to its ``__dict__`` so Pydantic can serialise the
-          plain field-name -> axis mapping.
-
-        The mutation is in-place so subsequent calls to
-        ``model_dump_json`` see the JSON-safe payload. Symmetrically
-        :meth:`_loading_postprocess` must be invoked after deserialising
-        to restore live objects.
+        * **JAX dtypes** into canonical string names via ``DTYPE_TO_STRING_MAP``;
+        * **PartitionAxis** (a ``slots=True`` dataclass) via
+          :func:`dataclasses.asdict`;
+        * **lax.Precision** values into canonical enum names (e.g. ``"DEFAULT"``).
         """
-        if self.config_variables:
-            for k, v in list(self.config_variables.items()):
-                if v in STRING_TO_DTYPE_MAP.values():
-                    self.config_variables[k] = DTYPE_TO_STRING_MAP[v]
-            if "partition_axis" in self.config_variables and isinstance(
-                self.config_variables["partition_axis"], PartitionAxis
-            ):
-                self.config_variables["partition_axis"] = self.config_variables["partition_axis"].__dict__
+        if self.config_variables is not None:
+            variables = copy.deepcopy(self.config_variables)
+            for k, v in list(variables.items()):
+                dtype_str = _dtype_to_string(v)
+                if dtype_str is not None:
+                    variables[k] = dtype_str
+                elif isinstance(v, PartitionAxis):
+                    variables[k] = dataclasses.asdict(v)
+                elif k == "precision" or isinstance(v, lax.Precision):
+                    variables[k] = _serialize_precision(v)
+                elif isinstance(v, EasyDeLGradientCheckPointers):
+                    variables[k] = v.value
+            self.config_variables = variables
 
-        if self.config_scaling_variables:
-            for k, v in list(self.config_scaling_variables.items()):
-                if v in STRING_TO_DTYPE_MAP.values():
-                    self.config_scaling_variables[k] = DTYPE_TO_STRING_MAP[v]
+        if self.config_scaling_variables is not None:
+            scaling = copy.deepcopy(self.config_scaling_variables)
+            for k, v in list(scaling.items()):
+                dtype_str = _dtype_to_string(v)
+                if dtype_str is not None:
+                    scaling[k] = dtype_str
+            self.config_scaling_variables = scaling
 
     def _loading_postprocess(self):
         """Reverse :meth:`_saving_preprocess` after JSON deserialisation.
 
-        After parsing the on-disk JSON Pydantic returns plain Python
-        primitives (strings for dtypes, dicts for ``PartitionAxis``).
-        This hook converts them back into the live runtime values that
-        :class:`RayDistributedTrainer` expects:
+        Converts deserialized JSON primitives back into live runtime values:
 
         * dtype strings in ``config_variables`` / ``config_scaling_variables``
           are reverse-looked-up through ``STRING_TO_DTYPE_MAP``;
-        * ``config_variables["partition_axis"]`` -- if it is still a
-          dict -- is rebuilt into a real :class:`PartitionAxis` via
-          ``PartitionAxis(**dict)``.
-
-        The mutation is in-place. The method is idempotent: already-live
-        values pass through untouched because they are not present in
-        ``DTYPE_TO_STRING_MAP.values()`` and are already
-        ``PartitionAxis`` instances.
+        * ``config_variables["partition_axis"]`` dicts are rebuilt into
+          :class:`PartitionAxis` instances with tuple axis fields preserved;
+        * ``config_variables["precision"]`` strings/ints/lists are restored to
+          :class:`lax.Precision`;
+        * ``config_variables["gradient_checkpointing"]`` strings are restored
+          to :class:`EasyDeLGradientCheckPointers` when recognized;
+        * sharding tuple fields (``sharding_axis_names``,
+          ``sharding_axis_dims``, ``sharding_dcn_axis_dims``) are restored from
+          JSON lists back into tuples.
         """
-        if self.config_variables:
-            for k, v in list(self.config_variables.items()):
-                if v in DTYPE_TO_STRING_MAP.values():
-                    self.config_variables[k] = STRING_TO_DTYPE_MAP[v]
-            if "partition_axis" in self.config_variables:
-                pa = self.config_variables["partition_axis"]
-                if not isinstance(pa, PartitionAxis):
-                    self.config_variables["partition_axis"] = PartitionAxis(**pa)
+        if self.config_variables is not None:
+            variables = copy.deepcopy(self.config_variables)
+            for k, v in list(variables.items()):
+                if isinstance(v, str) and v in STRING_TO_DTYPE_MAP:
+                    variables[k] = STRING_TO_DTYPE_MAP[v]
+                elif k == "precision":
+                    variables[k] = _deserialize_precision(v)
+                elif k == "gradient_checkpointing" and isinstance(v, str):
+                    try:
+                        variables[k] = EasyDeLGradientCheckPointers(v)
+                    except ValueError:
+                        variables[k] = v
+                elif k in _SHARDING_TUPLE_KEYS and isinstance(v, list):
+                    variables[k] = tuple(v)
+            if "partition_axis" in variables:
+                pa = variables["partition_axis"]
+                if isinstance(pa, dict):
+                    restored_pa = {pk: tuple(pv) if isinstance(pv, list) else pv for pk, pv in pa.items()}
+                    variables["partition_axis"] = PartitionAxis(**restored_pa)
+            self.config_variables = variables
 
-        if self.config_scaling_variables:
-            for k, v in list(self.config_scaling_variables.items()):
-                if v in DTYPE_TO_STRING_MAP.values():
-                    self.config_scaling_variables[k] = STRING_TO_DTYPE_MAP[v]
+        if self.config_scaling_variables is not None:
+            scaling = copy.deepcopy(self.config_scaling_variables)
+            for k, v in list(scaling.items()):
+                if isinstance(v, str) and v in STRING_TO_DTYPE_MAP:
+                    scaling[k] = STRING_TO_DTYPE_MAP[v]
+            self.config_scaling_variables = scaling
 
 
 class RayDistributedTrainer:
@@ -343,6 +444,7 @@ class RayDistributedTrainer:
         self.offload_backend = offload_backend if offload_backend is not None else "cpu"
         self.state_class = state_class if state_class is not None else EasyDeLState
         self.trainer_module = trainer_module if trainer_module is not None else Trainer
+        self.arguments: TrainingArguments | None = None
 
     @classmethod
     def from_config(
@@ -356,8 +458,9 @@ class RayDistributedTrainer:
 
         Reads the file via :class:`ePath`, parses it into
         :class:`RayDistributedConfig`, runs :meth:`_loading_postprocess` to
-        restore live JAX dtypes and :class:`PartitionAxis`, then instantiates
-        the trainer with the recovered fields plus any per-call overrides.
+        restore live JAX dtypes, :class:`lax.Precision`, sharding tuples, and
+        :class:`PartitionAxis`, then instantiates the trainer with the
+        recovered fields plus any per-call overrides.
 
         Args:
             path: Path to the JSON configuration file.
@@ -373,6 +476,7 @@ class RayDistributedTrainer:
         cfg._loading_postprocess()
         return cls(
             pretrained_model_name_or_path=cfg.pretrained_model_name_or_path,
+            bucket_path=cfg.bucket_path,
             model_task=cfg.model_task,
             model_type=cfg.model_type,
             config_scaling_variables=cfg.config_scaling_variables,
@@ -386,9 +490,10 @@ class RayDistributedTrainer:
     def save_config(self, path: str | os.PathLike):
         """Serialise the trainer's configuration to a JSON file.
 
-        Builds a :class:`RayDistributedConfig` from the trainer's current
-        fields, runs :meth:`_saving_preprocess` to coerce JAX dtypes and
-        :class:`PartitionAxis` into JSON-safe primitives, and writes the
+        Builds a :class:`RayDistributedConfig` from deep copies of the
+        trainer's current fields (leaving the live launcher unmutated), runs
+        :meth:`_saving_preprocess` to coerce JAX dtypes, :class:`lax.Precision`,
+        and :class:`PartitionAxis` into JSON-safe primitives, and writes the
         indented JSON dump to ``path`` via :class:`ePath`.
 
         Args:
@@ -397,11 +502,12 @@ class RayDistributedTrainer:
         """
         cfg = RayDistributedConfig(
             pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+            bucket_path=self.bucket_path,
             model_task=self.model_task,
             model_type=self.model_type,
             offload_backend=self.offload_backend,
-            config_scaling_variables=self.config_scaling_variables,
-            config_variables=self.config_variables,
+            config_scaling_variables=copy.deepcopy(self.config_scaling_variables),
+            config_variables=copy.deepcopy(self.config_variables),
         )
         cfg._saving_preprocess()
         ePath(path).write_text(cfg.model_dump_json(indent=2))
@@ -412,21 +518,34 @@ class RayDistributedTrainer:
         Uses ``_processor_loader_class.from_pretrained`` (defaults to
         :class:`AutoTokenizer`) against
         ``self.pretrained_model_name_or_path``. When the resulting tokenizer
-        has no ``pad_token_id`` but does expose ``eos_token_id``, the EOS
-        token id is reused for padding and a warning is logged.
+        lacks ``pad_token`` or ``pad_token_id`` and exposes ``eos_token`` /
+        ``eos_token_id``, both padding attributes fall back to EOS and a
+        warning is logged.
 
         Returns:
             PreTrainedTokenizer: Loaded tokenizer with a guaranteed padding
             configuration.
         """
         tok_cls = self._processor_loader_class
-        tokenizer = tok_cls.from_pretrained(self.pretrained_model_name_or_path)
+        processor = tok_cls.from_pretrained(self.pretrained_model_name_or_path)
+        tokenizer = getattr(processor, "tokenizer", processor)
 
-        has_eos = hasattr(tokenizer, "eos_token_id")
-        if getattr(tokenizer, "pad_token_id", None) is None and has_eos:
+        pad_token = getattr(tokenizer, "pad_token", None)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        eos_token = getattr(tokenizer, "eos_token", None)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+        warned = False
+        if pad_token is None and eos_token is not None:
             logger.warning("Tokenizer has no pad_token. Falling back to eos_token for padding.")
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        return tokenizer
+            tokenizer.pad_token = eos_token
+            warned = True
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None and eos_token_id is not None:
+            if not warned:
+                logger.warning("Tokenizer has no pad_token_id. Falling back to eos_token_id for padding.")
+            tokenizer.pad_token_id = eos_token_id
+        return processor
 
     @cached_property
     def processor(self) -> PreTrainedTokenizer:
@@ -627,22 +746,32 @@ class RayDistributedTrainer:
                 return self.model_class.lazy_init(**init_kwargs)
             return self.model_class.sequential_init(init_device=init_device, **init_kwargs)
 
-    def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
+    def convert_model_to_state(
+        self,
+        model: EasyDeLBaseModule,
+        trainable_selector: tp.Any | None = None,
+    ) -> EasyDeLState:
         """Wrap a model module in an :class:`EasyDeLState` using ``state_class``.
 
         Sharding is deliberately *not* applied here; the inner :class:`Trainer`
-        owns sharding decisions according to its partition rules.
-        ``self.arguments.trainable_selector`` is forwarded so non-trainable
-        leaves are routed correctly.
+        owns sharding decisions according to its partition rules. When
+        ``trainable_selector`` is omitted, ``self.arguments.trainable_selector``
+        is used if ``self.arguments`` has been attached (for example during
+        :meth:`train`), falling back to ``None`` otherwise.
 
         Args:
             model: The model module to convert.
+            trainable_selector: Optional selector override passed to
+                ``model.to_state``.
 
         Returns:
             EasyDeLState: State object built via
             ``model.to_state(self.state_class, ...)``.
         """
-        return model.to_state(self.state_class, trainable_selector=self.arguments.trainable_selector)
+        if trainable_selector is None:
+            arguments = getattr(self, "arguments", None)
+            trainable_selector = getattr(arguments, "trainable_selector", None) if arguments is not None else None
+        return model.to_state(self.state_class, trainable_selector=trainable_selector)
 
     def create_model_from_config(self, scaling_index: int) -> EasyDeLBaseModule:
         """Convenience helper that chains :meth:`create_config` and :meth:`create_model`.
@@ -673,31 +802,114 @@ class RayDistributedTrainer:
         dataset_eval: Dataset | None = None,
         data_collator: tp.Callable | None = None,
         state: EasyDeLState | None = None,
+        processing_class: PreTrainedTokenizer | None = None,
+        **trainer_kwargs: tp.Any,
     ) -> BaseTrainer | Trainer:
-        """Instantiate the inner trainer class with the given training inputs.
+        """Instantiate the inner trainer class with signature-mapped inputs.
 
-        Forwards ``arguments``, datasets, collator, and ``state`` to
-        ``self.trainer_module(...)`` without further preprocessing -- the inner
-        trainer owns sharding, scheduling, and resume.
+        Inspects ``self.trainer_module.__init__`` (walking its MRO for thin
+        ``**kwargs`` wrappers such as :class:`BEMADPOTrainer`) so both the base
+        :class:`Trainer` (``dataset_train`` / ``dataset_eval`` /
+        ``model_state``) and specialized trainers such as ``SFTTrainer``,
+        ``DPOTrainer``, ``RewardTrainer``, ``EmbeddingTrainer``, and
+        ``PRMTrainer`` (``train_dataset`` / ``eval_dataset`` / ``model`` /
+        ``processing_class``) receive the exact keyword names they accept.
 
         Args:
             arguments: Training configuration and hyperparameters.
             dataset_train: Training dataset.
             dataset_eval: Optional evaluation dataset.
             data_collator: Optional data collator for batching.
-            state: Model state to train.
+            state: Model or model state to train.
+            processing_class: Optional tokenizer/processor override. When
+                omitted and required by ``self.trainer_module`` (or already
+                cached on ``self.processor``), :attr:`processor` is supplied.
+            **trainer_kwargs: Additional keyword arguments forwarded when
+                accepted by ``self.trainer_module``.
 
         Returns:
             BaseTrainer | Trainer: Configured trainer instance ready to call
             ``.train()`` on.
         """
-        return self.trainer_module(
-            arguments=arguments,
-            dataset_train=dataset_train,
-            dataset_eval=dataset_eval,
-            data_collator=data_collator,
-            model_state=state,
-        )
+        params, accepts_var_kw = _resolve_trainer_init_params(self.trainer_module)
+        kwargs: dict[str, tp.Any] = {}
+
+        if "arguments" in params or accepts_var_kw:
+            kwargs["arguments"] = arguments
+
+        if "train_dataset" in params:
+            kwargs["train_dataset"] = dataset_train
+        elif "dataset_train" in params or accepts_var_kw:
+            kwargs["dataset_train"] = dataset_train
+
+        if "eval_dataset" in params:
+            kwargs["eval_dataset"] = dataset_eval
+        elif "dataset_eval" in params or accepts_var_kw:
+            kwargs["dataset_eval"] = dataset_eval
+
+        if "model_state" in params:
+            kwargs["model_state"] = state
+        elif "model" in params:
+            kwargs["model"] = state
+        elif "student_model" in params:
+            kwargs["student_model"] = state
+        elif accepts_var_kw:
+            kwargs["model_state"] = state
+
+        if "data_collator" in params or (data_collator is not None and accepts_var_kw):
+            kwargs["data_collator"] = data_collator
+
+        if "processing_class" in params or (processing_class is not None and accepts_var_kw):
+            resolved_processor = processing_class
+            if resolved_processor is None and "processor" in self.__dict__:
+                resolved_processor = self.__dict__["processor"]
+            if resolved_processor is None and "processing_class" in params:
+                param = params["processing_class"]
+                is_specialized_trainer = (
+                    inspect.isclass(self.trainer_module)
+                    and self.trainer_module is not Trainer
+                    and issubclass(self.trainer_module, BaseTrainer)
+                )
+                if param.default is inspect.Parameter.empty or is_specialized_trainer:
+                    resolved_processor = self.processor
+            if resolved_processor is not None or (
+                "processing_class" in params and params["processing_class"].default is inspect.Parameter.empty
+            ):
+                kwargs["processing_class"] = resolved_processor
+
+        for key, value in trainer_kwargs.items():
+            if key in params or accepts_var_kw:
+                kwargs[key] = value
+
+        return self.trainer_module(**kwargs)
+
+    @staticmethod
+    def _is_stageable_numpy_dtype(dtype: tp.Any) -> bool:
+        """Return whether a NumPy / ml_dtypes dtype is numeric or boolean and safe for ``jax.device_put``."""
+        if dtype is object or getattr(dtype, "kind", None) in ("U", "S", "M", "m", "O"):
+            return False
+        return bool(jax.dtypes.issubdtype(dtype, np.number) or jax.dtypes.issubdtype(dtype, np.bool_))
+
+    @staticmethod
+    def _stage_leaf(value: tp.Any, offload_device: jax.Device) -> tp.Any:
+        """Offload a local numeric array leaf without disturbing sharded or non-array leaves."""
+        if isinstance(value, jax.ShapeDtypeStruct):
+            return value
+        if isinstance(value, jax.Array):
+            if not value.is_fully_addressable or not isinstance(value.sharding, jax.sharding.SingleDeviceSharding):
+                return value
+            return jax.device_put(value, offload_device)
+        if isinstance(value, np.ndarray):
+            if not RayDistributedTrainer._is_stageable_numpy_dtype(value.dtype):
+                return value
+            return jax.device_put(value, offload_device)
+        if isinstance(value, np.generic):
+            if not RayDistributedTrainer._is_stageable_numpy_dtype(value.dtype):
+                return value
+            return jax.device_put(value, offload_device)
+        if isinstance(value, (bool, int, float, complex)):
+            return jax.device_put(value, offload_device)
+        return value
 
     def train(
         self,
@@ -708,6 +920,8 @@ class RayDistributedTrainer:
         data_collator: tp.Callable | None = None,
         model: EasyDeLBaseModule | None = None,
         state: EasyDeLState | None = None,
+        processing_class: PreTrainedTokenizer | None = None,
+        **trainer_kwargs: tp.Any,
     ):
         """Resolve a training state from available sources and launch training.
 
@@ -736,6 +950,10 @@ class RayDistributedTrainer:
             model: Optional pre-initialised model (converted to state when
                 ``state`` is also ``None``).
             state: Optional pre-initialised state taking highest priority.
+            processing_class: Optional tokenizer/processor forwarded to
+                :meth:`create_trainer`.
+            **trainer_kwargs: Extra trainer keyword arguments forwarded to
+                :meth:`create_trainer`.
 
         Returns:
             The return value of ``self.create_trainer(...).train()``.
@@ -756,6 +974,7 @@ class RayDistributedTrainer:
                     param_dtype=self.config_variables["param_dtype"],
                     precision=self.config_variables["precision"],
                     auto_shard_model=False,
+                    model_task=self.model_task,
                     sharding_axis_names=self.config_variables["sharding_axis_names"],
                     sharding_axis_dims=self.config_variables["sharding_axis_dims"],
                     sharding_dcn_axis_dims=self.config_variables["sharding_dcn_axis_dims"],
@@ -783,23 +1002,18 @@ class RayDistributedTrainer:
         # Never gather a supplied distributed array onto one host. Besides
         # rejecting non-addressable leaves, that would destroy valid training
         # placements (including stage-local PP shardings). Stage only unsharded,
-        # fully addressable leaves; retain caller-owned distributed layouts.
+        # fully addressable numeric leaves; retain caller-owned distributed
+        # layouts, lazy ShapeDtypeStructs, and non-numeric metadata leaves.
         offload_device = self._get_offload_device()
-
-        def stage_leaf(value):
-            """Offload a local leaf without collapsing an existing distributed layout."""
-            if isinstance(value, jax.Array):
-                if not value.is_fully_addressable or not isinstance(value.sharding, jax.sharding.SingleDeviceSharding):
-                    return value
-            return jax.device_put(value, offload_device)
-
-        state = jax.tree_util.tree_map(stage_leaf, state)
+        state = jax.tree_util.tree_map(lambda value: self._stage_leaf(value, offload_device), state)
         return self.create_trainer(
             arguments=arguments,
             dataset_train=dataset_train,
             dataset_eval=dataset_eval,
             data_collator=data_collator,
             state=state,
+            processing_class=processing_class,
+            **trainer_kwargs,
         ).train()
 
     def __repr__(self):

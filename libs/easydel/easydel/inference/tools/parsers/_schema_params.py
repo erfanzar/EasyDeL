@@ -63,7 +63,8 @@ def get_arguments_config(func_name: str, tools: list[ToolDefinition] | None) -> 
                 return {}
             params = config.function.parameters
             if isinstance(params, dict) and "properties" in params:
-                return params["properties"]
+                props = params["properties"]
+                return props if isinstance(props, dict) else {}
             elif isinstance(params, dict):
                 return params
             else:
@@ -91,7 +92,8 @@ def lookup_tool_properties(func_name: str | None, tools: list[ToolDefinition] | 
         if hasattr(tool, "function") and tool.function.name == func_name and hasattr(tool.function, "parameters"):
             params = tool.function.parameters
             if isinstance(params, dict) and "properties" in params:
-                return params["properties"]
+                props = params["properties"]
+                return props if isinstance(props, dict) else {}
             return {}
     return {}
 
@@ -148,6 +150,10 @@ def _param_value_has_type(value: Any, param_type: str) -> bool:
     return False
 
 
+_MAX_LOSSLESS_DECIMAL_EXPONENT = 308
+_MAX_SCHEMA_RECURSION_DEPTH = 128
+
+
 def _matches_union_constraints(value: Any, schema: dict | bool) -> bool:
     """Validate complete JSON-Schema branch membership, not just its scalar type.
 
@@ -159,16 +165,20 @@ def _matches_union_constraints(value: Any, schema: dict | bool) -> bool:
     if isinstance(schema, bool):
         return schema
 
-    def exact_numbers(obj):
+    def exact_numbers(obj, depth: int = 0):
+        if depth > _MAX_SCHEMA_RECURSION_DEPTH:
+            raise ValueError("JSON nesting depth exceeds bound")
         if type(obj) is float:
             return Fraction(str(obj))
         if isinstance(obj, list):
-            return [exact_numbers(item) for item in obj]
+            return [exact_numbers(item, depth + 1) for item in obj]
         if isinstance(obj, dict):
-            return {key: exact_numbers(item) for key, item in obj.items()}
+            return {key: exact_numbers(item, depth + 1) for key, item in obj.items()}
         return obj
 
-    def declared_types(node):
+    def declared_types(node, depth: int = 0):
+        if depth > _MAX_SCHEMA_RECURSION_DEPTH:
+            return
         if isinstance(node, dict):
             declared = node.get("type", [])
             if isinstance(declared, str):
@@ -176,10 +186,10 @@ def _matches_union_constraints(value: Any, schema: dict | bool) -> bool:
             elif isinstance(declared, list):
                 yield from (kind for kind in declared if isinstance(kind, str))
             for child in node.values():
-                yield from declared_types(child)
+                yield from declared_types(child, depth + 1)
         elif isinstance(node, list):
             for child in node:
-                yield from declared_types(child)
+                yield from declared_types(child, depth + 1)
 
     def has_type(instance, kind):
         # Preserve the parser's existing scalar aliases (int/float/bool/etc.)
@@ -198,21 +208,29 @@ def _matches_union_constraints(value: Any, schema: dict | bool) -> bool:
     validator = validators.extend(base, type_checker=checker)
     try:
         validator(exact_numbers(schema), registry=Registry()).validate(exact_numbers(value))
-    except (ValidationError, Unresolvable):
+    except (ValidationError, Unresolvable, ValueError, RecursionError):
         return False
     return True
 
 
-def _lossless_json_value(value: Any) -> Any:
+def _lossless_json_value(value: Any, depth: int = 0) -> Any:
     """Convert exact parsed JSON decimals to serializable numbers without rounding.
 
-    Integral decimals become arbitrary-precision integers. Fractional decimals must
-    survive JSON's float string round trip; otherwise callers preserve the raw text
-    instead of silently changing a tool argument or its enum/const membership.
+    Integral decimals become arbitrary-precision integers (bounded in magnitude so
+    adversarial exponents like ``1e100000000`` cannot exhaust CPU/RAM). Fractional
+    decimals must survive JSON's float string round trip; otherwise callers preserve
+    the raw text instead of silently changing a tool argument or its enum/const
+    membership.
     """
+    if depth > _MAX_SCHEMA_RECURSION_DEPTH:
+        raise ValueError("JSON nesting depth exceeds bound")
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("Nonfinite JSON number")
+        if value.is_zero():
+            return 0
+        if abs(value.adjusted()) > _MAX_LOSSLESS_DECIMAL_EXPONENT:
+            raise ValueError("JSON number exponent exceeds lossless bound")
         if value == value.to_integral_value():
             return int(value)
         converted = float(value)
@@ -220,9 +238,9 @@ def _lossless_json_value(value: Any) -> Any:
             raise ValueError("JSON number would lose precision")
         return converted
     if isinstance(value, list):
-        return [_lossless_json_value(member) for member in value]
+        return [_lossless_json_value(member, depth + 1) for member in value]
     if isinstance(value, dict):
-        return {key: _lossless_json_value(member) for key, member in value.items()}
+        return {key: _lossless_json_value(member, depth + 1) for key, member in value.items()}
     return value
 
 
@@ -253,12 +271,12 @@ def _convert_union_param_value(value: str, schema: dict, param_name: str, func_n
         if _param_value_has_type(1, param_type):
             try:
                 converted = _lossless_json_value(Decimal(value))
-            except (InvalidOperation, ValueError, TypeError, OverflowError):
+            except (InvalidOperation, ValueError, TypeError, OverflowError, RecursionError):
                 continue
         elif _param_value_has_type({}, param_type) or _param_value_has_type([], param_type):
             try:
-                exact = json.loads(value, parse_float=Decimal, parse_constant=Decimal)
-            except (json.JSONDecodeError, InvalidOperation):
+                exact = json.loads(value, parse_int=Decimal, parse_float=Decimal, parse_constant=Decimal)
+            except (json.JSONDecodeError, InvalidOperation, ValueError, RecursionError, MemoryError):
                 # Preserve Python-literal support, but recover numeric source text
                 # before literal_eval can hide rounding in a nested float constant.
                 source = value.strip()
@@ -268,12 +286,20 @@ def _convert_union_param_value(value: str, schema: dict, param_name: str, func_n
                         if isinstance(node, ast.Constant) and type(node.value) is float:
                             node.value = _lossless_json_value(Decimal(ast.get_source_segment(source, node)))
                     converted = ast.literal_eval(expression)
-                except (SyntaxError, ValueError, TypeError, InvalidOperation, OverflowError):
+                except (
+                    SyntaxError,
+                    ValueError,
+                    TypeError,
+                    InvalidOperation,
+                    OverflowError,
+                    RecursionError,
+                    MemoryError,
+                ):
                     continue
             else:
                 try:
                     converted = _lossless_json_value(exact)
-                except (ValueError, OverflowError):
+                except (ValueError, OverflowError, RecursionError):
                     continue
         else:
             converted = convert_param_value(value, param_name, {param_name: {"type": param_type}}, func_name)
@@ -304,9 +330,11 @@ def convert_param_value(param_value: str, param_name: str, param_config: dict, f
     schema = param_config.get(param_name)
     if isinstance(schema, dict) and ("anyOf" in schema or "oneOf" in schema or isinstance(schema.get("type"), list)):
         return _convert_union_param_value(param_value, schema, param_name, func_name)
-    if param_value.lower() == "null":
+    if isinstance(schema, dict) and schema.get("nullable") is True and param_value.lower() == "null":
         return None
     if param_name not in param_config:
+        if param_value.lower() == "null":
+            return None
         if param_config != {}:
             logger.debug(
                 "Parsed parameter '%s' is not defined in the tool parameters for tool '%s', directly "
@@ -318,9 +346,15 @@ def convert_param_value(param_value: str, param_name: str, param_config: dict, f
     if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
         param_type = str(param_config[param_name]["type"]).strip().lower()
     else:
+        if param_value.lower() == "null":
+            return None
         param_type = "string"
+    if param_type == "null":
+        return None if param_value.lower() == "null" else param_value
     if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
         return param_value
+    if param_value.lower() == "null":
+        return None
     elif (
         param_type.startswith("int")
         or param_type.startswith("uint")
@@ -365,7 +399,7 @@ def convert_param_value(param_value: str, param_name: str, param_config: dict, f
         if param_type in ["object", "array", "arr"] or param_type.startswith("dict") or param_type.startswith("list"):
             try:
                 return json.loads(param_value)
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError, MemoryError):
                 logger.debug(
                     "Parsed value '%s' of parameter '%s' cannot be parsed with json.loads in tool '%s', "
                     "will try other methods to parse it.",
@@ -375,7 +409,7 @@ def convert_param_value(param_value: str, param_name: str, param_config: dict, f
                 )
         try:
             param_value = ast.literal_eval(param_value)
-        except (ValueError, SyntaxError, TypeError):
+        except (ValueError, SyntaxError, TypeError, RecursionError, MemoryError):
             logger.debug(
                 "Parsed value '%s' of parameter '%s' cannot be converted via Python ast.literal_eval() "
                 "in tool '%s', degenerating to string.",

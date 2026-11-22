@@ -271,6 +271,7 @@ class LocalQuestionGenerator(QuestionGenerator):
         self._v_top_p = verifier_top_p
         self._v_top_k = verifier_top_k
         self._generate_fn: tp.Callable[..., list[str]] | None = None
+        self._has_custom_strip_reasoning = strip_reasoning_fn is not None
         if strip_reasoning_fn is None:
             _closed = re.compile(r"<think>.*?</think>", re.DOTALL)
             _unclosed = re.compile(r"<think>.*", re.DOTALL)
@@ -288,14 +289,20 @@ class LocalQuestionGenerator(QuestionGenerator):
 
         self._strip_reasoning = strip_reasoning_fn
 
-    def set_generate_fn(self, generate_fn: tp.Callable[[list[str]], list[str]]) -> None:
-        """Inject the trainer-provided batched generation callable.
+    def set_generate_fn(self, generate_fn: tp.Callable[[list[str]], list[str]] | None) -> None:
+        """Inject or clear the trainer-provided batched generation callable.
 
         Args:
             generate_fn: Callable accepting a list of prompts and
-                returning a list of completions of the same length.
+                returning a list of completions of the same length, or ``None``
+                to detach the previously bound callable.
         """
         self._generate_fn = generate_fn
+
+    def clear_generation(self, generate_fn: tp.Callable | None = None) -> None:
+        """Detach ``generate_fn`` so per-step closures cannot pin HBM states."""
+        if generate_fn is None or self._generate_fn is generate_fn:
+            self._generate_fn = None
 
     def configure_generation(
         self,
@@ -308,7 +315,7 @@ class LocalQuestionGenerator(QuestionGenerator):
         self.set_generate_fn(generate_fn)
         if self._tokenizer is None:
             self._tokenizer = tokenizer
-        if strip_reasoning_fn is not None:
+        if strip_reasoning_fn is not None and not self._has_custom_strip_reasoning:
             self._strip_reasoning = strip_reasoning_fn
 
     def generate(self, topic: str, seed: int | None = None) -> GeneratedQuestion:
@@ -502,23 +509,51 @@ class LocalQuestionGenerator(QuestionGenerator):
     def _parse_score(text: str) -> float:
         """Extract a normalized reward in ``[0, 1]`` from a verifier response.
 
-        Tries to match a ``<reward>X</reward>`` tag first, falling back
-        to the last number in ``text``.  Values outside ``[0, 10]`` are
-        clipped before normalization.
+        Strips ``<think>...</think>`` blocks first, matches the **last**
+        ``<reward>...</reward>`` tag (preventing prompt injection via an
+        earlier quoted tag), then checks explicit ``X/10`` and ``X out of 10``
+        patterns before falling back to the last standalone number. Values
+        outside ``[0, 10]`` are clipped to ``[0, 1]``.
 
         Args:
             text: Raw verifier response.
 
         Returns:
-            A float reward in ``[0, 1]``, or ``0.0`` when no number is
-            found.
+            A float reward in ``[0, 1]``, or ``0.0`` when no score is found.
         """
-        import re
+        if not text:
+            return 0.0
 
-        tag_match = re.search(r"<reward>\s*(\d+(?:\.\d+)?)\s*</reward>", text)
-        if tag_match:
-            return min(max(float(tag_match.group(1)) / 10.0, 0.0), 1.0)
-        numbers = re.findall(r"\b(\d+(?:\.\d+)?)\b", text)
+        clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(r"<think>.*", "", clean, flags=re.DOTALL | re.IGNORECASE).strip()
+        if not clean:
+            return 0.0
+
+        tag_bodies = re.findall(r"<reward>\s*(.*?)\s*</reward>", clean, flags=re.DOTALL | re.IGNORECASE)
+        for body in reversed(tag_bodies):
+            frac_match = re.search(
+                r"(?<![\w.])([+-]?\d+(?:\.\d+)?)\s*(?:/|out\s+of)\s*(\d+(?:\.\d+)?)\b",
+                body,
+                flags=re.IGNORECASE,
+            )
+            if frac_match:
+                num = float(frac_match.group(1))
+                denom = float(frac_match.group(2))
+                if denom > 0.0:
+                    return min(max(num / denom, 0.0), 1.0)
+            num_match = re.search(r"(?<![\w.])([+-]?\d+(?:\.\d+)?)(?![\w.])", body)
+            if num_match:
+                return min(max(float(num_match.group(1)) / 10.0, 0.0), 1.0)
+
+        ratio_matches = re.findall(
+            r"(?<![\w.])([+-]?\d+(?:\.\d+)?)\s*(?:/|out\s+of)\s*10(?:\.0+)?\b",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        if ratio_matches:
+            return min(max(float(ratio_matches[-1]) / 10.0, 0.0), 1.0)
+
+        numbers = re.findall(r"(?<![\w.])([+-]?\d+(?:\.\d+)?)(?![\w.])", clean)
         if numbers:
             return min(max(float(numbers[-1]) / 10.0, 0.0), 1.0)
         return 0.0
@@ -795,6 +830,8 @@ class SelfPlayEnvironment(AgenticEnvironment):
         self._defer_verify: bool = False
         self._final_answer: str | None = None
 
+    _parse_score = staticmethod(LocalQuestionGenerator._parse_score)
+
     def reset(self, seed: int | None = None) -> ResetResult:
         """Reset the environment.
 
@@ -811,6 +848,7 @@ class SelfPlayEnvironment(AgenticEnvironment):
             cached) question and whose info carries the topic and any
             generator metadata.
         """
+        self._defer_verify = False
         if self._question and self._step_count == 0:
             return ResetResult(
                 observation=self._question,
@@ -878,6 +916,7 @@ class SelfPlayEnvironment(AgenticEnvironment):
                 continue
             answer = env._final_answer or "\n".join(env._solver_turns)
             if not env._verify:
+                env._defer_verify = False
                 results[index] = StepResult("", 0.0, terminated=True, info=env._make_info(0.0, answer))
                 continue
             groups.setdefault(id(env._generator), []).append((index, env, answer))
@@ -907,14 +946,35 @@ class SelfPlayEnvironment(AgenticEnvironment):
         """Forward trainer generation services to the question backend."""
         self._generator.configure_generation(generate_fn, tokenizer=tokenizer, strip_reasoning_fn=strip_reasoning_fn)
 
+    def clear_generation(self, generate_fn: tp.Callable | None = None) -> None:
+        """Detach ``generate_fn`` from the shared question backend."""
+        clear_fn = getattr(self._generator, "clear_generation", None)
+        if callable(clear_fn):
+            clear_fn(generate_fn)
+        elif generate_fn is None or getattr(self._generator, "_generate_fn", None) is generate_fn:
+            self._generator.set_generate_fn(None)
+
+    def record_tool_turn(self, action: str, tool_result: StepResult) -> None:
+        """Record an assistant turn intercepted by :class:`ToolEnvWrapper`.
+
+        Ensures tool-only episodes that exhaust the turn limit still expose the
+        solver's turns and tool outputs to :meth:`finalize_batch` instead of
+        verifying an empty string.
+        """
+        parts = [part for part in (action.strip(), tool_result.observation.strip()) if part]
+        self._solver_turns.append("\n".join(parts) if parts else action)
+        self._step_count += 1
+
     def step(self, action: str) -> StepResult:
         """Advance the episode by one solver turn.
 
         The episode terminates when ``answer_pattern`` matches the
-        action or when ``max_steps_override`` is reached.  When
-        ``self._defer_verify`` is set the reward is left as ``NaN`` to
-        be filled in by a batched verifier later; otherwise the
-        verifier is invoked inline.
+        action (when ``verify=True``) or when ``max_steps_override`` is
+        reached. When ``verify=False``, the environment does not
+        self-terminate early and runs up to ``max_steps_override`` turns
+        with ``0.0`` reward. When ``self._defer_verify`` is set the reward
+        is left as ``NaN`` to be filled in by a batched verifier later;
+        otherwise the verifier is invoked inline.
 
         Args:
             action: The solver's response for this turn.
@@ -926,9 +986,25 @@ class SelfPlayEnvironment(AgenticEnvironment):
         self._solver_turns.append(action)
         self._step_count += 1
 
-        if self._answer_pattern:
-            import re
+        if not self._verify:
+            if self._step_count >= self._max_steps_override:
+                full_answer = "\n".join(self._solver_turns)
+                self._final_answer = full_answer
+                return StepResult(
+                    observation="",
+                    reward=0.0,
+                    terminated=False,
+                    truncated=True,
+                    info=self._make_info(0.0, full_answer),
+                )
+            return StepResult(
+                observation="Continue working on the problem.",
+                reward=0.0,
+                terminated=False,
+                info={},
+            )
 
+        if self._answer_pattern:
             if re.search(self._answer_pattern, action):
                 self._final_answer = action
                 if self._defer_verify:

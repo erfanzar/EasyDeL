@@ -47,6 +47,7 @@ from ..training_utils import (
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
@@ -184,7 +185,7 @@ def concatenated_forward(
         outputs = model(**call_kwargs)
         logits = outputs.logits
         labels = jnp.roll(input_ids, shift=-1, axis=1)
-        loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype(bool)
+        loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype(bool).at[:, -1].set(False)
 
     if logits is not None and logits.shape[:2] != loss_mask.shape:
         seq_len = loss_mask.shape[1]
@@ -226,9 +227,9 @@ def concatenated_forward(
             axis=1,
         )
 
-    token_counts = jnp.maximum(token_counts, 1.0)
+    safe_token_counts = jnp.maximum(token_counts, 1.0)
     if loss_type in ("ipo", "simpo"):
-        scaled_logps = jnp.where(token_counts > 0, sum_logps / token_counts, 0.0)
+        scaled_logps = jnp.where(token_counts > 0, sum_logps / safe_token_counts, 0.0)
     else:
         scaled_logps = sum_logps
 
@@ -256,8 +257,9 @@ def concatenated_forward(
         "mean_chosen_logits": mean_chosen_logits,
         "mean_rejected_logits": mean_rejected_logits,
     }
-    if aux_loss_enabled and hasattr(outputs, "aux_loss"):
-        outputs_dict["aux_loss"] = outputs.aux_loss
+    aux_loss = getattr(outputs, "aux_loss", None)
+    if aux_loss_enabled and aux_loss is not None:
+        outputs_dict["aux_loss"] = aux_loss
     return outputs_dict
 
 
@@ -322,10 +324,10 @@ def cpo_loss(
     """
 
     if alpha != 0.0:
-        chosen_probs = jnp.exp(policy_chosen_logps)
-        rejected_probs = jnp.exp(policy_rejected_logps)
-        chosen_rewards = (1.0 - jnp.power(chosen_probs, -alpha)) / alpha
-        rejected_rewards = (1.0 - jnp.power(rejected_probs, -alpha)) / alpha
+        chosen_exp_arg = jnp.minimum(-alpha * policy_chosen_logps.astype(jnp.float32), 80.0)
+        rejected_exp_arg = jnp.minimum(-alpha * policy_rejected_logps.astype(jnp.float32), 80.0)
+        chosen_rewards = -jnp.expm1(chosen_exp_arg) / alpha
+        rejected_rewards = -jnp.expm1(rejected_exp_arg) / alpha
         logits = chosen_rewards - rejected_rewards
     else:
         chosen_rewards = policy_chosen_logps
@@ -587,6 +589,8 @@ def _make_cpo_scheduled_loss(call):
     simpo_gamma = call.get("simpo_gamma")
     alpha = call.get("alpha")
     partition_spec = call.get("partition_spec")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the scalar CPO loss inside the SpectraX scheduled VJP.
@@ -601,9 +605,9 @@ def _make_cpo_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/cpo/scheduled_loss"):
             with jax.named_scope("easydel/trainer/cpo/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, schedule)
             with jax.named_scope("easydel/trainer/cpo/scheduled_loss/policy_forward"):
                 model_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
 
@@ -681,8 +685,14 @@ def evaluation_step(
         rewards, and the standard CPO diagnostics (policy NLL, reward
         margin, reward accuracy, mean logits).
     """
-    del partition_spec
     eval_scope = "easydel/trainer/cpo/eval_step"
+    with jax.named_scope(eval_scope + "/prepare_batch"):
+        *_, batch_partition_spec = make_assertions_and_get_sizes(
+            batch=batch,
+            gradient_accumulation_steps=1,
+            batch_partition_spec=partition_spec,
+        )
+        batch = with_sharding_constraint(batch, batch_partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
     with jax.named_scope(eval_scope + "/policy_forward"):
         model_outputs = concatenated_forward_fn(state.model, batch)

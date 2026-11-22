@@ -140,6 +140,7 @@ class RewardTrainer(Trainer):
             tokenizer.pad_token = tokenizer.eos_token
 
         self.arguments = arguments
+        self._has_custom_collator = data_collator is not None
 
         if data_collator is None:
             self.input_data_collator_tfds = RewardDataCollatorWithPaddingTFDS(
@@ -160,6 +161,8 @@ class RewardTrainer(Trainer):
 
         if isinstance(model, str):
             reject_string_model_id(model, role="reward model")
+        if model is None:
+            raise ValueError("`model` must be provided to `RewardTrainer`.")
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
         if arguments.disable_dropout:
@@ -233,6 +236,14 @@ class RewardTrainer(Trainer):
             return "input_ids_chosen" in sample
         except (StopIteration, IndexError):
             return False
+
+    def _configure_eval_config_override(self):
+        """Freeze evaluation mode into the eval graphdef outside the readonly JIT."""
+        super()._configure_eval_config_override()
+        eval_state = self._eval_state_for_compiled_step(self.model_state)
+        module = eval_state.model
+        module.eval()
+        self._eval_graphdef, _, _ = module.split_module(trainable_selector=self.arguments.trainable_selector)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Compile the reward-model training and evaluation steps.
@@ -317,7 +328,7 @@ class RewardTrainer(Trainer):
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=sharded_evaluation_static_argnums,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             mesh=self.model.mesh,
             schedule=self.arguments.mpmd_scheduler,
@@ -341,29 +352,57 @@ class RewardTrainer(Trainer):
 
     def create_grain_collect_function(
         self,
-        max_sequence_length: int,
+        max_sequence_length: int | None,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Return the cached Grain collator that pads chosen/rejected pairs.
+        """Return a Grain collator that pads chosen/rejected pairs safely.
 
-        The pre-instantiated collator already knows the configured
-        ``max_length`` and ``truncation_mode``; this method simply
-        returns it so the base :class:`Trainer` can hand it to the
-        loader. Both branches of each preference pair are padded to the
-        same length so the reward backbone can run them under a single
-        compiled forward.
+        When a fixed ``max_length`` is configured, delegates single-example
+        dicts directly to ``self.input_data_collator_grain``. When
+        ``max_length`` is ``None`` (dynamic padding), list batches are padded
+        to the batch maximum via ``self.input_data_collator_tfds`` and
+        single-example dicts are padded so chosen and rejected lengths align.
 
         Args:
-            max_sequence_length: Accepted for compatibility with
-                :class:`Trainer`; unused.
+            max_sequence_length: Optional sequence length override.
             truncation_mode: Accepted for compatibility with
-                :class:`Trainer`; unused.
+                :class:`Trainer`; used when constructing dynamic fallback
+                collators.
 
         Returns:
-            The :class:`RewardDataCollatorWithPaddingGrain` instance
-            built in ``__init__``.
+            A callable that collates reward batches or single examples.
         """
-        return self.input_data_collator_grain
+        if getattr(self, "_has_custom_collator", False):
+            return self.input_data_collator_grain
+
+        grain_collator = self.input_data_collator_grain
+        tfds_collator = self.input_data_collator_tfds
+        resolved_max_length = (
+            max_sequence_length
+            if max_sequence_length is not None
+            else getattr(grain_collator, "max_length", self.arguments.max_length)
+        )
+        if resolved_max_length is not None:
+            return grain_collator
+
+        def _dynamic_grain_collator(features: dict[str, tp.Any] | list[dict[str, tp.Any]]):
+            if isinstance(features, (list, tuple)):
+                return tfds_collator(list(features))
+            chosen = features.get("input_ids_chosen")
+            rejected = features.get("input_ids_rejected")
+            if chosen is not None and rejected is not None:
+                row_max = max(len(chosen), len(rejected))
+                row_collator = RewardDataCollatorWithPaddingGrain(
+                    tokenizer=grain_collator.tokenizer,
+                    padding="max_length",
+                    max_length=row_max,
+                    truncation_mode=getattr(grain_collator, "truncation_mode", truncation_mode),
+                    pad_to_multiple_of=getattr(grain_collator, "pad_to_multiple_of", None),
+                )
+                return row_collator(features)
+            return grain_collator(features)
+
+        return _dynamic_grain_collator
 
     def create_tfds_collect_function(
         self,

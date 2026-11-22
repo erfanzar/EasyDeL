@@ -199,7 +199,38 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
     # eSurge is an inference-only path that relies on instantiating
     # `self.__class__(config=...)` when swapping attention mechanisms.
     # This wrapper is not constructible from `config`, so we delegate all eSurge
-    # APIs to the underlying base model.
+    # APIs to the underlying base model after propagating our cache scope key.
+
+    def _sync_esurge_cache_scope(self) -> str:
+        """Propagate this wrapper's ``_esurge_cache_scope_key`` onto ``self.model``.
+
+        ``EasyDeLState.model`` stamps ``_esurge_cache_scope_key`` on the outer
+        ``CausalLMWithValueHead`` wrapper when rebinding state. Propagating it
+        onto ``self.model`` before delegating ensures ``get_esurge()`` reuses
+        cached engines across steps and ``pause_esurge()`` /
+        ``release_generation_runtime()`` match and release them.
+        """
+        scope = getattr(self, "_esurge_cache_scope_key", None)
+        if scope is None:
+            scope = getattr(self.model, "_esurge_cache_scope_key", None)
+        if scope is None:
+            scope = super()._esurge_cache_scope()
+        if getattr(self, "_esurge_cache_scope_key", None) != scope:
+            object.__setattr__(self, "_esurge_cache_scope_key", scope)
+        if getattr(self.model, "_esurge_cache_scope_key", None) != scope:
+            object.__setattr__(self.model, "_esurge_cache_scope_key", scope)
+        return scope
+
+    def _esurge_cache_scope(self) -> str:
+        """Return the synchronized eSurge cache scope key shared with ``self.model``."""
+        return self._sync_esurge_cache_scope()
+
+    @staticmethod
+    def _maybe_sync_esurge_cache_scope(wrapper: tp.Any) -> None:
+        """Propagate eSurge cache scope when invoked on a real wrapper instance."""
+        sync = getattr(wrapper, "_sync_esurge_cache_scope", None)
+        if callable(sync):
+            sync()
 
     @property
     def esurge_graphdef(self):  # pragma: no cover
@@ -210,7 +241,13 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         machinery operates on the base module's graph definition. This
         property surfaces that graph definition transparently.
         """
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.esurge_graphdef
+
+    def get_esurge_graphdef(self, *args, **kwargs):  # pragma: no cover
+        """Resolve the eSurge graph definition via the wrapped base model."""
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
+        return self.model.get_esurge_graphdef(*args, **kwargs)
 
     @property
     def esurge_compatible_model(self):  # pragma: no cover
@@ -221,7 +258,13 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         exposes the base model's variant without re-wrapping it -- the
         value head is dropped during inference.
         """
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.esurge_compatible_model
+
+    def get_esurge_compatible_model(self, *args, **kwargs):  # pragma: no cover
+        """Resolve an eSurge-compatible model handle via the wrapped base model."""
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
+        return self.model.get_esurge_compatible_model(*args, **kwargs)
 
     def get_esurge(self, *args, **kwargs):  # pragma: no cover
         """Construct or fetch an eSurge engine via the base model.
@@ -229,7 +272,13 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         Forwarded so PPO rollout code can opt into eSurge-accelerated
         sampling without unwrapping the value head.
         """
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.get_esurge(*args, **kwargs)
+
+    def get_relevant_esurge(self, *args, **kwargs):  # pragma: no cover
+        """Find an existing cached eSurge engine associated with this model."""
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
+        return self.model.get_relevant_esurge(*args, **kwargs)
 
     def esurge_generate(self, *args, **kwargs):  # pragma: no cover
         """Generate completions using the base model's eSurge engine.
@@ -237,6 +286,7 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         Mirrors :meth:`generate` but routes through the eSurge inference
         runtime; the value head is not consulted.
         """
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.esurge_generate(*args, **kwargs)
 
     def _call_esurge_engine(self, *args, **kwargs):  # pragma: no cover
@@ -245,6 +295,7 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         Internal helper used by the rollout path when an engine instance
         has already been built and only needs to be called.
         """
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model._call_esurge_engine(*args, **kwargs)
 
     def pause_esurge(self, *args, **kwargs):  # pragma: no cover
@@ -253,12 +304,15 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         Used by trainers that share the eSurge engine across rollout
         phases and wish to release worker capacity during the PPO update.
         """
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.pause_esurge(*args, **kwargs)
 
     def resume_esurge(self, *args, **kwargs):  # pragma: no cover
         """Resume an eSurge engine previously paused via :meth:`pause_esurge`."""
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.resume_esurge(*args, **kwargs)
 
     def list_esurge_engines(self, *args, **kwargs):  # pragma: no cover
         """Enumerate active eSurge engines registered against the base model."""
+        CausalLMWithValueHead._maybe_sync_esurge_cache_scope(self)
         return self.model.list_esurge_engines(*args, **kwargs)

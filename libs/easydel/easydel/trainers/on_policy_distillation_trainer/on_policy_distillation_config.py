@@ -74,6 +74,13 @@ class OnPolicyDistillationConfig(DistillationConfig):
         default="OnPolicyDistillation",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
+    alpha: float = field(
+        default=1.0,
+        metadata={
+            "help": "Weight applied to the on-policy KL distillation loss (defaults to 1.0 because no hard-label CE "
+            "term is active during on-policy rollouts)."
+        },
+    )
     remove_unused_columns: bool | None = field(
         default=False,
         metadata={"help": "Whether to remove unused columns from the dataset."},
@@ -153,6 +160,7 @@ class OnPolicyDistillationConfig(DistillationConfig):
                 or if ``max_prompt_length + max_completion_length`` exceeds
                 ``max_length``.
         """
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         default_prompt = type(self).__dataclass_fields__["max_prompt_length"].default
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_prompt_length is None:
@@ -186,7 +194,7 @@ class OnPolicyDistillationConfig(DistillationConfig):
         if self.generation_top_p is None:
             self.generation_top_p = self.top_p
         if self.generation_top_k is None:
-            self.generation_top_k = self.top_k
+            self.generation_top_k = 0 if self.top_k is None else self.top_k
         self.max_prompt_length = None  # type: ignore[assignment]
         self.max_completion_length = None  # type: ignore[assignment]
         self.top_p = 1.0

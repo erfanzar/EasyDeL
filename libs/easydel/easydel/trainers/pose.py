@@ -49,6 +49,15 @@ import numpy as np
 
 IGNORE_INDEX = -100
 POSE_GAP_MODES = ("uniform", "biased", "log_uniform")
+_POSE_RNG_STREAM = 0x504F5345
+
+
+def pose_rng(seed: int, step: int) -> np.random.Generator:
+    """Generator for one microbatch, keyed on ``(seed, step)`` without collisions or negative-seed errors."""
+    s = int(seed)
+    st = int(step)
+    entropy = [1 if s < 0 else 0, abs(s), 1 if st < 0 else 0, abs(st), _POSE_RNG_STREAM]
+    return np.random.default_rng(np.random.SeedSequence(entropy))
 
 
 @dataclass
@@ -221,17 +230,49 @@ def valid_sequence_end(
     labels: np.ndarray | None,
     pad_id: int | None,
     ignore_index: int,
+    *,
+    attention_mask: np.ndarray | None = None,
+    segment_ids: np.ndarray | None = None,
 ) -> int:
-    """Index one-past the last non-(padded-tail) token; the trailing pad region is untouched.
+    """Index one-past the last non-padded token; the trailing pad region is untouched.
 
-    A padded-tail position has ``token == pad_id`` AND ``label == ignore_index``. Requires
-    rank-2 ``tokens``+``labels`` and a ``pad_id``; otherwise the whole row is valid.
+    Positions with ``segment_ids < 0``, ``attention_mask == 0``, or
+    ``(token == pad_id) & (label == ignore_index)`` are treated as padding.
     """
-    if tokens is None or labels is None or pad_id is None or tokens.ndim != 2 or labels.ndim != 2:
+    is_pad = np.zeros(seq_len, dtype=bool)
+    has_pad_signal = False
+    if segment_ids is not None and segment_ids.ndim == 2 and sample_idx < segment_ids.shape[0]:
+        is_pad |= segment_ids[sample_idx, :seq_len] < 0
+        has_pad_signal = True
+    if attention_mask is not None and attention_mask.ndim == 2 and sample_idx < attention_mask.shape[0]:
+        is_pad |= attention_mask[sample_idx, :seq_len] == 0
+        has_pad_signal = True
+    if tokens is not None and labels is not None and pad_id is not None and tokens.ndim == 2 and labels.ndim == 2:
+        is_pad |= (tokens[sample_idx, :seq_len] == pad_id) & (labels[sample_idx, :seq_len] == ignore_index)
+        has_pad_signal = True
+    if not has_pad_signal:
         return seq_len
-    pad_tail = (tokens[sample_idx] == pad_id) & (labels[sample_idx] == ignore_index)
-    non_tail = np.flatnonzero(~pad_tail)
+    non_tail = np.flatnonzero(~is_pad)
     return int(non_tail[-1]) + 1 if non_tail.size > 0 else 0
+
+
+def _filter_ranges_by_mask(ranges: list[tuple[int, int]], active: np.ndarray) -> list[tuple[int, int]]:
+    """Split/trim ``(start, end)`` ranges to maximal contiguous runs where ``active`` is ``True``."""
+    out: list[tuple[int, int]] = []
+    for start, end in ranges:
+        sub = active[start:end]
+        if bool(sub.all()):
+            out.append((start, end))
+            continue
+        if not bool(sub.any()):
+            continue
+        padded = np.concatenate(([False], sub, [False]))
+        diffs = np.diff(padded.astype(np.int8))
+        run_starts = np.flatnonzero(diffs == 1)
+        run_ends = np.flatnonzero(diffs == -1)
+        for rs, re_ in zip(run_starts.tolist(), run_ends.tolist(), strict=True):
+            out.append((start + rs, start + re_))
+    return out
 
 
 def document_segment_ranges(
@@ -242,16 +283,25 @@ def document_segment_ranges(
     seq_lens_num: np.ndarray | None,
     cu_seqlens: np.ndarray | None,
     cu_seqlens_num: np.ndarray | None,
+    *,
+    attention_mask: np.ndarray | None = None,
+    segment_ids: np.ndarray | None = None,
 ) -> list[tuple[int, int]]:
     """Per-document ``(start, end)`` ranges within ``[0, valid_end)``; first source wins.
 
-    Priority: explicit ``seq_lens`` (cumulative lengths) → ``cu_seqlens`` (cumulative
-    offsets) → ``positions == 0`` resets → a single ``[0, valid_end)`` segment.
+    Priority: explicit ``segment_ids`` (non-negative contiguous runs) → ``seq_lens``
+    (cumulative lengths) → ``cu_seqlens`` (cumulative offsets) → ``positions == 0`` resets →
+    a single ``[0, valid_end)`` segment. Any ``attention_mask == 0`` positions are excluded.
     """
     if valid_end <= 0:
         return []
 
-    if seq_lens is not None and seq_lens.ndim == 2 and sample_idx < seq_lens.shape[0]:
+    if segment_ids is not None and segment_ids.ndim == 2 and sample_idx < segment_ids.shape[0]:
+        seg_row = segment_ids[sample_idx, :valid_end]
+        changes = (np.flatnonzero(np.diff(seg_row)) + 1).tolist()
+        bounds = [0, *changes, valid_end]
+        ranges = [(lo, hi) for lo, hi in pairwise(bounds) if lo < hi and int(seg_row[lo]) >= 0]
+    elif seq_lens is not None and seq_lens.ndim == 2 and sample_idx < seq_lens.shape[0]:
         if seq_lens_num is not None and seq_lens_num.ndim == 1 and sample_idx < seq_lens_num.shape[0]:
             n_segments = int(seq_lens_num[sample_idx])
         else:
@@ -267,6 +317,7 @@ def document_segment_ranges(
                 break
         if boundaries[-1] != valid_end:
             boundaries.append(valid_end)
+        ranges = list(pairwise(boundaries))
     elif cu_seqlens is not None and cu_seqlens.ndim == 2 and sample_idx < cu_seqlens.shape[0]:
         if cu_seqlens_num is not None and cu_seqlens_num.ndim == 1 and sample_idx < cu_seqlens_num.shape[0]:
             n_boundaries = int(cu_seqlens_num[sample_idx])
@@ -283,30 +334,44 @@ def document_segment_ranges(
                 break
         if boundaries[-1] != valid_end:
             boundaries.append(valid_end)
+        ranges = list(pairwise(boundaries))
     else:
         reset_points = (np.flatnonzero(positions[sample_idx, 1:valid_end] == 0) + 1).tolist()
         boundaries = [0, *reset_points, valid_end]
+        ranges = list(pairwise(boundaries))
 
-    return list(pairwise(boundaries))
+    if attention_mask is not None and attention_mask.ndim == 2 and sample_idx < attention_mask.shape[0]:
+        active = attention_mask[sample_idx, :valid_end] != 0
+        ranges = _filter_ranges_by_mask(ranges, active)
+    return ranges
 
 
 def seq_lens_from_segment_ids(segment_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row document lengths from packed ``segment_ids`` ``[B, S]`` (contiguous-equal runs).
+    """Per-row contiguous run lengths from packed ``segment_ids`` ``[B, S]``.
 
-    Returns ``(seq_lens[B, max_segs], seq_lens_num[B])`` for the core's ``seq_lens`` path. Every
-    run (including any trailing padding run) becomes a segment; the core then caps them at
-    ``valid_end`` so the padded tail is dropped.
+    Returns ``(seq_lens[B, max_segs], seq_lens_num[B])`` for the core's ``seq_lens`` path.
+    Trailing padding runs (``segment_ids < 0`` at the end of a row) are trimmed, while
+    leading and interior ``< 0`` separator runs are retained so cumulative boundaries stay
+    aligned with subsequent documents when callers omit ``segment_ids``.
     """
     rows: list[list[int]] = []
     for row in segment_ids:
+        if len(row) == 0:
+            rows.append([])
+            continue
         change = (np.flatnonzero(np.diff(row)) + 1).tolist()
         bounds = [0, *change, len(row)]
-        rows.append([bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)])
+        runs = [(hi - lo, int(row[lo])) for lo, hi in pairwise(bounds)]
+        while runs and runs[-1][1] < 0:
+            runs.pop()
+        rows.append([length for length, _ in runs])
     max_segs = max((len(r) for r in rows), default=1)
+    max_segs = max(max_segs, 1)
     seq_lens = np.zeros((len(rows), max_segs), dtype=np.int64)
     seq_lens_num = np.zeros(len(rows), dtype=np.int64)
     for b, lens in enumerate(rows):
-        seq_lens[b, : len(lens)] = lens
+        if lens:
+            seq_lens[b, : len(lens)] = lens
         seq_lens_num[b] = len(lens)
     return seq_lens, seq_lens_num
 
@@ -314,6 +379,30 @@ def seq_lens_from_segment_ids(segment_ids: np.ndarray) -> tuple[np.ndarray, np.n
 _sample_valid_end = valid_sequence_end
 _sample_segment_ranges = document_segment_ranges
 _seq_lens_from_segment_ids = seq_lens_from_segment_ids
+
+
+def _shared_mrope_cu_seqlens(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Derive shared ``(cu_seqlens, cu_seqlens_num)`` across all axes of a 3-D mRoPE array.
+
+    A new packed document resets every mRoPE axis ``(T, H, W)`` to ``0`` simultaneously;
+    segmenting jointly prevents spatial H/W coordinate resets inside an image grid from
+    desynchronizing axes when ``segment_ids`` is absent.
+    """
+    bsz, seq_len = positions.shape[1], positions.shape[2]
+    all_bounds: list[list[int]] = []
+    for b in range(bsz):
+        if seq_len <= 1:
+            all_bounds.append([0, seq_len])
+            continue
+        resets = (np.flatnonzero(np.all(positions[:, b, 1:seq_len] == 0, axis=0)) + 1).tolist()
+        all_bounds.append([0, *resets, seq_len])
+    max_b = max((len(bounds) for bounds in all_bounds), default=2)
+    cu_seqlens = np.zeros((bsz, max_b), dtype=np.int64)
+    cu_seqlens_num = np.zeros(bsz, dtype=np.int64)
+    for b, bounds in enumerate(all_bounds):
+        cu_seqlens[b, : len(bounds)] = bounds
+        cu_seqlens_num[b] = len(bounds)
+    return cu_seqlens, cu_seqlens_num
 
 
 def extract_position_batch(batch: collections.abc.Mapping, *, feature: str) -> tuple[np.ndarray, dict]:
@@ -327,8 +416,9 @@ def extract_position_batch(batch: collections.abc.Mapping, *, feature: str) -> t
         feature: Config name used in error messages.
 
     Returns:
-        ``(positions, inputs)`` where ``inputs`` holds ``tokens`` / ``labels`` / ``seq_lens`` /
-        ``seq_lens_num`` (``None`` when absent).
+        ``(positions, inputs)`` where ``inputs`` holds ``tokens`` / ``labels`` / ``attention_mask`` /
+        ``segment_ids`` / ``seq_lens`` / ``seq_lens_num`` / ``cu_seqlens`` / ``cu_seqlens_num``
+        (``None`` when absent).
 
     Raises:
         ValueError: When ``position_ids`` is missing or not rank 2 / 3.
@@ -341,14 +431,20 @@ def extract_position_batch(batch: collections.abc.Mapping, *, feature: str) -> t
     positions = np.array(batch["position_ids"])
     if positions.ndim not in (2, 3):
         raise ValueError(f"batch position_ids must be rank-2 [B,S] or rank-3 [axes,B,S], got {positions.ndim}.")
+    segment_ids = np.asarray(batch["segment_ids"]) if batch.get("segment_ids") is not None else None
     seq_lens = seq_lens_num = None
-    if "segment_ids" in batch:
-        seq_lens, seq_lens_num = seq_lens_from_segment_ids(np.asarray(batch["segment_ids"]))
+    cu_seqlens = cu_seqlens_num = None
+    if segment_ids is None and positions.ndim == 3:
+        cu_seqlens, cu_seqlens_num = _shared_mrope_cu_seqlens(positions)
     inputs = {
-        "tokens": np.asarray(batch["input_ids"]) if "input_ids" in batch else None,
-        "labels": np.asarray(batch["labels"]) if "labels" in batch else None,
+        "tokens": np.asarray(batch["input_ids"]) if batch.get("input_ids") is not None else None,
+        "labels": np.asarray(batch["labels"]) if batch.get("labels") is not None else None,
+        "attention_mask": np.asarray(batch["attention_mask"]) if batch.get("attention_mask") is not None else None,
+        "segment_ids": segment_ids,
         "seq_lens": seq_lens,
         "seq_lens_num": seq_lens_num,
+        "cu_seqlens": cu_seqlens,
+        "cu_seqlens_num": cu_seqlens_num,
     }
     return positions, inputs
 
@@ -364,7 +460,7 @@ def _draw_gap(config: PoSEConfig, rng: np.random.Generator, max_gap: int) -> int
     if mode == "biased":
         u = rng.random()
         u = 1.0 - (1.0 - u) * (1.0 - u)  # concave warp toward large gaps
-        return int(u * (max_gap + 1))
+        return min(max(int(u * (max_gap + 1)), 0), max_gap)
     if mode == "log_uniform" and max_gap >= config.gap_min:
         u = rng.random()
         lo, hi = math.log(config.gap_min), math.log(max_gap + 1)
@@ -387,6 +483,8 @@ def apply_pose_to_positions(
     cu_seqlens: np.ndarray | None = None,
     cu_seqlens_num: np.ndarray | None = None,
     image_token_id: int | None = None,
+    attention_mask: np.ndarray | None = None,
+    segment_ids: np.ndarray | None = None,
 ) -> None:
     """Apply PoSE in place, mutating only ``positions`` (a rank-2 ``[B, S]`` int array).
 
@@ -411,11 +509,28 @@ def apply_pose_to_positions(
         return
 
     for sample_idx in range(positions.shape[0]):
-        valid_end = valid_sequence_end(sample_idx, seq_len, tokens, labels, pad_id, ignore_index)
+        valid_end = valid_sequence_end(
+            sample_idx,
+            seq_len,
+            tokens,
+            labels,
+            pad_id,
+            ignore_index,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+        )
         if valid_end < 2:
             continue
         segment_ranges = document_segment_ranges(
-            sample_idx, valid_end, positions, seq_lens, seq_lens_num, cu_seqlens, cu_seqlens_num
+            sample_idx,
+            valid_end,
+            positions,
+            seq_lens,
+            seq_lens_num,
+            cu_seqlens,
+            cu_seqlens_num,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
         )
         sample_pos = positions[sample_idx]
         # capture per-doc bases BEFORE any mutation so each doc uses its own original base
@@ -488,7 +603,7 @@ def apply_pose_to_batch(
             axis_positions,
             config=config,
             step=step,
-            rng=np.random.default_rng(seed + step),
+            rng=pose_rng(seed, step),
             pad_id=pad_id,
             ignore_index=ignore_index,
             image_token_id=image_token_id,

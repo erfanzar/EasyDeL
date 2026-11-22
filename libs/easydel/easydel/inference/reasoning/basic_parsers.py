@@ -55,6 +55,53 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._streaming_entered = False
         self._emitted_reasoning = self._emitted_content = ""
 
+    def _delimiter_tokens(self) -> tuple[str, ...]:
+        """Return all non-empty delimiter strings recognized by this parser."""
+        tokens: list[str] = []
+        for attr in ("reasoning_start_tokens", "reasoning_end_tokens"):
+            value = getattr(self, attr, None)
+            if isinstance(value, (tuple, list)):
+                tokens.extend(tok for tok in value if isinstance(tok, str) and tok)
+        for attr in ("start_token", "end_token"):
+            value = getattr(self, attr, None)
+            if isinstance(value, str) and value:
+                tokens.append(value)
+        return tuple(dict.fromkeys(tokens))
+
+    def _delimiters_contain_special_tokens(self) -> bool:
+        """Return whether any reasoning delimiter is registered as a special token."""
+        tokenizer = self.model_tokenizer
+        if tokenizer is None:
+            return False
+        inner = getattr(tokenizer, "tokenizer", None)
+        candidates = (tokenizer, inner) if inner is not None else (tokenizer,)
+        delimiters = self._delimiter_tokens()
+        if not delimiters:
+            return False
+        for tok_obj in candidates:
+            for attr in ("all_special_tokens", "additional_special_tokens"):
+                specials = getattr(tok_obj, attr, None)
+                if isinstance(specials, (list, tuple, set, frozenset)):
+                    special_set = set(specials)
+                    if any(marker in special_set for marker in delimiters):
+                        return True
+            added_decoder = getattr(tok_obj, "added_tokens_decoder", None)
+            if isinstance(added_decoder, dict):
+                vocab = self.vocab
+                for marker in delimiters:
+                    tid = vocab.get(marker)
+                    if tid is not None:
+                        added = added_decoder.get(tid)
+                        if added is not None and getattr(added, "special", False):
+                            return True
+        return False
+
+    def adjust_request(self, request):
+        """Preserve special reasoning delimiters during detokenization when needed."""
+        if hasattr(request, "skip_special_tokens") and self._delimiters_contain_special_tokens():
+            request.skip_special_tokens = False
+        return request
+
     def _is_prompt_reasoning_active(self) -> bool:
         """Return whether reasoning starts before the first generated character."""
         return self.asymmetric_reasoning or self._prompt_started_reasoning or self.assume_reasoning
@@ -92,6 +139,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
         leading = text[: len(text) - len(stripped)]
         if self._is_prompt_reasoning_active():
             content = ""
+            if not final and not stripped:
+                # Hold leading whitespace until a non-whitespace character disambiguates
+                # whether the model repeated ``start_token`` (which would strip ``leading``).
+                return "", ""
             if stripped.startswith(self.start_token):
                 # The model may repeat the opener the prompt already emitted.
                 reasoning_text = stripped[len(self.start_token) :]

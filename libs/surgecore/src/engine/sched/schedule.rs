@@ -86,7 +86,7 @@ fn empty_pages(kv: &KvCore) -> GroupPages {
 }
 
 /// The longest prefix hit of `r` (at most `max_hit` tokens, and at most all but its last token). Computes and keeps
-/// the request's page keys first; a request that takes no hits gets none.
+/// the request's page keys first (extending incrementally if tokens grew); a request that takes no hits gets none.
 pub fn lookup(kv: &mut KvCore, r: &mut Request, max_hit: Option<i64>) -> Result<(GroupPages, i64), CoreError> {
     if !kv.caching() {
         return Ok((empty_pages(kv), 0));
@@ -96,7 +96,9 @@ pub fn lookup(kv: &mut KvCore, r: &mut Request, max_hit: Option<i64>) -> Result<
     if let Some(m) = max_hit {
         max_len = max_len.min(m);
     }
-    let tokens = if kv.num_keys(slot)? == 0 {
+    let ps = kv.chain_page_size();
+    let known = kv.num_keys(slot)?;
+    let tokens = if known == 0 || (ps > 0 && r.tokens.len() / ps > known) {
         Some(Tokens {
             tokens: &r.tokens,
             offset: 0,
@@ -109,7 +111,9 @@ pub fn lookup(kv: &mut KvCore, r: &mut Request, max_hit: Option<i64>) -> Result<
 
 fn page_keys(kv: &mut KvCore, r: &mut Request) -> Result<Vec<PageKey>, CoreError> {
     let slot = kv_slot(kv, r);
-    let tokens = if kv.num_keys(slot)? == 0 {
+    let ps = kv.chain_page_size();
+    let known = kv.num_keys(slot)?;
+    let tokens = if known == 0 || (ps > 0 && r.tokens.len() / ps > known) {
         Some(Tokens {
             tokens: &r.tokens,
             offset: 0,

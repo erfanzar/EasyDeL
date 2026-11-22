@@ -35,13 +35,12 @@ import collections.abc
 import typing as tp
 
 import jax
+import numpy as np
 import spectrax as spx
-from ejkernel.modules.operations import fused_cross_entropy as _fused_cross_entropy
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array
 from spectrax import with_sharding_constraint
-from spectrax.common_types import BATCH, LENGTH, MODE_TRAIN, VOCAB
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -49,8 +48,10 @@ from easydel.trainers._logprob_utils import (
     compute_sequence_scores_from_hidden_states,
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
+    sum_logits_vocab_chunked,
 )
 
+from .._shared import gather_multimodal_kwargs
 from ..training_utils import (
     ScheduledLossAdapter,
     _scheduled_terminal_stage_rank,
@@ -58,6 +59,7 @@ from ..training_utils import (
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
@@ -68,9 +70,42 @@ from ..training_utils import (
 
 
 def _log1mexp(x: Array) -> Array:
-    """Compute ``log(1 - exp(x))`` stably for non-positive log-probabilities."""
-    cutoff = jnp.array(-0.6931471805599453, dtype=x.dtype)
-    return jnp.where(x < cutoff, jnp.log1p(-jnp.exp(x)), jnp.log(-jnp.expm1(x)))
+    """Compute ``log(1 - exp(x))`` stably for non-positive log-probabilities.
+
+    Clamps inputs at ``-eps`` (for ``x.dtype``) so exact ``0.0`` log-probabilities
+    never produce ``-inf`` / ``NaN`` forward values or gradients, and guards both
+    branches of ``jnp.where`` to keep JAX VJPs finite.
+    """
+    orig_dtype = x.dtype
+    calc_dtype = jnp.result_type(orig_dtype, jnp.float32)
+    x_f = jnp.asarray(x, dtype=calc_dtype)
+    eps_dtype = orig_dtype if jnp.issubdtype(orig_dtype, jnp.floating) else jnp.float32
+    max_x = -jnp.asarray(jnp.finfo(eps_dtype).eps, dtype=calc_dtype)
+    safe_x = jnp.minimum(x_f, max_x)
+    cutoff = jnp.asarray(-0.6931471805599453, dtype=calc_dtype)
+    lower_x = jnp.where(safe_x < cutoff, safe_x, cutoff)
+    upper_x = jnp.where(safe_x < cutoff, cutoff, safe_x)
+    res = jnp.where(safe_x < cutoff, jnp.log1p(-jnp.exp(lower_x)), jnp.log(-jnp.expm1(upper_x)))
+    return res.astype(orig_dtype) if jnp.issubdtype(orig_dtype, jnp.floating) else res
+
+
+def _as_numeric_array(value: tp.Any) -> Array | None:
+    """Convert numeric JAX/NumPy/sequence batch leaves to JAX arrays, skipping non-numeric metadata."""
+    if isinstance(value, jax.Array):
+        return value
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind in ("U", "S", "O"):
+            return None
+        return jnp.asarray(value)
+    if isinstance(value, (list, tuple)):
+        try:
+            arr = np.asarray(value)
+        except ValueError:
+            return None
+        if arr.dtype.kind in ("U", "S", "O"):
+            return None
+        return jnp.asarray(arr)
+    return None
 
 
 def _require_scoreable_labels(labels: Array, label_pad_token_id: int) -> None:
@@ -149,21 +184,26 @@ def concatenated_forward(
     """
     if padding_value is None:
         raise ValueError("`padding_value` can not be set as `None` it must be an integer.")
-    model = state.model if isinstance(state, EasyDeLState) else getattr(state, "model", state)
+    if isinstance(state, EasyDeLState) or (not callable(state) and hasattr(state, "model")):
+        model = state.model
+    else:
+        model = state
 
     # Concatenate inputs from chosen and rejected examples.
-    concatenated_batch = concatenated_inputs(batch, is_encoder_decoder)
-
-    len_chosen = batch["chosen_labels"].shape[0]
-
-    model_kwargs = (
-        {
-            "labels": concatenated_batch["concatenated_labels"],
-            "decoder_input_ids": concatenated_batch.pop("concatenated_decoder_input_ids", None),
-        }
-        if is_encoder_decoder
-        else {}
+    concatenated_batch = concatenated_inputs(
+        batch,
+        is_encoder_decoder=is_encoder_decoder,
+        label_pad_token_id=label_pad_token_id,
+        padding_value=padding_value,
+        max_length=max_length,
     )
+
+    len_chosen = concatenated_batch["concatenated_labels"].shape[0] // 2
+
+    model_kwargs: dict[str, tp.Any] = gather_multimodal_kwargs(concatenated_batch)
+    if is_encoder_decoder:
+        model_kwargs["labels"] = concatenated_batch["concatenated_labels"]
+        model_kwargs["decoder_input_ids"] = concatenated_batch.pop("concatenated_decoder_input_ids", None)
     lmhead_chunksize = None
     if not is_encoder_decoder:
         lmhead_chunksize = resolve_lmhead_chunksize(model)
@@ -199,64 +239,6 @@ def concatenated_forward(
                 pad_values = jnp.full(pad_shape, label_pad_token_id, dtype=effective_labels.dtype)
                 effective_labels = jnp.concatenate((effective_labels, pad_values), axis=1)
 
-    def cross_entropy_loss(logits, labels):
-        """Compute cross-entropy loss and token-level accuracy.
-
-        For decoder-only models the logits/labels are causally shifted
-        (drop the last logit, drop the first label) before scoring.
-
-        Args:
-            logits (Array): Logits produced by the model with shape
-                ``(batch, seq_len, vocab_size)``.
-            labels (Array): Ground-truth label ids with shape
-                ``(batch, seq_len)``.
-
-        Returns:
-            tuple[Array, Array]: ``(loss, accuracy)`` -- scalar
-            cross-entropy averaged over non-padding tokens and the
-            corresponding masked top-1 accuracy.
-        """
-        if not is_encoder_decoder:
-            logits = logits[..., :-1, :]
-            labels = labels[..., 1:]
-        # masked-mean NLL over non-padding tokens via the ejkernel fused kernel (XLA backend). On a real
-        # (>1) TP mesh, resolve [BATCH, LENGTH, VOCAB] / [BATCH, LENGTH] specs and run inside shard_map so
-        # the vocab stays TP-sharded -- the full [B, S, V] logits are never all-reduced for the softmax.
-        ce_kwargs: dict[str, tp.Any] = dict(ignore_index=label_pad_token_id, reduction="mean", platform="xla")
-        ce_mesh = spx.get_current_stage_mesh(spx.get_incontext_mesh(raise_error=False), raise_error=False)
-        ce_logits, ce_labels = logits, labels
-        # Vocab-parallel NLL only for a real (>1) ``tp`` axis (no vocab to shard at tp=1). shard_map needs
-        # every meshed leading dim evenly divisible -- the chosen-only half is frequently indivisible
-        # (e.g. 1 row over fsdp=2), so pad [batch, seq] up to the sharded-axis product first. Padded rows
-        # carry ``label_pad_token_id`` and are dropped by the masked mean (and excluded from accuracy).
-        if ce_mesh is not None and "tp" in ce_mesh.axis_names and int(ce_mesh.shape["tp"]) > 1:
-            _pm = spx.PartitionManager(paxis=model.config.partition_axis)
-            _logit_spec = _pm.resolve([BATCH, LENGTH, VOCAB], MODE_TRAIN)
-            _token_spec = _pm.resolve([BATCH, LENGTH], MODE_TRAIN)
-
-            def _axis_prod(entry):
-                names = entry if isinstance(entry, tuple) else ((entry,) if entry is not None else ())
-                prod = 1
-                for nm in names:
-                    prod *= int(ce_mesh.shape[nm])
-                return prod
-
-            pads = [
-                (-int(d)) % max(_axis_prod(_token_spec[i]) if i < len(_token_spec) else 1, 1)
-                for i, d in enumerate(logits.shape[:-1])
-            ]
-            if any(p > 0 for p in pads):
-                ce_logits = jnp.pad(logits, [(0, p) for p in pads] + [(0, 0)])
-                ce_labels = jnp.pad(labels, [(0, p) for p in pads], constant_values=label_pad_token_id)
-            ce_kwargs.update(mesh=ce_mesh, in_specs=(_logit_spec, _token_spec), out_specs=PartitionSpec())
-        loss = _fused_cross_entropy(ce_logits, ce_labels, **ce_kwargs).loss
-        valid = labels != label_pad_token_id
-        safe_labels = jnp.where(valid, labels, 0)
-        accuracy = jnp.sum(
-            valid.astype(jnp.float32) * (jnp.argmax(logits, axis=-1) == safe_labels).astype(jnp.float32)
-        ) / jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
-        return loss, accuracy
-
     if is_encoder_decoder:
         labels = effective_labels
     else:
@@ -286,18 +268,18 @@ def concatenated_forward(
             return_correct_counts=True,
             vocab_shard_stage=vocab_shard_stage,
         )
-        token_counts = jnp.maximum(token_counts, 1.0)
-        all_log_probs = sum_logps / token_counts
+        safe_token_counts = jnp.maximum(token_counts, 1.0)
+        all_log_probs = sum_logps / safe_token_counts
         chosen_log_probs = all_log_probs[:len_chosen]
         rejected_log_probs = all_log_probs[len_chosen:]
         chosen_logits = jnp.where(
             token_counts[:len_chosen] > 0,
-            token_logit_sums[:len_chosen] / token_counts[:len_chosen],
+            token_logit_sums[:len_chosen] / safe_token_counts[:len_chosen],
             0.0,
         )
         rejected_logits = jnp.where(
             token_counts[len_chosen:] > 0,
-            token_logit_sums[len_chosen:] / token_counts[len_chosen:],
+            token_logit_sums[len_chosen:] / safe_token_counts[len_chosen:],
             0.0,
         )
         chosen_nll_loss = -sum_logps[:len_chosen].sum() / jnp.maximum(token_counts[:len_chosen].sum(), 1.0)
@@ -305,28 +287,39 @@ def concatenated_forward(
     else:
         if all_logits is None:
             raise TypeError(f"{type(model).__name__} did not return logits.")
-        chosen_nll_loss, chosen_accuracy = cross_entropy_loss(
-            all_logits[:len_chosen],
-            labels[:len_chosen],
+        shifted_logits = all_logits if is_encoder_decoder else all_logits[:, :-1, :]
+        shifted_labels = labels if is_encoder_decoder else labels[:, 1:]
+        loss_mask = shifted_labels != label_pad_token_id
+        safe_labels = jnp.where(loss_mask, shifted_labels, 0)
+        per_token_logps, _ = compute_token_logps_and_entropies_chunked(
+            shifted_logits,
+            safe_labels,
+            return_entropy=False,
+            chunk_size=logprob_vocab_chunk_size,
         )
-
-        all_log_probs = get_batch_logps(
-            all_logits,
-            labels,
-            average_log_prob=True,
-            is_encoder_decoder=is_encoder_decoder,
-            label_pad_token_id=label_pad_token_id,
-            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
-        )
+        masked_logps = jnp.where(loss_mask, per_token_logps, 0.0)
+        token_counts = loss_mask.astype(jnp.float32).sum(axis=-1)
+        safe_token_counts = jnp.maximum(token_counts, 1.0)
+        all_log_probs = masked_logps.sum(axis=-1) / safe_token_counts
 
         chosen_log_probs = all_log_probs[:len_chosen]
         rejected_log_probs = all_log_probs[len_chosen:]
-        all_logit_summaries = get_batch_mean_logit_summaries(
-            all_logits,
-            labels,
-            label_pad_token_id=label_pad_token_id,
-            is_encoder_decoder=is_encoder_decoder,
+        chosen_valid = loss_mask[:len_chosen]
+        chosen_token_total = jnp.maximum(token_counts[:len_chosen].sum(), 1.0)
+        chosen_nll_loss = -masked_logps[:len_chosen].sum() / chosen_token_total
+        chosen_accuracy = (
+            jnp.sum(
+                jnp.where(
+                    chosen_valid,
+                    (jnp.argmax(shifted_logits[:len_chosen], axis=-1) == safe_labels[:len_chosen]).astype(jnp.float32),
+                    0.0,
+                )
+            )
+            / chosen_token_total
         )
+
+        token_logit_sums = sum_logits_vocab_chunked(shifted_logits, chunk_size=logprob_vocab_chunk_size)
+        all_logit_summaries = jnp.where(loss_mask, token_logit_sums, 0.0).sum(axis=-1) / safe_token_counts
         chosen_logits = all_logit_summaries[:len_chosen]
         rejected_logits = all_logit_summaries[len_chosen:]
     return (
@@ -460,53 +453,93 @@ def get_batch_mean_logit_summaries(
 
 
 def concatenated_inputs(
-    batch: dict[str, list | Array],
+    batch: collections.abc.Mapping[str, list | Array],
     is_encoder_decoder: bool = False,
+    label_pad_token_id: int = -100,
+    padding_value: int = 0,
+    max_length: int | None = None,
 ) -> dict[str, Array]:
     """Concatenate chosen and rejected entries of a preference batch.
 
     Pairs every ``chosen<suffix>`` array with the matching
-    ``rejected<suffix>`` array and emits a single ``concatenated<suffix>``
-    entry that stacks them along the batch axis. For encoder-decoder
-    models the prompt inputs and attention masks are additionally
-    repeated twice along the batch axis so each branch sees its prompt.
+    ``rejected<suffix>`` array, right-pads unequal sequence lengths to a
+    shared width (capping at ``max_length`` when provided), and emits a
+    single ``concatenated<suffix>`` entry stacked along the batch axis.
+    Multimodal vision inputs (``pixel_values``, ``pixel_attention_mask``,
+    ``image_sizes``) and encoder-decoder prompt tensors are duplicated
+    along the batch axis so both halves align.
 
     Args:
-        batch (dict[str, list | Array]): Mapping carrying the preference
-            batch. Expected keys include those prefixed by ``"chosen"`` and
-            ``"rejected"`` (and, for encoder-decoder models,
-            ``"prompt_input_ids"`` and ``"prompt_attention_mask"``).
-        is_encoder_decoder (bool): Whether the model is encoder-decoder.
-            Defaults to ``False``.
+        batch: Mapping carrying the preference batch (supports JAX arrays,
+            NumPy arrays, and numeric lists).
+        is_encoder_decoder: Whether the model is encoder-decoder.
+        label_pad_token_id: Pad value used when right-padding label tensors.
+        padding_value: Pad value used when right-padding input-id tensors.
+        max_length: Optional maximum sequence length cap applied to
+            chosen/rejected 2D sequence tensors.
 
     Returns:
-        dict[str, Array]: Mapping whose keys are prefixed with
-        ``"concatenated"``, containing the stacked chosen+rejected
-        tensors.
+        dict[str, Array]: Mapping whose chosen/rejected keys are prefixed
+        with ``"concatenated"``, plus duplicated multimodal keys when present.
     """
-    concatenated_batch = {}
+    concatenated_batch: dict[str, Array] = {}
 
-    for k in batch:
-        if k.startswith("chosen") and isinstance(batch[k], jax.Array):
-            concatenated_key = k.replace("chosen", "concatenated")
-            concatenated_batch[concatenated_key] = batch[k]
-    for k in batch:
-        if k.startswith("rejected") and isinstance(batch[k], jax.Array):
-            concatenated_key = k.replace("rejected", "concatenated")
-            concatenated_batch[concatenated_key] = jnp.concatenate(
-                (concatenated_batch[concatenated_key], batch[k]), axis=0
-            )
+    def _pad_value_for_key(key: str) -> int:
+        if key.endswith("_labels"):
+            return label_pad_token_id
+        if key.endswith("_attention_mask"):
+            return 0
+        if key.endswith("_input_ids") or "decoder_input_ids" in key:
+            return padding_value
+        return 0
+
+    def _pad_and_cap_2d(arr: Array, target_len: int, pad_val: int) -> Array:
+        cur_len = arr.shape[1]
+        if cur_len > target_len:
+            return arr[:, :target_len]
+        if cur_len < target_len:
+            return jnp.pad(arr, ((0, 0), (0, target_len - cur_len)), constant_values=pad_val)
+        return arr
+
+    for k, raw_val in batch.items():
+        if not k.startswith("chosen"):
+            continue
+        chosen_arr = _as_numeric_array(raw_val)
+        if chosen_arr is None:
+            continue
+        concatenated_key = k.replace("chosen", "concatenated", 1)
+        rejected_key = k.replace("chosen", "rejected", 1)
+        rejected_arr = _as_numeric_array(batch[rejected_key]) if rejected_key in batch else None
+        if rejected_arr is None:
+            if max_length is not None and chosen_arr.ndim == 2 and chosen_arr.shape[1] > max_length:
+                chosen_arr = chosen_arr[:, :max_length]
+            concatenated_batch[concatenated_key] = chosen_arr
+            continue
+
+        if chosen_arr.ndim == 2 and rejected_arr.ndim == 2:
+            if max_length is not None:
+                chosen_arr = chosen_arr[:, :max_length]
+                rejected_arr = rejected_arr[:, :max_length]
+            target_len = max(int(chosen_arr.shape[1]), int(rejected_arr.shape[1]))
+            pad_val = _pad_value_for_key(concatenated_key)
+            chosen_arr = _pad_and_cap_2d(chosen_arr, target_len, pad_val)
+            rejected_arr = _pad_and_cap_2d(rejected_arr, target_len, pad_val)
+
+        concatenated_batch[concatenated_key] = jnp.concatenate((chosen_arr, rejected_arr), axis=0)
+
+    for key in ("pixel_values", "pixel_attention_mask", "image_sizes"):
+        if key in batch:
+            arr = _as_numeric_array(batch[key])
+            if arr is not None:
+                concatenated_batch[key] = jnp.concatenate([arr, arr], axis=0)
 
     # For encoder-decoder models, duplicate prompt inputs along the BATCH axis to line up with the
-    # chosen/rejected completions (which are concatenated on axis 0 above). ``.repeat(2, 1)`` wrongly doubled
-    # the sequence axis -> (batch, 2*seq); use a batch-axis concatenate to get (2*batch, seq), matching DPO.
+    # chosen/rejected completions (which are concatenated on axis 0 above).
     if is_encoder_decoder:
-        concatenated_batch["concatenated_input_ids"] = jnp.concatenate(
-            [batch["prompt_input_ids"], batch["prompt_input_ids"]], axis=0
-        )
-        concatenated_batch["concatenated_attention_mask"] = jnp.concatenate(
-            [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], axis=0
-        )
+        prompt_ids = jnp.asarray(batch["prompt_input_ids"])
+        prompt_mask = jnp.asarray(batch["prompt_attention_mask"])
+        concatenated_batch["concatenated_input_ids"] = jnp.concatenate([prompt_ids, prompt_ids], axis=0)
+        concatenated_batch["concatenated_attention_mask"] = jnp.concatenate([prompt_mask, prompt_mask], axis=0)
 
     return concatenated_batch
 
@@ -674,10 +707,6 @@ def orpo_step(
                     "log_odds_chosen": log_odds_chosen,
                 }
 
-                if mode == "eval":
-                    # Prefix metric names with 'eval_' in evaluation mode.
-                    metrics = {f"eval_{k}": v for k, v in metrics.items()}
-
             return loss, LossMetrics(
                 loss=loss,
                 other_metrics=metrics,
@@ -801,6 +830,8 @@ def _make_orpo_scheduled_loss(call):
     concatenated_forward = call.get("concatenated_forward")
     beta = call.get("beta")
     partition_spec = call.get("partition_spec")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict):
         """Compute the ORPO scalar loss for the scheduled-loss adapter.
@@ -814,9 +845,9 @@ def _make_orpo_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/orpo/scheduled_loss"):
             with jax.named_scope("easydel/trainer/orpo/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, schedule)
             with jax.named_scope("easydel/trainer/orpo/scheduled_loss/policy_forward"):
                 (
                     policy_chosen_logps,

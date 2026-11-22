@@ -33,7 +33,9 @@ import re
 from collections.abc import Sequence
 from uuid import uuid4
 
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -46,10 +48,12 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ..utils import partial_json_loads, stable_json_stream_prefix
 
 logger = get_logger(__name__)
 
 REGEX_FUNCTION_CALL = re.compile(r"function call(?:<\|role_sep\|>)?\n?(\{.*)", re.DOTALL)
+_REGEX_FUNCTION_CALL_HEADER = re.compile(r"function call(?:<\|role_sep\|>)?\n?(?=\{)")
 _TRIGGER_WORD = "function call"
 # Every spelling of the separator that may sit between ``function call`` and the opening ``{``
 # (the ``<|role_sep|>`` special token may be stripped by the detokenizer).
@@ -99,6 +103,28 @@ class GigaChat3ToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.content_buffer: str = ""
         self.trigger_start = "function call{"
+        self._active_header_start: int | None = None
+        self._active_json_start: int | None = None
+        self._cursor: int = 0
+        self._accumulated_text: str = ""
+        self._streaming_initialized: bool = False
+        self._tool_completed: bool = False
+
+    def _reset_streaming_state(self, cursor: int = 0) -> None:
+        self.tool_started = False
+        self.tool_name_sent = False
+        self.tool_id = None
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.content_buffer = ""
+        self._active_header_start = None
+        self._active_json_start = None
+        self._cursor = cursor
+        self._accumulated_text = ""
+        self._streaming_initialized = False
+        self._tool_completed = False
 
     @staticmethod
     def _may_become_function_call(buffer: str) -> bool:
@@ -114,6 +140,8 @@ class GigaChat3ToolParser(ToolParser):
         Returns:
             True while the buffer must keep being withheld.
         """
+        if not buffer:
+            return False
         if len(buffer) <= len(_TRIGGER_WORD):
             return _TRIGGER_WORD.startswith(buffer)
         if not buffer.startswith(_TRIGGER_WORD):
@@ -139,6 +167,8 @@ class GigaChat3ToolParser(ToolParser):
         Returns:
             Whether content is withheld or the stream is parsing a tool call.
         """
+        if self._streaming_initialized:
+            return self.tool_started or bool(self.content_buffer)
         return (
             self.tool_started
             or bool(self.content_buffer)
@@ -156,8 +186,18 @@ class GigaChat3ToolParser(ToolParser):
             Unemitted plain text, or an empty string for an active call or after
             a previous flush. Repeated flushes without new input are idempotent.
         """
+        if self.tool_name_sent:
+            self.content_buffer = ""
+            self._accumulated_text = ""
+            return ""
+        self.tool_started = False
+        self._active_header_start = None
+        self._active_json_start = None
         content, self.content_buffer = self.content_buffer, ""
-        return "" if self.tool_started else content
+        if self._streaming_initialized:
+            self._cursor = len(self._accumulated_text)
+        self._accumulated_text = ""
+        return content
 
     def extract_tool_calls(
         self,
@@ -190,28 +230,27 @@ class GigaChat3ToolParser(ToolParser):
             >>> result.tool_calls[0].function.name
             'search'
         """
-        match = REGEX_FUNCTION_CALL.search(model_output)
-        if not match:
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+        dec = json.JSONDecoder()
+        for match in _REGEX_FUNCTION_CALL_HEADER.finditer(model_output):
+            try:
+                data, _ = dec.raw_decode(model_output, match.end())
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                continue
 
-        json_candidate = match.group(1).strip()
-        try:
-            data = json.loads(json_candidate)
-        except json.JSONDecodeError:
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+            if not (isinstance(data, dict) and isinstance(data.get("name"), str) and data.get("name") and "arguments" in data):
+                continue
 
-        if not (isinstance(data, dict) and "name" in data and "arguments" in data):
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+            name = data["name"]
+            args = data["arguments"]
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
 
-        name = data["name"]
-        args = data["arguments"]
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
+            tool_calls = [ToolCall(type="function", function=FunctionCall(name=name, arguments=args))]
+            prefix = model_output[: match.start()]
+            content = prefix.rstrip() if prefix and prefix.strip() else None
+            return ExtractedToolCallInformation(tools_called=True, tool_calls=tool_calls, content=content)
 
-        tool_calls = [ToolCall(type="function", function=FunctionCall(name=name, arguments=args))]
-        prefix = model_output[: match.start()]
-        content = prefix.rstrip() if prefix and prefix.strip() else None
-        return ExtractedToolCallInformation(tools_called=True, tool_calls=tool_calls, content=content)
+        return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -253,103 +292,246 @@ class GigaChat3ToolParser(ToolParser):
             tool_id, prev_tool_call_arr, content_buffer) and should be called
             sequentially for each streaming step.
         """
-        func_name = None
-        cur_args = None
-        content = None
+        del delta_text, previous_token_ids, current_token_ids, delta_token_ids, request
+        if not previous_text:
+            self._reset_streaming_state(0)
+            self._streaming_initialized = True
+        elif not self._streaming_initialized:
+            self._reset_streaming_state(len(previous_text))
+            self._streaming_initialized = True
 
-        if not self.tool_started:
-            self.content_buffer += delta_text
-            match = REGEX_FUNCTION_CALL.search(current_text)
-            if match:
-                # Only the buffered suffix is still un-emitted. Preserve its
-                # ordinary prefix even when the header and JSON share a chunk.
-                prefix_length = max(0, len(self.content_buffer) - (len(current_text) - match.start()))
-                content = self.content_buffer[:prefix_length] or None
-                self.tool_started = True
-                self.content_buffer = ""
-            else:
-                clean_buffer = self.content_buffer.lstrip()
-                if self._may_become_function_call(clean_buffer):
+        self._accumulated_text = current_text
+        dec = json.JSONDecoder()
+        content_parts: list[str] = []
+
+        if self.tool_name_sent:
+            if self._tool_completed:
+                return None
+
+            json_start = self._active_json_start
+            if json_start is None:
+                match = _REGEX_FUNCTION_CALL_HEADER.search(current_text)
+                if not match:
                     return None
+                json_start = match.end()
+                self._active_json_start = json_start
+
+            is_complete = False
+            json_end = json_start
+            data: object = None
+            try:
+                data, json_end = dec.raw_decode(current_text, json_start)
+                is_complete = True
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                json_tail = current_text[json_start:]
+                try:
+                    data, _ = partial_json_loads(json_tail, Allow.ALL)
+                except (
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    ValueError,
+                    AssertionError,
+                    RecursionError,
+                ):
+                    return None
+
+            if is_complete:
+                self.tool_started = False
+                self._tool_completed = True
+                self._cursor = json_end
+
+            if not isinstance(data, dict):
+                return None
+
+            raw_args = data.get("arguments")
+            if raw_args is None:
+                return None
+            serialized = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
+            safe_args = serialized if is_complete else stable_json_stream_prefix(serialized)
+
+            prev_args = self.streamed_args_for_tool[0]
+            if not safe_args.startswith(prev_args):
+                return None
+
+            delta_args = safe_args[len(prev_args) :]
+            if not delta_args:
+                return None
+
+            self.prev_tool_call_arr[0]["arguments"] = safe_args
+            self.streamed_args_for_tool[0] = safe_args
+            return DeltaMessage(
+                tool_calls=[
+                    DeltaToolCall(
+                        index=0,
+                        function=DeltaFunctionCall(arguments=delta_args).model_dump(exclude_none=True),
+                    )
+                ],
+                content=None,
+            )
+
+        while True:
+            if not self.tool_started:
+                matched_header = _REGEX_FUNCTION_CALL_HEADER.search(current_text, self._cursor)
+
+                if matched_header is not None:
+                    if matched_header.start() > self._cursor:
+                        content_parts.append(current_text[self._cursor : matched_header.start()])
+                    self.tool_started = True
+                    self._active_header_start = matched_header.start()
+                    self._active_json_start = matched_header.end()
+                    self._cursor = matched_header.start()
+                    self.content_buffer = current_text[matched_header.start() :]
+                    continue
+
+                rem = current_text[self._cursor :]
+                clean_buffer = rem.lstrip()
+                leading_ws_len = len(rem) - len(clean_buffer)
+                if leading_ws_len > 0:
+                    content_parts.append(rem[:leading_ws_len])
+                    self._cursor += leading_ws_len
+                    rem = clean_buffer
+                if clean_buffer and self._may_become_function_call(clean_buffer):
+                    self.content_buffer = rem
+                    break
+
                 # A header can start anywhere, not just at the beginning of
-                # the content buffer. Emit ordinary text but retain the longest
+                # the remaining text. Emit ordinary text but retain the longest
                 # suffix that a future chunk could complete into a header.
                 pending_length = 0
                 max_header_length = len(_TRIGGER_WORD) + max(map(len, _TRIGGER_TAILS))
-                for length in range(min(len(self.content_buffer), max_header_length - 1), 0, -1):
-                    if self._may_become_function_call(self.content_buffer[-length:]):
+                for length in range(min(len(rem), max_header_length - 1), 0, -1):
+                    if self._may_become_function_call(rem[-length:]):
                         pending_length = length
                         break
-                split = len(self.content_buffer) - pending_length
-                flush_text, self.content_buffer = self.content_buffer[:split], self.content_buffer[split:]
-                return DeltaMessage(content=flush_text) if flush_text else None
+                split = len(rem) - pending_length
+                if split > 0:
+                    content_parts.append(rem[:split])
+                    self._cursor += split
+                self.content_buffer = rem[split:]
+                break
 
-        match = REGEX_FUNCTION_CALL.search(current_text)
-        if not match:
-            return None
+            header_start = self._active_header_start if self._active_header_start is not None else self._cursor
+            json_start = self._active_json_start
+            if json_start is None:
+                match = _REGEX_FUNCTION_CALL_HEADER.search(current_text, header_start)
+                if not match:
+                    self.tool_started = False
+                    self._active_header_start = None
+                    continue
+                header_start = match.start()
+                json_start = match.end()
+                self._active_header_start = header_start
+                self._active_json_start = json_start
 
-        json_tail = match.group(1).strip()
+            self.content_buffer = current_text[header_start:]
 
-        name_match = NAME_REGEX.search(json_tail)
-        if name_match:
-            func_name = name_match.group(1)
-
-        args_match = ARGS_REGEX.search(json_tail)
-        if args_match:
-            cur_args = args_match.group(1).strip()
-            if cur_args.endswith("}"):
+            is_complete = False
+            data = None
+            safe_data: object = None
+            json_end = json_start
+            malformed = False
+            try:
+                data, json_end = dec.raw_decode(current_text, json_start)
+                safe_data = data
+                is_complete = True
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                json_tail = current_text[json_start:]
                 try:
-                    candidate = cur_args[:-1].strip()
-                    json.loads(candidate)
-                    cur_args = candidate
-                except json.JSONDecodeError:
-                    pass
+                    data, _ = partial_json_loads(json_tail, Allow.ALL)
+                except (
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    ValueError,
+                    AssertionError,
+                    RecursionError,
+                ):
+                    malformed = True
+                else:
+                    try:
+                        safe_data, _ = partial_json_loads(json_tail, Allow.ALL & ~Allow.STR)
+                    except (
+                        partial_json_parser.core.exceptions.MalformedJSON,
+                        ValueError,
+                        AssertionError,
+                        RecursionError,
+                    ):
+                        safe_data = {}
 
-        if not self.prev_tool_call_arr:
-            self.prev_tool_call_arr.append({})
+            if malformed:
+                # Non-JSON after "function call{": release prefix as plain content and keep scanning.
+                advance_to = min(len(current_text), json_start + 1)
+                content_parts.append(current_text[header_start:advance_to])
+                self._cursor = advance_to
+                self.tool_started = False
+                self._active_header_start = None
+                self._active_json_start = None
+                self.content_buffer = ""
+                continue
 
-        if not self.tool_name_sent:
-            if not func_name:
-                return DeltaMessage(content=content) if content else None
+            if is_complete:
+                is_valid_call = (
+                    isinstance(data, dict)
+                    and isinstance(data.get("name"), str)
+                    and bool(data.get("name"))
+                    and "arguments" in data
+                )
+                if not is_valid_call:
+                    # Complete non-tool JSON after "function call": emit verbatim as plain content.
+                    content_parts.append(current_text[header_start:json_end])
+                    self._cursor = json_end
+                    self.tool_started = False
+                    self._active_header_start = None
+                    self._active_json_start = None
+                    self.content_buffer = ""
+                    continue
+
+            if not isinstance(data, dict):
+                break
+            if not isinstance(safe_data, dict):
+                safe_data = {}
+
+            raw_name = data.get("name") if is_complete else safe_data.get("name")
+            func_name = raw_name if isinstance(raw_name, str) and raw_name else None
+            if not func_name or "arguments" not in data:
+                break
+
+            if not self.prev_tool_call_arr:
+                self.prev_tool_call_arr.append({})
+            if not self.streamed_args_for_tool:
+                self.streamed_args_for_tool.append("")
+
+            raw_args = data.get("arguments")
+            safe_args = None
+            if raw_args is not None:
+                serialized = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
+                safe_args = serialized if is_complete else stable_json_stream_prefix(serialized)
+
             self.tool_name_sent = True
+            self.current_tool_id = 0
+            self.current_tool_name_sent = True
             self.tool_id = f"chatcmpl-tool-{uuid4()}"
+            self.content_buffer = ""
+            if is_complete:
+                self.tool_started = False
+                self._tool_completed = True
+                self._cursor = json_end
             self.prev_tool_call_arr[0]["name"] = func_name
-            self.prev_tool_call_arr[0]["arguments"] = cur_args or ""
+            initial_args = safe_args if safe_args else ""
+            self.prev_tool_call_arr[0]["arguments"] = initial_args
+            self.streamed_args_for_tool[0] = initial_args
+            content = "".join(content_parts) or None
             return DeltaMessage(
                 tool_calls=[
                     DeltaToolCall(
                         index=0,
                         id=self.tool_id,
                         type="function",
-                        function=DeltaFunctionCall(name=func_name, arguments=cur_args or None).model_dump(
-                            exclude_none=True
-                        ),
+                        function=DeltaFunctionCall(
+                            name=func_name,
+                            arguments=initial_args or None,
+                        ).model_dump(exclude_none=True),
                     )
                 ],
                 content=content,
             )
 
-        if cur_args is None:
-            return None
-
-        prev_args = self.prev_tool_call_arr[0].get("arguments", "")
-        if not prev_args:
-            delta_args = cur_args
-        elif cur_args.startswith(prev_args):
-            delta_args = cur_args[len(prev_args) :]
-        else:
-            return None
-
-        if not delta_args:
-            return None
-
-        self.prev_tool_call_arr[0]["arguments"] = cur_args
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=0,
-                    function=DeltaFunctionCall(arguments=delta_args).model_dump(exclude_none=True),
-                )
-            ],
-            content=None,
-        )
+        content = "".join(content_parts)
+        return DeltaMessage(content=content) if content else None

@@ -47,18 +47,17 @@ class XPOConfig(GRPOConfig):
     used as ``rejected``. The loss is
 
     ``L = L_DPO(beta; chosen, rejected, ref)
-          - alpha * mean(log pi_theta(ref_completion | prompt))``
+          + alpha * sum_t log pi_theta(y^ref_t | prompt, y^ref_<t)``
 
     where ``L_DPO`` is the standard ``"sigmoid"`` Bradley-Terry log-
     sigmoid surrogate (or the IPO squared-loss when
     ``loss_type="ipo"``), ``beta`` controls the KL penalty toward the
-    reference policy, and the second term -- the XPO-specific
-    exploration bonus -- pushes the policy to keep probability mass on
-    the *reference* completion. This balances exploitation (preference
-    signal) against exploration (don't collapse onto a narrow mode).
-    Both ``beta`` and ``alpha`` accept either a scalar (constant
-    schedule) or a sequence (epoch-wise schedule whose tail value is
-    reused once the schedule is exhausted).
+    reference policy, and the second term -- the XPO optimistic
+    exploration bonus -- penalizes placing excessive probability mass on
+    the *reference* completion, encouraging exploration away from the
+    reference policy. Both ``beta`` and ``alpha`` accept either a scalar
+    (constant schedule) or a sequence (epoch-wise schedule whose tail
+    value is reused once the schedule is exhausted).
 
     Inherits all generation / sampling / dataset knobs from
     :class:`GRPOConfig`; XPO fixes ``num_return_sequences`` to 1
@@ -75,8 +74,8 @@ class XPOConfig(GRPOConfig):
             scalar for a constant schedule or a sequence for an
             epoch-wise schedule (final value is reused when the
             schedule is exhausted).
-        alpha: Exploration-bonus weight on
-            ``-mean(log pi_theta(ref_completion | prompt))``. Default
+        alpha: Optimistic exploration weight on
+            ``+sum_t log pi_theta(y^ref_t | prompt, y^ref_<t)``. Default
             is the single-element list ``[1e-5]``, which the
             ``__post_init__`` collapses to the scalar ``1e-5``.
             Sequence form enables epoch-wise scheduling.
@@ -107,8 +106,8 @@ class XPOConfig(GRPOConfig):
     alpha: float | collections.abc.Sequence[float] = field(
         default_factory=lambda: [1e-5],
         metadata={
-            "help": "Weight of the exploratory term that encourages the policy to assign probability mass to "
-            "reference completions. Supports epoch-wise scheduling."
+            "help": "Weight of the optimistic exploratory term (+alpha * log pi_theta(y_ref | x)) discouraging "
+            "collapse onto reference completions. Supports epoch-wise scheduling."
         },
     )
 
@@ -138,6 +137,8 @@ class XPOConfig(GRPOConfig):
                 block size forwarded to the base class.
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
+        if self.loss_type not in ("sigmoid", "ipo"):
+            raise ValueError(f"Unsupported XPO `loss_type`: {self.loss_type!r}. Expected 'sigmoid' or 'ipo'.")
         if isinstance(self.alpha, collections.abc.Sequence) and len(self.alpha) == 1:
             self.alpha = self.alpha[0]
         if isinstance(self.beta, collections.abc.Sequence) and len(self.beta) == 1:

@@ -21,6 +21,7 @@ auth manager runs without persistence, so keys from earlier launches cannot accu
 
 from __future__ import annotations
 
+import errno
 import os
 import secrets
 import stat
@@ -30,15 +31,20 @@ from pathlib import Path
 MIN_KEY_LENGTH = 32
 """Shortest accepted key; generated keys are 64 URL-safe characters after the ``sk-`` prefix."""
 
+_HARDLINK_UNSUPPORTED_ERRNOS = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV, errno.EINVAL})
+
 
 class ApiKeyFileError(RuntimeError):
     """The API-key file is unusable: unreadable, empty, too short or readable by other users."""
 
 
 def _check_private(path: Path) -> None:
-    mode = path.stat().st_mode
+    st = path.stat()
+    mode = st.st_mode
     if not stat.S_ISREG(mode):
         raise ApiKeyFileError(f"{path} is not a regular file")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise ApiKeyFileError(f"{path} is owned by uid {st.st_uid}, expected current user uid {os.getuid()}")
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise ApiKeyFileError(f"{path} is accessible to other users (mode {stat.S_IMODE(mode):o}); chmod 600 it")
 
@@ -47,9 +53,10 @@ def load_or_create_api_key(path: str | Path) -> tuple[str, bool]:
     """Return the serving API key from ``path``, creating the file with a fresh key when it is absent.
 
     Creation is atomic and exclusive: the key is written and flushed to a private temporary file in the same
-    directory, then hard-linked into place, which fails when ``path`` already exists. Two processes racing on a
-    missing file therefore cannot end up with different keys (the loser reads the winner's key), and no reader can
-    ever see the file empty or half-written.
+    directory, then hard-linked into place, which fails when ``path`` already exists. On filesystems that do not
+    support hard links (for example GCS-fuse), creation falls back to ``O_CREAT | O_EXCL`` with mode ``0600``.
+    Two processes racing on a missing file therefore cannot end up with different keys (the loser reads the
+    winner's key), and no reader can ever see the file empty or half-written on hardlink-capable filesystems.
 
     Args:
         path: Key file location (``~`` is expanded). Parent directories are created with mode 0700.
@@ -58,27 +65,53 @@ def load_or_create_api_key(path: str | Path) -> tuple[str, bool]:
         ``(key, created)``.
 
     Raises:
-        ApiKeyFileError: When the file is not a private regular file, cannot be read, or holds no usable key.
+        ApiKeyFileError: When the file is not a private regular file, cannot be created or read, or holds no usable key.
     """
     path = Path(path).expanduser()
     created = False
     if not path.exists():
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        key = f"sk-{secrets.token_urlsafe(48)}"
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)  # mode 0600
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(key + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            key = f"sk-{secrets.token_urlsafe(48)}"
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)  # mode 0600
+            fd_owned = True
             try:
-                os.link(tmp_name, path)
-            except FileExistsError:
-                pass  # another process won the race; read its key below
-            else:
-                created = True
-        finally:
-            os.unlink(tmp_name)
+                fd_owned = False
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(key + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(tmp_name, path)
+                except FileExistsError:
+                    pass  # another process won the race; read its key below
+                except OSError as link_exc:
+                    if link_exc.errno not in _HARDLINK_UNSUPPORTED_ERRNOS:
+                        raise
+                    try:
+                        excl_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    except FileExistsError:
+                        pass  # another process won the race; read its key below
+                    else:
+                        with os.fdopen(excl_fd, "w", encoding="utf-8") as handle:
+                            handle.write(key + "\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        created = True
+                else:
+                    created = True
+            finally:
+                if fd_owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+        except OSError as exc:
+            raise ApiKeyFileError(f"cannot create API key file {path}: {exc}") from exc
     try:
         _check_private(path)
         key = path.read_text(encoding="utf-8").strip()

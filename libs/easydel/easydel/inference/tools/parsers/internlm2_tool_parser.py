@@ -51,9 +51,35 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import stable_json_stream_prefix
+from ..utils import consume_space, partial_json_loads, stable_json_stream_prefix
 
 logger = get_logger(__name__)
+
+
+def _strip_trailing_partial_marker(text: str, marker: str) -> str:
+    """Withhold any trailing non-empty proper prefix of *marker* from *text*."""
+    max_len = min(len(marker) - 1, len(text))
+    for k in range(max_len, 0, -1):
+        if text.endswith(marker[:k]):
+            return text[:-k]
+    return text
+
+
+def _has_open_marker_or_trailing_prefix(text: str, start_token: str, end_token: str) -> bool:
+    """Return True if *text* has an unclosed block or ends with a partial start marker."""
+    pos = 0
+    n = len(text)
+    start_len = len(start_token)
+    end_len = len(end_token)
+    while pos < n:
+        start_idx = text.find(start_token, pos)
+        if start_idx == -1:
+            return ToolParser._has_trailing_marker_prefix(text[pos:], (start_token,))
+        end_idx = text.find(end_token, start_idx + start_len)
+        if end_idx == -1:
+            return True
+        pos = end_idx + end_len
+    return False
 
 
 @ToolParserManager.register_module(["internlm"])  # pyright: ignore[reportUntypedClassDecorator]
@@ -87,6 +113,68 @@ class Internlm2ToolParser(ToolParser):
         self.position = 0
         self.tool_call_start_token = "<|action_start|><|plugin|>"
         self.tool_call_end_token = "<|action_end|>"
+        self._tool_name_sent: list[bool] = []
+        self._tool_call_ids: list[str] = []
+        self._emitted_content_pos: int | None = None
+        self._pending_tail_start: int | None = None
+        self._last_current_text: str = ""
+        self._streaming_initialized: bool = False
+        self._in_open_block: bool = False
+        self._scan_pos: int = 0
+        self._closed_emitted_idx: int = 0
+        self._closed_tracked_calls: list[dict] = []
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether an action block or partial start marker is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return self._in_open_block or self._pending_tail_start is not None
+        return _has_open_marker_or_trailing_prefix(
+            current_text,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+        )
+
+    def _reset_streaming_state(self, emitted_pos: int = 0) -> None:
+        self.position = emitted_pos
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        self._tool_name_sent = []
+        self._tool_call_ids = []
+        self._emitted_content_pos = emitted_pos
+        self._pending_tail_start = None
+        self._last_current_text = ""
+        self._streaming_initialized = False
+        self._in_open_block = False
+        self._scan_pos = 0
+        self._closed_emitted_idx = 0
+        self._closed_tracked_calls = []
+
+    def flush_streaming_content(self) -> str | None:
+        """Flush any trailing partial ``<|action_start|><|plugin|>`` prefix at EOS."""
+        flushed: str | None = None
+        if self._pending_tail_start is not None and self._pending_tail_start < len(self._last_current_text):
+            flushed = self._last_current_text[self._pending_tail_start :] or None
+            self._emitted_content_pos = len(self._last_current_text)
+            self.position = self._emitted_content_pos
+            self._pending_tail_start = None
+        self._last_current_text = ""
+        return flushed
+
+    @staticmethod
+    def _allowed_tool_names(request: ChatCompletionRequest | None) -> set[str] | None:
+        """Return declared tool names when ``request.tools`` is provided, or empty set if none."""
+        tools = getattr(request, "tools", None) if request is not None else None
+        if not tools:
+            return set()
+        return {tool.function.name for tool in tools if hasattr(tool, "function") and hasattr(tool.function, "name")}
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         """Adjust the request settings for InternLM2 tool parsing.
@@ -156,98 +244,242 @@ class Internlm2ToolParser(ToolParser):
                 - Empty content ("") if tool call is complete
             Returns None if more tokens are needed.
         """
-        if "<|action_start|>" not in current_text:
-            self.position = len(current_text)
-            return DeltaMessage(content=delta_text)
-        if self.current_tool_id > 0:
-            return DeltaMessage(content="")
+        if not previous_text:
+            self._reset_streaming_state(0)
+        elif self._emitted_content_pos is None:
+            self._reset_streaming_state(len(previous_text))
+        elif self._scan_pos > len(current_text):
+            self._reset_streaming_state(0)
 
-        last_pos = self.position
-        if "<|action_start|><|plugin|>" not in current_text[last_pos:]:
-            return None
+        self._streaming_initialized = True
+        self._last_current_text = current_text
+        self._pending_tail_start = None
+        self._in_open_block = False
 
-        new_delta = current_text[last_pos:]
-        # maxsplit=1: a later action marker stays inside `action` and is cut off by the
-        # <|action_end|> split below instead of breaking the two-name unpack.
-        text, action = new_delta.split("<|action_start|><|plugin|>", 1)
-
-        if len(text) > 0:
-            self.position = self.position + len(text)
-            return DeltaMessage(content=text)
-
-        action = action.strip()
-        action = action.split("<|action_end|>".strip())[0]
-
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
+        allowed_names = self._allowed_tool_names(request)
 
         try:
-            delta: DeltaMessage | None = None
-            parsable_arr = action
+            dec = json.JSONDecoder()
+            pos = self._scan_pos
+            next_scan_pos = pos
+            visible_parts: list[tuple[int, int]] = []
+            # list of (call_dict, safe_name_dict, call_complete, block_closed)
+            parsed_actions: list[tuple[dict, dict, bool, bool]] = []
 
-            try:
-                tool_call_arr: dict = partial_json_parser.loads(parsable_arr, flags)
-            except partial_json_parser.core.exceptions.MalformedJSON:
-                logger.debug("not enough tokens to parse into JSON yet")
-                return None
+            while pos < len(current_text):
+                start = current_text.find(self.tool_call_start_token, pos)
+                if start == -1:
+                    tail = current_text[pos:]
+                    safe_tail = _strip_trailing_partial_marker(tail, self.tool_call_start_token)
+                    safe_end = pos + len(safe_tail)
+                    if safe_tail:
+                        visible_parts.append((pos, safe_end))
+                    if len(safe_tail) < len(tail):
+                        self._pending_tail_start = safe_end
+                    next_scan_pos = safe_end
+                    break
 
-            if not self.current_tool_name_sent:
-                function_name = tool_call_arr.get("name")
-                if function_name:
-                    self.current_tool_id = self.current_tool_id + 1
-                    delta = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                type="function",
-                                id=f"chatcmpl-tool-{uuid4()}",
-                                function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
-                            )
-                        ]
-                    )
-                    self.current_tool_name_sent = True
-                    self.streamed_args_for_tool.append("")
+                if start > pos:
+                    visible_parts.append((pos, start))
+
+                payload_start = consume_space(start + len(self.tool_call_start_token), current_text)
+                if payload_start >= len(current_text):
+                    self._in_open_block = True
+                    next_scan_pos = start
+                    break
+
+                # String-aware JSON decode first so literal <|action_end|> inside JSON strings
+                # never truncates the payload.
+                decoded: object = None
+                end_pos = -1
+                try:
+                    decoded, end_pos = dec.raw_decode(current_text, payload_start)
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    decoded = None
+
+                if decoded is not None:
+                    after_json = consume_space(end_pos, current_text)
+                    has_end_marker = current_text.startswith(self.tool_call_end_token, after_json)
+                    if has_end_marker:
+                        if isinstance(decoded, dict):
+                            parsed_actions.append((decoded, decoded, True, True))
+                        pos = after_json + len(self.tool_call_end_token)
+                        next_scan_pos = pos
+                        continue
+                    if after_json == len(current_text) or self.tool_call_end_token.startswith(current_text[after_json:]):
+                        if isinstance(decoded, dict):
+                            parsed_actions.append((decoded, decoded, True, False))
+                        self._in_open_block = True
+                        next_scan_pos = start
+                        break
+                    end_idx = current_text.find(self.tool_call_end_token, end_pos)
+                    next_start = current_text.find(self.tool_call_start_token, end_pos)
+                    if end_idx != -1 and (next_start == -1 or end_idx < next_start):
+                        if isinstance(decoded, dict):
+                            parsed_actions.append((decoded, decoded, True, True))
+                        pos = end_idx + len(self.tool_call_end_token)
+                        next_scan_pos = pos
+                        continue
+                    if next_start != -1:
+                        if isinstance(decoded, dict):
+                            parsed_actions.append((decoded, decoded, True, True))
+                        pos = next_start
+                        next_scan_pos = pos
+                        continue
+                    if isinstance(decoded, dict):
+                        parsed_actions.append((decoded, decoded, True, False))
+                    self._in_open_block = True
+                    next_scan_pos = start
+                    break
+
+                # Incomplete JSON object: parse partially without splitting on <|action_end|>.
+                slice_text = current_text[payload_start:]
+                try:
+                    part_all, _ = partial_json_loads(slice_text, Allow.ALL)
+                except (
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    ValueError,
+                    AssertionError,
+                    RecursionError,
+                ):
+                    logger.debug("not enough tokens to parse into JSON yet")
+                    end_idx = current_text.find(self.tool_call_end_token, payload_start)
+                    next_start = current_text.find(self.tool_call_start_token, payload_start)
+                    if end_idx != -1 and (next_start == -1 or end_idx < next_start):
+                        pos = end_idx + len(self.tool_call_end_token)
+                        next_scan_pos = pos
+                        continue
+                    if next_start != -1:
+                        pos = next_start
+                        next_scan_pos = pos
+                        continue
+                    self._in_open_block = True
+                    next_scan_pos = start
+                    break
+
+                if isinstance(part_all, dict):
+                    try:
+                        part_safe, _ = partial_json_loads(slice_text, Allow.ALL & ~Allow.STR)
+                        if not isinstance(part_safe, dict):
+                            part_safe = {}
+                    except (
+                        partial_json_parser.core.exceptions.MalformedJSON,
+                        ValueError,
+                        AssertionError,
+                        RecursionError,
+                    ):
+                        part_safe = {}
+                    parsed_actions.append((part_all, part_safe, False, False))
+                self._in_open_block = True
+                next_scan_pos = start
+                break
+
+            content_chunks: list[str] = []
+            emitted_pos = self._emitted_content_pos or 0
+            for seg_start, seg_end in visible_parts:
+                if seg_end > emitted_pos:
+                    content_chunks.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                    emitted_pos = seg_end
+            self._emitted_content_pos = emitted_pos
+            self.position = emitted_pos
+            content_out = "".join(content_chunks)
+
+            deltas: list[DeltaToolCall] = []
+            emitted_idx = self._closed_emitted_idx
+            next_closed_emitted_idx = self._closed_emitted_idx
+            new_closed_records: list[dict] = []
+            open_tracked_records: list[dict] = []
+            for call, safe_call, call_complete, block_closed in parsed_actions:
+                already_sent = emitted_idx < len(self._tool_name_sent) and self._tool_name_sent[emitted_idx]
+                if already_sent or call_complete:
+                    func_name = call.get("name")
                 else:
-                    delta = None
-            else:
-                prev_arguments = self.get_arguments(self.prev_tool_call_arr[self.current_tool_id])
-                cur_arguments = self.get_arguments(tool_call_arr)
+                    func_name = safe_call.get("name")
 
-                if not cur_arguments and not prev_arguments:
-                    delta = None
-                elif not cur_arguments and prev_arguments:
-                    logger.error("INVARIANT - impossible to have arguments reset mid-arguments")
-                    delta = None
-                elif cur_arguments:
-                    # Stream only the prefix-stable part of the serialized
-                    # arguments. Trailing closing characters are withheld
-                    # because a partial JSON fill can still change them (an
-                    # unterminated string grows, the object may gain keys),
-                    # and the delta is an extension of everything already
-                    # streamed, so concatenating the deltas always yields a
-                    # prefix of valid JSON (completed by the final batch
-                    # extraction catch-up).
-                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    # Also withholds an unfinished trailing number (r12 S12-1).
-                    safe_json = stable_json_stream_prefix(cur_args_json)
+                if not isinstance(func_name, str) or not func_name:
+                    continue
 
-                    sent = self.streamed_args_for_tool[self.current_tool_id]
-                    arguments_delta = safe_json[len(sent) :] if safe_json.startswith(sent) else ""
-                    if arguments_delta:
-                        delta = DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_id,
-                                    function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
-                                )
-                            ]
+                # Align tool-name filtering with batch extract_tool_calls.
+                if not allowed_names or func_name not in allowed_names:
+                    continue
+
+                idx = emitted_idx
+                emitted_idx += 1
+                if block_closed:
+                    next_closed_emitted_idx = emitted_idx
+                while len(self.streamed_args_for_tool) <= idx:
+                    self.streamed_args_for_tool.append("")
+                while len(self._tool_name_sent) <= idx:
+                    self._tool_name_sent.append(False)
+                while len(self._tool_call_ids) <= idx:
+                    self._tool_call_ids.append("")
+
+                first = not self._tool_name_sent[idx]
+                if first:
+                    self._tool_call_ids[idx] = f"chatcmpl-tool-{uuid4()}"
+                    self._tool_name_sent[idx] = True
+                if idx >= self.current_tool_id:
+                    self.current_tool_id = idx
+                    self.current_tool_name_sent = True
+
+                cur_arguments = self.get_arguments(call)
+                if cur_arguments is None and call_complete:
+                    cur_arguments = {}
+
+                arguments_delta = ""
+                if cur_arguments is not None:
+                    cur_args_json = (
+                        cur_arguments
+                        if isinstance(cur_arguments, str)
+                        else json.dumps(cur_arguments, ensure_ascii=False)
+                    )
+                    safe_json = cur_args_json if call_complete else stable_json_stream_prefix(cur_args_json)
+                    sent = self.streamed_args_for_tool[idx]
+                    if safe_json.startswith(sent):
+                        arguments_delta = safe_json[len(sent) :]
+                        if arguments_delta:
+                            self.streamed_args_for_tool[idx] = sent + arguments_delta
+
+                call_record = dict(call)
+                call_record["arguments"] = cur_arguments
+                if block_closed:
+                    new_closed_records.append(call_record)
+                else:
+                    open_tracked_records.append(call_record)
+
+                if first or arguments_delta:
+                    deltas.append(
+                        DeltaToolCall(
+                            index=idx,
+                            type="function" if first else None,
+                            id=self._tool_call_ids[idx] if first else None,
+                            function=DeltaFunctionCall(
+                                name=func_name if first else None,
+                                arguments=arguments_delta if arguments_delta else None,
+                            ).model_dump(exclude_none=True),
                         )
-                        self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
-                    else:
-                        delta = None
+                    )
 
-            tool_call_arr["arguments"] = self.get_arguments(tool_call_arr)
-            self.prev_tool_call_arr = [tool_call_arr]
-            return delta
+            if new_closed_records:
+                self._closed_tracked_calls.extend(new_closed_records)
+            combined_tracked = (
+                [*self._closed_tracked_calls, *open_tracked_records]
+                if open_tracked_records
+                else self._closed_tracked_calls
+            )
+            if combined_tracked:
+                self.prev_tool_call_arr = list(combined_tracked)
+
+            self._scan_pos = next_scan_pos
+            self._closed_emitted_idx = next_closed_emitted_idx
+
+            if content_out and deltas:
+                return DeltaMessage(content=content_out, tool_calls=deltas)
+            if deltas:
+                return DeltaMessage(tool_calls=deltas)
+            if content_out:
+                return DeltaMessage(content=content_out)
+            return None
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
             logger.debug("Skipping chunk as a result of tool streaming extraction error")
@@ -260,8 +492,10 @@ class Internlm2ToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from a complete model response.
 
-        Parses the model output to identify and extract tool calls wrapped
-        in <|action_start|><|plugin|> and <|action_end|> tokens.
+        Parses the model output to identify and extract all tool calls wrapped
+        in ``<|action_start|><|plugin|>`` and ``<|action_end|>`` tokens using
+        string-aware JSON decoding so embedded markers inside string arguments
+        cannot truncate the payload.
 
         Args:
             model_output: The complete text output from the model.
@@ -269,33 +503,62 @@ class Internlm2ToolParser(ToolParser):
 
         Returns:
             ExtractedToolCallInformation containing:
-                - tools_called: True if valid tool calls were found
+                - tools_called: True if valid allowed tool calls were found
                 - tool_calls: List of ToolCall objects extracted
-                - content: Text content before the action, or full content
-                    if no tools were called
+                - content: Text content before the first valid action, or full
+                    ``model_output`` if no valid tools were called
         """
-        text = model_output
-        tools = request.tools
-        if "<|action_start|><|plugin|>" in text:
-            text, action = text.split("<|action_start|><|plugin|>", 1)
-            action = action.split("<|action_end|>".strip())[0]
-            action = action[action.find("{") :]
+        if self.tool_call_start_token not in model_output:
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+        allowed_names = self._allowed_tool_names(request)
+        dec = json.JSONDecoder()
+        tool_calls: list[ToolCall] = []
+        first_action_pos: int | None = None
+        pos = 0
+
+        while pos < len(model_output):
+            start = model_output.find(self.tool_call_start_token, pos)
+            if start == -1:
+                break
+            payload_start = consume_space(start + len(self.tool_call_start_token), model_output)
+            if payload_start >= len(model_output):
+                break
             try:
-                action_dict = json.loads(action)
-                name, parameters = (
-                    action_dict["name"],
-                    json.dumps(action_dict.get("parameters", action_dict.get("arguments", {})), ensure_ascii=False),
-                )
-            except (ValueError, KeyError, TypeError, AttributeError):
+                action_dict, end_pos = dec.raw_decode(model_output, payload_start)
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 logger.exception("Failed to parse InternLM2 action as a tool call")
-                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+                pos = start + len(self.tool_call_start_token)
+                continue
 
-            if not tools or name not in [t.function.name for t in tools]:
-                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=text)
+            after_json = consume_space(end_pos, model_output)
+            if model_output.startswith(self.tool_call_end_token, after_json):
+                pos = after_json + len(self.tool_call_end_token)
+            else:
+                pos = end_pos
 
-            tool_calls = [ToolCall(function=FunctionCall(name=name, arguments=parameters))]
-            return ExtractedToolCallInformation(
-                tools_called=True, tool_calls=tool_calls, content=text if len(text) > 0 else None
-            )
+            if not isinstance(action_dict, dict):
+                continue
+            name = action_dict.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if not allowed_names or name not in allowed_names:
+                continue
 
-        return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=text)
+            raw_params = self.get_arguments(action_dict)
+            if raw_params is None:
+                raw_params = {}
+            parameters = raw_params if isinstance(raw_params, str) else json.dumps(raw_params, ensure_ascii=False)
+            if first_action_pos is None:
+                first_action_pos = start
+            tool_calls.append(ToolCall(function=FunctionCall(name=name, arguments=parameters)))
+
+        if not tool_calls:
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+        content = model_output[:first_action_pos] if first_action_pos is not None else ""
+        return ExtractedToolCallInformation(
+            tools_called=True,
+            tool_calls=tool_calls,
+            content=content if len(content) > 0 else None,
+        )

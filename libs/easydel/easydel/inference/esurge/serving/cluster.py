@@ -93,6 +93,11 @@ def resolve_bind_host(value: str, *, internal_ip: tp.Callable[[], str | None] | 
     return address
 
 
+def _format_url_host(host: str) -> str:
+    bare = str(host).strip().strip("[]")
+    return f"[{bare}]" if ":" in bare else bare
+
+
 def public_urls(
     bind_host: str,
     port: int,
@@ -110,11 +115,11 @@ def public_urls(
 
         internal_ip = internal_ip or detect_internal_ip
         external_ip = external_ip or detect_external_ip
-    wildcard = bind_host in {"0.0.0.0", "::", ""}
-    internal = (internal_ip() if wildcard else bind_host) or bind_host
-    urls = {"internal": f"http://{internal}:{port}/v1"}
+    wildcard = bind_host in {"0.0.0.0", "::", "[::]", ""}
+    internal = (internal_ip() if wildcard else bind_host) or bind_host or "127.0.0.1"
+    urls = {"internal": f"http://{_format_url_host(internal)}:{port}/v1"}
     if wildcard:
         external = external_ip()
         if external:
-            urls["external"] = f"http://{external}:{port}/v1"
+            urls["external"] = f"http://{_format_url_host(external)}:{port}/v1"
     return urls

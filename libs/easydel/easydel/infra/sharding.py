@@ -134,6 +134,66 @@ def moe_fsdp_shard_expert_weights_enabled() -> bool:
     return _MOE_FSDP_SHARD_EXPERT_WEIGHTS.get()
 
 
+_ACTIVE_DP_SPMD_AXIS: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "easydel_active_dp_spmd_axis",
+    default=None,
+)
+
+
+def active_dp_spmd_axis() -> str | None:
+    """Return the mesh axis name currently mapped by an outer ``dp`` ``spmd_axis_name`` ``vmap``, or ``None``."""
+    return _ACTIVE_DP_SPMD_AXIS.get()
+
+
+@contextmanager
+def dp_spmd_vmap_scope(dp_axis: str = "dp") -> Iterator[None]:
+    """Scope an enclosing ``jax.vmap(..., spmd_axis_name=dp_axis)`` trace so inner specs omit ``dp_axis``."""
+    token = _ACTIVE_DP_SPMD_AXIS.set(str(dp_axis))
+    try:
+        yield
+    finally:
+        _ACTIVE_DP_SPMD_AXIS.reset(token)
+
+
+def _strip_compound_axis_entry(entry: tp.Any, axis_name: str) -> tp.Any:
+    if isinstance(entry, tuple):
+        kept = tuple(a for a in entry if a != axis_name)
+        return kept[0] if len(kept) == 1 else (kept if kept else None)
+    return entry
+
+
+def _strip_axis_entry(entry: tp.Any, axis_name: str) -> tp.Any:
+    if entry == axis_name:
+        return None
+    return _strip_compound_axis_entry(entry, axis_name)
+
+
+def strip_compound_axis_from_spec(spec: tp.Any, axis_name: str = "dp") -> tp.Any:
+    """Remove ``axis_name`` from compound axis tuples in ``spec`` while preserving single-axis queries."""
+    if spec is None:
+        return None
+    if isinstance(spec, PartitionSpec):
+        return PartitionSpec(*(_strip_compound_axis_entry(d, axis_name) for d in spec))
+    if isinstance(spec, list):
+        return [_strip_compound_axis_entry(d, axis_name) for d in spec]
+    if isinstance(spec, tuple):
+        return tuple(_strip_compound_axis_entry(d, axis_name) for d in spec)
+    return spec
+
+
+def strip_axis_from_spec(spec: tp.Any, axis_name: str = "dp") -> tp.Any:
+    """Remove ``axis_name`` from a ``PartitionSpec`` (or tuple/list of axis entries)."""
+    if spec is None:
+        return None
+    if isinstance(spec, PartitionSpec):
+        return PartitionSpec(*(_strip_axis_entry(d, axis_name) for d in spec))
+    if isinstance(spec, list):
+        return [_strip_axis_entry(d, axis_name) for d in spec]
+    if isinstance(spec, tuple):
+        return tuple(_strip_axis_entry(d, axis_name) for d in spec)
+    return spec
+
+
 CANONICAL_MESH_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
     common_types.DATA_PARALLEL,
@@ -1483,7 +1543,11 @@ class RuntimeShardingResolver:
             tuple: Tuple of ``(logical_name, mesh_axis_or_None)`` pairs.
         """
         resolved_mode = self._resolve_mode(mode=mode, shape=shape, layout_mode=MODE_TRAIN)
-        return self.axis_policy.logical_axis_rule_pairs(mode=resolved_mode, overrides=overrides)
+        pairs = self.axis_policy.logical_axis_rule_pairs(mode=resolved_mode, overrides=overrides)
+        dp_ax = active_dp_spmd_axis()
+        if dp_ax is not None:
+            pairs = tuple((k, _strip_compound_axis_entry(v, dp_ax)) for k, v in pairs)
+        return pairs
 
     @contextmanager
     def logical_axis_rules(
@@ -1515,6 +1579,9 @@ class RuntimeShardingResolver:
         Returns:
             PartitionSpec: The (possibly relaxed) safe partition spec.
         """
+        dp_ax = active_dp_spmd_axis()
+        if dp_ax is not None:
+            spec = strip_compound_axis_from_spec(spec, dp_ax)
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None or shape is NOT_GIVEN:
             return spec

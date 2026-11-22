@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import threading
 import typing as tp
 from collections import deque
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ class _AsyncRolloutResult:
     informations: dict[str, float | int | str]
     produced_at_step: int
     preprocessing_time: float
+    minibatches: tuple[dict[str, jax.Array], ...] = ()
 
 
 @Registry.register("trainer", "async_grpo")
@@ -100,6 +102,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
         """
         if not isinstance(arguments, AsyncGRPOConfig):
             raise TypeError(f"arguments must be AsyncGRPOConfig, got {type(arguments)}")
+        self._async_grpo_tls = threading.local()
         super().__init__(
             arguments=arguments,
             model=model,
@@ -111,6 +114,45 @@ class AsyncGRPOTrainer(GRPOTrainer):
             data_tokenize_fn=data_tokenize_fn,
             tools=tools,
             environment_factory=environment_factory,
+        )
+
+    def _get_async_tls(self) -> threading.local:
+        tls = getattr(self, "_async_grpo_tls", None)
+        if tls is None:
+            tls = threading.local()
+            self._async_grpo_tls = tls
+        return tls
+
+    def _is_forcing_old_logps(self) -> bool:
+        return bool(getattr(self._get_async_tls(), "force_old_logps", False))
+
+    def _get_next_batch(self, data_iter, dataloader):
+        """Advance the dataloader directly without GRPO's reuse pause.
+
+        ``AsyncGRPOTrainer`` manages multi-step and multi-iteration reuse
+        explicitly via ``active_reuse_batches`` and ``fetch_batch()``, so
+        inheriting :meth:`GRPOTrainer._get_next_batch`'s reuse pause would
+        replay cached prompts across distinct generation cycles or mis-size
+        multi-chunk fetches when ``steps_per_generation > 1``.
+        """
+        return super(GRPOTrainer, self)._get_next_batch(data_iter, dataloader)
+
+    def _should_compute_old_per_token_logps(
+        self,
+        *,
+        is_train: bool,
+        needs_dppo: bool,
+        needs_esurge_correction: bool,
+        needs_off_policy_mask: bool,
+    ) -> bool:
+        """Always snapshot behavior log-probs for asynchronous rollout batches."""
+        if is_train and self._is_forcing_old_logps():
+            return True
+        return super()._should_compute_old_per_token_logps(
+            is_train=is_train,
+            needs_dppo=needs_dppo,
+            needs_esurge_correction=needs_esurge_correction,
+            needs_off_policy_mask=needs_off_policy_mask,
         )
 
     def _take_rollout_snapshot(
@@ -195,18 +237,16 @@ class AsyncGRPOTrainer(GRPOTrainer):
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
         """Store the GRPO rollout batch and attach AsyncGRPO execution metrics.
 
-        The underlying buffering behavior is inherited from :class:`GRPOTrainer`.
-        This override records both AsyncGRPO scheduling limits and the concrete
-        eSurge async/overlap flags that make rollout generation asynchronous in
-        EasyDeL.
+        When called from the background async rollout worker thread, avoids
+        mutating shared trainer reuse caches (the main loop schedules any
+        ``steps_per_generation`` / ``num_iterations`` minibatches cleanly).
         """
-        if bool(getattr(self, "_async_grpo_force_old_logps", False)):
+        if self._is_forcing_old_logps():
+            reuse_span = self._generation_reuse_span()
             metrics = dict(metrics)
             metrics["generation_reused"] = 0
-            metrics["generation_reuse_span"] = 1
-            metrics["generation_reuse_remaining"] = 0
-            self._buffered_grpo_batch = None
-            self._buffered_grpo_remaining = 0
+            metrics["generation_reuse_span"] = reuse_span
+            metrics["generation_reuse_remaining"] = max(0, reuse_span - 1)
         else:
             model_batch, metrics = super()._store_buffered_grpo_batch(model_batch, metrics)
         return model_batch, {
@@ -217,20 +257,6 @@ class AsyncGRPOTrainer(GRPOTrainer):
             "async_grpo/esurge_async_scheduling": int(bool(self.arguments.esurge_async_scheduling)),
             "async_grpo/esurge_overlap_execution": int(bool(self.arguments.esurge_overlap_execution)),
         }
-
-    def _generation_reuse_span(self) -> int:
-        """Force sampling-policy log-probs for async rollouts without reuse.
-
-        GRPO computes ``old_per_token_logps`` when a generated batch may be
-        reused. AsyncGRPO also needs those log-probs because a rollout can be
-        consumed after one or more policy updates. The actual batch reuse cache
-        stays disabled in :meth:`_store_buffered_grpo_batch` while this flag is
-        active.
-        """
-        span = super()._generation_reuse_span()
-        if bool(getattr(self, "_async_grpo_force_old_logps", False)):
-            return max(span, 2)
-        return span
 
     def _preprocess_async_rollout(
         self,
@@ -248,8 +274,9 @@ class AsyncGRPOTrainer(GRPOTrainer):
         trainer. ``produced_at_step`` is recorded so the consumer can reject
         rollouts that exceed ``max_staleness`` before training on them.
         """
+        tls = self._get_async_tls()
         with capture_time() as preprocessing_time_fn:
-            self._async_grpo_force_old_logps = True
+            tls.force_old_logps = True
             try:
                 model_batch, informations = super()._preprocess_batch_input(
                     state=state,
@@ -257,14 +284,37 @@ class AsyncGRPOTrainer(GRPOTrainer):
                     is_train=True,
                 )
             finally:
-                self._async_grpo_force_old_logps = False
+                tls.force_old_logps = False
         informations = dict(informations)
         informations["async_grpo/rollout_produced_at_step"] = produced_at_step
+
+        steps_per_generation = max(1, int(getattr(self, "steps_per_generation", 1) or 1))
+        num_iterations = max(1, int(getattr(self, "num_iterations", 1) or 1))
+        reuse_span = max(1, steps_per_generation * num_iterations)
+        if reuse_span > 1:
+            prompt_ids = model_batch.get("prompt_ids")
+            expected_step_batch = int(getattr(self.arguments, "total_batch_size", 1) or 1)
+            if (
+                steps_per_generation > 1
+                and prompt_ids is not None
+                and int(prompt_ids.shape[0]) >= steps_per_generation * expected_step_batch
+                and int(prompt_ids.shape[0]) % steps_per_generation == 0
+            ):
+                chunks = self._slice_model_batch_chunks(model_batch, steps_per_generation)
+                schedule = tuple(mb for _ in range(num_iterations) for mb in chunks)
+            else:
+                schedule = tuple(dict(model_batch) for _ in range(reuse_span))
+            first_batch = schedule[0]
+        else:
+            schedule = (model_batch,)
+            first_batch = model_batch
+
         return _AsyncRolloutResult(
-            batch=model_batch,
+            batch=first_batch,
             informations=informations,
             produced_at_step=produced_at_step,
             preprocessing_time=float(preprocessing_time_fn()),
+            minibatches=schedule,
         )
 
     def _execute_preprocessed_train_step(
@@ -370,7 +420,9 @@ class AsyncGRPOTrainer(GRPOTrainer):
         pending_sync_time = 0.0
         pending_batch = None
         rollout_snapshot: OwnedPolicySnapshot | None = None
-        rollout_cache_scope_key = f"{state.esurge_cache_scope_key}-async-grpo-rollout"
+        # Reuse the live state's eSurge cache scope so eval()/maybe_generate()
+        # and rollouts share one eSurge engine rather than allocating 2x KV cache.
+        rollout_cache_scope_key = state.esurge_cache_scope_key
         # GRPO preprocessing mutates trainer buffers and shares one local
         # inference engine. Serialize execution but honor the configured bound
         # on submitted tasks (running plus queued), rather than capping it at 2.
@@ -378,16 +430,43 @@ class AsyncGRPOTrainer(GRPOTrainer):
         queue_capacity = int(self.arguments.max_inflight_tasks)
         if self.arguments.queue_maxsize:
             queue_capacity = min(queue_capacity, int(self.arguments.queue_maxsize))
+        sync_interval = int(self.arguments.weight_sync_steps)
+        max_staleness = int(self.arguments.max_staleness)
+        steps_per_generation = max(1, int(getattr(self, "steps_per_generation", 1) or 1))
+        num_iterations = max(1, int(getattr(self, "num_iterations", 1) or 1))
+        reuse_span = max(1, steps_per_generation * num_iterations)
+        is_multihost = int(jax.process_count()) > 1
+        if is_multihost:
+            logger.warning_once(
+                "AsyncGRPO background lookahead disabled on multi-host meshes (process_count=%d) "
+                "to prevent concurrent JAX/eSurge collective-order deadlocks.",
+                int(jax.process_count()),
+            )
+
         pending_rollouts: deque[tuple[concurrent.futures.Future, dict[str, object], float, float]] = deque()
+        active_reuse_batches: deque[tuple[dict[str, jax.Array], dict[str, float | int | str], int, float]] = deque()
         submitted_futures: set[concurrent.futures.Future] = set()
         rollout_timeout = min(float(self.arguments.request_timeout), float(self.arguments.heartbeat_stale_after_s))
 
         def fetch_batch() -> tuple[dict[str, object], float]:
             nonlocal train_iter
             with capture_time() as data_collection_time:
-                raw_batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                collated = data_collator(raw_batch)
+                if steps_per_generation <= 1:
+                    raw_batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                    collated = data_collator(raw_batch)
+                else:
+                    chunks = []
+                    for _ in range(steps_per_generation):
+                        raw_chunk, train_iter = self._get_next_batch(train_iter, train_dataset)
+                        chunks.append(data_collator(raw_chunk))
+                    collated = self._concat_raw_prompt_batches(chunks)
             return collated, float(data_collection_time())
+
+        def wait_for_inflight_rollouts() -> None:
+            """Wait for currently queued/running rollouts to finish without discarding them."""
+            for future, _, _, _ in tuple(pending_rollouts):
+                if not future.done():
+                    future.result(timeout=rollout_timeout)
 
         def submit_rollout(
             executor: concurrent.futures.ThreadPoolExecutor,
@@ -469,46 +548,37 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         state = self.on_step_start(state=state, step=current_step)
 
                         with capture_time() as rollout_wait_time:
-                            refresh_due = (
-                                rollout_snapshot is not None
-                                and current_step - rollout_snapshot.policy_step >= int(self.arguments.weight_sync_steps)
-                            )
-                            if refresh_due and pending_rollouts:
-                                # Stop replenishing at the synchronization boundary.
-                                # Retire old readers, preserving each prompt for replay.
-                                queued = list(pending_rollouts)
-                                pending_rollouts.clear()
-                                for future, _, _, _ in queued:
-                                    if not future.cancel():
-                                        future.result(timeout=rollout_timeout)
-                                snapshot, sync_time = ensure_rollout_snapshot(state, current_step, force=True)
-                                for _, raw_batch, data_time, _ in queued:
-                                    future = submit_rollout(
+                            if active_reuse_batches:
+                                reused_batch, reused_infos, reused_produced_step, reused_pre_time = (
+                                    active_reuse_batches.popleft()
+                                )
+                                reused_infos = dict(reused_infos)
+                                reused_infos["generation_reused"] = 1
+                                reused_infos["generation_reuse_remaining"] = len(active_reuse_batches)
+                                rollout = _AsyncRolloutResult(
+                                    batch=reused_batch,
+                                    informations=reused_infos,
+                                    produced_at_step=reused_produced_step,
+                                    preprocessing_time=reused_pre_time,
+                                )
+                                pending_batch = None
+                                pending_data_time = 0.0
+                                pending_sync_time = 0.0
+                            else:
+                                if pending_rollouts:
+                                    pending_future, pending_batch, pending_data_time, pending_sync_time = (
+                                        pending_rollouts.popleft()
+                                    )
+                                if pending_future is None:
+                                    pending_batch, pending_data_time = fetch_batch()
+                                    snapshot, pending_sync_time = ensure_rollout_snapshot(state, current_step)
+                                    pending_future = submit_rollout(
                                         executor,
                                         rollout_state=snapshot.state,
-                                        rollout_batch=raw_batch,
+                                        rollout_batch=pending_batch,
                                         produced_at_step=snapshot.policy_step,
                                     )
-                                    pending_rollouts.append((future, raw_batch, data_time, sync_time))
-                            if pending_rollouts:
-                                pending_future, pending_batch, pending_data_time, pending_sync_time = (
-                                    pending_rollouts.popleft()
-                                )
-                            if pending_future is None:
-                                pending_batch, pending_data_time = fetch_batch()
-                                snapshot, pending_sync_time = ensure_rollout_snapshot(state, current_step)
-                                pending_future = submit_rollout(
-                                    executor,
-                                    rollout_state=snapshot.state,
-                                    rollout_batch=pending_batch,
-                                    produced_at_step=snapshot.policy_step,
-                                )
-                            rollout = pending_future.result(
-                                timeout=min(
-                                    float(self.arguments.request_timeout),
-                                    float(self.arguments.heartbeat_stale_after_s),
-                                )
-                            )
+                                rollout = pending_future.result(timeout=rollout_timeout)
                         rollout_wait_seconds = float(rollout_wait_time())
                         rollout_sync_seconds = pending_sync_time
                         pending_sync_time = 0.0
@@ -524,14 +594,16 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         return state, exc, train_iter
 
                     rollout_staleness = max(0, current_step - int(rollout.produced_at_step))
-                    if rollout_staleness > int(self.arguments.max_staleness):
-                        # Preserve prompts while retiring all work that still
-                        # references the stale policy. Never release its buffers
-                        # until the running worker has stopped reading them.
+                    if rollout_staleness > max_staleness and pending_batch is not None:
+                        # Cancel unstarted futures first before waiting on any
+                        # running worker so queued tasks are not drained and wasted.
                         queued_batches = []
-                        while pending_rollouts:
-                            future, queued_batch, data_time, _ = pending_rollouts.popleft()
-                            if not future.cancel():
+                        queued_items = list(pending_rollouts)
+                        pending_rollouts.clear()
+                        for future, _, _, _ in queued_items:
+                            future.cancel()
+                        for future, queued_batch, data_time, _ in queued_items:
+                            if not future.cancelled():
                                 future.result(timeout=rollout_timeout)
                             queued_batches.append((queued_batch, data_time))
                         snapshot, rollout_sync_seconds = ensure_rollout_snapshot(
@@ -558,19 +630,61 @@ class AsyncGRPOTrainer(GRPOTrainer):
                             )
                             pending_rollouts.append((future, queued_batch, data_time, 0.0))
 
+                    # Enqueue any additional minibatches produced for steps_per_generation / num_iterations.
+                    if len(rollout.minibatches) > 1:
+                        for extra_mb in rollout.minibatches[1:]:
+                            active_reuse_batches.append(
+                                (
+                                    dict(extra_mb),
+                                    dict(rollout.informations),
+                                    int(rollout.produced_at_step),
+                                    float(rollout.preprocessing_time),
+                                )
+                            )
+
                     compiled_train_ready = bool(getattr(self, "_async_grpo_train_compiled_once", False))
+                    step_limit = min(self.max_training_steps, epoch_end_step)
                     schedule_next = (
-                        compiled_train_ready
-                        and current_step + 1 < self.max_training_steps
-                        and current_step + 1 < epoch_end_step
+                        not is_multihost
+                        and compiled_train_ready
+                        and max_staleness > 0
+                        and current_step + 1 < step_limit
                     )
                     next_data_time = 0.0
                     if schedule_next:
-                        remaining = min(self.max_training_steps, epoch_end_step) - current_step - 1
-                        while len(pending_rollouts) < min(queue_capacity, remaining):
+                        # Refresh the snapshot *after* consuming valid rollouts when no
+                        # worker is reading the old snapshot, so lookahead work for
+                        # upcoming steps runs on fresh weights instead of being discarded.
+                        next_unscheduled_step = (
+                            current_step + 1 + len(active_reuse_batches) + len(pending_rollouts) * reuse_span
+                        )
+                        if not pending_rollouts and rollout_snapshot is not None:
+                            needs_refresh = (
+                                current_step - rollout_snapshot.policy_step >= sync_interval
+                                or next_unscheduled_step - rollout_snapshot.policy_step > max_staleness
+                            )
+                            if needs_refresh:
+                                rollout_snapshot, refresh_sync_time = ensure_rollout_snapshot(
+                                    state,
+                                    current_step,
+                                    force=True,
+                                )
+                                rollout_sync_seconds += refresh_sync_time
+
+                        lookahead_budget = min(max_staleness, max(sync_interval, 1))
+                        while len(pending_rollouts) < queue_capacity:
+                            next_unscheduled_step = (
+                                current_step + 1 + len(active_reuse_batches) + len(pending_rollouts) * reuse_span
+                            )
+                            if next_unscheduled_step >= step_limit:
+                                break
+                            snapshot, sync_time = ensure_rollout_snapshot(state, current_step)
+                            # Do not submit lookahead work on a snapshot that would be
+                            # stale or superseded before it is consumed.
+                            if next_unscheduled_step - snapshot.policy_step > lookahead_budget:
+                                break
                             next_batch, data_time = fetch_batch()
                             next_data_time += data_time
-                            snapshot, sync_time = ensure_rollout_snapshot(state, current_step)
                             future = submit_rollout(
                                 executor,
                                 rollout_state=snapshot.state,
@@ -630,6 +744,14 @@ class AsyncGRPOTrainer(GRPOTrainer):
                         )
                         train_metrics["performance/data_collection_time"] = float(pending_data_time)
                         train_metrics["performance/async_next_data_collection_time"] = float(next_data_time)
+                        sync_ref_due = (
+                            bool(getattr(self.arguments, "sync_ref_model", False))
+                            and getattr(self, "ref_state", None) is not None
+                            and current_step % max(int(getattr(self.arguments, "ref_model_sync_steps", 1) or 1), 1) == 0
+                        )
+                        if sync_ref_due:
+                            # Idle background rollout workers before mutating self.ref_state.
+                            wait_for_inflight_rollouts()
                         state, metrics = self.on_step_end(
                             state=state,
                             metrics=metrics,
@@ -649,11 +771,21 @@ class AsyncGRPOTrainer(GRPOTrainer):
                             self.log_weight_distribution(state=state, step=current_step)
                         with capture_time() as watchers_time:
                             self.log_watchers(state=state, step=current_step)
+                        gen_interval = getattr(self.arguments, "generation_interval", None)
+                        gen_due = bool(gen_interval and gen_interval > 0 and current_step % int(gen_interval) == 0)
+                        if gen_due:
+                            wait_for_inflight_rollouts()
                         with capture_time() as generation_time:
                             try:
                                 self.maybe_generate(state=state, step=current_step, metrics=metrics)
                             except Exception as exc:
                                 logger.warning("Preview generation hook failed: %s", exc, exc_info=True)
+                        bench_interval = getattr(self.arguments, "benchmark_interval", None)
+                        bench_due = bool(
+                            bench_interval and bench_interval > 0 and current_step % int(bench_interval) == 0
+                        )
+                        if bench_due:
+                            wait_for_inflight_rollouts()
                         with capture_time() as benchmark_time:
                             try:
                                 self.maybe_benchmark(state=state, step=current_step)
@@ -667,6 +799,7 @@ class AsyncGRPOTrainer(GRPOTrainer):
                             )
                         with capture_time() as evaluation_time:
                             if self._should_run_evaluation(current_step):
+                                wait_for_inflight_rollouts()
                                 for _ in self.eval(model_state=state):
                                     ...
                         self.log_metrics(

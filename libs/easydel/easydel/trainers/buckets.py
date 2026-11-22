@@ -123,8 +123,12 @@ class ModBucketRule(BucketRule):
     off_bucket: int = 1
 
     def __post_init__(self) -> None:
-        if self.mod <= 0:
+        if isinstance(self.mod, bool) or self.mod <= 0:
             raise ValueError(f"ModBucketRule.mod must be > 0, got {self.mod}.")
+        if isinstance(self.on_bucket, bool) or self.on_bucket < 0:
+            raise ValueError(f"ModBucketRule.on_bucket must be >= 0, got {self.on_bucket}.")
+        if isinstance(self.off_bucket, bool) or self.off_bucket < 0:
+            raise ValueError(f"ModBucketRule.off_bucket must be >= 0, got {self.off_bucket}.")
 
     def select(self, step: int) -> int:
         return self.on_bucket if ((step - self.offset) % self.mod) == 0 else self.off_bucket
@@ -359,6 +363,23 @@ class TrainingBucket:
     # dataset is attached separately on the trainer (one source per bucket),
     # not on this dataclass, to keep it free of dataset/dataloader imports.
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"TrainingBucket.name must be a non-empty string, got {self.name!r}.")
+        if isinstance(self.max_length, bool) or int(self.max_length) <= 0:
+            raise ValueError(f"TrainingBucket.max_length must be > 0, got {self.max_length!r}.")
+        self.max_length = int(self.max_length)
+        if self.gradient_accumulation_steps is not None:
+            if isinstance(self.gradient_accumulation_steps, bool) or int(self.gradient_accumulation_steps) <= 0:
+                raise ValueError(
+                    f"TrainingBucket.gradient_accumulation_steps must be > 0, got {self.gradient_accumulation_steps!r}."
+                )
+            self.gradient_accumulation_steps = int(self.gradient_accumulation_steps)
+        if self.total_batch_size is not None:
+            if isinstance(self.total_batch_size, bool) or int(self.total_batch_size) <= 0:
+                raise ValueError(f"TrainingBucket.total_batch_size must be > 0, got {self.total_batch_size!r}.")
+            self.total_batch_size = int(self.total_batch_size)
+
 
 def apply_config_overrides(
     base_config: "EasyDeLBaseConfig",
@@ -366,10 +387,12 @@ def apply_config_overrides(
     *,
     label: str,
 ) -> "EasyDeLBaseConfig":
-    """Return a deep copy of ``base_config`` with ``overrides`` applied via ``setattr``.
+    """Return a deep copy of ``base_config`` with ``overrides`` applied recursively.
 
     Shared by per-bucket config resolution and the trainer-level
-    ``eval_config_overrides`` path so both validate keys identically.
+    ``eval_config_overrides`` path so both validate keys identically and
+    propagate overrides (such as ``attn_mechanism``, ``blocksize_*``, or
+    ``gradient_checkpointing``) into composite VLM/Omni sub-configs.
 
     Args:
             base_config: The config to copy and override; never mutated.
@@ -381,13 +404,36 @@ def apply_config_overrides(
             The overridden deep copy.
 
     Raises:
-            AttributeError: if an override key is not a field of the base config.
+            AttributeError: if an override key is not a field of the base config
+                    or any of its nested sub-configs.
     """
+    from easydel.infra.base_module import EasyDeLBaseModule
+
     cfg = copy.deepcopy(base_config)
+    sub_configs: list[tp.Any] = []
+    visited = {id(cfg)}
+    pending = list(EasyDeLBaseModule._recursive_config_children(cfg))
+    while pending:
+        sub_cfg = pending.pop()
+        if id(sub_cfg) in visited:
+            continue
+        visited.add(id(sub_cfg))
+        sub_configs.append(sub_cfg)
+        pending.extend(EasyDeLBaseModule._recursive_config_children(sub_cfg))
+
+    def _has_override_field(target: tp.Any, field_name: str) -> bool:
+        target_dict = getattr(target, "__dict__", None)
+        return (isinstance(target_dict, dict) and field_name in target_dict) or hasattr(type(target), field_name)
+
     for key, value in overrides.items():
-        if not hasattr(cfg, key):
+        has_root = hasattr(cfg, key)
+        has_child = any(_has_override_field(sub_cfg, key) for sub_cfg in sub_configs)
+        if not has_root and not has_child:
             raise AttributeError(f"{label}: base config has no field {key!r} to override.")
-        setattr(cfg, key, value)
+        if has_root:
+            setattr(cfg, key, value)
+    if overrides:
+        EasyDeLBaseModule._apply_recursive_config_updates(cfg, overrides)
     return cfg
 
 

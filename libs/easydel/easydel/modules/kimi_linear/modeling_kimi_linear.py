@@ -766,6 +766,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
             norm_topk_prob=bool(self.gate.norm_topk_prob) and self.gate.top_k > 1,
             routed_scaling_factor=self.gate.routed_scaling_factor,
         )
+        has_shared = self.config.num_shared_experts is not None and self.config.num_shared_experts > 0
         out, router_logits = self.moe_call(
             hidden_state=expert_input,
             # Routing is scored on the full-width hidden state even when the
@@ -780,16 +781,15 @@ class KimiSparseMoeBlock(BaseMoeModule):
             ffn_activation=self.experts.act_fn,
             act_fn=jax.nn.silu,
             hooks=self.moe_hooks.replace(select_hook=select_hook),
+            shared_expert=self.shared_experts if (has_shared and not self.use_latent_moe) else None,
         )
 
         if self.use_latent_moe:
             if self.routed_expert_norm is not None:
                 out = self.routed_expert_norm(out)
             out = self.routed_expert_up_proj(out)
-
-        if self.config.num_shared_experts is not None and self.config.num_shared_experts > 0:
-            shared_out = self.shared_experts(hidden_states)
-            out = out + shared_out
+            if has_shared:
+                out = out + self.shared_experts(hidden_states)
 
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
