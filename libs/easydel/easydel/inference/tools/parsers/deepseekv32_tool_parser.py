@@ -30,6 +30,7 @@ Example tool call format:
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from collections.abc import Sequence
@@ -50,6 +51,36 @@ from ...openai_api_modules import (
 from ..abstract_tool import ToolParser, ToolParserManager
 
 logger = get_logger(__name__)
+
+_STRING_SCHEMA_TYPES = frozenset({"string", "str", "text"})
+_INVOKE_OPEN_RE = re.compile(r'<｜DSML｜invoke\s+name="([^"]+)"\s*>')
+_PARAM_OPEN_RE = re.compile(r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>')
+
+
+def _strip_trailing_partial_marker(text: str, marker: str) -> str:
+    """Withhold any trailing non-empty proper prefix of *marker* from *text*."""
+    max_len = min(len(marker) - 1, len(text))
+    for k in range(max_len, 0, -1):
+        if text.endswith(marker[:k]):
+            return text[:-k]
+    return text
+
+
+def _has_open_marker_or_trailing_prefix(text: str, start_token: str, end_token: str) -> bool:
+    """Return True if *text* has an unclosed outer section or ends with a partial start marker."""
+    pos = 0
+    n = len(text)
+    start_len = len(start_token)
+    end_len = len(end_token)
+    while pos < n:
+        start_idx = text.find(start_token, pos)
+        if start_idx == -1:
+            return ToolParser._has_trailing_marker_prefix(text[pos:], (start_token,))
+        end_idx = text.find(end_token, start_idx + start_len)
+        if end_idx == -1:
+            return True
+        pos = end_idx + end_len
+    return False
 
 
 @ToolParserManager.register_module("deepseek_v32")  # pyright: ignore[reportUntypedClassDecorator]
@@ -142,12 +173,32 @@ class DeepSeekV32ToolParser(ToolParser):
         self.tool_call_complete_regex = re.compile(r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>", re.DOTALL)
         self.invoke_complete_regex = re.compile(r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL)
         self.parameter_complete_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(?:true|false)"\s*>(.*?)</｜DSML｜parameter>',
+            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
             re.DOTALL,
         )
 
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
+
+    def get_streaming_buffer_marker_pairs(self) -> Sequence[tuple[str, str | None]]:
+        """Scope protocol buffering strictly to ``<｜DSML｜function_calls>`` envelopes."""
+        return ((self.tool_call_start_token, self.tool_call_end_token),)
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether a DSML function_calls envelope or partial start marker is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return self.is_tool_call_started or self._pending_tail_start is not None
+        return _has_open_marker_or_trailing_prefix(
+            current_text,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+        )
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         """Adjust the chat completion request for DSML tool call parsing.
@@ -204,6 +255,72 @@ class DeepSeekV32ToolParser(ToolParser):
         self.json_closed = False
         self.accumulated_params: dict = {}
         self.streaming_request: ChatCompletionRequest | None = None
+        self._emitted_content_pos: int | None = None
+        self._pending_tail_start: int | None = None
+        self._last_current_text: str = ""
+        self._streaming_initialized: bool = False
+
+    def flush_streaming_content(self) -> str | None:
+        """Flush any trailing partial DSML start marker withheld at end-of-stream."""
+        flushed: str | None = None
+        if self._pending_tail_start is not None and self._pending_tail_start < len(self._last_current_text):
+            flushed = self._last_current_text[self._pending_tail_start :] or None
+            self._emitted_content_pos = len(self._last_current_text)
+            self._pending_tail_start = None
+        self._last_current_text = ""
+        self.streaming_request = None
+        return flushed
+
+    def _find_complete_invokes(self, text: str) -> list[tuple[str, str]]:
+        """Linearly scan complete ``<｜DSML｜invoke ...>...</｜DSML｜invoke>`` blocks."""
+        invokes: list[tuple[str, str]] = []
+        invoke_prefix = self.dsml_start_check + "invoke"
+        end_token = self.invoke_end_token
+        end_len = len(end_token)
+        pos = 0
+        n = len(text)
+        while pos < n:
+            start_idx = text.find(invoke_prefix, pos)
+            if start_idx == -1:
+                break
+            open_match = _INVOKE_OPEN_RE.match(text, start_idx)
+            if open_match is None:
+                pos = start_idx + len(invoke_prefix)
+                continue
+            body_start = open_match.end()
+            end_idx = text.find(end_token, body_start)
+            if end_idx == -1:
+                break
+            invokes.append((open_match.group(1), text[body_start:end_idx]))
+            pos = end_idx + end_len
+        return invokes
+
+    def _parse_invoke_params_with_flags(self, invoke_str: str) -> tuple[dict[str, str], dict[str, str]]:
+        """Parse parameter values and their DSML ``string`` attributes from an invoke body."""
+        param_dict: dict[str, str] = {}
+        string_flags: dict[str, str] = {}
+        param_prefix = self.dsml_start_check + "parameter"
+        end_token = self.parameter_end_token
+        end_len = len(end_token)
+        pos = 0
+        n = len(invoke_str)
+        while pos < n:
+            start_idx = invoke_str.find(param_prefix, pos)
+            if start_idx == -1:
+                break
+            open_match = _PARAM_OPEN_RE.match(invoke_str, start_idx)
+            if open_match is None:
+                pos = start_idx + len(param_prefix)
+                continue
+            body_start = open_match.end()
+            end_idx = invoke_str.find(end_token, body_start)
+            if end_idx == -1:
+                break
+            param_name = open_match.group(1)
+            param_dict[param_name] = invoke_str[body_start:end_idx]
+            string_flags[param_name] = open_match.group(2)
+            pos = end_idx + end_len
+        return param_dict, string_flags
 
     def _parse_invoke_params(self, invoke_str: str) -> dict | None:
         """Parse parameters from an invoke block string.
@@ -219,9 +336,7 @@ class DeepSeekV32ToolParser(ToolParser):
             dict | None: Dictionary mapping parameter names to their
                 string values, or None if parsing fails.
         """
-        param_dict: dict[str, str] = {}
-        for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
-            param_dict[param_name] = param_val
+        param_dict, _ = self._parse_invoke_params_with_flags(invoke_str)
         return param_dict
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
@@ -256,11 +371,30 @@ class DeepSeekV32ToolParser(ToolParser):
         try:
             tool_calls: list[ToolCall] = []
 
-            for tool_call_match in self.tool_call_complete_regex.findall(model_output):
-                for invoke_name, invoke_content in self.invoke_complete_regex.findall(tool_call_match):
-                    param_dict = self._parse_invoke_params(invoke_content) or {}
+            pos = 0
+            n = len(model_output)
+            start_len = len(self.tool_call_start_token)
+            end_len = len(self.tool_call_end_token)
+            while pos < n:
+                sec_start = model_output.find(self.tool_call_start_token, pos)
+                if sec_start == -1:
+                    break
+                body_start = sec_start + start_len
+                sec_end = model_output.find(self.tool_call_end_token, body_start)
+                if sec_end == -1:
+                    break
+                tool_call_match = model_output[body_start:sec_end]
+                pos = sec_end + end_len
+                for invoke_name, invoke_content in self._find_complete_invokes(tool_call_match):
+                    param_dict, string_flags = self._parse_invoke_params_with_flags(invoke_content)
                     # Same schema-driven typing as the streaming path so both modes agree.
-                    converted = self._convert_params_with_schema(invoke_name, param_dict, request, invoke_content)
+                    converted = self._convert_params_with_schema(
+                        invoke_name,
+                        param_dict,
+                        request,
+                        invoke_content,
+                        string_flags=string_flags,
+                    )
                     tool_calls.append(
                         ToolCall(
                             type="function",
@@ -277,11 +411,10 @@ class DeepSeekV32ToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=True, tool_calls=tool_calls, content=content)
 
         except Exception:
-            self.failed_count += 1
             logger.exception("Error extracting tool calls")
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
-    def _convert_param_value(self, value: str, param_type: str) -> Any:
+    def _convert_param_value(self, value: str, param_type: str, *, allow_null: bool = True) -> Any:
         """Convert parameter value to the correct Python type.
 
         Converts a string value to the appropriate type based on the
@@ -291,15 +424,19 @@ class DeepSeekV32ToolParser(ToolParser):
             value: The string value to convert.
             param_type: The target type (e.g., "string", "integer",
                 "number", "boolean", "object", "array").
+            allow_null: Whether literal ``"null"`` may be coerced to ``None`` for
+                non-string types.
 
         Returns:
             Any: The converted value in the appropriate Python type.
                 Falls back to string if conversion fails.
         """
-        if value.lower() == "null":
-            return None
-
         param_type = param_type.lower()
+        if value.strip().lower() == "null":
+            if allow_null and param_type not in _STRING_SCHEMA_TYPES:
+                return None
+            return value
+
         if param_type in ["string", "str", "text"]:
             return value
         if param_type in ["integer", "int"]:
@@ -310,20 +447,29 @@ class DeepSeekV32ToolParser(ToolParser):
         if param_type in ["number", "float"]:
             try:
                 val = float(value)
+                if not math.isfinite(val):
+                    return value
                 return val if val != int(val) else int(val)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 return value
         if param_type in ["boolean", "bool"]:
             return value.lower() in ["true", "1"]
-        if param_type in ["object", "array"]:
+        if param_type == "object":
             try:
-                return json.loads(value)
-            except json.JSONDecodeError:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else value
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                return value
+        if param_type == "array":
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else value
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return value
 
         try:
             return json.loads(value)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return value
 
     def _convert_params_with_schema(
@@ -332,6 +478,8 @@ class DeepSeekV32ToolParser(ToolParser):
         param_dict: dict[str, str],
         request: ChatCompletionRequest | None,
         invoke_body: str = "",
+        *,
+        string_flags: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Convert raw string parameter values using the tool schema types.
 
@@ -347,6 +495,8 @@ class DeepSeekV32ToolParser(ToolParser):
                 or None if unavailable.
             invoke_body: Original parameter markup. Without a schema, ``string="false"``
                 values are decoded as JSON and ``string="true"`` values remain strings.
+            string_flags: Optional pre-parsed mapping of parameter name to its DSML
+                ``string`` attribute (``"true"`` or ``"false"``).
 
         Returns:
             Dictionary mapping parameter names to their type-converted values.
@@ -361,61 +511,153 @@ class DeepSeekV32ToolParser(ToolParser):
                 ):
                     schema = tool.function.parameters
                     if isinstance(schema, dict) and "properties" in schema:
-                        param_config = schema["properties"]
+                        props = schema["properties"]
+                        if isinstance(props, dict):
+                            param_config = props
                     break
 
-        string_flags = dict(re.findall(r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>', invoke_body))
+        if string_flags is None:
+            _, string_flags = self._parse_invoke_params_with_flags(invoke_body)
         converted: dict[str, Any] = {}
         for name, value in param_dict.items():
             schema = param_config.get(name)
             param_type = schema.get("type") if isinstance(schema, dict) else None
+            string_flag = string_flags.get(name)
+
             if isinstance(param_type, list):
-                # Do not discard union nullability: DSML distinguishes JSON null
-                # from the literal string "null" with its explicit string flag.
-                if "null" in param_type and string_flags.get(name) == "false" and value.strip() == "null":
+                lower_types = [kind.strip().lower() for kind in param_type if isinstance(kind, str)]
+                has_string = any(kind in _STRING_SCHEMA_TYPES for kind in lower_types)
+                allows_null = "null" in lower_types or (isinstance(schema, dict) and schema.get("nullable") is True)
+                if string_flag == "true" and has_string:
+                    converted[name] = value
+                    continue
+                if string_flag == "false":
+                    if allows_null and value.strip().lower() == "null":
+                        converted[name] = None
+                        continue
+                    non_string_types = [
+                        kind for kind in lower_types if kind != "null" and kind not in _STRING_SCHEMA_TYPES
+                    ]
+                    if non_string_types:
+                        coerced: Any = value
+                        for candidate_type in non_string_types:
+                            if candidate_type in {"boolean", "bool"} and value.strip().lower() not in {
+                                "true",
+                                "false",
+                                "1",
+                                "0",
+                            }:
+                                continue
+                            candidate = self._convert_param_value(value, candidate_type, allow_null=False)
+                            if not isinstance(candidate, str) or candidate_type in _STRING_SCHEMA_TYPES:
+                                coerced = candidate
+                                break
+                        converted[name] = coerced
+                        continue
+                    if has_string:
+                        converted[name] = value
+                        continue
+                if allows_null and value.strip().lower() == "null":
                     converted[name] = None
                     continue
-                param_type = next((kind for kind in param_type if kind != "null"), None)
+                param_type = next((kind for kind in lower_types if kind != "null"), None)
+                if isinstance(param_type, str):
+                    normalized_type = param_type.strip().lower()
+                    converted[name] = (
+                        value
+                        if normalized_type in _STRING_SCHEMA_TYPES
+                        else self._convert_param_value(value, param_type, allow_null=allows_null)
+                    )
+                    continue
+                if lower_types:
+                    converted[name] = value
+                    continue
+
             if isinstance(param_type, str):
                 # A schema-typed string, including the literal "null", stays a string.
-                converted[name] = value if param_type == "string" else self._convert_param_value(value, param_type)
-            elif string_flags.get(name) == "false":
+                normalized_type = param_type.strip().lower()
+                converted[name] = (
+                    value if normalized_type in _STRING_SCHEMA_TYPES else self._convert_param_value(value, param_type)
+                )
+            elif string_flag == "false":
                 try:
                     converted[name] = json.loads(value)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     converted[name] = value
             else:
                 converted[name] = value
         return converted
 
+    def _collect_section_bodies(self, current_text: str) -> tuple[list[tuple[int, int, bool]], list[tuple[int, int]]]:
+        """Partition *current_text* into DSML function_calls sections and visible content spans."""
+        sections: list[tuple[int, int, bool]] = []
+        visible_parts: list[tuple[int, int]] = []
+        pos = 0
+        while pos < len(current_text):
+            sec_start = current_text.find(self.tool_call_start_token, pos)
+            if sec_start == -1:
+                tail = current_text[pos:]
+                safe_tail = _strip_trailing_partial_marker(tail, self.tool_call_start_token)
+                if safe_tail:
+                    visible_parts.append((pos, pos + len(safe_tail)))
+                if len(safe_tail) < len(tail):
+                    self._pending_tail_start = pos + len(safe_tail)
+                break
+            if sec_start > pos:
+                visible_parts.append((pos, sec_start))
+            body_start = sec_start + len(self.tool_call_start_token)
+            sec_end = current_text.find(self.tool_call_end_token, body_start)
+            if sec_end == -1:
+                sections.append((body_start, len(current_text), False))
+                break
+            sections.append((body_start, sec_end, True))
+            pos = sec_end + len(self.tool_call_end_token)
+        return sections, visible_parts
+
     def _extract_delta_tool_calls(
         self,
         current_text: str,
         request: ChatCompletionRequest | None,
+        *,
+        sections: list[tuple[int, int, bool]] | None = None,
     ) -> list[DeltaToolCall]:
-        """Extract DeltaToolCalls from newly completed invoke blocks.
+        """Extract DeltaToolCalls from newly completed invoke blocks inside DSML sections.
 
-        Scans ``current_text`` for complete ``<invoke>...</invoke>`` blocks
-        that have not yet been emitted, parses their parameters, converts
-        values using the tool schema, and returns one ``DeltaToolCall`` per
-        newly completed invoke.
+        Scans ``<｜DSML｜function_calls>`` blocks in ``current_text`` for complete
+        ``<invoke>...</invoke>`` blocks that have not yet been emitted, parses their
+        parameters, converts values using the tool schema, and returns one
+        ``DeltaToolCall`` per newly completed invoke.
 
         Args:
             current_text: The full accumulated model output so far.
             request: The chat completion request with tool definitions for
                 schema-based type conversion, or None.
+            sections: Optional precomputed list of ``(body_start, body_end, is_closed)``
+                spans for DSML function_calls blocks.
 
         Returns:
             List of ``DeltaToolCall`` objects for each newly completed invoke
             block. Empty if no new blocks were found.
         """
-        complete_invokes = self.invoke_complete_regex.findall(current_text)
+        if sections is None:
+            sections, _ = self._collect_section_bodies(current_text)
+
+        complete_invokes: list[tuple[str, str]] = []
+        for body_start, body_end, _is_closed in sections:
+            complete_invokes.extend(self._find_complete_invokes(current_text[body_start:body_end]))
+
         delta_tool_calls: list[DeltaToolCall] = []
 
         while len(complete_invokes) > self.current_tool_index:
             invoke_name, invoke_body = complete_invokes[self.current_tool_index]
-            param_dict = self._parse_invoke_params(invoke_body) or {}
-            converted = self._convert_params_with_schema(invoke_name, param_dict, request, invoke_body)
+            param_dict, string_flags = self._parse_invoke_params_with_flags(invoke_body)
+            converted = self._convert_params_with_schema(
+                invoke_name,
+                param_dict,
+                request,
+                invoke_body,
+                string_flags=string_flags,
+            )
             args_json = json.dumps(converted, ensure_ascii=False)
             idx = self.current_tool_index
             self.current_tool_index += 1
@@ -450,10 +692,11 @@ class DeepSeekV32ToolParser(ToolParser):
         """Extract tool calls from streaming model output.
 
         Uses a buffer-until-complete-invoke strategy: tokens are accumulated
-        until a complete ``<invoke>...</invoke>`` block is available, then
-        the block is parsed and emitted in one shot as a ``DeltaToolCall``.
-        Content tokens that appear before the first DSML block are forwarded
-        as regular content deltas.
+        until a complete ``<invoke>...</invoke>`` block is available inside a
+        ``<｜DSML｜function_calls>`` section, then the block is parsed and
+        emitted in one shot as a ``DeltaToolCall``. Content tokens outside DSML
+        sections are forwarded as regular content deltas while withholding
+        partial ``<｜DSML｜function_calls>`` marker prefixes.
 
         Args:
             previous_text: All text generated before this step.
@@ -470,26 +713,44 @@ class DeepSeekV32ToolParser(ToolParser):
         """
         if not previous_text:
             self._reset_streaming_state()
-        self.streaming_request = request
-        content_before = None
-        if self.is_tool_call_started:
-            pass
-        elif self.tool_call_start_token in current_text:
-            self.is_tool_call_started = True
-            start_idx = current_text.index(self.tool_call_start_token)
-            content_before = current_text[len(previous_text) : start_idx] or None
-        else:
-            return DeltaMessage(content=delta_text) if delta_text else None
+            self._emitted_content_pos = 0
+        elif self._emitted_content_pos is None:
+            self._emitted_content_pos = len(previous_text)
 
-        self.json_started = self.is_tool_call_started
-        self.json_closed = self.tool_call_end_token in current_text
-        invoke_start = current_text.rfind(self.dsml_start_check + "invoke")
-        self.in_function = invoke_start > current_text.rfind(self.invoke_end_token)
+        self._streaming_initialized = True
+        self.streaming_request = request
+        self._last_current_text = current_text
+        self._pending_tail_start = None
+
+        sections, visible_parts = self._collect_section_bodies(current_text)
+
+        content_chunks: list[str] = []
+        emitted_pos = self._emitted_content_pos or 0
+        for seg_start, seg_end in visible_parts:
+            if seg_end > emitted_pos:
+                content_chunks.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                emitted_pos = seg_end
+        self._emitted_content_pos = emitted_pos
+        content_out = "".join(content_chunks) or None
+
+        has_sections = bool(sections)
+        is_open_section = has_sections and not sections[-1][2]
+        self.is_tool_call_started = is_open_section
+        self.json_started = has_sections
+        self.json_closed = has_sections and not is_open_section
+
+        if not has_sections:
+            return DeltaMessage(content=content_out) if content_out else None
+
+        last_body_start, last_body_end, _ = sections[-1]
+        active_section_text = current_text[last_body_start:last_body_end]
+        invoke_start = active_section_text.rfind(self.dsml_start_check + "invoke")
+        self.in_function = invoke_start > active_section_text.rfind(self.invoke_end_token)
         if invoke_start >= 0:
-            invoke_text = current_text[invoke_start:]
+            invoke_text = active_section_text[invoke_start:]
             name_match = re.match(re.escape(self.dsml_start_check) + r'invoke\s+name="([^"]+)"', invoke_text)
             self.current_function_name = name_match.group(1) if name_match else None
-            self.param_count = len(self.parameter_complete_regex.findall(invoke_text))
+            self.param_count = len(self._parse_invoke_params_with_flags(invoke_text)[0])
             param_start = invoke_text.rfind(self.parameter_prefix)
             self.in_param = param_start > invoke_text.rfind(self.parameter_end_token)
             self.current_param_name = None
@@ -502,15 +763,18 @@ class DeepSeekV32ToolParser(ToolParser):
                 if separator:
                     self.current_param_value = value_text.split(self.parameter_end_token, 1)[0]
                 self.param_count += int(self.in_param)
+        else:
+            self.in_param = False
+
         try:
-            delta_tool_calls = self._extract_delta_tool_calls(current_text, request)
+            delta_tool_calls = self._extract_delta_tool_calls(current_text, request, sections=sections)
         except Exception:
             self.failed_count += 1
             logger.exception("Error extracting streaming DSML tool calls")
             return None
 
-        if delta_tool_calls or content_before:
-            return DeltaMessage(content=content_before, tool_calls=delta_tool_calls)
+        if delta_tool_calls or content_out:
+            return DeltaMessage(content=content_out, tool_calls=delta_tool_calls)
         if not delta_text and delta_token_ids and self.prev_tool_call_arr:
             return DeltaMessage(content="")
         return None

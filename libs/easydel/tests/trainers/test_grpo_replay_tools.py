@@ -161,8 +161,16 @@ def test_esurge_correction_survives_replay_for_replaced_and_live_groups(
         assert actual["importance_sampling_ratio"].shape == (4, target_length)
         expected = np.concatenate(
             [
-                np.pad(live["importance_sampling_ratio"], ((0, 0), (0, target_length - active_length))),
-                np.pad(stored["importance_sampling_ratio"], ((0, 0), (0, target_length - stored_length))),
+                np.pad(
+                    live["importance_sampling_ratio"],
+                    ((0, 0), (0, target_length - active_length)),
+                    constant_values=1.0,
+                ),
+                np.pad(
+                    stored["importance_sampling_ratio"],
+                    ((0, 0), (0, target_length - stored_length)),
+                    constant_values=1.0,
+                ),
             ]
         )
     np.testing.assert_allclose(actual["importance_sampling_ratio"], expected, rtol=1e-6)

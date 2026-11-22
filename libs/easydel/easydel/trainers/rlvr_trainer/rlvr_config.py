@@ -122,13 +122,33 @@ class RLVRConfig(GRPOConfig):
             "help": "Target length for length penalty verifier. `None` disables; `0` is accepted for backward compatibility."
         },
     )
+    length_penalty_min_length: int = field(
+        default=10,
+        metadata={"help": "Minimum length below which the length penalty verifier scores 0.0."},
+    )
+    length_penalty_max_length: int | None = field(
+        default=None,
+        metadata={
+            "help": "Optional maximum length above which the length penalty verifier scores 0.0. `None` disables the hard cap."
+        },
+    )
     length_penalty_weight: float = field(
         default=0.0,
         metadata={"help": "Weight for length penalty reward component."},
     )
-    max_len_mask: bool = field(
-        default=True,
-        metadata={"help": "Mask completions without EOS from the loss."},
+    mask_truncated_completions: bool | None = field(
+        default=None,
+        metadata={
+            "help": "If True, drop completions that do not terminate with EOS from the loss calculation. "
+            "Defaults to `max_len_mask` (True) when omitted."
+        },
+    )
+    max_len_mask: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Mask completions without EOS from the loss. Alias for `mask_truncated_completions`; "
+            "defaults to True when neither is explicitly set."
+        },
     )
     reward_clip_range: float | None = field(
         default=None,
@@ -152,11 +172,13 @@ class RLVRConfig(GRPOConfig):
     ):
         """Normalize RLVR-specific knobs after parent post-init runs.
 
+        - Resolves ``mask_truncated_completions`` and ``max_len_mask`` without
+          letting default ``max_len_mask=True`` clobber an explicit
+          ``mask_truncated_completions=False``.
         - Forwards both inputs to the GRPO ``__post_init__``.
-        - Coerces ``length_penalty_target`` and ``reward_clip_range`` to
-          ``None`` when they hold a non-positive sentinel value.
-        - Forces ``mask_truncated_completions`` on whenever
-          ``max_len_mask`` is requested.
+        - Coerces ``length_penalty_target``, ``length_penalty_max_length``, and
+          ``reward_clip_range`` to ``None`` when they hold a non-positive
+          sentinel value.
 
         Args:
             max_sequence_length (int | None): Deprecated alias for
@@ -164,6 +186,24 @@ class RLVRConfig(GRPOConfig):
             quantization_block (int | None): Optional quantization block
                 size forwarded to the parent class.
         """
+        if self.mask_truncated_completions is None and self.max_len_mask is None:
+            resolved_mask = True
+        elif self.mask_truncated_completions is None:
+            resolved_mask = bool(self.max_len_mask)
+        elif self.max_len_mask is None:
+            resolved_mask = bool(self.mask_truncated_completions)
+        else:
+            mask_trunc = bool(self.mask_truncated_completions)
+            max_len = bool(self.max_len_mask)
+            if mask_trunc != max_len:
+                raise ValueError(
+                    "Conflicting `mask_truncated_completions` and `max_len_mask` values: "
+                    f"mask_truncated_completions={mask_trunc}, max_len_mask={max_len}."
+                )
+            resolved_mask = mask_trunc
+        self.mask_truncated_completions = resolved_mask
+        self.max_len_mask = resolved_mask
+
         super().__post_init__(
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
@@ -173,10 +213,14 @@ class RLVRConfig(GRPOConfig):
             self.length_penalty_target = (
                 normalized_length_penalty_target if normalized_length_penalty_target > 0 else None
             )
+        self.length_penalty_min_length = max(0, int(self.length_penalty_min_length))
+        if self.length_penalty_max_length is not None:
+            normalized_length_penalty_max_length = int(self.length_penalty_max_length)
+            self.length_penalty_max_length = (
+                normalized_length_penalty_max_length if normalized_length_penalty_max_length > 0 else None
+            )
         if self.reward_clip_range is not None:
             normalized_reward_clip_range = float(self.reward_clip_range)
             self.reward_clip_range = normalized_reward_clip_range if normalized_reward_clip_range > 0.0 else None
-        if self.mask_truncated_completions is False and self.max_len_mask:
-            self.mask_truncated_completions = True
 
     __hash__ = hash_fn

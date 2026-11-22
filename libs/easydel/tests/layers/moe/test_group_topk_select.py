@@ -439,5 +439,146 @@ def test_flat_selection_on_wide_token_sharded_rows_matches_stable_host_reference
     np.testing.assert_allclose(np.asarray(weights), expected_weights, rtol=1e-5, atol=1e-6)
 
 
+def _stable_topk_reference(scores: np.ndarray, k: int) -> np.ndarray:
+    """Host top-k: NaN ranks as ``+inf``, ``-inf`` as the lowest finite value, ties to the lower index."""
+    key = np.maximum(scores, np.finfo(scores.dtype).min)
+    key = np.where(np.isnan(key), np.inf, key)
+    return np.argsort(-key, axis=-1, kind="stable")[:, :k]
+
+
+def _rows_without_nan(seed: int, tokens: int, experts: int) -> np.ndarray:
+    """Selection scores without NaN that stress the tie, ``-inf`` and signed-zero handling of the picks."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for i in range(tokens):
+        kind = i % 7
+        if kind == 0:  # a few distinct values: heavy ties
+            row = rng.integers(0, 4, size=experts).astype(np.float32) * 0.25
+        elif kind == 1:  # -inf entries; every other such row keeps fewer finite entries than k
+            row = rng.random(experts).astype(np.float32)
+            row[rng.random(experts) < (0.99 if i % 14 == 1 else 0.5)] = -np.inf
+        elif kind == 2:
+            row = np.full(experts, -np.inf, np.float32)
+        elif kind == 3:  # +0 / -0 with a few positive entries
+            row = np.where(rng.random(experts) < 0.5, 0.0, -0.0).astype(np.float32)
+            row[rng.integers(0, experts, size=3)] = rng.random(3).astype(np.float32)
+        elif kind == 4:
+            row = np.full(experts, 0.5, np.float32)
+        elif kind == 5:  # the largest finite value, repeated
+            row = rng.random(experts).astype(np.float32)
+            row[rng.integers(0, experts, size=4)] = np.finfo(np.float32).max
+        else:  # sigmoid scores plus a selection bias
+            logits = rng.standard_normal(experts)
+            row = (1.0 / (1.0 + np.exp(-logits)) + 1e-3 * rng.standard_normal(experts)).astype(np.float32)
+        rows.append(row)
+    return np.stack(rows).astype(np.float32)
+
+
+@pytest.mark.parametrize("experts", [64, 128, 288, 512])
+@pytest.mark.parametrize("k", [2, 4, 8])
+def test_ranked_topk_matches_the_argmax_picks_on_rows_without_nan(experts, k):
+    """One-pass ranking returns the argmax picks' indices exactly on every row without NaN."""
+    from easydel.layers.moe._routing import _ranked_topk_indices, _topk_indices
+
+    scores = _rows_without_nan(31 + experts + k, 64, experts)
+    picks = np.asarray(jax.jit(functools.partial(_topk_indices, k=k))(jnp.asarray(scores)))
+    ranked = np.asarray(jax.jit(functools.partial(_ranked_topk_indices, k=k))(jnp.asarray(scores)))
+
+    np.testing.assert_array_equal(picks, _stable_topk_reference(scores, k))
+    np.testing.assert_array_equal(ranked, picks)
+
+
+def test_ranked_topk_ranks_nan_scores_first_in_index_order():
+    """NaN scores rank as ``+inf`` with ties to the lower index, so every row gets ``k`` distinct experts."""
+    from easydel.layers.moe._routing import _ranked_topk_indices
+
+    rng = np.random.default_rng(37)
+    experts, k = 288, 8
+    scores = rng.random((24, experts)).astype(np.float32)
+    for i, row in enumerate(scores):
+        if i % 4 == 0:
+            row[:] = 0.25  # ties beside the NaN entries
+        if i % 3 == 0:
+            row[rng.random(experts) < 0.5] = -np.inf
+        row[rng.integers(0, experts, size=1 + i % 12)] = np.nan  # 1 to 12 NaN entries: fewer and more than k
+    scores[0] = np.nan  # a row of NaN only
+
+    got = np.asarray(jax.jit(functools.partial(_ranked_topk_indices, k=k))(jnp.asarray(scores)))
+
+    np.testing.assert_array_equal(got, _stable_topk_reference(scores, k))
+    assert all(len(set(row.tolist())) == k for row in got)
+
+
+def _primitive_count(jaxpr, name: str) -> int:
+    count = 0
+    for eqn in jaxpr.eqns:
+        count += eqn.primitive.name == name
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (tuple, list)) else (param,):
+                sub = getattr(sub, "jaxpr", sub)
+                if hasattr(sub, "eqns"):
+                    count += _primitive_count(sub, name)
+    return count
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize(
+    ("tokens", "experts", "k", "decode_layout", "ranked"),
+    [
+        (32, 288, 8, False, False),  # training and every other trace outside eSurge's decode layout
+        (32, 288, 8, True, True),  # the GLM-5.3-Flash decode step
+        (128, 288, 8, True, False),  # too many compares for one pass
+        (32, 288, 2, True, False),  # k = 2: the argmax picks are always cheaper
+    ],
+)
+def test_ranked_topk_is_traced_only_in_decode_layout_programs_where_it_pays(tokens, experts, k, decode_layout, ranked):
+    """Outside the decode layout (training included) the selection keeps its ``k`` argmax picks."""
+    from easydel.infra.sharding import decode_mode_specs
+    from easydel.layers.moe._routing import _topk_indices
+
+    spec = jax.ShapeDtypeStruct((tokens, experts), jnp.float32)
+    with decode_mode_specs(decode_layout):
+        jaxpr = jax.make_jaxpr(functools.partial(_topk_indices, k=k))(spec).jaxpr
+
+    assert _primitive_count(jaxpr, "argmax") == (0 if ranked else k)
+
+
+def test_decode_layout_selection_on_token_sharded_rows_matches_stable_host_reference():
+    """The decode-step selection (288 experts, k = 8) inside the decode layout, with tokens sharded over devices."""
+    from easydel.infra.sharding import decode_mode_specs
+    from easydel.layers.moe._routing import _ranked_topk_pays
+
+    devices = jax.devices()
+    experts, k = 288, 8
+    tokens = len(devices) * max(1, 32 // len(devices))
+    if not _ranked_topk_pays(tokens, experts, k):
+        pytest.skip(f"{tokens} tokens over {len(devices)} devices take the argmax picks")
+    rng = np.random.default_rng(41)
+    logits = rng.standard_normal((tokens, experts)).astype(np.float32)
+    bias = rng.standard_normal(experts).astype(np.float32)
+    mesh = Mesh(np.asarray(devices), ("tokens",))
+    inputs = jax.device_put(jnp.asarray(logits), NamedSharding(mesh, PartitionSpec("tokens", None)))
+    select = functools.partial(
+        moe_group_topk_select,
+        pre_bias_logits=None,
+        k=k,
+        n_routed_experts=experts,
+        score_fn="sigmoid",
+        e_score_correction_bias=jnp.asarray(bias),
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+    )
+    with decode_mode_specs():
+        weights, indices = jax.jit(select)(inputs)
+
+    scores = np.asarray(jax.nn.sigmoid(jnp.asarray(logits)))
+    expected_indices = np.argsort(-(scores + bias), axis=-1, kind="stable")[:, :k]
+    expected_weights = np.take_along_axis(scores, expected_indices, axis=-1)
+    expected_weights = expected_weights / (expected_weights.sum(axis=-1, keepdims=True) + 1e-20) * 2.5
+
+    np.testing.assert_array_equal(np.asarray(indices), expected_indices)
+    np.testing.assert_allclose(np.asarray(weights), expected_weights, rtol=1e-5, atol=1e-6)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

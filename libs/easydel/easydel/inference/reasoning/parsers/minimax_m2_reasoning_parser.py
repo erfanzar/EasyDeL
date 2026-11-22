@@ -73,15 +73,10 @@ class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
             content, preserving the stateless batch-extraction contract.
         """
         if self.end_token not in model_output:
-            if self.start_token in model_output:
-                cleaned = model_output.replace(self.start_token, "").strip()
-                return cleaned or None, None
+            if model_output.lstrip().startswith(self.start_token):
+                return super().extract_reasoning(model_output, request)
             return None, model_output
-        # Everything before end token is reasoning (even without start token)
-        parts = model_output.split(self.end_token, 1)
-        reasoning = parts[0].replace(self.start_token, "").strip()
-        content = parts[1].strip() if len(parts) > 1 else None
-        return reasoning or None, content
+        return super().extract_reasoning(model_output, request)
 
     def extract_reasoning_final(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Preserve streamed reasoning without hiding markerless batch content.

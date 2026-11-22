@@ -128,6 +128,7 @@ _ESURGE_INT_FIELDS = frozenset(
         "max_num_batched_tokens",
         "long_prefill_token_threshold",
         "token_safety_margin",
+        "dp_admission_hold",
         "page_size",
         "max_cache_tokens",
         "reserve_tokens",
@@ -169,8 +170,11 @@ _ESURGE_BOOL_FIELDS = frozenset(
         "enable_window_aware_runtime_cap",
         "chunked_prefill_enabled",
         "include_finished_set",
+        "freeze_startup_heap",
         "enable_prefix_caching",
         "destroy_pages_on_pause",
+        "decode_prefix_snapshots",
+        "snapshot_aware_routing",
         "auto_truncate_prompt",
         "auto_cap_new_tokens",
         "strict_context",
@@ -721,6 +725,13 @@ def build_esurge(cfg_like: eLMConfig | Mapping[str, Any], model: EasyDeLBaseModu
         getattr(TaskType, "VISION_LM", None),
     ]:
         raise NotImplementedError(f"eSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, ANY_TO_ANY, VISION_LM]; got {task}")
+    if model is None:
+        # dp > 1 from a Ray driver, or the same script on every host: one independent engine per dp slice.
+        from easydel.inference.esurge.serving.host_replicas import launch_dp_replicas
+
+        replicas = launch_dp_replicas(cfg)
+        if replicas is not None:
+            return replicas
     loader_cfg = cfg.get("loader", {})
     trust_remote_code = bool(loader_cfg.get("trust_remote_code", False))
     proc_path = (

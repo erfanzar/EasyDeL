@@ -74,9 +74,12 @@ from .indexer_scores import indexer_scores
 from .kda_chunk import kda_chunk
 from .kda_chunk_local import kda_chunk_local
 from .mhc_coefficients import mhc_coefficients
+from .mhc_decode_fused import mhc_decode_read, mhc_decode_write
 from .mhc_fused import mhc_collapse, mhc_expand
+from .mhc_prefill_fused import mhc_prefill_project, mhc_prefill_read, mhc_prefill_write
+from .moe_decode_fused_w8a8 import moe_decode_fused_w8a8
 from .moe_local_ffn import moe_local_ffn
-from .moe_row_gather import moe_row_gather, moe_row_gather_sum
+from .moe_row_gather import moe_row_gather, moe_row_gather_quantized, moe_row_gather_sum, moe_row_gather_sum_packed
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .page_attention import page_attention
@@ -86,12 +89,17 @@ from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
+from .ragged_kda import ragged_kda
+from .ragged_kda_conv_decode import ragged_kda_conv_decode
+from .ragged_kda_decode import ragged_kda_decode
+from .ragged_kda_short import ragged_kda_short
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .reduce_scatter import reduce_scatter
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 from .row_permute import row_permute
+from .shared_expert_w8a8 import shared_expert_w8a8
 from .sinkhorn_knopp import sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
 from .sparse_selected_attention import sparse_selected_attention
@@ -124,10 +132,18 @@ __all__ = (
     "kda_chunk_local",
     "mhc_coefficients",
     "mhc_collapse",
+    "mhc_decode_read",
+    "mhc_decode_write",
     "mhc_expand",
+    "mhc_prefill_project",
+    "mhc_prefill_read",
+    "mhc_prefill_write",
+    "moe_decode_fused_w8a8",
     "moe_local_ffn",
     "moe_row_gather",
+    "moe_row_gather_quantized",
     "moe_row_gather_sum",
+    "moe_row_gather_sum_packed",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",
@@ -137,12 +153,17 @@ __all__ = (
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
     "ragged_gated_delta_rule_v2",
+    "ragged_kda",
+    "ragged_kda_conv_decode",
+    "ragged_kda_decode",
+    "ragged_kda_short",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "reduce_scatter",
     "reduce_scatter_matmul",
     "ring_attention",
     "row_permute",
+    "shared_expert_w8a8",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "sparse_selected_attention",

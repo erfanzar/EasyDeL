@@ -95,13 +95,14 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.inference.sampling_processors import SamplingConstraints
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.layers.quantization import TurboQuantConfig
 from easydel.utils import flags
 
 from ..multimodal.side_inputs import empty_side_inputs, prefill_embeds_dtype
 from ..utils import model_uses_mrope
-from .async_types import DeviceInputTokenHandoff
+from .async_types import DeviceInputTokenHandoff, DeviceSpecWindowHandoff
 from .execution_types import CacheGroupInputs, ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor, SamplerRuntime
 from .executors.compile_orchestrator import CompileOrchestrator, _tree_hash, _tree_hash_diff
@@ -110,7 +111,10 @@ from .executors.sampler_executor import (
     _cpu_vector_size,
     _greedy_argmax_tokens,
     _padded_cpu_window,
+    _scratch_copy,
+    gather_handoff_tokens,
 )
+from .host_sync import host_payload_broadcast_needed, put_host_payload
 from .pipeline_plan import PipelineInferencePlan, metadata_num_pages, set_metadata_num_pages
 from .sequence_buffer import SequenceBuffer
 
@@ -198,13 +202,28 @@ def _jit_slot_sidecar_rows(output_shardings, fill_values):
 _SNAPSHOT_DROP_INDEX = 2**30
 
 
-def _snapshot_sharding(array: jax.Array) -> jax.sharding.Sharding:
-    """Sharding for a snapshot store: the live leaf's layout with the slot axis replicated."""
+def _snapshot_sharding(array: tp.Any, num_slots: int | None = None) -> jax.sharding.Sharding:
+    """Sharding for a snapshot store of ``num_slots`` slots: the live leaf's layout.
+
+    The slot axis keeps the live pool's slot-axis sharding when ``num_slots`` divides over it, so each device holds
+    only its share of the slots (with ``dp`` ranks a replicated store held every rank's slots on every device). It
+    is replicated otherwise, or when ``num_slots`` is not given.
+    """
     sharding = array.sharding
     if isinstance(sharding, NamedSharding):
         spec = tuple(sharding.spec)[: array.ndim]
         spec = spec + (None,) * (array.ndim - len(spec))
-        return NamedSharding(sharding.mesh, PartitionSpec(None, *spec[1:]))
+        slot_axis = spec[0]
+        if slot_axis is not None and num_slots is not None:
+            names = slot_axis if isinstance(slot_axis, tuple) else (slot_axis,)
+            size = 1
+            for name in names:
+                size *= int(sharding.mesh.shape[name])
+            if size <= 1 or int(num_slots) % size != 0:
+                slot_axis = None
+        else:
+            slot_axis = None
+        return NamedSharding(sharding.mesh, PartitionSpec(slot_axis, *spec[1:]))
     return sharding
 
 
@@ -232,6 +251,25 @@ def _jit_snapshot_restore(output_shardings: tuple[jax.sharding.Sharding, ...]):
         ]
 
     return jax.jit(body, out_shardings=list(output_shardings))
+
+
+@lru_cache(maxsize=32)
+def _jit_snapshot_zeros(
+    shapes: tuple[tuple[tuple[int, ...], typing.Any], ...], output_shardings: tuple[jax.sharding.Sharding, ...]
+):
+    """Allocate a zeroed snapshot store, one ``(shape, dtype)`` per leaf, placed with ``output_shardings``."""
+
+    def make():
+        return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
+
+    return jax.jit(make, out_shardings=list(output_shardings))
+
+
+def _snapshot_zeros_key(leaves: list[tuple[int, str, typing.Any]], positions: list[int], num_slots: int):
+    """``(shapes, shardings)`` of the snapshot arrays for the ``leaves`` at ``positions`` (one device group)."""
+    shapes = tuple(((num_slots, *leaves[i][2].shape[1:]), jnp.dtype(leaves[i][2].dtype)) for i in positions)
+    shardings = tuple(_snapshot_sharding(leaves[i][2], num_slots) for i in positions)
+    return shapes, shardings
 
 
 def _per_slot_state_leaves(views) -> list[tuple[int, str, typing.Any]]:
@@ -314,12 +352,33 @@ def _recurrent_leaf_entries(views):
     return entries
 
 
-def _device_key(array: typing.Any) -> tuple[int, ...]:
-    """Sorted device ids holding ``array``; PP stages own disjoint device sets."""
-    devices = getattr(getattr(array, "sharding", None), "device_set", None)
+def _sorted_device_ids(sharding: typing.Any) -> tuple[int, ...]:
+    devices = getattr(sharding, "device_set", None)
     if not devices:
         return ()
     return tuple(sorted(int(device.id) for device in devices))
+
+
+@lru_cache(maxsize=1024)
+def _sharding_device_key(sharding: jax.sharding.Sharding) -> tuple[int, ...]:
+    """:func:`_sorted_device_ids`, memoized per sharding.
+
+    Row maintenance keys every recurrent leaf by its device set on each row-move event (a hybrid model has
+    hundreds of such leaves, all sharing a handful of shardings), so rebuilding and sorting the id tuple each time
+    was a measurable share of the host time between decode steps.
+    """
+    return _sorted_device_ids(sharding)
+
+
+def _device_key(array: typing.Any) -> tuple[int, ...]:
+    """Sorted device ids holding ``array``; PP stages own disjoint device sets."""
+    sharding = getattr(array, "sharding", None)
+    if sharding is None:
+        return ()
+    try:
+        return _sharding_device_key(sharding)
+    except TypeError:  # an unhashable sharding: compute it uncached
+        return _sorted_device_ids(sharding)
 
 
 def _group_by_devices(leaves: list[tuple[int, str, typing.Any]]) -> dict[tuple[int, ...], list[int]]:
@@ -374,16 +433,17 @@ def _write_back_leaf_results(new_views, entries, results_by_pool) -> bool:
     return changed
 
 
-def _transform_recurrent_sidecars(views, make_indices):
-    """Apply the native slot mapping to positions and Qwen PLE continuation.
+def _recurrent_sidecar_pools(views) -> dict[tuple[int, tuple[int, ...]], list[tuple[int, str, typing.Any, int]]]:
+    """Per-slot sidecar leaves (positions, Qwen PLE continuation) as ``(view index, field, array, fill)``.
 
-    Paged attention leaves are intentionally excluded: their leading dimension
-    indexes physical pages, not recurrent request slots. Segment padding uses
-    -1 rather than zero, matching the PLE cache initialization contract. KDA
-    views contribute only their ``positions`` sidecar here — their state
-    leaves ride the fused zero/permute dispatches instead.
+    Grouped by (pool size, device set). Paged attention leaves are intentionally
+    excluded: their leading dimension indexes physical pages, not recurrent
+    request slots. Segment padding uses -1 rather than zero, matching the PLE
+    cache initialization contract. KDA views contribute only their
+    ``positions`` sidecar here — their state leaves ride the fused zero/permute
+    dispatches instead.
     """
-    by_pool = {}
+    by_pool: dict[tuple[int, tuple[int, ...]], list[tuple[int, str, typing.Any, int]]] = {}
     for index, view in enumerate(views):
         rec = view.recurrent if isinstance(view, ParallelHybridCacheView) else view
         if isinstance(rec, KDACacheView):
@@ -403,8 +463,40 @@ def _transform_recurrent_sidecars(views, make_indices):
             array = getattr(rec, name, None)
             if array is not None:
                 by_pool.setdefault((int(array.shape[0]), _device_key(array)), []).append((index, name, array, fill))
+    return by_pool
+
+
+def _pool_replicated_sharding(array: typing.Any) -> jax.sharding.Sharding | None:
+    """Return a replicated sharding on ``array``'s mesh/device set for host index/mask vectors."""
+    sharding = getattr(array, "sharding", None)
+    if isinstance(sharding, NamedSharding):
+        return NamedSharding(sharding.mesh, PartitionSpec())
+    if isinstance(sharding, jax.sharding.Sharding):
+        return sharding
+    return None
+
+
+def _place_recurrent_host_payload(
+    values: typing.Any,
+    array: typing.Any,
+    *,
+    host_payloads_replicated: bool | None = None,
+) -> typing.Any:
+    """Broadcast (when required) and place recurrent slot index/mask arrays onto ``array``'s mesh."""
+    sharding = _pool_replicated_sharding(array)
+    if host_payload_broadcast_needed(host_payloads_replicated):
+        from jax.experimental import multihost_utils
+
+        values = multihost_utils.broadcast_one_to_all(values)
+    if sharding is None:
+        return values
+    return put_host_payload(values, sharding, host_payloads_replicated=host_payloads_replicated)
+
+
+def _transform_recurrent_sidecars(views, make_indices, *, host_payloads_replicated: bool | None = None):
+    """Apply the native slot mapping to the sidecars of :func:`_recurrent_sidecar_pools`."""
     updates = {}
-    for (n_slots, _devices), entries in by_pool.items():
+    for (n_slots, _devices), entries in _recurrent_sidecar_pools(views).items():
         indices = make_indices(n_slots)
         if indices is None:
             continue
@@ -413,7 +505,12 @@ def _transform_recurrent_sidecars(views, make_indices):
         transform = _jit_slot_sidecar_rows(
             tuple(array.sharding for array in arrays), tuple(entry[3] for entry in entries)
         )
-        result = transform(arrays, numpy.asarray(gather, numpy.int32), numpy.asarray(keep, bool))
+        gather_dev, keep_dev = _place_recurrent_host_payload(
+            (numpy.asarray(gather, numpy.int32), numpy.asarray(keep, bool)),
+            arrays[0],
+            host_payloads_replicated=host_payloads_replicated,
+        )
+        result = transform(arrays, gather_dev, keep_dev)
         for (index, name, _array, _fill), value in zip(entries, result, strict=True):
             updates.setdefault(index, {})[name] = value
     for index, values in updates.items():
@@ -526,6 +623,8 @@ class ExecutionManager:
         layer_to_cache_group: tuple[int, ...] = (),
         host_payloads_replicated: bool = False,
         request_seeds: tp.Mapping[int, int] | None = None,
+        recurrent_slots_pooled: bool = False,
+        recurrent_slot_group_size: int = 1,
     ):
         """Initialize the executor manager.
 
@@ -568,6 +667,11 @@ class ExecutionManager:
                 if the coordinator is initialized after the manager.
             request_seeds: Live mapping of global sequence-buffer rows to request seeds. Retained without copying
                 so row moves and removals are visible to the sampler.
+            recurrent_slots_pooled: Requests own stable pooled recurrent-state slots (recurrent layers that declare the
+                eSurge slot contract, where rows can leave their window-local index), shipped with every step as
+                ``cache_metadata.recurrent_state_indices``. Compressed-window caches are always pooled.
+            recurrent_slot_group_size: Recurrent slots per request, ``W`` (``1 + K_max`` for speculative verify,
+                else 1). The recurrent pools hold ``max_num_reqs * W`` slots.
         """
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
@@ -587,11 +691,21 @@ class ExecutionManager:
         self.pp_microbatch_count = pp_microbatch_count
         self.pp_microbatch_size = pp_microbatch_size
         self.speculative_recurrent_state_tokens = max(0, int(speculative_recurrent_state_tokens))
-        self.enable_spec_recurrent_commit_metadata = self.speculative_recurrent_state_tokens > 0
+        self.recurrent_slot_group_size = max(1, int(recurrent_slot_group_size))
+        # The [2, max_num_reqs] step payload carries the candidate-row commit (GDN candidate rows) or, with slot groups
+        # of W > 1 slots, the tokens covered by every row's slot g (row 0; see _recurrent_slot_bases).
+        self.enable_spec_recurrent_commit_metadata = (
+            self.speculative_recurrent_state_tokens > 0 or self.recurrent_slot_group_size > 1
+        )
+        self._recurrent_base_cpu = numpy.zeros((2, int(max_num_reqs)), dtype=numpy.int32)
+        self._recurrent_base_by_slot = numpy.zeros((int(max_num_reqs) * self.recurrent_slot_group_size,), numpy.int64)
+        self._pending_recurrent_base_deltas: dict[int, tuple[jax.Array, int]] = {}
         self.speculative_trace_tokens = max(0, int(speculative_trace_tokens))
-        # Slot-indexed state families (compressed-window caches) receive the
-        # per-row physical state-slot ids in the batch metadata every step.
-        self._slot_indexed_state = getattr(model, "esurge_cache_family", None) == "compressed_window"
+        # Requests with pooled state slots (compressed-window caches, recurrent layers that declare the slot contract)
+        # receive the per-row physical state-slot ids in the batch metadata every step.
+        self._slot_indexed_state = bool(recurrent_slots_pooled) or (
+            getattr(model, "esurge_cache_family", None) == "compressed_window"
+        )
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -635,6 +749,17 @@ class ExecutionManager:
         )
 
         self.graphdef, self.graphstate, self.graphother = model.split_module()
+        self._last_graphdef_id: int | None = id(self.graphdef) if self.graphdef is not None else None
+        self._compiled_graphstate_shardings = (
+            spx.extract_sharding_structure(self.graphstate, mesh=self.mesh)
+            if self.graphstate is not None and self.mesh is not None
+            else None
+        )
+        self._compiled_graphother_shardings = (
+            spx.extract_sharding_structure(self.graphother, mesh=self.mesh)
+            if self.graphother is not None and self.mesh is not None
+            else None
+        )
 
         self.log_it = logger.info if verbose else logger.debug
         self._verbose = verbose
@@ -669,6 +794,7 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
             host_payloads_replicated=self.host_payloads_replicated,
@@ -690,15 +816,26 @@ class ExecutionManager:
             enable_spec_recurrent_commit=self.enable_spec_recurrent_commit_metadata,
             input_sharding=self._input_sharding,
             slot_indexed_state=self._slot_indexed_state,
+            recurrent_slot_group_size=self.recurrent_slot_group_size,
             cache_group_configs=self.cache_group_configs,
             layer_to_cache_group=self.layer_to_cache_group,
         )
-        self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
+        self._sampler_vocab_size = int(getattr(text_config, "total_vocab_size", None) or text_config.vocab_size)
+        # The sampler's [rows, vocab] logits arrive replicated on every device; split its rows over the whole mesh so
+        # each device samples only its own rows (SPMD meshes only: an MPMD final stage keeps the replicated sampler).
+        sampler_row_sharding = None
+        if self.model.mesh is not None and not bool(getattr(self.model.mesh, "is_mpmd", False)):
+            sampler_jax_mesh = getattr(self.model.mesh, "jax_mesh", self.model.mesh)
+            if sampler_jax_mesh is not None and getattr(sampler_jax_mesh, "axis_names", None):
+                sampler_row_sharding = NamedSharding(
+                    sampler_jax_mesh, PartitionSpec(tuple(sampler_jax_mesh.axis_names))
+                )
         self._sampler_executor = SamplerExecutor(
             model=self.model,
             max_model_len=self.max_model_len,
             empty_sharding=self._sampler_sharding,
             use_aot_forward=self.use_aot_forward,
+            row_sharding=sampler_row_sharding,
         )
         self._sampler_min_input_pad = 1
         # Sampler runtime (phase 11.1): CPU scratch buffers, penalty-count state,
@@ -730,8 +867,8 @@ class ExecutionManager:
 
     @property
     def host_payloads_replicated(self) -> bool:
-        """Whether this manager's coordinator guarantees identical host payloads."""
-        return self._host_payloads_replicated
+        """Whether this manager's coordinator guarantees identical host payloads (``False`` until set)."""
+        return getattr(self, "_host_payloads_replicated", False)
 
     @host_payloads_replicated.setter
     def host_payloads_replicated(self, enabled: bool) -> None:
@@ -781,7 +918,8 @@ class ExecutionManager:
 
         def _allocate() -> tp.Any:
             """Single attempt at building the operations cache via the model API."""
-            cache_batch_size = int(self.max_num_reqs)
+            # Every request owns a group of ``recurrent_slot_group_size`` recurrent-state slots.
+            cache_batch_size = int(self.max_num_reqs) * int(getattr(self, "recurrent_slot_group_size", 1) or 1)
             if self.speculative_recurrent_state_tokens > 0:
                 cache_batch_size += cache_batch_size * int(self.speculative_recurrent_state_tokens)
             extra: dict[str, tp.Any] = {}
@@ -801,10 +939,27 @@ class ExecutionManager:
                 pipeline_plan=self.pipeline_plan,
             )
 
+        initial_pages = metadata_num_pages(self.metadata)
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
         max_attempts = 10 if getattr(self.pipeline_plan, "is_enabled", False) else 1
         for attempt in range(max_attempts):
             try:
-                return _allocate()
+                cache = _allocate()
+                model_executor = getattr(self, "_model_executor", None)
+                if model_executor is not None and hasattr(model_executor, "refresh_kv_pages_template"):
+                    model_executor.refresh_kv_pages_template(cache)
+                if metadata_num_pages(self.metadata) != initial_pages:
+                    preparer = getattr(self, "_batch_preparer", None)
+                    if preparer is not None and hasattr(preparer, "invalidate_page_table_cache"):
+                        preparer.invalidate_page_table_cache()
+                    if model_executor is not None:
+                        pipeline_runtime = getattr(model_executor, "pipeline_runtime", None)
+                        if pipeline_runtime is not None and hasattr(pipeline_runtime, "clear_prepare_cache"):
+                            pipeline_runtime.clear_prepare_cache()
+                        carry_cache = getattr(model_executor, "_pipeline_kv_carry_map_cache", None)
+                        if carry_cache is not None:
+                            carry_cache.clear()
+                return cache
             except Exception as exc:
                 msg = str(exc)
                 oom = "RESOURCE_EXHAUSTED" in msg or "RuntimeBufferAllocationFailure" in msg
@@ -812,6 +967,8 @@ class ExecutionManager:
                 if not oom or current_pages is None or attempt + 1 >= max_attempts:
                     raise
                 next_pages = max(1, int(current_pages * 0.78))
+                if dp_size > 1:
+                    next_pages = max(dp_size, (next_pages // dp_size) * dp_size)
                 if next_pages >= current_pages:
                     raise
                 logger.warning(
@@ -822,6 +979,14 @@ class ExecutionManager:
                     max_attempts,
                 )
                 set_metadata_num_pages(self.metadata, next_pages)
+                preparer = getattr(self, "_batch_preparer", None)
+                if preparer is not None and getattr(preparer, "metadata", None) is not None:
+                    if preparer.metadata is not self.metadata:
+                        set_metadata_num_pages(preparer.metadata, next_pages)
+                model_executor = getattr(self, "_model_executor", None)
+                if model_executor is not None and getattr(model_executor, "metadata", None) is not None:
+                    if model_executor.metadata is not self.metadata:
+                        set_metadata_num_pages(model_executor.metadata, next_pages)
 
         raise RuntimeError("unreachable: cache allocation retry loop exhausted")
 
@@ -903,18 +1068,79 @@ class ExecutionManager:
         graphstate_arg, graphother_arg = self._model_executor.runtime_graph_args()
         return lm_head_fn(graphstate_arg, graphother_arg, hidden_rows)
 
+    def destroy_kv_cache(self) -> None:
+        """Drop live KV cache pages, recurrent snapshots, bases, device caches, and cached PP prepare plans."""
+        self.kv_pages = None
+        self.drop_recurrent_snapshots()
+        self.last_batch_metadata = None
+        self.last_spec_window_delta = None
+        preparer = getattr(self, "_batch_preparer", None)
+        if preparer is not None:
+            if hasattr(preparer, "clear_device_caches"):
+                preparer.clear_device_caches()
+            elif hasattr(preparer, "invalidate_page_table_cache"):
+                preparer.invalidate_page_table_cache()
+        sampler_runtime = getattr(self, "sampler_runtime", None)
+        if sampler_runtime is not None and hasattr(sampler_runtime, "release_device_buffers"):
+            sampler_runtime.release_device_buffers()
+        greedy_cache = getattr(self, "_greedy_total_tokens_cache", None)
+        if greedy_cache is not None:
+            greedy_cache.clear()
+        model_executor = getattr(self, "_model_executor", None)
+        if model_executor is not None:
+            if hasattr(model_executor, "refresh_kv_pages_template"):
+                model_executor.refresh_kv_pages_template(None)
+            carry_cache = getattr(model_executor, "_pipeline_kv_carry_map_cache", None)
+            if carry_cache is not None:
+                carry_cache.clear()
+            pipeline_runtime = getattr(model_executor, "pipeline_runtime", None)
+            if pipeline_runtime is not None and hasattr(pipeline_runtime, "clear_prepare_cache"):
+                pipeline_runtime.clear_prepare_cache()
+
     def release_model_state(self, *, clear_compiled_cache: bool = False) -> None:
         """Drop live model and runtime graph references from both executors.
 
         The runner must ensure requests are idle before calling this method.
         Restore state with :meth:`update_graphs` before executing again. Compiled
-        executables and their trace templates are retained by default for reuse.
+        executables and their extracted weight shardings are retained by default
+        for reuse so a subsequent :meth:`update_graphs` can reshard restored
+        weights back onto the compiled layout.
 
         Args:
             clear_compiled_cache: Whether to also discard compiled variants.
         """
+        mesh = getattr(self, "mesh", None)
         if clear_compiled_cache:
             self.clear_cache()
+            self._compiled_graphstate_shardings = None
+            self._compiled_graphother_shardings = None
+            self._last_graphdef_id = None
+            clear_templates = getattr(self._model_executor, "clear_pipeline_templates", None)
+            if callable(clear_templates):
+                clear_templates()
+        else:
+            if self.graphstate is not None and mesh is not None:
+                self._compiled_graphstate_shardings = spx.extract_sharding_structure(self.graphstate, mesh=mesh)
+            if self.graphother is not None and mesh is not None:
+                self._compiled_graphother_shardings = spx.extract_sharding_structure(self.graphother, mesh=mesh)
+            if self.graphdef is not None:
+                self._last_graphdef_id = id(self.graphdef)
+
+        self.drop_recurrent_snapshots()
+        self.last_batch_metadata = None
+        self.last_spec_window_delta = None
+        preparer = getattr(self, "_batch_preparer", None)
+        if preparer is not None:
+            if hasattr(preparer, "clear_device_caches"):
+                preparer.clear_device_caches()
+            elif hasattr(preparer, "invalidate_page_table_cache"):
+                preparer.invalidate_page_table_cache()
+        sampler_runtime = getattr(self, "sampler_runtime", None)
+        if sampler_runtime is not None and hasattr(sampler_runtime, "release_device_buffers"):
+            sampler_runtime.release_device_buffers()
+        greedy_cache = getattr(self, "_greedy_total_tokens_cache", None)
+        if greedy_cache is not None:
+            greedy_cache.clear()
         self.model = None
         self.graphdef = None
         self.graphstate = None
@@ -922,6 +1148,9 @@ class ExecutionManager:
         self._model_executor.model = None
         self._model_executor.graphdef = None
         self._model_executor.clear_runtime_graph_args()
+        pipeline_runtime = getattr(self._model_executor, "pipeline_runtime", None)
+        if pipeline_runtime is not None and hasattr(pipeline_runtime, "clear_prepare_cache"):
+            pipeline_runtime.clear_prepare_cache()
         self._sampler_executor.model = None
 
     def invalidate_sampler_penalty_state(
@@ -1023,14 +1252,16 @@ class ExecutionManager:
 
     @property
     def _sampler_zero_token_counts(self) -> jax.Array:
+        if hasattr(self.sampler_runtime, "_get_zero_token_counts"):
+            return self.sampler_runtime._get_zero_token_counts()
         return self.sampler_runtime._sampler_zero_token_counts
 
     @property
-    def _sampler_token_counts(self) -> jax.Array:
+    def _sampler_token_counts(self) -> jax.Array | None:
         return self.sampler_runtime._sampler_token_counts
 
     @_sampler_token_counts.setter
-    def _sampler_token_counts(self, value: jax.Array) -> None:
+    def _sampler_token_counts(self, value: jax.Array | None) -> None:
         self.sampler_runtime._sampler_token_counts = value
 
     def _pipeline_model_logits_bucket(
@@ -1087,7 +1318,10 @@ class ExecutionManager:
         padded requests``. The resident PP runtime is only valid for the true
         decode case, where every active scheduled row contributes exactly one
         token. This predicate looks at the unpadded scheduler payload rather
-        than the compile bucket.
+        than the compile bucket. It also selects the SPMD single-token program
+        (:func:`~easydel.infra.sharding.single_token_rows`), so every row the
+        batch builder packs (each row up to the last live one, live or not)
+        must schedule at most one token.
         """
         padded_num_reqs = int(padded_num_reqs)
         scheduled_window = ExecutionManager._padded_cpu_window(
@@ -1103,7 +1337,13 @@ class ExecutionManager:
             fill_value=False,
         )
         active_scheduled = scheduled_window[active_window & (scheduled_window > 0)]
-        return bool(active_scheduled.size > 0 and numpy.all(active_scheduled == 1))
+        if not (active_scheduled.size > 0 and numpy.all(active_scheduled == 1)):
+            return False
+        # The batch builder packs the scheduled tokens of every row up to the last live one and zeroes the rest.
+        last_live = int(numpy.flatnonzero(numpy.asarray(active_mask_full_cpu, dtype=numpy.bool_).reshape(-1))[-1])
+        if last_live >= padded_num_reqs:
+            return False
+        return bool(numpy.all(scheduled_window[: last_live + 1] <= 1))
 
     @staticmethod
     def _window_emits_token(
@@ -1217,27 +1457,62 @@ class ExecutionManager:
         if graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No graph components supplied for update")
 
+        prev_graphdef = self.graphdef
+        prev_graphdef_id = getattr(self, "_last_graphdef_id", None)
         if graphdef is not None:
             self.graphdef = graphdef
             self._model_executor.graphdef = graphdef
 
+        graphdef_changed = False
+        if self.graphdef is not None:
+            if prev_graphdef is not None:
+                graphdef_changed = self.graphdef is not prev_graphdef
+            elif prev_graphdef_id is not None:
+                graphdef_changed = id(self.graphdef) != prev_graphdef_id
+            self._last_graphdef_id = id(self.graphdef)
+
+        def _same_structure(left, right) -> bool:
+            return jax.tree_util.tree_structure(left, is_leaf=lambda x: x is None) == jax.tree_util.tree_structure(
+                right, is_leaf=lambda x: x is None
+            )
+
         if graphstate is not None:
-            template_graphstate = self.graphstate if self.graphstate is not None else graphstate
-            shardings = spx.extract_sharding_structure(template_graphstate, mesh=self.mesh)
+            saved_shardings = getattr(self, "_compiled_graphstate_shardings", None)
+            if self.graphstate is not None and _same_structure(self.graphstate, graphstate):
+                shardings = spx.extract_sharding_structure(self.graphstate, mesh=self.mesh)
+            elif saved_shardings is not None and _same_structure(saved_shardings, graphstate):
+                shardings = saved_shardings
+            else:
+                shardings = spx.extract_sharding_structure(graphstate, mesh=self.mesh)
             self.graphstate = jax.tree_util.tree_map(
                 lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
                 graphstate,
                 shardings,
             )
+            self._compiled_graphstate_shardings = shardings
 
         if graphother is not None:
-            template_graphother = self.graphother if self.graphother is not None else graphother
-            shardings = spx.extract_sharding_structure(template_graphother, mesh=self.mesh)
+            saved_shardings = getattr(self, "_compiled_graphother_shardings", None)
+            if self.graphother is not None and _same_structure(self.graphother, graphother):
+                shardings = spx.extract_sharding_structure(self.graphother, mesh=self.mesh)
+            elif saved_shardings is not None and _same_structure(saved_shardings, graphother):
+                shardings = saved_shardings
+            else:
+                shardings = spx.extract_sharding_structure(graphother, mesh=self.mesh)
             self.graphother = jax.tree_util.tree_map(
                 lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
                 graphother,
                 shardings,
             )
+            self._compiled_graphother_shardings = shardings
+
+        refresh_templates = getattr(self._model_executor, "refresh_graph_templates", None)
+        if callable(refresh_templates) and (self.graphstate is not None or self.graphother is not None):
+            refresh_templates(self.graphstate, self.graphother)
+
+        on_graphs_updated = getattr(self._model_executor, "on_graphs_updated", None)
+        if callable(on_graphs_updated):
+            on_graphs_updated(graphdef_changed=graphdef_changed)
 
         if (
             self.mesh.is_mpmd
@@ -1253,6 +1528,9 @@ class ExecutionManager:
         if self.graphstate is not None and self.graphother is not None:
             self._model_executor.set_runtime_graph_args(self.graphstate, self.graphother)
 
+        self.drop_recurrent_snapshots()
+        self.last_batch_metadata = None
+        self.last_spec_window_delta = None
         self._debug_baselines.clear()
 
     def _validate_cache_group_mapping(self) -> None:
@@ -1335,6 +1613,7 @@ class ExecutionManager:
         presence_penalties_cpu: numpy.ndarray,
         repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        sampling_constraints: SamplingConstraints | None = None,
         recurrent_slot_indices_cpu: numpy.ndarray | None = None,
         page_table_version: int | None = None,
         spec_recurrent_commit_cpu: numpy.ndarray | None = None,
@@ -1354,6 +1633,7 @@ class ExecutionManager:
         wait_for_outputs: bool = True,
         model_side_inputs_cpu: dict[str, numpy.ndarray] | None = None,
         cache_group_inputs: tuple[CacheGroupInputs, ...] = (),
+        spec_window_handoff: DeviceSpecWindowHandoff | None = None,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -1401,6 +1681,8 @@ class ExecutionManager:
             presence_penalties_cpu: Per-request presence penalty values.
             repetition_penalties_cpu: Per-request repetition penalty values.
             page_table_cpu: Host-side KV-cache page-table block ids.
+            sampling_constraints: The window rows' sparse logit bias, allow-lists and banned next tokens, or
+                ``None``. They reach the sampler only, never the compiled model step.
             page_table_version: Optional monotonic version for page-table cache
                 reuse; bump on allocator/swap/condense changes.
             spec_recurrent_commit_cpu: Optional speculative recurrent commit
@@ -1416,6 +1698,10 @@ class ExecutionManager:
             video_grid_thw: Optional video grid shape ``(T, H, W)``.
             device_token_handoff: Optional device-resident sampled-token handoff
                 from the previous PP step (avoids host token materialization).
+            spec_window_handoff: Optional previous verify step's device results; the step's optimistic verify
+                windows are rewritten from them on the device (see
+                ``BatchMetadataPreparer.apply_spec_window_handoff``), and the per-row correction is left in
+                ``last_spec_window_delta``.
             wait_for_outputs: If ``True``, block on the device-side output
                 arrays before returning so the timing metrics reflect full
                 completion; otherwise the returned arrays may still be running.
@@ -1473,16 +1759,51 @@ class ExecutionManager:
                 bool(wait_for_outputs),
             )
         microbatch_result = None
+        recurrent_group_size = int(getattr(self, "recurrent_slot_group_size", 1) or 1)
+        recurrent_fed_mask: numpy.ndarray | None = None
+        if recurrent_group_size > 1 and recurrent_slot_indices_cpu is not None:
+            skip_host_read_mask: numpy.ndarray | None = None
+            if spec_window_handoff is not None and not isinstance(spec_window_handoff.sources, jax.Array):
+                sources_host = numpy.asarray(spec_window_handoff.sources, dtype=numpy.int32)
+                n_rows = min(
+                    int(self._recurrent_base_cpu.shape[1]),
+                    len(scheduled_full_cpu),
+                    len(num_computed_tokens_cpu),
+                    len(recurrent_slot_indices_cpu),
+                )
+                recurrent_fed_mask = numpy.zeros((n_rows,), dtype=bool)
+                src_len = min(n_rows, int(sources_host.shape[1])) if sources_host.ndim == 2 else 0
+                if src_len > 0:
+                    recurrent_fed_mask[:src_len] = sources_host[0, :src_len] >= 0
+                if spec_window_handoff.rewrite_recurrent_base:
+                    skip_host_read_mask = recurrent_fed_mask
+            spec_recurrent_commit_cpu = self._recurrent_slot_bases(
+                scheduled_full_cpu,
+                num_computed_tokens_cpu,
+                recurrent_slot_indices_cpu,
+                skip_host_read_mask=skip_host_read_mask,
+            )
         # The wavefront path builds per-microbatch metadata without model side inputs, physical recurrent-state slots
         # or speculative recurrent commits; a step that needs any of them must take the full-window path instead.
         # The runner supplies recurrent_slot_indices_cpu for every model, including ordinary attention models.
         # BatchMetadataPreparer consumes those indices only for slot-indexed state or SPMD DP, so gate on those
         # capabilities rather than the presence of the always-allocated bookkeeping array.
+        # Identity-layout hybrid/recurrent caches also cannot run PP decode microbatching because each chunk packs
+        # into scratch rows [0..m-1] while carrying kv_pages, overwriting earlier chunks' recurrent slots.
+        # Steps carrying spec_window_handoff, sampling constraints, or requiring full hidden states (drafter) also
+        # stay on the full-window path.
+        has_recurrent_views = isinstance(self.kv_pages, HybridCache) and bool(
+            _recurrent_leaf_entries(self.kv_pages.views)
+        )
         microbatch_unsupported = (
             bool(model_side_inputs_cpu)
             or self._slot_indexed_state
+            or has_recurrent_views
             or self._batch_preparer._uses_spmd_dp()
             or spec_recurrent_commit_cpu is not None
+            or spec_window_handoff is not None
+            or int(getattr(self._model_executor, "full_hidden_state_max_tokens", 0) or 0) > 0
+            or sampling_constraints is not None
         )
         if self._pp_microbatch is not None and not microbatch_unsupported:
             microbatch_result = self._pp_microbatch.try_execute(
@@ -1518,6 +1839,7 @@ class ExecutionManager:
                 **({"cache_group_inputs": cache_group_inputs} if cache_group_inputs else {}),
             )
         if microbatch_result is not None:
+            self.last_spec_window_delta = None
             if self._verbose and num_tokens > 0:
                 logger.info("[esurge-prof-exec] microbatch path returned tok=%d", int(num_tokens))
             return microbatch_result
@@ -1573,7 +1895,30 @@ class ExecutionManager:
             batch_metadata = self._apply_device_token_handoff(batch_metadata, device_token_handoff)
             input_ids_buf = batch_metadata.input_ids_buf
             prep_handoff_took = time.time() - prep_phase_start
+        self.last_spec_window_delta = None
+        if spec_window_handoff is not None:
+            prep_phase_start = time.time()
+            batch_metadata, self.last_spec_window_delta = self._batch_preparer.apply_spec_window_handoff(
+                batch_metadata, spec_window_handoff
+            )
+            if (
+                recurrent_group_size > 1
+                and recurrent_slot_indices_cpu is not None
+                and self.last_spec_window_delta is not None
+            ):
+                self._record_pending_recurrent_base_deltas(
+                    scheduled_cpu=scheduled_full_cpu,
+                    slot_indices_cpu=recurrent_slot_indices_cpu,
+                    delta_dev=self.last_spec_window_delta,
+                    fed_mask=recurrent_fed_mask,
+                )
+            input_ids_buf = batch_metadata.input_ids_buf
+            position_ids_buf = batch_metadata.position_ids_buf
+            prep_handoff_took += time.time() - prep_phase_start
 
+        # Per-request logit bias, allow-list and bad-word constraints go to the sampler only: the batch metadata is an
+        # argument of the compiled model step, whose signature has none of them.
+        self.last_batch_metadata = batch_metadata
         window_emits_token = self._window_emits_token(
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -1640,13 +1985,13 @@ class ExecutionManager:
             sample_took = 0.0
             execute_total_took = time.time() - start_prep
             execute_overhead_took = max(0.0, float(execute_total_took - (prep_took + exec_took + sample_took)))
-            out_tokens_full = jax.device_put(
-                numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+            out_tokens_full, valid_mask_full = put_host_payload(
+                (
+                    numpy.full((int(padded_num_reqs),), -1, dtype=numpy.int32),
+                    numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
+                ),
                 self._empty_sharding,
-            )
-            valid_mask_full = jax.device_put(
-                numpy.zeros((int(padded_num_reqs),), dtype=numpy.bool_),
-                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
             )
             metrics = {
                 "exec_time": exec_took,
@@ -1762,8 +2107,11 @@ class ExecutionManager:
             & (self._sampler_scheduled_cpu[: int(sampler_padded_num_reqs)] > 0)
             & (self._sampler_seq_lens_cpu[: int(sampler_padded_num_reqs)] >= req_num_tokens_for_sampler)
         )
+        # The fused greedy argmax applies no logit bias, allow-list or bad-word mask; a step carrying one samples
+        # through the sampler, which does.
         use_greedy_argmax_fastpath = bool(
             not need_penalties
+            and sampling_constraints is None
             # Under an MPMD/PP mesh the logits live on the final stage's
             # submesh, but the fastpath's helper tensors (valid mask, RNG
             # fold scalar) are replicated over the full mesh — a device-set
@@ -1798,6 +2146,14 @@ class ExecutionManager:
             padded_num_reqs=model_logits_padded_num_reqs,
             inputs=inputs,
             use_pipeline_runtime=use_pipeline_runtime_for_window,
+            decode_only=bool(
+                not self.model.mesh.is_mpmd
+                and self._is_decode_only_window(
+                    scheduled_full_cpu=scheduled_full_cpu,
+                    active_mask_full_cpu=active_mask_full_cpu,
+                    padded_num_reqs=padded_num_reqs,
+                )
+            ),
         )
         model_enqueue_took = time.time() - model_enqueue_start
         if self._verbose and num_tokens > 0:
@@ -1873,6 +2229,7 @@ class ExecutionManager:
                 compact_presence_penalties_cpu=self._sampler_presence_penalties_cpu,
                 compact_repetition_penalties_cpu=self._sampler_repetition_penalties_cpu,
                 need_penalties=need_penalties,
+                sampling_constraints=sampling_constraints,
             )
             sampler_enqueue_took = time.time() - sampler_enqueue_start
             if self._verbose and num_tokens > 0:
@@ -1976,7 +2333,9 @@ class ExecutionManager:
         cached = self._greedy_mask_cache
         if cached is not None and cached[0] == key:
             return cached[1]
-        device_mask = jax.device_put(valid_mask_cpu, self._empty_sharding)
+        device_mask = put_host_payload(
+            valid_mask_cpu, self._empty_sharding, host_payloads_replicated=self.host_payloads_replicated
+        )
         self._greedy_mask_cache = (key, device_mask)
         return device_mask
 
@@ -1987,7 +2346,11 @@ class ExecutionManager:
         """
         cached = self._greedy_total_tokens_cache.get(total_tokens)
         if cached is None:
-            cached = jax.device_put(jnp.asarray(total_tokens, dtype=jnp.int32), self._empty_sharding)
+            cached = put_host_payload(
+                numpy.asarray(total_tokens, dtype=numpy.int32),
+                self._empty_sharding,
+                host_payloads_replicated=self.host_payloads_replicated,
+            )
             self._greedy_total_tokens_cache[total_tokens] = cached
         return cached
 
@@ -1997,6 +2360,7 @@ class ExecutionManager:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
         use_pipeline_runtime: bool = True,
+        decode_only: bool = False,
     ) -> ModelStepOutputs:
         """Run the compiled model forward step and update self.kv_pages.
 
@@ -2011,6 +2375,9 @@ class ExecutionManager:
             use_pipeline_runtime: Select the resident PP-runtime backbone
                 variant for true decode wavefronts, or the direct SpectraX
                 variant for prompt prefill chunks.
+            decode_only: Whether every active row of the window schedules exactly one token. On SPMD meshes such
+                a window runs the decode-layout program of its bucket when one was compiled; the key that ran is
+                recorded in ``last_model_step_key``.
 
         Returns:
             ModelStepOutputs containing updated kv_pages, hidden_states, and
@@ -2022,11 +2389,19 @@ class ExecutionManager:
             not block on completion, allowing the caller to pipeline work like
             enqueuing sampling before synchronizing.
         """
+        effective_use_pipeline_runtime = bool(use_pipeline_runtime)
+        if getattr(self.model.mesh, "is_mpmd", False) and getattr(self._model_executor, "pipeline_runtime", None) is None:
+            effective_use_pipeline_runtime = False
         model_fn = self._model_executor.get_compiled(
             num_tokens=num_tokens,
             padded_num_reqs=padded_num_reqs,
-            use_pipeline_runtime=use_pipeline_runtime,
+            use_pipeline_runtime=effective_use_pipeline_runtime,
+            decode_only=decode_only,
         )
+        if not self.model.mesh.is_mpmd:
+            self.last_model_step_key = self._model_executor.model_step_key(
+                num_tokens, padded_num_reqs, decode_only=decode_only
+            )
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
         graphstate_arg, graphother_arg = self._model_executor.runtime_graph_args()
@@ -2043,8 +2418,53 @@ class ExecutionManager:
         sampler executor has no background threads so is not touched here.
         Safe to call multiple times.
         """
+        model_executor = getattr(self, "_model_executor", None)
+        if model_executor is not None and hasattr(model_executor, "shutdown"):
+            model_executor.shutdown()
+
+    def close(self) -> None:
+        """Terminal teardown: release caches/sub-executors and break all back-reference cycles.
+
+        Called from :meth:`eSurgeRunner.close` / :meth:`eSurge.close` (leaving
+        :meth:`shutdown` restartable across :meth:`eSurge.terminate` / :meth:`eSurge.initiate`).
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            self.destroy_kv_cache()
+        except Exception:
+            logger.debug("ExecutionManager close: destroy_kv_cache failed", exc_info=True)
+        try:
+            if getattr(self, "_model_executor", None) is not None and getattr(self, "_sampler_executor", None) is not None:
+                self.release_model_state(clear_compiled_cache=True)
+        except Exception:
+            logger.debug("ExecutionManager close: release_model_state failed", exc_info=True)
+        try:
+            self.shutdown()
+        except Exception:
+            logger.debug("ExecutionManager close: shutdown failed", exc_info=True)
+        pp_microbatch = getattr(self, "_pp_microbatch", None)
+        if pp_microbatch is not None:
+            if callable(getattr(pp_microbatch, "close", None)):
+                pp_microbatch.close()
+            else:
+                if callable(getattr(pp_microbatch, "clear_cache", None)):
+                    pp_microbatch.clear_cache()
+                if hasattr(pp_microbatch, "_manager"):
+                    pp_microbatch._manager = None
+            self._pp_microbatch = None
+        orchestrator = self.__dict__.pop("_compile_orchestrator", None)
+        if orchestrator is not None and hasattr(orchestrator, "_manager"):
+            orchestrator._manager = None
+        if hasattr(self, "sampler_runtime"):
+            self.sampler_runtime = None
+        if hasattr(self, "_batch_preparer"):
+            self._batch_preparer = None
         if hasattr(self, "_model_executor"):
-            self._model_executor.shutdown()
+            self._model_executor = None
+        if hasattr(self, "_sampler_executor"):
+            self._sampler_executor = None
 
     def clear_recurrent_slots(self, slot_indices: list[int]) -> None:
         """Zero recurrent/SSM state in freed slots before slot reuse.
@@ -2074,6 +2494,15 @@ class ExecutionManager:
         """
         if not slot_indices:
             return
+        by_slot = getattr(self, "_recurrent_base_by_slot", None)
+        pending_deltas = getattr(self, "_pending_recurrent_base_deltas", None)
+        if by_slot is not None or pending_deltas:
+            for s in slot_indices:
+                idx = int(s)
+                if by_slot is not None and 0 <= idx < int(by_slot.shape[0]):
+                    by_slot[idx] = 0
+                if pending_deltas is not None:
+                    pending_deltas.pop(idx, None)
         cache = self.kv_pages
         from easydel.caching import CompressedWindowCache
         from easydel.caching.compressed_window import SharedCompressedWindowCache
@@ -2102,6 +2531,7 @@ class ExecutionManager:
         entries = _recurrent_leaf_entries(new_views)
         by_pool = _bucket_leaf_arrays(entries)
         cleared_by_pool: dict[tuple[int, tuple[int, ...]], list[jax.Array]] = {}
+        replicated = getattr(self, "host_payloads_replicated", False)
         for key, arrays in by_pool.items():
             n_slots = key[0]
             filtered_slots = sorted({int(s) for s in slot_indices_to_clear if 0 <= int(s) < n_slots})
@@ -2110,7 +2540,8 @@ class ExecutionManager:
             keep_np = numpy.ones((n_slots,), dtype=bool)
             keep_np[numpy.asarray(filtered_slots, dtype=numpy.int64)] = False
             transform = _jit_zero_rows(tuple(array.sharding for array in arrays))
-            cleared_by_pool[key] = list(transform(arrays, keep_np))
+            keep_dev = _place_recurrent_host_payload(keep_np, arrays[0], host_payloads_replicated=replicated)
+            cleared_by_pool[key] = list(transform(arrays, keep_dev))
 
         changed = _write_back_leaf_results(new_views, entries, cleared_by_pool) or changed
 
@@ -2122,9 +2553,134 @@ class ExecutionManager:
             keep[numpy.asarray(selected, dtype=numpy.int32)] = False
             return numpy.arange(n_slots, dtype=numpy.int32), keep
 
-        changed = _transform_recurrent_sidecars(new_views, sidecar_clear_indices) or changed
+        changed = (
+            _transform_recurrent_sidecars(new_views, sidecar_clear_indices, host_payloads_replicated=replicated)
+            or changed
+        )
         if changed:
             self.kv_pages = HybridCache(views=new_views)
+
+    def reset_recurrent_bases(self) -> None:
+        """Reset tracked verify-contract recurrent slot bases and any pending overlapped deltas."""
+        by_slot = getattr(self, "_recurrent_base_by_slot", None)
+        if by_slot is not None:
+            by_slot.fill(0)
+        pending = getattr(self, "_pending_recurrent_base_deltas", None)
+        if pending is not None:
+            pending.clear()
+
+    def _flush_pending_recurrent_bases(self, slots_needed: typing.Iterable[int]) -> None:
+        """Apply deferred overlapped ``-delta`` corrections for ``slots_needed`` before a host read.
+
+        Only materialized for non-fed rows whose previous overlapped step has already drained,
+        so steady-state overlapped steps incur zero device-to-host synchronization.
+        """
+        pending = getattr(self, "_pending_recurrent_base_deltas", None)
+        if not pending:
+            return
+        needed_delta_ids: set[int] = set()
+        for slot in slots_needed:
+            entry = pending.get(int(slot))
+            if entry is not None:
+                needed_delta_ids.add(id(entry[0]))
+        if not needed_delta_ids:
+            return
+        by_slot = self._recurrent_base_by_slot
+        host_deltas: dict[int, numpy.ndarray] = {}
+        to_pop: list[int] = []
+        for slot, (delta_dev, row_idx) in pending.items():
+            did = id(delta_dev)
+            if did not in needed_delta_ids:
+                continue
+            arr = host_deltas.get(did)
+            if arr is None:
+                arr = numpy.asarray(delta_dev, dtype=numpy.int64).reshape(-1)
+                host_deltas[did] = arr
+            if 0 <= row_idx < arr.shape[0] and 0 <= slot < by_slot.shape[0]:
+                by_slot[slot] -= int(arr[row_idx])
+            to_pop.append(slot)
+        for slot in to_pop:
+            pending.pop(slot, None)
+
+    def _record_pending_recurrent_base_deltas(
+        self,
+        *,
+        scheduled_cpu: numpy.ndarray,
+        slot_indices_cpu: numpy.ndarray,
+        delta_dev: jax.Array,
+        fed_mask: numpy.ndarray | None,
+    ) -> None:
+        """Record deferred ``delta`` corrections for slots written during an overlapped step."""
+        by_slot = getattr(self, "_recurrent_base_by_slot", None)
+        if by_slot is None:
+            return
+        pending = getattr(self, "_pending_recurrent_base_deltas", None)
+        if pending is None:
+            pending = {}
+            self._pending_recurrent_base_deltas = pending
+        n = min(int(self._recurrent_base_cpu.shape[1]), len(scheduled_cpu), len(slot_indices_cpu))
+        sched = numpy.asarray(scheduled_cpu[:n], dtype=numpy.int64)
+        slots = numpy.asarray(slot_indices_cpu[:n], dtype=numpy.int64)
+        for row in range(n):
+            slot = int(slots[row])
+            if sched[row] <= 0 or not (0 <= slot < by_slot.shape[0]):
+                continue
+            if fed_mask is not None and (row >= len(fed_mask) or not bool(fed_mask[row])):
+                continue
+            pending[slot] = (delta_dev, row)
+
+    def _recurrent_slot_bases(
+        self,
+        scheduled_cpu: numpy.ndarray,
+        num_computed_cpu: numpy.ndarray,
+        slot_indices_cpu: numpy.ndarray,
+        *,
+        skip_host_read_mask: numpy.ndarray | None = None,
+    ) -> numpy.ndarray:
+        """Per window row, the tokens slot ``g`` covers before this step; then record what it covers after it.
+
+        With slot groups of ``W`` slots a row of at most ``W`` tokens writes the state after its first token into
+        slot ``g`` (and after token ``j`` into ``g + j``), a longer row its final state. So after a step slot ``g``
+        covers ``computed + 1`` tokens for a short row and ``computed + scheduled`` for a chunk row. The device reads
+        slot ``g + (context before the step - base)`` on the next step, which is the drafts the previous verify step
+        accepted; no acceptance result is needed here.
+
+        Args:
+            scheduled_cpu: Scheduled tokens per window row.
+            num_computed_cpu: Computed tokens per window row before this step.
+            slot_indices_cpu: Base slot ``g`` per window row.
+            skip_host_read_mask: Optional boolean mask of rows whose pre-step base will be overwritten on device
+                by ``apply_spec_window_handoff`` and therefore do not need any pending host-side delta flush.
+
+        Returns:
+            The ``[2, max_num_reqs]`` step payload: row 0 holds the bases, row 1 zeros.
+        """
+        width = self.recurrent_slot_group_size
+        out = self._recurrent_base_cpu
+        out.fill(0)
+        by_slot = self._recurrent_base_by_slot
+        n = min(out.shape[1], len(scheduled_cpu), len(num_computed_cpu), len(slot_indices_cpu))
+        sched = numpy.asarray(scheduled_cpu[:n], dtype=numpy.int64)
+        computed = numpy.asarray(num_computed_cpu[:n], dtype=numpy.int64)
+        slots = numpy.asarray(slot_indices_cpu[:n], dtype=numpy.int64)
+        live = (sched > 0) & (slots >= 0) & (slots < by_slot.shape[0])
+        if skip_host_read_mask is not None:
+            skip = numpy.zeros((n,), dtype=bool)
+            m = min(n, len(skip_host_read_mask))
+            skip[:m] = numpy.asarray(skip_host_read_mask[:m], dtype=bool)
+            need_host_read = live & ~skip
+        else:
+            need_host_read = live
+        if numpy.any(need_host_read):
+            self._flush_pending_recurrent_bases(int(s) for s in slots[need_host_read])
+        out[0, :n] = numpy.where(live, by_slot[numpy.clip(slots, 0, by_slot.shape[0] - 1)], 0)
+        live_slots = slots[live]
+        by_slot[live_slots] = (computed + numpy.where(sched <= width, 1, sched))[live]
+        pending = getattr(self, "_pending_recurrent_base_deltas", None)
+        if pending:
+            for s in live_slots:
+                pending.pop(int(s), None)
+        return out
 
     def _recurrent_snapshot_store(self, leaves: list[tuple[int, str, typing.Any]]) -> list[jax.Array]:
         """Return (allocating on first use) the snapshot arrays matching ``leaves``."""
@@ -2143,13 +2699,8 @@ class ExecutionManager:
             raise RuntimeError("Recurrent prefix snapshots were requested but no snapshot slots are configured.")
         store: list[typing.Any] = [None] * len(leaves)
         for positions in _group_by_devices(leaves).values():
-            shapes = [((num_slots, *leaves[i][2].shape[1:]), leaves[i][2].dtype) for i in positions]
-            shardings = [_snapshot_sharding(leaves[i][2]) for i in positions]
-
-            def make(shapes=shapes):
-                return [jnp.zeros(shape, dtype) for shape, dtype in shapes]
-
-            for i, value in zip(positions, jax.jit(make, out_shardings=shardings)(), strict=True):
+            make = _jit_snapshot_zeros(*_snapshot_zeros_key(leaves, positions, num_slots))
+            for i, value in zip(positions, make(), strict=True):
                 store[i] = value
         self._recurrent_snapshot_arrays = store
         self._recurrent_snapshot_signature = signature
@@ -2181,10 +2732,14 @@ class ExecutionManager:
             return
         store = list(self._recurrent_snapshot_store(leaves))
         rows_np, slots_np = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=False)
+        replicated = getattr(self, "host_payloads_replicated", False)
         for positions in _group_by_devices(leaves).values():
             snapshots = [store[i] for i in positions]
             transform = _jit_snapshot_save(tuple(array.sharding for array in snapshots))
-            saved = transform([leaves[i][2] for i in positions], snapshots, rows_np, slots_np)
+            rows_dev, slots_dev = _place_recurrent_host_payload(
+                (rows_np, slots_np), snapshots[0], host_payloads_replicated=replicated
+            )
+            saved = transform([leaves[i][2] for i in positions], snapshots, rows_dev, slots_dev)
             for i, value in zip(positions, saved, strict=True):
                 store[i] = value
         self._recurrent_snapshot_arrays = store
@@ -2205,11 +2760,15 @@ class ExecutionManager:
             return
         store = self._recurrent_snapshot_store(leaves)
         rows_np, slots_np = self._recurrent_snapshot_index_arrays(rows, slots, pad_rows=True)
+        replicated = getattr(self, "host_payloads_replicated", False)
         updates: dict[int, dict[str, jax.Array]] = {}
         for positions in _group_by_devices(leaves).values():
             pools = [leaves[i][2] for i in positions]
             transform = _jit_snapshot_restore(tuple(array.sharding for array in pools))
-            restored = transform(pools, [store[i] for i in positions], rows_np, slots_np)
+            rows_dev, slots_dev = _place_recurrent_host_payload(
+                (rows_np, slots_np), pools[0], host_payloads_replicated=replicated
+            )
+            restored = transform(pools, [store[i] for i in positions], rows_dev, slots_dev)
             for i, value in zip(positions, restored, strict=True):
                 idx, name, _array = leaves[i]
                 updates.setdefault(idx, {})[name] = value
@@ -2217,9 +2776,15 @@ class ExecutionManager:
         self.kv_pages = HybridCache(views=views)
 
     def drop_recurrent_snapshots(self) -> None:
-        """Release the snapshot store; contents are only meaningful to the scheduler that issued them."""
+        """Release the snapshot store, reset verify-contract bases, and clear stale PP prepare cache."""
         self._recurrent_snapshot_arrays = None
         self._recurrent_snapshot_signature = None
+        self.reset_recurrent_bases()
+        model_executor = getattr(self, "_model_executor", None)
+        if model_executor is not None:
+            pipeline_runtime = getattr(model_executor, "pipeline_runtime", None)
+            if pipeline_runtime is not None and hasattr(pipeline_runtime, "clear_prepare_cache"):
+                pipeline_runtime.clear_prepare_cache()
 
     def permute_recurrent_slots(self, perm: numpy.ndarray) -> None:
         """Gather recurrent/SSM state rows into a new physical row layout.
@@ -2296,6 +2861,7 @@ class ExecutionManager:
                 return None
             return gather, keep
 
+        replicated = getattr(self, "host_payloads_replicated", False)
         by_pool = _bucket_leaf_arrays(entries)
         moved_by_pool: dict[tuple[int, tuple[int, ...]], list[jax.Array]] = {}
         for key, arrays in by_pool.items():
@@ -2304,11 +2870,16 @@ class ExecutionManager:
                 continue
             gather, keep = gk
             transform = _jit_permute_rows(tuple(array.sharding for array in arrays))
-            moved_by_pool[key] = list(transform(arrays, numpy.asarray(gather, dtype=numpy.int32), keep))
+            gather_dev, keep_dev = _place_recurrent_host_payload(
+                (numpy.asarray(gather, dtype=numpy.int32), keep),
+                arrays[0],
+                host_payloads_replicated=replicated,
+            )
+            moved_by_pool[key] = list(transform(arrays, gather_dev, keep_dev))
 
         changed = _write_back_leaf_results(new_views, entries, moved_by_pool) or changed
 
-        changed = _transform_recurrent_sidecars(new_views, _gather_keep) or changed
+        changed = _transform_recurrent_sidecars(new_views, _gather_keep, host_payloads_replicated=replicated) or changed
         if changed:
             self.kv_pages = HybridCache(views=new_views)
 
@@ -2438,9 +3009,9 @@ class ExecutionManager:
         """Delegate to :meth:`CompileOrchestrator._compile_backbone_variant`."""
         self._get_compile_orchestrator()._compile_backbone_variant(**kwargs)
 
-    def _reset_kv_pages_after_compile_warmup(self) -> None:
+    def _reset_kv_pages_after_compile_warmup(self, *, force: bool = False) -> None:
         """Delegate to :meth:`CompileOrchestrator._reset_kv_pages_after_compile_warmup`."""
-        self._get_compile_orchestrator()._reset_kv_pages_after_compile_warmup()
+        self._get_compile_orchestrator()._reset_kv_pages_after_compile_warmup(force=force)
 
     def _compile_lm_head_variant(self, **kwargs) -> None:
         """Delegate to :meth:`CompileOrchestrator._compile_lm_head_variant`."""
@@ -2449,6 +3020,116 @@ class ExecutionManager:
     def _compile_sampler_variant(self, **kwargs) -> None:
         """Delegate to :meth:`CompileOrchestrator._compile_sampler_variant`."""
         self._get_compile_orchestrator()._compile_sampler_variant(**kwargs)
+
+    def _warm_step_programs(self, *, logits_buckets: list[int], sampler_buckets: list[int]) -> None:
+        """Compile, before serving, the small per-step programs around the model step for the whole bucket grid.
+
+        The sampler's row compaction (slice or gather, scatter back), the fused greedy argmax and the async token
+        handoff gather each compile once per window bucket (and sampler bucket) the first time a step reaches that
+        layout. Requests finishing at different times reach new layouts mid-run, and on a multi-host mesh the one
+        host compiling then holds every other host in the next collective. Scratch inputs only: the live RNG key,
+        token counts and cache are neither read for their values nor written, and nothing called here donates.
+
+        Args:
+            logits_buckets: Request buckets of the model step's logits rows.
+            sampler_buckets: Compiled sampler request buckets.
+        """
+        logits_sharding = self._model_executor._lm_head_replicated_sharding() or self._empty_sharding
+        tokens = self.sampler_runtime.warm_compaction_programs(
+            logits_buckets=logits_buckets,
+            sampler_buckets=sampler_buckets,
+            logits_dtype=self.model.dtype,
+            logits_sharding=logits_sharding,
+            rng_key=self.rng_key,
+        )
+        replicated = self.host_payloads_replicated
+        if not self._model_executor._uses_mpmd_mesh():
+            key = _scratch_copy(self.rng_key)
+            vocab = int(self._sampler_vocab_size)
+            for m in sorted({int(b) for b in logits_buckets if int(b) > 0}):
+                logits = jnp.zeros((m, vocab), dtype=self.model.dtype, device=logits_sharding)
+                mask = put_host_payload(
+                    numpy.ones((m,), dtype=numpy.bool_), self._empty_sharding, host_payloads_replicated=replicated
+                )
+                total = put_host_payload(
+                    numpy.asarray(m, dtype=numpy.int32), self._empty_sharding, host_payloads_replicated=replicated
+                )
+                tokens.append(_greedy_argmax_tokens(logits, mask, key, total, padded_num_reqs=m)[1])
+        # The handoff reads a window's sampled tokens as the runner keeps them (``tokens[:rows]``), from either sampler.
+        rows = put_host_payload(
+            numpy.zeros((int(self.max_num_reqs),), dtype=numpy.int32),
+            self._empty_sharding,
+            host_payloads_replicated=replicated,
+        )
+        seen: set[tuple[int, typing.Any]] = set()
+        warmed = []
+        for out in tokens:
+            m = int(out.shape[0])
+            if (m, out.sharding) in seen:
+                continue
+            seen.add((m, out.sharding))
+            source = out[:m]
+            warmed.append(gather_handoff_tokens([source, source], [rows, rows], self._empty_sharding))
+        jax.block_until_ready(warmed)
+        self._warm_recurrent_slot_programs()
+
+    def _warm_recurrent_slot_programs(self) -> None:
+        """Compile the recurrent slot-maintenance programs from the live cache's shapes, before serving.
+
+        Zeroing a finished request's slots, moving rows and their sidecars when the batch layout changes, and the
+        prefix-snapshot store's allocation, save and restore each run one fused program per pool, compiled the first
+        time a request finishes, moves or hits the prefix cache. They are lowered here from abstract shapes and
+        shardings (with host index vectors where serving passes host arrays): nothing is allocated, read or written.
+        """
+        cache = self.kv_pages
+        if not isinstance(cache, HybridCache):
+            return
+
+        def abstract(array: jax.Array) -> jax.ShapeDtypeStruct:
+            return jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
+
+        views = list(cache.views)
+        for (n_slots, _devices), arrays in _bucket_leaf_arrays(_recurrent_leaf_entries(views)).items():
+            shardings = tuple(array.sharding for array in arrays)
+            pool_sharding = _pool_replicated_sharding(arrays[0])
+            leaves = [abstract(array) for array in arrays]
+            index = jax.ShapeDtypeStruct((n_slots,), jnp.int32, sharding=pool_sharding)
+            keep = jax.ShapeDtypeStruct((n_slots,), jnp.bool_, sharding=pool_sharding)
+            _jit_zero_rows(shardings).lower(leaves, keep).compile()
+            _jit_permute_rows(shardings).lower(leaves, index, keep).compile()
+        for (n_slots, _devices), entries in _recurrent_sidecar_pools(views).items():
+            arrays = [entry[2] for entry in entries]
+            pool_sharding = _pool_replicated_sharding(arrays[0])
+            transform = _jit_slot_sidecar_rows(
+                tuple(array.sharding for array in arrays), tuple(entry[3] for entry in entries)
+            )
+            transform.lower(
+                [abstract(array) for array in arrays],
+                jax.ShapeDtypeStruct((n_slots,), jnp.int32, sharding=pool_sharding),
+                jax.ShapeDtypeStruct((n_slots,), jnp.bool_, sharding=pool_sharding),
+            ).compile()
+        num_slots = int(getattr(self, "recurrent_snapshot_slots", 0) or 0)
+        leaves = _per_slot_state_leaves(views)
+        if num_slots <= 0 or not leaves or not all(isinstance(leaf[2], jax.Array) for leaf in leaves):
+            return
+        for positions in _group_by_devices(leaves).values():
+            shapes, snapshot_shardings = _snapshot_zeros_key(leaves, positions, num_slots)
+            _jit_snapshot_zeros(shapes, snapshot_shardings).lower().compile()
+            pools = [abstract(leaves[i][2]) for i in positions]
+            snapshots = [
+                jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
+                for (shape, dtype), sharding in zip(shapes, snapshot_shardings, strict=True)
+            ]
+            save_rows = jax.ShapeDtypeStruct(
+                (int(self.max_num_reqs),), jnp.int32, sharding=_pool_replicated_sharding(snapshots[0])
+            )
+            restore_rows = jax.ShapeDtypeStruct(
+                (int(self.max_num_reqs),), jnp.int32, sharding=_pool_replicated_sharding(pools[0])
+            )
+            _jit_snapshot_save(snapshot_shardings).lower(pools, snapshots, save_rows, save_rows).compile()
+            _jit_snapshot_restore(tuple(pool.sharding for pool in pools)).lower(
+                pools, snapshots, restore_rows, restore_rows
+            ).compile()
 
     def get_compile_configurations(
         self,
@@ -2486,11 +3167,13 @@ class ExecutionManager:
             shardings exactly to avoid recompilation.
         """
 
+        text_config = self.model.config.get_text_config()
+        vocab_size = int(getattr(text_config, "total_vocab_size", None) or text_config.vocab_size)
         temp_buffer = SequenceBuffer(
             max_num_reqs=max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
-            vocab_size=self.model.config.get_text_config().vocab_size,
+            vocab_size=vocab_size,
             page_sizes=[metadata.page_size],
             sharding=self._empty_sharding,
         )
@@ -2504,6 +3187,18 @@ class ExecutionManager:
         active_reqs = max(1, min(padded_num_reqs, max_num_reqs, num_tokens))
         scheduled_full_cpu[:active_reqs] = 1
         active_mask_full_cpu[:active_reqs] = True
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1) or 1))
+        if dp_size > 1 and int(max_num_reqs) % dp_size == 0:
+            # Rank-major DP gives every rank ``num_tokens / dp`` tokens and ``max_num_reqs / dp`` rows. Dealing the
+            # dummy rows round-robin over the ranks keeps each rank within both budgets for every compiled pair
+            # (``active_reqs <= num_tokens`` and ``num_tokens % dp == 0``); packing them into the first rows would
+            # put up to ``padded_num_reqs`` tokens on rank 0 alone.
+            rows_per_rank = int(max_num_reqs) // dp_size
+            slot_group = max(1, int(getattr(self, "recurrent_slot_group_size", 1) or 1))
+            dummy = numpy.arange(active_reqs, dtype=numpy.int32)
+            global_rows = (dummy % dp_size) * rows_per_rank + dummy // dp_size
+            window_row_indices_cpu[:active_reqs] = global_rows
+            recurrent_slot_indices_cpu[:active_reqs] = global_rows * slot_group
         input_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
         position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
 
@@ -2520,8 +3215,6 @@ class ExecutionManager:
             and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
             and callable(getattr(self.model, "get_image_features", None))
         )
-        if int(getattr(self.metadata, "data_parallel_size", 1) or 1) > 1:
-            is_vlm_model = False
         uses_mrope_model = is_vlm_model and model_uses_mrope(self.model)
 
         if is_vlm_model:

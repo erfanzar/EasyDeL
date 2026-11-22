@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import typing as tp
 from collections import deque
+from contextlib import contextmanager
 from functools import partial
 
 import jax
@@ -28,7 +30,8 @@ import spectrax as spx
 from eformer.paths import ePath
 from jax import numpy as jnp
 from spectrax import with_sharding_constraint
-from spectrax.serialization import Checkpointer
+from spectrax.serialization import AsyncCheckpointManager
+from spectrax.serialization import Checkpointer as _SpectraxCheckpointer
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -40,6 +43,7 @@ from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
 
 from .._shared import OwnedPolicySnapshot
+from .._shared.policy_losses import _MAX_SAFE_LOG_RATIO, _MIN_SAFE_LOG_RATIO
 from ..proximal_policy_optimization_trainer import PPOTrainer
 from ..proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
 from ..trainer_protocol import TrainerConfigureFunctionOutput, TrainerConfigureModelOutput
@@ -53,7 +57,7 @@ from .actor_critic import (
     score_actor_tokens,
     score_critic_values,
 )
-from .async_rollout import BoundedAsyncRolloutCoordinator, PolicySnapshot
+from .async_rollout import AsyncRolloutCancelled, BoundedAsyncRolloutCoordinator, PolicySnapshot
 from .config import OnlineActorCriticConfig
 from .math import length_adaptive_lambda, skip_observation_gae, target_aligned_action_mask
 from .trajectory import OnlineRLTrajectory, OnlineRLTrajectoryCollator
@@ -65,6 +69,7 @@ if tp.TYPE_CHECKING:
     from easydel.trainers.proximal_policy_optimization_trainer.ppo_trainer import RewardFunc
 
 logger = get_logger(__name__)
+Checkpointer = _SpectraxCheckpointer
 
 
 class _PreparedOnlineBatch(dict):
@@ -115,6 +120,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
     adapted into the same target-aligned schema.
     """
 
+    supports_async_rollout: tp.ClassVar[bool] = False
     actor_algorithm: tp.ClassVar[tp.Literal["sao", "ppo"]] = "ppo"
     requires_value_head: tp.ClassVar[bool] = False
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = PPOTrainer._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS | {
@@ -295,10 +301,16 @@ class OnlineActorCriticTrainer(PPOTrainer):
             arguments=self.arguments,
         )
 
-        self._eval_shared_fn_static_args = (*actor_static_args[:-2], False, straight_through_emulator)
+        self._eval_shared_fn_static_args = (
+            *actor_static_args[:-4],
+            1,
+            bool(self.arguments.global_token_normalization),
+            False,
+            straight_through_emulator,
+        )
         sharded_actor_eval_step = compile_trainer_step(
             actor_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=actor_static_argnums,
             mesh=mesh,
@@ -550,12 +562,13 @@ class OnlineActorCriticTrainer(PPOTrainer):
         behavior_logps = behavior_logps.at[:, start : start + completion_length].set(ppo_batch["old_logps"])
 
         contiguous_advantages = ppo_batch["returns"] - ppo_batch["old_values"]
+        critic_lam = getattr(self.arguments, "gae_lambda_critic", None)
         completion_rewards = recover_rewards_from_gae(
             contiguous_advantages,
             ppo_batch["old_values"],
             completion_mask,
             gamma=float(self.arguments.gamma),
-            gae_lambda=float(self.arguments.lam),
+            gae_lambda=float(critic_lam if critic_lam is not None else self.arguments.lam),
         )
         rewards = jnp.zeros_like(action_mask)
         rewards = rewards.at[:, start : start + completion_length].set(completion_rewards)
@@ -638,9 +651,15 @@ class OnlineActorCriticTrainer(PPOTrainer):
             isinstance(trajectory, OnlineRLTrajectory) for trajectory in provider_batch
         ):
             trajectories = provider_batch
+            processing_class = getattr(self, "processing_class", None)
+            pad_token_id = getattr(processing_class, "pad_token_id", None)
+            if pad_token_id is None and processing_class is not None:
+                pad_token_id = getattr(getattr(processing_class, "tokenizer", None), "pad_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = getattr(self, "padding_value", 0)
             provider_batch = OnlineRLTrajectoryCollator(
                 max_length=self.arguments.max_length,
-                pad_token_id=self.processing_class.pad_token_id or 0,
+                pad_token_id=0 if pad_token_id is None else int(pad_token_id),
             )(trajectories)
             if all(trajectory.behavior_logps is None for trajectory in trajectories):
                 provider_batch.pop("behavior_logps", None)
@@ -689,6 +708,16 @@ class OnlineActorCriticTrainer(PPOTrainer):
             raise ValueError("`action_mask` cannot select a target outside the attended causal context.")
 
         behavior_logps = normalized.get("target_behavior_logps", normalized.get("behavior_logps"))
+        if behavior_logps is not None:
+            if behavior_logps.shape == input_ids.shape:
+                behavior_logps = behavior_logps[:, 1:]
+            if behavior_logps.shape != expected_shape:
+                raise ValueError(f"`behavior_logps` must have shape {expected_shape}, got {behavior_logps.shape}.")
+            host_behavior_logps = np.asarray(jax.device_get(behavior_logps))
+            # OnlineRLTrajectoryCollator fills absent behavior_logps with NaN; treat
+            # all-NaN arrays as absent so pre-collated dicts match raw trajectories.
+            if np.all(np.isnan(host_behavior_logps)):
+                behavior_logps = None
         if behavior_logps is None:
             if self.arguments.rollout_logprob_source == "engine":
                 raise ValueError(
@@ -700,12 +729,10 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 input_ids,
                 normalized["attention_mask"],
             )
-        elif behavior_logps.shape == input_ids.shape:
-            behavior_logps = behavior_logps[:, 1:]
-        if behavior_logps.shape != expected_shape:
-            raise ValueError(f"`behavior_logps` must have shape {expected_shape}, got {behavior_logps.shape}.")
+            if behavior_logps.shape != expected_shape:
+                raise ValueError(f"`behavior_logps` must have shape {expected_shape}, got {behavior_logps.shape}.")
+            host_behavior_logps = np.asarray(jax.device_get(behavior_logps))
         host_action_mask = np.asarray(jax.device_get(action_mask), dtype=np.bool_)
-        host_behavior_logps = np.asarray(jax.device_get(behavior_logps))
         if not np.all(np.isfinite(host_behavior_logps[host_action_mask])):
             raise ValueError("`behavior_logps` must be finite at every optimized action token.")
         behavior_logps = jnp.where(
@@ -840,16 +867,18 @@ class OnlineActorCriticTrainer(PPOTrainer):
             host_reference_logps = np.asarray(jax.device_get(reference_logps))
             if not np.all(np.isfinite(host_reference_logps[host_action_mask])):
                 raise ValueError("`reference_logps` must be finite at every optimized action token.")
+            mask_bool = action_mask.astype(jnp.bool_)
             reference_logps = jnp.where(
-                action_mask.astype(jnp.bool_),
+                mask_bool,
                 reference_logps.astype(jnp.float32),
                 0.0,
             )
-            log_ref_over_behavior = reference_logps - behavior_logps
+            log_ref_over_behavior = jnp.where(mask_bool, reference_logps - behavior_logps, 0.0)
             if self.arguments.kl_estimator == "k1":
                 kl = -log_ref_over_behavior
             else:
-                kl = jnp.exp(log_ref_over_behavior) - 1.0 - log_ref_over_behavior
+                safe_logr = jnp.clip(log_ref_over_behavior, _MIN_SAFE_LOG_RATIO, _MAX_SAFE_LOG_RATIO)
+                kl = jnp.where(mask_bool, jnp.exp(safe_logr) - 1.0 - log_ref_over_behavior, 0.0)
             rewards = rewards - float(self.arguments.kl_coef) * kl * action_mask
 
         if "done_mask" not in normalized:
@@ -882,6 +911,87 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 learner_batch[key] = normalized[key]
         return self._prepare_target_batch(learner_batch)
 
+    @staticmethod
+    def _process_count() -> int:
+        """Return the JAX host count without failing on uninitialized CPU-only host stubs."""
+        try:
+            return int(jax.process_count())
+        except Exception:
+            return 1
+
+    def _get_online_eval_condition(self) -> threading.Condition:
+        """Lazily initialize the condition coordinating mid-epoch eval with rollout workers."""
+        cond = getattr(self, "_online_eval_condition", None)
+        if cond is None:
+            cond = self._online_eval_condition = threading.Condition()
+        return cond
+
+    def _apply_randomized_yarn_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
+        """Apply randomized YaRN while preserving ``_PreparedOnlineBatch`` metadata."""
+        result = super()._apply_randomized_yarn_to_batch(batch, step)
+        if isinstance(batch, _PreparedOnlineBatch) and not isinstance(result, _PreparedOnlineBatch):
+            return _PreparedOnlineBatch(result, batch.information)
+        return result
+
+    @contextmanager
+    def _pause_online_rollout_workers(self, *, operation: str) -> tp.Iterator[None]:
+        """Serialize eval/preview/benchmark against active async rollout workers."""
+        cond = self._get_online_eval_condition()
+        timeout = getattr(self.arguments, "rollout_timeout", None)
+        with cond:
+            self._online_eval_active = int(getattr(self, "_online_eval_active", 0)) + 1
+            deadline = None if timeout is None else time.monotonic() + float(timeout)
+            try:
+                while getattr(self, "_online_running_train_workers", 0) > 0:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError(
+                            f"Timed out waiting for active online-RL rollout workers to finish before {operation}."
+                        )
+                    cond.wait(timeout=remaining)
+            except BaseException:
+                self._online_eval_active = max(0, int(getattr(self, "_online_eval_active", 1)) - 1)
+                cond.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            with cond:
+                self._online_eval_active = max(0, int(getattr(self, "_online_eval_active", 1)) - 1)
+                cond.notify_all()
+
+    def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
+        """Run evaluation cleanly without colliding with active training rollout workers."""
+        with self._pause_online_rollout_workers(operation="eval"):
+            yield from super().eval(model_state)
+
+    def maybe_generate(
+        self,
+        state: EasyDeLState,
+        step: int,
+        metrics: tp.Any = None,
+    ) -> None:
+        """Gate periodic preview generation against active async rollout workers."""
+        args = getattr(self, "arguments", None)
+        interval = getattr(args, "generation_interval", None) if args is not None else None
+        if interval is None or interval <= 0 or step % interval != 0:
+            return
+        with self._pause_online_rollout_workers(operation="maybe_generate"):
+            super().maybe_generate(state=state, step=step, metrics=metrics)
+
+    def maybe_benchmark(
+        self,
+        state: EasyDeLState,
+        step: int,
+    ) -> None:
+        """Gate periodic benchmark runs against active async rollout workers."""
+        args = getattr(self, "arguments", None)
+        interval = getattr(args, "benchmark_interval", None) if args is not None else None
+        if interval is None or interval <= 0 or step % interval != 0:
+            return
+        with self._pause_online_rollout_workers(operation="maybe_benchmark"):
+            super().maybe_benchmark(state=state, step=step)
+
     def collect_rollouts(
         self,
         state: EasyDeLState,
@@ -899,6 +1009,13 @@ class OnlineActorCriticTrainer(PPOTrainer):
         work; a timed-out running provider cannot be killed by Python, so its
         snapshot remains alive until it returns.
 
+        Evaluation rollouts (``is_train=False``) execute synchronously directly
+        against ``state`` without allocating an extra snapshot or touching
+        training worker retirement state. On multi-host meshes
+        (``jax.process_count() > 1``) or when ``asynchronous_rollouts=False``,
+        training rollouts also execute synchronously on the learner thread to
+        avoid concurrent SPMD collective-order deadlocks and prefetching.
+
         Args:
             state: Current learner state.
             batches: Prompt batches; at most the configured queue/inflight
@@ -910,17 +1027,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
         Yields:
             Target-aligned learner batches and rollout diagnostics.
         """
-        if not getattr(self, "_online_rollout_idle", True):
-            raise RuntimeError("A previous rollout worker is still retiring; wait for it before collecting again.")
         live_state = learner_state or (lambda: state)
-        current_step = int(jax.device_get(live_state().step))
-        snapshot = getattr(self, "_online_rollout_snapshot", None) if is_train else None
-        sync_interval = int(self.arguments.weight_sync_steps)
-        max_lag = self.arguments.max_policy_staleness
-        capacity = int(self.arguments.max_inflight_rollouts)
-        if self.arguments.rollout_queue_size:
-            capacity = min(capacity, int(self.arguments.rollout_queue_size))
-        workers = capacity if self.rollout_provider is not None else 1
         generation_lock = getattr(self, "_online_generation_lock", None)
         if generation_lock is None:
             generation_lock = self._online_generation_lock = threading.Lock()
@@ -928,7 +1035,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
         if context is None:
             context = self._online_rollout_context = threading.local()
 
-        def collect(policy, payload):
+        def _collect_once(policy: PolicySnapshot[EasyDeLState], payload: dict[str, tp.Any]):
             if self.rollout_provider is not None:
                 return self.rollout_provider(trainer=self, state=policy.state, batch=payload, is_train=is_train)
             with generation_lock:
@@ -940,10 +1047,140 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 finally:
                     context.defer_critic = False
 
+        def _unpack_output(output):
+            if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], dict):
+                return output
+            return output, {}
+
+        def _prepare_output(provider_batch, *, scoring_state: EasyDeLState, learner_step: int):
+            if self.rollout_provider is None:
+                return self._adapt_ppo_rollout_batch(provider_batch)
+            return self._normalize_provider_batch(
+                provider_batch, scoring_state=scoring_state, learner_step=learner_step
+            )
+
+        if not is_train:
+            # Evaluation never donates `state`; run synchronously on `state`
+            # directly to avoid doubling snapshot HBM or colliding with
+            # training `_online_rollout_idle` / worker retirement.
+            for payload in batches:
+                eval_state = live_state()
+                current_step = int(jax.device_get(eval_state.step))
+                policy = PolicySnapshot(version=current_step, state=eval_state)
+                started_at = time.monotonic()
+                output = _collect_once(policy, payload)
+                execution_time = max(0.0, time.monotonic() - started_at)
+                provider_batch, information = _unpack_output(output)
+                prepared = _prepare_output(provider_batch, scoring_state=eval_state, learner_step=current_step)
+                yield (
+                    prepared,
+                    {
+                        **information,
+                        "rollout/policy_version": current_step,
+                        "rollout/queue_time": 0.0,
+                        "rollout/execution_time": execution_time,
+                    },
+                )
+            return
+
+        if not getattr(self, "_online_rollout_idle", True):
+            raise RuntimeError("A previous rollout worker is still retiring; wait for it before collecting again.")
+        snapshot = getattr(self, "_online_rollout_snapshot", None)
+        sync_interval = int(self.arguments.weight_sync_steps)
+        max_lag = self.arguments.max_policy_staleness
+        capacity = int(self.arguments.max_inflight_rollouts)
+        if self.arguments.rollout_queue_size:
+            capacity = min(capacity, int(self.arguments.rollout_queue_size))
+        requested_async = bool(getattr(self.arguments, "asynchronous_rollouts", True))
+        process_count = self._process_count()
+        async_enabled = requested_async and process_count <= 1
+        if requested_async and process_count > 1 and not getattr(self, "_online_multihost_async_warned", False):
+            self._online_multihost_async_warned = True
+            logger.warning(
+                "Disabling concurrent background rollout workers on multi-host mesh "
+                "(process_count=%d) to prevent SPMD collective-order deadlocks; "
+                "collecting rollouts synchronously on the learner thread.",
+                process_count,
+            )
+
+        if not async_enabled:
+            completed_normally = False
+            try:
+                for payload in batches:
+                    current_step = int(jax.device_get(live_state().step))
+                    refresh = (
+                        snapshot is None
+                        or current_step - snapshot.policy_step >= sync_interval
+                        or (max_lag is not None and current_step - snapshot.policy_step > max_lag)
+                    )
+                    if refresh:
+                        if snapshot is not None:
+                            snapshot.release()
+                        snapshot = OwnedPolicySnapshot.from_training_state(
+                            live_state(),
+                            policy_step=current_step,
+                            cache_scope_key=state.esurge_cache_scope_key,
+                        )
+                        self._online_rollout_snapshot = snapshot
+                    policy = PolicySnapshot(version=snapshot.policy_step, state=snapshot.state)
+                    started_at = time.monotonic()
+                    output = _collect_once(policy, payload)
+                    execution_time = max(0.0, time.monotonic() - started_at)
+                    provider_batch, information = _unpack_output(output)
+                    prepared = _prepare_output(provider_batch, scoring_state=snapshot.state, learner_step=current_step)
+                    yield (
+                        prepared,
+                        {
+                            **information,
+                            "rollout/policy_version": snapshot.policy_step,
+                            "rollout/queue_time": 0.0,
+                            "rollout/execution_time": execution_time,
+                        },
+                    )
+                completed_normally = True
+            finally:
+                if not completed_normally:
+                    if snapshot is not None:
+                        snapshot.release()
+                    self._online_rollout_snapshot = None
+            return
+
+        workers = capacity if self.rollout_provider is not None else 1
+        eval_cond = self._get_online_eval_condition()
+
+        def collect(policy, payload):
+            with eval_cond:
+                while getattr(self, "_online_eval_active", False):
+                    eval_cond.wait()
+                self._online_running_train_workers = getattr(self, "_online_running_train_workers", 0) + 1
+            try:
+                return _collect_once(policy, payload)
+            finally:
+                with eval_cond:
+                    self._online_running_train_workers = max(
+                        0, getattr(self, "_online_running_train_workers", 1) - 1
+                    )
+                    eval_cond.notify_all()
+
+        step_increment = max(int(getattr(self.arguments, "num_ppo_epochs", 1)), 1)
+
+        def snapshot_batch_budget(step: int, snap: OwnedPolicySnapshot, *, after_current: bool = False) -> int:
+            if learner_state is None:
+                return capacity
+            expiry_step = snap.policy_step + sync_interval
+            if max_lag is not None:
+                expiry_step = min(expiry_step, snap.policy_step + int(max_lag) + 1)
+            effective_step = step + step_increment if after_current else step
+            remaining_steps = max(0, expiry_step - effective_step)
+            if remaining_steps <= 0:
+                return 0
+            remaining_batches = (remaining_steps + step_increment - 1) // step_increment
+            return min(capacity, remaining_batches)
+
         coordinator = BoundedAsyncRolloutCoordinator(collect, max_workers=workers, max_outstanding=capacity)
         source = iter(batches)
-        pending = {}
-        retry = deque()
+        pending: dict[int, dict[str, tp.Any]] = {}
+        retry: deque[dict[str, tp.Any]] = deque()
         exhausted = False
         completed_normally = False
         try:
@@ -955,28 +1192,39 @@ class OnlineActorCriticTrainer(PPOTrainer):
                     or (max_lag is not None and current_step - snapshot.policy_step > max_lag)
                 )
                 if refresh:
-                    # Stop replenishing. Retire all readers before releasing the
-                    # old policy; replay their original prompts on the new one.
-                    retry.extend(pending.values())
-                    while coordinator.outstanding_count:
-                        coordinator.next_completed(timeout=self.arguments.rollout_timeout)
-                    pending.clear()
+                    # Cancel queued rollouts before draining running readers so
+                    # unstarted work is never executed only to be discarded.
+                    if coordinator.outstanding_count:
+                        coordinator.cancel_pending()
+                        retry.extendleft(reversed(list(pending.values())))
+                        while coordinator.outstanding_count:
+                            try:
+                                coordinator.next_completed(timeout=self.arguments.rollout_timeout)
+                            except AsyncRolloutCancelled:
+                                pass
+                        pending.clear()
+                    # Avoid allocating a fresh snapshot if the prompt source is already exhausted.
+                    if not retry and not exhausted:
+                        try:
+                            retry.append(next(source))
+                        except StopIteration:
+                            exhausted = True
+                    if not retry and exhausted:
+                        completed_normally = True
+                        break
                     if snapshot is not None:
                         snapshot.release()
                     snapshot = OwnedPolicySnapshot.from_training_state(
                         live_state(),
                         policy_step=current_step,
-                        cache_scope_key=(
-                            f"{state.esurge_cache_scope_key}-online-rollout" + ("" if is_train else "-eval")
-                        ),
+                        cache_scope_key=state.esurge_cache_scope_key,
                     )
-                    if is_train:
-                        self._online_rollout_snapshot = snapshot
+                    self._online_rollout_snapshot = snapshot
                 policy = PolicySnapshot(version=snapshot.policy_step, state=snapshot.state)
 
-                def fill(policy=policy):
+                def fill(max_outstanding: int, policy=policy):
                     nonlocal exhausted
-                    while (retry or not exhausted) and coordinator.outstanding_count < capacity:
+                    while (retry or not exhausted) and coordinator.outstanding_count < max_outstanding:
                         if retry:
                             payload = retry.popleft()
                         else:
@@ -988,26 +1236,18 @@ class OnlineActorCriticTrainer(PPOTrainer):
                         ticket = coordinator.submit(payload, snapshot=policy, timeout=self.arguments.rollout_timeout)
                         pending[ticket.submission_id] = payload
 
-                fill()
+                fill(snapshot_batch_budget(current_step, snapshot, after_current=False))
                 if not coordinator.outstanding_count:
                     completed_normally = True
                     break
                 completion = coordinator.next_completed(timeout=self.arguments.rollout_timeout)
                 pending.pop(completion.ticket.submission_id)
-                output = completion.value
-                if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], dict):
-                    provider_batch, information = output
-                else:
-                    provider_batch, information = output, {}
-                if self.rollout_provider is None:
-                    prepared = self._adapt_ppo_rollout_batch(provider_batch)
-                else:
-                    prepared = self._normalize_provider_batch(
-                        provider_batch, scoring_state=snapshot.state, learner_step=current_step
-                    )
-                # Refill before yielding, so providers overlap the actor/critic
-                # updates even at capacity=1. Capacity counts unconsumed results.
-                fill()
+                provider_batch, information = _unpack_output(completion.value)
+                prepared = _prepare_output(provider_batch, scoring_state=snapshot.state, learner_step=current_step)
+                # Refill only up to the remaining batches that can be consumed
+                # before the current snapshot expires, avoiding wasted rollouts
+                # when weight_sync_steps=1 or at sync boundaries.
+                fill(snapshot_batch_budget(current_step, snapshot, after_current=True))
                 yield (
                     prepared,
                     {
@@ -1018,21 +1258,25 @@ class OnlineActorCriticTrainer(PPOTrainer):
                     },
                 )
         finally:
+            idle_event = getattr(self, "_online_rollout_idle_event", None)
+            if idle_event is None:
+                idle_event = self._online_rollout_idle_event = threading.Event()
             if not completed_normally:
                 self._online_rollout_idle = False
-                if is_train:
-                    self._online_rollout_snapshot = None
+                idle_event.clear()
+                self._online_rollout_snapshot = None
 
-                def release_when_idle(owner=snapshot):
+                def release_when_idle(owner=snapshot, event=idle_event):
                     if owner is not None:
                         owner.release()
                     self._online_rollout_idle = True
+                    event.set()
 
                 coordinator.close(wait=False, cancel_pending=True, on_idle=release_when_idle)
             else:
                 coordinator.close(wait=True, cancel_pending=True)
-                if not is_train:
-                    snapshot.release()
+                self._online_rollout_idle = True
+                idle_event.set()
 
     def _preprocess_batch_input(
         self,
@@ -1043,6 +1287,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
         """Consume epoch lookahead, or collect a standalone batch."""
         if is_train and isinstance(batch, _PreparedOnlineBatch):
             return dict(batch), batch.information
+        prior_snapshot = getattr(self, "_online_rollout_snapshot", None)
         rollouts = self.collect_rollouts(state, [batch], is_train=is_train)
         try:
             result = next(rollouts)
@@ -1051,6 +1296,16 @@ class OnlineActorCriticTrainer(PPOTrainer):
             return result
         finally:
             rollouts.close()
+            if (
+                is_train
+                and getattr(self, "_online_epoch_state", None) is None
+                and not getattr(self, "_online_critic_pretrain_active", False)
+                and getattr(self, "_online_rollout_idle", True)
+            ):
+                snapshot = getattr(self, "_online_rollout_snapshot", None)
+                if snapshot is not None and snapshot is not prior_snapshot:
+                    snapshot.release()
+                    self._online_rollout_snapshot = None
 
     def _train_epoch(
         self,
@@ -1079,13 +1334,16 @@ class OnlineActorCriticTrainer(PPOTrainer):
         prefetch = getattr(self.arguments, "dataloader_prefetch", False)
         has_buckets = getattr(self, "_has_buckets", False)
         pose = self._apply_pose_to_batch
+        ryarn = self._apply_randomized_yarn_to_batch
         encoder = self._apply_process_encoder_to_batch
         start_step = int(jax.device_get(state.step))
         end_step = min(self.max_training_steps, epoch_end_step)
+        ppo_epochs = max(int(getattr(self.arguments, "num_ppo_epochs", 1)), 1)
+        self._online_epoch_end_step = end_step
 
         def prompts():
             nonlocal raw_iter
-            for prompt_step in range(start_step, end_step):
+            for prompt_step in range(start_step, end_step, ppo_epochs):
                 if has_buckets:
                     bucket = self._bucket_rule.select(prompt_step)
                     raw, self._bucket_iters[bucket] = self._get_next_batch(
@@ -1095,7 +1353,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 else:
                     raw, raw_iter = self._get_next_batch(raw_iter, train_dataset)
                     batch = collator(raw) if collator is not None else raw
-                yield encoder(pose(batch, prompt_step), prompt_step)
+                yield encoder(ryarn(pose(batch, prompt_step), prompt_step), prompt_step)
 
         rollouts = self.collect_rollouts(state, prompts(), learner_state=lambda: self._online_epoch_state)
         prepared = (_PreparedOnlineBatch(batch, info) for batch, info in rollouts)
@@ -1107,9 +1365,13 @@ class OnlineActorCriticTrainer(PPOTrainer):
         self._apply_pose_to_batch = lambda batch, step: (
             batch if isinstance(batch, _PreparedOnlineBatch) else pose(batch, step)
         )
+        self._apply_randomized_yarn_to_batch = lambda batch, step: (
+            batch if isinstance(batch, _PreparedOnlineBatch) else ryarn(batch, step)
+        )
         self._apply_process_encoder_to_batch = lambda batch, step: (
             batch if isinstance(batch, _PreparedOnlineBatch) else encoder(batch, step)
         )
+        epoch_completed_cleanly = False
         try:
             updated_state, error, _ = super()._train_epoch(
                 state,
@@ -1122,16 +1384,23 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 epoch_start_step=epoch_start_step,
                 epoch_end_step=epoch_end_step,
             )
+            epoch_completed_cleanly = error is None
             return updated_state, error, raw_iter
         finally:
             prepared.close()
             rollouts.close()
+            if epoch_completed_cleanly and not getattr(self, "_online_rollout_idle", True):
+                idle_event = getattr(self, "_online_rollout_idle_event", None)
+                if idle_event is not None:
+                    idle_event.wait(timeout=self.arguments.rollout_timeout)
             self.data_collator = collator
             self.arguments.dataloader_prefetch = prefetch
             self._has_buckets = has_buckets
             self._apply_pose_to_batch = pose
+            self._apply_randomized_yarn_to_batch = ryarn
             self._apply_process_encoder_to_batch = encoder
             self._online_epoch_state = None
+            self._online_epoch_end_step = None
             snapshot = getattr(self, "_online_rollout_snapshot", None)
             if snapshot is not None:
                 snapshot.release()
@@ -1194,7 +1463,23 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 )
             batch = self._refresh_policy_advantages(batch)
 
-            for _ in range(int(self.arguments.num_ppo_epochs)):
+            prev_step = int(jax.device_get(state.step))
+            self._last_train_step_prev = prev_step
+            epochs_to_run = max(int(self.arguments.num_ppo_epochs), 1)
+            limits = [
+                limit
+                for limit in (
+                    getattr(self, "max_training_steps", None),
+                    getattr(self, "_online_epoch_end_step", None),
+                )
+                if limit is not None
+            ]
+            if limits:
+                step_limit = min(int(limit) for limit in limits)
+                if prev_step < step_limit:
+                    epochs_to_run = min(epochs_to_run, step_limit - prev_step)
+
+            for _ in range(epochs_to_run):
                 state, metrics = jax.block_until_ready(
                     self.sharded_training_step_function(
                         state,
@@ -1246,29 +1531,40 @@ class OnlineActorCriticTrainer(PPOTrainer):
         logger.info("Starting %d critic-only value-pretraining steps.", pretrain_steps)
         train_iter = iter(self.dataloader_train)
         data_collator = self.data_collator or (lambda batch: batch)
-        for pretrain_step in range(pretrain_steps):
-            raw_batch, train_iter = self._get_next_batch(train_iter, self.dataloader_train)
-            batch = data_collator(raw_batch)
-            prepared, _ = self._preprocess_batch_input(
-                state=self.model_state,
-                batch=batch,
-                is_train=True,
-            )
-            self.critic_state, metrics = jax.block_until_ready(
-                self.sharded_critic_step_function(
-                    self.critic_state,
-                    prepared,
-                    *self._critic_shared_fn_static_args,
+        self._online_critic_pretrain_active = True
+        try:
+            for pretrain_step in range(pretrain_steps):
+                raw_batch, train_iter = self._get_next_batch(train_iter, self.dataloader_train)
+                batch = data_collator(raw_batch)
+                prepared, _ = self._preprocess_batch_input(
+                    state=self.model_state,
+                    batch=batch,
+                    is_train=True,
                 )
-            )
-            if (pretrain_step + 1) % 10 == 0 or pretrain_step + 1 == pretrain_steps:
-                logger.info(
-                    "Critic value pretraining: %d/%d, loss=%s.",
-                    pretrain_step + 1,
-                    pretrain_steps,
-                    jax.device_get(metrics.loss),
+                self.critic_state, metrics = jax.block_until_ready(
+                    self.sharded_critic_step_function(
+                        self.critic_state,
+                        prepared,
+                        *self._critic_shared_fn_static_args,
+                    )
                 )
-        self._critic_pretraining_complete = True
+                if (pretrain_step + 1) % 10 == 0 or pretrain_step + 1 == pretrain_steps:
+                    logger.info(
+                        "Critic value pretraining: %d/%d, loss=%s.",
+                        pretrain_step + 1,
+                        pretrain_steps,
+                        jax.device_get(metrics.loss),
+                    )
+            self._critic_pretraining_complete = True
+        finally:
+            self._online_critic_pretrain_active = False
+            close_iter = getattr(train_iter, "close", None)
+            if callable(close_iter):
+                close_iter()
+            snapshot = getattr(self, "_online_rollout_snapshot", None)
+            if snapshot is not None and getattr(self, "_online_rollout_idle", True):
+                snapshot.release()
+                self._online_rollout_snapshot = None
 
     def _save_state(
         self,
@@ -1299,6 +1595,10 @@ class OnlineActorCriticTrainer(PPOTrainer):
                     indent=2,
                 )
             )
+        if self._process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            multihost_utils.sync_global_devices("easydel.online_rl.save_state.after_manifest_init")
         directory = super()._save_state(
             state,
             save_directory,
@@ -1313,6 +1613,10 @@ class OnlineActorCriticTrainer(PPOTrainer):
             save_optimizer=self.arguments.save_optimizer_state,
             merge_lora_before_save=False,
         )
+        if self._process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            multihost_utils.sync_global_devices("easydel.online_rl.save_state.before_manifest_complete")
         if jax.process_index() == 0:
             manifest = {
                 "format": "easydel-online-actor-critic-v1",
@@ -1322,6 +1626,10 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 "complete": True,
             }
             (ePath(directory) / "online_rl_checkpoint.json").write_text(json.dumps(manifest, indent=2))
+        if self._process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            multihost_utils.sync_global_devices("easydel.online_rl.save_state.after_manifest_complete")
         return directory
 
     def _load_auxiliary_states(self, checkpoint_path: str) -> None:
@@ -1375,18 +1683,29 @@ class OnlineActorCriticTrainer(PPOTrainer):
         )
         full_template = template_state.graphstate.merge(template_state.graphother, copy=False)
         raw_template = jax.eval_shape(lambda: full_template.raw())
-        loaded_raw, _ = Checkpointer(
-            base_path=str(critic_directory),
-            save_interval=None,
-            step_policies=[],
-        ).load_pytree(
-            mesh=template_model.mesh,
-            path=str(critic_directory),
-            prefix="model",
-            discover_latest=False,
-            template=raw_template,
-            sharding_rules=template_model.resolve_shardings_regex(),
-        )
+        if Checkpointer is _SpectraxCheckpointer:
+            # Load directly via AsyncCheckpointManager so resume does not instantiate
+            # a one-off Checkpointer and leak its permanent cleanup daemon thread.
+            loaded_raw, _ = AsyncCheckpointManager().load_pytree(
+                mesh=template_model.mesh,
+                path=str(critic_directory),
+                prefix="model",
+                template=raw_template,
+                sharding_rules=template_model.resolve_shardings_regex(),
+            )
+        else:
+            loaded_raw, _ = Checkpointer(
+                base_path=str(critic_directory),
+                save_interval=None,
+                step_policies=[],
+            ).load_pytree(
+                mesh=template_model.mesh,
+                path=str(critic_directory),
+                prefix="model",
+                discover_latest=False,
+                template=raw_template,
+                sharding_rules=template_model.resolve_shardings_regex(),
+            )
         loaded_full = spx.State(loaded_raw)
         expected_paths = set(full_template.paths())
         loaded_paths = set(loaded_full.paths())

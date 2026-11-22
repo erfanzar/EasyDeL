@@ -130,7 +130,6 @@ class ORPOTrainer(Trainer):
         self.arguments = arguments
         self.truncation_mode = arguments.truncation_mode
         self.processing_class = processing_class
-        self.is_encoder_decoder = arguments.is_encoder_decoder
 
         if arguments.padding_value is not None:
             self.padding_value = arguments.padding_value
@@ -146,13 +145,25 @@ class ORPOTrainer(Trainer):
                 )
         arguments.padding_value = self.padding_value
 
+        model = self._resolve_policy_model(model)
+        if not isinstance(model, EasyDeLState):
+            model = model.to_state(trainable_selector=arguments.trainable_selector)
+        if arguments.disable_dropout:
+            (model,) = self._disable_state_dropout(model)
+
+        if arguments.is_encoder_decoder is not None:
+            self.is_encoder_decoder = arguments.is_encoder_decoder
+        else:
+            self.is_encoder_decoder = bool(getattr(getattr(model.model, "config", None), "is_encoder_decoder", False))
+            self.arguments.is_encoder_decoder = self.is_encoder_decoder
+
         self.input_data_collator_tfds = (
             DPODataCollatorWithPaddingTFDS(
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,
                 pad_token_id=self.padding_value,
                 label_pad_token_id=arguments.label_pad_token_id,
-                is_encoder_decoder=arguments.is_encoder_decoder,
+                is_encoder_decoder=self.is_encoder_decoder,
                 prepadded=True,
             )
             if data_collator is None
@@ -164,18 +175,12 @@ class ORPOTrainer(Trainer):
                 max_completion_length=arguments.max_completion_length,
                 pad_token_id=self.padding_value,
                 label_pad_token_id=arguments.label_pad_token_id,
-                is_encoder_decoder=arguments.is_encoder_decoder,
+                is_encoder_decoder=self.is_encoder_decoder,
                 prepadded=True,
             )
             if data_collator is None
             else data_collator
         )
-
-        model = self._resolve_policy_model(model)
-        if not isinstance(model, EasyDeLState):
-            model = model.to_state(trainable_selector=arguments.trainable_selector)
-        if arguments.disable_dropout:
-            (model,) = self._disable_state_dropout(model)
 
         super().__init__(
             model_state=model,
@@ -319,7 +324,14 @@ class ORPOTrainer(Trainer):
         jited_concatenated_forward = compile_trainer_auxiliary(
             partial_concatenated_forward,
             mesh=mesh,
-            static_argnames=("is_encoder_decoder", "label_pad_token_id", "padding_value", "max_length"),
+            static_argnames=(
+                "is_encoder_decoder",
+                "label_pad_token_id",
+                "padding_value",
+                "max_length",
+                "logprob_vocab_chunk_size",
+                "vocab_shard_stage",
+            ),
         )
 
         self._train_shared_fn_static_args = (
@@ -362,7 +374,7 @@ class ORPOTrainer(Trainer):
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             orpo_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=eval_static_argnums,
             mesh=self.model.mesh,

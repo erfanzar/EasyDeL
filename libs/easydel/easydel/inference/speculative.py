@@ -48,6 +48,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
 from ejkernel.types import MaskInfo
 from jaxtyping import Array, Float, Int
@@ -56,6 +57,7 @@ from spectrax import common_types
 from easydel.caching import TransformerCache, TransformerCacheConfig, TransformerMetadata
 from easydel.infra.spec_decode import SpecDecodeBase, register_drafter
 from easydel.utils.graph_jit import module_jit
+from easydel.utils.inference_mode import set_inference_mode
 
 
 @dataclass(frozen=True)
@@ -213,6 +215,358 @@ def _restore_cache_views(cache: TransformerCache, orig_indexes: list, orig_start
     return TransformerCache(views=fixed_views)
 
 
+DEFAULT_DRAFT_WINDOW_MIN = 256
+"""Smallest drafter-cache window (slots per row) a batched draft pass runs on (see :func:`_draft_window_widths`)."""
+
+
+def _windowable(view: typing.Any) -> bool:
+    """Whether a batched draft pass may run on the leading slots of ``view`` (a plain, non-sliding dense view)."""
+    return (
+        view is not None
+        and isinstance(view.key, jax.Array)
+        and isinstance(view.value, jax.Array)
+        and getattr(view, "masking_details", None) is None
+    )
+
+
+def _cache_capacity(cache: TransformerCache | None) -> int | None:
+    """Widest per-row slot count over the windowable views of ``cache`` (see :func:`_windowable`).
+
+    Args:
+        cache: A drafter ``TransformerCache``, or ``None``.
+
+    Returns:
+        The capacity in slots, or ``None`` without a cache or any windowable view.
+    """
+    if cache is None:
+        return None
+    widths = [int(view.key.shape[1]) for view in cache.views if _windowable(view)]
+    return max(widths) if widths else None
+
+
+def _draft_window_widths(capacity: int, minimum: int) -> tuple[int, ...]:
+    """Cache widths a batched draft pass may run on: ``minimum * 2**i`` below ``capacity``, then ``capacity``.
+
+    A batched pass reads and writes only the leading ``W`` slots of every drafter-cache view
+    (:func:`_window_cache`), with ``W`` the narrowest width that holds every drafted row's slots. The head's
+    attention and indexer then cost ``rows x W`` instead of ``rows x capacity``. Each width is one compiled program
+    per draft shape; an all-idle call (the runner's precompile) warms every width.
+
+    Args:
+        capacity: Slots per row of the drafter cache.
+        minimum: Smallest width; clamped up to one.
+
+    Returns:
+        Ascending widths; the last one equals ``capacity``.
+    """
+    capacity = int(capacity)
+    width = max(1, int(minimum))
+    widths: list[int] = []
+    while width < capacity:
+        widths.append(width)
+        width *= 2
+    widths.append(capacity)
+    return tuple(widths)
+
+
+def _window_cache(cache: TransformerCache | None, width: int | None) -> TransformerCache | None:
+    """Slice every view of ``cache`` to its leading ``width`` slots (``None`` keeps the whole capacity).
+
+    For a row whose writes this pass end at or before ``width``, the window holds every slot the head can read:
+    attention masks every slot at or past the row's end, the indexer's pools skip slots of segment ``-1`` (every
+    slot past the end), and its selection budget ``min(index_topk // kpool, pools)`` either equals the full view's
+    or covers every pool of the window. Writes past ``width`` (idle rows only) are dropped, as writes past the
+    capacity are.
+
+    Args:
+        cache: The drafter pool cache, or ``None``.
+        width: Leading slots to keep per row, or ``None``.
+
+    Returns:
+        The windowed cache (views no wider than ``width`` are kept as they are).
+    """
+    if cache is None or width is None:
+        return cache
+    width = int(width)
+    views: list[typing.Any] = []
+    for view in cache.views:
+        if not _windowable(view) or int(view.key.shape[1]) <= width:
+            views.append(view)
+            continue
+        views.append(
+            view.replace(
+                key=view.key[:, :width],
+                value=view.value[:, :width],
+                segment_ids=None if view.segment_ids is None else view.segment_ids[:, :width],
+                auxiliary_state=None if view.auxiliary_state is None else view.auxiliary_state[:, :width],
+            )
+        )
+    return TransformerCache(views=views)
+
+
+def _unwindow_cache(full: TransformerCache | None, windowed: TransformerCache | None) -> TransformerCache | None:
+    """Write a :func:`_window_cache` window back into the leading slots of the pool it was sliced from.
+
+    The caller donates ``full``, so the leading-slot update is in place. Write indexes and starts come from
+    ``windowed``; slots past the window keep their contents.
+
+    Args:
+        full: The pool cache the window was sliced from, or ``None``.
+        windowed: The advanced window.
+
+    Returns:
+        The pool cache with its leading slots replaced by the window.
+    """
+    if full is None or windowed is None:
+        return windowed
+
+    def put(dst: jax.Array, src: jax.Array) -> jax.Array:
+        return jax.lax.dynamic_update_slice_in_dim(dst, src.astype(dst.dtype), 0, axis=1)
+
+    views: list[typing.Any] = []
+    for base, win in zip(full.views, windowed.views, strict=True):
+        if base is None or win is None or base.key is None or int(win.key.shape[1]) == int(base.key.shape[1]):
+            views.append(win)
+            continue
+        segment_ids = base.segment_ids
+        if win.segment_ids is not None:
+            if segment_ids is None:
+                # Legacy pools have one implicit continuation segment per row (see ``_scatter_view_row``).
+                width = base.key.shape[1]
+                segment_ids = jnp.where(jnp.arange(width)[None, :] < base.indexes[:, None], 0, -1).astype(
+                    win.segment_ids.dtype
+                )
+            segment_ids = put(segment_ids, win.segment_ids)
+        auxiliary_state = base.auxiliary_state
+        if win.auxiliary_state is not None:
+            if auxiliary_state is None:
+                auxiliary_state = jnp.zeros(
+                    (*base.key.shape[:2], win.auxiliary_state.shape[-1]), dtype=win.auxiliary_state.dtype
+                )
+            auxiliary_state = put(auxiliary_state, win.auxiliary_state)
+        views.append(
+            win.replace(
+                key=put(base.key, win.key),
+                value=put(base.value, win.value),
+                segment_ids=segment_ids,
+                auxiliary_state=auxiliary_state,
+            )
+        )
+    return TransformerCache(views=views)
+
+
+def _host_vector(x: typing.Any, dtype: typing.Any) -> np.ndarray | None:
+    """``x`` as a flat host array, or ``None`` when ``x`` lives on a device.
+
+    A drafter-cache window is chosen from host-known bounds only: reading a device array back would add a host
+    sync between the acceptance program and the draft dispatch, so a device input selects the whole capacity.
+    """
+    if isinstance(x, jax.Array):
+        return None
+    return np.asarray(x, dtype=dtype).reshape(-1)
+
+
+def _device_column(x: typing.Any) -> jax.Array:
+    """``x`` as an ``(N, 1)`` int32 device array.
+
+    A host array is cast and shaped on the host and transferred with ``jax.device_put``: ``jnp.asarray`` of an ndarray
+    without a dtype, and a cast or reshape of a device array, run a device program, and on a multi-host mesh every
+    launch waits for every host. A device array is cast and reshaped.
+    """
+    if isinstance(x, jax.Array):
+        return x.astype(jnp.int32).reshape(-1, 1)
+    return jax.device_put(np.asarray(x, dtype=np.int32).reshape(-1, 1))
+
+
+def _device_vector(x: typing.Any, dtype: typing.Any) -> jax.Array:
+    """``x`` as a flat device array of ``dtype`` (a host array is converted as in :func:`_device_column`)."""
+    if isinstance(x, jax.Array):
+        return x.astype(dtype).reshape(-1)
+    return jax.device_put(np.asarray(x, dtype=dtype).reshape(-1))
+
+
+def _named_sharding(leaf: typing.Any) -> jax.sharding.NamedSharding | None:
+    """The ``NamedSharding`` a device array ``leaf`` is placed on, or ``None``."""
+    sharding = getattr(leaf, "sharding", None) if isinstance(leaf, jax.Array) else None
+    return sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
+
+
+def _place_cache(cache: TransformerCache | None) -> TransformerCache | None:
+    """Commit every array leaf of a drafter cache to a sharding over the cache's mesh.
+
+    A leaf already on a ``NamedSharding`` keeps it; any other array leaf is replicated over the mesh of the first leaf
+    that has one. The drafter programs then hand the cache back placed exactly as it went in
+    (:func:`_cache_out_shardings`), so every program sees the placement it was compiled for.
+
+    Args:
+        cache: A newly allocated drafter cache, or ``None``.
+
+    Returns:
+        The placed cache; ``cache`` itself when no leaf is on a mesh.
+    """
+    if cache is None:
+        return None
+    mesh = next((s.mesh for s in map(_named_sharding, jax.tree.leaves(cache)) if s is not None), None)
+    if mesh is None:
+        return cache
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def place(leaf: typing.Any) -> typing.Any:
+        if not isinstance(leaf, jax.Array) or _named_sharding(leaf) is not None or not leaf.is_fully_addressable:
+            return leaf
+        # Each process places its own copy: ``device_put`` of a process-local array onto a sharding that spans
+        # processes would compare the value across hosts.
+        host = np.asarray(jax.device_get(leaf))
+        return jax.make_array_from_callback(host.shape, replicated, lambda index: host[index])
+
+    return jax.tree.map(place, cache)
+
+
+def _cache_out_shardings(cache: TransformerCache | None, num_outputs: int) -> tuple | None:
+    """``out_shardings`` for a drafter program that returns ``num_outputs`` small arrays and then the cache.
+
+    Without them the compiler picks the placement of the returned cache. When that placement is written differently
+    from the cache's input placement (an equivalent layout under another spec counts), the next drafter program,
+    compiled for the input placement, compiles again in serving. Every cache leaf therefore keeps its input
+    placement, and the small outputs (drafts, argmaxes, counts) are replicated over the cache's mesh, so every host
+    reads them locally.
+
+    Args:
+        cache: The drafter cache the program is built for, or ``None``.
+        num_outputs: Arrays the program returns before the cache.
+
+    Returns:
+        The ``out_shardings`` tuple, or ``None`` (the compiler chooses) when there is no cache or an array leaf of it
+        is not on a ``NamedSharding``.
+    """
+    if cache is None:
+        return None
+    leaves = jax.tree.leaves(cache)
+    shardings = [_named_sharding(leaf) for leaf in leaves]
+    if not leaves or any(sharding is None for sharding in shardings):
+        return None
+    replicated = jax.sharding.NamedSharding(shardings[0].mesh, jax.sharding.PartitionSpec())
+    return (*([replicated] * int(num_outputs)), jax.tree.map(_named_sharding, cache))
+
+
+def _restore_cache_placement(
+    new_cache: TransformerCache | None, old_cache: TransformerCache | None
+) -> TransformerCache | None:
+    """Put a returned drafter cache back on the placement of the cache passed into the program."""
+    if new_cache is None or old_cache is None:
+        return new_cache
+    return jax.tree.map(
+        lambda new, old: jax.device_put(new, old.sharding) if isinstance(new, jax.Array) else new,
+        new_cache,
+        old_cache,
+    )
+
+
+def _select_draft_widths(capacity: int | None, reach: typing.Any) -> tuple[int | None, ...]:
+    """Cache widths one batched draft call runs on (``None`` = the whole capacity).
+
+    Args:
+        capacity: Slots per row of the drafter cache, or ``None`` without a cache.
+        reach: Per drafted row, one past the last slot the pass can read or write (its rollback target plus the
+            drafts written), from host arrays; ``None`` when unknown on the host (whole capacity).
+
+    Returns:
+        ``(width,)``, the narrowest of :func:`_draft_window_widths` that holds every drafted row. With no drafted row
+        (the runner's precompile call) every width, so serving compiles no new program.
+    """
+    if capacity is None or reach is None:
+        return (None,)
+    widths = _draft_window_widths(int(capacity), DEFAULT_DRAFT_WINDOW_MIN)
+    as_arg = tuple(None if width >= int(capacity) else width for width in widths)
+    reach = np.asarray(reach).reshape(-1)
+    if reach.size == 0:
+        return as_arg
+    need = int(reach.max())
+    for width, arg in zip(widths, as_arg, strict=True):
+        if need <= width:
+            return (arg,)
+    return (None,)
+
+
+def _array_signature(arr: typing.Any) -> tuple | str | None:
+    """Compact shape/dtype signature of an optional array argument for compile keys."""
+    if arr is None:
+        return None
+    shape = getattr(arr, "shape", None)
+    dtype = getattr(arr, "dtype", None)
+    if shape is not None and dtype is not None:
+        return (tuple(int(s) for s in shape), str(dtype))
+    return type(arr).__name__
+
+
+def _constraint_signature(
+    logit_bias: typing.Any,
+    allowed_token_ids_mask: typing.Any,
+    bad_words_token_ids: typing.Any,
+) -> tuple:
+    """Compile-key signature for optional dense sampling constraints."""
+    return (
+        _array_signature(logit_bias),
+        _array_signature(allowed_token_ids_mask),
+        _array_signature(bad_words_token_ids),
+    )
+
+
+def _tied_lm_head_weight_from_parts(
+    embed_module: typing.Any,
+    tie_embeddings: bool,
+    tied_sharding: tuple[typing.Any, typing.Any, typing.Any] | None = None,
+) -> Array | None:
+    """Return transposed embedding weight for tied LM-head projections, preserving kernel sharding."""
+    if not tie_embeddings:
+        return None
+    w = embed_module.weight.value.T
+    if tied_sharding is not None:
+        spec, mesh, metadata = tied_sharding
+        w = spx.with_sharding_constraint(w, spec, mesh=mesh, metadata=metadata)
+    return w
+
+
+def _advance_paged_cache_metadata(
+    cache_metadata: typing.Any,
+    cache_view: typing.Any = None,
+    collected_mask: jax.Array | None = None,
+) -> typing.Any:
+    """Advance paged-attention metadata by one decode token between chained MTP draft steps."""
+    if cache_metadata is None or not hasattr(cache_metadata, "replace"):
+        return cache_metadata
+
+    page_size = int(getattr(getattr(cache_view, "metadata", None), "page_size", 0) or 0)
+
+    def _advance_inner(inner: typing.Any) -> typing.Any:
+        if inner is None or not hasattr(inner, "replace"):
+            return inner
+        changes: dict[str, typing.Any] = {}
+        context_lens = getattr(inner, "context_lens", None)
+        if context_lens is not None:
+            ctx = jnp.asarray(context_lens)
+            if collected_mask is not None and ctx.shape == collected_mask.shape:
+                delta = collected_mask.astype(ctx.dtype)
+            else:
+                delta = jnp.where(ctx > 0, jnp.asarray(1, dtype=ctx.dtype), jnp.asarray(0, dtype=ctx.dtype))
+            next_ctx = ctx + delta
+            pages_tables = getattr(inner, "pages_tables", None)
+            if page_size > 0 and pages_tables is not None and getattr(pages_tables, "ndim", 0) >= 2:
+                max_slots = int(pages_tables.shape[1]) * page_size
+                next_ctx = jnp.minimum(next_ctx, jnp.asarray(max_slots, dtype=ctx.dtype))
+            changes["context_lens"] = next_ctx
+        position_ids = getattr(inner, "position_ids", None)
+        if position_ids is not None:
+            pos_arr = jnp.asarray(position_ids)
+            changes["position_ids"] = pos_arr + jnp.asarray(1, dtype=pos_arr.dtype)
+        return inner.replace(**changes) if changes else inner
+
+    ragged = getattr(cache_metadata, "ragged", None)
+    if ragged is not None:
+        return cache_metadata.replace(ragged=_advance_inner(ragged))
+    return _advance_inner(cache_metadata)
+
+
 def _mtp_forward_core(
     mtp: typing.Any,
     next_embeds: Array,
@@ -222,7 +576,9 @@ def _mtp_forward_core(
     pos: Array | None,
     cache: TransformerCache | None,
     row: jax.Array | None,
-) -> tuple[Array, TransformerCache | None]:
+    cache_view: typing.Any = None,
+    cache_metadata: typing.Any = None,
+) -> tuple[Array, TransformerCache | typing.Any | None]:
     """Shared inline-MTP-head body: fuse embeddings + hidden and run the MTP layers.
 
     Both :meth:`_mtp_forward_compute` (whole target model) and
@@ -242,7 +598,9 @@ def _mtp_forward_core(
             batch-1 forward and the advanced view scattered back.
 
     Returns:
-        ``(hidden_out, new_cache)`` where ``hidden_out`` is the post-norm MTP hidden.
+        ``(hidden_out, new_cache)`` where ``hidden_out`` is the post-norm MTP hidden
+        and ``new_cache`` is the updated paged ``cache_view`` when ``cache_view``
+        was supplied, else the updated ``TransformerCache`` (or ``None``).
     """
     normed_e = mtp.pre_fc_norm_embedding(next_embeds)
     normed_h = mtp.pre_fc_norm_hidden(hidden)
@@ -256,37 +614,45 @@ def _mtp_forward_core(
     if pos is None:
         batch_size, seq_len = h.shape[:2]
         pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :].repeat(batch_size, axis=0)
-    views = cache.views if cache is not None else None
+    use_paged = cache_view is not None
+    views = cache.views if (cache is not None and not use_paged) else None
     new_views = []
     mtp_mode = common_types.MODE_PREFILL if ids.shape[1] > 1 else common_types.MODE_DECODE
     for layer in mtp.layers:
         cv_full = views[layer.layer_idx] if views is not None and layer.layer_idx < len(views) else None
         # Per-request row targeting: slice this request's row out of the shared pool cache so the
         # batch-1 attention only touches it.
-        cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
-        cache_metadata = (
-            TransformerMetadata(
-                postpadded=False,
-                starts=cv_in.starts,
-                indexes=cv_in.indexes,
+        if use_paged:
+            cv_in = cache_view
+            step_metadata = cache_metadata
+        else:
+            cv_in = _slice_view_row(cv_full, row) if (cv_full is not None and row is not None) else cv_full
+            step_metadata = (
+                TransformerMetadata(
+                    postpadded=False,
+                    starts=cv_in.starts,
+                    indexes=cv_in.indexes,
+                )
+                if cv_in is not None
+                else None
             )
-            if cv_in is not None
-            else None
-        )
         h, _cache_view = layer(
             h,
             mask_info,
             pos,
             mtp_mode,
             cv_in,
-            cache_metadata,
+            step_metadata,
             frequencies,
         )
-        if cv_full is not None and row is not None:
+        if not use_paged and cv_full is not None and row is not None:
             _cache_view = _scatter_view_row(cv_full, _cache_view, row)
         new_views.append(_cache_view)
     h = mtp.norm(h)
-    new_cache = TransformerCache(views=new_views) if cache is not None else None
+    if use_paged:
+        new_cache = new_views[-1] if new_views else cache_view
+    else:
+        new_cache = TransformerCache(views=new_views) if cache is not None else None
     return h, new_cache
 
 
@@ -423,8 +789,19 @@ def accept_or_reject(
         ``norm(max(0, p_target - p_draft))``; that step is handled by
         the caller using ``full_log_probs`` from the :class:`DraftStep`.
     """
-    log_ratio = target_log_probs - draft_log_probs
-    accept_prob = jnp.minimum(1.0, jnp.exp(log_ratio))
+    target_lp = jnp.asarray(target_log_probs, dtype=jnp.float32)
+    draft_lp = jnp.asarray(draft_log_probs, dtype=jnp.float32)
+    target_has_mass = jnp.isfinite(target_lp) & (jnp.exp(target_lp) > 0.0)
+    log_ratio = jnp.where(
+        target_has_mass,
+        jnp.where(
+            jnp.isfinite(draft_lp),
+            jnp.minimum(target_lp - draft_lp, 0.0),
+            jnp.where(draft_lp < 0.0, 0.0, -jnp.inf),
+        ),
+        -jnp.inf,
+    )
+    accept_prob = jnp.where(target_has_mass, jnp.exp(log_ratio), 0.0)
     u = jax.random.uniform(rng_key, accept_prob.shape, dtype=jnp.float32)
     return (u < accept_prob).astype(jnp.int32)
 
@@ -449,11 +826,18 @@ def resample_rejected(
     Returns:
         ``(batch,)`` replacement token IDs.
     """
-    p_target = jnp.exp(target_log_probs)
-    p_draft = jnp.exp(draft_log_probs)
+    target_lp = jnp.asarray(target_log_probs, dtype=jnp.float32)
+    draft_lp = jnp.asarray(draft_log_probs, dtype=jnp.float32)
+    p_target = jnp.where(jnp.isfinite(target_lp), jnp.exp(target_lp), 0.0)
+    p_draft = jnp.where(jnp.isfinite(draft_lp), jnp.exp(draft_lp), 0.0)
     residual = jnp.maximum(p_target - p_draft, 0.0)
-    residual = residual / jnp.maximum(jnp.sum(residual, axis=-1, keepdims=True), 1e-9)
-    return jax.random.categorical(rng_key, jnp.log(residual + 1e-9))
+    residual_sum = jnp.sum(residual, axis=-1, keepdims=True)
+    has_residual = residual_sum > 0.0
+    norm_residual = residual / jnp.where(has_residual, residual_sum, 1.0)
+    safe_residual = jnp.where(residual > 0.0, norm_residual, 1.0)
+    residual_log_probs = jnp.where(residual > 0.0, jnp.log(safe_residual), -jnp.inf)
+    sample_log_probs = jnp.where(has_residual, residual_log_probs, target_lp)
+    return jax.random.categorical(rng_key, sample_log_probs, axis=-1).astype(jnp.int32)
 
 
 class Qwen3_5MTPDrafter:
@@ -525,8 +909,13 @@ class Qwen3_5MTPDrafter:
         self._jit_adaptive: dict[tuple, typing.Callable] = {}
         self._jit_batched: dict[tuple, typing.Callable] = {}
         self._jit_verify_draft: dict[tuple, typing.Callable] = {}
+        self._jit_spec_step: dict[tuple, typing.Callable] = {}
+        # Constant greedy ``spec_step`` inputs (sampled, params, rng key) per row count: built once, never donated.
+        self._spec_step_defaults: dict[int, tuple[jax.Array, jax.Array, jax.Array]] = {}
         self.supports_batched_draft = True
         self.supports_draft_in_verify = True
+        # Models whose forward writes the draft layer's KV into the target's paged pool expose that view.
+        self.writes_draft_kv = callable(getattr(self.model, "_nextn_cache_view", None))
         # Cached static GraphDefs for the batched-draft submodule bundle
         # (mtp block, input embeddings, LM head) — see
         # ``_batched_bundle_graph_and_states``.
@@ -536,6 +925,67 @@ class Qwen3_5MTPDrafter:
         # through the drafter jits as a runtime INPUT, never closed over — see
         # ``_model_graph_and_state``.
         self._graphdef: spx.GraphDef | None = None
+
+    def update_target_model(self, model: typing.Any) -> None:
+        """Refresh the bound target model after weight hot-swap / reload.
+
+        Reuses compiled programs when the module structure (``GraphDef``) is
+        unchanged because live weights are exported as runtime ``spx.State``
+        inputs on every call; invalidates cached programs if structure changed.
+        """
+        old_graphdef = self._graphdef
+        self.model = model
+        self.writes_draft_kv = callable(getattr(self.model, "_nextn_cache_view", None))
+        new_graphdef, _ = spx.export(self.model)
+        if old_graphdef is None or new_graphdef != old_graphdef:
+            self._graphdef = new_graphdef
+            self._bundle_graphdefs = None
+            self._jit_mtp.clear()
+            self._jit_adaptive.clear()
+            self._jit_batched.clear()
+            self._jit_verify_draft.clear()
+            self._jit_spec_step.clear()
+
+    def release_target_model(self) -> None:
+        """Drop target model references, MTP caches, and compiled closures to free HBM."""
+        self.model = None
+        self._mtp_cache = None
+        self._mtp_cache_batch_size = None
+        self._graphdef = None
+        self._bundle_graphdefs = None
+        self._spec_step_defaults.clear()
+        self._jit_mtp.clear()
+        self._jit_adaptive.clear()
+        self._jit_batched.clear()
+        self._jit_verify_draft.clear()
+        self._jit_spec_step.clear()
+
+    def _tied_lm_head_sharding(self, tie_embeddings: bool) -> tuple[typing.Any, typing.Any, typing.Any] | None:
+        """Resolve ``(PartitionSpec, mesh, metadata)`` for tied LM-head projections."""
+        if not tie_embeddings or self.model is None:
+            return None
+        model = self.model
+        lm_head_spec_fn = getattr(model, "_lm_head_kernel_spec", None)
+        if not callable(lm_head_spec_fn):
+            return None
+        try:
+            head = model.get_lm_head()
+            if hasattr(model, "get_input_embeddings"):
+                embed = model.get_input_embeddings()
+            else:
+                embed = model.model.get_embedding()
+            weight = getattr(embed, "weight", None)
+            w_shape = getattr(weight, "shape", None)
+            if w_shape is None or len(w_shape) != 2:
+                return None
+            spec = lm_head_spec_fn(head, (int(w_shape[1]), int(w_shape[0])))
+            if spec is None:
+                return None
+            mesh = getattr(getattr(model, "config", None), "mesh", None) or getattr(model, "mesh", None)
+            metadata = getattr(getattr(head, "weight", None), "metadata", None)
+            return (spec, mesh, metadata)
+        except Exception:
+            return None
 
     def _batched_bundle_graph_and_states(self):
         """Split ONLY the modules the MTP forward touches into (GraphDefs, States).
@@ -572,15 +1022,21 @@ class Qwen3_5MTPDrafter:
         language_model = getattr(base_model, "language_model", None)
         frequencies_owner = language_model if language_model is not None else base_model
         frequencies = getattr(frequencies_owner, "frequencies", None)
-        cfg = getattr(model, "config", None)
-        tie_embeddings = next(
-            (
-                getattr(cfg, key)
-                for key in ("tie_word_embeddings", "use_lm_head", "share_input_output_layers")
-                if hasattr(cfg, key)
-            ),
-            False,
-        )
+        tie_fn = getattr(model, "_tie_embeddings_enabled", None)
+        if callable(tie_fn):
+            tie_embeddings = bool(tie_fn())
+        else:
+            cfg = getattr(model, "config", None)
+            config_tie = next(
+                (
+                    getattr(cfg, key)
+                    for key in ("tie_word_embeddings", "use_lm_head", "share_input_output_layers")
+                    if hasattr(cfg, key)
+                ),
+                False,
+            )
+            feature = getattr(model, "_tie_embeddings_feature", None)
+            tie_embeddings = bool(config_tie) or bool(getattr(feature, "tie", False))
         return self._bundle_graphdefs, (mtp_st, embed_st, head_st), frequencies, bool(tie_embeddings)
 
     @staticmethod
@@ -595,7 +1051,10 @@ class Qwen3_5MTPDrafter:
         pos: Int[Array, "batch seq"] | None,
         cache: TransformerCache | None,
         row: jax.Array | None = None,
-    ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | None]:
+        cache_view: typing.Any = None,
+        cache_metadata: typing.Any = None,
+        tied_lm_head_sharding: tuple[typing.Any, typing.Any, typing.Any] | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | typing.Any | None]:
         """One inline-MTP-head forward from its constituent modules.
 
         Same numerics as ``_mtp_forward_compute``, but the target model's
@@ -619,14 +1078,18 @@ class Qwen3_5MTPDrafter:
                 pool cache is sliced down to this row for a batch-1 forward and
                 the advanced view scattered back (same semantics as
                 ``_mtp_forward_compute``'s ``row``).
+            tied_lm_head_sharding: Optional ``(spec, mesh, metadata)`` tuple to
+                constrain the transposed embedding weight when ``tie_embeddings``.
 
         Returns:
             ``(hidden_out, logits, new_cache)``.
         """
 
         next_embeds = embed_module(ids.astype("i4"))
-        h, new_cache = _mtp_forward_core(mtp, next_embeds, frequencies, ids, hidden, pos, cache, row)
-        w = embed_module.weight.value.T if tie_embeddings else None
+        h, new_cache = _mtp_forward_core(
+            mtp, next_embeds, frequencies, ids, hidden, pos, cache, row, cache_view, cache_metadata
+        )
+        w = _tied_lm_head_weight_from_parts(embed_module, tie_embeddings, tied_lm_head_sharding)
         return h, lm_head_module(h, w=w), new_cache
 
     def _model_graph_and_state(self) -> tuple[spx.GraphDef, spx.State]:
@@ -674,6 +1137,8 @@ class Qwen3_5MTPDrafter:
             self._mtp_cache_batch_size = None
             return
         batch_size = int(batch_size)
+        # Drop the old pool first: the KV page pool was sized around one drafter cache, not two.
+        self._mtp_cache = None
         self._mtp_cache = self._init_mtp_cache(batch_size)
         self._mtp_cache_batch_size = batch_size if self._mtp_cache is not None else None
 
@@ -806,11 +1271,13 @@ class Qwen3_5MTPDrafter:
                 value_dim=int(spec["value_dim"]),
                 auxiliary_dim=spec.get("auxiliary_dim"),
             )
-            return TransformerCache.init_cache(
-                mesh=mesh,
-                config=cache_config,
-                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
-                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            return _place_cache(
+                TransformerCache.init_cache(
+                    mesh=mesh,
+                    config=cache_config,
+                    runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                    dtype=getattr(self.model, "dtype", jnp.bfloat16),
+                )
             )
         max_length = self._mtp_cache_max_length
         if max_length is None:
@@ -844,11 +1311,13 @@ class Qwen3_5MTPDrafter:
             value_dim=head_dim,
             auxiliary_dim=auxiliary_dim,
         )
-        return TransformerCache.init_cache(
-            mesh=mesh,
-            config=cache_config,
-            runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
-            dtype=getattr(self.model, "dtype", jnp.bfloat16),
+        return _place_cache(
+            TransformerCache.init_cache(
+                mesh=mesh,
+                config=cache_config,
+                runtime_sharding_resolver=getattr(text_cfg, "runtime_sharding_resolver", None),
+                dtype=getattr(self.model, "dtype", jnp.bfloat16),
+            )
         )
 
     def _ensure_mtp_cache(self, batch_size: int) -> TransformerCache | None:
@@ -912,6 +1381,8 @@ class Qwen3_5MTPDrafter:
         pos: Int[Array, "batch seq"] | None,
         cache: TransformerCache | None,
         row: jax.Array | None,
+        cache_view: typing.Any = None,
+        cache_metadata: typing.Any = None,
     ) -> tuple[Float[Array, "batch seq hidden"], Float[Array, "batch seq vocab"], TransformerCache | None]:
         """One inline-MTP-head forward: ``(ids, hidden) -> (hidden_out, logits, new_cache)``.
 
@@ -959,7 +1430,9 @@ class Qwen3_5MTPDrafter:
         language_model = getattr(base_model, "language_model", None)
         frequencies_owner = language_model if language_model is not None else base_model
         frequencies = getattr(frequencies_owner, "frequencies", None)
-        h, new_cache = _mtp_forward_core(model.mtp, next_embeds, frequencies, ids, hidden, pos, cache, row)
+        h, new_cache = _mtp_forward_core(
+            model.mtp, next_embeds, frequencies, ids, hidden, pos, cache, row, cache_view, cache_metadata
+        )
         return h, model.apply_lm_head(h), new_cache
 
     def _mtp_hidden_and_logits(
@@ -1018,6 +1491,7 @@ class Qwen3_5MTPDrafter:
             # leaves instead of the full model State (1100+ leaves whose
             # per-call re-export + dispatch dominated the per-request draft).
             graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+            tied_sharding = self._tied_lm_head_sharding(tie_embeddings)
             mtp_gd, embed_gd, head_gd = graphdefs
             if use_row:
 
@@ -1034,6 +1508,7 @@ class Qwen3_5MTPDrafter:
                         pos,
                         cache,
                         row,
+                        tied_lm_head_sharding=tied_sharding,
                     )
             else:
 
@@ -1050,6 +1525,7 @@ class Qwen3_5MTPDrafter:
                         pos,
                         cache,
                         None,
+                        tied_lm_head_sharding=tied_sharding,
                     )
 
             fn = _fn
@@ -1183,6 +1659,9 @@ class Qwen3_5MTPDrafter:
         position: jax.Array,
         mtp_cache: TransformerCache | None,
         use_row: bool,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
     ) -> typing.Callable:
         """Build (or fetch) the jitted early-exit draft ``while_loop`` for a shape.
 
@@ -1212,6 +1691,8 @@ class Qwen3_5MTPDrafter:
             ``state`` is the target model's weight State (threaded as an input so
             the weights are not captured constants).
         """
+        from easydel.inference.sampling_processors import apply_sampling_constraints
+
         has_cache = mtp_cache is not None
         key = (
             int(k_max),
@@ -1223,21 +1704,32 @@ class Qwen3_5MTPDrafter:
             str(position.dtype),
             self._cache_signature(mtp_cache),
             bool(use_row),
+            _constraint_signature(logit_bias, allowed_token_ids_mask, bad_words_token_ids),
         )
         fn = self._jit_adaptive.get(key)
         if fn is not None:
             return fn
 
         batch = int(cur_token.shape[0])
+        # Eager warmup on the concrete model (NOT under a trace) materializes any
+        # lazily-created state before it is split/traced (see ``_model_graph_and_state``).
+        if use_row:
+            _ = self._mtp_forward_compute(
+                self.model, cur_token, cur_hidden, position, mtp_cache, jnp.asarray(0, dtype=jnp.int32)
+            )
+        else:
+            _ = self._mtp_forward_compute(self.model, cur_token, cur_hidden, position, mtp_cache, None)
         # Cache the static GraphDef so the compiled while_loop closes over
         # structure only; the weight State is a runtime jit input (see
         # ``_model_graph_and_state``) and thus never a captured constant.
         graphdef, _ = self._model_graph_and_state()
 
-        def _step(model, ct, ch, pos, cache_in, row):
+        def _step(model, ct, ch, pos, cache_in, row, lb, allow_mask, bad_words):
             """One MTP forward -> (next_token[B], next_hidden[B,1,H], confidence, new_cache)."""
             h, logits, new_cache = self._mtp_forward_compute(model, ct, ch, pos, cache_in, row)
-            last = logits[:, -1, :].astype(jnp.float32)
+            # Slice 3D (B, 1, V) -> 2D (B, V) before applying 2D (B, V) sampling constraints.
+            last = logits[:, -1, :]
+            last = apply_sampling_constraints(last, lb, allow_mask, bad_words).astype(jnp.float32)
             probs = jax.nn.softmax(last, axis=-1)
             # Top-1 confidence = the argmax token's softmax prob == max softmax
             # prob; take the batch-min so the loop stops when the least-confident
@@ -1246,7 +1738,18 @@ class Qwen3_5MTPDrafter:
             next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
             return next_tok, h[:, -1:, :], confidence, new_cache
 
-        def _run(state, ct0, ch0, pos0, cache0, conf_threshold, row):
+        def _run(
+            state,
+            ct0,
+            ch0,
+            pos0,
+            lb_in,
+            allow_mask_in,
+            bad_words_in,
+            cache0,
+            conf_threshold,
+            row,
+        ):
             model = spx.bind(graphdef, state)
             drafts0 = jnp.zeros((k_max,), dtype=jnp.int32)
             row_arg = row if use_row else None
@@ -1262,7 +1765,9 @@ class Qwen3_5MTPDrafter:
                 else:
                     i, ct, ch, pos, drafts, _keep = carry
                     cache_in = None
-                next_tok, next_hidden, confidence, new_cache = _step(model, ct, ch, pos, cache_in, row_arg)
+                next_tok, next_hidden, confidence, new_cache = _step(
+                    model, ct, ch, pos, cache_in, row_arg, lb_in, allow_mask_in, bad_words_in
+                )
                 # Keep the carried hidden's dtype invariant across iterations (the
                 # ``while_loop`` requires it). The seed hidden is model-sourced, so
                 # this is an identity cast in the expected case (seed dtype == MTP
@@ -1304,6 +1809,9 @@ class Qwen3_5MTPDrafter:
         conf_threshold: float,
         *,
         row_pos: int | None = None,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
     ) -> tuple[Int[Array, "k_max"], Int[Array, ""]]:
         """Greedy adaptive-length draft: up to ``k_max`` tokens, early-exit on low confidence.
 
@@ -1354,13 +1862,32 @@ class Qwen3_5MTPDrafter:
             mtp_cache = self._ensure_mtp_cache(max(int(self._mtp_cache_batch_size or 0), int(row_pos) + 1))
 
         use_row = row_pos is not None and mtp_cache is not None
-        fn = self._get_adaptive_fn(k_max, cur_token, cur_hidden, position, mtp_cache, use_row)
+        fn = self._get_adaptive_fn(
+            k_max,
+            cur_token,
+            cur_hidden,
+            position,
+            mtp_cache,
+            use_row,
+            logit_bias,
+            allowed_token_ids_mask,
+            bad_words_token_ids,
+        )
         # Pass the live model State as the first jit input (never closed over),
         # so the weights stay out of the compiled program's captured constants.
         _, state = self._model_graph_and_state()
         row_arg = jnp.asarray(int(row_pos) if use_row else 0, dtype=jnp.int32)
         drafts, valid_count, new_cache = fn(
-            state, cur_token, cur_hidden, position, mtp_cache, conf_threshold_arr, row_arg
+            state,
+            cur_token,
+            cur_hidden,
+            position,
+            logit_bias,
+            allowed_token_ids_mask,
+            bad_words_token_ids,
+            mtp_cache,
+            conf_threshold_arr,
+            row_arg,
         )
         if new_cache is not None:
             self._mtp_cache = new_cache
@@ -1376,6 +1903,12 @@ class Qwen3_5MTPDrafter:
         hidden0: jax.Array,
         pos0: jax.Array,
         mtp_cache: TransformerCache | None,
+        width: int | None = None,
+        cache_view: typing.Any = None,
+        cache_metadata: typing.Any = None,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
     ) -> typing.Callable:
         """Build (or fetch) the jitted fixed-``k`` batched-draft program for a shape.
 
@@ -1412,12 +1945,22 @@ class Qwen3_5MTPDrafter:
             pos0: ``(N, 1)`` seed positions (shape/dtype only).
             mtp_cache: The pool ``TransformerCache`` (shape/dtype signature keys the
                 compile) or ``None`` for the cache-free path.
+            width: Leading slots per row the program reads and writes (one of
+                :func:`_draft_window_widths`; see :func:`_window_cache`), or ``None``
+                for the whole capacity. Keys the compile.
 
         Returns:
             ``fn(state, ids0, hidden0, pos0, cache, committed_lens, collected_mask)
-            -> (drafts[N, k], new_cache)``.
+            -> (drafts[N, k], new_cache)``. The pool cache (argument 7) is donated:
+            the program updates its leading ``width`` slots in place.
         """
+        from easydel.inference.sampling_processors import apply_sampling_constraints
+
         has_cache = mtp_cache is not None
+        use_paged = cache_view is not None
+        capacity = _cache_capacity(mtp_cache)
+        if width is not None and (capacity is None or int(width) >= capacity):
+            width = None
         key = (
             int(k),
             tuple(ids0.shape),
@@ -1427,6 +1970,16 @@ class Qwen3_5MTPDrafter:
             tuple(pos0.shape),
             str(pos0.dtype),
             self._cache_signature(mtp_cache),
+            None if width is None else int(width),
+            None
+            if not use_paged
+            else (
+                type(cache_view).__name__,
+                int(getattr(getattr(cache_view, "metadata", None), "num_pages", 0)),
+                int(getattr(getattr(cache_view, "metadata", None), "page_size", 0)),
+                cache_metadata is not None,
+            ),
+            _constraint_signature(logit_bias, allowed_token_ids_mask, bad_words_token_ids),
         )
         fn = self._jit_batched.get(key)
         if fn is not None:
@@ -1434,42 +1987,112 @@ class Qwen3_5MTPDrafter:
 
         # Eager warmup on the concrete model (NOT under a trace) materializes any
         # lazily-created state before it is split/traced (see
-        # ``_model_graph_and_state``).
-        _ = self._mtp_forward_compute(self.model, ids0, hidden0, pos0, mtp_cache, None)
+        # ``_model_graph_and_state``), on the window the program traces.
+        if use_paged:
+            if cache_metadata is not None:
+                _ = self._mtp_forward_compute(
+                    self.model,
+                    ids0,
+                    hidden0,
+                    pos0,
+                    None,
+                    None,
+                    cache_view=cache_view,
+                    cache_metadata=cache_metadata,
+                )
+        else:
+            _ = self._mtp_forward_compute(self.model, ids0, hidden0, pos0, _window_cache(mtp_cache, width), None)
         graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+        tied_sharding = self._tied_lm_head_sharding(tie_embeddings)
         mtp_gd, embed_gd, head_gd = graphdefs
 
-        def _run(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, cache0, committed_lens, collected_mask):
+        def _run(
+            mtp_st,
+            embed_st,
+            head_st,
+            freqs,
+            ids0,
+            hidden0,
+            pos0,
+            lb_in,
+            allow_mask_in,
+            bad_words_in,
+            paged_view_in,
+            paged_meta_in,
+            cache0,
+            committed_lens,
+            collected_mask,
+        ):
             mtp = spx.bind(mtp_gd, mtp_st)
             embed_module = spx.bind(embed_gd, embed_st)
             head_module = spx.bind(head_gd, head_st)
             orig_indexes: list = []
             orig_starts: list = []
-            if has_cache:
+            if has_cache and not use_paged:
                 cache: TransformerCache | None
-                cache, orig_indexes, orig_starts = _rollback_cache_views(cache0, committed_lens, collected_mask)
+                cache, orig_indexes, orig_starts = _rollback_cache_views(
+                    _window_cache(cache0, width), committed_lens, collected_mask
+                )
             else:
-                cache = None
+                cache = cache0
 
+            paged_view = paged_view_in
+            paged_meta = paged_meta_in
             ct, ch, pos = ids0, hidden0, pos0
             drafts_cols = []
             for _ in range(int(k)):
-                h, logits, cache = self._mtp_forward_compute_parts(
-                    mtp, embed_module, head_module, freqs, tie_embeddings, ct, ch, pos, cache
-                )
-                last = logits[:, -1, :].astype(jnp.float32)
+                if use_paged:
+                    h, logits, paged_view = self._mtp_forward_compute_parts(
+                        mtp,
+                        embed_module,
+                        head_module,
+                        freqs,
+                        tie_embeddings,
+                        ct,
+                        ch,
+                        pos,
+                        None,
+                        cache_view=paged_view,
+                        cache_metadata=paged_meta,
+                        tied_lm_head_sharding=tied_sharding,
+                    )
+                    paged_meta = _advance_paged_cache_metadata(paged_meta, paged_view, collected_mask)
+                else:
+                    h, logits, cache = self._mtp_forward_compute_parts(
+                        mtp,
+                        embed_module,
+                        head_module,
+                        freqs,
+                        tie_embeddings,
+                        ct,
+                        ch,
+                        pos,
+                        cache,
+                        tied_lm_head_sharding=tied_sharding,
+                    )
+                last = logits[:, -1, :]
+                last = apply_sampling_constraints(last, lb_in, allow_mask_in, bad_words_in).astype(jnp.float32)
                 next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
                 drafts_cols.append(next_tok)
                 ct = next_tok.reshape(-1, 1)
                 ch = h[:, -1:, :].astype(hidden0.dtype)
                 pos = pos + 1
-            drafts = jnp.stack(drafts_cols, axis=1)
+            if drafts_cols:
+                drafts = jnp.stack(drafts_cols, axis=1)
+            else:
+                drafts = jnp.zeros((int(ids0.shape[0]), 0), dtype=jnp.int32)
 
-            if has_cache and cache is not None:
+            if has_cache and cache is not None and not use_paged:
                 cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
+                cache = _unwindow_cache(cache0, cache)
             return drafts, cache
 
-        fn = jax.jit(_run)
+        # Donate the pool cache (arg 7): its leading slots are updated in place instead of the whole pool being
+        # copied on every call (as ``_get_verify_draft_fn`` does). The cache comes back placed as it went in, so the
+        # drafter program called next runs the placement it was compiled for (``_cache_out_shardings``).
+        out_shardings = _cache_out_shardings(mtp_cache, 1)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(12,), **jit_kwargs)
         self._jit_batched[key] = fn
         return fn
 
@@ -1482,6 +2105,11 @@ class Qwen3_5MTPDrafter:
         committed_lens: jax.Array,
         collected_mask: jax.Array,
         num_draft_tokens: int,
+        cache_view: typing.Any = None,
+        cache_metadata: typing.Any = None,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
     ) -> Int[Array, "pool k"]:
         """Draft ``k`` greedy tokens for every pool row in ONE batched pass.
 
@@ -1507,21 +2135,61 @@ class Qwen3_5MTPDrafter:
             ``(N, k)`` device array of drafted token ids. Row ``r`` is valid only
             when ``collected_mask[r]`` is ``True``.
         """
-        ids0 = jnp.asarray(seed_tokens, dtype=jnp.int32).reshape(-1, 1)
-        pos0 = jnp.asarray(seed_positions, dtype=jnp.int32).reshape(-1, 1)
+        ids0 = _device_column(seed_tokens)
+        pos0 = _device_column(seed_positions)
         hidden0 = jnp.asarray(seed_hidden)
         if hidden0.ndim == 2:
             hidden0 = hidden0[:, None, :]
         n = int(ids0.shape[0])
         self.ensure_batch_size(n)
         mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
-        committed = jnp.asarray(committed_lens, dtype=jnp.int32).reshape(-1)
-        mask = jnp.asarray(collected_mask).astype(bool).reshape(-1)
-        fn = self._get_batched_draft_fn(int(num_draft_tokens), ids0, hidden0, pos0, mtp_cache)
-        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
-        drafts, new_cache = fn(mtp_st, embed_st, head_st, freqs, ids0, hidden0, pos0, mtp_cache, committed, mask)
-        if new_cache is not None:
-            self._mtp_cache = new_cache
+        k = int(num_draft_tokens)
+        # A collected row reads and writes slots below ``committed_lens + k`` only (its write index is rolled back
+        # to at most ``committed_lens``), so the pass runs on the narrowest window holding every collected row.
+        # Host arrays only (see ``_host_vector``): device inputs run on the whole capacity.
+        collected = _host_vector(collected_mask, bool)
+        committed_host = _host_vector(committed_lens, np.int64)
+        reach = None if collected is None or committed_host is None else committed_host[collected] + k
+        committed = _device_vector(committed_lens, np.int32)
+        mask = _device_vector(collected_mask, np.bool_)
+        drafts = None
+        widths = (None,) if cache_view is not None else _select_draft_widths(_cache_capacity(mtp_cache), reach)
+        with set_inference_mode():
+            for width in widths:
+                fn = self._get_batched_draft_fn(
+                    k,
+                    ids0,
+                    hidden0,
+                    pos0,
+                    mtp_cache,
+                    width,
+                    cache_view,
+                    cache_metadata,
+                    logit_bias,
+                    allowed_token_ids_mask,
+                    bad_words_token_ids,
+                )
+                _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+                drafts, new_cache = fn(
+                    mtp_st,
+                    embed_st,
+                    head_st,
+                    freqs,
+                    ids0,
+                    hidden0,
+                    pos0,
+                    logit_bias,
+                    allowed_token_ids_mask,
+                    bad_words_token_ids,
+                    cache_view,
+                    cache_metadata,
+                    mtp_cache,
+                    committed,
+                    mask,
+                )
+                if new_cache is not None:
+                    new_cache = _restore_cache_placement(new_cache, mtp_cache)
+                    self._mtp_cache = mtp_cache = new_cache
         return drafts
 
     @staticmethod
@@ -1543,6 +2211,431 @@ class Qwen3_5MTPDrafter:
             for view in mtp_cache.views
         )
 
+    def _get_spec_step_fn(
+        self,
+        *,
+        k_pad: int,
+        k_live: int,
+        gathered_hidden: jax.Array,
+        mtp_cache: TransformerCache | None,
+        project_fn: typing.Callable | None,
+        width: int | None = None,
+        input_ids: jax.Array | None = None,
+        cache_view: typing.Any = None,
+        cache_metadata: typing.Any = None,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
+        n_rows: int | None = None,
+        has_sampled: bool = False,
+    ) -> typing.Callable:
+        """Compile verify, acceptance, next drafts and packed output as one program."""
+        from easydel.inference.esurge.runners.spec.verify import (
+            NUM_ROW_FIELDS,
+            PARAM_MIN_P,
+            PARAM_TEMPERATURE,
+            PARAM_TOP_K,
+            PARAM_TOP_P,
+            ROW_DRAFTER,
+            ROW_DRAFTS,
+            ROW_FRESH,
+            ROW_GREEDY,
+            ROW_LIVE,
+            ROW_OFFSET,
+            ROW_REAL,
+            ROW_SEQ,
+            ROW_SPEC,
+            ROW_START,
+            filter_logits,
+            pack_rows,
+            resolve_rows,
+        )
+        from easydel.inference.sampling_processors import apply_sampling_constraints
+
+        has_cache = mtp_cache is not None
+        use_paged = cache_view is not None
+        capacity = _cache_capacity(mtp_cache)
+        if width is not None and (capacity is None or int(width) >= capacity):
+            width = None
+        n_warm = int(n_rows) if n_rows is not None else (int(self._mtp_cache_batch_size or 1) if has_cache else 1)
+        key = (
+            int(k_pad),
+            int(k_live),
+            int(n_warm),
+            tuple(gathered_hidden.shape),
+            str(gathered_hidden.dtype),
+            self._cache_signature(mtp_cache),
+            None if project_fn is None else id(project_fn),
+            None if width is None else int(width),
+            _array_signature(input_ids),
+            bool(has_sampled),
+            None
+            if not use_paged
+            else (
+                type(cache_view).__name__,
+                int(getattr(getattr(cache_view, "metadata", None), "num_pages", 0)),
+                int(getattr(getattr(cache_view, "metadata", None), "page_size", 0)),
+                cache_metadata is not None,
+            ),
+            _constraint_signature(logit_bias, allowed_token_ids_mask, bad_words_token_ids),
+        )
+        fn = self._jit_spec_step.get(key)
+        if fn is not None:
+            return fn
+
+        hidden_dim = int(gathered_hidden.shape[-1])
+        if use_paged:
+            if cache_metadata is not None:
+                _ = self._mtp_forward_compute(
+                    self.model,
+                    jnp.zeros((n_warm, 1), dtype=jnp.int32),
+                    jnp.zeros((n_warm, 1, hidden_dim), dtype=gathered_hidden.dtype),
+                    jnp.zeros((n_warm, 1), dtype=jnp.int32),
+                    None,
+                    None,
+                    cache_view=cache_view,
+                    cache_metadata=cache_metadata,
+                )
+        else:
+            _ = self._mtp_forward_compute(
+                self.model,
+                jnp.zeros((n_warm, 1), dtype=jnp.int32),
+                jnp.zeros((n_warm, 1, hidden_dim), dtype=gathered_hidden.dtype),
+                jnp.zeros((n_warm, 1), dtype=jnp.int32),
+                _window_cache(mtp_cache, width),
+                None,
+            )
+        graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+        tied_sharding = self._tied_lm_head_sharding(tie_embeddings)
+        mtp_gd, embed_gd, head_gd = graphdefs
+        k_pad = int(k_pad)
+        k_live = int(k_live)
+        k_out = max(k_pad, k_live)
+
+        def _run(
+            mtp_st,
+            embed_st,
+            head_st,
+            freqs,
+            hidden,
+            row_offsets,
+            draft_tokens,
+            draft_counts,
+            seed_pos_base,
+            committed_base,
+            fresh_mask,
+            collected_mask,
+            output_rows,
+            sampled,
+            params,
+            rng_key,
+            input_ids,
+            draft_indices,
+            spec_delta,
+            lb_in,
+            allow_mask_in,
+            bad_words_in,
+            target_cache_view,
+            target_cache_metadata,
+            cache0,
+        ):
+            mtp = spx.bind(mtp_gd, mtp_st)
+            embed_module = spx.bind(embed_gd, embed_st)
+            head_module = spx.bind(head_gd, head_st)
+            if project_fn is not None:
+                logits = project_fn(hidden)
+            else:
+                w = _tied_lm_head_weight_from_parts(embed_module, tie_embeddings, tied_sharding)
+                logits = head_module(hidden, w=w)
+            logits = logits.astype(jnp.float32)
+            r_total = int(logits.shape[0])
+            n_rows_cur = int(row_offsets.shape[0])
+            stripe = jnp.arange(k_pad + 1, dtype=jnp.int32)[None, :]
+            stripe_offsets = jnp.clip(row_offsets[:, None] + stripe, 0, r_total - 1)
+            stripe_logits = logits[stripe_offsets]
+            # Apply sampling constraints ONCE to the full verify stripe (including bonus position)
+            # so arg_mat, greedy bonus, and resolve_rows all observe identical constrained logits.
+            stripe_logits = apply_sampling_constraints(stripe_logits, lb_in, allow_mask_in, bad_words_in).astype(
+                jnp.float32
+            )
+            arg_mat = jnp.argmax(stripe_logits, axis=-1).astype(jnp.int32)
+            counts = jnp.clip(draft_counts.astype(jnp.int32), 0, k_pad)
+            if spec_delta is not None:
+                seed_pos_base = seed_pos_base - spec_delta
+                committed_base = jnp.maximum(committed_base - spec_delta, 0)
+            greedy = (params[:, PARAM_TEMPERATURE] <= 0.0).astype(jnp.int32)
+            rows = jnp.zeros((n_rows_cur, NUM_ROW_FIELDS), dtype=jnp.int32)
+            rows = rows.at[:, ROW_LIVE].set(collected_mask.astype(jnp.int32))
+            rows = rows.at[:, ROW_SEQ].set(output_rows.astype(jnp.int32))
+            rows = rows.at[:, ROW_OFFSET].set(row_offsets.astype(jnp.int32))
+            rows = rows.at[:, ROW_REAL].set(1)
+            rows = rows.at[:, ROW_DRAFTS].set(counts)
+            rows = rows.at[:, ROW_START].set(seed_pos_base.astype(jnp.int32))
+            rows = rows.at[:, ROW_DRAFTER].set(jnp.arange(n_rows_cur, dtype=jnp.int32))
+            rows = rows.at[:, ROW_FRESH].set(fresh_mask.astype(jnp.int32))
+            rows = rows.at[:, ROW_GREEDY].set(greedy)
+            rows = rows.at[:, ROW_SPEC].set(collected_mask.astype(jnp.int32))
+            if input_ids is not None:
+                draft_tokens = input_ids[draft_indices]
+            greedy_bonus = jnp.take_along_axis(arg_mat, jnp.minimum(counts, k_pad)[:, None], axis=1)[:, 0]
+            if has_sampled:
+                bonus = jnp.where(greedy > 0, greedy_bonus, sampled.astype(jnp.int32))
+                resolve_rng = rng_key
+            else:
+                resolve_rng, bonus_rng = jax.random.split(rng_key)
+                bonus_logits = jnp.take_along_axis(
+                    stripe_logits, jnp.minimum(counts, k_pad)[:, None, None], axis=1
+                )
+                filtered_bonus = jax.vmap(filter_logits)(
+                    bonus_logits,
+                    params[:, PARAM_TEMPERATURE],
+                    params[:, PARAM_TOP_P],
+                    params[:, PARAM_TOP_K],
+                    params[:, PARAM_MIN_P],
+                )[:, 0, :]
+                sampled_bonus = jax.random.categorical(bonus_rng, filtered_bonus, axis=-1).astype(jnp.int32)
+                bonus = jnp.where(greedy > 0, greedy_bonus, sampled_bonus)
+            resolution = resolve_rows(
+                stripe_logits[:, :k_pad, :] if k_pad > 0 else None,
+                draft_tokens,
+                bonus,
+                rows,
+                params,
+                resolve_rng,
+                logit_bias=None,
+                allowed_token_ids_mask=None,
+                bad_words_token_ids=None,
+            )
+            accepted = resolution.accepted
+            seed_rows = jnp.clip(row_offsets + jnp.maximum(accepted, 0), 0, r_total - 1)
+            seed_hidden = hidden[seed_rows][:, None, :]
+            committed = jnp.where(
+                fresh_mask,
+                jnp.zeros_like(accepted),
+                jnp.maximum(committed_base + jnp.maximum(accepted, 0), 0),
+            ).astype(jnp.int32)
+            cache = cache0
+            orig_indexes: list = []
+            orig_starts: list = []
+            if has_cache and not use_paged:
+                cache, orig_indexes, orig_starts = _rollback_cache_views(
+                    _window_cache(cache0, width), committed, collected_mask
+                )
+            paged_view = target_cache_view
+            paged_meta = target_cache_metadata
+            ct = resolution.seed_tokens.reshape(-1, 1)
+            ch = seed_hidden.astype(hidden.dtype)
+            pos = resolution.seed_positions.reshape(-1, 1)
+            drafts_cols = []
+            for _ in range(k_live):
+                if use_paged:
+                    h, step_logits, paged_view = self._mtp_forward_compute_parts(
+                        mtp,
+                        embed_module,
+                        head_module,
+                        freqs,
+                        tie_embeddings,
+                        ct,
+                        ch,
+                        pos,
+                        None,
+                        cache_view=paged_view,
+                        cache_metadata=paged_meta,
+                        tied_lm_head_sharding=tied_sharding,
+                    )
+                    paged_meta = _advance_paged_cache_metadata(paged_meta, paged_view, collected_mask)
+                else:
+                    h, step_logits, cache = self._mtp_forward_compute_parts(
+                        mtp,
+                        embed_module,
+                        head_module,
+                        freqs,
+                        tie_embeddings,
+                        ct,
+                        ch,
+                        pos,
+                        cache,
+                        tied_lm_head_sharding=tied_sharding,
+                    )
+                last = step_logits[:, -1, :]
+                last = apply_sampling_constraints(last, lb_in, allow_mask_in, bad_words_in).astype(jnp.float32)
+                next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
+                drafts_cols.append(next_tok)
+                ct = next_tok.reshape(-1, 1)
+                ch = h[:, -1:, :].astype(hidden.dtype)
+                pos = pos + 1
+            if drafts_cols:
+                drafts = jnp.stack(drafts_cols, axis=1)
+            else:
+                drafts = jnp.zeros((n_rows_cur, 0), dtype=jnp.int32)
+            drafts = jnp.where(collected_mask[:, None], drafts, -1)
+            if has_cache and cache is not None and not use_paged:
+                cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
+                cache = _unwindow_cache(cache0, cache)
+            emitted_packed = resolution.emitted
+            if int(emitted_packed.shape[1]) < k_out + 1:
+                emitted_packed = jnp.concatenate(
+                    [
+                        emitted_packed,
+                        jnp.full((n_rows_cur, k_out + 1 - int(emitted_packed.shape[1])), -1, dtype=jnp.int32),
+                    ],
+                    axis=1,
+                )
+            drafts_packed = drafts
+            if int(drafts_packed.shape[1]) < k_out:
+                drafts_packed = jnp.concatenate(
+                    [drafts_packed, jnp.full((n_rows_cur, k_out - int(drafts_packed.shape[1])), -1, dtype=jnp.int32)],
+                    axis=1,
+                )
+            spec_out = pack_rows(
+                rows,
+                emitted_packed,
+                accepted,
+                drafts_packed,
+                num_rows=n_rows_cur,
+                num_draft_tokens=k_out,
+            )
+            return arg_mat, accepted, resolution.seed_positions, spec_out, cache
+
+        out_shardings = _cache_out_shardings(mtp_cache, 4)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(24,), **jit_kwargs)
+        self._jit_spec_step[key] = fn
+        return fn
+
+    def spec_step(
+        self,
+        *,
+        gathered_hidden: jax.Array,
+        row_offsets: jax.Array,
+        draft_tokens: jax.Array,
+        draft_counts: jax.Array,
+        seed_pos_base: jax.Array,
+        committed_base: jax.Array,
+        fresh_mask: jax.Array,
+        collected_mask: jax.Array,
+        num_draft_tokens: int,
+        output_rows: jax.Array | None = None,
+        input_ids: jax.Array | None = None,
+        draft_indices: jax.Array | None = None,
+        spec_delta: jax.Array | None = None,
+        cache_view: typing.Any = None,
+        cache_metadata: typing.Any = None,
+        logit_bias: jax.Array | None = None,
+        allowed_token_ids_mask: jax.Array | None = None,
+        bad_words_token_ids: jax.Array | None = None,
+        sampled: jax.Array | None = None,
+        params: jax.Array | None = None,
+        rng_key: jax.Array | None = None,
+        project_fn: typing.Callable | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Resolve and draft every collected row, returning one packed result array."""
+        from easydel.inference.esurge.runners.spec.verify import (
+            NUM_PARAM_FIELDS,
+            PARAM_MIN_P,
+            PARAM_TEMPERATURE,
+            PARAM_TOP_K,
+            PARAM_TOP_P,
+        )
+
+        row_offsets = jnp.asarray(row_offsets, dtype=jnp.int32).reshape(-1)
+        n = int(row_offsets.shape[0])
+        self.ensure_batch_size(n)
+        mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
+        draft_tokens = jnp.asarray(draft_tokens, dtype=jnp.int32).reshape(n, -1)
+        k_live = int(num_draft_tokens)
+        if input_ids is not None and draft_indices is None:
+            raise ValueError("input_ids requires draft_indices")
+        if draft_indices is None:
+            draft_indices = jnp.zeros((n, int(draft_tokens.shape[1])), dtype=jnp.int32)
+        if spec_delta is None:
+            spec_delta = jnp.zeros((n,), dtype=jnp.int32)
+        if output_rows is None:
+            output_rows = jnp.arange(n, dtype=jnp.int32)
+        has_sampled = sampled is not None
+        if sampled is None or params is None or rng_key is None:
+            # Built once per row count with the same construction and placement as before, so every call passes the
+            # same arrays instead of dispatching seven small programs to rebuild them; the jit donates none of them.
+            # Default temperature is 0.0 (greedy) so callers omitting ``params`` stay on the greedy path while
+            # callers supplying ``params`` with ``temperature > 0`` engage sampled verification.
+            defaults = self._spec_step_defaults.get(n)
+            if defaults is None:
+                default_params = jnp.zeros((n, NUM_PARAM_FIELDS), dtype=jnp.float32)
+                default_params = default_params.at[:, PARAM_TEMPERATURE].set(0.0)
+                default_params = default_params.at[:, PARAM_TOP_P].set(1.0)
+                default_params = default_params.at[:, PARAM_TOP_K].set(0)
+                default_params = default_params.at[:, PARAM_MIN_P].set(0.0)
+                defaults = (jnp.zeros((n,), dtype=jnp.int32), default_params, jax.random.PRNGKey(0))
+                self._spec_step_defaults[n] = defaults
+            sampled = defaults[0] if sampled is None else sampled
+            params = defaults[1] if params is None else params
+            rng_key = defaults[2] if rng_key is None else rng_key
+        host = [
+            _host_vector(collected_mask, bool),
+            _host_vector(committed_base, np.int64),
+            _host_vector(draft_counts, np.int64),
+            _host_vector(fresh_mask, bool),
+        ]
+        reach = None
+        if all(h is not None for h in host):
+            collected, base, counts, fresh = host
+            reach = (np.where(fresh, 0, np.maximum(base, 0) + counts) + k_live)[collected]
+        # Commit the hidden rows and verify ids to the model mesh before they become program inputs, so warm-up and
+        # serving call the compiled program with the same placement.
+        replicated = jax.sharding.NamedSharding(self.model.mesh, jax.sharding.PartitionSpec())
+        if input_ids is not None:
+            input_ids = jax.device_put(input_ids, replicated)
+        gathered_hidden = jax.device_put(gathered_hidden, replicated)
+        inputs = (
+            jnp.asarray(gathered_hidden),
+            row_offsets,
+            draft_tokens,
+            jnp.asarray(draft_counts, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(seed_pos_base, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(committed_base, dtype=jnp.int32).reshape(-1),
+            _device_vector(fresh_mask, np.bool_),
+            _device_vector(collected_mask, np.bool_),
+            jnp.asarray(output_rows, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(sampled, dtype=jnp.int32).reshape(-1),
+            jnp.asarray(params, dtype=jnp.float32).reshape(n, NUM_PARAM_FIELDS),
+            rng_key,
+            input_ids,
+            draft_indices,
+            jnp.asarray(spec_delta, dtype=jnp.int32).reshape(-1),
+            logit_bias,
+            allowed_token_ids_mask,
+            bad_words_token_ids,
+            cache_view,
+            cache_metadata,
+        )
+        outputs: list = []
+        widths = (None,) if cache_view is not None else _select_draft_widths(_cache_capacity(mtp_cache), reach)
+        with set_inference_mode():
+            for width in widths:
+                fn = self._get_spec_step_fn(
+                    k_pad=int(draft_tokens.shape[1]),
+                    k_live=k_live,
+                    gathered_hidden=gathered_hidden,
+                    mtp_cache=mtp_cache,
+                    project_fn=project_fn,
+                    width=width,
+                    input_ids=input_ids,
+                    cache_view=cache_view,
+                    cache_metadata=cache_metadata,
+                    logit_bias=logit_bias,
+                    allowed_token_ids_mask=allowed_token_ids_mask,
+                    bad_words_token_ids=bad_words_token_ids,
+                    n_rows=n,
+                    has_sampled=has_sampled,
+                )
+                _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+                *outputs, new_cache = fn(mtp_st, embed_st, head_st, freqs, *inputs, mtp_cache)
+                if new_cache is not None:
+                    new_cache = _restore_cache_placement(new_cache, mtp_cache)
+                    self._mtp_cache = mtp_cache = new_cache
+        arg_mat, accepted, seed_positions, spec_out = outputs
+        return arg_mat, accepted, seed_positions, spec_out
+
     def _get_verify_draft_fn(
         self,
         *,
@@ -1551,6 +2644,7 @@ class Qwen3_5MTPDrafter:
         gathered_hidden: jax.Array,
         mtp_cache: TransformerCache | None,
         project_fn: typing.Callable | None,
+        width: int | None = None,
     ) -> typing.Callable:
         """Build (or fetch) the fused DRAFT-IN-VERIFY program for a shape.
 
@@ -1599,6 +2693,9 @@ class Qwen3_5MTPDrafter:
                 shared LM head from the drafter bundle (same math as
                 ``apply_lm_head``). Must be a STABLE callable — its ``id`` is
                 part of the compile key.
+            width: Leading slots per row the MTP forwards read and write (one of
+                :func:`_draft_window_widths`; see :func:`_window_cache`), or ``None``
+                for the whole capacity. Keys the compile.
 
         Returns:
             ``fn(mtp_st, embed_st, head_st, freqs, hidden, row_offsets,
@@ -1607,6 +2704,9 @@ class Qwen3_5MTPDrafter:
             accepted[N], seed_positions[N], drafts[N, k_live], new_cache)``.
         """
         has_cache = mtp_cache is not None
+        capacity = _cache_capacity(mtp_cache)
+        if width is not None and (capacity is None or int(width) >= capacity):
+            width = None
         key = (
             int(k_pad),
             int(k_live),
@@ -1614,6 +2714,7 @@ class Qwen3_5MTPDrafter:
             str(gathered_hidden.dtype),
             self._cache_signature(mtp_cache),
             None if project_fn is None else id(project_fn),
+            None if width is None else int(width),
         )
         fn = self._jit_verify_draft.get(key)
         if fn is not None:
@@ -1627,8 +2728,9 @@ class Qwen3_5MTPDrafter:
         warm_ids = jnp.zeros((n, 1), dtype=jnp.int32)
         warm_hidden = jnp.zeros((n, 1, hidden_dim), dtype=gathered_hidden.dtype)
         warm_pos = jnp.zeros((n, 1), dtype=jnp.int32)
-        _ = self._mtp_forward_compute(self.model, warm_ids, warm_hidden, warm_pos, mtp_cache, None)
+        _ = self._mtp_forward_compute(self.model, warm_ids, warm_hidden, warm_pos, _window_cache(mtp_cache, width), None)
         graphdefs, _states, _freqs, tie_embeddings = self._batched_bundle_graph_and_states()
+        tied_sharding = self._tied_lm_head_sharding(tie_embeddings)
         mtp_gd, embed_gd, head_gd = graphdefs
         k_pad = int(k_pad)
         k_live = int(k_live)
@@ -1656,7 +2758,7 @@ class Qwen3_5MTPDrafter:
             if project_fn is not None:
                 logits = project_fn(hidden)
             else:
-                w = embed_module.weight.value.T if tie_embeddings else None
+                w = _tied_lm_head_weight_from_parts(embed_module, tie_embeddings, tied_sharding)
                 logits = head_module(hidden, w=w)
             argmaxes = jnp.argmax(logits.astype(jnp.float32), axis=-1).astype(jnp.int32)  # [R]
             r_total = int(argmaxes.shape[0])
@@ -1685,7 +2787,9 @@ class Qwen3_5MTPDrafter:
             orig_starts: list = []
             if has_cache:
                 cache: TransformerCache | None
-                cache, orig_indexes, orig_starts = _rollback_cache_views(cache0, committed, collected_mask)
+                cache, orig_indexes, orig_starts = _rollback_cache_views(
+                    _window_cache(cache0, width), committed, collected_mask
+                )
             else:
                 cache = None
 
@@ -1695,7 +2799,16 @@ class Qwen3_5MTPDrafter:
             drafts_cols = []
             for _ in range(k_live):
                 h, step_logits, cache = self._mtp_forward_compute_parts(
-                    mtp, embed_module, head_module, freqs, tie_embeddings, ct, ch, pos, cache
+                    mtp,
+                    embed_module,
+                    head_module,
+                    freqs,
+                    tie_embeddings,
+                    ct,
+                    ch,
+                    pos,
+                    cache,
+                    tied_lm_head_sharding=tied_sharding,
                 )
                 last = step_logits[:, -1, :].astype(jnp.float32)
                 next_tok = jnp.argmax(last, axis=-1).astype(jnp.int32)
@@ -1703,15 +2816,24 @@ class Qwen3_5MTPDrafter:
                 ct = next_tok.reshape(-1, 1)
                 ch = h[:, -1:, :].astype(hidden.dtype)
                 pos = pos + 1
-            drafts = jnp.stack(drafts_cols, axis=1)
+            if drafts_cols:
+                drafts = jnp.stack(drafts_cols, axis=1)
+            else:
+                drafts = jnp.zeros((int(row_offsets.shape[0]), 0), dtype=jnp.int32)
 
             if has_cache and cache is not None:
                 cache = _restore_cache_views(cache, orig_indexes, orig_starts, collected_mask)
+                cache = _unwindow_cache(cache0, cache)
             return arg_mat, accepted, seed_positions, drafts, cache
 
         # Donate the MTP pool cache (arg 12): the program aliases the pool
         # buffers input->output instead of copying the whole pool each step.
-        fn = jax.jit(_run, donate_argnums=(12,))
+        # The cache comes back placed as it went in, so the drafter program
+        # called next runs the placement it was compiled for
+        # (``_cache_out_shardings``).
+        out_shardings = _cache_out_shardings(mtp_cache, 4)
+        jit_kwargs = {} if out_shardings is None else {"out_shardings": out_shardings}
+        fn = jax.jit(_run, donate_argnums=(12,), **jit_kwargs)
         self._jit_verify_draft[key] = fn
         return fn
 
@@ -1776,31 +2898,46 @@ class Qwen3_5MTPDrafter:
         self.ensure_batch_size(n)
         mtp_cache = self._mtp_cache if self.uses_mtp_cache else None
         draft_tokens = jnp.asarray(draft_tokens, dtype=jnp.int32).reshape(n, -1)
-        fn = self._get_verify_draft_fn(
-            k_pad=int(draft_tokens.shape[1]),
-            k_live=int(num_draft_tokens),
-            gathered_hidden=gathered_hidden,
-            mtp_cache=mtp_cache,
-            project_fn=project_fn,
-        )
-        _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
-        arg_mat, accepted, seed_positions, drafts, new_cache = fn(
-            mtp_st,
-            embed_st,
-            head_st,
-            freqs,
+        k_live = int(num_draft_tokens)
+        # A collected row's in-program rollback target is at most ``committed_base + draft_counts`` (0 when fresh)
+        # and the pass writes ``k_live`` slots from there, so it runs on the narrowest window holding every collected
+        # row (host arrays: no device read).
+        host = [
+            _host_vector(collected_mask, bool),
+            _host_vector(committed_base, np.int64),
+            _host_vector(draft_counts, np.int64),
+            _host_vector(fresh_mask, bool),
+        ]
+        reach = None
+        if all(h is not None for h in host):
+            collected, base, counts, fresh = host
+            reach = (np.where(fresh, 0, np.maximum(base, 0) + counts) + k_live)[collected]
+        inputs = (
             jnp.asarray(gathered_hidden),
             row_offsets,
             draft_tokens,
             jnp.asarray(draft_counts, dtype=jnp.int32).reshape(-1),
             jnp.asarray(seed_pos_base, dtype=jnp.int32).reshape(-1),
             jnp.asarray(committed_base, dtype=jnp.int32).reshape(-1),
-            jnp.asarray(fresh_mask).astype(bool).reshape(-1),
-            jnp.asarray(collected_mask).astype(bool).reshape(-1),
-            mtp_cache,
+            _device_vector(fresh_mask, np.bool_),
+            _device_vector(collected_mask, np.bool_),
         )
-        if new_cache is not None:
-            self._mtp_cache = new_cache
+        outputs: list = []
+        with set_inference_mode():
+            for width in _select_draft_widths(_cache_capacity(mtp_cache), reach):
+                fn = self._get_verify_draft_fn(
+                    k_pad=int(draft_tokens.shape[1]),
+                    k_live=k_live,
+                    gathered_hidden=gathered_hidden,
+                    mtp_cache=mtp_cache,
+                    project_fn=project_fn,
+                    width=width,
+                )
+                _gds, (mtp_st, embed_st, head_st), freqs, _tie = self._batched_bundle_graph_and_states()
+                *outputs, new_cache = fn(mtp_st, embed_st, head_st, freqs, *inputs, mtp_cache)
+                if new_cache is not None:
+                    self._mtp_cache = mtp_cache = new_cache
+        arg_mat, accepted, seed_positions, drafts = outputs
         return arg_mat, accepted, seed_positions, drafts
 
 
@@ -1823,6 +2960,7 @@ class Gemma4AssistantDrafter:
         assistant_model: typing.Any,
         target_embed_module: typing.Any,
         *,
+        num_draft_tokens: int = 1,
         layer_mapping: list[int] | None = None,
         target_config: typing.Any | None = None,
     ):
@@ -1833,6 +2971,8 @@ class Gemma4AssistantDrafter:
             target_embed_module: ``embed_tokens`` of the target
                 Gemma4 model. Needed to compute
                 ``target_token_embeds`` at the target's hidden size.
+            num_draft_tokens: Number of speculative tokens to propose per
+                verify window (default ``1``).
             layer_mapping: Optional assistant-layer -> target-layer
                 mapping. ``None`` uses the eSurge default heuristic.
             target_config: Optional target config used to resolve the
@@ -1840,6 +2980,7 @@ class Gemma4AssistantDrafter:
         """
         self.assistant = assistant_model
         self.supports_return_full_log_probs = True
+        self.num_draft_tokens = max(1, int(num_draft_tokens))
         self.target_embed = target_embed_module
         self.layer_mapping = list(layer_mapping) if layer_mapping is not None else None
         self.target_config = target_config
@@ -1863,6 +3004,23 @@ class Gemma4AssistantDrafter:
             (lambda: self.assistant, lambda: self.target_embed),
             static_argnames=("return_dense_logits",),
         )
+
+    def update_target_model(self, model: typing.Any) -> None:
+        """Refresh the bound target embedding & config after a target weight reload."""
+        resolver = getattr(model, "_resolve_drafter_target_embedding", None)
+        if callable(resolver):
+            self.target_embed = resolver()
+        elif hasattr(model, "get_input_embeddings"):
+            self.target_embed = model.get_input_embeddings()
+        elif hasattr(getattr(model, "model", None), "get_embedding"):
+            self.target_embed = model.model.get_embedding()
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            self.target_config = cfg
+
+    def release_target_model(self) -> None:
+        """Drop target embedding reference to avoid pinning old target weights in HBM."""
+        self.target_embed = None
 
     def resolve_layer_mapping(self, target_cache: typing.Any | None = None) -> list[int]:
         """Return the assistant-layer to target-layer K/V mapping.
@@ -2077,18 +3235,32 @@ class Gemma4AssistantDrafter:
             )
 
         last = out.logits[:, -1, :].astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(last, axis=-1)
         if sample:
             if rng_key is None:
                 raise ValueError("rng_key required when sample=True")
+            log_probs = jax.nn.log_softmax(last, axis=-1)
             token_ids = jax.random.categorical(rng_key, last)
-        else:
-            token_ids = jnp.argmax(last, axis=-1)
-        token_log_probs = jnp.take_along_axis(log_probs, token_ids[:, None], axis=-1).squeeze(-1)
+            token_log_probs = jnp.take_along_axis(log_probs, token_ids[:, None], axis=-1).squeeze(-1)
+            return DraftStep(
+                token_ids=token_ids.astype(jnp.int32),
+                log_probs=token_log_probs,
+                full_log_probs=log_probs,
+                hidden_states=out.backbone_hidden_state,
+            )
+        token_ids = jnp.argmax(last, axis=-1)
+        if return_full_log_probs:
+            log_probs = jax.nn.log_softmax(last, axis=-1)
+            token_log_probs = jnp.take_along_axis(log_probs, token_ids[:, None], axis=-1).squeeze(-1)
+            return DraftStep(
+                token_ids=token_ids.astype(jnp.int32),
+                log_probs=token_log_probs,
+                full_log_probs=log_probs,
+                hidden_states=out.backbone_hidden_state,
+            )
         return DraftStep(
             token_ids=token_ids.astype(jnp.int32),
-            log_probs=token_log_probs,
-            full_log_probs=log_probs,
+            log_probs=None,
+            full_log_probs=None,
             hidden_states=out.backbone_hidden_state,
         )
 
@@ -2190,11 +3362,11 @@ def _build_gemma4_assistant_drafter(
     drafter = Gemma4AssistantDrafter(
         assistant_model=assistant,
         target_embed_module=target_embed_module or target_model._resolve_drafter_target_embedding(),
+        num_draft_tokens=max(1, int(num_draft_tokens)),
         layer_mapping=layer_mapping,
         target_config=target_config if target_config is not None else getattr(target_model, "config", None),
         **kwargs,
     )
-    drafter.num_draft_tokens = max(1, int(num_draft_tokens))
     return drafter
 
 

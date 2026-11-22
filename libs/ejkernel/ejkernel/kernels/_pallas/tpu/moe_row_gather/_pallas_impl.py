@@ -47,6 +47,8 @@ DEFAULT_VMEM_LIMIT = 64 * 2**20
 VMEM_BUDGET = 48 * 2**20
 LIVE_WAIT_ROWS = 64
 """Row copies retired per semaphore wait in the sparse (``skip_negative``) gather-sum."""
+LIVE_ISSUE_UNROLL = 32
+"""Row copies issued per unrolled group in the sparse gather-sum (divides 128, so a group shares one list row)."""
 _PACK_BLOCKS = (256, 128, 64, 32, 16)
 
 
@@ -183,6 +185,9 @@ def _gather_kernel(idx_ref, *refs, block, sub, half, n_src, has_scale, has_dot):
                 acc = term if acc is None else acc + term
             if has_scale:
                 lo, hi = lo * factor, hi * factor
+            if jnp.issubdtype(out_ref.dtype, jnp.integer):
+                # Integer-valued rows (e.g. int8 codes carried as bfloat16): f32 -> int32 -> int8 is exact.
+                lo, hi = lo.astype(I32), hi.astype(I32)
             out_ref[r0:r1, cols_lo] = lo.astype(out_ref.dtype)
             out_ref[r0:r1, cols_hi] = hi.astype(out_ref.dtype)
         if has_dot:
@@ -195,11 +200,13 @@ def gather_rows(
     scale: jax.Array | None = None,
     dot_with: jax.Array | None = None,
     *,
+    out_dtype=None,
     vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array | None]:
     """``out[i] = scale[i] * x[indices[i]]`` and ``dot[i] = <x[indices[i]], dot_with[i]>`` by per-row DMA.
 
-    Shapes must satisfy :func:`gather_unsupported_reason`.
+    ``out_dtype`` int8 (no ``scale``) writes integer-valued source rows (int8 codes carried as bfloat16) as int8
+    directly, bit for bit ``x[indices].astype(int8)``. Shapes must satisfy :func:`gather_unsupported_reason`.
     """
     n, h = x.shape
     rows = indices.shape[0]
@@ -216,8 +223,11 @@ def gather_rows(
     if has_dot:
         in_specs.append(pl.BlockSpec((block, h), lambda i: (i, 0)))
         args.append(dot_with)
+    out_dtype = jnp.dtype(out_dtype or x.dtype)
+    if out_dtype not in (jnp.dtype(x.dtype), jnp.dtype(jnp.int8)) or (out_dtype == jnp.int8 and has_scale):
+        raise ValueError(f"out_dtype {out_dtype} unsupported (x.dtype, or int8 without scale)")
     out_specs = [pl.BlockSpec((block, h), lambda i: (i, 0))]
-    out_shape = [jax.ShapeDtypeStruct((rows, h), x.dtype)]
+    out_shape = [jax.ShapeDtypeStruct((rows, h), out_dtype)]
     if has_dot:
         out_specs.append(pl.BlockSpec((block, 1), lambda i: (i, 0)))
         out_shape.append(jax.ShapeDtypeStruct((rows, 1), F32))
@@ -233,13 +243,145 @@ def gather_rows(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), vmem_limit_bytes=int(vmem_limit_bytes or DEFAULT_VMEM_LIMIT)
         ),
-        name=f"moe_row_gather_s{int(has_scale)}_d{int(has_dot)}",
+        name=f"moe_row_gather_s{int(has_scale)}_d{int(has_dot)}" + ("_i8" if out_dtype == jnp.int8 else ""),
     )(*args)
     return (res[0], res[1][:, 0]) if has_dot else (res[0], None)
 
 
+# ------------------------------------------------------------------------------------------- quantized row gather
+_QPACK_BLOCKS = (256, 128, 64, 32)
+"""Pack row blocks for int8 sources (int8 tiles hold 32 rows)."""
+
+
+def quantized_packed_rows(hidden: int) -> int:
+    """int32 ``(·, 128)`` rows of one packed int8 row of width ``hidden`` plus its scale: a multiple of 8 (one tile)."""
+    return -(-(hidden // (4 * LANES) + 1) // SUBLANES) * SUBLANES
+
+
+def quantized_gather_unsupported_reason(src_shape, dtype, scale_shape, scale_dtype, rows: int) -> str | None:
+    """Why :func:`gather_quantized_rows` cannot run these shapes (``None`` when it can)."""
+    if len(src_shape) != 2:
+        return f"rank-{len(src_shape)} codes (needs [rows, hidden])"
+    if jnp.dtype(dtype) != jnp.int8:
+        return f"codes dtype {jnp.dtype(dtype).name} (needs int8)"
+    n, h = src_shape
+    if tuple(scale_shape) != (n,) or jnp.dtype(scale_dtype) != jnp.float32:
+        return f"scale must be float32 [{n}], got {jnp.dtype(scale_dtype).name} {tuple(scale_shape)}"
+    if h % (4 * LANES):
+        return f"hidden size {h} is not a multiple of {4 * LANES}"
+    if next((tb for tb in _QPACK_BLOCKS if n % tb == 0), None) is None:
+        return f"{n} source rows is not a multiple of {_QPACK_BLOCKS[-1]}"
+    if rows % INDEX_BLOCK:
+        return f"{rows} gathered rows is not a multiple of {INDEX_BLOCK}"
+    if n < INDEX_BLOCK:
+        return f"{n} source rows is fewer than {INDEX_BLOCK}"
+    need = INDEX_BLOCK * quantized_packed_rows(h) * LANES * 4 + 2 * INDEX_BLOCK * h
+    if need > VMEM_BUDGET:
+        return f"a {INDEX_BLOCK}-row step needs {need >> 20} MiB of VMEM (budget {VMEM_BUDGET >> 20} MiB)"
+    return None
+
+
+def _pack_quantized_kernel(c_ref, s_ref, o_ref, *, block, sub, quarter):
+    # Word (row a, lane l) holds the code of column a * 128 + l + b * H / 4 in byte b; row H / 512 holds the scale
+    # bits (in every lane).
+    code_rows = quarter // LANES
+    for a in range(code_rows):
+        word = None
+        for b in range(4):
+            col = b * quarter + a * LANES
+            byte = c_ref[:, col : col + LANES].astype(I32) & jnp.int32(255)
+            byte = lax.shift_left(byte, jnp.int32(8 * b)) if b else byte
+            word = byte if word is None else word | byte
+        o_ref[pl.ds(a, block, stride=sub), :] = word
+    # Scale bits arrive as int32 (bitcast in XLA): no f32 value passes through the vector unit (denormals stay exact).
+    o_ref[pl.ds(code_rows, block, stride=sub), :] = jnp.broadcast_to(s_ref[...], (block, LANES))
+
+
+def pack_quantized_rows(codes: jax.Array, scale: jax.Array, *, vmem_limit_bytes: int | None = None) -> jax.Array:
+    """int8 ``[N, H]`` codes + f32 ``[N]`` scales -> int32 ``[N * S, 128]`` (``S = quantized_packed_rows(H)``).
+
+    Row ``i`` occupies packed rows ``[i * S, (i + 1) * S)``: rows ``0 .. H / 512 - 1`` hold its codes four per word,
+    row ``H / 512`` its scale's bits (in every lane); the remaining rows are padding and never read.
+    """
+    n, h = codes.shape
+    sub, block = quantized_packed_rows(h), next(tb for tb in _QPACK_BLOCKS if n % tb == 0)
+    return pl.pallas_call(
+        functools.partial(_pack_quantized_kernel, block=block, sub=sub, quarter=h // 4),
+        grid=(n // block,),
+        in_specs=[pl.BlockSpec((block, h), lambda i: (i, 0)), pl.BlockSpec((block, 1), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((block * sub, LANES), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((n * sub, LANES), I32),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",), vmem_limit_bytes=int(vmem_limit_bytes or DEFAULT_VMEM_LIMIT)
+        ),
+        name=f"moe_row_pack_q_b{block}",
+    )(codes, lax.bitcast_convert_type(scale.astype(F32), I32).reshape(n, 1))
+
+
+def _gather_quantized_kernel(idx_ref, src_hbm, out_ref, scale_ref, buf, sem, *, block, sub, quarter, n_src):
+    def issue(j, carry):
+        row = _clamped_index(idx_ref, j, n_src)
+        pltpu.make_async_copy(
+            src_hbm.at[pl.ds(pl.multiple_of(row * sub, sub), sub)],
+            buf.at[pl.ds(pl.multiple_of(j * sub, sub), sub)],
+            sem,
+        ).start()
+        return carry
+
+    lax.fori_loop(0, block, issue, 0, unroll=8)
+    # One descriptor covering the whole buffer: its byte count equals the `block` row copies signalled.
+    pltpu.make_async_copy(src_hbm.at[pl.ds(0, block * sub)], buf, sem).wait()
+    code_rows = quarter // LANES
+    for c in range(block // COMPUTE_ROWS):
+        r0, r1 = c * COMPUTE_ROWS, (c + 1) * COMPUTE_ROWS
+        for a in range(code_rows):
+            words = buf[pl.ds(r0 * sub + a, COMPUTE_ROWS, stride=sub), :]
+            for b in range(4):
+                # Byte b, sign-extended: exactly the packed int8 code.
+                byte = lax.shift_right_arithmetic(lax.shift_left(words, jnp.int32(24 - 8 * b)), jnp.int32(24))
+                col = b * quarter + a * LANES
+                out_ref[r0:r1, col : col + LANES] = byte.astype(out_ref.dtype)
+        # Scale bits stay int32 in the kernel (bitcast to f32 in XLA): subnormal scales are not flushed.
+        scale_ref[r0:r1, :] = buf[pl.ds(r0 * sub + code_rows, COMPUTE_ROWS, stride=sub), :][:, :1]
+
+
+def gather_quantized_rows(
+    codes: jax.Array, scale: jax.Array, indices: jax.Array, *, vmem_limit_bytes: int | None = None
+) -> tuple[jax.Array, jax.Array]:
+    """``(codes[indices], scale[indices])`` for int8 ``[N, H]`` codes and f32 ``[N]`` scales by one DMA per row.
+
+    Each row's scale travels in the same packed slot as its codes (:func:`pack_quantized_rows`), so the scales cost no
+    second gather. Pure bit movement: bit for bit ``jnp.take`` of both (indices clamped to range), except that a
+    subnormal scale is flushed to zero on TPU (measured on v5p); the row quantization never produces one there (its
+    ``amax / qmax`` divide already flushes), so its scales are always gathered exactly. Shapes must satisfy
+    :func:`quantized_gather_unsupported_reason`.
+    """
+    n, h = codes.shape
+    rows = indices.shape[0]
+    block, sub = INDEX_BLOCK, quantized_packed_rows(h)
+    out, out_scale = pl.pallas_call(
+        functools.partial(_gather_quantized_kernel, block=block, sub=sub, quarter=h // 4, n_src=n),
+        grid=(rows // block,),
+        in_specs=[
+            pl.BlockSpec((block // LANES, LANES), lambda i: (i, 0), memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ],
+        out_specs=[pl.BlockSpec((block, h), lambda i: (i, 0)), pl.BlockSpec((block, 1), lambda i: (i, 0))],
+        out_shape=[jax.ShapeDtypeStruct((rows, h), jnp.int8), jax.ShapeDtypeStruct((rows, 1), I32)],
+        scratch_shapes=[pltpu.VMEM((block * sub, LANES), I32), pltpu.SemaphoreType.DMA(())],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",), vmem_limit_bytes=int(vmem_limit_bytes or DEFAULT_VMEM_LIMIT)
+        ),
+        name="moe_row_gather_q",
+    )(
+        indices.astype(I32).reshape(rows // LANES, LANES),
+        pack_quantized_rows(codes, scale, vmem_limit_bytes=vmem_limit_bytes),
+    )
+    return out, lax.bitcast_convert_type(out_scale[:, 0], F32)
+
+
 # ------------------------------------------------------------------------------------------------------- gather-sum
-def _gather_sum_kernel(idx_ref, w_ref, src_hbm, out_ref, buf, sem, *, block, k, sub, half, n_src):
+def _gather_sum_kernel(idx_ref, w_ref, src_hbm, out_ref, buf, sem, *, block, k, sub, half, n_src, pair_width=None):
     # Copy j of token t lands in buffer row block (j * block + t), so each copy index is a contiguous run of tokens.
     def issue_all(slot, carry):
         t, j = lax.div(slot, k), lax.rem(slot, k)
@@ -254,30 +396,56 @@ def _gather_sum_kernel(idx_ref, w_ref, src_hbm, out_ref, buf, sem, *, block, k, 
     lax.fori_loop(0, block * k, issue_all, 0, unroll=8)
     # One descriptor covering the whole buffer: its byte count equals the ``block * k`` row copies signalled.
     pltpu.make_async_copy(src_hbm.at[pl.ds(0, block * k * sub)], buf, sem).wait()
-    _weighted_sum(w_ref, out_ref, buf, block=block, k=k, sub=sub, half=half, mask_dead=False)
+    _weighted_sum(w_ref, out_ref, buf, block=block, k=k, sub=sub, half=half, mask_dead=False, pair_width=pair_width)
 
 
 def _gather_sum_live_kernel(
-    count_ref, key_ref, row_ref, w_ref, src_hbm, out_ref, buf, sem, *, block, k, sub, half, wait_rows
+    count_ref,
+    src_ref,
+    dst_ref,
+    w_ref,
+    src_hbm,
+    out_ref,
+    buf,
+    sem,
+    *,
+    block,
+    k,
+    sub,
+    half,
+    wait_rows,
+    unroll,
+    pair_width=None,
 ):
-    # Grid step i owns entries [0, count[i]) of its (key, row) list block (:func:`live_slot_lists`): buffer row
-    # ``key mod (block * k)`` (laid out as in the dense kernel) receives source row ``row``. Only live slots are
-    # visited; dead slots leave stale buffer rows, which their zeroed weights mask in the sum.
+    # Grid step i owns entries [0, count[i]) of its (source, destination) offset list block
+    # (:func:`_live_slot_offsets`): packed buffer rows ``[dst, dst + sub)`` (buffer row ``j * block + t`` as in the
+    # dense kernel) receive packed source rows ``[src, src + sub)``. Only live slots are visited; dead slots leave
+    # stale buffer rows, which their zeroed weights mask in the sum. Copies are issued in unrolled groups of
+    # ``unroll`` entries (one list row and lane base per group), so the scalar issue loop stays below the DMA rate.
     n = count_ref[pl.program_id(0)]
-    span = block * k
 
-    def issue(q, carry):
-        r, c = lax.div(q, LANES), lax.rem(q, LANES)
-        dst = lax.rem(key_ref[r, c], span)
-        row = row_ref[r, c]
+    def copy(r, c):
         pltpu.make_async_copy(
-            src_hbm.at[pl.ds(pl.multiple_of(row * sub, sub), sub)],
-            buf.at[pl.ds(pl.multiple_of(dst * sub, sub), sub)],
+            src_hbm.at[pl.ds(pl.multiple_of(src_ref[r, c], sub), sub)],
+            buf.at[pl.ds(pl.multiple_of(dst_ref[r, c], sub), sub)],
             sem,
         ).start()
+
+    def group(g, carry):
+        base = g * unroll
+        r, c0 = lax.shift_right_logical(base, jnp.int32(7)), lax.bitwise_and(base, jnp.int32(LANES - 1))
+        for u in range(unroll):
+            copy(r, c0 + u)
         return carry
 
-    lax.fori_loop(0, n, issue, 0)
+    groups = lax.div(n, unroll)
+    lax.fori_loop(0, groups, group, 0)
+
+    def single(q, carry):
+        copy(lax.shift_right_logical(q, jnp.int32(7)), lax.bitwise_and(q, jnp.int32(LANES - 1)))
+        return carry
+
+    lax.fori_loop(groups * unroll, n, single, 0)
 
     def waiter(rows):
         # A descriptor of ``rows`` source rows: its byte count equals that many row copies signalled.
@@ -289,13 +457,22 @@ def _gather_sum_live_kernel(
 
     lax.fori_loop(0, lax.div(n, wait_rows), waiter(wait_rows), 0)
     lax.fori_loop(0, lax.rem(n, wait_rows), waiter(1), 0)
-    _weighted_sum(w_ref, out_ref, buf, block=block, k=k, sub=sub, half=half, mask_dead=True)
+    _weighted_sum(w_ref, out_ref, buf, block=block, k=k, sub=sub, half=half, mask_dead=True, pair_width=pair_width)
 
 
-def _weighted_sum(w_ref, out_ref, buf, *, block, k, sub, half, mask_dead):
-    """``out[t] = sum_j w[t, j] * unpack(buffer row j * block + t)`` with fp32 accumulation, in slot order."""
+def _weighted_sum(w_ref, out_ref, buf, *, block, k, sub, half, mask_dead, pair_width=None):
+    """``out[t] = sum_j w[t, j] * unpack(buffer row j * block + t)`` with fp32 accumulation, in slot order.
+
+    Packed row ``a`` of a source row holds columns ``n * W + c`` (low) and ``n * W + W / 2 + c`` (high) with
+    ``n, c = divmod(a, W / 256)`` scaled by 128 (``W = pair_width``, default ``2 * half``: the ``pack_rows`` layout).
+    """
     w = w_ref[...].astype(F32)
+    width = pair_width or 2 * half
+    per_block = width // (2 * LANES)
     for a in range(sub):
+        n_blk, a_in = divmod(a, per_block)
+        lo_col = n_blk * width + a_in * LANES
+        hi_col = lo_col + width // 2
         acc_lo = acc_hi = None
         for j in range(k):
             lo, hi = _unpack(buf[pl.ds(j * block * sub + a, block, stride=sub), :])
@@ -308,8 +485,8 @@ def _weighted_sum(w_ref, out_ref, buf, *, block, k, sub, half, mask_dead):
                 term_hi = jnp.where(live, term_hi, 0.0)
             acc_lo = term_lo if acc_lo is None else acc_lo + term_lo
             acc_hi = term_hi if acc_hi is None else acc_hi + term_hi
-        out_ref[:, a * LANES : (a + 1) * LANES] = acc_lo.astype(out_ref.dtype)
-        out_ref[:, half + a * LANES : half + (a + 1) * LANES] = acc_hi.astype(out_ref.dtype)
+        out_ref[:, lo_col : lo_col + LANES] = acc_lo.astype(out_ref.dtype)
+        out_ref[:, hi_col : hi_col + LANES] = acc_hi.astype(out_ref.dtype)
 
 
 def live_slot_lists(indices: jax.Array, block: int, n_src: int) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -343,6 +520,13 @@ def live_slot_lists(indices: jax.Array, block: int, n_src: int) -> tuple[jax.Arr
     return counts, keys.reshape(-1, LANES), rows.reshape(-1, LANES)
 
 
+def _live_slot_offsets(indices: jax.Array, block: int, n_src: int, sub: int):
+    """:func:`live_slot_lists` as packed-row DMA offsets: ``(counts, src = rows * sub, dst = (keys mod span) * sub)``."""
+    counts, keys, rows = live_slot_lists(indices, block, n_src)
+    span = block * indices.shape[1]
+    return counts, rows * sub, lax.rem(keys, jnp.int32(span)) * sub
+
+
 def gather_sum_rows(
     y: jax.Array,
     indices: jax.Array,
@@ -361,18 +545,89 @@ def gather_sum_rows(
     indices are clamped to range. Shapes must satisfy :func:`gather_sum_unsupported_reason`.
     """
     m, h = y.shape
+    packed = pack_rows(y, vmem_limit_bytes=vmem_limit_bytes)
+    return _gather_sum_packed(
+        packed,
+        m,
+        h,
+        None,
+        indices,
+        weights,
+        out_dtype or y.dtype,
+        skip_negative=skip_negative,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+
+def gather_sum_packed_unsupported_reason(packed_shape, dtype, hidden, pair_width, tokens, k, out_dtype) -> str | None:
+    """Why :func:`gather_sum_packed_rows` cannot run these shapes (``None`` when it can)."""
+    if len(packed_shape) != 2 or packed_shape[1] != LANES or jnp.dtype(dtype) != I32:
+        return f"packed source must be int32 [rows, {LANES}], got {jnp.dtype(dtype).name} {tuple(packed_shape)}"
+    if hidden % (2 * LANES * SUBLANES):
+        return f"hidden size {hidden} is not a multiple of {2 * LANES * SUBLANES}"
+    if pair_width % (2 * LANES) or hidden % pair_width:
+        return f"pair width {pair_width} must be a multiple of {2 * LANES} dividing {hidden}"
+    sub = packed_rows(hidden)
+    if packed_shape[0] % sub:
+        return f"{packed_shape[0]} packed rows is not a multiple of {sub}"
+    m = packed_shape[0] // sub
+    tb = gather_sum_block_tokens(k)
+    if tokens % tb:
+        return f"{tokens} tokens is not a multiple of {tb}"
+    if m < tb * k:
+        return f"{m} source rows is fewer than {tb * k}"
+    need = tb * k * hidden * 2 + 2 * tb * hidden * jnp.dtype(out_dtype or jnp.bfloat16).itemsize
+    if need > VMEM_BUDGET:
+        return f"a {tb}-token step needs {need >> 20} MiB of VMEM (budget {VMEM_BUDGET >> 20} MiB)"
+    return None
+
+
+def gather_sum_packed_rows(
+    packed: jax.Array,
+    indices: jax.Array,
+    weights: jax.Array,
+    hidden: int,
+    pair_width: int,
+    out_dtype=None,
+    *,
+    skip_negative: bool = False,
+    vmem_limit_bytes: int | None = None,
+) -> jax.Array:
+    """:func:`gather_sum_rows` of bfloat16 rows already in the int32 paired layout (``pack_rows_paired``).
+
+    ``pair_width == hidden`` is the :func:`pack_rows` layout; a narrower width (e.g. one TensorCore's output columns of
+    a grouped matmul that writes this layout itself) only changes which output columns each packed word feeds: every
+    output element gets the same fp32 terms in the same slot order. Shapes must satisfy
+    :func:`gather_sum_packed_unsupported_reason`.
+    """
+    m = packed.shape[0] // packed_rows(hidden)
+    return _gather_sum_packed(
+        packed,
+        m,
+        hidden,
+        pair_width,
+        indices,
+        weights,
+        out_dtype or jnp.bfloat16,
+        skip_negative=skip_negative,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+
+def _gather_sum_packed(packed, m, h, pair_width, indices, weights, out_dtype, *, skip_negative, vmem_limit_bytes):
     tokens, k = indices.shape
     block, sub = gather_sum_block_tokens(k), packed_rows(h)
     span = block * k
-    out_shape = jax.ShapeDtypeStruct((tokens, h), jnp.dtype(out_dtype or y.dtype))
+    out_shape = jax.ShapeDtypeStruct((tokens, h), jnp.dtype(out_dtype))
     scratch = [pltpu.VMEM((span * sub, LANES), I32), pltpu.SemaphoreType.DMA(())]
     params = pltpu.CompilerParams(
         dimension_semantics=("parallel",), vmem_limit_bytes=int(vmem_limit_bytes or DEFAULT_VMEM_LIMIT)
     )
-    packed = pack_rows(y, vmem_limit_bytes=vmem_limit_bytes)
     if not skip_negative:
         return pl.pallas_call(
-            functools.partial(_gather_sum_kernel, block=block, k=k, sub=sub, half=h // 2, n_src=m),
+            functools.partial(
+                _gather_sum_kernel, block=block, k=k, sub=sub, half=h // 2, n_src=m, pair_width=pair_width
+            ),
             grid=(tokens // block,),
             in_specs=[
                 pl.BlockSpec((span // LANES, LANES), lambda i: (i, 0), memory_space=pltpu.SMEM),
@@ -386,7 +641,7 @@ def gather_sum_rows(
             name=f"moe_row_gather_sum_k{k}",
         )(indices.astype(I32).reshape(tokens * k // LANES, LANES), weights.astype(F32), packed)
     weights = jnp.where(indices >= 0, weights.astype(F32), 0.0)
-    counts, keys, rows = live_slot_lists(indices, block, m)
+    counts, src, dst = _live_slot_offsets(indices, block, m, sub)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
         grid=(tokens // block,),
@@ -400,9 +655,18 @@ def gather_sum_rows(
         scratch_shapes=scratch,
     )
     return pl.pallas_call(
-        functools.partial(_gather_sum_live_kernel, block=block, k=k, sub=sub, half=h // 2, wait_rows=LIVE_WAIT_ROWS),
+        functools.partial(
+            _gather_sum_live_kernel,
+            block=block,
+            k=k,
+            sub=sub,
+            half=h // 2,
+            wait_rows=LIVE_WAIT_ROWS,
+            unroll=LIVE_ISSUE_UNROLL,
+            pair_width=pair_width,
+        ),
         grid_spec=grid_spec,
         out_shape=out_shape,
         compiler_params=params,
         name=f"moe_row_gather_sum_k{k}_live",
-    )(counts, keys, rows, weights, packed)
+    )(counts, src, dst, weights, packed)

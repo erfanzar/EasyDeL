@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
-from easydel.trainers import base_trainer
+from easydel.trainers._shared import esurge_generation
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -14,16 +14,17 @@ pytestmark = pytest.mark.cpu_ok
 @pytest.fixture
 def reconstruct(monkeypatch):
     # Only replace the final array materialization; exercise the real token,
-    # candidate-lookup, prompt-order and padding code using host data.
-    monkeypatch.setattr(base_trainer, "jnp", SimpleNamespace(array=np.array))
+    # candidate-lookup, row-order and padding code using host data.
+    monkeypatch.setattr(esurge_generation, "jnp", SimpleNamespace(array=np.array))
 
     def convert(outputs):
-        return base_trainer.BaseTrainer._esurge_outputs_to_arrays(
-            object(),
+        # One caller prompt row per request output, left-padded to width 2.
+        prompt_tokens = [output.prompt_token_ids[0][0] for output in outputs]
+        return esurge_generation.outputs_to_arrays(
             outputs,
-            input_ids=[[0, 10], [0, 20]],
-            attention_mask=[[0, 1], [0, 1]],
-            return_prompts=["first", "second"],
+            input_ids=[[0, token] for token in prompt_tokens],
+            attention_mask=[[0, 1] for _ in prompt_tokens],
+            return_prompts=[output.prompt for output in outputs],
             pad_token_id=0,
             max_seq_len=2,
             max_new_tokens=3,
@@ -42,9 +43,10 @@ def request(prompt_token, completions):
     )
 
 
-def test_esurge_sampled_logprobs_follow_prompt_reorder_padding_and_multiple_completions(reconstruct):
-    # Inputs arrive in engine completion order, not caller prompt order. Candidate
-    # maps deliberately put a non-sampled token first; score lookup must use ids.
+def test_esurge_sampled_logprobs_follow_request_order_padding_and_multiple_completions(reconstruct):
+    # eSurge returns one output per prompt in request order; completion i of prompt j
+    # becomes row j * n + i. Candidate maps deliberately put a non-sampled token first;
+    # score lookup must use ids.
     second = CompletionOutput(0, "second answer", [8], logprobs=[{99: -9.0, 8: -0.5}])
     first = CompletionOutput(0, "first answer", [3, 2], logprobs=[{99: -9.0, 3: -0.25}, {2: -1.0}])
     alternative = CompletionOutput(
@@ -53,7 +55,9 @@ def test_esurge_sampled_logprobs_follow_prompt_reorder_padding_and_multiple_comp
         [4, 5, 6, 7],
         logprobs=[{4: -0.5}, {5: -1.0}, {6: -1.5}, {7: -2.0}],
     )
-    arrays = reconstruct([request(20, [second]), request(10, [first, alternative])])
+    arrays = reconstruct([request(10, [first, alternative]), request(20, [second])])
+    assert arrays.prompt_ids.tolist() == [[0, 10], [0, 20]]
+    assert arrays.sequences.tolist() == [[0, 10, 3, 2, 0], [0, 10, 4, 5, 6], [0, 20, 8, 0, 0]]
     assert arrays.completion_ids.tolist() == [[3, 2, 0], [4, 5, 6], [8, 0, 0]]
     assert arrays.completion_mask.tolist() == [[1, 1, 0], [1, 1, 1], [1, 0, 0]]
     assert arrays.sampling_per_token_logps.tolist() == [[-0.25, -1.0, 0.0], [-0.5, -1.0, -1.5], [-0.5, 0.0, 0.0]]

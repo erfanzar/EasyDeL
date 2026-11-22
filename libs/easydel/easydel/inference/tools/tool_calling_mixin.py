@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import threading
 import typing as tp
 from collections import OrderedDict
 from http import HTTPStatus
@@ -69,6 +70,8 @@ _MAX_TRACKED_TOOL_STREAMS = 512
 _HARD_MAX_TRACKED_TOOL_STREAMS_FACTOR = 4
 """Past ``factor * _MAX_TRACKED_TOOL_STREAMS`` the least recently used streams are dropped even if they
 emitted output, so streams abandoned without a ``finished=True`` call cannot grow the table forever."""
+
+_TOOL_LOCK_INIT = threading.Lock()
 
 
 @dataclasses.dataclass
@@ -353,7 +356,7 @@ class ToolCallingMixin:
         else:
             message = ChatMessage(
                 role="assistant",
-                content=extracted.content if extracted.content else response_text,
+                content=extracted.content if extracted.content is not None else response_text,
             )
             finish_reason = "stop"
 
@@ -437,6 +440,14 @@ class ToolCallingMixin:
             restart=not previous_text,
         )
         tool_parser = state.parser
+        if tool_parser is None:
+            normalized = DeltaMessage(content=delta_text) if delta_text else None
+            if normalized is not None and normalized.content:
+                with self._get_tool_streams_lock():
+                    state.emitted_content = True
+            if finished:
+                self._end_tool_stream(model_name, stream_key)
+            return normalized
 
         previous_token_ids = previous_token_ids or []
         current_token_ids = current_token_ids or []
@@ -465,10 +476,11 @@ class ToolCallingMixin:
             normalized = self._normalize_streaming_delta(delta, delta_text)
 
         if normalized is not None:
-            if normalized.tool_calls:
-                state.record(normalized.tool_calls)
-            if normalized.content:
-                state.emitted_content = True
+            with self._get_tool_streams_lock():
+                if normalized.tool_calls:
+                    state.record(normalized.tool_calls)
+                if normalized.content:
+                    state.emitted_content = True
 
         if finished:
             flush = getattr(tool_parser, "flush_streaming_content", None)
@@ -539,23 +551,48 @@ class ToolCallingMixin:
         stream_key = stream_id if stream_id is not None else (id(request) if request is not None else None)
         self._end_tool_stream(model_name, stream_key)
 
+    def _get_tool_streams_lock(self) -> threading.Lock:
+        """Return the per-instance lock protecting ``_mixin_tool_streams``."""
+        lock = getattr(self, "_mixin_tool_streams_lock", None)
+        if lock is None:
+            with _TOOL_LOCK_INIT:
+                lock = getattr(self, "_mixin_tool_streams_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._mixin_tool_streams_lock = lock
+        return lock
+
     @staticmethod
     def _new_stream_parser(registered: tp.Any) -> tp.Any:
         """Build an isolated parser instance for one stream.
 
         Tool parsers keep per-stream parsing state on the instance, so streams
-        must not share the registered one. Parsers that cannot be rebuilt from
-        their tokenizer (no ``model_tokenizer`` or a failing constructor) fall
-        back to the shared registered instance.
+        must not share the registered singleton. Real :class:`ToolParser`
+        subclasses are never allowed to silently fall back to ``registered``
+        when ``model_tokenizer`` is ``None`` or reconstruction fails; returning
+        ``None`` lets streaming degrade cleanly to pass-through text without
+        corrupting shared state across concurrent requests. Lightweight
+        non-``ToolParser`` test doubles without ``model_tokenizer`` are
+        preserved as-is.
 
         Args:
             registered: The parser registered for the model.
 
         Returns:
-            A fresh parser of the same class, or ``registered`` when a fresh one
-            cannot be built.
+            A fresh parser of the same class, ``None`` when a real
+            :class:`ToolParser` cannot be isolated, or ``registered`` for
+            lightweight non-``ToolParser`` doubles.
         """
         tokenizer = getattr(registered, "model_tokenizer", None)
+        if isinstance(registered, ToolParser):
+            fresh = build_tool_parser_or_none(type(registered), tokenizer, context="a new tool stream")
+            if fresh is None:
+                logger.warning(
+                    "Refusing to fall back to shared %s singleton for streaming (tokenizer=%s).",
+                    type(registered).__name__,
+                    "None" if tokenizer is None else type(tokenizer).__name__,
+                )
+            return fresh
         if tokenizer is None:
             return registered
         fresh = build_tool_parser_or_none(type(registered), tokenizer, context="a new tool stream")
@@ -583,22 +620,23 @@ class ToolCallingMixin:
         Returns:
             The mutable :class:`_ToolStreamState` for this stream.
         """
-        streams = getattr(self, "_mixin_tool_streams", None)
-        if not isinstance(streams, OrderedDict):
-            streams = OrderedDict()
-            self._mixin_tool_streams = streams
         key = (model_name, stream_key)
-        state = None if restart else streams.get(key)
-        if state is None:
-            state = _ToolStreamState(parser=self._new_stream_parser(registered))
-            streams[key] = state
-            # Re-assigning an existing key keeps its old position; a restarted stream is the newest (r15 S12-3).
-            streams.move_to_end(key)
-            if len(streams) > _MAX_TRACKED_TOOL_STREAMS:
-                self._evict_idle_tool_streams(streams, keep=key)
-        else:
-            streams.move_to_end(key)
-        return state
+        with self._get_tool_streams_lock():
+            streams = getattr(self, "_mixin_tool_streams", None)
+            if not isinstance(streams, OrderedDict):
+                streams = OrderedDict()
+                self._mixin_tool_streams = streams
+            state = None if restart else streams.get(key)
+            if state is None:
+                state = _ToolStreamState(parser=self._new_stream_parser(registered))
+                streams[key] = state
+                # Re-assigning an existing key keeps its old position; a restarted stream is the newest (r15 S12-3).
+                streams.move_to_end(key)
+                if len(streams) > _MAX_TRACKED_TOOL_STREAMS:
+                    self._evict_idle_tool_streams(streams, keep=key)
+            else:
+                streams.move_to_end(key)
+            return state
 
     @staticmethod
     def _evict_idle_tool_streams(streams: OrderedDict, keep: tp.Hashable) -> None:
@@ -652,9 +690,10 @@ class ToolCallingMixin:
             model_name: Model the stream belongs to.
             stream_key: Stream identity used when the state was created.
         """
-        streams = getattr(self, "_mixin_tool_streams", None)
-        if isinstance(streams, OrderedDict):
-            streams.pop((model_name, stream_key), None)
+        with self._get_tool_streams_lock():
+            streams = getattr(self, "_mixin_tool_streams", None)
+            if isinstance(streams, OrderedDict):
+                streams.pop((model_name, stream_key), None)
 
     @staticmethod
     def _build_final_tool_catch_up(
@@ -698,16 +737,31 @@ class ToolCallingMixin:
             final_args = tool_call.function.arguments or ""
             streamed = state.arguments.get(index, "")
 
-            if final_args == streamed:
+            if not streamed:
+                missing = final_args
+            elif final_args == streamed:
                 missing = ""
-            elif streamed and final_args.startswith(streamed):
+            elif final_args.startswith(streamed):
                 missing = final_args[len(streamed) :]
-            elif streamed and _json_payloads_equal(final_args, streamed):
+            elif _json_payloads_equal(final_args, streamed):
                 # Same payload in a different serialization; re-sending would
                 # corrupt the concatenated argument stream.
                 missing = ""
             else:
-                missing = final_args
+                missing = ""
+                try:
+                    final_payload = json.loads(final_args)
+                except Exception:
+                    final_payload = None
+                if final_payload is not None:
+                    for ensure_ascii in (False, True):
+                        for separators in ((", ", ": "), (",", ":")):
+                            candidate = json.dumps(final_payload, ensure_ascii=ensure_ascii, separators=separators)
+                            if candidate.startswith(streamed):
+                                missing = candidate[len(streamed) :]
+                                break
+                        if missing:
+                            break
 
             include_name = index not in state.named and bool(tool_call.function.name)
             if not include_name and not missing:

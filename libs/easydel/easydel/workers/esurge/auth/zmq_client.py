@@ -35,7 +35,7 @@ import typing as tp
 
 import zmq
 
-from .auth_manager import PermissionDenied, QuotaExceeded, RateLimitExceeded
+from .auth_manager import InvalidApiKey, PermissionDenied, QuotaExceeded, RateLimitExceeded
 from .auth_models import (
     ApiKeyMetadata,
     ApiKeyPermissions,
@@ -49,7 +49,12 @@ from .auth_models import (
 # ``PermissionDenied`` / ``RateLimitExceeded`` / ``QuotaExceeded`` are the very classes raised by
 # :class:`EnhancedApiKeyManager` (and caught by the API server), re-exported here so that
 # ``except`` clauses behave identically for the in-process manager and for this client.
-__all__ = ["AuthWorkerClient", "PermissionDenied", "QuotaExceeded", "RateLimitExceeded"]
+__all__ = ["AuthWorkerClient", "InvalidApiKey", "PermissionDenied", "QuotaExceeded", "RateLimitExceeded"]
+
+# Worker error ``exception_type`` -> the class re-raised on the client.
+_WORKER_EXCEPTIONS: dict[str, type[Exception]] = {
+    cls.__name__: cls for cls in (InvalidApiKey, PermissionDenied, RateLimitExceeded, QuotaExceeded)
+}
 
 
 class AuthWorkerClient:
@@ -113,14 +118,7 @@ class AuthWorkerClient:
                 # Re-raise specific exceptions
                 exception_type = resp.get("exception_type")
                 message = resp.get("message", "Auth worker failed")
-                if exception_type == "PermissionDenied":
-                    raise PermissionDenied(message)
-                elif exception_type == "RateLimitExceeded":
-                    raise RateLimitExceeded(message)
-                elif exception_type == "QuotaExceeded":
-                    raise QuotaExceeded(message)
-                else:
-                    raise RuntimeError(message)
+                raise _WORKER_EXCEPTIONS.get(str(exception_type), RuntimeError)(message)
             return resp
 
     def generate_api_key(

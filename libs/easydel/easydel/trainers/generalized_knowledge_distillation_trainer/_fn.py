@@ -26,7 +26,6 @@ import functools
 import typing as tp
 
 import jax
-import numpy as np
 import spectrax as spx
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -39,14 +38,14 @@ from ..distillation_trainer.loss_utils import fused_kl_vocab_parallel, resolve_k
 from ..training_utils import (
     ScheduledLossAdapter,
     bind_scheduled_module,
-    constrain_scheduled_batch,
+    constrain_batch_sharding,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
     scheduled_loss_cache_key,
-    stop_gradient_tree,
     sync_module_schedule_config,
     update_metrics,
     update_state_respectfully,
@@ -79,12 +78,10 @@ def _ejkernel_gjsd_loss(
     ejkernel applies the Hinton ``T**2`` factor; ``generalized_jsd_loss`` does not, so the
     result is divided by ``temperature ** 2`` (which also rescales the gradient correctly).
     """
-    if mask is not None:
-        weights = mask.astype(student_logits.dtype)
-    elif labels is not None:
-        weights = (labels != -100).astype(student_logits.dtype)
-    else:
-        weights = None
+    weights = mask.astype(jnp.float32) if mask is not None else None
+    if labels is not None:
+        valid_label_mask = (labels != -100).astype(jnp.float32)
+        weights = valid_label_mask if weights is None else weights * valid_label_mask
 
     direction = resolve_kl_direction(beta)
 
@@ -97,10 +94,10 @@ def _ejkernel_gjsd_loss(
         beta=float(beta),
         platform=(None if backend == "auto" else backend),
     )
-    loss = out.loss
+    loss = out.loss.astype(jnp.float32)
     if temperature != 1.0:
-        loss = loss / (temperature**2)
-    return loss.astype(student_logits.dtype)
+        loss = loss / jnp.asarray(temperature**2, dtype=jnp.float32)
+    return loss.astype(jnp.float32)
 
 
 def generalized_jsd_loss(
@@ -160,6 +157,75 @@ def generalized_jsd_loss(
     )
 
 
+def _gkd_resolve_mask(batch: collections.abc.Mapping[str, tp.Any]) -> jax.Array | None:
+    """Resolve the GKD token mask: ``completion_mask`` > ``assistant_masks`` > ``attention_mask``."""
+    completion_mask = batch.get("completion_mask")
+    assistant_masks = batch.get("assistant_masks")
+    attention_mask = batch.get("attention_mask")
+    if completion_mask is not None:
+        mask = completion_mask.astype(jnp.float32)
+        if attention_mask is not None:
+            mask = mask * attention_mask.astype(jnp.float32)
+        return mask
+    if assistant_masks is not None:
+        mask = assistant_masks.astype(jnp.float32)
+        if attention_mask is not None:
+            mask = mask * attention_mask.astype(jnp.float32)
+        return mask
+    if attention_mask is not None:
+        return attention_mask.astype(jnp.float32)
+    return None
+
+
+def _gkd_token_mass_from_batch(batch: collections.abc.Mapping[str, tp.Any], *, shift_tokens: bool) -> jax.Array:
+    """Return total active token count for a GKD minibatch after optional causal shift."""
+    mask = _gkd_resolve_mask(batch)
+    if mask is None:
+        ids = batch.get("input_ids", batch.get("inputs_embeds"))
+        mask = jnp.ones(tuple(ids.shape[:2]), dtype=jnp.float32)
+    labels = batch.get("labels")
+    if labels is not None:
+        mask = mask * (labels != -100).astype(jnp.float32)
+    if shift_tokens:
+        mask = mask[:, 1:]
+    return jnp.sum(mask)
+
+
+def _gkd_z_loss(
+    student_logits: jax.Array,
+    *,
+    mask: jax.Array | None,
+    labels: jax.Array | None,
+    z_loss_coef: float,
+) -> jax.Array:
+    """Compute ``z_loss_coef * mean(logsumexp(logits)**2)`` over valid tokens in float32."""
+    weights = mask.astype(jnp.float32) if mask is not None else jnp.ones(student_logits.shape[:2], dtype=jnp.float32)
+    if labels is not None:
+        weights = weights * (labels != -100).astype(jnp.float32)
+    lse = jax.nn.logsumexp(student_logits.astype(jnp.float32), axis=-1)
+    return (
+        jnp.asarray(z_loss_coef, dtype=jnp.float32)
+        * jnp.sum(jnp.square(lse) * weights)
+        / jnp.maximum(jnp.sum(weights), jnp.float32(1.0))
+    )
+
+
+def _gkd_forward_outputs(model, batch: collections.abc.Mapping[str, jax.Array]) -> tuple[jax.Array, jax.Array | None]:
+    """Run ``model`` on ``batch`` and return ``(logits, aux_loss)`` for GKD."""
+    call_kwargs = dict(batch)
+    call_kwargs.pop("labels", None)
+    call_kwargs.pop("completion_mask", None)
+    call_kwargs.pop("assistant_masks", None)
+    call_kwargs.pop("teacher_logits", None)
+    call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
+    call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+    outputs = model(**call_kwargs)
+    logits = getattr(outputs, "logits", None)
+    if logits is None:
+        raise TypeError(f"{type(model).__name__} did not return logits for GKD.")
+    return logits, getattr(outputs, "aux_loss", None)
+
+
 def _gkd_forward_logits(model, batch: collections.abc.Mapping[str, jax.Array]) -> jax.Array:
     """Run ``model`` on ``batch`` and return token logits for GKD.
 
@@ -177,17 +243,7 @@ def _gkd_forward_logits(model, batch: collections.abc.Mapping[str, jax.Array]) -
     Raises:
         TypeError: If the model does not return logits.
     """
-    call_kwargs = dict(batch)
-    call_kwargs.pop("labels", None)
-    call_kwargs.pop("completion_mask", None)
-    call_kwargs.pop("assistant_masks", None)
-    call_kwargs.pop("teacher_logits", None)
-    call_kwargs = filter_kwargs_for_callable(getattr(model, "forward", model), call_kwargs)
-    call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-    outputs = model(**call_kwargs)
-    logits = getattr(outputs, "logits", None)
-    if logits is None:
-        raise TypeError(f"{type(model).__name__} did not return logits for GKD.")
+    logits, _ = _gkd_forward_outputs(model, batch)
     return logits
 
 
@@ -241,6 +297,7 @@ def gkd_step(
         records the raw scalar GJSD value.
     """
     shift_tokens = bool(getattr(loss_config, "shift_tokens", True)) if loss_config is not None else True
+    z_loss_coef = float(getattr(loss_config, "z_loss", 0.0) or 0.0) if loss_config is not None else 0.0
     scope_root = "easydel/trainer/gkd/" + ("train_step" if is_training else "eval_step")
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -331,9 +388,7 @@ def gkd_step(
             with jax.named_scope(scope_root + "/loss_fn/student_forward"):
                 student_outputs = module(**call_kwargs)
 
-            completion_mask = minibatch.get("completion_mask")
-            attention_mask = minibatch.get("attention_mask")
-            mask = completion_mask if completion_mask is not None else attention_mask
+            mask = _gkd_resolve_mask(minibatch)
 
             # Causal shift (LossConfig.shift_tokens default). Position t predicts token t+1, so the
             # JSD compares student/teacher distributions at [:, :-1] and masks by the completion /
@@ -350,7 +405,7 @@ def gkd_step(
                     mask = mask[:, 1:]
 
             with jax.named_scope(scope_root + "/loss_fn/compute_gjsd_loss"):
-                loss_value = generalized_jsd_loss(
+                jsd_loss = generalized_jsd_loss(
                     student_logits=student_logits,
                     teacher_logits=teacher_logits,
                     labels=labels,
@@ -358,11 +413,32 @@ def gkd_step(
                     beta=beta,
                     temperature=temperature,
                 )
+            total_loss = jsd_loss.astype(jnp.float32)
+            other_metrics: dict[str, jax.Array] = {"gkd_jsd_loss": total_loss}
+            z_value = None
+            if z_loss_coef:
+                z_value = _gkd_z_loss(
+                    student_logits,
+                    mask=mask,
+                    labels=labels,
+                    z_loss_coef=z_loss_coef,
+                )
+                total_loss = total_loss + z_value
+                other_metrics["z_loss"] = z_value
+            aux_loss = getattr(student_outputs, "aux_loss", None)
+            if aux_loss is not None:
+                aux_loss = aux_loss.astype(jnp.float32)
+                total_loss = total_loss + aux_loss
+                other_metrics["aux_loss"] = aux_loss
             metrics = LossMetrics(
-                loss=loss_value,
-                other_metrics={"gkd_jsd_loss": jnp.asarray(loss_value)},
+                loss=total_loss,
+                z_loss=z_value,
+                other_metrics=other_metrics,
             )
-            return loss_value, metrics
+            return total_loss, metrics
+
+    def _gkd_microbatch_weight(_tree, minibatch) -> jax.Array:
+        return _gkd_token_mass_from_batch(minibatch, shift_tokens=shift_tokens)
 
     if is_training:
         with jax.named_scope(scope_root + "/grad_and_minibatch"):
@@ -371,6 +447,7 @@ def gkd_step(
                 batch=batch,
                 minibatch_size=minibatch_size,
                 grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+                microbatch_weight_fn=_gkd_microbatch_weight if gradient_accumulation_steps > 1 else None,
             )
         with jax.named_scope(scope_root + "/update_state"):
             student_state = update_state_respectfully(
@@ -391,38 +468,13 @@ def gkd_step(
 
 
 def _prepare_gkd_scheduled_batch(call) -> dict[str, tp.Any]:
-    """Inject precomputed teacher logits into ``call.batch`` for GKD.
+    """Return a mutable copy of ``call.batch`` for GKD scheduled MPMD training.
 
-    Args:
-        call: The :class:`ScheduledStepCall` being prepared.
-
-    Returns:
-        A copy of ``call.batch`` with ``teacher_logits`` populated.
-
-    Raises:
-        RuntimeError: If no teacher state is available.
+    The frozen teacher forward runs directly inside :func:`_make_gkd_scheduled_loss`
+    under ``stop_gradient`` rather than invoking an uncached ``spx.jit`` + host
+    ``jax.device_get`` on full ``[B, S, V]`` logits every step.
     """
-    batch = dict(call.batch)
-    if "teacher_logits" in batch:
-        return batch
-
-    teacher_state = call.get("teacher_state")
-    if teacher_state is None:
-        raise RuntimeError("GKD scheduled MPMD training requires teacher_state.")
-
-    teacher_model = teacher_state.model
-    teacher_model.eval()
-    sync_module_schedule_config(teacher_model, call.schedule)
-    constrained_batch = constrain_scheduled_batch(teacher_model, batch, call.get("partition_spec"))
-    teacher_forward = spx.jit(
-        _gkd_forward_logits,
-        mesh=teacher_model.mesh,
-        schedule=call.schedule,
-        batch_argnums=1,
-    )
-    teacher_logits = np.asarray(jax.device_get(stop_gradient_tree(teacher_forward(teacher_model, constrained_batch))))
-    batch["teacher_logits"] = teacher_logits
-    return batch
+    return dict(call.batch)
 
 
 def _gkd_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
@@ -433,13 +485,24 @@ def _gkd_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
 
     Returns:
         A tuple covering ``beta``, ``temperature``, the partition spec,
-        and the quantization emulator identity.
+        and the quantization emulator / teacher state identities.
     """
     return scheduled_loss_cache_key(
         call,
         value_fields=("beta", "temperature", "partition_spec", "loss_config"),
-        object_fields=("straight_through_emulator",),
+        object_fields=("straight_through_emulator", "teacher_state"),
     )
+
+
+def _make_gkd_microbatch_weight(call):
+    """Build the per-microbatch token-weight callable for GKD scheduled MPMD."""
+    _loss_config = call.get("loss_config")
+    shift_tokens = bool(getattr(_loss_config, "shift_tokens", True)) if _loss_config is not None else True
+
+    def _weight(_tree, batch):
+        return _gkd_token_mass_from_batch(batch, shift_tokens=shift_tokens)
+
+    return _weight
 
 
 def _make_gkd_scheduled_loss(call):
@@ -450,44 +513,59 @@ def _make_gkd_scheduled_loss(call):
 
     Returns:
         A closure ``loss_fn(tree, batch) -> scalar`` evaluating the
-        generalized Jensen-Shannon divergence against precomputed
-        teacher logits.
+        generalized Jensen-Shannon divergence (plus optional ``z_loss``
+        and ``aux_loss``) against the frozen teacher forward.
     """
     beta = call.get("beta", 0.5)
     temperature = call.get("temperature", 1.0)
     partition_spec = call.get("partition_spec")
+    teacher_state = call.get("teacher_state")
     _loss_config = call.get("loss_config")
     shift_tokens = bool(getattr(_loss_config, "shift_tokens", True)) if _loss_config is not None else True
+    z_loss_coef = float(getattr(_loss_config, "z_loss", 0.0) or 0.0) if _loss_config is not None else 0.0
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the scalar GKD loss inside the SpectraX scheduled VJP.
 
         Args:
             tree: Student graphstate to differentiate against.
-            batch: Minibatch dict including teacher logits as a dynamic
-                input, refreshed by the auxiliary frozen-teacher forward
-                for every step.
+            batch: Minibatch dict (may optionally include precomputed
+                ``teacher_logits``; otherwise runs ``teacher_state`` in-graph).
 
         Returns:
             The generalized JSD loss scalar.
         """
         with jax.named_scope("easydel/trainer/gkd/scheduled_loss"):
             with jax.named_scope("easydel/trainer/gkd/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 model_batch = dict(batch)
-                teacher_logits = model_batch.get("teacher_logits")
-                if teacher_logits is None:
-                    raise RuntimeError("GKD scheduled MPMD loss requires precomputed teacher_logits.")
-                model_batch.pop("teacher_logits", None)
-                call_batch = constrain_scheduled_batch(module, model_batch, partition_spec)
+                precomputed_teacher_logits = model_batch.pop("teacher_logits", None)
+                call_batch = dict(
+                    constrain_batch_sharding(
+                        model_batch,
+                        partition_spec,
+                        mesh=getattr(module, "mesh", None),
+                        ignore_mpmd=True,
+                    )
+                )
             labels = call_batch.get("labels")
             with jax.named_scope("easydel/trainer/gkd/scheduled_loss/student_forward"):
-                student_logits = _gkd_forward_logits(module, call_batch)
-            teacher_logits = jnp.asarray(teacher_logits)
-            teacher_logits = jax.lax.stop_gradient(teacher_logits)
-            completion_mask = call_batch.get("completion_mask")
-            attention_mask = call_batch.get("attention_mask")
-            mask = completion_mask if completion_mask is not None else attention_mask
+                student_logits, aux_loss = _gkd_forward_outputs(module, call_batch)
+            with jax.named_scope("easydel/trainer/gkd/scheduled_loss/teacher_forward"):
+                if precomputed_teacher_logits is not None:
+                    teacher_logits = jax.lax.stop_gradient(jnp.asarray(precomputed_teacher_logits))
+                else:
+                    if teacher_state is None:
+                        raise RuntimeError("GKD scheduled MPMD training requires teacher_state or teacher_logits.")
+                    if hasattr(teacher_state, "merge") and hasattr(teacher_state, "graphstate"):
+                        teacher_module = teacher_state.merge(jax.lax.stop_gradient(teacher_state.graphstate))
+                    else:
+                        teacher_module = teacher_state.model
+                    sync_module_schedule_config(teacher_module, schedule)
+                    teacher_logits = jax.lax.stop_gradient(_gkd_forward_logits(teacher_module, call_batch))
+            mask = _gkd_resolve_mask(call_batch)
             # Causal shift (LossConfig.shift_tokens default), matching the eager ``gkd_step``:
             # position t predicts token t+1, so compare logits[:, :-1] and mask by [:, 1:].
             if shift_tokens:
@@ -498,14 +576,24 @@ def _make_gkd_scheduled_loss(call):
                 if mask is not None:
                     mask = mask[:, 1:]
             with jax.named_scope("easydel/trainer/gkd/scheduled_loss/compute_gjsd_loss"):
-                return generalized_jsd_loss(
+                total_loss = generalized_jsd_loss(
                     student_logits=student_logits,
                     teacher_logits=teacher_logits,
                     labels=labels,
                     mask=mask,
                     beta=beta,
                     temperature=temperature,
+                ).astype(jnp.float32)
+            if z_loss_coef:
+                total_loss = total_loss + _gkd_z_loss(
+                    student_logits,
+                    mask=mask,
+                    labels=labels,
+                    z_loss_coef=z_loss_coef,
                 )
+            if aux_loss is not None:
+                total_loss = total_loss + aux_loss.astype(jnp.float32)
+            return total_loss
 
     return scheduled_loss
 
@@ -517,5 +605,6 @@ register_scheduled_loss_adapter(
         make_loss=_make_gkd_scheduled_loss,
         make_cache_key=_gkd_scheduled_loss_cache_key,
         prepare_batch=_prepare_gkd_scheduled_batch,
+        make_microbatch_weight=_make_gkd_microbatch_weight,
     ),
 )

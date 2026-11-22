@@ -26,6 +26,7 @@ import json
 from typing import Any
 
 from ...openai_api_modules import DeltaFunctionCall, DeltaToolCall, FunctionCall, ToolCall
+from ..utils import stable_json_stream_prefix
 
 
 class UnexpectedAstError(Exception):
@@ -39,11 +40,17 @@ class UnexpectedAstError(Exception):
 _NAME_LITERALS: dict[str, Any] = {"null": None, "true": True, "false": False}
 
 
+def _is_json_constant(value: Any) -> bool:
+    """Return True if *value* is a JSON-serializable scalar constant."""
+    return value is None or isinstance(value, bool | int | float | str)
+
+
 def get_parameter_value(val: ast.expr) -> Any:
     """Extract a Python value from an AST expression node.
 
-    Recursively processes AST nodes to extract literal values: constants, signed numeric
-    constants (``-1``, ``+2.5``), dicts, lists, and the JSON-style names ``null``/``true``/``false``.
+    Recursively processes AST nodes to extract literal values: JSON-compatible constants,
+    signed numeric constants (``-1``, ``+2.5``), dicts, lists, and the JSON-style names
+    ``null``/``true``/``false``.
 
     Args:
         val: The AST expression node to extract the value from.
@@ -52,23 +59,25 @@ def get_parameter_value(val: ast.expr) -> Any:
         The Python value represented by the AST node.
 
     Raises:
-        UnexpectedAstError: If the node contains non-literal expressions or dict keys that are
-            not constants.
+        UnexpectedAstError: If the node contains non-literal expressions, non-JSON constants
+            (such as ``bytes``, ``complex``, or ``Ellipsis``), or invalid dict keys.
     """
     if isinstance(val, ast.Constant):
+        if not _is_json_constant(val.value):
+            raise UnexpectedAstError(f"Unsupported constant literal type: {type(val.value).__name__}")
         return val.value
     if isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.USub | ast.UAdd):
         operand = val.operand
         if (
             isinstance(operand, ast.Constant)
-            and isinstance(operand.value, int | float | complex)
+            and isinstance(operand.value, int | float)
             and not isinstance(operand.value, bool)
         ):
             return -operand.value if isinstance(val.op, ast.USub) else operand.value
         raise UnexpectedAstError("Signed tool call arguments must be numeric literals")
     if isinstance(val, ast.Dict):
-        if not all(isinstance(k, ast.Constant) for k in val.keys):
-            raise UnexpectedAstError("Dict tool call arguments must have literal keys")
+        if not all(isinstance(k, ast.Constant) and _is_json_constant(k.value) for k in val.keys):
+            raise UnexpectedAstError("Dict tool call arguments must have JSON-compatible literal keys")
         return {k.value: get_parameter_value(v) for k, v in zip(val.keys, val.values, strict=False)}
     if isinstance(val, ast.List):
         return [get_parameter_value(v) for v in val.elts]
@@ -92,14 +101,81 @@ def handle_single_tool(call: ast.Call) -> ToolCall:
     """
     if not isinstance(call.func, ast.Name):
         raise UnexpectedAstError("Invalid tool call name")
+    if call.args:
+        raise UnexpectedAstError("Positional tool call arguments are not supported")
     function_name = call.func.id
     arguments = {}
     for keyword in call.keywords:
+        if keyword.arg is None:
+            raise UnexpectedAstError("Starred keyword arguments are not supported")
         arguments[keyword.arg] = get_parameter_value(keyword.value)
+    try:
+        serialized_arguments = json.dumps(arguments, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise UnexpectedAstError("Tool call arguments must be JSON-serializable") from exc
     return ToolCall(
         type="function",
-        function=FunctionCall(name=function_name, arguments=json.dumps(arguments, ensure_ascii=False)),
+        function=FunctionCall(name=function_name, arguments=serialized_arguments),
     )
+
+
+def parse_pythonic_call_list(source: str) -> list[ToolCall] | None:
+    """Parse ``[fn(k=v), ...]`` strictly as a non-empty list of valid pythonic tool calls.
+
+    Returns ``None`` on syntax error, empty lists, non-call elements, positional/starred
+    arguments, or non-literal argument values. Runs in linear time without regex backtracking.
+    """
+    stripped = source.strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        return None
+    try:
+        module = ast.parse(stripped)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    if len(module.body) != 1 or not isinstance(module.body[0], ast.Expr):
+        return None
+    parsed = module.body[0].value
+    if not isinstance(parsed, ast.List) or not parsed.elts:
+        return None
+    if not all(isinstance(elt, ast.Call) for elt in parsed.elts):
+        return None
+    try:
+        return [handle_single_tool(elt) for elt in parsed.elts]
+    except (UnexpectedAstError, RecursionError, MemoryError, ValueError):
+        return None
+
+
+def _count_top_level_delimiters(segment: str, sep: str) -> tuple[int, int]:
+    """Count top-level ``sep`` and ``,`` tokens outside strings and nested brackets."""
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    sep_count = 0
+    comma_count = 0
+
+    for char in segment:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in {"[", "(", "{"}:
+            depth += 1
+        elif char in {"]", ")", "}"}:
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            if char == sep:
+                sep_count += 1
+            elif char == ",":
+                comma_count += 1
+
+    return sep_count, comma_count
 
 
 def make_valid_python(text: str) -> tuple[str, str] | None:
@@ -116,51 +192,63 @@ def make_valid_python(text: str) -> tuple[str, str] | None:
     Raises:
         UnexpectedAstError: If brackets are mismatched.
     """
-    bracket_stack: list[str] = []
+    bracket_stack: list[tuple[str, int]] = []
     escaped = False
-    for char in text:
+    for idx, char in enumerate(text):
         # Strings own their contents, including brackets and the other quote.
         # Toggle escape state so an even run of backslashes does not escape a quote.
-        if bracket_stack and bracket_stack[-1] in {"'", '"'}:
+        if bracket_stack and bracket_stack[-1][0] in {"'", '"'}:
             if escaped:
                 escaped = False
             elif char == "\\":
                 escaped = True
-            elif char == bracket_stack[-1]:
+            elif char == bracket_stack[-1][0]:
                 bracket_stack.pop()
             continue
         if char in {"[", "(", "{", "'", '"'}:
-            bracket_stack.append(char)
+            bracket_stack.append((char, idx))
         elif char in {"]", ")", "}"}:
             opening = {"]": "[", ")": "(", "}": "{"}[char]
-            if not bracket_stack or bracket_stack.pop() != opening:
+            if not bracket_stack or bracket_stack.pop()[0] != opening:
                 raise UnexpectedAstError("Mismatched brackets")
     if escaped:
         # A trailing escape needs another token before a quote can close it.
         return None
 
-    text = text.rstrip()
-    if text.endswith("=") or text.endswith(":"):
-        return None
-    if bracket_stack and bracket_stack[-1] == "{":
-        trailing_dict_text = text[: text.rfind("{")]
-        num_keys = trailing_dict_text.count(":")
-        num_values = trailing_dict_text.count(",")
-        if num_keys <= num_values:
+    in_string = bool(bracket_stack and bracket_stack[-1][0] in {"'", '"'})
+    if not in_string:
+        text = text.rstrip()
+        if text.endswith("=") or text.endswith(":"):
             return None
-    if bracket_stack and bracket_stack[-1] == "(":
-        trailing_params_text = text[: text.rfind("(")]
-        num_full_param_names = trailing_params_text.count("=")
-        num_full_param_values = trailing_params_text.count(",")
-        if num_full_param_names <= num_full_param_values:
+        if text.endswith(","):
+            text = text[:-1].rstrip()
+        if text.endswith("=") or text.endswith(":"):
             return None
-    if text.endswith(","):
-        text = text[:-1]
-    if bracket_stack and bracket_stack[-1] == "[" and not text.endswith("[") and not text.endswith(")"):
+
+    if bracket_stack and bracket_stack[-1][0] == "{":
+        inner_dict_text = text[bracket_stack[-1][1] + 1 :]
+        num_keys, num_commas = _count_top_level_delimiters(inner_dict_text, ":")
+        if num_keys <= num_commas:
+            return None
+    if bracket_stack and bracket_stack[-1][0] == "(":
+        inner_params_text = text[bracket_stack[-1][1] + 1 :]
+        num_full_param_names, num_commas = _count_top_level_delimiters(inner_params_text, "=")
+        if num_full_param_names <= num_commas:
+            return None
+    if (
+        in_string
+        and len(bracket_stack) >= 2
+        and bracket_stack[-2][0] == "{"
+    ):
+        inner_dict_text = text[bracket_stack[-2][1] + 1 : bracket_stack[-1][1]]
+        num_keys, num_commas = _count_top_level_delimiters(inner_dict_text, ":")
+        if num_keys <= num_commas:
+            return None
+    if len(bracket_stack) == 1 and bracket_stack[0][0] == "[" and not text.endswith("[") and not text.endswith(")"):
         return None
 
     added_text = ""
-    for char in reversed(bracket_stack):
+    for char, _idx in reversed(bracket_stack):
         if char == "[":
             added_text += "]"
         elif char == "(":
@@ -192,8 +280,10 @@ def compute_tool_delta(
         later deltas, or ``None`` when there is nothing new to send.
     """
     new_call_args = new_call.function.arguments
-    if withheld_suffix and new_call_args.endswith(withheld_suffix):
-        new_call_args = new_call_args[: -len(withheld_suffix)]
+    if withheld_suffix:
+        if new_call_args.endswith(withheld_suffix):
+            new_call_args = new_call_args[: -len(withheld_suffix)]
+        new_call_args = stable_json_stream_prefix(new_call_args)
     if not previously_sent_args:
         return DeltaToolCall(
             id=new_call.id,
@@ -202,5 +292,7 @@ def compute_tool_delta(
             function=DeltaFunctionCall(name=new_call.function.name, arguments=new_call_args),
         )
 
+    if not new_call_args.startswith(previously_sent_args):
+        return None
     arg_diff = new_call_args[len(previously_sent_args) :]
     return DeltaToolCall(id=None, index=index, function=DeltaFunctionCall(arguments=arg_diff)) if arg_diff else None

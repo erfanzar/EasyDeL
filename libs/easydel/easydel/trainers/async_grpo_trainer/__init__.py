@@ -20,6 +20,6 @@ use external inference servers or string model loading surfaces.
 """
 
 from .async_grpo_config import AsyncGRPOConfig
-from .async_grpo_trainer import AsyncGRPOTrainer
+from .async_grpo_trainer import AsyncGRPOTrainer, environment_reward_placeholder
 
-__all__ = ("AsyncGRPOConfig", "AsyncGRPOTrainer")
+__all__ = ("AsyncGRPOConfig", "AsyncGRPOTrainer", "environment_reward_placeholder")

@@ -89,8 +89,12 @@ def sample_top_p_efficient(
     """
     vocab_size = logits.shape[-1]
     effective_k = min(top_k_for_computation, vocab_size)
-    safe_temperature = jnp.where(temperature > 1e-6, temperature, 1.0)
-    scaled_logits = logits / jnp.expand_dims(safe_temperature, axis=-1)
+    logits_f32 = logits.astype(jnp.float32)
+    temp_f32 = jnp.asarray(temperature, dtype=jnp.float32)
+    top_p_f32 = jnp.asarray(top_p, dtype=jnp.float32)
+    is_greedy = temp_f32 <= 1e-6
+    safe_temperature = jnp.where(is_greedy, jnp.ones_like(temp_f32), temp_f32)
+    scaled_logits = logits_f32 / jnp.expand_dims(safe_temperature, axis=-1)
     top_k_logits, top_k_indices = jax.lax.top_k(scaled_logits, k=effective_k)
     top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
     cumulative_probs_k = jnp.cumsum(top_k_probs, axis=-1)
@@ -98,11 +102,13 @@ def sample_top_p_efficient(
     # threshold is retained (standard nucleus sampling, identical to ``TopPLogitsWarper``). Comparing the inclusive
     # cumulative sum instead would drop that token and shrink the nucleus below the requested mass.
     preceding_mass_k = cumulative_probs_k - top_k_probs
-    keep_mask_k = preceding_mass_k < jnp.expand_dims(top_p, axis=-1)
+    keep_mask_k = preceding_mass_k < jnp.expand_dims(top_p_f32, axis=-1)
     keep_mask_k = keep_mask_k.at[..., 0].set(True)
     filtered_top_k_logits = jnp.where(keep_mask_k, top_k_logits, -jnp.inf)
     sampled_k_index = jax.random.categorical(rng, filtered_top_k_logits)
-    return jnp.take_along_axis(top_k_indices, jnp.expand_dims(sampled_k_index, axis=-1), axis=-1).squeeze(-1)
+    sampled_token = jnp.take_along_axis(top_k_indices, jnp.expand_dims(sampled_k_index, axis=-1), axis=-1).squeeze(-1)
+    greedy_token = top_k_indices[..., 0]
+    return jnp.where(is_greedy, greedy_token, sampled_token)
 
 
 def vmaped_sample_top_p_efficient(
@@ -112,22 +118,24 @@ def vmaped_sample_top_p_efficient(
     rng: jax.random.PRNGKey,
     top_k_for_computation: int = TOPK_FOR_COMPUTE,
 ) -> jax.Array:
-    """Vectorize nucleus sampling with per-row controls and a shared random key.
+    """Vectorize nucleus sampling with per-row controls and independent per-row PRNG keys.
 
     Args:
         logits: Batched logits of shape ``(batch_size, vocab_size)``.
         top_p: Per-row nucleus thresholds of shape ``(batch_size,)``.
         temperature: Per-row temperatures of shape ``(batch_size,)``.
-        rng: Shared JAX random key.
+        rng: Base JAX random key split independently across batch rows.
         top_k_for_computation: Maximum number of candidates per row.
 
     Returns:
         Sampled token indices of shape ``(batch_size,)``.
     """
+    # Split base key per batch row so parallel samples draw independent Gumbel noise.
+    row_rngs = jax.random.split(rng, logits.shape[0])
     # Supply the optional argument positionally to vmap as well: its in_axes
     # describes five inputs even when callers rely on the public default.
-    return jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)(
-        logits, top_p, temperature, rng, top_k_for_computation
+    return jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
+        logits, top_p, temperature, row_rngs, top_k_for_computation
     )
 
 
@@ -155,14 +163,13 @@ def dynamic_sample_tokens(
         presence_penalty: Per-entry fixed penalty for previously seen tokens.
         frequency_penalty: Per-entry count-proportional penalty.
         repetition_penalty: Per-entry multiplicative repetition penalty.
-        rngs: Shared JAX random key, not batched.
+        rngs: Base JAX random key, split independently across batch rows.
 
     Returns:
         Token indices of shape ``(batch_size, 1, 1)``, retaining the original
         vectorized API's singleton dimensions.
     """
-    # Keep the key unmapped for positional and keyword callers alike. JAX maps
-    # keyword arguments on axis zero regardless of the explicit in_axes tuple.
+    row_rngs = jax.random.split(rngs, logits.shape[0])
     return _dynamic_sample_tokens(
         tokens,
         length,
@@ -173,11 +180,11 @@ def dynamic_sample_tokens(
         presence_penalty,
         frequency_penalty,
         repetition_penalty,
-        rngs,
+        row_rngs,
     )
 
 
-@partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=0)
+@partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0), out_axes=0)
 def _dynamic_sample_tokens(
     tokens: jax.Array,
     length: jax.Array,
@@ -202,40 +209,34 @@ def _dynamic_sample_tokens(
         presence_penalty: Per-entry fixed penalty for previously seen tokens.
         frequency_penalty: Per-entry count-proportional penalty.
         repetition_penalty: Per-entry multiplicative repetition penalty.
-        rngs: Shared JAX random key, not mapped over the batch.
+        rngs: Per-entry JAX random key.
 
     Returns:
         Token indices of shape ``(batch_size, 1, 1)``, preserving the original
         vectorized API's singleton dimensions.
     """
+    # Apply penalty processors before branching so both greedy and random decoding respect them.
+    penalized_logits = LogitsProcessorList(
+        [
+            PresencePenaltyLogitsProcessor(presence_penalty.astype(jnp.float32)),
+            FrequencyPenaltyLogitsProcessor(frequency_penalty.astype(jnp.float32)),
+            RepetitionPenaltyLogitsProcessor(repetition_penalty.astype(jnp.float32)),
+        ]
+    )(tokens.reshape(1, -1), logits.reshape(1, -1), length)
 
-    def _random_sampling_fn(tokens, length, logits, top_p, temperature, presence, frequency, repetition):
-        """Apply the shared logits processors before nucleus sampling."""
-        logits = logits.reshape(1, -1)
-        processors = LogitsProcessorList(
-            [
-                PresencePenaltyLogitsProcessor(presence),
-                FrequencyPenaltyLogitsProcessor(frequency),
-                RepetitionPenaltyLogitsProcessor(repetition),
-            ]
-        )
-        logits = processors(tokens.reshape(1, -1), logits, length)
-        return sample_top_p_efficient(logits, top_p, temperature, rngs)[:, None]
+    def _random_sampling_fn(scored_logits, top_p_val, temp_val):
+        """Sample via top-p nucleus sampling from penalized logits."""
+        return sample_top_p_efficient(scored_logits, top_p_val, temp_val, rngs)[:, None]
 
-    def _greedy_sampling_fn(tokens, length, logits, top_p, temperature, presence, frequency, repetition):
-        """Keep the original greedy argmax contract."""
-        return jnp.argmax(logits.reshape(1, -1), axis=-1)[:, None]
+    def _greedy_sampling_fn(scored_logits, _top_p_val, _temp_val):
+        """Select argmax token from penalized logits."""
+        return jnp.argmax(scored_logits, axis=-1)[:, None]
 
     return jax.lax.cond(
         random_sampling,
         _random_sampling_fn,
         _greedy_sampling_fn,
-        tokens,
-        length,
-        logits,
-        top_p.astype(logits.dtype),
-        temperature.astype(logits.dtype),
-        presence_penalty.astype(logits.dtype),
-        frequency_penalty.astype(logits.dtype),
-        repetition_penalty.astype(logits.dtype),
+        penalized_logits,
+        top_p.astype(jnp.float32),
+        temperature.astype(jnp.float32),
     )

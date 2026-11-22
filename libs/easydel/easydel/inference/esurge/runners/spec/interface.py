@@ -77,7 +77,7 @@ class SpeculativeStrategy(typing.Protocol):
     debug_max_traces: int
     draft_full_log_probs_by_req: dict[str, jax.Array]
 
-    def resolve_step_draft_budget(self, concurrency: int) -> int:
+    def resolve_step_draft_budget(self, concurrency: int, *, num_draft_tokens_next: int | None = None) -> int:
         """Resolve the per-step draft-token budget from the live concurrency."""
         ...
 
@@ -87,6 +87,14 @@ class SpeculativeStrategy(typing.Protocol):
 
     def on_reset(self) -> None:
         """Clear per-request speculative state (runner ``reset_state`` hook)."""
+        ...
+
+    def update_target_model(self, model: typing.Any) -> None:
+        """Bind a refreshed target model on the attached drafter."""
+        ...
+
+    def release_target_model(self) -> None:
+        """Drop target model references and HBM caches held by the drafter."""
         ...
 
     def is_spec_request(self, req_state: CachedRequestState | None) -> bool:
@@ -299,9 +307,9 @@ class NullSpeculation:
         self.debug_max_traces = 0
         self.draft_full_log_probs_by_req: dict[str, jax.Array] = {}
 
-    def resolve_step_draft_budget(self, concurrency: int) -> int:
+    def resolve_step_draft_budget(self, concurrency: int, *, num_draft_tokens_next: int | None = None) -> int:
         """Always ``0``: no drafter, no draft budget at any concurrency."""
-        del concurrency
+        del concurrency, num_draft_tokens_next
         return 0
 
     def on_states_applied(self, scheduler_output: SchedulerOutput) -> None:
@@ -310,6 +318,13 @@ class NullSpeculation:
 
     def on_reset(self) -> None:
         """No-op: no per-request speculative state to clear."""
+
+    def update_target_model(self, model: typing.Any) -> None:
+        """No-op: no drafter attached."""
+        del model
+
+    def release_target_model(self) -> None:
+        """No-op: no drafter attached."""
 
     def is_spec_request(self, req_state: CachedRequestState | None) -> bool:
         """Always ``False``: no request is spec-eligible without a drafter."""

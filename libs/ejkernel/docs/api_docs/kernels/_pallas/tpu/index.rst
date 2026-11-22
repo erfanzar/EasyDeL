@@ -20,6 +20,9 @@ ejkernel.kernels._pallas.tpu package
    quantized_matmul/index
    ragged_decode_attention/index
    ragged_gated_delta_rule/index
+   ragged_kda/index
+   ragged_kda_decode/index
+   ragged_kda_short/index
    ragged_page_attention_v2/index
    ragged_page_attention_v3/index
    reduce_scatter_matmul/index

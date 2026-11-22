@@ -15,21 +15,13 @@
 """Minimax tool parser with thinking tag support.
 
 This module provides a comprehensive tool call parser for Minimax models
-that handles tool calls wrapped in <tool_calls> tokens while filtering
-out tool calls that appear within <think>...</think> thinking sections.
+that handles tool calls wrapped in ``<tool_calls>`` tokens while filtering
+out tool calls that appear within ``<think>...</think>`` thinking sections.
 
 Example format:
     <tool_calls>
     {"name": "func", "arguments": {...}}
     </tool_calls>
-
-Features:
-    - Thinking tag filtering (<think>...</think>)
-    - Stateful streaming with buffer management
-    - Tool boundary detection and validation
-    - Duplicate brace cleaning for arguments
-    - Multi-tool support with index tracking
-    - Pending buffer for potential tag starts
 """
 
 from __future__ import annotations
@@ -40,12 +32,13 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import uuid4
 
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
     ExtractedToolCallInformation,
@@ -53,66 +46,87 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from .utils import partial_json_loads, stream_json_calls
 
 logger = get_logger(__name__)
+
+
+def _trailing_prefix_len(text: str, marker: str) -> int:
+    """Return length of the longest proper prefix of *marker* matching the end of *text*."""
+    max_len = min(len(text), len(marker) - 1)
+    for size in range(max_len, 0, -1):
+        if text.endswith(marker[:size]):
+            return size
+    return 0
+
+
+def _find_tag_outside_json_strings(text: str, tag: str, start: int = 0) -> int:
+    """Find *tag* in *text* from *start*, ignoring occurrences inside JSON double-quoted strings."""
+    in_string = False
+    escaped = False
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if text.startswith(tag, i):
+            return i
+        i += 1
+    return -1
+
+
+def _strip_trailing_partial_tag_outside_json_strings(text: str, tag: str) -> str:
+    """Strip an incomplete trailing *tag* prefix only when outside JSON strings."""
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+    if in_string:
+        return text
+    hold = _trailing_prefix_len(text, tag)
+    return text[:-hold] if hold else text
 
 
 @ToolParserManager.register_module("minimax")  # pyright: ignore[reportUntypedClassDecorator]
 class MinimaxToolParser(ToolParser):
     """Tool parser for Minimax models.
 
-    Comprehensive parser handling tool calls with thinking tags support.
-    Filters tool calls from thinking sections and manages complex
-    streaming state with pending buffers.
-
-    Features:
-        - Thinking tag filtering (<think>...</think>)
-        - Stateful streaming with buffer management
-        - Tool boundary detection and validation
-        - Duplicate brace cleaning for arguments
-        - Multi-tool support with index tracking
-
-    Format:
-        <tool_calls>
-        {"name": "func", "arguments": {...}}
-        </tool_calls>
-
-    The parser maintains extensive state for proper streaming including
-    buffer management, tool indices, and sent status tracking.
-
-    Attributes:
-        streaming_state: Dictionary tracking current tool index, tool IDs,
-            and sent tool information.
-        tool_call_start_token: The opening delimiter '<tool_calls>'.
-        tool_call_end_token: The closing delimiter '</tool_calls>'.
-        tool_call_regex: Compiled regex for tool call extraction.
-        thinking_tag_pattern: Regex pattern for thinking sections.
-        tool_name_pattern: Compiled regex for extracting tool names.
-        tool_args_pattern: Compiled regex for finding arguments section.
-        pending_buffer: Buffer for incomplete tag detection.
-        in_thinking_tag: Flag indicating if currently inside thinking tags.
+    Handles ``<tool_calls>...</tool_calls>`` blocks while ignoring any
+    ``<tool_calls>`` markup inside closed or unclosed ``<think>`` sections.
+    Supports multiple ``<tool_calls>`` blocks, pretty-printed and multi-object
+    JSON payloads, and string-aware streaming without leaking protocol JSON.
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
         """Initialize the MinimaxToolParser.
 
-        Sets up the parser with tool call and thinking tag patterns,
-        initializes streaming state, and validates tokenizer presence.
-
         Args:
             tokenizer: The tokenizer associated with the Minimax model.
-                Used for token-level operations during streaming.
 
         Raises:
             ValueError: If tokenizer is None.
         """
         super().__init__(tokenizer)
-
-        self.streaming_state: dict[str, Any] = {
-            "current_tool_index": -1,
-            "tool_ids": [],
-            "sent_tools": [],
-        }
 
         self.tool_call_start_token = "<tool_calls>"
         self.tool_call_end_token = "</tool_calls>"
@@ -121,8 +135,7 @@ class MinimaxToolParser(ToolParser):
         self.tool_name_pattern = re.compile(r'"name":\s*"([^"]+)"')
         self.tool_args_pattern = re.compile(r'"arguments":\s*')
 
-        self.pending_buffer = ""
-        self.in_thinking_tag = False
+        self._reset_streaming_state()
 
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
@@ -136,631 +149,436 @@ class MinimaxToolParser(ToolParser):
                 "tokens in the tokenizer. Falling back to string matching."
             )
 
-    def preprocess_model_output(self, model_output: str) -> str:
-        """Preprocess model output by removing tool calls from thinking tags.
+    def _reset_streaming_state(self) -> None:
+        """Reset all streaming state to initial values."""
+        self.prev_tool_call_arr = []
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool = []
+        self.pending_buffer = ""
+        self.in_thinking_tag = False
+        self.streaming_state: dict[str, Any] = {
+            "current_tool_index": -1,
+            "tool_ids": [],
+            "sent_tools": [],
+        }
+        self._stream_tool_ids: list[str] = []
+        self._streaming_initialized = False
+        self._cursor = 0
+        self._accumulated_text = ""
+        self._in_open_tool_block = False
+        self._scan_pos = 0
+        self._in_think = False
+        self._open_block_start: int | None = None
+        self._open_block_scan_pos = 0
+        self._open_block_in_string = False
+        self._open_block_escaped = False
+        self._closed_call_count = 0
+        self._active_block_prev: list[dict] = []
+        self._active_block_sent: list[str] = []
+        self._active_block_ids: list[str] = []
 
-        Filters out any tool calls that appear within <think>...</think>
-        sections to prevent them from being executed.
+    def flush_streaming_content(self) -> str:
+        """Release withheld opening-tag prefix when the stream ends outside a tool block."""
+        if self._in_open_tool_block:
+            self._accumulated_text = ""
+            self._cursor = 0
+            return ""
+        pending = self._accumulated_text[self._cursor :]
+        self._accumulated_text = ""
+        self._cursor = 0
+        return pending
 
-        Args:
-            model_output: Raw model output string that may contain thinking
-                sections with embedded tool calls.
+    def is_buffering_protocol(self, *, current_text: str, delta_text: str) -> bool:
+        """Return True only for unclosed ``<tool_calls>`` blocks or prefixes outside ``<think>``."""
+        del delta_text
+        if self._streaming_initialized:
+            if self._in_open_tool_block:
+                return True
+            if self.in_thinking_tag:
+                return False
+            return _trailing_prefix_len(current_text[self._cursor :], self.tool_call_start_token) > 0
+        blocks, in_open_think = self._scan_tool_blocks(current_text)
+        if blocks and blocks[-1][1] is None:
+            return True
+        if in_open_think:
+            return False
+        tail_start = blocks[-1][1] + len(self.tool_call_end_token) if blocks and blocks[-1][1] is not None else 0
+        return _trailing_prefix_len(current_text[tail_start:], self.tool_call_start_token) > 0
 
-        Returns:
-            Preprocessed model output with tool calls removed from thinking
-            tags while preserving other thinking content.
+    def _scan_tool_blocks(self, text: str) -> tuple[list[tuple[int, int | None]], bool]:
+        """Scan *text* for ``<tool_calls>`` blocks strictly outside ``<think>`` regions.
+
+        Returns ``(blocks, in_open_think)`` where each element of ``blocks`` is
+        ``(start_idx, end_idx)`` (with ``end_idx is None`` if still open).
         """
+        blocks: list[tuple[int, int | None]] = []
+        pos = 0
+        n = len(text)
+        in_think = False
 
-        def remove_tool_calls_from_think(match):
-            """Strip <tool_calls> blocks from inside a <think> match group."""
-            think_content = match.group(1)
-            cleaned_content = re.sub(r"<tool_calls>.*?</tool_calls>", "", think_content, flags=re.DOTALL)
-            return f"<think>{cleaned_content}</think>"
+        while pos < n:
+            if in_think:
+                close_think = text.find("</think>", pos)
+                if close_think == -1:
+                    return blocks, True
+                pos = close_think + len("</think>")
+                in_think = False
+                continue
 
-        return re.sub(self.thinking_tag_pattern, remove_tool_calls_from_think, model_output, flags=re.DOTALL)
+            next_think = text.find("<think>", pos)
+            next_tool = text.find(self.tool_call_start_token, pos)
+
+            if next_think != -1 and (next_tool == -1 or next_think < next_tool):
+                in_think = True
+                pos = next_think + len("<think>")
+                continue
+
+            if next_tool == -1:
+                break
+
+            body_start = next_tool + len(self.tool_call_start_token)
+            end_tool = _find_tag_outside_json_strings(text, self.tool_call_end_token, body_start)
+            if end_tool == -1:
+                blocks.append((next_tool, None))
+                break
+            blocks.append((next_tool, end_tool))
+            pos = end_tool + len(self.tool_call_end_token)
+
+        return blocks, in_think
+
+    def preprocess_model_output(self, model_output: str) -> str:
+        """Remove closed and unclosed ``<tool_calls>`` markup from inside ``<think>`` sections."""
+
+        def _strip_inner(content: str) -> str:
+            cleaned = re.sub(r"<tool_calls>.*?(?:</tool_calls>|$)", "", content, flags=re.DOTALL)
+            return cleaned.replace("</tool_calls>", "")
+
+        def _replace_closed(match: re.Match[str]) -> str:
+            return f"<think>{_strip_inner(match.group(1))}</think>"
+
+        result = re.sub(self.thinking_tag_pattern, _replace_closed, model_output, flags=re.DOTALL)
+        # Also sanitize any unclosed trailing <think> block.
+        last_open = result.rfind("<think>")
+        last_close = result.rfind("</think>")
+        if last_open > last_close:
+            result = result[: last_open + len("<think>")] + _strip_inner(result[last_open + len("<think>") :])
+        return result
 
     def _clean_duplicate_braces(self, args_text: str) -> str:
-        """Clean duplicate closing braces from arguments text.
-
-        Attempts to fix malformed JSON that has extra closing braces
-        by iteratively removing them until valid JSON is achieved.
-
-        Args:
-            args_text: Raw arguments text that may have duplicate braces.
-
-        Returns:
-            Cleaned arguments text with proper JSON formatting.
-        """
+        """Clean duplicate closing braces from arguments text."""
         args_text = args_text.strip()
         if not args_text:
             return args_text
-
         try:
             json.loads(args_text)
             return args_text
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             pass
-
         while args_text.endswith("}}"):
             candidate = args_text[:-1]
             try:
                 json.loads(candidate)
                 return candidate
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 args_text = candidate
-
         return args_text
+
+    def _find_tool_boundaries(self, text: str) -> list[tuple[int, int]]:
+        """Find JSON object boundaries in *text* with string/escape-aware brace tracking."""
+        boundaries: list[tuple[int, int]] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text[i] != "{":
+                i += 1
+                continue
+            start = i
+            depth = 0
+            in_string = False
+            escaped = False
+            while i < n:
+                ch = text[i]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        segment = text[start:end]
+                        if '"name"' in segment and '"arguments"' in segment:
+                            boundaries.append((start, end))
+                        i = end
+                        break
+                i += 1
+            else:
+                if depth > 0 and '"name"' in text[start:i]:
+                    boundaries.append((start, i))
+        return boundaries
+
+    def _extract_tool_args(self, tool_content: str, args_match: re.Match[str]) -> str:
+        """Extract tool arguments from *tool_content* with string/escape-aware brace scanning."""
+        remaining = tool_content[args_match.end() :].lstrip()
+        if remaining.startswith("{"):
+            depth = 0
+            in_string = False
+            escaped = False
+            for idx, ch in enumerate(remaining):
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return remaining[: idx + 1]
+            return remaining
+        try:
+            _, end_idx = json.JSONDecoder().raw_decode(remaining)
+            return remaining[:end_idx]
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            return remaining.rstrip("}").strip()
+
+    @staticmethod
+    def _decode_block_calls_batch(body: str) -> list[dict]:
+        """Decode all JSON tool call objects/arrays from a ``<tool_calls>`` block."""
+        raw_calls: list[dict] = []
+        decoder = json.JSONDecoder()
+        position = 0
+        length = len(body)
+        while position < length:
+            if body[position].isspace() or body[position] in ",;":
+                position += 1
+                continue
+            try:
+                parsed, position = decoder.raw_decode(body, position)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                newline = body.find("\n", position)
+                if newline < 0:
+                    break
+                position = newline + 1
+                continue
+            if isinstance(parsed, dict):
+                raw_calls.append(parsed)
+            elif isinstance(parsed, list):
+                raw_calls.extend(item for item in parsed if isinstance(item, dict))
+        return raw_calls
+
+    @staticmethod
+    def _decode_block_calls_streaming(body: str, *, closed: bool) -> list[tuple[dict, bool]]:
+        """Decode complete and partial JSON tool call objects from a streaming block."""
+        payload = body if closed else _strip_trailing_partial_tag_outside_json_strings(body, "</tool_calls>")
+        decoder = json.JSONDecoder()
+        results: list[tuple[dict, bool]] = []
+        pos = 0
+        length = len(payload)
+
+        while pos < length:
+            if payload[pos].isspace() or payload[pos] in ",;":
+                pos += 1
+                continue
+            try:
+                parsed, next_pos = decoder.raw_decode(payload, pos)
+            except RecursionError:
+                break
+            except json.JSONDecodeError:
+                # Tail is incomplete JSON: parse safely for names and partially for arguments.
+                tail = payload[pos:].strip()
+                if not tail:
+                    break
+                try:
+                    safe_obj, _ = partial_json_loads(tail, Allow.ALL & ~Allow.STR)
+                except (
+                    ValueError,
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    AssertionError,
+                    IndexError,
+                    RecursionError,
+                ):
+                    break
+                safe_items = safe_obj if isinstance(safe_obj, list) else [safe_obj]
+                partial_items: list[Any] = []
+                try:
+                    partial_obj, _ = partial_json_loads(tail, Allow.ALL)
+                    partial_items = partial_obj if isinstance(partial_obj, list) else [partial_obj]
+                except (
+                    ValueError,
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    AssertionError,
+                    IndexError,
+                    RecursionError,
+                ):
+                    pass
+
+                for idx, item in enumerate(safe_items):
+                    if not isinstance(item, dict):
+                        continue
+                    merged = dict(item)
+                    if idx < len(partial_items) and isinstance(partial_items[idx], dict):
+                        if "arguments" in partial_items[idx]:
+                            merged["arguments"] = partial_items[idx]["arguments"]
+                    results.append((merged, closed))
+                break
+            except ValueError:
+                break
+
+            pos = next_pos
+            if isinstance(parsed, dict):
+                results.append((parsed, True))
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        results.append((item, True))
+        return results
 
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        """Extract tool calls from model output for non-streaming mode.
-
-        Preprocesses the output to remove tool calls from thinking sections,
-        then extracts and parses tool calls from <tool_calls> delimiters.
-
-        Args:
-            model_output: Complete model output string.
-            request: Chat completion request for context.
-
-        Returns:
-            ExtractedToolCallInformation containing:
-                - tools_called: True if valid tool calls were found
-                - tool_calls: List of ToolCall objects extracted
-                - content: Text content before tool calls, None if empty
-        """
-        processed_output = self.preprocess_model_output(model_output)
-
-        if self.tool_call_start_token not in processed_output:
+        """Extract tool calls from model output for non-streaming mode."""
+        del request
+        blocks, _in_think = self._scan_tool_blocks(model_output)
+        if not blocks:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
         try:
-            function_call_tuples = self.tool_call_regex.findall(processed_output)
+            tool_calls: list[ToolCall] = []
+            first_valid_block_start: int | None = None
 
-            raw_function_calls = []
-            for match in function_call_tuples:
-                tool_call_content = match[0] if match[0] else match[1]
-                decoder = json.JSONDecoder()
-                position = 0
-                while position < len(tool_call_content):
-                    if tool_call_content[position].isspace() or tool_call_content[position] in ",;":
-                        position += 1
-                        continue
-                    try:
-                        parsed_call, position = decoder.raw_decode(tool_call_content, position)
-                    except json.JSONDecodeError:
-                        # A malformed line must not hide later complete values.
-                        newline = tool_call_content.find("\n", position)
-                        if newline < 0:
-                            break
-                        position = newline + 1
-                        continue
-                    if isinstance(parsed_call, dict):
-                        raw_function_calls.append(parsed_call)
-                    elif isinstance(parsed_call, list):
-                        raw_function_calls.extend(call for call in parsed_call if isinstance(call, dict))
-
-            tool_calls = []
-            for function_call in raw_function_calls:
-                if "name" in function_call and "arguments" in function_call:
-                    tool_calls.append(
-                        ToolCall(
-                            type="function",
-                            function=FunctionCall(
-                                name=function_call["name"],
-                                arguments=json.dumps(function_call["arguments"], ensure_ascii=False),
-                            ),
+            for block_start, block_end in blocks:
+                body_start = block_start + len(self.tool_call_start_token)
+                body = model_output[body_start : block_end if block_end is not None else len(model_output)]
+                block_calls = []
+                for function_call in self._decode_block_calls_batch(body):
+                    name = function_call.get("name")
+                    if isinstance(name, str) and name and "arguments" in function_call:
+                        raw_args = function_call["arguments"]
+                        args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
+                        block_calls.append(
+                            ToolCall(
+                                type="function",
+                                function=FunctionCall(name=name, arguments=args_str),
+                            )
                         )
-                    )
+                if block_calls:
+                    if first_valid_block_start is None:
+                        first_valid_block_start = block_start
+                    tool_calls.extend(block_calls)
 
-            if not tool_calls:
+            if not tool_calls or first_valid_block_start is None:
                 return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
-            processed_pos = processed_output.find(self.tool_call_start_token)
-            if processed_pos != -1:
-                processed_content = processed_output[:processed_pos].strip()
-
-                if processed_content:
-                    lines = processed_content.split("\n")
-                    for line in reversed(lines):
-                        line = line.strip()
-                        if line:
-                            pos = model_output.find(line)
-                            if pos != -1:
-                                content = model_output[: pos + len(line)]
-                                break
-                    else:
-                        content = ""
-                else:
-                    content = ""
-            else:
-                content = model_output
-
+            content = model_output[:first_valid_block_start].strip()
             return ExtractedToolCallInformation(
-                tools_called=len(tool_calls) > 0,
+                tools_called=True,
                 tool_calls=tool_calls,
-                content=content.strip() if content.strip() else None,
+                content=content if content else None,
             )
 
         except Exception:
             logger.exception("An unexpected error occurred during tool call extraction.")
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
-    def _update_thinking_state(self, text: str) -> None:
-        """Update the thinking tag state based on text content.
+    def _find_tool_start_outside_thinking(self, current_text: str) -> int | None:
+        """Find the first ``<tool_calls>`` position outside ``<think>`` blocks."""
+        blocks, _ = self._scan_tool_blocks(current_text)
+        return blocks[0][0] if blocks else None
 
-        Determines if currently inside a thinking section by counting
-        open and close tags.
+    def _find_open_block_end_incremental(self, text: str) -> int:
+        """Advance incremental string-aware scan for ``</tool_calls>`` inside the open block."""
+        tag = self.tool_call_end_token
+        tag_len = len(tag)
+        tag_first = tag[0]
+        i = self._open_block_scan_pos
+        n = len(text)
+        in_string = self._open_block_in_string
+        escaped = self._open_block_escaped
 
-        Args:
-            text: Text to analyze for thinking tags.
-        """
-        open_count = text.count("<think>")
-        close_count = text.count("</think>")
-        self.in_thinking_tag = open_count > close_count or (open_count == close_count and text.endswith("</think>"))
-
-    def _is_potential_tag_start(self, text: str) -> bool:
-        """Check if text might be the start of a tool call tag.
-
-        Determines if the text ends with a partial match of either
-        the start or end tool call token.
-
-        Args:
-            text: Text to check for potential tag start.
-
-        Returns:
-            True if text could be the start of a tool call tag.
-        """
-        for tag in [self.tool_call_start_token, self.tool_call_end_token]:
-            if any(tag.startswith(text[-i:]) for i in range(1, min(len(text) + 1, len(tag)))):
-                return True
-        return False
-
-    def _should_buffer_content(self, delta_text: str) -> bool:
-        """Determine if content should be buffered for later processing.
-
-        Content is buffered when it might contain tool call tokens
-        to ensure proper boundary detection.
-
-        Args:
-            delta_text: Delta text to check.
-
-        Returns:
-            True if content should be buffered.
-        """
-        if self.in_thinking_tag:
-            return False
-        return bool(
-            self.pending_buffer
-            or self.tool_call_start_token in delta_text
-            or self.tool_call_end_token in delta_text
-            or delta_text.startswith("<")
-        )
-
-    def _split_content_for_buffering(self, delta_text: str) -> tuple[str, str]:
-        """Split delta text into safe content and potential tag content.
-
-        Separates text that can be safely output from text that might
-        be the start of a tool call tag.
-
-        Args:
-            delta_text: Delta text to split.
-
-        Returns:
-            Tuple of (safe_content, potential_tag_content) where safe_content
-            can be output immediately and potential_tag_content needs buffering.
-        """
-        if self.in_thinking_tag:
-            return delta_text, ""
-
-        for tag in [self.tool_call_start_token, self.tool_call_end_token]:
-            for i in range(1, len(tag)):
-                tag_prefix = tag[:i]
-                pos = delta_text.rfind(tag_prefix)
-                if pos != -1 and tag.startswith(delta_text[pos:]):
-                    return delta_text[:pos], delta_text[pos:]
-        return delta_text, ""
-
-    def _process_buffer(self, new_content: str) -> str:
-        """Process buffered content and return output content.
-
-        Handles the pending buffer by identifying complete tags and
-        extracting content that can be safely output.
-
-        Args:
-            new_content: New content to add to buffer.
-
-        Returns:
-            Processed output content that can be sent to client.
-        """
-        self.pending_buffer += new_content
-        output_content = ""
-
-        if self.in_thinking_tag:
-            output_content = self.pending_buffer
-            self.pending_buffer = ""
-            return output_content
-
-        while self.pending_buffer:
-            start_pos = self.pending_buffer.find(self.tool_call_start_token)
-            end_pos = self.pending_buffer.find(self.tool_call_end_token)
-
-            if start_pos != -1 and (end_pos == -1 or start_pos < end_pos):
-                tag_pos, tag_len = start_pos, len(self.tool_call_start_token)
-            elif end_pos != -1:
-                tag_pos, tag_len = end_pos, len(self.tool_call_end_token)
-            else:
-                if self._is_potential_tag_start(self.pending_buffer):
-                    break
-                output_content += self.pending_buffer
-                self.pending_buffer = ""
-                break
-
-            output_content += self.pending_buffer[:tag_pos]
-            self.pending_buffer = self.pending_buffer[tag_pos + tag_len :]
-
-        return output_content
-
-    def _reset_streaming_state(self) -> None:
-        """Reset the streaming state to initial values.
-
-        Clears all tool tracking state for a fresh streaming session.
-        """
-        self.streaming_state = {
-            "current_tool_index": -1,
-            "tool_ids": [],
-            "sent_tools": [],
-        }
-
-    @staticmethod
-    def _is_complete_json_object(text: str) -> bool:
-        """Return whether ``text`` is a complete JSON object.
-
-        Args:
-            text: Candidate arguments text.
-
-        Returns:
-            ``True`` when ``text`` parses as a JSON object.
-        """
-        try:
-            return isinstance(json.loads(text), dict)
-        except ValueError:
-            return False
-
-    def _advance_to_next_tool(self) -> None:
-        """Advance to the next tool in the streaming sequence.
-
-        Increments the current tool index for multi-tool responses.
-        """
-        self.streaming_state["current_tool_index"] = int(self.streaming_state["current_tool_index"]) + 1
-
-    def _set_current_tool_index(self, index: int) -> None:
-        """Set the current tool index.
-
-        Args:
-            index: Tool index to set as current.
-        """
-        self.streaming_state["current_tool_index"] = index
-
-    def _get_current_tool_index(self) -> int:
-        """Get the current tool index.
-
-        Returns:
-            Current tool index being processed.
-        """
-        return int(self.streaming_state["current_tool_index"])
-
-    def _get_next_unsent_tool_index(self, tool_count: int) -> int:
-        """Get the index of the next unsent tool.
-
-        Finds the first tool whose name has not been sent yet.
-
-        Args:
-            tool_count: Total number of tools detected.
-
-        Returns:
-            Index of next unsent tool, or -1 if all tools sent.
-        """
-        sent_tools = list(self.streaming_state["sent_tools"])
-        for i in range(tool_count):
-            if i < len(sent_tools):
-                if not sent_tools[i]["sent_name"]:
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                i += 1
+                continue
+            if ch == tag_first:
+                if text.startswith(tag, i):
+                    self._open_block_scan_pos = i + tag_len
+                    self._open_block_in_string = False
+                    self._open_block_escaped = False
                     return i
-            else:
-                return i
+                if n - i < tag_len and tag.startswith(text[i:]):
+                    break
+            i += 1
+
+        self._open_block_scan_pos = i
+        self._open_block_in_string = in_string
+        self._open_block_escaped = escaped
         return -1
 
-    def _ensure_state_arrays(self, tool_count: int) -> None:
-        """Ensure state arrays have sufficient capacity for tool_count tools.
-
-        Expands the sent_tools and tool_ids arrays to accommodate
-        the specified number of tools.
-
-        Args:
-            tool_count: Number of tools to prepare for.
-        """
-        sent_tools = list(self.streaming_state["sent_tools"])
-        tool_ids = list(self.streaming_state["tool_ids"])
-
-        while len(sent_tools) < tool_count:
-            sent_tools.append(
-                {
-                    "sent_name": False,
-                    "sent_arguments": "",
-                    "id": f"chatcmpl-tool-{uuid4()}",
-                }
-            )
-
-        while len(tool_ids) < tool_count:
-            tool_ids.append(None)
-
-        self.streaming_state["sent_tools"] = sent_tools
-        self.streaming_state["tool_ids"] = tool_ids
-
-    def _detect_tools_in_text(self, text: str) -> int:
-        """Detect the number of tools in text by counting name patterns.
-
-        Args:
-            text: Text to analyze for tool name patterns.
-
-        Returns:
-            Number of tools detected.
-        """
-        matches = self.tool_name_pattern.findall(text)
-        return len(matches)
-
-    def _find_tool_boundaries(self, text: str) -> list[tuple[int, int]]:
-        """Find the boundaries of tool calls in text.
-
-        Identifies start and end positions of each tool call JSON object
-        by tracking brace depth and verifying required fields.
-
-        Args:
-            text: Text to analyze for tool call boundaries.
-
-        Returns:
-            List of (start, end) position tuples for tool calls.
-        """
-        boundaries = []
-        i = 0
-        while i < len(text):
-            if text[i] == "{":
-                start = i
-                depth = 0
-                has_name = False
-                has_arguments = False
-
-                while i < len(text):
-                    if text[i] == "{":
-                        depth += 1
-                    elif text[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            end = i + 1
-                            segment = text[start:end]
-                            if '"name"' in segment and '"arguments"' in segment:
-                                boundaries.append((start, end))
-                            break
-
-                    if not has_name and '"name"' in text[start : i + 1]:
-                        has_name = True
-                    if not has_arguments and '"arguments"' in text[start : i + 1]:
-                        has_arguments = True
-
-                    i += 1
-
-                if depth > 0 and has_name:
-                    boundaries.append((start, i))
-            else:
-                i += 1
-        return boundaries
-
-    def _extract_tool_args(self, tool_content: str, args_match) -> str:
-        """Extract tool arguments from tool content.
-
-        Parses the arguments section from a tool call, handling nested
-        JSON structures by tracking brace depth.
-
-        Args:
-            tool_content: Tool call content string.
-            args_match: Regex match object for arguments pattern.
-
-        Returns:
-            Extracted arguments as string.
-        """
-        args_start_pos = args_match.end()
-        remaining_content = tool_content[args_start_pos:]
-
-        if remaining_content.strip().startswith("{"):
-            depth = 0
-            for i, char in enumerate(remaining_content):
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return remaining_content[: i + 1]
-        else:
-            args_end = remaining_content.find("}")
-            if args_end > 0:
-                return remaining_content[:args_end].strip()
-
-        return remaining_content.rstrip("}").strip()
-
-    def _get_current_tool_content(self, text: str, tool_index: int) -> tuple[str | None, str | None]:
-        """Get the content of a specific tool by index.
-
-        Extracts the name and arguments of a tool at the specified index.
-
-        Args:
-            text: Text containing tool calls.
-            tool_index: Index of tool to extract (0-based).
-
-        Returns:
-            Tuple of (tool_name, tool_arguments) or (None, None) if not found.
-        """
-        boundaries = self._find_tool_boundaries(text)
-
-        if tool_index >= len(boundaries):
-            return None, None
-
-        start, end = boundaries[tool_index]
-        tool_content = text[start:end]
-
-        name_match = self.tool_name_pattern.search(tool_content)
-        name = name_match.group(1) if name_match else None
-
-        args_match = self.tool_args_pattern.search(tool_content)
-        if args_match:
-            try:
-                args_text = self._extract_tool_args(tool_content, args_match)
-                return name, args_text
-            except Exception:
-                remaining_content = tool_content[args_match.end() :]
-                args_text = remaining_content.rstrip("}").strip()
-                return name, args_text
-
-        return name, None
-
-    def _handle_tool_name_streaming(self, tool_content: str, tool_count: int) -> DeltaMessage | None:
-        """Handle streaming of tool names.
-
-        Sends the tool name delta for the next unsent tool.
-
-        Args:
-            tool_content: Content containing tool calls.
-            tool_count: Total number of tools detected.
-
-        Returns:
-            DeltaMessage with tool name or None if no tool to stream.
-        """
-        next_idx = self._get_next_unsent_tool_index(tool_count)
-
-        if next_idx == -1:
-            return None
-
-        boundaries = self._find_tool_boundaries(tool_content)
-        if next_idx >= len(boundaries):
-            return None
-
-        tool_name, _ = self._get_current_tool_content(tool_content, next_idx)
-        if not tool_name:
-            return None
-
-        self._set_current_tool_index(next_idx)
-        sent_tools = list(self.streaming_state["sent_tools"])
-        tool_ids = list(self.streaming_state["tool_ids"])
-
-        tool_id = sent_tools[next_idx]["id"]
-        tool_ids[next_idx] = tool_id
-        sent_tools[next_idx]["sent_name"] = True
-
-        self.streaming_state["sent_tools"] = sent_tools
-        self.streaming_state["tool_ids"] = tool_ids
-
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=next_idx,
-                    type="function",
-                    id=tool_id,
-                    function=DeltaFunctionCall(name=tool_name).model_dump(exclude_none=True),
-                )
-            ]
+    def _emit_active_block_deltas(
+        self,
+        block_calls: list[dict],
+        *,
+        last_complete: bool,
+    ) -> list[DeltaToolCall]:
+        """Stream calls for the active ``<tool_calls>`` block without touching closed blocks."""
+        if not block_calls:
+            return []
+        base = self._closed_call_count
+        deltas = stream_json_calls(
+            block_calls,
+            self._active_block_prev,
+            self._active_block_sent,
+            self._active_block_ids,
+            last_complete,
         )
-
-    def _handle_tool_args_streaming(self, tool_content: str, tool_count: int) -> DeltaMessage | None:
-        """Handle streaming of tool arguments.
-
-        Sends argument deltas for the current tool being processed.
-
-        Args:
-            tool_content: Content containing tool calls.
-            tool_count: Total number of tools detected.
-
-        Returns:
-            DeltaMessage with tool arguments or None if no arguments to stream.
-        """
-        current_idx = self._get_current_tool_index()
-
-        if current_idx < 0 or current_idx >= tool_count:
-            return None
-
-        tool_name, tool_args = self._get_current_tool_content(tool_content, current_idx)
-        if not tool_name or tool_args is None:
-            return None
-
-        sent_tools = list(self.streaming_state["sent_tools"])
-
-        if not sent_tools[current_idx]["sent_name"]:
-            return None
-
-        clean_args = self._clean_duplicate_braces(tool_args)
-        sent_args = sent_tools[current_idx]["sent_arguments"]
-
-        if clean_args != sent_args and clean_args:
-            # Diff against the exact bytes already sent to the client.  A
-            # pretty-printed partial argument may contain repeated substrings
-            # or several closing braces (nested JSON); neither a general diff
-            # nor brace collapsing is safe for append-only argument deltas.
-            args_delta = clean_args[len(sent_args) :] if clean_args.startswith(sent_args) else clean_args
-            sent_tools[current_idx]["sent_arguments"] = clean_args
-            self.streaming_state["sent_tools"] = sent_tools
-
-            # Advance only once the arguments object is complete JSON. A textual
-            # trailing ``}`` also appears mid-object for pretty-printed nested
-            # arguments (``{\n "a": {\n "b": 1\n }\n``), and advancing there would
-            # strand the outer object's remaining text.
-            if self._is_complete_json_object(clean_args):
-                self._advance_to_next_tool()
-
-            return DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=current_idx,
-                        function=DeltaFunctionCall(arguments=args_delta).model_dump(exclude_none=True),
-                    )
-                ]
-            )
-
-        return None
-
-    def _is_end_tool_calls(self, current_text: str) -> bool:
-        """Check if tool calls section has ended.
-
-        Determines if there is a tool call end token outside of
-        thinking sections.
-
-        Args:
-            current_text: Current accumulated text.
-
-        Returns:
-            True if tool calls section has ended outside thinking tags.
-        """
-        if self.tool_call_end_token not in current_text:
-            return False
-
-        end_token_positions = []
-        search_start = 0
-        while True:
-            pos = current_text.find(self.tool_call_end_token, search_start)
-            if pos == -1:
-                break
-            end_token_positions.append(pos)
-            search_start = pos + 1
-
-        think_regions = []
-        for match in re.finditer(self.thinking_tag_pattern, current_text, flags=re.DOTALL):
-            think_regions.append((match.start(), match.end()))
-
-        for pos in end_token_positions:
-            in_think = any(pos >= t_start and pos < t_end for t_start, t_end in think_regions)
-            if not in_think:
-                return True
-
-        return False
+        for delta in deltas:
+            delta.index += base
+        self.prev_tool_call_arr[base:] = self._active_block_prev
+        self.streamed_args_for_tool[base:] = self._active_block_sent
+        self._stream_tool_ids[base:] = self._active_block_ids
+        self.current_tool_id = base + len(block_calls) - 1
+        self.current_tool_name_sent = bool(self._stream_tool_ids and self._stream_tool_ids[-1])
+        self.streaming_state["current_tool_index"] = self.current_tool_id
+        self.streaming_state["tool_ids"] = list(self._stream_tool_ids)
+        sent_tools = self.streaming_state["sent_tools"]
+        target_len = base + len(self._active_block_ids)
+        while len(sent_tools) < target_len:
+            sent_tools.append({"sent_name": False, "sent_arguments": "", "id": ""})
+        del sent_tools[target_len:]
+        for offset, (tid, args) in enumerate(zip(self._active_block_ids, self._active_block_sent, strict=True)):
+            sent_tools[base + offset] = {
+                "sent_name": bool(tid),
+                "sent_arguments": args,
+                "id": tid or sent_tools[base + offset]["id"] or f"chatcmpl-tool-{uuid4()}",
+            }
+        return deltas
 
     def extract_tool_calls_streaming(
         self,
@@ -772,157 +590,125 @@ class MinimaxToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        """Extract tool calls incrementally during streaming.
+        """Extract tool calls incrementally during streaming without leaking tool JSON."""
+        del delta_text, previous_token_ids, current_token_ids, delta_token_ids, request
+        if not previous_text:
+            self._reset_streaming_state()
+            self._streaming_initialized = True
+        elif not self._streaming_initialized:
+            self._reset_streaming_state()
+            self._cursor = len(previous_text)
+            last_open_think = previous_text.rfind("<think>")
+            last_close_think = previous_text.rfind("</think>")
+            self._in_think = last_open_think > last_close_think
+            self.in_thinking_tag = self._in_think
+            if self._in_think:
+                self._scan_pos = max(0, len(previous_text) - _trailing_prefix_len(previous_text, "</think>"))
+            else:
+                hold_prev = max(
+                    _trailing_prefix_len(previous_text, "<think>"),
+                    _trailing_prefix_len(previous_text, self.tool_call_start_token),
+                )
+                self._scan_pos = max(0, len(previous_text) - hold_prev)
+            self._streaming_initialized = True
 
-        Processes streaming output while handling thinking tags and
-        managing complex streaming state including buffers and tool tracking.
+        self._accumulated_text = current_text
+        content_parts: list[str] = []
+        tool_deltas: list[DeltaToolCall] = []
 
-        Args:
-            previous_text: Text accumulated before this delta.
-            current_text: Complete text including the current delta.
-            delta_text: The new text added in this streaming chunk.
-            previous_token_ids: Token IDs before this delta.
-            current_token_ids: All token IDs including current delta.
-            delta_token_ids: Token IDs in the current delta.
-            request: The chat completion request for context.
-
-        Returns:
-            DeltaMessage containing either:
-                - content: Regular text content or thinking section content
-                - tool_calls: Tool call deltas for names or arguments
-            Returns None if more tokens are needed or processing should pause.
-        """
-        self._update_thinking_state(current_text)
-
-        if self.in_thinking_tag:
-            return DeltaMessage(content=delta_text)
-
-        if self._should_buffer_content(delta_text):
-            buffered_output = self._process_buffer(delta_text)
-            return DeltaMessage(content=buffered_output) if buffered_output else None
-
-        if self._is_end_tool_calls(current_text):
-            return DeltaMessage(content=delta_text)
-
-        safe_content, potential_tag = self._split_content_for_buffering(delta_text)
-        if potential_tag:
-            self.pending_buffer += potential_tag
-            return DeltaMessage(content=safe_content) if safe_content else None
-
-        processed_current_text = self.preprocess_model_output(current_text)
-
-        if self.tool_call_start_token not in processed_current_text:
-            if self.tool_call_end_token in delta_text and self.tool_call_start_token in current_text:
-                return None
-            if delta_text.strip() == "" and self.tool_call_start_token in current_text:
-                return None
-            if self._get_current_tool_index() != -1 and self.tool_call_end_token in current_text:
-                self._reset_streaming_state()
-            return DeltaMessage(content=delta_text)
-
-        if (
-            self.tool_call_start_token_id is not None
-            and self.tool_call_start_token_id in delta_token_ids
-            and len(delta_token_ids) == 1
-        ):
-            return None
-
-        original_tool_start = self._find_tool_start_outside_thinking(current_text)
-        if original_tool_start is None:
-            return None
-
-        content_before_tools = self._extract_content_before_tools(current_text, delta_text, original_tool_start)
-        if content_before_tools:
-            return DeltaMessage(content=content_before_tools)
-
-        try:
-            tool_content = self._extract_tool_content(current_text, original_tool_start)
-            current_tools_count = self._detect_tools_in_text(tool_content)
-
-            if current_tools_count == 0:
-                return None
-
-            if self._get_current_tool_index() == -1:
-                self._reset_streaming_state()
-
-            self._ensure_state_arrays(current_tools_count)
-
-            return self._handle_tool_name_streaming(
-                tool_content, current_tools_count
-            ) or self._handle_tool_args_streaming(tool_content, current_tools_count)
-
-        except Exception:
-            logger.exception("An unexpected error occurred during streaming tool call handling.")
-            return None
-
-    def _find_tool_start_outside_thinking(self, current_text: str) -> int | None:
-        """Find the start position of tool calls outside of thinking tags.
-
-        Searches for tool call start tokens that are not within
-        thinking sections.
-
-        Args:
-            current_text: Current text to search.
-
-        Returns:
-            Position of tool call start or None if not found outside thinking.
-        """
-        search_start = 0
         while True:
-            pos = current_text.find(self.tool_call_start_token, search_start)
-            if pos == -1:
-                return None
+            if self._open_block_start is None:
+                if self._in_think:
+                    close_think = current_text.find("</think>", self._scan_pos)
+                    if close_think != -1:
+                        self._in_think = False
+                        self.in_thinking_tag = False
+                        self._scan_pos = close_think + len("</think>")
+                        if self._scan_pos > self._cursor:
+                            content_parts.append(current_text[self._cursor : self._scan_pos])
+                            self._cursor = self._scan_pos
+                        continue
+                    if len(current_text) > self._cursor:
+                        content_parts.append(current_text[self._cursor :])
+                        self._cursor = len(current_text)
+                    self._scan_pos = max(
+                        self._scan_pos,
+                        len(current_text) - _trailing_prefix_len(current_text[self._scan_pos :], "</think>"),
+                    )
+                    self.in_thinking_tag = True
+                    break
 
-            think_regions = [
-                (m.start(), m.end()) for m in re.finditer(r"<think>(.*?)</think>", current_text, flags=re.DOTALL)
-            ]
-            in_think = any(pos >= t_start and pos < t_end for t_start, t_end in think_regions)
+                next_think = current_text.find("<think>", self._scan_pos)
+                next_tool = current_text.find(self.tool_call_start_token, self._scan_pos)
 
-            if not in_think:
-                return pos
+                if next_think != -1 and (next_tool == -1 or next_think < next_tool):
+                    self._in_think = True
+                    self.in_thinking_tag = True
+                    self._scan_pos = next_think + len("<think>")
+                    if self._scan_pos > self._cursor:
+                        content_parts.append(current_text[self._cursor : self._scan_pos])
+                        self._cursor = self._scan_pos
+                    continue
 
-            search_start = pos + 1
+                if next_tool != -1:
+                    if next_tool > self._cursor:
+                        content_parts.append(current_text[self._cursor : next_tool])
+                    self._cursor = next_tool
+                    self._open_block_start = next_tool
+                    self._open_block_scan_pos = next_tool + len(self.tool_call_start_token)
+                    self._open_block_in_string = False
+                    self._open_block_escaped = False
+                    self._in_open_tool_block = True
+                    self._active_block_prev = []
+                    self._active_block_sent = []
+                    self._active_block_ids = []
+                    continue
 
-    def _extract_content_before_tools(self, current_text: str, delta_text: str, tool_start: int) -> str | None:
-        """Extract content that appears before tool calls.
+                rem = current_text[self._cursor :]
+                hold = _trailing_prefix_len(rem, self.tool_call_start_token)
+                safe_end = len(current_text) - hold
+                if safe_end > self._cursor:
+                    content_parts.append(current_text[self._cursor : safe_end])
+                    self._cursor = safe_end
+                scan_tail = current_text[self._scan_pos :]
+                max_marker_hold = max(
+                    _trailing_prefix_len(scan_tail, "<think>"),
+                    _trailing_prefix_len(scan_tail, self.tool_call_start_token),
+                )
+                self._scan_pos = max(self._scan_pos, len(current_text) - max_marker_hold)
+                self.in_thinking_tag = False
+                break
 
-        Determines if the current delta contains content before the
-        tool calls section begins.
+            # Inside an open <tool_calls> block: advance incrementally to find </tool_calls>.
+            end_tool = self._find_open_block_end_incremental(current_text)
+            body_start = self._open_block_start + len(self.tool_call_start_token)
+            closed = end_tool != -1
+            body = current_text[body_start : end_tool if closed else len(current_text)]
+            decoded = self._decode_block_calls_streaming(body, closed=closed)
+            block_calls: list[dict] = []
+            last_complete = False
+            for call_obj, call_complete in decoded:
+                name = call_obj.get("name")
+                if isinstance(name, str) and name:
+                    block_calls.append(call_obj)
+                    last_complete = call_complete
+            if block_calls:
+                tool_deltas.extend(self._emit_active_block_deltas(block_calls, last_complete=last_complete))
 
-        Args:
-            current_text: Current accumulated text.
-            delta_text: New delta text.
-            tool_start: Start position of tools section.
+            if closed:
+                self._closed_call_count += len(self._active_block_ids)
+                self._active_block_prev = []
+                self._active_block_sent = []
+                self._active_block_ids = []
+                end_after_tag = end_tool + len(self.tool_call_end_token)
+                self._cursor = end_after_tag
+                self._scan_pos = end_after_tag
+                self._open_block_start = None
+                self._in_open_tool_block = False
+                continue
+            break
 
-        Returns:
-            Content before tools or None if delta is within tools section.
-        """
-        if tool_start > 0:
-            delta_start_pos = len(current_text) - len(delta_text)
-            if delta_start_pos < tool_start:
-                content_part = delta_text
-                if delta_start_pos + len(delta_text) > tool_start:
-                    content_part = delta_text[: tool_start - delta_start_pos]
-                return content_part if content_part else None
+        content = "".join(content_parts)
+        if content or tool_deltas:
+            return DeltaMessage(content=content or None, tool_calls=tool_deltas or None)
         return None
-
-    def _extract_tool_content(self, current_text: str, tool_start: int) -> str:
-        """Extract tool content from current text starting at tool_start.
-
-        Gets the content between tool call start and end tokens.
-
-        Args:
-            current_text: Current accumulated text.
-            tool_start: Start position of tool calls section.
-
-        Returns:
-            Extracted tool content between delimiters.
-        """
-        tool_content_start = tool_start + len(self.tool_call_start_token)
-        tool_content = current_text[tool_content_start:]
-
-        end_pos = tool_content.find(self.tool_call_end_token)
-        if end_pos != -1:
-            tool_content = tool_content[:end_pos]
-
-        return tool_content

@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
+import errno
 import gc
 import inspect
 import json
@@ -69,11 +70,13 @@ import tempfile
 import time
 import typing as tp
 import warnings
+import weakref
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 
 import huggingface_hub
+import huggingface_hub.constants
 import huggingface_hub.errors
 import jax
 import numpy as np
@@ -285,6 +288,396 @@ def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
     return decode
 
 
+def _is_gcs_uri(path: tp.Any) -> bool:
+    """Return whether ``path`` names a Google Cloud Storage location.
+
+    Args:
+        path: Any string or path-like value.
+
+    Returns:
+        bool: ``True`` for ``gs://`` URIs.
+    """
+    return str(path).startswith("gs://")
+
+
+def _gcs_object_uri(source: str | os.PathLike, filename: str, subfolder: str = "") -> str:
+    """Build the URI of one file inside a ``gs://`` checkpoint directory.
+
+    Args:
+        source: Checkpoint root URI (``gs://bucket/prefix``).
+        filename: Checkpoint-relative filename. Indexes in the wild may already
+            prefix the subfolder; that prefix is not repeated.
+        subfolder: Optional checkpoint subfolder.
+
+    Returns:
+        str: ``<source>[/<subfolder>]/<filename>``.
+    """
+    effective_subfolder = str(subfolder or "").strip("/").replace("\\", "/")
+    if effective_subfolder and filename.startswith(effective_subfolder + "/"):
+        filename = filename[len(effective_subfolder) + 1 :]
+    base = str(source).rstrip("/")
+    if effective_subfolder:
+        base = f"{base}/{effective_subfolder}"
+    return f"{base}/{filename}"
+
+
+# Bytes that staging a gs:// object must leave free on its disk. Staging defaults to the system temp dir, often on a
+# small root disk, and a full root disk breaks every other process on the host -- not just this load.
+_STAGING_MIN_FREE_BYTES = 1 << 30
+
+
+def _ensure_staging_space(uri: str, dest_dir: str) -> None:
+    """Refuse to stage ``uri`` into ``dest_dir`` when the copy would leave its disk (almost) full.
+
+    Args:
+        uri: Object URI.
+        dest_dir: Existing local directory about to receive the object.
+
+    Raises:
+        FileNotFoundError: If the object does not exist.
+        OSError: ``ENOSPC`` when the disk holding ``dest_dir`` has less free space than the object's size
+            plus ``_STAGING_MIN_FREE_BYTES``.
+    """
+    from google.api_core import exceptions as google_exceptions
+
+    blob = ePath(uri).blob
+    try:
+        blob.reload()
+    except google_exceptions.NotFound as exc:
+        raise FileNotFoundError(f"No such object: {uri}") from exc
+    size = int(blob.size or 0)
+    free = shutil.disk_usage(dest_dir).free
+    if size + _STAGING_MIN_FREE_BYTES > free:
+        raise OSError(
+            errno.ENOSPC,
+            f"Not staging {uri} ({size / 2**30:.2f} GiB) into {dest_dir!r}: its disk has {free / 2**30:.2f} GiB "
+            f"free and staging leaves at least {_STAGING_MIN_FREE_BYTES / 2**30:.0f} GiB free. Pass "
+            "torch_streaming_tmp_dir= pointing at a disk with room for the staged shards (two at a time).",
+        )
+
+
+def _fetch_gcs_object(uri: str, local_path: str, *, use_cli: bool = True) -> None:
+    """Download one ``gs://`` object to a local file.
+
+    Fast path: ``gcloud storage cp`` does a parallel/chunked transfer and
+    measured 877 MB/s against ePath's single-stream 115 MB/s on a 3.5 GB shard
+    (7.6x) -- ~22 minutes over a 48-shard model. It is the modern replacement
+    for ``gsutil``, which aborts on multi-GB objects when its compiled
+    ``crcmod`` is missing. ePath stays the fallback so nothing depends on a CLI
+    being installed; it exposes whole-object reads only, so the object lands in
+    memory once before being written. Transient failures (HTTP 429/5xx, dropped
+    connections) are retried by the storage client's default retry policy before
+    the ePath read raises; nothing here retries again.
+
+    Args:
+        uri: Object URI.
+        local_path: Destination file; its directory must exist.
+        use_cli: Try ``gcloud storage cp`` first. Pass ``False`` for small
+            metadata files, where one ePath read is cheaper than starting the CLI.
+
+    Raises:
+        FileNotFoundError: Only when the object does not exist (the storage API
+            answers 404). Callers probe lists of candidate filenames and read
+            this one error as "absent".
+        Exception: Any other failure -- permission denied, a server or network
+            error that outlived the client's retries, missing credentials --
+            propagates as the storage client raised it, so it is never mistaken
+            for a missing file.
+    """
+    from google.api_core import exceptions as google_exceptions
+
+    if use_cli:
+        _ensure_staging_space(uri, os.path.dirname(os.path.abspath(local_path)))
+    try:
+        if use_cli and shutil.which("gcloud") is not None:
+            try:
+                result = subprocess.run(
+                    ["gcloud", "storage", "cp", uri, local_path],
+                    capture_output=True,
+                    check=False,
+                )
+            except OSError as exc:
+                # A CLI that cannot even start must not surface as a FileNotFoundError ("no such object").
+                logger.debug(f"gcloud storage cp could not run ({exc}); reading {uri} through ePath.")
+            else:
+                if result.returncode == 0 and os.path.exists(local_path):
+                    return
+                # The CLI's exit code does not tell a missing object from any other failure; the ePath read
+                # below raises the storage API's own error, which does.
+                logger.debug(f"gcloud storage cp {uri} failed ({result.returncode}): {result.stderr[-500:]!r}")
+        try:
+            payload = ePath(uri).read_bytes()
+        except google_exceptions.NotFound as exc:
+            raise FileNotFoundError(f"No such object: {uri}") from exc
+        with open(local_path, "wb") as dst:
+            dst.write(payload)
+    except BaseException as exc:
+        # A failed CLI transfer or write can leave a partial file; no later reader may take it for the object.
+        with contextlib.suppress(OSError):
+            os.remove(local_path)
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            raise OSError(
+                errno.ENOSPC,
+                f"No space left on device while staging {uri} into {os.path.dirname(local_path)!r}. Free space "
+                "there, or pass torch_streaming_tmp_dir= on a disk with room for the staged shards.",
+            ) from exc
+        raise
+
+
+def _copy_gcs_file(
+    source: str | os.PathLike,
+    filename: str,
+    dest_dir: str,
+    *,
+    subfolder: str = "",
+    use_cli: bool = True,
+) -> str:
+    """Stage one file of a ``gs://`` checkpoint into a local directory.
+
+    Args:
+        source: Checkpoint root URI.
+        filename: Checkpoint-relative filename.
+        dest_dir: Local directory, created when missing.
+        subfolder: Optional checkpoint subfolder.
+        use_cli: Forwarded to :func:`_fetch_gcs_object`.
+
+    Returns:
+        str: Local path of the copy, ``dest_dir/<basename of filename>``.
+
+    Raises:
+        FileNotFoundError: If the object does not exist. Every other failure
+            propagates unchanged (see :func:`_fetch_gcs_object`).
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    local_path = os.path.join(dest_dir, os.path.basename(filename))
+    _fetch_gcs_object(_gcs_object_uri(source, filename, subfolder), local_path, use_cli=use_cli)
+    return local_path
+
+
+def _discover_gcs_weight_files(
+    source: str | os.PathLike,
+    dest_dir: str,
+    *,
+    subfolder: str = "",
+) -> tuple[tp.Literal["safetensors", "bin"] | None, str | None, str | None]:
+    """Stage the weight entry point of a ``gs://`` checkpoint.
+
+    Candidates are probed in the same precedence as local and Hub sources:
+    ``model.safetensors.index.json``, ``pytorch_model.bin.index.json``,
+    ``model.safetensors``, ``pytorch_model.bin``.
+
+    Args:
+        source: Checkpoint root URI.
+        dest_dir: Local directory receiving the staged file.
+        subfolder: Optional checkpoint subfolder.
+
+    Returns:
+        ``(weight_format, index_path, single_file_path)``. On a hit exactly one
+        of the two paths is set; everything is ``None`` when nothing was found.
+
+    Raises:
+        Exception: A probe failed for a reason other than the candidate's absence
+            (permission denied, a server or network error); such a failure is
+            never taken to mean that the candidate is missing.
+    """
+    candidates: tuple[tuple[str, tp.Literal["safetensors", "bin"], bool], ...] = (
+        (SAFE_WEIGHTS_INDEX_NAME, "safetensors", True),
+        (WEIGHTS_INDEX_NAME, "bin", True),
+        (SAFE_WEIGHTS_NAME, "safetensors", False),
+        (WEIGHTS_NAME, "bin", False),
+    )
+    for filename, weight_format, is_index in candidates:
+        try:
+            # Index files are small: one ePath read beats starting the CLI; single-file payloads are not.
+            local_path = _copy_gcs_file(source, filename, dest_dir, subfolder=subfolder, use_cli=not is_index)
+        except FileNotFoundError:
+            continue
+        return weight_format, (local_path if is_index else None), (None if is_index else local_path)
+    return None, None, None
+
+
+# Shards of a gs:// checkpoint the streaming loader keeps on local disk at once.
+# The streaming converter visits shards once, in order, and assembles groups
+# that span shard files (MoE experts, reform fusions) during that single pass,
+# so besides the shard being converted it only ever opens a sibling for a
+# tensor stored across a boundary -- typically a quantization scale in the next
+# shard. Two staged shards cover that without re-downloading either one, at
+# ~2 shards of disk (~10 GiB at 5 GiB/shard).
+_GCS_MAX_STAGED_SHARDS = 2
+
+
+class _GCSShardStager:
+    """Bounded local staging of the shards of a ``gs://`` checkpoint.
+
+    The streaming converter reads shards through local paths (``safe_open`` /
+    ``torch.load``), so each remote shard is copied into one per-process
+    directory created under ``tmp_dir`` (the system temp dir otherwise). At most
+    ``max_staged`` shards stay on disk: before another is fetched, the least
+    recently used shard that is not open is deleted, and a later read of an
+    evicted shard fetches it again -- e.g. a quantization scale stored in a
+    shard that was already converted and evicted. An open shard is never
+    deleted, so when every staged shard is open a nested read briefly exceeds
+    the budget by one.
+    :meth:`close` deletes the whole directory; it also runs when the stager is
+    garbage-collected or the interpreter exits.
+
+    Attributes:
+        source: Checkpoint root URI.
+        subfolder: Checkpoint subfolder within ``source``.
+        max_staged: Shards kept on disk at once.
+        root: Per-process staging directory.
+        metadata_dir: Directory for the staged index or single-file payload,
+            kept outside the shard budget until :meth:`close`.
+    """
+
+    def __init__(
+        self,
+        source: str | os.PathLike,
+        *,
+        subfolder: str = "",
+        tmp_dir: str | os.PathLike | None = None,
+        max_staged: int | None = None,
+    ) -> None:
+        """Create the per-process staging directory.
+
+        Args:
+            source: Checkpoint root URI (``gs://bucket/prefix``).
+            subfolder: Checkpoint subfolder within ``source``.
+            tmp_dir: Parent of the staging directory, created when missing;
+                ``None`` uses the system temp dir.
+            max_staged: Shards kept on disk at once (at least one). ``None``
+                uses ``_GCS_MAX_STAGED_SHARDS``.
+
+        Raises:
+            NotADirectoryError: If ``tmp_dir`` is an existing file.
+        """
+        self.source = str(source)
+        self.subfolder = str(subfolder or "")
+        self.max_staged = max(1, int(_GCS_MAX_STAGED_SHARDS if max_staged is None else max_staged))
+        if tmp_dir is not None:
+            tmp_dir = os.fspath(tmp_dir)
+            if os.path.isfile(tmp_dir):
+                raise NotADirectoryError(f"torch_streaming_tmp_dir points to a file: {tmp_dir!r}")
+            os.makedirs(tmp_dir, exist_ok=True)
+        # One directory per process: every host stages its own copies, and
+        # processes sharing a filesystem never collide.
+        self.root = tempfile.mkdtemp(prefix=f"easydel-gcs-shards-{os.getpid()}-", dir=tmp_dir)
+        self.metadata_dir = os.path.join(self.root, "metadata")
+        self._staged: collections.OrderedDict[str, tuple[str, str]] = collections.OrderedDict()
+        self._open: collections.Counter[str] = collections.Counter()
+        self._serial = 0
+        self._cleanup = weakref.finalize(self, shutil.rmtree, self.root, ignore_errors=True)
+
+    def acquire(self, filename: str) -> str:
+        """Stage ``filename`` when it is not on disk, and mark it open.
+
+        Args:
+            filename: Checkpoint-relative shard filename.
+
+        Returns:
+            str: Local path, valid until the matching :meth:`release`.
+
+        Raises:
+            FileNotFoundError: If the shard does not exist in the bucket. Every other
+                read failure propagates unchanged.
+            RuntimeError: If the stager was already closed.
+        """
+        if not self._cleanup.alive:
+            raise RuntimeError(f"GCS shard stager for {self.source!r} is closed.")
+        entry = self._staged.get(filename)
+        if entry is not None and os.path.isfile(entry[1]):
+            self._staged.move_to_end(filename)
+        else:
+            if entry is not None:
+                self._discard(filename)
+            self._evict(incoming=1)
+            shard_dir = os.path.join(self.root, f"shard-{self._serial:05d}")
+            self._serial += 1
+            try:
+                path = _copy_gcs_file(self.source, filename, shard_dir, subfolder=self.subfolder)
+            except FileNotFoundError as exc:
+                shutil.rmtree(shard_dir, ignore_errors=True)
+                uri = _gcs_object_uri(self.source, filename, self.subfolder)
+                raise FileNotFoundError(
+                    f"The checkpoint index lists {filename}, but {uri} does not exist: the checkpoint is incomplete."
+                ) from exc
+            except BaseException:
+                shutil.rmtree(shard_dir, ignore_errors=True)
+                raise
+            entry = (shard_dir, path)
+            self._staged[filename] = entry
+        self._open[filename] += 1
+        return entry[1]
+
+    def release(self, filename: str) -> None:
+        """Close one use of ``filename``, then enforce the shard budget.
+
+        Args:
+            filename: A filename previously passed to :meth:`acquire`.
+        """
+        self._open[filename] -= 1
+        if self._open[filename] <= 0:
+            del self._open[filename]
+        self._evict(incoming=0)
+
+    @contextlib.contextmanager
+    def staged(self, filename: str) -> collections.abc.Iterator[str]:
+        """Hold a staged shard open for the duration of a ``with`` block.
+
+        Args:
+            filename: Checkpoint-relative shard filename.
+
+        Yields:
+            str: Local path of the staged shard.
+        """
+        path = self.acquire(filename)
+        try:
+            yield path
+        finally:
+            self.release(filename)
+
+    def resolve(self, filename: str, cache_dir_override: str | None = None) -> str:
+        """Adapter for :attr:`StreamingCheckpointInfo.resolve_shard`.
+
+        Args:
+            filename: Checkpoint-relative shard filename.
+            cache_dir_override: Ignored; every shard is staged under :attr:`root`.
+
+        Returns:
+            str: Local path, valid until enough other shards are staged to evict it.
+        """
+        path = self.acquire(filename)
+        self.release(filename)
+        return path
+
+    def close(self) -> None:
+        """Delete every staged file and the staging directory. Idempotent."""
+        self._staged.clear()
+        self._open.clear()
+        self._cleanup()
+
+    def _evict(self, *, incoming: int) -> None:
+        """Delete least recently used, unopened shards until ``incoming`` more fit the budget.
+
+        Args:
+            incoming: Number of shards about to be staged.
+        """
+        for filename in list(self._staged):
+            if len(self._staged) + incoming <= self.max_staged:
+                return
+            if not self._open[filename]:
+                self._discard(filename)
+
+    def _discard(self, filename: str) -> None:
+        """Forget ``filename`` and delete its staged copy.
+
+        Args:
+            filename: A currently staged shard filename.
+        """
+        shard_dir, _ = self._staged.pop(filename)
+        shutil.rmtree(shard_dir, ignore_errors=True)
+
+
 def stage_remote_metadata(
     pretrained_model_name_or_path: str | os.PathLike,
     *,
@@ -316,23 +709,23 @@ def stage_remote_metadata(
     Raises:
         FileNotFoundError: If the first entry of ``filenames`` is absent.
     """
-    if not str(pretrained_model_name_or_path).startswith("gs://"):
+    if not _is_gcs_uri(pretrained_model_name_or_path):
         return pretrained_model_name_or_path, None
 
     tmp = tempfile.TemporaryDirectory()
-    base = str(pretrained_model_name_or_path).rstrip("/")
-    normalized = str(subfolder or "").strip("/").replace("\\", "/")
-    if normalized:
-        base = f"{base}/{normalized}"
-    for index, filename in enumerate(filenames):
-        source = ePath(f"{base}/{filename}")
-        try:
-            payload = source.read_bytes()
-        except Exception as exc:
-            if index == 0:
-                raise FileNotFoundError(f"{filename} not found under {base!r}") from exc
-            continue
-        ePath(os.path.join(tmp.name, os.path.basename(filename))).write_bytes(payload)
+    try:
+        for index, filename in enumerate(filenames):
+            try:
+                # A few KB each: one ePath read is cheaper than starting the gcloud CLI.
+                _copy_gcs_file(pretrained_model_name_or_path, filename, tmp.name, subfolder=subfolder, use_cli=False)
+            except FileNotFoundError as exc:
+                if index == 0:
+                    base = _gcs_object_uri(pretrained_model_name_or_path, "", subfolder).rstrip("/")
+                    raise FileNotFoundError(f"{filename} not found under {base!r}") from exc
+    except BaseException:
+        # A missing config, a denied or failed read, or an interrupt: nothing staged outlives the call.
+        tmp.cleanup()
+        raise
     return tmp.name, tmp
 
 
@@ -894,12 +1287,16 @@ class StreamingCheckpointInfo:
         generation_config: Optional ``transformers.GenerationConfig``-like
             object discovered alongside the model. ``None`` when the
             checkpoint doesn't ship one.
-        pretrained_model_name_or_path: Original Hub repo id or local path
-            the user passed in. Used for logging and for any follow-up
-            shard fetches that need to re-resolve the source.
+        pretrained_model_name_or_path: Original Hub repo id, local path or
+            ``gs://`` URI the user passed in. Used for logging and for any
+            follow-up shard fetches that need to re-resolve the source.
         resolve_shard: Callable accepting ``(filename, optional_subfolder)``
             that returns a usable local path to that shard, transparently
             downloading if the shard hasn't been seen yet.
+        shard_stager: Bounded local staging of the shards of a ``gs://``
+            source, ``None`` otherwise. Its paths are only valid while a shard
+            is held open, so they are never recorded in
+            ``ckpt_filename_to_path``; the caller closes it after conversion.
     """
 
     ckpt_weight_format: tp.Literal["safetensors", "bin"]
@@ -909,6 +1306,7 @@ class StreamingCheckpointInfo:
     generation_config: tp.Any
     pretrained_model_name_or_path: str
     resolve_shard: tp.Callable[[str, str | None], str]
+    shard_stager: _GCSShardStager | None = None
 
 
 def _save_generation_config(generation_config: tp.Any, save_directory: ePathLike) -> None:
@@ -1106,6 +1504,172 @@ def _strip_trailing_separators(path: str) -> str:
     while path.endswith("/") or path.endswith("\\"):
         path = path[:-1]
     return path
+
+
+def _path_to_str(path: tp.Any) -> str:
+    """Return the string form of a local path, ``os.PathLike`` or ePath object.
+
+    Args:
+        path: A ``str``, an ``os.PathLike`` (local ePath objects included) or a
+            remote ePath object such as ``GCSPath``, which is not ``os.PathLike``.
+
+    Returns:
+        str: The path string, e.g. ``"gs://bucket/prefix"`` or ``"/data/model"``.
+    """
+    try:
+        return os.fspath(path)
+    except TypeError:
+        return str(path)
+
+
+# Tokenizer, processor and chat-template files a converted checkpoint carries over from its source. Tokenizer
+# modules named in a config's ``auto_map`` (``trust_remote_code`` tokenizers such as Kimi's) are not copied yet.
+_TOKENIZER_ARTIFACT_NAMES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "tiktoken.model",
+    "tekken.json",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "chat_template.json",
+    "processor_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+)
+
+
+def _stage_checkpoint_artifact(
+    source: str,
+    filename: str,
+    staging_dir: str,
+    *,
+    subfolder: str,
+    hub_kwargs: collections.abc.Mapping[str, tp.Any],
+) -> str | None:
+    """Return a local copy of one small checkpoint file, or ``None`` when the source lacks it.
+
+    Args:
+        source: Hub repo id, local directory or ``gs://`` URI of the checkpoint.
+        filename: Checkpoint-relative filename.
+        staging_dir: Local directory receiving ``gs://`` downloads.
+        subfolder: Checkpoint subfolder.
+        hub_kwargs: Hub download options (``cache_dir``, ``revision``, ``token``,
+            ``local_files_only``, ``force_download``, ``proxies``).
+
+    Returns:
+        str | None: Local path of the file, or ``None`` when the source has no such file.
+    """
+    if _is_gcs_uri(source):
+        try:
+            return _copy_gcs_file(source, filename, staging_dir, subfolder=subfolder, use_cli=False)
+        except FileNotFoundError:
+            return None
+    if os.path.isdir(source):
+        return _find_local_file(source, filename, subfolder)
+    try:
+        return _hf_download_file(
+            source,
+            filename,
+            subfolder=subfolder,
+            revision=hub_kwargs.get("revision"),
+            cache_dir=hub_kwargs.get("cache_dir"),
+            force_download=bool(hub_kwargs.get("force_download", False)),
+            proxies=hub_kwargs.get("proxies"),
+            token=hub_kwargs.get("token"),
+            local_files_only=bool(hub_kwargs.get("local_files_only", False)),
+        )
+    except huggingface_hub.errors.LocalEntryNotFoundError:
+        # Raised both for a file missing from the local cache in offline use and for a Hub that could not be
+        # reached; only the former means the file is absent.
+        if hub_kwargs.get("local_files_only") or huggingface_hub.constants.HF_HUB_OFFLINE:
+            return None
+        raise
+    except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+        return None
+
+
+def _copy_tokenizer_artifacts(
+    source: str | os.PathLike,
+    destination: str | os.PathLike,
+    *,
+    subfolder: str = "",
+    hub_kwargs: collections.abc.Mapping[str, tp.Any] | None = None,
+) -> list[str]:
+    """Copy the tokenizer, processor and chat-template files present at ``source`` into ``destination``.
+
+    Args:
+        source: Hub repo id, local directory or ``gs://`` URI of the source checkpoint.
+        destination: Local directory or ``gs://`` URI receiving the copies.
+        subfolder: Checkpoint subfolder within ``source``.
+        hub_kwargs: Hub download options used when ``source`` is a Hub repo id.
+
+    Returns:
+        list[str]: The copied filenames, in ``_TOKENIZER_ARTIFACT_NAMES`` order. Files
+        the source lacks are skipped; a file that exists but cannot be read is skipped
+        with a warning, since the weights are already saved by then.
+    """
+    source = _path_to_str(source)
+    destination_root = ePath(_path_to_str(destination))
+    hub_kwargs = hub_kwargs or {}
+    copied: list[str] = []
+    with tempfile.TemporaryDirectory() as staging_dir:
+        for filename in _TOKENIZER_ARTIFACT_NAMES:
+            try:
+                local_path = _stage_checkpoint_artifact(
+                    source, filename, staging_dir, subfolder=subfolder, hub_kwargs=hub_kwargs
+                )
+            except Exception as exc:
+                logger.warning(f"Not copying {filename}: reading it from {source!r} failed ({exc}).")
+                continue
+            if local_path is None:
+                continue
+            with open(local_path, "rb") as handle:
+                payload = handle.read()
+            try:
+                (destination_root / filename).write_bytes(payload)
+            except Exception as exc:
+                # Only process 0 copies these files: raising here would leave the other processes, which return
+                # from from_pretrained normally, waiting in their next collective. Warn like a failed read.
+                logger.warning(f"Not copying {filename}: writing it to {destination_root} failed ({exc}).")
+                continue
+            copied.append(filename)
+    return copied
+
+
+def _save_converted_checkpoint(
+    model: tp.Any,
+    save_directory: str,
+    *,
+    source: str | os.PathLike,
+    subfolder: str = "",
+    hub_kwargs: collections.abc.Mapping[str, tp.Any] | None = None,
+) -> None:
+    """Write a freshly converted model as a native EasyDeL checkpoint, with its tokenizer files.
+
+    ``save_pretrained`` is collective -- every JAX process writes its own array
+    shards and process 0 the metadata -- so this must run on every process; only
+    process 0 copies the tokenizer files.
+
+    Args:
+        model: The converted model.
+        save_directory: Local directory or ``gs://`` URI.
+        source: The checkpoint the model was converted from.
+        subfolder: Checkpoint subfolder within ``source``.
+        hub_kwargs: Hub download options used when ``source`` is a Hub repo id.
+    """
+    logger.info(f"Saving the converted EasyDeL checkpoint to {save_directory}")
+    model.save_pretrained(save_directory)
+    if jax.process_index() != 0:
+        return
+    copied = _copy_tokenizer_artifacts(source, save_directory, subfolder=subfolder, hub_kwargs=hub_kwargs)
+    logger.info(f"Copied {len(copied)} tokenizer/processor file(s) to {save_directory}: {', '.join(copied) or '-'}")
 
 
 class EasyBridgeMixin(PushToHubMixin):
@@ -2854,6 +3418,7 @@ class EasyBridgeMixin(PushToHubMixin):
         quantization_config: QuantizationConfig | None = None,
         apply_quantization: bool = False,
         verbose: bool = True,
+        converted_save_directory: str | os.PathLike | None = None,
         **kwargs,
     ):
         """Loads an EasyDeL model from a PyTorch pretrained checkpoint.
@@ -2862,9 +3427,15 @@ class EasyBridgeMixin(PushToHubMixin):
         Supports both full loading (loads entire model into memory) and streaming loading
         (processes one shard at a time to reduce memory usage).
 
+        A Hugging Face-format checkpoint under a ``gs://`` URI is always loaded in streaming
+        mode, because transformers' full loader cannot read object-store URIs. Its config files
+        and weight index are staged locally; shards are staged on demand under
+        ``torch_streaming_tmp_dir`` (the system temp dir otherwise), a bounded few at a time,
+        and deleted after use. Every JAX process stages its own copies.
+
         Args:
-            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path
-                to the PyTorch checkpoint.
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID, local path, or
+                ``gs://`` URI of the PyTorch checkpoint.
             device (jax.Device | None): The JAX device for tensor placement. Defaults to None.
             dtype (jax.numpy.dtype): The data type for model computations.
                 Defaults to jax.numpy.float32.
@@ -2890,10 +3461,24 @@ class EasyBridgeMixin(PushToHubMixin):
                 Pass None to disable. Defaults to None.
             apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
             verbose (bool): Whether to print verbose messages. Defaults to True.
+            converted_save_directory (str | PathLike | None): When set, the converted model is
+                written there (local path or ``gs://`` URI) with ``save_pretrained`` as a native
+                EasyDeL checkpoint, so a later ``from_pretrained(converted_save_directory)``
+                takes the native loader. The save runs after conversion, merging,
+                materialization and layer re-stacking but before runtime quantization
+                (``quantization_config`` / ``apply_quantization``), so it holds the plain
+                converted weights. Tokenizer, processor and chat-template files present at the
+                source are copied next to it. The save is collective -- every JAX process writes
+                its own array shards and process 0 the metadata -- so every process must make
+                this call; only process 0 copies the tokenizer files. Defaults to None.
             **kwargs: Additional keyword arguments including:
-                - torch_load_mode (str): "full" or "streaming". Defaults to "streaming".
+                - torch_load_mode (str): "full" or "streaming". Defaults to "full". A ``gs://``
+                  source always streams; an explicit "full" for one warns and switches to
+                  "streaming".
                 - torch_streaming_cache (str): "hf_cache" or "temp". Defaults to "hf_cache".
-                - torch_streaming_tmp_dir (str): Temporary directory for streaming.
+                  Ignored for ``gs://`` sources, which always use bounded local staging.
+                - torch_streaming_tmp_dir (str): Temporary directory for streaming; also the
+                  parent directory of the staged shards of a ``gs://`` source.
                 - allow_missing_mtp_init (bool): If True, missing MTP-only
                   parameters are initialized from their module initializers after
                   checkpoint conversion. Any non-MTP missing parameter still
@@ -2906,6 +3491,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         Raises:
             ModuleNotFoundError: If PyTorch is not installed.
+            ValueError: If ``converted_save_directory`` names an existing file.
         """
         from transformers import AutoConfig
 
@@ -2929,22 +3515,43 @@ class EasyBridgeMixin(PushToHubMixin):
                 "in order to load model from torch you should install torch first run `pip install torch`"
             ) from er
 
+        if converted_save_directory is not None:
+            converted_save_directory = _path_to_str(converted_save_directory)
+            # Fail before an hours-long conversion rather than at the save, which skips file targets.
+            if ePath(converted_save_directory).is_file():
+                raise ValueError(
+                    f"converted_save_directory must be a directory, got the file {converted_save_directory!r}."
+                )
+        requested_load_mode = kwargs.get("torch_load_mode")
         load_options = _parse_torch_load_options(kwargs)
+        if _is_gcs_uri(pretrained_model_name_or_path) and load_options.mode != "streaming":
+            # transformers' full loader cannot read object-store URIs; streaming stages shards locally.
+            if requested_load_mode is not None:
+                warnings.warn(
+                    f"torch_load_mode={requested_load_mode!r} cannot read the gs:// checkpoint "
+                    f"{pretrained_model_name_or_path!r}; using torch_load_mode='streaming' instead.",
+                    stacklevel=2,
+                )
+            load_options.mode = "streaming"
         allow_missing_mtp_init = bool(kwargs.pop("allow_missing_mtp_init", False))
         trust_remote_code = kwargs.get("trust_remote_code", False)
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
         # `gs://` reaches here for HF-format checkpoints kept in a bucket; the
-        # hub resolver cannot parse an object-store URI, while the weight side
-        # below already streams shards through ePath.
+        # hub resolver cannot parse an object-store URI, so the config files are
+        # staged locally and the weights stream through a bounded shard stager.
         _config_source, _staged_meta = stage_remote_metadata(
             pretrained_model_name_or_path,
             subfolder=str(kwargs.get("subfolder", "") or ""),
         )
+        config_hub_kwargs = load_options.hub_kwargs
+        if _staged_meta is not None:
+            # The staged copies sit at the top of a temp dir: the subfolder is already applied.
+            config_hub_kwargs = {key: value for key, value in config_hub_kwargs.items() if key != "subfolder"}
         hf_config = AutoConfig.from_pretrained(
             _config_source,
             trust_remote_code=trust_remote_code,
-            **load_options.hub_kwargs,
+            **config_hub_kwargs,
         )
         model_type: str = hf_config.model_type
         config_class, module = get_modules_by_type(model_type, task_type=cls._model_task)
@@ -2970,6 +3577,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 config_class=config_class,
                 hub_kwargs=load_options.hub_kwargs,
                 kwargs=kwargs,
+                streaming_tmp_dir=load_options.streaming_tmp_dir,
             )
             ed_config = ckpt_info.ed_config
             generation_config = ckpt_info.generation_config
@@ -3026,7 +3634,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 shard_fns = flatten_dict(shard_fns)
         elif auto_shard_model:
             shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
-                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                # The staged metadata copy for a gs:// source; the source itself otherwise.
+                pretrained_model_name_or_path=_config_source,
                 sharding_axis_dims=sharding_axis_dims,
                 sharding_dcn_axis_dims=sharding_dcn_axis_dims,
                 sharding_axis_names=sharding_axis_names,
@@ -3070,16 +3679,20 @@ class EasyBridgeMixin(PushToHubMixin):
             if ckpt_info is None:
                 raise RuntimeError("torch_load_mode='streaming' was selected but no checkpoint info was resolved.")
 
-            parameters_flat = cls._convert_streaming_checkpoint_to_params(
-                model=model,
-                ckpt_info=ckpt_info,
-                hf_config=hf_config,
-                load_options=load_options,
-                shard_fns=passed_shard_fns,
-                callback=callback,
-                device=device,
-                clear_fn=_clear,
-            )
+            try:
+                parameters_flat = cls._convert_streaming_checkpoint_to_params(
+                    model=model,
+                    ckpt_info=ckpt_info,
+                    hf_config=hf_config,
+                    load_options=load_options,
+                    shard_fns=passed_shard_fns,
+                    callback=callback,
+                    device=device,
+                    clear_fn=_clear,
+                )
+            finally:
+                if ckpt_info.shard_stager is not None:
+                    ckpt_info.shard_stager.close()
             parameters_flat = cls._fill_tied_lm_head_from_embeddings(model, parameters_flat)
             params = unflatten_dict(parameters_flat)
 
@@ -3100,6 +3713,16 @@ class EasyBridgeMixin(PushToHubMixin):
             # Eager stacking drops the per-layer mesh placement; re-place the stacked leaves on the mesh.
             model = _restack_layer_containers(model, stacked_layer_paths).shard_model()
         logger.debug("model and parameters pytree merged.")
+
+        if converted_save_directory is not None:
+            # Before runtime quantization, so the checkpoint holds the plain converted weights.
+            _save_converted_checkpoint(
+                model,
+                converted_save_directory,
+                source=pretrained_model_name_or_path,
+                subfolder=str(kwargs.get("subfolder", "") or ""),
+                hub_kwargs=load_options.hub_kwargs,
+            )
 
         model = model.quantize(
             quantization_config=quantization_config,
@@ -3304,12 +3927,100 @@ class EasyBridgeMixin(PushToHubMixin):
         return model
 
     @classmethod
+    def _resolve_gcs_streaming_checkpoint(
+        cls,
+        pretrained_model_name_or_path: str,
+        *,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        subfolder: str = "",
+        streaming_tmp_dir: str | os.PathLike | None = None,
+    ) -> StreamingCheckpointInfo:
+        """Resolve a Hugging Face-format checkpoint stored under a ``gs://`` URI for streaming.
+
+        The weight index (or the lone single-file payload) and the config files
+        are staged into the stager's metadata directory; shards are staged
+        lazily, a bounded number at a time, while the converter reads them.
+
+        Args:
+            pretrained_model_name_or_path: Checkpoint root URI (``gs://bucket/prefix``).
+            config_class: The EasyDeL config class used to read ``config.json``.
+            hub_kwargs: Hub options; forwarded to the config readers, minus
+                ``subfolder``, which the staging already applied.
+            subfolder: Checkpoint subfolder within the URI.
+            streaming_tmp_dir: Parent directory for the local shard copies (the
+                system temp dir when ``None``).
+
+        Returns:
+            StreamingCheckpointInfo: Info whose ``shard_stager`` owns the local
+            copies; the caller closes it once conversion is done.
+
+        Raises:
+            FileNotFoundError: If no weight entry point or no ``config.json`` exists.
+            ValueError: If the shard index file is invalid (missing weight_map).
+        """
+        stager = _GCSShardStager(pretrained_model_name_or_path, subfolder=subfolder, tmp_dir=streaming_tmp_dir)
+        try:
+            ckpt_weight_format, index_file, single_file = _discover_gcs_weight_files(
+                pretrained_model_name_or_path, stager.metadata_dir, subfolder=subfolder
+            )
+            if ckpt_weight_format is None:
+                raise FileNotFoundError(
+                    f"Couldn't locate a PyTorch checkpoint to convert under {pretrained_model_name_or_path!r}. "
+                    f"Expected one of: {SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, {WEIGHTS_INDEX_NAME}, "
+                    f"{WEIGHTS_NAME}"
+                )
+            ckpt_key_to_filename: dict[str, str] = {}
+            ckpt_filename_to_path: dict[str, str] = {}
+            if index_file is not None:
+                weight_map = _load_json_index(index_file).get("weight_map") or {}
+                if not weight_map:
+                    raise ValueError(f"Invalid shard index file (missing weight_map): {index_file}")
+                # Shard paths stay unrecorded: a staged copy is deleted once evicted.
+                ckpt_key_to_filename = dict(weight_map)
+            else:
+                # The lone payload is staged beside the index, outside the shard budget.
+                single_name = SAFE_WEIGHTS_NAME if ckpt_weight_format == "safetensors" else WEIGHTS_NAME
+                ckpt_filename_to_path[single_name] = single_file
+            # The config readers take Hub ids and local directories, not object-store URIs.
+            for filename in (CONFIG_NAME, GENERATION_CONFIG_NAME):
+                try:
+                    _copy_gcs_file(
+                        pretrained_model_name_or_path,
+                        filename,
+                        stager.metadata_dir,
+                        subfolder=subfolder,
+                        use_cli=False,
+                    )
+                except FileNotFoundError:
+                    if filename == CONFIG_NAME:
+                        raise
+            # The staged copies sit at the top of the metadata dir: the subfolder is already applied.
+            local_kwargs = {key: value for key, value in hub_kwargs.items() if key != "subfolder"}
+            ed_config = config_class.from_pretrained(stager.metadata_dir, **local_kwargs)
+            generation_config = _load_generation_config(stager.metadata_dir, **local_kwargs)
+        except BaseException:
+            stager.close()
+            raise
+        return StreamingCheckpointInfo(
+            ckpt_weight_format=ckpt_weight_format,
+            ckpt_key_to_filename=ckpt_key_to_filename,
+            ckpt_filename_to_path=ckpt_filename_to_path,
+            ed_config=ed_config,
+            generation_config=generation_config,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            resolve_shard=stager.resolve,
+            shard_stager=stager,
+        )
+
+    @classmethod
     def _resolve_streaming_checkpoint(
         cls,
         pretrained_model_name_or_path: str,
         config_class: type,
         hub_kwargs: dict[str, tp.Any],
         kwargs: dict[str, tp.Any],
+        streaming_tmp_dir: str | os.PathLike | None = None,
     ) -> StreamingCheckpointInfo:
         """Resolve checkpoint files for streaming mode, returning checkpoint info.
 
@@ -3318,23 +4029,37 @@ class EasyBridgeMixin(PushToHubMixin):
         into memory.
 
         Args:
-            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path.
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID, local path, or
+                ``gs://`` URI of a Hugging Face-format checkpoint.
             config_class (type): The EasyDeL config class to use for loading configuration.
             hub_kwargs (dict[str, Any]): Keyword arguments for HuggingFace Hub operations
                 (cache_dir, revision, token, etc.).
             kwargs (dict[str, Any]): Additional keyword arguments including revision, token,
                 local_files_only, force_download, proxies, subfolder, and cache_dir.
+            streaming_tmp_dir (str | PathLike | None): Parent directory for the local shard
+                copies of a ``gs://`` source (the system temp dir when ``None``). Unused for
+                local and Hub sources.
 
         Returns:
             StreamingCheckpointInfo: Metadata containing checkpoint format, key-to-file mappings,
                 resolved file paths, EasyDeL config, generation config, and a resolve_shard
-                callable for on-demand shard downloading.
+                callable for on-demand shard downloading. For a ``gs://`` source its
+                ``shard_stager`` owns the staged copies and must be closed by the caller.
 
         Raises:
             FileNotFoundError: If no valid PyTorch checkpoint files can be found.
             ValueError: If the shard index file is invalid (missing weight_map).
         """
         logger.debug(f"Resolving checkpoint files (streaming) for {pretrained_model_name_or_path}")
+
+        if _is_gcs_uri(pretrained_model_name_or_path):
+            return cls._resolve_gcs_streaming_checkpoint(
+                pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=hub_kwargs,
+                subfolder=str(kwargs.get("subfolder", "") or ""),
+                streaming_tmp_dir=streaming_tmp_dir,
+            )
 
         ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
         ckpt_key_to_filename: dict[str, str] = {}
@@ -3517,6 +4242,7 @@ class EasyBridgeMixin(PushToHubMixin):
         ckpt_filename_to_path = ckpt_info.ckpt_filename_to_path
         pretrained_model_name_or_path = ckpt_info.pretrained_model_name_or_path
         resolve_shard = ckpt_info.resolve_shard
+        shard_stager = ckpt_info.shard_stager
         torch_streaming_cache = load_options.streaming_cache
         torch_streaming_tmp_dir = load_options.streaming_tmp_dir
 
@@ -3780,6 +4506,14 @@ class EasyBridgeMixin(PushToHubMixin):
                 yield ckpt_filename_to_path[fname]
                 return
 
+            if shard_stager is not None:
+                # gs:// source: held open for the block, so the bounded staging
+                # never evicts it mid-read; its path is never recorded because a
+                # released copy may be deleted at any later fetch.
+                with shard_stager.staged(fname) as staged_path:
+                    yield staged_path
+                return
+
             if os.path.isdir(pretrained_model_name_or_path):
                 resolved = resolve_shard(fname, None)
                 ckpt_filename_to_path[fname] = resolved
@@ -3886,16 +4620,88 @@ class EasyBridgeMixin(PushToHubMixin):
 
             all_files = sorted(set(ckpt_key_to_filename.values()) | set(ckpt_filename_to_path.keys()))
 
+            # Revisiting a gs:// shard downloads it again, so for those sources the
+            # groups that span shard files -- experts and reform-fusion sources --
+            # are assembled during this single pass instead of the deferred passes
+            # below: each member is read while its own shard is staged, and a group
+            # is converted once its last member lands (typically in the next shard).
+            # Local and Hub sources keep the deferred passes.
+            split_expert_items: dict[str, list[tuple[str, int, str]]] = {}  # fname -> [(target, slot, key)]
+            split_expert_state: dict[str, list[tp.Any]] = {}  # target -> [stacked | None, missing, experts]
+            split_fusion_items: dict[str, list[tuple[str, str]]] = {}  # fname -> [(fused key, source key)]
+            split_fusion_pending: dict[str, dict[str, tp.Any]] = {}  # fused key -> {source key: tensor}
+            if shard_stager is not None:
+                for target_path, expert_key_by_idx in multi_file_moe_groups.items():
+                    expert_indices = sorted(expert_key_by_idx)
+                    if not expert_indices:
+                        continue
+                    split_expert_state[target_path] = [None, len(expert_indices), len(expert_indices)]
+                    for pos, expert_idx in enumerate(expert_indices):
+                        key = expert_key_by_idx[expert_idx]
+                        split_expert_items.setdefault(ckpt_key_to_filename[key], []).append((target_path, pos, key))
+                for fused_key, source_keys in multi_file_reform_fusion_groups.items():
+                    split_fusion_pending[fused_key] = {}
+                    for source_key in source_keys:
+                        source_file = ckpt_key_to_filename[source_key]
+                        split_fusion_items.setdefault(source_file, []).append((fused_key, source_key))
+                multi_file_moe_groups = {}
+                multi_file_reform_fusion_groups = {}
+
+            def _gather_split_groups(fname: str, getter) -> None:
+                """Collect the members of shard-spanning groups stored in *fname*; convert completed groups.
+
+                Args:
+                    fname: Shard currently open.
+                    getter: Reads one tensor of that shard by key.
+                """
+                for fused_key, source_key in split_fusion_items.get(fname, ()):
+                    pending = split_fusion_pending[fused_key]
+                    # Hold an owned copy: a safetensors tensor is a view of its shard's memory map, which would keep
+                    # an evicted (deleted) staged shard's disk blocks alive until the whole group arrives.
+                    held_source = _read_source(source_key, getter)
+                    pending[source_key] = held_source.clone() if hasattr(held_source, "clone") else held_source.copy()
+                    source_keys = reform_fusion_groups[fused_key]
+                    if not all(k in pending for k in source_keys):
+                        continue
+                    fused_tensor = StateDictConverter.fuse_reform_param_tensors(
+                        reform_fusion_rules[fused_key],
+                        [pending[k] for k in source_keys],
+                    )
+                    del split_fusion_pending[fused_key], pending
+                    _process_tensor(fused_key, fused_tensor, pre_normalized=True)
+                    del fused_tensor
+                    clear_fn()
+                for target_path, pos, key in split_expert_items.get(fname, ()):
+                    state = split_expert_state[target_path]
+                    tensor = _read_source(key, getter)
+                    if state[0] is None:
+                        state[0] = torch.empty((state[2], *tensor.shape), dtype=tensor.dtype, device=tensor.device)
+                    state[0][pos] = tensor
+                    del tensor
+                    state[1] -= 1
+                    if state[1] == 0:
+                        stacked_tensor = split_expert_state.pop(target_path)[0]
+                        _emit_stacked(f"{target_path}.weight", stacked_tensor)
+                        del stacked_tensor
+                        clear_fn()
+
             for fname in all_files:
                 non_moe_keys = file_to_non_moe_keys.get(fname, [])
                 reform_fusion_groups_for_file = file_to_reform_fusion_groups.get(fname, [])
                 moe_groups_for_file = file_to_moe_groups.get(fname, [])
-                if not non_moe_keys and not reform_fusion_groups_for_file and not moe_groups_for_file:
+                if (
+                    not non_moe_keys
+                    and not reform_fusion_groups_for_file
+                    and not moe_groups_for_file
+                    and not split_expert_items.get(fname)
+                    and not split_fusion_items.get(fname)
+                ):
                     continue
 
                 with _with_resolved_shard(fname) as resolved_path:
                     if ckpt_weight_format == "safetensors":
                         with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                            _gather_split_groups(fname, f.get_tensor)
                             for k in sorted(non_moe_keys):
                                 _process_tensor(k, _read_source(k, f.get_tensor))
 
@@ -3933,6 +4739,7 @@ class EasyBridgeMixin(PushToHubMixin):
                         except TypeError:
                             shard = torch.load(resolved_path, map_location="cpu")
 
+                        _gather_split_groups(fname, shard.__getitem__)
                         for k in sorted(non_moe_keys):
                             _process_tensor(k, _read_source(k, shard.__getitem__))
 
@@ -3966,6 +4773,12 @@ class EasyBridgeMixin(PushToHubMixin):
 
                         del shard
                         clear_fn()
+
+            if split_expert_state or split_fusion_pending:
+                raise RuntimeError(
+                    "Groups spanning shard files never received every member: "
+                    + ", ".join(sorted([*split_expert_state, *split_fusion_pending])[:10])
+                )
 
             if multi_file_reform_fusion_groups:
                 for fused_key, source_keys in sorted(multi_file_reform_fusion_groups.items()):
@@ -4432,68 +5245,31 @@ class EasyBridgeMixin(PushToHubMixin):
 
         hub_kwargs = _extract_hub_kwargs(kwargs)
 
-        gcs_source = str(pretrained_model_name_or_path).startswith("gs://")
+        gcs_source = _is_gcs_uri(pretrained_model_name_or_path)
         gcs_meta_tmp: tempfile.TemporaryDirectory[str] | None = None
         config_source = pretrained_model_name_or_path
+        gcs_subfolder = str(kwargs.get("subfolder", "") or "")
 
-        def _gcs_object_uri(filename: str) -> str:
-            effective_subfolder = str(kwargs.get("subfolder", "") or "").strip("/").replace("\\", "/")
-            if effective_subfolder and filename.startswith(effective_subfolder + "/"):
-                filename = filename[len(effective_subfolder) + 1 :]
-            base = str(pretrained_model_name_or_path).rstrip("/")
-            if effective_subfolder:
-                base = f"{base}/{effective_subfolder}"
-            return f"{base}/{filename}"
+        def _stage_gcs_file(filename: str, dest_dir: str) -> str:
+            """Stage one file of the ``gs://`` source into *dest_dir* (see :func:`_copy_gcs_file`).
 
-        def _copy_gcs_file(filename: str, dest_dir: str) -> str:
-            """Stage one remote object locally, streaming in chunks.
+            Args:
+                filename: Checkpoint-relative filename.
+                dest_dir: Local destination directory.
 
-            Uses ``ePath`` rather than shelling out to ``gsutil``: the repo's
-            GCS I/O goes through ``ePath`` everywhere else, and ``gsutil``
-            aborts on multi-GB objects when its compiled ``crcmod`` is missing
-            ("check_hashes" warning) -- which is every safetensors shard here,
-            so shard streaming failed on the first file.
+            Returns:
+                str: Local path of the staged copy.
 
-            ``ePath`` exposes whole-object reads only, so the shard lands in
-            memory once before being written; the streaming loader keeps just
-            one shard resident at a time, which is the point of staging it.
+            Raises:
+                FileNotFoundError: If the object cannot be read.
             """
-            os.makedirs(dest_dir, exist_ok=True)
-            local_path = os.path.join(dest_dir, os.path.basename(filename))
-            uri = _gcs_object_uri(filename)
-            # Fast path: `gcloud storage cp` does a parallel/chunked transfer
-            # and measured 877 MB/s against ePath's single-stream 115 MB/s on
-            # a 3.5 GB shard (7.6x) -- ~22 minutes over a 48-shard model. It is
-            # the modern replacement for `gsutil`, which is what used to be
-            # here and which aborts on multi-GB objects when its compiled
-            # crcmod is missing. ePath stays the fallback so nothing depends on
-            # a CLI being installed.
-            if shutil.which("gcloud") is not None:
-                result = subprocess.run(
-                    ["gcloud", "storage", "cp", uri, local_path],
-                    capture_output=True,
-                    check=False,
-                )
-                if result.returncode == 0 and os.path.exists(local_path):
-                    return local_path
-            try:
-                payload = ePath(uri).read_bytes()
-            except Exception as exc:
-                # Callers probe a list of candidate filenames and expect a
-                # miss to be catchable; surface one portable error rather than
-                # the storage backend's own (gsutil raised CalledProcessError,
-                # ePath raises google.api_core NotFound).
-                raise FileNotFoundError(uri) from exc
-            with open(local_path, "wb") as dst:
-                dst.write(payload)
-            del payload
-            return local_path
+            return _copy_gcs_file(pretrained_model_name_or_path, filename, dest_dir, subfolder=gcs_subfolder)
 
         if gcs_source:
             gcs_meta_tmp = tempfile.TemporaryDirectory()
-            _copy_gcs_file(CONFIG_NAME, gcs_meta_tmp.name)
+            _stage_gcs_file(CONFIG_NAME, gcs_meta_tmp.name)
             try:
-                _copy_gcs_file(GENERATION_CONFIG_NAME, gcs_meta_tmp.name)
+                _stage_gcs_file(GENERATION_CONFIG_NAME, gcs_meta_tmp.name)
             except FileNotFoundError:
                 pass
             config_source = gcs_meta_tmp.name
@@ -4694,32 +5470,9 @@ class EasyBridgeMixin(PushToHubMixin):
         if gcs_source:
             if gcs_meta_tmp is None:
                 raise RuntimeError("GCS metadata temporary directory was not initialized.")
-            try:
-                resolved_index_file = _copy_gcs_file(SAFE_WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
-                ckpt_weight_format = "safetensors"
-            except FileNotFoundError:
-                resolved_index_file = None
-
-            if resolved_index_file is None:
-                try:
-                    resolved_index_file = _copy_gcs_file(WEIGHTS_INDEX_NAME, gcs_meta_tmp.name)
-                    ckpt_weight_format = "bin"
-                except FileNotFoundError:
-                    resolved_index_file = None
-
-            if resolved_index_file is None:
-                try:
-                    resolved_single_file = _copy_gcs_file(SAFE_WEIGHTS_NAME, gcs_meta_tmp.name)
-                    ckpt_weight_format = "safetensors"
-                except FileNotFoundError:
-                    resolved_single_file = None
-
-            if resolved_index_file is None and resolved_single_file is None:
-                try:
-                    resolved_single_file = _copy_gcs_file(WEIGHTS_NAME, gcs_meta_tmp.name)
-                    ckpt_weight_format = "bin"
-                except FileNotFoundError:
-                    resolved_single_file = None
+            ckpt_weight_format, resolved_index_file, resolved_single_file = _discover_gcs_weight_files(
+                pretrained_model_name_or_path, gcs_meta_tmp.name, subfolder=gcs_subfolder
+            )
         elif os.path.isdir(pretrained_model_name_or_path):
             resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
             if resolved_index_file is not None:
@@ -5004,7 +5757,7 @@ class EasyBridgeMixin(PushToHubMixin):
                         )
                     os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
                 with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
-                    yield _copy_gcs_file(fname, tmpdir)
+                    yield _stage_gcs_file(fname, tmpdir)
                 return
 
             if torch_streaming_cache == "hf_cache":

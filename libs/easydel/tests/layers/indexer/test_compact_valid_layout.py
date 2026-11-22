@@ -71,6 +71,44 @@ def test_layout_is_the_identity_exactly_for_valid_first_rows():
     assert not bool(jax.jit(compact_valid_layout)(jnp.asarray(_rows("all", "left"))).identity)
 
 
+def test_layout_matches_numpy_reference_for_random_masks():
+    """Batches of valid-first rows take the identity branch, any other batch the searches; both match NumPy."""
+    rng = np.random.default_rng(13)
+    layout_fn = jax.jit(compact_valid_layout)
+    batched_fn = jax.jit(jax.vmap(compact_valid_layout))
+    identity_batches = 0
+    for trial in range(32):
+        rows = []
+        for _ in range(3):
+            kind, length = int(rng.integers(4)), int(rng.integers(0, SEQ + 1))
+            if trial == 0:
+                kind = 3
+            row = np.zeros(SEQ, bool)
+            if kind == 0:
+                row[:length] = True
+            elif kind == 1:
+                row[SEQ - length :] = True
+            elif kind == 2:
+                row = rng.random(SEQ) < 0.5
+            else:
+                row[:] = True
+            rows.append(row)
+        valid = np.stack(rows)
+        order, inverse, rank = _reference(valid)
+        expected_identity = bool(np.array_equal(order, np.broadcast_to(np.arange(SEQ), order.shape)))
+        identity_batches += expected_identity
+        layout = layout_fn(jnp.asarray(valid))
+        np.testing.assert_array_equal(np.asarray(layout.order), order)
+        np.testing.assert_array_equal(np.asarray(layout.inverse), inverse)
+        np.testing.assert_array_equal(np.asarray(layout.rank), rank)
+        assert bool(layout.identity) == expected_identity
+        # Under vmap the branch becomes a select over both results; every row must still match.
+        per_row = batched_fn(jnp.asarray(valid[:, None, :]))
+        np.testing.assert_array_equal(np.asarray(per_row.order)[:, 0], order)
+        np.testing.assert_array_equal(np.asarray(per_row.inverse)[:, 0], inverse)
+    assert 0 < identity_batches < 32, identity_batches
+
+
 def test_gather_reads_tokens_in_valid_first_order():
     rng = np.random.default_rng(3)
     for patterns in (("all", "right"), ("left", "holes", "right")):

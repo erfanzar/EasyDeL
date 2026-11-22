@@ -12,46 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ray-based distributed training module for EasyDeL.
+"""Ray-oriented distributed trainer launcher utilities for EasyDeL.
 
-This module provides distributed training capabilities using Ray, enabling
-efficient multi-node and multi-GPU training for large language models.
-Ray provides a unified framework for scaling Python workloads from a single
-machine to large clusters.
+This module provides :class:`RayDistributedTrainer` (and its JSON-persistable
+:class:`RayDistributedConfig`), a lightweight launcher wrapper intended to be
+invoked from Ray workers or distributed scaling scripts.
 
-The module includes:
-- RayDistributedTrainer: Main class for distributed training with Ray
-- Support for data parallelism and model parallelism
-- Automatic resource management and fault tolerance
-- Integration with Ray's distributed computing primitives
-
-Key Features:
-- Seamless scaling from single GPU to multi-node clusters
-- Automatic gradient synchronization across workers
-- Efficient data loading with Ray datasets
-- Built-in fault tolerance and checkpointing
-- Support for heterogeneous hardware configurations
+The wrapper handles pre-training setup and delegates the training loop, mesh
+sharding, and checkpoint resumption to an inner EasyDeL trainer class:
+- Model class resolution from EasyDeL's module registry via ``model_type`` /
+  ``model_task`` or an explicit ``model_class``
+- Linear model-width scaling through ``config_scaling_variables`` and
+  ``scaling_index``
+- Offloaded model initialization on ``offload_backend`` (default ``"cpu"``)
+- Optional checkpoint loading from an explicit ``bucket_path``
+- JSON configuration persistence via ``save_config`` / ``from_config``
+- Signature-aware construction of ``Trainer`` and specialized subclasses
+  (``SFTTrainer``, ``DPOTrainer``, ``RewardTrainer``, ``EmbeddingTrainer``,
+  ``PRMTrainer``, etc.)
 
 Example:
+    >>> from easydel.modules.llama import LlamaForCausalLM
+    >>> from easydel.trainers import TrainingArguments
     >>> from easydel.trainers.ray_scaler import RayDistributedTrainer
-    >>> trainer = RayDistributedTrainer(
-    ...     num_workers=4,
-    ...     use_gpu=True,
-    ...     model=model,
-    ...     train_dataset=dataset,
-    ...     arguments=training_args
+    >>> launcher = RayDistributedTrainer(
+    ...     pretrained_model_name_or_path="meta-llama/Llama-3.2-1B",
+    ...     model_class=LlamaForCausalLM,
     ... )
-    >>> trainer.train()
-
-Requirements:
-    - Ray must be installed: pip install ray[default]
-    - For multi-node setups, Ray cluster must be configured
-
-References:
-    - Ray documentation: https://docs.ray.io/
-    - Ray Train: https://docs.ray.io/en/latest/train/train.html
+    >>> launcher.train(
+    ...     scaling_index=1,
+    ...     arguments=TrainingArguments(save_directory="./checkpoints"),
+    ...     dataset_train=dataset,
+    ... )
 """
 
-from .distributed_trainer import RayDistributedTrainer
+from .distributed_trainer import RayDistributedConfig, RayDistributedTrainer
 
-__all__ = ("RayDistributedTrainer",)
+__all__ = ("RayDistributedConfig", "RayDistributedTrainer")

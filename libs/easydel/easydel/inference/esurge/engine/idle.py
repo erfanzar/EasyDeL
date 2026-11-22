@@ -189,3 +189,11 @@ class IdleMonitor:
         thread.join(timeout=2.0)
         if thread.is_alive():
             logger.debug("Idle monitor thread did not stop gracefully")
+
+    def close(self) -> None:
+        """Stop the watchdog and break engine callback references."""
+        self.stop()
+        self._on_idle_reset = None
+        self._is_running = None
+        self._is_busy = None
+        self._info = None

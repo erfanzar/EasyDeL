@@ -118,6 +118,16 @@ class CompactionController:
             raise ValueError("current_tokens must be non-negative")
         return self.context_budget - current_tokens < self.compaction_threshold
 
+    @property
+    def current_execution_segment_id(self) -> int:
+        """Return the non-colliding ``SegmentKind.EXECUTION`` ID for the current phase.
+
+        Chronological layout per trajectory::
+
+            EXECUTION(0) -> SUMMARY(1) -> COPIED_TAIL(2) -> EXECUTION(3) -> ...
+        """
+        return 3 * self.compactions_done
+
     def maybe_compact(
         self,
         *,
@@ -127,6 +137,7 @@ class CompactionController:
         current_tokens: int,
         policy_summarizer: PolicySummarizer,
         token_counter: TokenCounter,
+        next_segment_id: int | None = None,
     ) -> CompactionResult | None:
         """Compact a trajectory when the strict trigger fires.
 
@@ -139,15 +150,20 @@ class CompactionController:
 
         Returns ``None`` when no compaction is needed. Under
         ``keep_context``, failures return ``applied=False`` with a bounded
-        ``failure_code`` and the original complete context.
+        ``failure_code`` and the original complete context with its
+        ``trainable_token_mask`` preserved.
         """
         if not self.should_compact(current_tokens):
             return None
 
+        if next_segment_id is not None and int(next_segment_id) < 0:
+            raise ValueError("next_segment_id must be non-negative")
+
         original_system = tuple(message.as_copied_context() for message in original_system_messages)
-        history_prefix = tuple(message.as_copied_context() for message in history_prefix_messages)
+        raw_history_prefix = tuple(history_prefix_messages)
+        copied_history_prefix = tuple(message.as_copied_context() for message in raw_history_prefix)
         atomic_steps = tuple(steps)
-        original_context = self._original_context(history_prefix, atomic_steps)
+        original_context = self._original_context(raw_history_prefix, atomic_steps)
         if self.compactions_done >= self.max_compactions:
             return self._fail("max_compactions", original_context)
 
@@ -156,7 +172,7 @@ class CompactionController:
             summary = policy_summarizer(
                 SummaryRequest(
                     compaction_index=compaction_index,
-                    history_prefix_messages=history_prefix,
+                    history_prefix_messages=copied_history_prefix,
                     steps=atomic_steps,
                     summary_instruction=self.summary_instruction,
                 )
@@ -170,7 +186,10 @@ class CompactionController:
         fitted: tuple[tuple[RolloutMessage, ...], tuple[AtomicInteractionStep, ...]] | None = None
         while retained_count >= 0:
             retained = atomic_steps[len(atomic_steps) - retained_count :] if retained_count else ()
-            candidate = self._reconstructed_context(original_system, summary, retained)
+            try:
+                candidate = self._reconstructed_context(original_system, summary, retained)
+            except Exception as exc:
+                return self._fail("template_failure", original_context, cause=exc)
             try:
                 token_count = int(token_counter(candidate))
             except Exception as exc:
@@ -181,7 +200,7 @@ class CompactionController:
                     original_context,
                     cause=ValueError("token_counter returned a negative value"),
                 )
-            if token_count <= self.context_budget:
+            if token_count <= self.context_budget and not self.should_compact(token_count):
                 fitted = candidate, retained
                 break
             retained_count -= 1
@@ -190,6 +209,12 @@ class CompactionController:
             return self._fail("context_does_not_fit", original_context)
 
         context_messages, retained_steps = fitted
+        # Reserve 3 * k for EXECUTION segments (0, 3, 6, ...) so compaction
+        # SUMMARY (3 * k + 1) and COPIED_TAIL (3 * k + 2) segments never collide
+        # with execution segments and maintain strict chronological ordering.
+        base_segment_id = (
+            int(next_segment_id) if next_segment_id is not None else 3 * compaction_index + 1
+        )
         summary_message = RolloutMessage(
             role="assistant",
             content=summary.text,
@@ -197,7 +222,7 @@ class CompactionController:
             trainable_token_mask=(self.train_summary_tokens,) * len(summary.token_ids),
         )
         summary_segment = TrainingSegment(
-            segment_id=2 * compaction_index,
+            segment_id=base_segment_id,
             kind=SegmentKind.SUMMARY,
             messages=(summary_message,),
         )
@@ -209,7 +234,7 @@ class CompactionController:
             tail_messages.extend(message.as_copied_context() for message in step.messages(train_assistant=False))
             source_indices.append(first_retained_index + offset)
         tail_segment = TrainingSegment(
-            segment_id=2 * compaction_index + 1,
+            segment_id=base_segment_id + 1,
             kind=SegmentKind.COPIED_TAIL,
             messages=tuple(tail_messages),
             source_step_indices=tuple(source_indices),
@@ -225,6 +250,13 @@ class CompactionController:
             compaction_index=compaction_index,
         )
 
+    def _format_resume_content(self, summary_text: str) -> str:
+        """Render ``resume_template`` safely even if it contains extra braces."""
+        try:
+            return self.resume_template.format(summary=summary_text)
+        except (KeyError, ValueError, IndexError):
+            return self.resume_template.replace("{summary}", summary_text)
+
     def _reconstructed_context(
         self,
         original_system: tuple[RolloutMessage, ...],
@@ -235,7 +267,7 @@ class CompactionController:
         messages.append(
             RolloutMessage(
                 role="user",
-                content=self.resume_template.format(summary=summary.text),
+                content=self._format_resume_content(summary.text),
             )
         )
         for step in retained_steps:
@@ -249,7 +281,7 @@ class CompactionController:
     ) -> tuple[RolloutMessage, ...]:
         messages = list(history_prefix)
         for step in steps:
-            messages.extend(message.as_copied_context() for message in step.messages(train_assistant=False))
+            messages.extend(step.messages(train_assistant=True))
         return tuple(messages)
 
     def _fail(

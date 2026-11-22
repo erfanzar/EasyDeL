@@ -36,7 +36,11 @@ from jax import numpy as jnp
 from .sampling_metadata import SamplingMetadata
 
 
-def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray], jnp.ndarray]):
+def int32_bsearch(
+    batch_shape: Sequence[int],
+    predicate: Callable[[jnp.ndarray], jnp.ndarray],
+    unroll: bool = False,
+):
     """Perform batched binary search over int32 bit patterns.
 
     Searches for the largest int32 value (closest to positive infinity) for which
@@ -48,6 +52,8 @@ def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray],
         predicate: Monotonic function mapping int32 → bool. Must return False
             for all values ≤ threshold and True for all values > threshold.
             The threshold may differ per batch element.
+        unroll: Unroll the 31 search steps into straight-line code instead of a device loop. The steps and
+            their results are unchanged.
 
     Returns:
         Array of shape `batch_shape` containing the largest int32 value for which
@@ -59,22 +65,24 @@ def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray],
     """
     current_bits = jnp.zeros(batch_shape, dtype=jnp.int32)
 
-    # Bit 31 (sign bit) requires special handling due to two's complement
+    # Bit 31 (sign bit) requires special handling due to two's complement.
+    # Keep operands strictly int32 so jax_enable_x64=True never promotes
+    # current_bits to int64 (which would break float32 bitcasts).
     midpoint = current_bits
     predicate_satisfied = predicate(midpoint)
-    current_bits = current_bits | jnp.where(predicate_satisfied, jnp.uint32(1 << 31), jnp.uint32(0))
+    current_bits = current_bits | jnp.where(predicate_satisfied, jnp.int32(-2147483648), jnp.int32(0))
     del midpoint, predicate_satisfied
 
     def loop_body(i, current_bits):
         """Test bit `i` and set it in the result based on the predicate."""
-        bit_index = 30 - i
-        bit = jnp.int32(1 << bit_index)
+        bit_index = jnp.int32(30) - jnp.int32(i)
+        bit = jnp.left_shift(jnp.int32(1), bit_index)
         midpoint = current_bits | bit
         predicate_satisfied = predicate(midpoint)
         current_bits = current_bits | jnp.where(predicate_satisfied, jnp.int32(0), bit)
         return current_bits
 
-    current_bits = lax.fori_loop(0, 31, loop_body, current_bits)
+    current_bits = lax.fori_loop(0, 31, loop_body, current_bits, unroll=bool(unroll))
     return current_bits
 
 
@@ -112,7 +120,7 @@ def _monotonic_int32_to_float32(x: int) -> jax.Array:
     return lax.bitcast_convert_type(x, jnp.float32)
 
 
-def apply_float32_bsearch(batch_shape, predicate):
+def apply_float32_bsearch(batch_shape, predicate, unroll: bool = False):
     """Perform batched binary search over finite float32 values.
 
     Searches for the largest finite non-NaN float32 for which the predicate
@@ -124,6 +132,7 @@ def apply_float32_bsearch(batch_shape, predicate):
         predicate: Monotonic function mapping float32 → bool, following
             IEEE 754 total-ordering. Must return False for values ≤ threshold
             and True for values > threshold.
+        unroll: Forwarded to :func:`int32_bsearch`.
 
     Returns:
         Array of shape `batch_shape` containing the largest float32 value
@@ -144,7 +153,7 @@ def apply_float32_bsearch(batch_shape, predicate):
         x_float32 = lax.bitcast_convert_type(x, jnp.float32)
         return jnp.where(is_finite, predicate(x_float32), predicate_on_nonfinite)
 
-    result = int32_bsearch(batch_shape, int32_predicate)
+    result = int32_bsearch(batch_shape, int32_predicate, unroll=unroll)
     return _monotonic_int32_to_float32(result)
 
 
@@ -237,7 +246,7 @@ def apply_topk_mask(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jnp.nda
     return jnp.where(x >= cutoff, x, jnp.full_like(x, replace_val))
 
 
-def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float) -> jnp.ndarray:
+def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float, unroll: bool = False) -> jnp.ndarray:
     """Apply top-p (nucleus) masking with bfloat16 optimization.
 
     Filters logits to the smallest set of tokens whose cumulative probability
@@ -247,6 +256,7 @@ def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float) 
         logits: Logits before masking [batch..., vocab_size].
         p: Minimum probability mass to retain (0.0 to 1.0).
         replace_val: Value for masked logits.
+        unroll: Unroll the threshold search (:func:`int32_bsearch`); the result is unchanged.
 
     Returns:
         Masked logits with same shape and dtype as input.
@@ -277,7 +287,7 @@ def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float) 
         )
         return probability_mass < p
 
-    threshold = apply_float32_bsearch(batch_shape, predicate)
+    threshold = apply_float32_bsearch(batch_shape, predicate, unroll=unroll)
     threshold = lax.expand_dims(threshold, (threshold.ndim,))
 
     return jnp.where(probs_f32 >= threshold, logits, jnp.full_like(logits, replace_val))

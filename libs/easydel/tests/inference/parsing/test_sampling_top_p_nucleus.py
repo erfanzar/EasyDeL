@@ -60,16 +60,16 @@ def test_vectorized_top_p_api_keeps_per_row_threshold_and_temperature():
 
 def test_dynamic_sampling_api_preserves_batched_greedy_random_penalties_and_shape():
     tokens = dynamic_sample_tokens(
-        tokens=jnp.asarray([[0, 0], [1, 1], [0, 0]]),
-        length=jnp.asarray([2, 2, 2]),
-        logits=jnp.asarray([[4.0, 3.0, 0.0]] * 3),
-        top_p=jnp.asarray([0.01] * 3),
-        temperature=jnp.asarray([1.0] * 3),
-        random_sampling=jnp.asarray([True, True, False]),
-        presence_penalty=jnp.asarray([2.0] * 3),
-        frequency_penalty=jnp.asarray([1.0] * 3),
-        repetition_penalty=jnp.asarray([2.0] * 3),
+        tokens=jnp.asarray([[0, 0], [1, 1], [0, 0], [0, 0]]),
+        length=jnp.asarray([2, 2, 2, 2]),
+        logits=jnp.asarray([[4.0, 3.0, 0.0]] * 4),
+        top_p=jnp.asarray([0.01] * 4),
+        temperature=jnp.asarray([1.0] * 4),
+        random_sampling=jnp.asarray([True, True, False, False]),
+        presence_penalty=jnp.asarray([2.0, 2.0, 2.0, 0.0]),
+        frequency_penalty=jnp.asarray([1.0, 1.0, 1.0, 0.0]),
+        repetition_penalty=jnp.asarray([2.0, 2.0, 2.0, 1.0]),
         rngs=jax.random.PRNGKey(0),
     )
-    assert tokens.shape == (3, 1, 1)
-    np.testing.assert_array_equal(tokens[:, 0, 0], [1, 0, 0])
+    assert tokens.shape == (4, 1, 1)
+    np.testing.assert_array_equal(tokens[:, 0, 0], [1, 0, 1, 0])

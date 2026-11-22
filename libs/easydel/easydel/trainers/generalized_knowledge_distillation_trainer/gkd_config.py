@@ -60,7 +60,7 @@ class GKDConfig(SFTConfig):
             generation and inside the JSD loss. Larger values produce
             softer targets. Default ``0.9``.
         lmbda: Probability of replacing the supervised batch with
-            on-policy student samples. ``None`` (or ``<= 0``) disables
+            on-policy student samples. ``None`` (or ``0``) disables
             on-policy sampling. Validated in ``[0, 1]``. Default ``0.5``.
         beta: Mixing weight inside the generalised JSD loss. ``0.0``
             recovers forward ``KL(teacher || student)``; ``1.0``
@@ -96,7 +96,7 @@ class GKDConfig(SFTConfig):
         default=0.5,
         metadata={
             "help": "Interpolation factor in the generalized Jensen-Shannon divergence. "
-            "0.0 reduces to KL(student‖teacher) while 1.0 becomes KL(teacher‖student)."
+            "0.0 reduces to forward KL(teacher‖student) while 1.0 becomes reverse KL(student‖teacher)."
         },
     )
     max_new_tokens: int = field(
@@ -134,11 +134,14 @@ class GKDConfig(SFTConfig):
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
         )
+        self.temperature = float(self.temperature)
+        if self.temperature <= 0.0:
+            raise ValueError("`temperature` must be strictly positive.")
         if self.lmbda is not None:
             normalized_lmbda = float(self.lmbda)
-            self.lmbda = normalized_lmbda if normalized_lmbda > 0.0 else None
-            if self.lmbda is not None and not 0.0 <= self.lmbda <= 1.0:
+            if not 0.0 <= normalized_lmbda <= 1.0:
                 raise ValueError("`lmbda` must be within [0, 1].")
+            self.lmbda = normalized_lmbda if normalized_lmbda > 0.0 else None
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError("`beta` must be within [0, 1].")
         if self.max_new_tokens <= 0:

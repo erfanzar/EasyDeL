@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
+
 import numpy as np
 import pytest
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
+from easydel.inference.esurge.runners.executors.compile_orchestrator import CompileOrchestrator
 from easydel.inference.esurge.runners.executors.sampler_executor import SamplerRuntime
+from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 from easydel.inference.esurge.runners.window_planner import WindowPlanner
 
 
@@ -62,6 +66,8 @@ def test_spmd_compile_prepares_full_bucket_grid():
         (int(kwargs["num_tokens"]), int(kwargs["padded_num_reqs"]))
     )
     manager._compile_sampler_variant = lambda **kwargs: sampler_calls.append(int(kwargs["padded_num_reqs"]))
+    warm_calls: list[dict] = []
+    manager._warm_step_programs = lambda **kwargs: warm_calls.append(kwargs)
 
     ExecutionManager.compile(
         manager,
@@ -77,6 +83,8 @@ def test_spmd_compile_prepares_full_bucket_grid():
     assert model_step_calls == [(4, 4), (8, 4), (8, 8), (16, 4), (16, 8)]
     assert sampler_calls == [1, 2, 4, 8]
     assert manager._model_num_tokens_paddings == [4, 8, 16]
+    # Every (logits bucket, sampler bucket) pair the grid allows is warmed, not only the pairs a workload reaches.
+    assert warm_calls == [{"logits_buckets": [4, 8], "sampler_buckets": [1, 2, 4, 8]}]
 
 
 def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
@@ -105,6 +113,8 @@ def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
     )
     manager._compile_lm_head_variant = lambda **kwargs: lm_head_calls.append(int(kwargs["padded_num_reqs"]))
     manager._compile_sampler_variant = lambda **kwargs: sampler_calls.append(int(kwargs["padded_num_reqs"]))
+    warm_calls: list[dict] = []
+    manager._warm_step_programs = lambda **kwargs: warm_calls.append(kwargs)
 
     ExecutionManager.compile(
         manager,
@@ -121,6 +131,8 @@ def test_mpmd_compile_prepares_fused_split_and_sampler_buckets():
     assert backbone_calls == [(4, False), (4, True), (8, False), (8, True), (16, False), (16, True)]
     assert lm_head_calls == [4, 8]
     assert sampler_calls == [1, 2, 4, 8]
+    # A fused PP step may size its logits to a sampler bucket, so those are logits buckets too.
+    assert warm_calls == [{"logits_buckets": [1, 2, 4, 8], "sampler_buckets": [1, 2, 4, 8]}]
 
 
 def test_backbone_trace_mode_is_determined_by_the_cache_key():
@@ -158,6 +170,73 @@ def test_fused_pp_runtime_logits_bucket_respects_model_min_input_pad():
     assert manager._pipeline_model_logits_bucket(padded_num_reqs=4, sampler_padded_num_reqs=1) == 4
     assert manager._pipeline_model_logits_bucket(padded_num_reqs=8, sampler_padded_num_reqs=2) == 4
     assert manager._pipeline_model_logits_bucket(padded_num_reqs=8, sampler_padded_num_reqs=8) == 8
+
+
+@pytest.mark.parametrize(
+    ("scheduled", "active", "expected"),
+    [
+        pytest.param([1, 1, 1, 1], [True, True, True, True], True, id="every-row-one-token"),
+        pytest.param([1, 0, 1, 0], [True, False, True, False], True, id="idle-rows-hold-nothing"),
+        pytest.param([1, 1, 0, 5], [True, True, False, False], True, id="rows-past-the-last-live-one-are-zeroed"),
+        pytest.param([1, 3, 1, 0], [True, False, True, False], False, id="idle-row-before-a-live-one-holds-three"),
+        pytest.param([1, 2, 1, 1], [True, True, True, True], False, id="prompt-chunk"),
+        pytest.param([0, 0, 0, 0], [False, False, False, False], False, id="idle-window"),
+        pytest.param([1, 1, 1, 1, 1], [True, True, True, True, True], False, id="live-row-past-the-window"),
+    ],
+)
+def test_decode_only_window_covers_every_row_the_builder_packs(scheduled, active, expected):
+    """The pure-decode program promises at most one token in every row the batch builder packs: each row up to the last
+    live one, live or not (rows after it are zeroed)."""
+    assert (
+        ExecutionManager._is_decode_only_window(
+            scheduled_full_cpu=np.array(scheduled, dtype=np.int32),
+            active_mask_full_cpu=np.array(active, dtype=np.bool_),
+            padded_num_reqs=4,
+        )
+        is expected
+    )
+
+
+def test_pure_decode_pairs_follow_the_single_token_queries():
+    """A request bucket's decode pair gets a pure-decode program beyond the decode-layout ratio, and within it only
+    when its general trace asked for the single-token promise."""
+    pairs = [(64, 4), (64, 32), (256, 4), (256, 32)]
+    # (64, 4) is beyond DECODE_LAYOUT_MAX_TOKENS_PER_REQ (64 > 4 x 4); (64, 32) is within it.
+    assert CompileOrchestrator._decode_layout_pairs(pairs, [4, 32]) == [(64, 4)]
+    asked = frozenset({(64, 32), (256, 32)})
+    assert CompileOrchestrator._decode_layout_pairs(pairs, [4, 32], asked) == [(64, 4), (64, 32)]
+
+
+def _bare_executor(*, single_token_pairs=(), compiled=()):
+    from easydel.inference.esurge.runners.executors.model_executor import ModelStepExecutor
+
+    executor = ModelStepExecutor.__new__(ModelStepExecutor)
+    executor.use_aot_forward = True
+    executor._uses_mpmd_mesh = lambda: False
+    executor._single_token_pairs = set(single_token_pairs)
+    executor._cache = OrderedDict(((*pair, kind, "aot"), object()) for *pair, kind in compiled)
+    return executor
+
+
+def test_pure_decode_windows_run_the_pure_decode_program_when_compiled():
+    general, decode = (32, 32, "model_step", "aot"), (32, 32, "model_step_decode", "aot")
+    # Never asked: the general program (traced under the decode layout) serves pure-decode windows.
+    executor = _bare_executor(compiled=[(32, 32, "model_step")])
+    assert executor.has_decode_model_step(32, 32)
+    assert executor.model_step_key(32, 32, decode_only=True) == general
+    # Asked: pure-decode windows need their own program, and run it once compiled.
+    executor = _bare_executor(single_token_pairs=[(32, 32)], compiled=[(32, 32, "model_step")])
+    assert not executor.has_decode_model_step(32, 32)
+    assert executor.model_step_key(32, 32, decode_only=True) == general
+    executor = _bare_executor(
+        single_token_pairs=[(32, 32)], compiled=[(32, 32, "model_step"), (32, 32, "model_step_decode")]
+    )
+    assert executor.has_decode_model_step(32, 32)
+    assert executor.model_step_key(32, 32, decode_only=True) == decode
+    assert executor.model_step_key(32, 32, decode_only=False) == general
+    # Beyond the ratio the general program keeps the general layout: pure-decode windows always need their own.
+    executor = _bare_executor(compiled=[(64, 4, "model_step")])
+    assert not executor.has_decode_model_step(64, 4)
 
 
 def test_window_emits_token_accepts_unpadded_request_vectors():
@@ -283,3 +362,57 @@ def test_runtime_bucket_validation_accepts_precompiled_mpmd_split_bucket():
         sampler_padded_num_reqs=4,
         use_pipeline_runtime=True,
     )
+
+
+_LADDER = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+
+
+def _bare_runner(*, data_parallel_size, compiled):
+    """An eSurgeRunner shell whose ``compile`` records the token buckets it hands to the execution manager."""
+
+    class _ExecutionManager:
+        @staticmethod
+        def compile(**kwargs):
+            compiled.append(list(kwargs["num_tokens_paddings"]))
+
+    class _Metadata:
+        pass
+
+    metadata = _Metadata()
+    if data_parallel_size is not None:
+        metadata.data_parallel_size = data_parallel_size
+    runner = eSurgeRunner.__new__(eSurgeRunner)
+    runner.num_tokens_paddings = list(_LADDER)
+    runner.metadata = metadata
+    runner.executor_manager = _ExecutionManager()
+    runner.num_reqs_max_model_len = 32
+    runner.max_pages_per_req = 1
+    runner.max_num_reqs = 32
+    runner.active_num_seq_buckets = [32]
+    runner._allow_sparse_window_packing = False
+    runner.drafter = None
+    runner.num_draft_tokens = 0
+    runner._precompile_vlm_vision_helpers = lambda **kwargs: None
+    runner._precompile_draft_schedule_variants = lambda: None
+    runner._precompile_draft_in_verify_variants = lambda: None
+    runner._precompile_whole_block_drafter = lambda: None
+    runner._measure_step_times = lambda num_tokens_paddings: None
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("data_parallel_size", "budget", "largest"),
+    [
+        pytest.param(None, 2048, 2048, id="no-dp-size"),
+        pytest.param(1, 2048, 2048, id="dp1"),
+        pytest.param(4, 2048, 8192, id="dp4"),
+        pytest.param(4, 1500, 8192, id="dp4-budget-between-buckets"),
+        pytest.param(16, 2048, 16384, id="dp16-past-the-ladder"),
+    ],
+)
+def test_compile_reaches_the_token_budget_times_the_dp_size(data_parallel_size, budget, largest):
+    """Rank-major SPMD DP: every rank scheduler gets the whole budget and a step runs its busiest rank's tokens times
+    the DP size, so the compiled buckets must reach the smallest bucket >= budget x DP size (or the ladder's end)."""
+    compiled: list[list[int]] = []
+    _bare_runner(data_parallel_size=data_parallel_size, compiled=compiled).compile(max_num_batched_tokens=budget)
+    assert compiled == [[bucket for bucket in _LADDER if bucket <= largest]]

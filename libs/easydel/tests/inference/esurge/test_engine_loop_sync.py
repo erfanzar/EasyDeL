@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Behavior of the synchronous scheduler loop: profiler ticking and clean DP shutdown."""
+"""Behavior of the synchronous scheduler loop: profiler ticking and a clean stop on a closed engine core."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from easydel.inference.esurge.engine.loop import EngineLoop
-from easydel.inference.esurge.scheduler.dp_scheduler import DPSchedulerClosed
+from surgecore import CoreClosed
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -34,9 +34,9 @@ class _Coordinator:
         return SimpleNamespace()
 
 
-def _make_loop(scheduler, *, handle_profiling_step, on_fatal):
+def _make_loop(core, *, handle_profiling_step, on_fatal):
     return EngineLoop(
-        scheduler=scheduler,
+        core=core,
         runner=SimpleNamespace(),
         coordinator=_Coordinator(),
         scheduler_lock=threading.RLock(),
@@ -53,12 +53,16 @@ def _make_loop(scheduler, *, handle_profiling_step, on_fatal):
     )
 
 
-class _Scheduler:
+class _Core:
+    """Engine-core stand-in: one-token steps, or ``raise_exc`` from ``schedule()``."""
+
+    closed_error = CoreClosed
+    num_running = 0
+    num_waiting = 0
+
     def __init__(self, raise_exc: BaseException | None = None):
         self.raise_exc = raise_exc
         self.schedule_calls = 0
-        self.running: list = []
-        self.waiting: list = []
 
     def schedule(self):
         self.schedule_calls += 1
@@ -66,7 +70,7 @@ class _Scheduler:
             raise self.raise_exc
         return SimpleNamespace(total_num_scheduled_tokens=1, num_scheduled_tokens={"r": 1})
 
-    def update_from_output(self, scheduler_output, model_output):
+    def commit(self, scheduler_output, model_output):
         return {}
 
 
@@ -79,16 +83,16 @@ def test_sync_loop_ticks_profiler_step_budget_each_executed_step():
         if len(ticks) >= 3:
             holder["loop"].request_stop()
 
-    loop = _make_loop(_Scheduler(), handle_profiling_step=handle_profiling_step, on_fatal=lambda exc: None)
+    loop = _make_loop(_Core(), handle_profiling_step=handle_profiling_step, on_fatal=lambda exc: None)
     holder["loop"] = loop
     loop._running = True
     loop._run_sync()
     assert len(ticks) == 3
 
 
-def test_sync_loop_stops_quietly_on_dp_scheduler_closed():
+def test_sync_loop_stops_quietly_when_the_engine_core_is_closed():
     fatal: list[BaseException] = []
-    scheduler = _Scheduler(raise_exc=DPSchedulerClosed("shut down"))
+    scheduler = _Core(raise_exc=CoreClosed("shut down"))
     loop = _make_loop(scheduler, handle_profiling_step=lambda: None, on_fatal=fatal.append)
     loop._running = True
     loop._run_sync()

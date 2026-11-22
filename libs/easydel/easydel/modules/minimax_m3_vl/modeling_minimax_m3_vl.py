@@ -584,9 +584,8 @@ class MiniMaxM3VLSparseMoeBlock(BaseMoeModule):
             act_fn=self.experts.act_fn,
             ffn_activation=ffn_activation,
             hooks=hooks,
+            shared_expert=self.shared_experts,
         )
-        shared_output = self.shared_experts(hidden_states)
-        out = out + shared_output
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 

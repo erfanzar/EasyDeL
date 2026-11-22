@@ -49,42 +49,117 @@ Available verifiers:
 
 from __future__ import annotations
 
+import math
 import re
 import typing as tp
 
 _BOXED_RE = re.compile(r"\\boxed\{([^}]+)\}")
-_HASH_ANSWER_RE = re.compile(r"####\s*(-?[\d,]+(?:\.\d+)?)")
+_NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_HASH_ANSWER_RE = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
+_FRAC_RE = re.compile(r"^([+-]?)\\(?:d|t)?frac\{([^{}]+)\}\{([^{}]+)\}$")
+_SIMPLE_FRAC_RE = re.compile(r"^([+-]?\d[\d,]*(?:\.\d+)?)/([+-]?\d[\d,]*(?:\.\d+)?)$")
+_TEXT_WRAPPER_RE = re.compile(r"^\\(?:text|mathrm|mathbf|operatorname)\{([^{}]+)\}$")
+
+
+def _extract_boxed_contents(text: str) -> list[str]:
+    """Extract all balanced-brace ``\\boxed{...}`` payloads in appearance order."""
+    results: list[str] = []
+    marker = r"\boxed{"
+    idx = 0
+    while True:
+        start = text.find(marker, idx)
+        if start == -1:
+            break
+        content_start = start + len(marker)
+        depth = 1
+        pos = content_start
+        while pos < len(text) and depth > 0:
+            ch = text[pos]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            results.append(text[content_start : pos - 1])
+            idx = pos
+        else:
+            idx = content_start
+    return results
 
 
 def _normalize_number(text: str) -> str | None:
     """Strip formatting and return a canonical number string.
 
-    Removes whitespace and thousands-separator commas, then tries to
-    parse the result as a ``float`` and serialise it back to ``str`` so
-    that lexically distinct but numerically equal answers (``"1,000"``
-    vs ``"1000.0"``) compare equal.
+    Removes whitespace, optional ``$`` / ``\\text{...}`` wrappers, and
+    thousands-separator commas; evaluates simple LaTeX/slash fractions such as
+    ``\\frac{1}{2}`` or ``3/4``; and serialises the finite ``float`` back to
+    ``str`` so that lexically distinct but numerically equal answers
+    (``"1,000"`` vs ``"1000.0"``, ``"\\frac{1}{2}"`` vs ``"0.5"``) compare
+    equal.
 
     Args:
         text: Free-form input that should represent a number.
 
     Returns:
         A canonical ``str(float(...))`` representation, or ``None``
-        when the input does not parse as a number.
+        when the input does not parse as a finite number.
     """
-    text = text.strip().replace(",", "").replace(" ", "")
+    cleaned = text.strip()
+    if len(cleaned) >= 2 and cleaned[0] == "$" and cleaned[-1] == "$":
+        cleaned = cleaned[1:-1].strip()
+    while True:
+        wrapper = _TEXT_WRAPPER_RE.match(cleaned)
+        if not wrapper:
+            break
+        cleaned = wrapper.group(1).strip()
+
+    compact = cleaned.replace(" ", "")
+    frac_match = _FRAC_RE.match(compact)
+    if frac_match:
+        sign_str, num_str, den_str = frac_match.groups()
+        num_norm = _normalize_number(num_str)
+        den_norm = _normalize_number(den_str)
+        if num_norm is None or den_norm is None:
+            return None
+        den_val = float(den_norm)
+        if den_val == 0.0:
+            return None
+        val = float(num_norm) / den_val
+        if sign_str == "-":
+            val = -val
+        return str(val) if math.isfinite(val) else None
+
+    simple_frac = _SIMPLE_FRAC_RE.match(compact)
+    if simple_frac:
+        num_str, den_str = simple_frac.groups()
+        try:
+            num_val = float(num_str.replace(",", ""))
+            den_val = float(den_str.replace(",", ""))
+        except ValueError:
+            return None
+        if den_val == 0.0:
+            return None
+        val = num_val / den_val
+        return str(val) if math.isfinite(val) else None
+
+    numeric = compact.replace(",", "")
+    if not numeric:
+        return None
     try:
-        return str(float(text))
+        val = float(numeric)
     except ValueError:
         return None
+    return str(val) if math.isfinite(val) else None
 
 
 def _extract_answer(text: str) -> str | None:
     """Extract a numeric answer from model output.
 
-    Tries three strategies in order: ``\\boxed{...}`` (LaTeX), the
-    GSM8K-style ``#### <number>`` marker, and finally the *last* number
-    that appears anywhere in the text. Each candidate is normalised via
-    :func:`_normalize_number` before being returned.
+    Tries three strategies in order: the *last* parseable balanced-brace
+    ``\\boxed{...}`` (LaTeX), the *last* GSM8K-style ``#### <number>`` marker,
+    and finally the *last* digit-leading number anywhere in the text. Falls
+    through if an earlier marker is empty or unparseable.
 
     Args:
         text: Raw model completion to scan.
@@ -93,15 +168,18 @@ def _extract_answer(text: str) -> str | None:
         The extracted canonical number string, or ``None`` if no
         candidate matched.
     """
-    match = _BOXED_RE.search(text)
-    if match:
-        return _normalize_number(match.group(1))
-    match = _HASH_ANSWER_RE.search(text)
-    if match:
-        return _normalize_number(match.group(1))
-    numbers = re.findall(r"-?[\d,]+(?:\.\d+)?", text)
-    if numbers:
-        return _normalize_number(numbers[-1])
+    for boxed in reversed(_extract_boxed_contents(text)):
+        normalized = _normalize_number(boxed)
+        if normalized is not None:
+            return normalized
+    for hash_num in reversed(_HASH_ANSWER_RE.findall(text)):
+        normalized = _normalize_number(hash_num)
+        if normalized is not None:
+            return normalized
+    for num in reversed(_NUMBER_RE.findall(text)):
+        normalized = _normalize_number(num)
+        if normalized is not None:
+            return normalized
     return None
 
 
@@ -198,16 +276,26 @@ class MathVerifier:
         if batch is None:
             return [None] * n
 
-        result = []
+        result: list[str | None] = []
         for ans in _get_column(batch, self._answer_key, n):
-            if isinstance(ans, str):
-                match = _HASH_ANSWER_RE.search(ans)
-                if match:
-                    result.append(_normalize_number(match.group(1)))
-                else:
-                    result.append(_normalize_number(ans))
+            if ans is None:
+                result.append(None)
+            elif isinstance(ans, str):
+                normalized: str | None = None
+                for boxed in reversed(_extract_boxed_contents(ans)):
+                    normalized = _normalize_number(boxed)
+                    if normalized is not None:
+                        break
+                if normalized is None:
+                    for hash_num in reversed(_HASH_ANSWER_RE.findall(ans)):
+                        normalized = _normalize_number(hash_num)
+                        if normalized is not None:
+                            break
+                if normalized is None:
+                    normalized = _normalize_number(ans)
+                result.append(normalized)
             else:
-                result.append(str(ans))
+                result.append(_normalize_number(str(ans)))
 
         while len(result) < n:
             result.append(None)
@@ -229,7 +317,7 @@ class CodeVerifier:
             column.
     """
 
-    def __init__(self, timeout: float = 10.0, test_key: str = "tests"):
+    def __init__(self, timeout: float = 10.0, test_key: str = "tests", use_jail: str = "auto"):
         """Initialize a code-execution verifier.
 
         Args:
@@ -237,9 +325,15 @@ class CodeVerifier:
                 case execution.
             test_key (str): Column name in the batch dict carrying test
                 source code.
+            use_jail (str): Sandbox jail policy (``"auto"``, ``"required"``,
+                ``"bwrap"``, ``"nsjail"``, or ``"off"``).
         """
+        from .._shared.sandbox import Sandbox
+
         self._timeout = timeout
         self._test_key = test_key
+        self._use_jail = use_jail
+        self._sandbox = Sandbox(timeout=self._timeout, use_jail=self._use_jail)
 
     def __call__(
         self,
@@ -304,27 +398,22 @@ class CodeVerifier:
     def _run_tests(self, code: str, test_code: str) -> bool:
         """Execute code + test assertions in a hardened out-of-process sandbox.
 
-        The combined script runs in a child process with CPU/address-space
-        rlimits, a scrubbed environment, a temp working directory, and a
-        wall-clock timeout enforced by killing the process group (see
-        :class:`easydel.trainers._shared.sandbox.Sandbox`), so a crash,
-        allocation bomb, or infinite loop in the generated code cannot take
-        down the trainer worker.
+        Both candidate code and tests are staged in temporary files (avoiding
+        Linux ``-c`` ``E2BIG`` argv limits) and run with a per-run cryptographic
+        sentinel written to a private file *only after* ``test_code`` completes
+        normally, defeating ``sys.exit(0)`` / ``os._exit(0)`` reward hacking.
 
         Args:
             code (str): The candidate code to execute.
-            test_code (str): The test/assertion source appended to the
+            test_code (str): The test/assertion source run after the
                 candidate code.
 
         Returns:
-            bool: True if the combined script exited cleanly (exit code 0)
-            within the limits; False on any exception, non-zero exit, or
-            timeout.
+            bool: True iff the sandbox exited cleanly (exit code 0), did not
+            time out, and the post-test sentinel matched exactly.
         """
-        from .._shared.sandbox import Sandbox
-
-        combined = f"{code}\n\n{test_code}"
-        return Sandbox(timeout=self._timeout).run_python(combined).ok
+        _, passed = self._sandbox.run_python_with_sentinel(code, test_code)
+        return passed
 
     def _get_tests(self, batch: dict[str, tp.Any] | None, n: int) -> list[str | None]:
         """Extract per-completion test sources from the batch dict.
@@ -418,7 +507,7 @@ class LengthPenaltyVerifier:
         self,
         target_length: int = 500,
         min_length: int = 10,
-        max_length: int = 5000,
+        max_length: int | None = None,
     ):
         """Initialize a length-penalty verifier.
 
@@ -427,12 +516,14 @@ class LengthPenaltyVerifier:
                 characters); produces reward 1.0 at the target.
             min_length (int): Lower bound; completions shorter than this
                 receive 0.0.
-            max_length (int): Upper bound; completions longer than this
-                receive 0.0.
+            max_length (int | None): Optional upper bound; completions
+                longer than this receive 0.0. When ``None`` (the default),
+                no arbitrary upper cap is applied beyond the natural linear
+                decay to 0.0 at ``2 * target_length``.
         """
-        self._target = target_length
-        self._min = min_length
-        self._max = max_length
+        self._target = int(target_length)
+        self._min = int(min_length)
+        self._max: int | None = None if max_length is None else int(max_length)
 
     def __call__(
         self,
@@ -458,7 +549,7 @@ class LengthPenaltyVerifier:
         for c in completions_list:
             text = c if isinstance(c, str) else str(c)
             length = len(text)
-            if length < self._min or length > self._max:
+            if length < self._min or (self._max is not None and length > self._max):
                 rewards.append(0.0)
             else:
                 penalty = abs(length - self._target) / max(self._target, 1)
@@ -636,8 +727,16 @@ class ExactMatchVerifier:
                 continue
             candidate = text
             if self._extract is not None:
-                found = self._extract.findall(text)
-                candidate = found[-1] if found else ""
+                matches = list(self._extract.finditer(text))
+                if not matches:
+                    candidate = ""
+                else:
+                    last_match = matches[-1]
+                    if self._extract.groups == 0:
+                        candidate = last_match.group(0)
+                    else:
+                        non_empty = [g for g in last_match.groups() if g is not None and g != ""]
+                        candidate = non_empty[-1] if non_empty else ""
             pred = _normalize_text(candidate, lower=self._lower, strip_punctuation=self._strip_punct)
             target = _normalize_text(str(gold), lower=self._lower, strip_punctuation=self._strip_punct)
             rewards.append(1.0 if pred == target and pred != "" else 0.0)
@@ -668,7 +767,17 @@ class MultipleChoiceVerifier:
         self._choices = choices.upper()
         cls = f"[{re.escape(self._choices)}]"
         self._boxed = re.compile(rf"\\boxed\{{\s*({cls})\s*\}}", re.IGNORECASE)
-        self._phrase = re.compile(rf"answer\s*(?:is|:)?\s*\(?\s*({cls})\s*\)?", re.IGNORECASE)
+        # Require an explicit "is" or ":" connector plus a trailing non-letter
+        # boundary. Lowercase bare letters (such as the English article "a" in
+        # "Answer: a simple equation gives B") are accepted only when parenthesized
+        # or terminated by punctuation / end-of-line.
+        self._phrase = re.compile(
+            rf"(?i:\banswer\s*(?:is\b\s*:?|:))\s*"
+            rf"(?:\(\s*(?i:({cls}))\s*\)"
+            rf"|({cls})(?![A-Za-z])"
+            rf"|(?i:({cls}))(?=[.,;:!?)\]\n]|$))"
+        )
+        self._lone_upper = re.compile(rf"(?<![A-Za-z])({cls})(?![A-Za-z])")
         self._lone = re.compile(rf"(?<![A-Za-z])({cls})(?![A-Za-z])", re.IGNORECASE)
 
     def _extract_choice(self, text: str) -> str | None:
@@ -680,10 +789,18 @@ class MultipleChoiceVerifier:
         Returns:
             The upper-cased option letter, or ``None`` if none was found.
         """
-        for pattern in (self._boxed, self._phrase):
-            m = pattern.search(text)
-            if m:
-                return m.group(1).upper()
+        boxed_matches = self._boxed.findall(text)
+        if boxed_matches:
+            return boxed_matches[-1].upper()
+        phrase_matches = list(self._phrase.finditer(text))
+        if phrase_matches:
+            last = phrase_matches[-1]
+            for group in last.groups():
+                if group is not None:
+                    return group.upper()
+        lone_upper = self._lone_upper.findall(text)
+        if lone_upper:
+            return lone_upper[-1].upper()
         lone = self._lone.findall(text)
         return lone[-1].upper() if lone else None
 
@@ -817,7 +934,8 @@ class JSONVerifier:
         _graded (bool): Return the key-coverage fraction instead of binary.
     """
 
-    _FENCE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+    _JSON_FENCE = re.compile(r"```json\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
+    _FENCE = re.compile(r"```[a-zA-Z0-9_-]*\s*\n?(.*?)```", re.DOTALL)
     _PARSE_FAILURE = object()
 
     def __init__(self, required_keys: tp.Sequence[str] | None = None, graded: bool = False):
@@ -832,7 +950,7 @@ class JSONVerifier:
         self._graded = graded
 
     def _parse(self, text: str) -> tp.Any:
-        """Parse JSON from a completion, preferring a fenced block.
+        """Parse JSON from a completion, preferring explicit ```` ```json ```` blocks.
 
         Args:
             text: Raw completion text.
@@ -844,15 +962,23 @@ class JSONVerifier:
         import json
 
         candidates: list[str] = []
-        fenced = self._FENCE.search(text)
-        if fenced:
-            candidates.append(fenced.group(1).strip())
+        # Prefer explicit ```json fences (last to first) over earlier non-JSON code fences.
+        for block in reversed(self._JSON_FENCE.findall(text)):
+            candidates.append(block.strip())
+        for block in reversed(self._FENCE.findall(text)):
+            stripped_block = block.strip()
+            if stripped_block not in candidates:
+                candidates.append(stripped_block)
         stripped = text.strip()
         candidates.append(stripped)
         start = stripped.find("{")
         end = stripped.rfind("}")
         if start != -1 and end != -1 and end > start:
             candidates.append(stripped[start : end + 1])
+        arr_start = stripped.find("[")
+        arr_end = stripped.rfind("]")
+        if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+            candidates.append(stripped[arr_start : arr_end + 1])
         for candidate in candidates:
             try:
                 return json.loads(candidate)
@@ -1071,7 +1197,10 @@ class CompositeVerifier:
         per_verifier: list[list[float]] = []
         for verifier in self._verifiers:
             scores = verifier(prompts=prompts, completions=completions, batch=batch, **kwargs)
-            per_verifier.append([float(s) for s in scores])
+            if scores is None:
+                per_verifier.append([0.0] * n)
+            else:
+                per_verifier.append([0.0 if s is None else float(s) for s in scores])
         if not per_verifier:
             return [0.0] * n
         length = min(len(scores) for scores in per_verifier)

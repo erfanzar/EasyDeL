@@ -14,6 +14,7 @@
 """Shared implementation primitives for EasyDeL online-RL trainers."""
 
 from .async_rollout import (
+    AsyncRolloutAdmissionDeferred,
     AsyncRolloutCancelled,
     AsyncRolloutError,
     AsyncRolloutWorkerError,
@@ -21,6 +22,8 @@ from .async_rollout import (
     CompletedRollout,
     PolicySnapshot,
     RolloutTicket,
+    admission_is_feasible,
+    min_admissible_version,
 )
 from .config import OnlineActorCriticConfig
 from .math import (
@@ -47,6 +50,7 @@ from .trajectory import (
 )
 
 __all__ = (
+    "AsyncRolloutAdmissionDeferred",
     "AsyncRolloutCancelled",
     "AsyncRolloutError",
     "AsyncRolloutWorkerError",
@@ -65,12 +69,14 @@ __all__ = (
     "TrajectorySegment",
     "TrajectorySpan",
     "TruncationSide",
+    "admission_is_feasible",
     "collate_trajectories",
     "cross_segment_advantage_correction",
     "following_segment_token_counts",
     "global_token_denominator",
     "global_token_mean",
     "length_adaptive_lambda",
+    "min_admissible_version",
     "skip_observation_gae",
     "target_aligned_action_mask",
     "target_aligned_token_ids",

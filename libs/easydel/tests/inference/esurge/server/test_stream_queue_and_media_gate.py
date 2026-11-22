@@ -312,6 +312,42 @@ def test_stream_queue_aborts_after_blocked_first_next_returns():
         server.thread_pool.shutdown(wait=True)
 
 
+def test_idle_stream_consumers_do_not_spin_the_event_loop():
+    # A consumer awaiting get() on a stream with nothing to deliver must sleep until the producer enqueues, not poll:
+    # a 1 ms poll per open stream holds the GIL ~128k times a second at 128 streams and starves the engine loop.
+    server = _server(maxsize=4)
+    server._max_stream_producers = 128
+    release = threading.Event()
+
+    def stream_fn():
+        release.wait(timeout=10.0)
+        yield "late"
+
+    async def run():
+        queues = [server._start_stream_task(stream_fn) for _ in range(128)]
+        try:
+            waiters = [asyncio.ensure_future(queue.get()) for queue in queues]
+            await asyncio.sleep(0.1)  # let every waiter park
+            cpu0 = time.process_time()
+            await asyncio.sleep(1.0)
+            idle_cpu = time.process_time() - cpu0
+            release.set()
+            first = await asyncio.wait_for(asyncio.gather(*waiters), timeout=5.0)
+            return idle_cpu, first
+        finally:
+            release.set()
+            for queue in queues:
+                _close_and_join(server, queue)
+
+    try:
+        idle_cpu, first = asyncio.run(run())
+        assert first == [("data", "late")] * 128  # every parked waiter is woken by its producer
+        assert idle_cpu < 0.25, f"idle stream consumers burned {idle_cpu:.2f}s CPU in 1s"
+    finally:
+        server._get_stream_pool().shutdown(wait=True)
+        server.thread_pool.shutdown(wait=True)
+
+
 def test_close_stream_queue_tolerates_objects_without_close():
     eSurgeApiServer._close_stream_queue(object())
 

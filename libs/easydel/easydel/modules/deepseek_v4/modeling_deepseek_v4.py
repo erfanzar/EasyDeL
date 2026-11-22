@@ -158,6 +158,7 @@ from easydel.layers.indexer import (
     CompressedIndexerConfig,
     indexer_distillation_loss,
     is_vacuous_selection,
+    resolve_index_scoring_kernel,
     selection_bias,
 )
 from easydel.layers.moe import moe_group_topk_select, normalize_topk_weights
@@ -551,7 +552,7 @@ def _compressed_indexer_config(config: DeepseekV4Config) -> CompressedIndexerCon
         compress_rate=config.compress_rates["compressed_sparse_attention"],
         rms_norm_eps=config.rms_norm_eps,
         initializer_range=config.initializer_range,
-        scoring_kernel=config.index_scoring_kernel,
+        scoring_kernel=resolve_index_scoring_kernel(config.index_scoring_kernel),
     )
 
 
@@ -1897,15 +1898,19 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
         self,
         hidden_states: Float[Array, "batch seq hidden"],
         input_ids: Int[Array, "batch seq"] | None = None,
+        *,
+        post_write_gate: Float[Array, "batch seq hc"] | None = None,
     ) -> tuple[Array, Array]:
         """Route tokens through experts and add the shared expert.
 
         Args:
             hidden_states: Post-norm hidden states ``[B, S, D_model]``.
             input_ids: Token ids ``[B, S]``; required on hash-MoE layers.
+            post_write_gate: Optional mHC write gate ``[B, S, hc]`` (cast to stream dtype). When the chunked
+                fused MoE path fuses it, returns the 4-D ``post * (routed + shared)`` stream contribution.
 
         Returns:
-            Tuple of the MoE output ``[B, S, D_model]`` and the router scores
+            Tuple of the MoE output (``[B, S, D_model]`` or 4-D expanded stream write) and the router scores
             (``[B * S, n_routed_experts]``).
 
         Raises:
@@ -1958,7 +1963,7 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
             """Clamped SwiGLU: ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``."""
             return clamped_swiglu(gate, up, limit=limit, act_fn=self.experts.act_fn)
 
-        routed, router_scores = self.moe_call(
+        out, router_scores = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=gate_layer,
             expert_layer=self.experts,
@@ -1969,10 +1974,11 @@ class DeepseekV4SparseMoeBlock(BaseMoeModule):
             ffn_activation=ffn_activation,
             hooks=hooks,
             layer_idx=self.layer_idx,
+            shared_expert=self.shared_experts,
+            post_write_gate=post_write_gate,
         )
         if self.is_hash:
             router_scores = router_scores[:, :num_experts]  # drop the carried hash-index columns
-        out = routed + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_scores, "moe_router_logits")
 
 
@@ -2108,7 +2114,11 @@ class DeepseekV4DecoderLayer(spx.Module):
         hidden_streams = manifold_residual_write(hidden_streams, attn_output, post, comb, precision=self.precision)
 
         post, comb, collapsed = self.ffn_hc(hidden_streams)
-        mlp_output, router_logits = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        mlp_output, router_logits = self.mlp(
+            self.post_attention_layernorm(collapsed),
+            input_ids=input_ids,
+            post_write_gate=self.ffn_hc.fused_post_write_gate(hidden_streams, post, comb),
+        )
         hidden_streams = manifold_residual_write(hidden_streams, mlp_output, post, comb, precision=self.precision)
 
         return _DeepseekV4DecoderLayerOutput(

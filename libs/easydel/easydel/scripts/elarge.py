@@ -198,6 +198,22 @@ def _parse_action(item: Any) -> tuple[str, Any | None]:
     raise SystemExit(f"Invalid action item type: {type(item).__name__}.")
 
 
+def _joined_world() -> tuple[int, int]:
+    """``(process count, process index)`` of the joined ``jax.distributed`` world, without starting a JAX backend.
+
+    ``(1, 0)`` when no multi-process world is joined. Once a backend runs, JAX's own answer is returned.
+    """
+    import jax
+    from jax._src import xla_bridge
+    from jax._src.distributed import global_state
+
+    if xla_bridge.backends_are_initialized():
+        return int(jax.process_count()), int(jax.process_index())
+    if global_state.client is None:
+        return 1, 0
+    return int(global_state.num_processes or 1), int(global_state.process_id or 0)
+
+
 def _require_mapping(value: Any, *, ctx: str) -> dict[str, Any]:
     """Assert that ``value`` is a dict and return it.
 
@@ -784,7 +800,10 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
 
         import jax
 
-        if int(jax.process_count()) > 1:
+        # Before build_esurge(): read the joined world from jax.distributed's state, not jax.process_count(), which
+        # would start the backend and keep a dp>1 launch from moving each host into its own replica world.
+        world_size, world_rank = _joined_world()
+        if world_size > 1:
             # Serving on a multi-process runtime needs the step-coordination
             # plane: requests arrive at rank 0 only, but the jitted step is a
             # global collective. Enable coordination="zmq" automatically with
@@ -804,8 +823,8 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
                 elm.set_esurge(coordination="zmq", distributed_auth_token=auth)
                 logger.info(
                     "Multi-process serve: enabled esurge step coordination (coordination='zmq', %d processes, rank %d).",
-                    int(jax.process_count()),
-                    int(jax.process_index()),
+                    world_size,
+                    world_rank,
                 )
 
         surge = elm.build_esurge()

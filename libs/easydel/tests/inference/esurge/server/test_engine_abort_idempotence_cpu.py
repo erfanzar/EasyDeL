@@ -23,6 +23,30 @@ from easydel.inference.esurge.esurge_engine import eSurge
 pytestmark = pytest.mark.cpu_ok
 
 
+class _FakeCore:
+    """Engine-core stand-in: live requests by id with their parent link; records every finish call."""
+
+    num_running = 0
+    num_waiting = 0
+
+    def __init__(self, requests, finished_calls):
+        self.requests = requests
+        self._finished_calls = finished_calls
+
+    def record_of(self, request_id):
+        return self.requests.get(request_id)
+
+    def children_of(self, parent_request_id):
+        return [rid for rid, r in self.requests.items() if getattr(r, "parent_request_id", None) == parent_request_id]
+
+    def finish_requests(self, ids, reason):
+        ids = [rid for rid in ids if rid in self.requests]
+        self._finished_calls.append((set(ids), reason))
+        for rid in ids:
+            self.requests.pop(rid, None)
+        return ids
+
+
 def _stub_engine(output, *, active=False):
     engine = object.__new__(eSurge)
     engine._scheduler_lock = threading.RLock()
@@ -40,14 +64,8 @@ def _stub_engine(output, *, active=False):
     notified = []
     engine._detokenizer_client = SimpleNamespace(reset=resets.append)
     engine._request_plane = SimpleNamespace(owns_scheduling=False, notify_abort=notified.append)
-    requests = {"req": SimpleNamespace(parent_request_id=None)} if active else {}
-
-    def finish_requests(ids, status):
-        finished_calls.append((set(ids), status))
-        for rid in ids:
-            requests.pop(rid, None)
-
-    engine.scheduler = SimpleNamespace(requests=requests, running=[], waiting=[], finish_requests=finish_requests)
+    requests = {"req": SimpleNamespace(parent_request_id=None, sample_index=0)} if active else {}
+    engine.core = _FakeCore(requests, finished_calls)
     return engine, resets, finished_calls, notified
 
 
@@ -78,7 +96,7 @@ def test_abort_finished_output_with_live_scheduler_row_frees_row_and_keeps_stop(
 
     assert len(finished_calls) == 1
     assert finished_calls[0][0] == {"req"}
-    assert "req" not in engine.scheduler.requests
+    assert "req" not in engine.core.requests
     assert resets == ["req"]
     assert notified == ["req"]
     assert output.finished is True
@@ -95,15 +113,15 @@ def test_abort_finished_child_with_live_row_does_not_touch_live_sibling():
         update_seq=5,
     )
     engine, resets, finished_calls, notified = _stub_engine(output)
-    engine.scheduler.requests["req-0"] = SimpleNamespace(parent_request_id="req", sample_index=0)
-    engine.scheduler.requests["req-1"] = SimpleNamespace(parent_request_id="req", sample_index=1)
+    engine.core.requests["req-0"] = SimpleNamespace(parent_request_id="req", sample_index=0)
+    engine.core.requests["req-1"] = SimpleNamespace(parent_request_id="req", sample_index=1)
     engine._active_requests["req-0"] = SimpleNamespace(parent_request_id="req", sample_index=0)
 
     engine.abort_request("req-1")
 
     assert [call[0] for call in finished_calls] == [{"req-1"}]
-    assert "req-0" in engine.scheduler.requests
-    assert "req-1" not in engine.scheduler.requests
+    assert "req-0" in engine.core.requests
+    assert "req-1" not in engine.core.requests
     assert [item.finish_reason for item in output.outputs] == [None, "stop"]
     assert output.finished is False
     assert output.update_seq == 5
@@ -120,13 +138,13 @@ def test_late_abort_of_released_child_does_not_touch_live_sibling():
         update_seq=5,
     )
     engine, _resets, finished_calls, _notified = _stub_engine(output)
-    engine.scheduler.requests["req-0"] = SimpleNamespace(parent_request_id="req", sample_index=0)
+    engine.core.requests["req-0"] = SimpleNamespace(parent_request_id="req", sample_index=0)
     engine._active_requests["req-0"] = SimpleNamespace(parent_request_id="req", sample_index=0)
 
     engine.abort_request("req-1")
 
     assert finished_calls == []
-    assert "req-0" in engine.scheduler.requests
+    assert "req-0" in engine.core.requests
     assert [item.finish_reason for item in output.outputs] == [None, "stop"]
     assert output.finished is False
     assert output.update_seq == 5

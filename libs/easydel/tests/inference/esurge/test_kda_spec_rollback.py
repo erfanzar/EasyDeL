@@ -15,14 +15,12 @@
 """Speculative rollback on KDA (Kimi-style linear attention) caches: greedy parity with plain serving.
 
 A tiny fp32 GLM-5-Next hybrid (3 KDA layers + 1 DSA/MLA layer, HIGHEST precision) is served by the real
-``eSurgeRunner`` + ``Scheduler`` with and without an oracle drafter whose proposals are the plain greedy continuation
+``eSurgeRunner`` + engine core with and without an oracle drafter whose proposals are the plain greedy continuation
 with every 3rd window corrupted. Rejected drafts must leave the KDA short-conv windows and recurrent rows exactly as
-plain decoding would. KDA pools keep speculative candidate rows (decode-exact state after every verify prefix,
-written by ``kda_packed_rows_forward``); the accepted prefix's row is committed into the live row at the next step
-(regressions: ``KDACacheView`` was once invisible to the rollback, so a rejected draft left the KDA state advanced
-through the rejected tokens; a commit that never reaches the kernel would do the same).
-
-The default (fast) recurrent path is tested on purpose: ``EASYDEL_SPEC_RECURRENT_REPLAY`` is left unset.
+plain decoding would. Every request owns ``W = 1 + K`` KDA slots: a verify step captures the decode-exact state
+after each of its tokens into slot ``g + j``, and the next step reads slot ``g + accepted drafts`` (no candidate rows,
+no snapshot, no replay; regression: ``KDACacheView`` was once invisible to the rollback, so a rejected draft left the
+KDA state advanced through the rejected tokens).
 """
 
 from __future__ import annotations
@@ -34,11 +32,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import DraftStep
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 VOCAB = 128
 K = 3
@@ -53,11 +54,6 @@ WAVE2 = [
     {"id": "w2-b", "prompt_token_ids": [21, 34, 2], "max_tokens": 13},
 ]
 WAVES = (WAVE1, WAVE2)
-
-
-@pytest.fixture(autouse=True)
-def _default_fast_recurrent_path(monkeypatch):
-    monkeypatch.delenv("EASYDEL_SPEC_RECURRENT_REPLAY", raising=False)
 
 
 def _make_tiny_glm5_next():
@@ -188,7 +184,7 @@ class _Harness:
             drafter=drafter,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -199,7 +195,7 @@ class _Harness:
     def generate_greedy(self, specs: list[dict]) -> list[list[int]]:
         requests = []
         for spec in specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=spec["id"],
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(max_tokens=int(spec["max_tokens"]), temperature=0.0, ignore_eos=True),
@@ -210,7 +206,7 @@ class _Harness:
         for _ in range(STEP_BUDGET):
             scheduler_output = self.scheduler.schedule()
             output = self.runner.execute_model(scheduler_output)
-            self.scheduler.update_from_output(scheduler_output, output)
+            self.scheduler.commit(scheduler_output, output)
             if all(r.is_finished() for r in requests):
                 break
         else:
@@ -264,7 +260,8 @@ def test_kda_rejected_drafts_roll_back_to_plain_greedy(tiny_model, baseline):
         print(f"[kda spec rollback] generated={generated} accepted={accepted} windows={drafter.windows}")
         print(f"[kda spec rollback] drafter errors={drafter.errors}")
         assert not drafter.errors, drafter.errors
-        assert runner.spec.recurrent_candidate_count() == K + 1, "KDA candidate rows are not allocated"
+        assert runner.recurrent_slot_group_size == K + 1, "KDA slot groups are not allocated"
+        assert runner.spec.recurrent_candidate_count() == 0, "KDA pools must not carry candidate rows"
         assert accepted > 0, "no draft was ever accepted"
         assert accepted < generated, "no draft was ever rejected"
     finally:

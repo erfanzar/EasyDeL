@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from easydel.inference.esurge.core import ChunkedLocalAttentionManager, ChunkedLocalAttentionSpec
+from easydel.inference.esurge.core import ChunkedLocalAttentionSpec
 from easydel.inference.esurge.core.interface import (
     CacheGroupSpec,
     FullAttentionSpec,
@@ -32,8 +32,6 @@ from easydel.inference.esurge.core.interface import (
     create_kv_cache_specs_from_config,
 )
 from easydel.inference.esurge.core.manager import CacheManager, CachePages
-from easydel.inference.esurge.core.page_pool import PagePool
-from easydel.inference.esurge.core.single_type_cache_manager import get_manager_for_kv_cache_spec
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
@@ -118,17 +116,18 @@ def test_explicit_mixed_groups_evict_only_chunk_pages_at_boundary(enable_caching
     assert first is not None
     full_pages, chunk_pages = first.pages
     assert len(full_pages) == len(chunk_pages) == 4
-    assert not {page.page_id for page in full_pages} & {page.page_id for page in chunk_pages}
+    assert not set(full_pages) & set(chunk_pages)
 
     request.num_computed_tokens = 64
     next_pages = manager.allocate_slots(request, num_new_tokens=1)
     assert next_pages is not None
     full_ids, chunk_ids = manager.get_page_ids(request.request_id)
-    assert full_ids[:4] == [page.page_id for page in full_pages]
-    assert chunk_ids[:4] == [manager.page_pool.null_page.page_id] * 4
+    assert full_ids[:4] == full_pages
+    assert chunk_ids[:4] == [0] * 4
     assert len(full_ids) == len(chunk_ids) == 5
-    assert all(page.ref_cnt == 1 for page in full_pages)
-    assert all(page.ref_cnt == 0 for page in chunk_pages)
+    refs = manager._core.refs()
+    assert all(refs[page - 1] == 1 for page in full_pages)
+    assert all(refs[page - 1] == 0 for page in chunk_pages)
     assert full_ids[-1] != chunk_ids[-1]
 
 
@@ -143,17 +142,19 @@ def test_explicit_chunk_spec_keeps_registered_manager_and_chunk_eviction():
         use_mla=False,
         attention_chunk_size=64,
     )
-    pool = PagePool(num_pages=8, enable_caching=False)
-    manager = get_manager_for_kv_cache_spec(spec, page_pool=pool, kv_cache_group_id=0)
-    assert isinstance(manager, ChunkedLocalAttentionManager)
+    manager = CacheManager(
+        num_pages=8, kv_cache_groups=[CacheGroupSpec(spec, ["layer.0"])], max_model_len=512, enable_caching=False
+    )
     assert spec.max_memory_usage_bytes(max_model_len=512, max_num_batched_tokens=16) == 5 * spec.page_size_bytes
 
-    allocated = manager.allocate_new_pages("request", num_tokens=80)
-    manager.remove_skipped_pages("request", num_computed_tokens=64)
+    request = SimpleNamespace(request_id="request", num_computed_tokens=0)
+    (allocated,) = manager.allocate_slots(request, num_new_tokens=80).pages
+    request.num_computed_tokens = 64
+    assert manager.allocate_slots(request, num_new_tokens=1).pages == ([],)
 
     assert len(allocated) == 5
-    assert [page.ref_cnt for page in allocated] == [0, 0, 0, 0, 1]
-    assert manager.req_to_pages["request"] == [pool.null_page] * 4 + allocated[4:]
+    assert [manager._core.refs()[page - 1] for page in allocated] == [0, 0, 0, 0, 1]
+    assert manager.get_page_ids("request") == ([0] * 4 + allocated[4:],)
 
 
 @pytest.mark.cpu_ok

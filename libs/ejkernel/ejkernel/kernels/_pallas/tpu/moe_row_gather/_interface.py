@@ -24,8 +24,22 @@ import jax
 from jaxtyping import Array, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
-from ...._xla.moe_row_gather._xla_impl import moe_row_gather_sum_xla, moe_row_gather_xla
-from ._pallas_impl import gather_rows, gather_sum_rows, gather_sum_unsupported_reason, gather_unsupported_reason
+from ...._xla.moe_row_gather._xla_impl import (
+    moe_row_gather_quantized_xla,
+    moe_row_gather_sum_packed_xla,
+    moe_row_gather_sum_xla,
+    moe_row_gather_xla,
+)
+from ._pallas_impl import (
+    gather_quantized_rows,
+    gather_rows,
+    gather_sum_packed_rows,
+    gather_sum_packed_unsupported_reason,
+    gather_sum_rows,
+    gather_sum_unsupported_reason,
+    gather_unsupported_reason,
+    quantized_gather_unsupported_reason,
+)
 
 
 def row_gather_unsupported_reason(x, indices, scale=None, dot_with=None) -> str | None:
@@ -47,13 +61,45 @@ def row_gather_unsupported_reason(x, indices, scale=None, dot_with=None) -> str 
     return gather_unsupported_reason(tuple(x.shape), x.dtype, rows, has_dot=dot_with is not None)
 
 
-def row_gather_sum_unsupported_reason(y, indices, weights, out_dtype=None) -> str | None:
+def quantized_row_gather_unsupported_reason(codes, scale, indices) -> str | None:
+    """Why ``moe_row_gather_quantized`` would use the XLA fallback for these arguments (``None``: the kernel runs).
+
+    Only ``.shape`` / ``.dtype`` are read, so ``jax.ShapeDtypeStruct`` arguments work.
+    """
+    if jax.default_backend() != "tpu":
+        return f"backend is {jax.default_backend()}, not tpu"
+    if len(indices.shape) != 1:
+        return f"indices must be 1-D, got shape {tuple(indices.shape)}"
+    return quantized_gather_unsupported_reason(
+        tuple(codes.shape), codes.dtype, tuple(scale.shape), scale.dtype, indices.shape[0]
+    )
+
+
+def packed_row_gather_sum_unsupported_reason(
+    packed, indices, weights, hidden, pair_width, out_dtype=None, *, skip_negative=False
+) -> str | None:
+    """Why ``moe_row_gather_sum_packed`` would use the XLA fallback for these arguments (``None``: the kernel runs)."""
+    if jax.default_backend() != "tpu":
+        return f"backend is {jax.default_backend()}, not tpu"
+    if len(indices.shape) != 2 or tuple(weights.shape) != tuple(indices.shape):
+        return f"indices {tuple(indices.shape)} and weights {tuple(weights.shape)} must both be [tokens, k]"
+    tokens, k = indices.shape
+    if skip_negative and 2 * tokens * k >= 2**31:
+        return f"{tokens} x {k} slots overflow the int32 live-slot sort keys"
+    return gather_sum_packed_unsupported_reason(
+        tuple(packed.shape), packed.dtype, int(hidden), int(pair_width), tokens, k, out_dtype
+    )
+
+
+def row_gather_sum_unsupported_reason(y, indices, weights, out_dtype=None, *, skip_negative=False) -> str | None:
     """Why ``moe_row_gather_sum`` would use the XLA fallback for these arguments (``None``: the Pallas kernel runs)."""
     if jax.default_backend() != "tpu":
         return f"backend is {jax.default_backend()}, not tpu"
     if len(indices.shape) != 2 or tuple(weights.shape) != tuple(indices.shape):
         return f"indices {tuple(indices.shape)} and weights {tuple(weights.shape)} must both be [tokens, k]"
     tokens, k = indices.shape
+    if skip_negative and 2 * tokens * k >= 2**31:
+        return f"{tokens} x {k} slots overflow the int32 live-slot sort keys"
     return gather_sum_unsupported_reason(tuple(y.shape), y.dtype, tokens, k, out_dtype)
 
 
@@ -63,8 +109,11 @@ def moe_row_gather(
     indices: Int[Array, "rows"],
     scale: Float[Array, "rows"] | None = None,
     dot_with: Float[Array, "rows hidden"] | None = None,
+    out_dtype: jax.typing.DTypeLike | None = None,
 ) -> tuple[Float[Array, "rows hidden"], Float[Array, "rows"] | None]:
     """``out[i] = scale[i] * x[indices[i]]`` and optionally ``dot[i] = <x[indices[i]], dot_with[i]>`` by row DMA.
+
+    ``out_dtype=int8`` (no ``scale``): integer-valued rows (int8 codes carried as bfloat16) are written as int8.
 
     Args:
         x: ``[src_rows, hidden]`` source rows.
@@ -76,8 +125,63 @@ def moe_row_gather(
         ``(out [rows, hidden] in x.dtype, dot [rows] fp32 or None)``; bit-identical to the XLA entry for ``out``.
     """
     if row_gather_unsupported_reason(x, indices, scale, dot_with) is not None:
-        return moe_row_gather_xla(x, indices, scale, dot_with)
-    return gather_rows(x, indices, scale, dot_with)
+        return moe_row_gather_xla(x, indices, scale, dot_with, out_dtype)
+    return gather_rows(x, indices, scale, dot_with, out_dtype=out_dtype)
+
+
+@kernel_registry.register("moe_row_gather_quantized", Platform.PALLAS, Backend.TPU, priority=10)
+def moe_row_gather_quantized(
+    codes: Int[Array, "src_rows hidden"],
+    scale: Float[Array, "src_rows"],
+    indices: Int[Array, "rows"],
+) -> tuple[Int[Array, "rows hidden"], Float[Array, "rows"]]:
+    """``(codes[indices], scale[indices])`` by one DMA per row that carries the row's codes and its scale together.
+
+    Args:
+        codes: ``[src_rows, hidden]`` int8 codes.
+        scale: ``[src_rows]`` fp32 row scales.
+        indices: ``[rows]`` row ids (clamped to range).
+
+    Returns:
+        ``(codes [rows, hidden] int8, scale [rows] fp32)``; bit-identical to the XLA entry.
+    """
+    if quantized_row_gather_unsupported_reason(codes, scale, indices) is not None:
+        return moe_row_gather_quantized_xla(codes, scale, indices)
+    return gather_quantized_rows(codes, scale, indices)
+
+
+@kernel_registry.register("moe_row_gather_sum_packed", Platform.PALLAS, Backend.TPU, priority=10)
+def moe_row_gather_sum_packed(
+    packed: Int[Array, "packed_rows lanes"],
+    indices: Int[Array, "tokens k"],
+    weights: Float[Array, "tokens k"],
+    hidden: int,
+    pair_width: int,
+    out_dtype: jax.typing.DTypeLike | None = None,
+    skip_negative: bool = False,
+) -> Float[Array, "tokens hidden"]:
+    """``moe_row_gather_sum`` of bfloat16 rows given in the int32 ``pack_rows_paired`` layout, by row DMA.
+
+    No pack pass: the source is DMA-ready (e.g. written in this layout by the producing grouped matmul).
+
+    Args:
+        packed: int32 ``[src_rows * hidden / 256, 128]``.
+        indices: ``[tokens, k]`` row ids (clamped; negative = inactive slot under ``skip_negative``).
+        weights: ``[tokens, k]`` combine weights.
+        hidden: Row width of the packed bfloat16 rows.
+        pair_width: Column-pairing block width of the layout.
+        out_dtype: Output dtype (default bfloat16).
+        skip_negative: As in ``moe_row_gather_sum``.
+
+    Returns:
+        ``[tokens, hidden]`` in ``out_dtype``; bit-identical to the XLA entry.
+    """
+    reason = packed_row_gather_sum_unsupported_reason(
+        packed, indices, weights, hidden, pair_width, out_dtype, skip_negative=skip_negative
+    )
+    if reason is not None:
+        return moe_row_gather_sum_packed_xla(packed, indices, weights, hidden, pair_width, out_dtype, skip_negative)
+    return gather_sum_packed_rows(packed, indices, weights, hidden, pair_width, out_dtype, skip_negative=skip_negative)
 
 
 @kernel_registry.register("moe_row_gather_sum", Platform.PALLAS, Backend.TPU, priority=10)
@@ -86,26 +190,34 @@ def moe_row_gather_sum(
     indices: Int[Array, "tokens k"],
     weights: Float[Array, "tokens k"],
     out_dtype: jax.typing.DTypeLike | None = None,
+    skip_negative: bool = False,
 ) -> Float[Array, "tokens hidden"]:
     """``out[t] = sum_j weights[t, j] * y[indices[t, j]]`` (fp32 accumulation) by row DMA.
 
     Args:
         y: ``[src_rows, hidden]`` source rows.
-        indices: ``[tokens, k]`` row ids (clamped to range).
+        indices: ``[tokens, k]`` row ids (clamped to range; negative = inactive slot under ``skip_negative``).
         weights: ``[tokens, k]`` combine weights.
         out_dtype: Output dtype (default ``y.dtype``).
+        skip_negative: A negative index contributes exactly zero and issues no row copy: the live-slot kernel
+            (:func:`gather_sum_rows`) visits only the non-negative slots of each token block, so rows that only
+            inactive slots point at are never read (they may be non-finite).
 
     Returns:
         ``[tokens, hidden]`` in ``out_dtype``.
     """
-    if row_gather_sum_unsupported_reason(y, indices, weights, out_dtype) is not None:
-        return moe_row_gather_sum_xla(y, indices, weights, out_dtype)
-    return gather_sum_rows(y, indices, weights, out_dtype)
+    if row_gather_sum_unsupported_reason(y, indices, weights, out_dtype, skip_negative=skip_negative) is not None:
+        return moe_row_gather_sum_xla(y, indices, weights, out_dtype, skip_negative)
+    return gather_sum_rows(y, indices, weights, out_dtype, skip_negative=skip_negative)
 
 
 __all__ = (
     "moe_row_gather",
+    "moe_row_gather_quantized",
     "moe_row_gather_sum",
+    "moe_row_gather_sum_packed",
+    "packed_row_gather_sum_unsupported_reason",
+    "quantized_row_gather_unsupported_reason",
     "row_gather_sum_unsupported_reason",
     "row_gather_unsupported_reason",
 )

@@ -145,6 +145,9 @@ def _manager(monkeypatch, *, slot_indexed=False, enable_spec=False):
     monkeypatch.setattr(preparer_module, "jax", host_jax)
     monkeypatch.setattr(preparer_module, "host_payload_broadcast_needed", lambda host_payloads_replicated=None: False)
     monkeypatch.setattr(manager_module, "jax", host_jax)
+    # Per-step placements go through host_sync.put_host_payload, which resolves the real jax: keep them on the host.
+    for module in (preparer_module, manager_module):
+        monkeypatch.setattr(module, "put_host_payload", lambda values, shardings, **_kwargs: _host_put(values))
     # This adapter only places fixed device indices; NumPy is sufficient for host control-flow coverage.
     monkeypatch.setattr(
         PipelineMicrobatchExecutor, "_get_pipeline_logits_indices", lambda self, count, like: np.arange(count)

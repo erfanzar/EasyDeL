@@ -222,13 +222,14 @@ meshes without a resolver retain the unpartitioned fallback. CPU tests cannot
 validate this TPU lowering path. As with other changes to distributed reduction
 order, this layout is not a promise of bitwise-equal bf16 results.
 
-### Opt-in fused coefficients
+### Fused coefficients
 
 `ManifoldHyperConnectionConfig(use_fused_coefficients=True)` routes the gates,
 softmax, and Sinkhorn projection through ejkernel's registered
-`mhc_coefficients` operation. It is off by default; GLM-5-Next and DeepSeek-V4
-expose it as `hc_use_fused_coefficients`. Parameters and checkpoint leaves are
-unchanged, so the flag can be toggled on an existing checkpoint.
+`mhc_coefficients` operation. GLM-5-Next, DeepSeek-V4 and DeepSeek-V4.1 expose
+it as `hc_use_fused_coefficients`, whose default `None` turns it on on TPU and
+off elsewhere. Parameters and checkpoint leaves are unchanged, so the flag can
+be toggled on an existing checkpoint.
 
 On TPU with four streams and at most 20 Sinkhorn iterations, the operation runs
 a lane-packed Pallas kernel. Its backward pass saves only the small projection
@@ -237,9 +238,10 @@ iteration counts above 20, and empty inputs fall back to the XLA
 implementation.
 
 **Differentiation limit:** the Pallas path supports **first-order reverse-mode
-AD only** (`jax.grad`/`jax.vjp`). Leave the flag off where forward-mode
-(`jax.jvp`) or higher-order derivatives are needed. Calling the operation
-directly with `platform="xla"` supports both.
+AD only** (`jax.grad`/`jax.vjp`). Set the flag to `False` where forward-mode
+(`jax.jvp`) or higher-order derivatives are needed. A config saved with `false`
+loads as `None`, so set it again after loading. Calling the operation directly
+with `platform="xla"` supports both.
 
 The multi-device path uses the same token-local `shard_map` as the unfused
 Sinkhorn. The kernel declares that its outputs vary over exactly its inputs'

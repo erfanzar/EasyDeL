@@ -16,18 +16,36 @@
 
 from ._interface import (
     moe_row_gather,
+    moe_row_gather_quantized,
     moe_row_gather_sum,
+    moe_row_gather_sum_packed,
+    packed_row_gather_sum_unsupported_reason,
+    quantized_row_gather_unsupported_reason,
     row_gather_sum_unsupported_reason,
     row_gather_unsupported_reason,
 )
-from ._pallas_impl import gather_rows, gather_sum_rows, pack_rows
+from ._pallas_impl import (
+    gather_quantized_rows,
+    gather_rows,
+    gather_sum_packed_rows,
+    gather_sum_rows,
+    pack_quantized_rows,
+    pack_rows,
+)
 
 __all__ = (
+    "gather_quantized_rows",
     "gather_rows",
+    "gather_sum_packed_rows",
     "gather_sum_rows",
     "moe_row_gather",
+    "moe_row_gather_quantized",
     "moe_row_gather_sum",
+    "moe_row_gather_sum_packed",
+    "pack_quantized_rows",
     "pack_rows",
+    "packed_row_gather_sum_unsupported_reason",
+    "quantized_row_gather_unsupported_reason",
     "row_gather_sum_unsupported_reason",
     "row_gather_unsupported_reason",
 )

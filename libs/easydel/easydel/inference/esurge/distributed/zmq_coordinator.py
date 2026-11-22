@@ -36,6 +36,8 @@ migration.
 
 from __future__ import annotations
 
+import hmac
+import itertools
 import queue
 import threading
 import time
@@ -43,7 +45,7 @@ import typing
 
 from ..logger import logger
 from . import wire
-from .coordinator import StepCoordinationError, StepHandle
+from .coordinator import StepCoordinationError, StepHandle, format_tcp_endpoint
 from .protocol import compute_sampled_digest
 
 if typing.TYPE_CHECKING:
@@ -52,10 +54,25 @@ if typing.TYPE_CHECKING:
 
 _POLL_MS = 50
 
+# Distinct inproc endpoints per IO loop, so a restarted coordinator never rebinds a name a closing socket still holds.
+_LEADER_WAKE_IDS = itertools.count()
+_WORKER_WAKE_IDS = itertools.count()
+
 # Outbox destination sentinels: the step stream broadcasts to worker ranks
 # only; _DEST_ALL additionally covers request-plane clients (shutdown).
 _DEST_WORKERS = object()
 _DEST_ALL = object()
+
+
+def _configure_zmq_socket(sock, zmq) -> None:
+    """Apply common transport options: no silent HWM drops, dual-stack IPv6 support, bounded linger."""
+    sock.setsockopt(zmq.LINGER, 500)
+    sock.setsockopt(zmq.SNDHWM, 0)
+    sock.setsockopt(zmq.RCVHWM, 0)
+    try:
+        sock.setsockopt(zmq.IPV6, 1)
+    except zmq.ZMQError:
+        pass
 
 
 def _worker_identity(rank: int) -> bytes:
@@ -197,7 +214,6 @@ class ZmqLeaderCoordinator:
         max_inflight_steps: Leader/worker skew bound.
     """
 
-    supports_overlap = True
     is_leader = True
     rank = 0
 
@@ -221,7 +237,7 @@ class ZmqLeaderCoordinator:
     ) -> None:
         self._runner = runner
         self.world_size = int(world_size)
-        self._bind_endpoint = f"tcp://{bind_host}:{int(control_port)}"
+        self._bind_endpoint = format_tcp_endpoint(bind_host, int(control_port))
         self._auth_token = str(auth_token)
         self._config_fingerprint = str(config_fingerprint)
         self._ready_timeout_s = float(ready_timeout_s)
@@ -232,14 +248,27 @@ class ZmqLeaderCoordinator:
         self._max_inflight = max(1, int(max_inflight_steps))
         self._engine_spec = engine_spec
         self._plane_handler = plane_handler
+        self._client_evict_handler: typing.Callable[[bytes], None] | None = None
         self._stats_provider: typing.Callable[[], wire.QueueStats] | None = None
 
         self._outbox: queue.Queue = queue.Queue()
         self._io_thread: threading.Thread | None = None
         self._stop_io = threading.Event()
+        # Caller threads hand frames to the IO thread (the ROUTER socket's only user) through the outbox and poke an
+        # inproc wakeup socket that interrupts its poll, so a queued Step or Drain leaves at once instead of after the
+        # poll interval: workers start a step only when its command arrives, and the leader's devices wait for them
+        # in the step's first collective. The IO loop owns the wakeup sockets; _wake_push is None while it is down.
+        self._wake_push = None
+        self._wake_lock = threading.Lock()
         self._client_identities: dict[str, bytes] = {}
         self._next_step_id = 0
+        self._undrained_async: set[int] = set()
         self._reset_control_state()
+
+    @property
+    def supports_overlap(self) -> bool:
+        """Whether overlap execution is safe (multi-host overlap dispatches step N+1 before draining step N)."""
+        return self.world_size <= 1 or self._max_inflight >= 2
 
     def _reset_control_state(self) -> None:
         """Fresh handshake/ledger state so a leader can start() again after shutdown()."""
@@ -249,8 +278,12 @@ class ZmqLeaderCoordinator:
             step_timeout_s=self._step_timeout_s,
             heartbeat_timeout_s=self._heartbeat_timeout_s,
         )
+        self._next_step_id = 0
+        self._undrained_async = set()
         self._helloed: set[int] = set()
         self._ready: set[int] = set()
+        self._bound_event = threading.Event()
+        self._bind_error: BaseException | None = None
         self._ready_event = threading.Event()
         self._hello_error: str | None = None
         self._client_identities = {}
@@ -270,27 +303,55 @@ class ZmqLeaderCoordinator:
 
         A ``world_size == 1`` leader has no workers to wait for — it exists
         purely to serve request-plane clients (DP replica engines) and is
-        ready immediately.
+        ready as soon as its control socket is bound.
         """
-        if self._io_thread is not None:
+        if self._io_thread is not None and self._io_thread.is_alive():
             return
+        self._io_thread = None
         self._reset_control_state()
-        if self.world_size <= 1:
-            self._ready_event.set()
         self._io_thread = threading.Thread(target=self._io_loop, name="eSurgeCoordLeaderIO", daemon=True)
         self._io_thread.start()
+        if not self._bound_event.wait(self._ready_timeout_s):
+            self.shutdown("bind timeout")
+            raise StepCoordinationError(
+                f"timed out after {self._ready_timeout_s}s binding control plane at {self._bind_endpoint}"
+            )
+        if self._bind_error is not None:
+            bind_error = self._bind_error
+            self.shutdown("bind failed")
+            raise StepCoordinationError(
+                f"failed to bind control plane at {self._bind_endpoint}: {bind_error}"
+            ) from bind_error
         if not self._ready_event.wait(self._ready_timeout_s):
+            helloed = sorted(self._helloed)
+            ready = sorted(self._ready)
+            self.shutdown("ready timeout")
             raise StepCoordinationError(
                 f"timed out after {self._ready_timeout_s}s waiting for {self.world_size - 1} worker(s); "
-                f"helloed={sorted(self._helloed)}, ready={sorted(self._ready)}"
+                f"helloed={helloed}, ready={ready}"
             )
         if self._hello_error is not None:
-            raise StepCoordinationError(self._hello_error)
+            hello_error = self._hello_error
+            self.shutdown("handshake error")
+            raise StepCoordinationError(hello_error)
         logger.info("eSurge coordinator: %d worker(s) ready.", self.world_size - 1)
 
     def set_plane_handler(self, handler: typing.Callable[[bytes, wire.WireMessage, bytes | None], None] | None) -> None:
         """Install the request-plane inbound handler (Admit/AbortReq/StopHit/...)."""
         self._plane_handler = handler
+
+    def set_client_evict_handler(self, handler: typing.Callable[[bytes], None] | None) -> None:
+        """Install the callback notified when a silent or replaced request-plane client is evicted."""
+        self._client_evict_handler = handler
+
+    def _notify_client_evicted(self, identity: bytes) -> None:
+        handler = self._client_evict_handler
+        if handler is None:
+            return
+        try:
+            handler(identity)
+        except Exception:
+            logger.exception("eSurge coordinator: client-evict handler failed for %r", identity)
 
     def set_stats_provider(self, provider: typing.Callable[[], wire.QueueStats] | None) -> None:
         """Install the queue-stats snapshot provider.
@@ -305,6 +366,16 @@ class ZmqLeaderCoordinator:
     def send_to_peer(self, identity: bytes, header: wire.WireMessage, payload: bytes | None = None) -> None:
         """Queue a message for one specific peer (worker or client) identity."""
         self._outbox.put((identity, wire.encode_message(header), payload))
+        self._wake_io()
+
+    def _wake_io(self) -> None:
+        """Interrupt the IO loop's poll so the frames just queued in the outbox leave now (callable from any thread)."""
+        with self._wake_lock:
+            if self._wake_push is not None:
+                try:
+                    self._wake_push.send(b"", flags=1)  # zmq.DONTWAIT
+                except Exception:
+                    pass
 
     def client_identity(self, client_id: str) -> bytes | None:
         """Resolve a request-plane client's ZMQ identity, if connected."""
@@ -320,27 +391,36 @@ class ZmqLeaderCoordinator:
             # mirror, so skip the payload pickling entirely.
             return
         self._ledger.raise_if_failed()
+        if len(self._undrained_async) >= self._max_inflight:
+            raise StepCoordinationError(
+                f"cannot dispatch step {step_id}: {len(self._undrained_async)} undrained async step(s) "
+                f"already fill max_inflight_steps={self._max_inflight}; workers cannot ack async steps "
+                "until Drain is sent (set distributed_max_inflight_steps >= 2 for overlap execution)"
+            )
         self._ledger.wait_for_window(step_id, self._max_inflight)
         header = wire.Step(step_id=step_id, mode=mode, want_digest=want_digest)
         payload = wire.encode_payload(scheduler_output)
         self._ledger.expect(step_id, self._ledger.last_acked.keys())
         self._outbox.put((_DEST_WORKERS, wire.encode_message(header), payload))
+        self._wake_io()
 
     def execute_sync(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Mirror STEP(SYNC) to all workers, then execute locally."""
-        self._next_step_id += 1
-        step_id = self._next_step_id
+        step_id = self._next_step_id + 1
         want_digest = self._want_digest(step_id)
         self._broadcast_step(step_id, wire.STEP_MODE_SYNC, scheduler_output, want_digest)
+        self._next_step_id = step_id
         model_output = self._runner.execute_model(scheduler_output)
         self._record_local(step_id, model_output, want_digest)
         return model_output
 
     def execute_async(self, scheduler_output: SchedulerOutput) -> StepHandle:
         """Mirror STEP(ASYNC) to all workers, then dispatch locally."""
-        self._next_step_id += 1
-        step_id = self._next_step_id
+        step_id = self._next_step_id + 1
         self._broadcast_step(step_id, wire.STEP_MODE_ASYNC, scheduler_output, want_digest=False)
+        self._next_step_id = step_id
+        if self.world_size > 1:
+            self._undrained_async.add(step_id)
         runner_handle = self._runner.execute_model_async(scheduler_output)
         return StepHandle(step_id=step_id, runner_handle=runner_handle, scheduler_output=scheduler_output)
 
@@ -348,10 +428,12 @@ class ZmqLeaderCoordinator:
         """Mirror DRAIN to all workers, then materialize locally."""
         if self.world_size > 1:
             self._ledger.raise_if_failed()
+            self._undrained_async.discard(handle.step_id)
             want_digest = self._want_digest(handle.step_id)
             header = wire.Drain(step_id=handle.step_id, want_digest=want_digest)
             self._ledger.expect(handle.step_id, self._ledger.last_acked.keys())
             self._outbox.put((_DEST_WORKERS, wire.encode_message(header), None))
+            self._wake_io()
         else:
             want_digest = False
         model_output = self._runner.wait_for_execution(handle.runner_handle)
@@ -377,25 +459,63 @@ class ZmqLeaderCoordinator:
 
     def shutdown(self, reason: str = "") -> None:
         """Broadcast Shutdown, then stop the IO thread and close the socket."""
-        if self._io_thread is None:
+        thread = self._io_thread
+        if thread is None:
             return
-        self._outbox.put((_DEST_ALL, wire.encode_message(wire.Shutdown(reason=reason)), None))
-        time.sleep(0.05)
-        self._stop_io.set()
-        self._io_thread.join(timeout=5.0)
-        self._io_thread = None
+        if thread.is_alive():
+            self._outbox.put((_DEST_ALL, wire.encode_message(wire.Shutdown(reason=reason)), None))
+            self._wake_io()
+            time.sleep(0.05)
+            self._stop_io.set()
+            self._wake_io()
+            thread.join(timeout=5.0)
+        if thread.is_alive():
+            logger.warning("eSurge coordinator: leader IO thread did not exit within 5.0s")
+            return
+        if self._io_thread is thread:
+            self._io_thread = None
 
-    def _handle_hello(self, sock, identity: bytes, message: wire.Hello, worker_identities: dict, authed: set) -> None:
+    def _handle_hello(
+        self,
+        sock,
+        identity: bytes,
+        message: wire.Hello,
+        worker_identities: dict[int, bytes],
+        worker_authed: dict[bytes, int],
+        client_authed: dict[bytes, str],
+        client_last_seen: dict[bytes, float],
+    ) -> None:
         """Validate a Hello and register the peer (worker or plane client)."""
-        if message.auth != self._auth_token:
+        if not hmac.compare_digest(str(message.auth), self._auth_token):
             logger.warning("eSurge coordinator: rejecting peer with bad auth token")
             return
         if message.role == wire.ROLE_CLIENT:
+            client_id = str(message.client_id or "").strip()
+            if not client_id:
+                logger.warning("eSurge coordinator: rejecting ROLE_CLIENT peer with empty client_id")
+                return
+            failure = self._ledger.failure
+            if failure is not None:
+                # This IO thread outlives a failed world until the process aborts; answering HelloOk would let a
+                # router re-attach a dead engine. Refuse with Shutdown so the client treats it as down.
+                sock.send_multipart(
+                    [identity, wire.encode_message(wire.Shutdown(reason=f"engine world failed: {failure}"))]
+                )
+                return
             # Request-plane clients attach to whatever engine the owner runs:
             # no world/fingerprint requirements, never counted toward Ready.
-            self._client_identities[message.client_id] = identity
-            authed.add(identity)
+            prev_identity = self._client_identities.get(client_id)
+            if prev_identity is not None and prev_identity != identity:
+                client_authed.pop(prev_identity, None)
+                client_last_seen.pop(prev_identity, None)
+                self._notify_client_evicted(prev_identity)
+            self._client_identities[client_id] = identity
+            client_authed[identity] = client_id
+            client_last_seen[identity] = time.monotonic()
             sock.send_multipart([identity, wire.encode_message(wire.HelloOk(rank=-1, engine_spec=self._engine_spec))])
+            return
+        if message.role != wire.ROLE_WORKER:
+            logger.warning("eSurge coordinator: rejecting peer with unknown role %r", message.role)
             return
         if message.world_size != self.world_size:
             self._hello_error = (
@@ -403,14 +523,24 @@ class ZmqLeaderCoordinator:
             )
             self._ready_event.set()
             return
+        if not (1 <= message.rank < self.world_size):
+            logger.warning(
+                "eSurge coordinator: rejecting worker Hello with invalid rank=%r for world_size=%d",
+                message.rank,
+                self.world_size,
+            )
+            return
         if message.config_fingerprint != self._config_fingerprint:
             self._hello_error = (
                 f"worker rank={message.rank} config mismatch: {message.config_fingerprint} != {self._config_fingerprint}"
             )
             self._ready_event.set()
             return
+        prev_worker = worker_identities.get(message.rank)
+        if prev_worker is not None and prev_worker != identity:
+            worker_authed.pop(prev_worker, None)
         worker_identities[message.rank] = identity
-        authed.add(identity)
+        worker_authed[identity] = message.rank
         self._helloed.add(message.rank)
         sock.send_multipart(
             [identity, wire.encode_message(wire.HelloOk(rank=message.rank, engine_spec=self._engine_spec))]
@@ -420,15 +550,47 @@ class ZmqLeaderCoordinator:
         import zmq
 
         ctx = zmq.Context.instance()
-        sock = ctx.socket(zmq.ROUTER)
-        sock.setsockopt(zmq.LINGER, 500)
-        sock.bind(self._bind_endpoint)
+        sock = None
+        wake_pull = None
+        wake_push = None
+        try:
+            sock = ctx.socket(zmq.ROUTER)
+            _configure_zmq_socket(sock, zmq)
+            sock.bind(self._bind_endpoint)
+            wake_endpoint = f"inproc://esurge-leader-wake-{next(_LEADER_WAKE_IDS)}"
+            wake_pull = ctx.socket(zmq.PULL)
+            wake_pull.bind(wake_endpoint)
+            wake_push = ctx.socket(zmq.PUSH)
+            wake_push.connect(wake_endpoint)
+        except BaseException as exc:
+            self._bind_error = exc
+            if wake_push is not None:
+                wake_push.close(linger=0)
+            if wake_pull is not None:
+                wake_pull.close(linger=0)
+            if sock is not None:
+                sock.close(linger=0)
+            self._bound_event.set()
+            self._ready_event.set()
+            return
+
+        with self._wake_lock:
+            self._wake_push = wake_push
+        self._bound_event.set()
+        if self.world_size <= 1:
+            self._ready_event.set()
+
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
+        poller.register(wake_pull, zmq.POLLIN)
         worker_identities: dict[int, bytes] = {}
-        authed: set[bytes] = set()
+        worker_authed: dict[bytes, int] = {}
+        client_authed: dict[bytes, str] = {}
+        client_last_seen: dict[bytes, float] = {}
+        expected_worker_ranks = set(range(1, self.world_size))
         last_beat = 0.0
         last_sweep = 0.0
+        failure_announced = False
 
         def _send_to(identity: bytes, header: bytes, payload: bytes | None) -> None:
             frames = [identity, header]
@@ -475,14 +637,39 @@ class ZmqLeaderCoordinator:
                             sock.send_multipart([identity, stats_frame])
                     last_beat = now
                 if now - last_sweep >= 0.5:
+                    # Evict disconnected request-plane clients whose heartbeats stopped.
+                    for ident, seen_at in list(client_last_seen.items()):
+                        if now - seen_at > self._heartbeat_timeout_s:
+                            client_last_seen.pop(ident, None)
+                            cid = client_authed.pop(ident, None)
+                            if cid is not None and self._client_identities.get(cid) == ident:
+                                self._client_identities.pop(cid, None)
+                            self._notify_client_evicted(ident)
+                            logger.info("eSurge coordinator: evicted silent request-plane client %r", cid)
                     if self._ready_event.is_set():
                         self._ledger.sweep()
+                        failure = self._ledger.failure
+                        if failure is not None and not failure_announced and self._client_identities:
+                            # The step thread may be blocked inside a device collective with a dead worker and
+                            # never return to raise; this IO thread keeps heartbeating meanwhile. Tell request-plane
+                            # clients now, so a router stops routing here and fails in-flight requests at once.
+                            notice = wire.encode_message(wire.Shutdown(reason=f"engine world failed: {failure}"))
+                            for identity in self._client_identities.values():
+                                sock.send_multipart([identity, notice])
+                            failure_announced = True
+                            logger.error("eSurge coordinator: told request-plane clients the world failed: %s", failure)
                     last_sweep = now
 
                 events = dict(poller.poll(_POLL_MS))
+                if wake_pull in events:
+                    while wake_pull.poll(0):
+                        wake_pull.recv()
                 if sock not in events:
                     continue
                 frames = sock.recv_multipart()
+                if len(frames) < 2:
+                    logger.warning("eSurge coordinator: dropping malformed %d-frame ROUTER message", len(frames))
+                    continue
                 identity, header_bytes = frames[0], frames[1]
                 try:
                     message = wire.decode_message(header_bytes)
@@ -491,24 +678,59 @@ class ZmqLeaderCoordinator:
                     continue
 
                 if isinstance(message, wire.Hello):
-                    self._handle_hello(sock, identity, message, worker_identities, authed)
+                    self._handle_hello(
+                        sock,
+                        identity,
+                        message,
+                        worker_identities,
+                        worker_authed,
+                        client_authed,
+                        client_last_seen,
+                    )
                     continue
 
-                if identity not in authed:
+                worker_rank = worker_authed.get(identity)
+                is_client = identity in client_authed
+                if worker_rank is None and not is_client:
                     logger.warning("eSurge coordinator: dropping frame from unauthenticated peer")
                     continue
 
                 if isinstance(message, wire.Ready):
-                    self._ready.add(message.rank)
-                    self._ledger.record_heartbeat(message.rank)
-                    if len(self._ready) >= self.world_size - 1:
+                    if worker_rank is None or message.rank != worker_rank or worker_identities.get(worker_rank) != identity:
+                        logger.warning(
+                            "eSurge coordinator: rejecting forged Ready(rank=%r) from %r",
+                            message.rank,
+                            identity,
+                        )
+                        continue
+                    self._ready.add(worker_rank)
+                    self._ledger.record_heartbeat(worker_rank)
+                    if self._ready == expected_worker_ranks:
                         self._ready_event.set()
                 elif isinstance(message, wire.StepAck):
+                    if worker_rank is None or message.rank != worker_rank or worker_identities.get(worker_rank) != identity:
+                        logger.warning(
+                            "eSurge coordinator: rejecting forged StepAck(rank=%r) from %r",
+                            message.rank,
+                            identity,
+                        )
+                        continue
                     self._ledger.record_ack(message)
                 elif isinstance(message, wire.Heartbeat):
-                    if message.rank >= 0:
-                        self._ledger.record_heartbeat(message.rank)
+                    if worker_rank is not None:
+                        if message.rank != worker_rank or worker_identities.get(worker_rank) != identity:
+                            logger.warning(
+                                "eSurge coordinator: rejecting forged worker Heartbeat(rank=%r) from %r",
+                                message.rank,
+                                identity,
+                            )
+                            continue
+                        self._ledger.record_heartbeat(worker_rank)
+                    elif is_client:
+                        client_last_seen[identity] = time.monotonic()
                 elif self._plane_handler is not None:
+                    if is_client:
+                        client_last_seen[identity] = time.monotonic()
                     # Request-plane traffic (Admit/AbortReq/StopHit/...): hand
                     # off untouched — engine work never runs on the IO thread.
                     payload = frames[2] if len(frames) > 2 else None
@@ -521,8 +743,18 @@ class ZmqLeaderCoordinator:
             # Shutdown broadcast and then sets _stop_io within one poll
             # interval, so the top-of-loop drain can miss it. LINGER on
             # close() flushes the queued frames to peers.
-            _drain_outbox()
-            sock.close(linger=500)
+            try:
+                _drain_outbox()
+            except Exception:
+                logger.debug("eSurge coordinator: final outbox drain failed during shutdown", exc_info=True)
+            with self._wake_lock:
+                if self._wake_push is wake_push:
+                    self._wake_push = None
+            for s, linger in ((wake_push, 0), (wake_pull, 0), (sock, 500)):
+                try:
+                    s.close(linger=linger)
+                except Exception:
+                    pass
 
 
 class ZmqWorkerCoordinator:
@@ -561,7 +793,7 @@ class ZmqWorkerCoordinator:
         self._runner = runner
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self._endpoint = f"tcp://{leader_addr}:{int(control_port)}"
+        self._endpoint = format_tcp_endpoint(leader_addr, int(control_port))
         self._auth_token = str(auth_token)
         self._config_fingerprint = str(config_fingerprint)
         self._connect_timeout_s = float(connect_timeout_s)
@@ -574,7 +806,6 @@ class ZmqWorkerCoordinator:
         # Caller-thread → replay-thread send path: an outbox drained by the
         # replay loop plus an inproc wakeup socket that interrupts its poll.
         self._worker_outbox: queue.Queue = queue.Queue()
-        self._wake_endpoint = f"inproc://esurge-worker-wake-{id(self)}"
         self._wake_push = None
         self._wake_lock = threading.Lock()
 
@@ -611,37 +842,50 @@ class ZmqWorkerCoordinator:
 
         if self._sock is not None:
             self.shutdown()
+        while True:
+            try:
+                self._worker_outbox.get_nowait()
+            except queue.Empty:
+                break
         self._ctx = zmq.Context.instance()
         sock = self._ctx.socket(zmq.DEALER)
-        sock.setsockopt(zmq.IDENTITY, _worker_identity(self.rank))
-        sock.setsockopt(zmq.LINGER, 500)
-        sock.connect(self._endpoint)
-        sock.send_multipart(
-            [
-                wire.encode_message(
-                    wire.Hello(
-                        rank=self.rank,
-                        world_size=self.world_size,
-                        config_fingerprint=self._config_fingerprint,
-                        auth=self._auth_token,
+        try:
+            sock.setsockopt(zmq.IDENTITY, _worker_identity(self.rank))
+            _configure_zmq_socket(sock, zmq)
+            sock.connect(self._endpoint)
+            sock.send_multipart(
+                [
+                    wire.encode_message(
+                        wire.Hello(
+                            rank=self.rank,
+                            world_size=self.world_size,
+                            config_fingerprint=self._config_fingerprint,
+                            auth=self._auth_token,
+                        )
                     )
-                )
-            ]
-        )
-        if not sock.poll(int(self._connect_timeout_s * 1000)):
-            sock.close(linger=0)
-            self._sock = None
-            raise StepCoordinationError(
-                f"worker rank={self.rank}: no HelloOk from leader at {self._endpoint} within {self._connect_timeout_s}s"
+                ]
             )
-        frames = sock.recv_multipart()
-        message = wire.decode_message(frames[0])
-        if not isinstance(message, wire.HelloOk):
+            if not sock.poll(int(self._connect_timeout_s * 1000)):
+                raise StepCoordinationError(
+                    f"worker rank={self.rank}: no HelloOk from leader at {self._endpoint} within {self._connect_timeout_s}s"
+                )
+            frames = sock.recv_multipart()
+            if not frames:
+                raise StepCoordinationError(f"worker rank={self.rank}: empty handshake reply from {self._endpoint}")
+            try:
+                message = wire.decode_message(frames[0])
+            except Exception as exc:
+                raise StepCoordinationError(
+                    f"worker rank={self.rank}: undecodable handshake reply from {self._endpoint}: {exc}"
+                ) from exc
+            if not isinstance(message, wire.HelloOk):
+                raise StepCoordinationError(f"worker rank={self.rank}: unexpected handshake reply {type(message).__name__}")
+            self.engine_spec = message.engine_spec
+            self._sock = sock
+        except BaseException:
             sock.close(linger=0)
             self._sock = None
-            raise StepCoordinationError(f"worker rank={self.rank}: unexpected handshake reply {type(message).__name__}")
-        self.engine_spec = message.engine_spec
-        self._sock = sock
+            raise
 
     # Workers never originate steps; the leader's stream is the only program.
     def execute_sync(self, scheduler_output):
@@ -676,21 +920,25 @@ class ZmqWorkerCoordinator:
         if self._sock is None:
             raise StepCoordinationError("run_worker_loop called before start().")
         sock = self._sock
-        wake_pull = self._ctx.socket(zmq.PULL)
-        wake_pull.bind(self._wake_endpoint)
-        with self._wake_lock:
-            self._wake_push = self._ctx.socket(zmq.PUSH)
-            self._wake_push.connect(self._wake_endpoint)
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-        poller.register(wake_pull, zmq.POLLIN)
-
-        sock.send_multipart([wire.encode_message(wire.Ready(rank=self.rank))])
-        inflight: dict[int, typing.Any] = {}
-        last_leader_beat = time.monotonic()
-        last_beat_sent = 0.0
-        logger.info("eSurge worker rank=%d: replaying the leader step stream.", self.rank)
+        wake_endpoint = f"inproc://esurge-worker-wake-{next(_WORKER_WAKE_IDS)}"
+        wake_pull = None
+        wake_push = None
         try:
+            wake_pull = self._ctx.socket(zmq.PULL)
+            wake_pull.bind(wake_endpoint)
+            wake_push = self._ctx.socket(zmq.PUSH)
+            wake_push.connect(wake_endpoint)
+            with self._wake_lock:
+                self._wake_push = wake_push
+            poller = zmq.Poller()
+            poller.register(sock, zmq.POLLIN)
+            poller.register(wake_pull, zmq.POLLIN)
+
+            sock.send_multipart([wire.encode_message(wire.Ready(rank=self.rank))])
+            inflight: dict[int, typing.Any] = {}
+            last_leader_beat = time.monotonic()
+            last_beat_sent = 0.0
+            logger.info("eSurge worker rank=%d: replaying the leader step stream.", self.rank)
             while not stop_event.is_set():
                 # Drain caller-thread messages (plane admits, aborts, ...).
                 try:
@@ -719,7 +967,14 @@ class ZmqWorkerCoordinator:
                 if sock not in events:
                     continue
                 frames = sock.recv_multipart()
-                message = wire.decode_message(frames[0])
+                if not frames:
+                    logger.warning("eSurge worker rank=%d: dropping empty frame set", self.rank)
+                    continue
+                try:
+                    message = wire.decode_message(frames[0])
+                except Exception:
+                    logger.warning("eSurge worker rank=%d: dropping undecodable frame", self.rank)
+                    continue
                 if isinstance(message, wire.Heartbeat):
                     last_leader_beat = time.monotonic()
                     continue
@@ -728,8 +983,12 @@ class ZmqWorkerCoordinator:
                     return
                 if isinstance(message, wire.Step):
                     last_leader_beat = time.monotonic()
-                    scheduler_output = wire.decode_payload(frames[1])
+                    if len(frames) < 2:
+                        exc = StepCoordinationError(f"worker rank={self.rank}: Step {message.step_id} missing payload frame")
+                        self._nack(sock, message.step_id, wire.ACK_PHASE_SYNC_DONE, exc)
+                        raise exc
                     try:
+                        scheduler_output = wire.decode_payload(frames[1])
                         if message.mode == wire.STEP_MODE_ASYNC:
                             inflight[message.step_id] = self._runner.execute_model_async(scheduler_output)
                         else:
@@ -768,10 +1027,18 @@ class ZmqWorkerCoordinator:
             logger.info("eSurge worker rank=%d: stop requested.", self.rank)
         finally:
             with self._wake_lock:
-                if self._wake_push is not None:
-                    self._wake_push.close(linger=0)
+                if self._wake_push is wake_push:
                     self._wake_push = None
-            wake_pull.close(linger=0)
+            if wake_push is not None:
+                try:
+                    wake_push.close(linger=0)
+                except Exception:
+                    pass
+            if wake_pull is not None:
+                try:
+                    wake_pull.close(linger=0)
+                except Exception:
+                    pass
 
     def _ack(self, sock, step_id: int, phase: int, model_output, want_digest: bool) -> None:
         digest = None

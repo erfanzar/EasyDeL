@@ -104,7 +104,7 @@ def test_capacity_chunking_matches_full_dispatch_and_input_gradients(ring, ep_si
         use_ring_of_experts=ring,
         fsdp_is_ep_bound=False,
         sp_is_ep_bound=False,
-        moe_chunk_size=None,
+        moe_chunk_size=0,
     )
     config.moe_force_xla_gmm = True
     block = ArcticMoeBlock(config, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(3), layer_idx=0)

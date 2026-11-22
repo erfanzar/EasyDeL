@@ -20,7 +20,12 @@ import typing as tp
 from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
 
-from ..model_loading import apply_tokenizer_overrides, disable_state_dropout, reject_string_model_id
+from ..model_loading import (
+    apply_chat_template_path,
+    apply_tokenizer_overrides,
+    disable_state_dropout,
+    reject_string_model_id,
+)
 from ..trainer import Trainer
 from .prm_config import PRMConfig
 from .prm_preprocess import PRMPreprocessTransform
@@ -71,8 +76,12 @@ class PRMTrainer(Trainer):
             raise ValueError("processing_class must be specified.")
         if isinstance(model, str):
             reject_string_model_id(model, role="token-classification model")
+        if model is None:
+            raise ValueError("`model` must be provided to `PRMTrainer`.")
         tokenizer = processing_class.tokenizer if hasattr(processing_class, "tokenizer") else processing_class
         apply_tokenizer_overrides(tokenizer, eos_token=arguments.eos_token, pad_token=arguments.pad_token)
+        if arguments.chat_template_path is not None:
+            apply_chat_template_path(tokenizer, arguments.chat_template_path)
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
         if not isinstance(model, EasyDeLState):
@@ -95,8 +104,9 @@ class PRMTrainer(Trainer):
         """Return PRM preprocessing with the requested training or evaluation policy.
 
         The transform is configured from trainer arguments, including step
-        separator, max lengths, final-step-only supervision, and padding
-        multiple. Pretokenized rows pass through unchanged.
+        separator, max lengths, final-step-only supervision, padding policy
+        (disabled when ``sequence_packing=True``), and padding multiple.
+        Pretokenized rows pass through unchanged.
         """
         return PRMPreprocessTransform(
             tokenizer=getattr(self.processing_class, "tokenizer", self.processing_class),
@@ -106,6 +116,7 @@ class PRMTrainer(Trainer):
             train_on_last_step_only=self.arguments.train_on_last_step_only,
             is_eval=is_eval,
             pad_to_multiple_of=self.arguments.pad_to_multiple_of,
+            padding=False if getattr(self.arguments, "sequence_packing", False) else "max_length",
         )
 
     def _apply_preprocess_transforms(self) -> None:
@@ -127,6 +138,8 @@ class PRMTrainer(Trainer):
         max_completion_length: int | None = None,
         train_on_last_step_only: bool = False,
         is_eval: bool = False,
+        pad_to_multiple_of: int | None = None,
+        padding: bool | str = "max_length",
     ) -> dict[str, list[int]]:
         """Convenience wrapper around :meth:`PRMPreprocessTransform.tokenize_row`.
 
@@ -144,4 +157,6 @@ class PRMTrainer(Trainer):
             train_on_last_step_only=train_on_last_step_only,
             is_eval=is_eval,
             pad_token_id=pad_token_id,
+            pad_to_multiple_of=pad_to_multiple_of,
+            padding=padding,
         )

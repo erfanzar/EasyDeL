@@ -85,9 +85,7 @@ def test_actual_engine_constructor_selects_registered_paged_graph_without_mutati
     monkeypatch.setattr(
         esurge_engine,
         "WorkerManager",
-        lambda *args, **kwargs: SimpleNamespace(
-            start=lambda **kwargs: (None, None), tokenizer_endpoint=None, detokenizer_endpoint=None
-        ),
+        lambda *args, **kwargs: SimpleNamespace(start=lambda **kwargs: (None, None), tokenizer_endpoint=None),
     )
 
     def runner_factory(**kwargs):
@@ -216,7 +214,7 @@ def test_graph_component_weight_refresh_preserves_explicit_backend(monkeypatch, 
     instance = _SchedulerStub()
     instance.decoding_engine = engine
     instance.runner.update_model_weights = lambda **kwargs: updates.append(kwargs)
-    monkeypatch.setattr(instance, "_build_scheduler", lambda: object())
+    monkeypatch.setattr(instance, "_build_core", lambda: object())
     instance.update_model_weights(
         model=None if components_only else original,
         graphdef=original.graphdef,

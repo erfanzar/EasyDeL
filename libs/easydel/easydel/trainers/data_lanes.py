@@ -64,6 +64,8 @@ _PASSTHROUGH_FIELDS = (
     "input_ids",
     "attention_mask",
     "labels",
+    "completion_mask",
+    "assistant_masks",
     "image_grid_thw",
     "image_embeds",
     "embed_n_tok",
@@ -356,18 +358,33 @@ class ParquetRowTokenize:
         self.verify_rows = int(verify_rows)
         self.fast_verified = 0
         self._encode = None
+        self._lock = threading.Lock()
 
     def __getstate__(self) -> dict:
         state = dict(self.__dict__)
         state["_encode"] = None  # built lazily per worker process
+        state["_lock"] = None
         return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
+    def _get_encoder(self) -> tp.Callable[[str], list[int]]:
+        encode = self._encode
+        if encode is None:
+            with self._lock:
+                encode = self._encode
+                if encode is None:
+                    encode = self.fast_encoder_factory(self.hf_tokenizer)
+                    self._encode = encode
+        return encode
 
     def _fast_ids(self, row: tp.Mapping[str, tp.Any]) -> list[int] | None:
         """Fast-path ids, or ``None`` when the row is outside the fast common case."""
         from .prompt_utils import maybe_convert_to_chatml, normalize_message_payload, resolve_example_tools
 
-        if self._encode is None:
-            self._encode = self.fast_encoder_factory(self.hf_tokenizer)
+        encode = self._get_encoder()
         result = maybe_convert_to_chatml(dict(row))
         raw = result.get(self.messages_field)
         if raw is None and self.messages_field != "messages":
@@ -379,7 +396,7 @@ class ParquetRowTokenize:
             text = self.hf_tokenizer.apply_chat_template(messages, tokenize=False, tools=resolve_example_tools(result))
         except Exception:
             return None
-        ids = [int(t) for t in self._encode(text)]
+        ids = [int(t) for t in encode(text)]
         if self.max_length and len(ids) > self.max_length:
             ids = ids[: self.max_length] if self.truncation_mode == "keep_start" else ids[-self.max_length :]
         return ids
@@ -392,16 +409,36 @@ class ParquetRowTokenize:
                 f"in-loop tokenization produced no input_ids for a row (keys={keys}); fix the row or the "
                 "text/messages field mapping -- this lane cannot skip rows without desynchronizing hosts."
             )
-        return _finalize_row(_strip_padding(out))
+        stripped = _strip_padding(out)
+        if not stripped.get("input_ids"):
+            keys = sorted(row) if isinstance(row, collections.abc.Mapping) else type(row).__name__
+            raise ValueError(
+                f"in-loop tokenization produced only padded tokens for a row (keys={keys}); fix the row or the "
+                "text/messages field mapping -- this lane cannot skip rows without desynchronizing hosts."
+            )
+        return _finalize_row(stripped)
 
     def __call__(self, row: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
         if isinstance(row, collections.abc.Mapping) and row.get("input_ids") is not None:
+            if len(row["input_ids"]) == 0:
+                raise ValueError(
+                    "in-loop tokenization received an empty `input_ids` row; fix the dataset -- "
+                    "this lane cannot skip rows without desynchronizing hosts."
+                )
             if row.get("image_embeds") is not None:
                 return {k: row[k] for k in _PASSTHROUGH_FIELDS if row.get(k) is not None}
-            return _finalize_row(_strip_padding(row))
+            stripped = _strip_padding(row)
+            if not stripped.get("input_ids"):
+                raise ValueError(
+                    "in-loop tokenization received a pretokenized row with no non-pad tokens; fix the dataset -- "
+                    "this lane cannot skip rows without desynchronizing hosts."
+                )
+            return _finalize_row(stripped)
         if self.fast_encoder_factory is None:
             return self._slow(row)
-        if self.fast_verified >= self.verify_rows:
+        with self._lock:
+            verified = self.fast_verified >= self.verify_rows
+        if verified:
             ids = self._fast_ids(row)
             if ids is None:
                 return self._slow(row)
@@ -423,7 +460,9 @@ class ParquetRowTokenize:
                 f"first_divergence_at={div} labels_equal_ids={slow['labels'] == slow['input_ids']}. Unset "
                 "`parquetra_fast_tokenizer` for this run."
             )
-        self.fast_verified += 1
+        with self._lock:
+            if self.fast_verified < self.verify_rows:
+                self.fast_verified += 1
         return slow
 
 
@@ -550,7 +589,12 @@ def build_map_lane(
     """
     import grain.python as grain
 
-    shard_count = max(int(shard_count), 1)
+    shard_count = int(shard_count)
+    shard_index = int(shard_index)
+    if shard_count < 1:
+        raise ValueError(f"{lane}: shard_count must be >= 1, got {shard_count}.")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(f"{lane}: shard_index must be in [0, {shard_count}), got {shard_index}.")
     mixture = len(per_source) > 1
     target = int(max_steps) if max_steps and int(max_steps) > 0 else None
     if target is None and mixture:
@@ -683,6 +727,14 @@ class PackedParquetLoader:
         self.pack_seq_len = int(pack_seq_len)
         self.max_steps = int(max_steps)
         self.misfit_patience = int(misfit_patience)
+        if self.batch_size < 1:
+            raise ValueError(f"packed lane: batch_size must be >= 1, got {self.batch_size}.")
+        if self.pack_seq_len < 1:
+            raise ValueError(f"packed lane: pack_seq_len must be >= 1, got {self.pack_seq_len}.")
+        if self.max_steps < 0:
+            raise ValueError(f"packed lane: max_steps must be >= 0, got {self.max_steps}.")
+        if self.misfit_patience < 1:
+            raise ValueError(f"packed lane: misfit_patience must be >= 1, got {self.misfit_patience}.")
         self.embed_cap = int(embed_cap) if int(embed_cap) > 0 else self.batch_size * self.pack_seq_len
         self.read_threads = int(read_threads)
         self.prefetch_buffer = int(prefetch_buffer)
@@ -733,55 +785,74 @@ class PackedParquetLoader:
     def _iterate(self, *, step: int, shift: int, cursor: int, carry: tuple[int, ...]):
         stream = self._stream(shift)
         rows = self._row_iter(stream, cursor)
-        pending: list[tuple[int, dict]] = [(i, stream[i]) for i in carry]
-        while step < self.max_steps:
-            windows: list[list[dict]] = [[] for _ in range(self.batch_size)]
-            remaining = [self.pack_seq_len] * self.batch_size
-            embed_left = self.embed_cap
-            misfits: list[tuple[int, dict]] = []
-            queue, pending = pending, []
-            while True:
-                if queue:
-                    index, row = queue.pop(0)
-                else:
-                    index, row = cursor, next(rows)
-                    cursor += 1
-                length = len(row["input_ids"])
-                if length > self.pack_seq_len:
-                    raise ValueError(
-                        f"packed lane: a row of {length} tokens exceeds the {self.pack_seq_len}-token window; the "
-                        "packer never truncates -- set max_length <= parquetra_pack_seq_len."
-                    )
-                embeds = row.get("embed_n_tok")
-                embed_rows = int(sum(int(v) for v in embeds)) if embeds is not None and len(embeds) else 0
-                placed = False
-                if embed_rows <= embed_left:
-                    for w in range(self.batch_size):
-                        if remaining[w] >= length:
-                            windows[w].append(row)
-                            remaining[w] -= length
-                            embed_left -= embed_rows
-                            placed = True
+        try:
+            pending: collections.deque[tuple[int, dict]] = collections.deque((i, stream[i]) for i in carry)
+            while step < self.max_steps:
+                windows: list[list[dict]] = [[] for _ in range(self.batch_size)]
+                remaining = [self.pack_seq_len] * self.batch_size
+                embed_left = self.embed_cap
+                misfits: list[tuple[int, dict]] = []
+                queue, pending = pending, collections.deque()
+                while True:
+                    if queue:
+                        index, row = queue.popleft()
+                    else:
+                        index, row = cursor, next(rows)
+                        cursor += 1
+                    length = len(row["input_ids"])
+                    if length <= 0:
+                        raise ValueError("packed lane: received an empty row (0 tokens); fix the dataset.")
+                    if length > self.pack_seq_len:
+                        raise ValueError(
+                            f"packed lane: a row of {length} tokens exceeds the {self.pack_seq_len}-token window; the "
+                            "packer never truncates -- set max_length <= parquetra_pack_seq_len."
+                        )
+                    embeds = row.get("embed_n_tok")
+                    if embeds is None:
+                        embed_rows = 0
+                    elif isinstance(embeds, (int, np.integer)):
+                        embed_rows = int(embeds)
+                    else:
+                        arr = np.asarray(embeds)
+                        embed_rows = int(arr.item()) if arr.ndim == 0 else (int(arr.sum()) if arr.size else 0)
+                    if embed_rows > self.embed_cap:
+                        raise ValueError(
+                            f"packed lane: a row with {embed_rows} image embedding tokens exceeds the {self.embed_cap}-token "
+                            "embed cap; raise parquetra_pack_embed_cap."
+                        )
+                    placed = False
+                    if embed_rows <= embed_left:
+                        for w in range(self.batch_size):
+                            if remaining[w] >= length:
+                                windows[w].append(row)
+                                remaining[w] -= length
+                                embed_left -= embed_rows
+                                placed = True
+                                break
+                    if not placed:
+                        misfits.append((index, row))
+                        if len(misfits) >= self.misfit_patience:
                             break
-                if not placed:
-                    misfits.append((index, row))
-                    if len(misfits) >= self.misfit_patience:
-                        break
-            pending = misfits + queue
-            step += 1
-            self._record(
-                PackedLaneCursor(
-                    step=step,
-                    shift=shift,
-                    cursor=cursor,
-                    carry=tuple(i for i, _ in pending),
-                    fingerprint=self.fingerprint,
+                pending = collections.deque(misfits)
+                pending.extend(queue)
+                step += 1
+                self._record(
+                    PackedLaneCursor(
+                        step=step,
+                        shift=shift,
+                        cursor=cursor,
+                        carry=tuple(i for i, _ in pending),
+                        fingerprint=self.fingerprint,
+                    )
                 )
-            )
-            yield [r for window in windows for r in window]
+                yield [r for window in windows for r in window]
+        finally:
+            close_fn = getattr(rows, "close", None)
+            if callable(close_fn):
+                close_fn()
 
     def __iter__(self) -> collections.abc.Iterator:
-        return self._iterate(step=0, shift=self.base_shift, cursor=0, carry=())
+        return self._iterate(step=self.base_shift, shift=self.base_shift, cursor=0, carry=())
 
     def iter_from_batch(self, num_batches: int) -> collections.abc.Iterator:
         """Position at window-set ``num_batches`` without materializing the skipped sets.
@@ -839,7 +910,12 @@ def build_packed_parquet_stream_factory(
 
     names = sorted(sources)
     rows = {name: len(sources[name]) for name in names}
-    shard_count = max(int(shard_count), 1)
+    shard_count = int(shard_count)
+    shard_index = int(shard_index)
+    if shard_count < 1:
+        raise ValueError(f"packed lane: shard_count must be >= 1, got {shard_count}.")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(f"packed lane: shard_index must be in [0, {shard_count}), got {shard_index}.")
 
     def build(shift: int):
         per_source = []
@@ -901,9 +977,13 @@ def arrayrecord_manifest_instructions(
     """
     from eformer.paths import ePath
 
-    set_dir, _, shard_pattern = str(pattern).rpartition("/")
-    root = set_dir.rpartition("/")[0]
-    manifest = ePath(f"{set_dir}/_MANIFEST.tsv")
+    set_dir, has_slash, shard_pattern = str(pattern).rpartition("/")
+    if has_slash:
+        manifest = ePath(f"{set_dir}/_MANIFEST.tsv")
+        root, has_root_slash, _ = set_dir.rpartition("/")
+    else:
+        manifest = ePath("_MANIFEST.tsv")
+        root, has_root_slash = "", ""
     if not manifest.exists():
         return None
     instructions: list[ArrayRecordFileInstruction] = []
@@ -922,8 +1002,14 @@ def arrayrecord_manifest_instructions(
             raise ValueError(f"{manifest}: non-positive byte/row counts in line {line!r}")
         total_bytes += nbytes
         total_rows += nrows
+        if root:
+            filename = f"{root}/{parts[0]}"
+        elif has_root_slash and set_dir.startswith("/"):
+            filename = f"/{parts[0]}"
+        else:
+            filename = parts[0]
         instructions.append(
-            ArrayRecordFileInstruction(filename=f"{root}/{parts[0]}", skip=0, take=nrows, examples_in_shard=nrows)
+            ArrayRecordFileInstruction(filename=filename, skip=0, take=nrows, examples_in_shard=nrows)
         )
     if not instructions:
         raise ValueError(f"{manifest} selects no shard for source {source_name!r} (pattern {shard_pattern!r}).")
@@ -1007,9 +1093,13 @@ def _host_shard(trainer: tp.Any) -> tuple[int, int]:
 
     arguments = trainer.arguments
     if arguments.grain_shard_index is not None or arguments.grain_shard_count is not None:
-        index = arguments.grain_shard_index if arguments.grain_shard_index is not None else jax.process_index()
-        count = arguments.grain_shard_count if arguments.grain_shard_count is not None else jax.process_count()
-        return int(index), max(int(count), 1)
+        index = int(arguments.grain_shard_index if arguments.grain_shard_index is not None else jax.process_index())
+        count = int(arguments.grain_shard_count if arguments.grain_shard_count is not None else jax.process_count())
+        if count < 1:
+            raise ValueError(f"`grain_shard_count` must be >= 1, got {count}.")
+        if index < 0 or index >= count:
+            raise ValueError(f"`grain_shard_index` must be in [0, {count}), got {index}.")
+        return index, count
     me = jax.process_index()
     groups = _trainer_process_groups(trainer)
     if groups is None and jax.process_count() > 1:
@@ -1101,6 +1191,23 @@ def _parquetra_tokenizers(trainer: tp.Any, names: list[str]) -> dict[str, Parque
             padding=False,
             truncation_mode=truncation_mode,
         )
+    elif isinstance(transform, SFTPreprocessTransform):
+        effective_truncation_mode = "keep_start" if masking else transform._truncation_mode
+        if transform._padding is not False or transform._truncation_mode != effective_truncation_mode:
+            transform = SFTPreprocessTransform(
+                tokenizer=transform._tokenizer,
+                max_length=transform._max_length or max_length,
+                text_field=transform._text_field,
+                messages_field=transform._messages_field,
+                mask_prompt=transform._mask_prompt,
+                add_eos=transform._add_eos,
+                truncation=transform._truncation,
+                truncation_mode=effective_truncation_mode,
+                padding=False,
+                pad_to_multiple_of=None,
+                formatting_func=transform._formatting_func,
+                packing_mode=False,
+            )
     factory = None
     if arguments.parquetra_fast_tokenizer:
         factory = load_fast_encoder_factory(arguments.parquetra_fast_tokenizer)

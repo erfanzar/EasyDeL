@@ -65,8 +65,9 @@ class SDPOConfig(GRPOConfig):
         max_feedback_length (int): Maximum number of tokens reserved for the
             feedback separator inserted between the original prompt and the
             original completion in the teacher context. Longer feedback is
-            truncated; shorter feedback is right-padded with the tokenizer's
-            pad token. Defaults to ``256``.
+            truncated; the combined prompt + feedback prefix is left-padded so
+            ``completion_ids[:, 0]`` is always conditioned on a real token.
+            Defaults to ``256``.
         distillation_type (str): Loss used to match the student to the
             self-teacher. Either ``"kl"`` (forward KL approximated at the
             sampled token) or ``"jsd"`` (symmetric JSD approximated at the
@@ -91,8 +92,8 @@ class SDPOConfig(GRPOConfig):
                 "Maximum number of tokens reserved for the feedback separator "
                 "that is inserted between the original prompt and the original "
                 "completion in the teacher context. Feedback strings that are "
-                "longer will be truncated; shorter ones are right-padded with "
-                "the tokenizer's pad token."
+                "longer will be truncated; the combined prompt + feedback prefix "
+                "is left-padded with the tokenizer's pad token."
             )
         },
     )

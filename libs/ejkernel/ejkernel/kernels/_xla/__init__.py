@@ -56,6 +56,7 @@ Available Operations:
         - gated_delta_rule_grouped_decode: Grouped-head single-step GDR decode
         - ragged_gated_delta_rule: Ragged-batch gated delta rule
         - ragged_gated_delta_rule_v2: Packed continuous-batch GDN v2 (mixed prefill+decode)
+        - ragged_kda: Per-channel-decay KDA over a flat packed token stream with a state pool
         - lightning_attn: Lightning attention with exponential decay
         - recurrent: General recurrent state-space attention
         - kernel_delta_attention (kda / kda_decay): Delta-rule linear attention
@@ -127,9 +128,12 @@ from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .mhc_coefficients import mhc_coefficients
+from .mhc_decode_fused import mhc_decode_read, mhc_decode_write
 from .mhc_fused import mhc_collapse, mhc_expand
+from .mhc_prefill_fused import mhc_prefill_project, mhc_prefill_read, mhc_prefill_write
+from .moe_decode_fused_w8a8 import moe_decode_fused_w8a8
 from .moe_local_ffn import moe_local_ffn
-from .moe_row_gather import moe_row_gather, moe_row_gather_sum
+from .moe_row_gather import moe_row_gather, moe_row_gather_quantized, moe_row_gather_sum, moe_row_gather_sum_packed
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .native_sparse_attention import apply_native_sparse_attention
@@ -143,6 +147,10 @@ from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_del
 from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
 from .ragged_gather import ragged_gather
 from .ragged_gather_reduce import ragged_gather_reduce
+from .ragged_kda import ragged_kda
+from .ragged_kda_conv_decode import ragged_kda_conv_decode
+from .ragged_kda_decode import ragged_kda_decode
+from .ragged_kda_short import ragged_kda_short
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -156,6 +164,7 @@ from .rwkv4 import rwkv4
 from .rwkv6 import rwkv6
 from .rwkv7 import rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import scaled_dot_product_attention
+from .shared_expert_w8a8 import shared_expert_w8a8
 from .sinkhorn_knopp import sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import sparse_multi_latent_ragged_page_attention
 from .sparse_selected_attention import sparse_selected_attention
@@ -204,10 +213,18 @@ __all__ = [
     "mean_pooling",
     "mhc_coefficients",
     "mhc_collapse",
+    "mhc_decode_read",
+    "mhc_decode_write",
     "mhc_expand",
+    "mhc_prefill_project",
+    "mhc_prefill_read",
+    "mhc_prefill_write",
+    "moe_decode_fused_w8a8",
     "moe_local_ffn",
     "moe_row_gather",
+    "moe_row_gather_quantized",
     "moe_row_gather_sum",
+    "moe_row_gather_sum_packed",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "page_attention",
@@ -220,6 +237,10 @@ __all__ = [
     "ragged_gated_delta_rule_v2",
     "ragged_gather",
     "ragged_gather_reduce",
+    "ragged_kda",
+    "ragged_kda_conv_decode",
+    "ragged_kda_decode",
+    "ragged_kda_short",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
@@ -235,6 +256,7 @@ __all__ = [
     "rwkv7",
     "rwkv7_mul",
     "scaled_dot_product_attention",
+    "shared_expert_w8a8",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "sparse_selected_attention",

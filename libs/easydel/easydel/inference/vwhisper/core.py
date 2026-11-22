@@ -52,6 +52,8 @@ Example:
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import typing as tp
 
 import jax
@@ -232,8 +234,7 @@ class vWhisperInference:
             - If inference_config provides a generation_config, it takes
               precedence over the model's built-in generation_config.
         """
-        if inference_config is None:
-            inference_config = vWhisperInferenceConfig()
+        base_config = vWhisperInferenceConfig() if inference_config is None else inference_config
         self.dtype = dtype
         self.processor = processor
         self.feature_extractor = self.processor.feature_extractor
@@ -242,11 +243,15 @@ class vWhisperInference:
         graphdef, graphstate = spx.export(model)
         self.graphdef = graphdef
         self.graphstate = graphstate
-        generation_config = inference_config.generation_config or self.model.generation_config
-        inference_config.generation_config = generation_config
+        generation_config = base_config.generation_config or self.model.generation_config
+        if dataclasses.is_dataclass(base_config):
+            resolved_config = dataclasses.replace(base_config, generation_config=generation_config)
+        else:
+            resolved_config = copy.copy(base_config)
+            resolved_config.generation_config = generation_config
         self.generation_config = generation_config
-        self.max_length = inference_config.max_length or self.generation_config.max_length
-        self.inference_config = inference_config
+        self.max_length = resolved_config.max_length or getattr(self.generation_config, "max_length", None)
+        self.inference_config = resolved_config
         self.generate_function = _compiled_generate
 
     def _generate(
@@ -287,6 +292,7 @@ class vWhisperInference:
             for efficient execution. The forced_decoder_ids are constructed
             from language and task tokens.
         """
+        return_timestamps = bool(return_timestamps)
         forced_decoder_ids = dict(
             get_decoder_input_ids(
                 model_config=self.model.config,
@@ -297,6 +303,10 @@ class vWhisperInference:
                 is_multilingual=self.inference_config.is_multilingual,
             )
         )
+        if not forced_decoder_ids:
+            # Avoid passing an empty dict into ForceTokensLogitsProcessor via
+            # model._force_generate while preserving a no-op forced token map.
+            forced_decoder_ids = {0: None}
         input_features = jnp.asarray(input_features, dtype=self.dtype)
         output_sequences = self.generate_function(
             graphdef=self.graphdef,
@@ -365,6 +375,10 @@ class vWhisperInference:
         )
 
         if chunk_length_s:
+            if batch_size is None:
+                cfg_batch_size = getattr(getattr(self, "inference_config", None), "batch_size", None)
+                batch_size = 1 if cfg_batch_size is None else cfg_batch_size
+
             if stride_length_s is None:
                 stride_length_s = chunk_length_s / 6
 
@@ -387,13 +401,15 @@ class vWhisperInference:
                 feature_extractor=self.feature_extractor,
             )
         else:
+            if audio_array.shape[0] == 0:
+                return
             processed = self.feature_extractor(
                 audio_array,
                 sampling_rate=self.feature_extractor.sampling_rate,
                 return_tensors="np",
             )
             if stride is not None:
-                processed["stride"] = stride
+                processed["stride"] = [stride]
             yield processed
 
     def _process_model_outputs(
@@ -489,9 +505,16 @@ class vWhisperInference:
             Padding is removed after generation to return only the
             valid outputs for the actual input batch size.
         """
+        if batch_size is None:
+            cfg_batch_size = getattr(getattr(self, "inference_config", None), "batch_size", None)
+            batch_size = 1 if cfg_batch_size is None else cfg_batch_size
+        if isinstance(batch_size, bool) or batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        return_timestamps = bool(return_timestamps)
+
         input_features = model_inputs.pop("input_features")
         input_batch_size = input_features.shape[0]
-        if input_batch_size != batch_size:
+        if input_batch_size < batch_size:
             padding = np.zeros([batch_size - input_batch_size, *input_features.shape[1:]], input_features.dtype)
             input_features = np.concatenate([input_features, padding])
         output_tokens = self._generate(
@@ -499,7 +522,8 @@ class vWhisperInference:
             language=language,
             task=task,
             return_timestamps=return_timestamps,
-        )[:input_batch_size]
+        )
+        output_tokens = np.asarray(output_tokens[:input_batch_size])
 
         output = {"tokens": output_tokens[:, None, :]}
         stride = model_inputs.pop("stride", None)
@@ -591,11 +615,16 @@ class vWhisperInference:
             - The engine expects mono audio; stereo will cause errors
         """
         batch_size = batch_size if batch_size is not None else self.inference_config.batch_size
+        if batch_size is None:
+            batch_size = 1
+        if isinstance(batch_size, bool) or batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         language = language if language is not None else self.inference_config.language
         task = task if task is not None else self.inference_config.task
         return_timestamps = (
             return_timestamps if return_timestamps is not None else self.inference_config.return_timestamps
         )
+        return_timestamps = bool(return_timestamps)
 
         dataloader = self._process_model_inputs(
             audio_input=audio_input,

@@ -51,7 +51,50 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             arguments = args[0]
         super().__init__(*args, **kwargs)
         replay_buffer_size = int(getattr(arguments, "replay_buffer_size", 0) or 0)
-        self.replay_buffer = _ReplayBuffer(replay_buffer_size, seed=getattr(arguments, "seed", None))
+        raw_seed = getattr(arguments, "seed", None)
+        # Deterministic fallback avoids multi-host replay divergence when seed is unset.
+        replay_seed = 0 if raw_seed is None else int(raw_seed)
+        self.replay_buffer = _ReplayBuffer(replay_buffer_size, seed=replay_seed)
+
+    def _should_compute_old_per_token_logps(
+        self,
+        *,
+        is_train: bool,
+        needs_dppo: bool,
+        needs_esurge_correction: bool,
+        needs_off_policy_mask: bool,
+    ) -> bool:
+        """Always snapshot behavior log-probs when the replay buffer is active.
+
+        Replayed groups can be trained on many steps after generation even when
+        ``num_iterations == 1``; carrying ``old_per_token_logps`` ensures
+        PPO/GRPO clipping stays active on off-policy replayed groups.
+        """
+        replay_buffer = getattr(self, "replay_buffer", None)
+        if is_train and replay_buffer is not None and replay_buffer.max_size > 0:
+            return True
+        return super()._should_compute_old_per_token_logps(
+            is_train=is_train,
+            needs_dppo=needs_dppo,
+            needs_esurge_correction=needs_esurge_correction,
+            needs_off_policy_mask=needs_off_policy_mask,
+        )
+
+    @staticmethod
+    def _to_host_array(value: tp.Any) -> tp.Any:
+        """Move accelerator arrays onto host memory so the replay buffer does not pin HBM."""
+        if isinstance(value, jax.Array):
+            return np.asarray(jax.device_get(value)).copy()
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        return value
+
+    @staticmethod
+    def _to_batch_array(value: tp.Any, template: tp.Any) -> tp.Any:
+        """Convert a host-buffered replay tensor back to match the active batch array type."""
+        if isinstance(template, jax.Array) and not isinstance(value, jax.Array):
+            return jnp.asarray(value)
+        return value
 
     @staticmethod
     def _pad_sequence_axis(array: jax.Array, target_length: int, *, value: float | int, left: bool) -> jax.Array:
@@ -80,6 +123,8 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
         """
         return {
             "advantages",
+            "behavior_parity_gate",
+            "behavior_per_token_logps",
             "completion_ids",
             "completion_mask",
             "completion_attention_mask",
@@ -150,14 +195,15 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
                 )
             )
             replay_group = {
-                "advantages": group_advantages,
-                "completion_ids": model_batch["completion_ids"][start:end],
-                "completion_mask": model_batch["completion_mask"][start:end],
-                "completion_attention_mask": model_batch["completion_attention_mask"][start:end],
-                "prompt_ids": model_batch["prompt_ids"][group_index : group_index + 1],
-                "prompt_mask": model_batch["prompt_mask"][group_index : group_index + 1],
+                "advantages": self._to_host_array(group_advantages),
+                "completion_ids": self._to_host_array(model_batch["completion_ids"][start:end]),
+                "completion_mask": self._to_host_array(model_batch["completion_mask"][start:end]),
+                "completion_attention_mask": self._to_host_array(model_batch["completion_attention_mask"][start:end]),
+                "prompt_ids": self._to_host_array(model_batch["prompt_ids"][group_index : group_index + 1]),
+                "prompt_mask": self._to_host_array(model_batch["prompt_mask"][group_index : group_index + 1]),
             }
             for key in (
+                "behavior_per_token_logps",
                 "difficulty_weights",
                 "importance_sampling_ratio",
                 "old_per_token_logps",
@@ -165,7 +211,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
                 "sampling_per_token_logps",
             ):
                 if key in model_batch and model_batch[key] is not None:
-                    replay_group[key] = model_batch[key][start:end]
+                    replay_group[key] = self._to_host_array(model_batch[key][start:end])
             replay_buffer.add(score, replay_group)
             added += 1
 
@@ -205,6 +251,7 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             if key == "importance_sampling_ratio" and sequence_correction:
                 continue
             if value is not None and key in {
+                "behavior_per_token_logps",
                 "completion_ids",
                 "completion_mask",
                 "completion_attention_mask",
@@ -213,7 +260,12 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
                 "ref_per_token_logps",
                 "sampling_per_token_logps",
             }:
-                pad_value = pad_token_id if key == "completion_ids" else 0
+                if key == "completion_ids":
+                    pad_value: float | int = pad_token_id
+                elif key == "importance_sampling_ratio":
+                    pad_value = 1.0
+                else:
+                    pad_value = 0
                 updated_batch[key] = self._pad_sequence_axis(value, target_completion_len, value=pad_value, left=False)
 
         replaced = 0
@@ -221,19 +273,34 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             start = group_index * num_generations
             end = start + num_generations
             sampled_prompt_ids = self._pad_sequence_axis(
-                sampled_group["prompt_ids"], target_prompt_len, value=pad_token_id, left=True
+                self._to_batch_array(sampled_group["prompt_ids"], updated_batch["prompt_ids"]),
+                target_prompt_len,
+                value=pad_token_id,
+                left=True,
             )
             sampled_prompt_mask = self._pad_sequence_axis(
-                sampled_group["prompt_mask"], target_prompt_len, value=0, left=True
+                self._to_batch_array(sampled_group["prompt_mask"], updated_batch["prompt_mask"]),
+                target_prompt_len,
+                value=0,
+                left=True,
             )
             sampled_completion_ids = self._pad_sequence_axis(
-                sampled_group["completion_ids"], target_completion_len, value=pad_token_id, left=False
+                self._to_batch_array(sampled_group["completion_ids"], updated_batch["completion_ids"]),
+                target_completion_len,
+                value=pad_token_id,
+                left=False,
             )
             sampled_completion_mask = self._pad_sequence_axis(
-                sampled_group["completion_mask"], target_completion_len, value=0, left=False
+                self._to_batch_array(sampled_group["completion_mask"], updated_batch["completion_mask"]),
+                target_completion_len,
+                value=0,
+                left=False,
             )
             sampled_attention_mask = self._pad_sequence_axis(
-                sampled_group.get("completion_attention_mask", sampled_group["completion_mask"]),
+                self._to_batch_array(
+                    sampled_group.get("completion_attention_mask", sampled_group["completion_mask"]),
+                    updated_batch["completion_attention_mask"],
+                ),
                 target_completion_len,
                 value=0,
                 left=False,
@@ -251,12 +318,14 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             updated_batch["completion_attention_mask"] = (
                 updated_batch["completion_attention_mask"].at[start:end].set(sampled_attention_mask)
             )
+            sampled_advantages = self._to_batch_array(sampled_group["advantages"], updated_batch["advantages"])
             updated_batch["advantages"] = (
                 updated_batch["advantages"]
                 .at[start:end]
-                .set(sampled_group["advantages"].reshape(updated_batch["advantages"][start:end].shape))
+                .set(sampled_advantages.reshape(updated_batch["advantages"][start:end].shape))
             )
             for key in (
+                "behavior_per_token_logps",
                 "difficulty_weights",
                 "importance_sampling_ratio",
                 "old_per_token_logps",
@@ -265,16 +334,18 @@ class GRPOWithReplayBufferTrainer(GRPOTrainer):
             ):
                 if updated_batch.get(key) is None or key not in sampled_group:
                     continue
-                sampled_value = sampled_group[key]
+                sampled_value = self._to_batch_array(sampled_group[key], updated_batch[key])
                 if key in {
+                    "behavior_per_token_logps",
                     "importance_sampling_ratio",
                     "old_per_token_logps",
                     "ref_per_token_logps",
                     "sampling_per_token_logps",
                 }:
                     if key != "importance_sampling_ratio" or not sequence_correction:
+                        sampled_pad_value = 1.0 if key == "importance_sampling_ratio" else 0.0
                         sampled_value = self._pad_sequence_axis(
-                            sampled_value, target_completion_len, value=0.0, left=False
+                            sampled_value, target_completion_len, value=sampled_pad_value, left=False
                         )
                 updated_batch[key] = (
                     updated_batch[key].at[start:end].set(sampled_value.reshape(updated_batch[key][start:end].shape))

@@ -47,8 +47,15 @@ Example:
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+import hashlib
+import inspect
+import re
 import typing as tp
+from collections.abc import Mapping
 
+import numpy as np
 from eformer.pytree import auto_pytree
 
 from easydel.utils.compiling_utils import get_safe_hash_int
@@ -57,6 +64,137 @@ if tp.TYPE_CHECKING:
     from transformers import GenerationConfig
 else:
     GenerationConfig = tp.Any
+
+_HEX_ADDR_RE = re.compile(r"\s+at\s+0x[0-9a-fA-F]+")
+
+
+def _canonicalize_cache_value(value: tp.Any, _seen: frozenset[int] | None = None) -> tp.Any:
+    """Return a deterministic, memory-address-free representation for cache keys."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int | float | str | bytes):
+        return (type(value).__qualname__, value)
+    if isinstance(value, type):
+        return ("type", value.__module__, value.__qualname__)
+
+    obj_id = id(value)
+    seen = frozenset() if _seen is None else _seen
+    if obj_id in seen:
+        return ("cycle", type(value).__module__, type(value).__qualname__)
+    next_seen = seen | {obj_id}
+
+    if isinstance(value, np.ndarray):
+        return ("ndarray", value.shape, str(value.dtype), hashlib.sha256(value.tobytes()).hexdigest())
+
+    if hasattr(value, "shape") and hasattr(value, "dtype") and type(value).__module__.startswith("jax"):
+        if hasattr(value, "aval") and not hasattr(value, "addressable_data"):
+            return ("jax_tracer", tuple(value.shape), str(value.dtype))
+        try:
+            arr = np.asarray(value)
+            return ("jax_array", arr.shape, str(arr.dtype), hashlib.sha256(arr.tobytes()).hexdigest())
+        except Exception:
+            return ("jax_value", tuple(value.shape), str(value.dtype))
+
+    if isinstance(value, functools.partial):
+        return (
+            "partial",
+            _canonicalize_cache_value(value.func, next_seen),
+            _canonicalize_cache_value(value.args, next_seen),
+            tuple((k, _canonicalize_cache_value(v, next_seen)) for k, v in sorted((value.keywords or {}).items())),
+        )
+
+    if inspect.ismethod(value):
+        return (
+            "method",
+            value.__func__.__module__,
+            value.__func__.__qualname__,
+            _canonicalize_cache_value(value.__self__, next_seen),
+        )
+
+    if inspect.isfunction(value):
+        closure_vals: list[tp.Any] = []
+        for cell in value.__closure__ or ():
+            try:
+                closure_vals.append(_canonicalize_cache_value(cell.cell_contents, next_seen))
+            except ValueError:
+                closure_vals.append(("empty_cell",))
+        return (
+            "function",
+            value.__module__,
+            value.__qualname__,
+            value.__code__.co_firstlineno,
+            tuple(closure_vals),
+        )
+
+    if isinstance(value, Mapping):
+        items = [
+            (_canonicalize_cache_value(k, next_seen), _canonicalize_cache_value(v, next_seen))
+            for k, v in value.items()
+        ]
+        items.sort(key=repr)
+        return (type(value).__module__, type(value).__qualname__, tuple(items))
+
+    if isinstance(value, list | tuple):
+        return (
+            type(value).__module__,
+            type(value).__qualname__,
+            tuple(_canonicalize_cache_value(item, next_seen) for item in value),
+        )
+
+    if isinstance(value, set | frozenset):
+        items = [_canonicalize_cache_value(item, next_seen) for item in value]
+        items.sort(key=repr)
+        return (type(value).__module__, type(value).__qualname__, tuple(items))
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            dict_repr = to_dict()
+        except TypeError:
+            dict_repr = None
+        if isinstance(dict_repr, Mapping):
+            return (
+                "to_dict",
+                type(value).__module__,
+                type(value).__qualname__,
+                _canonicalize_cache_value(dict_repr, next_seen),
+            )
+
+    if dataclasses.is_dataclass(value):
+        fields_tuple = tuple(
+            (f.name, _canonicalize_cache_value(getattr(value, f.name), next_seen)) for f in dataclasses.fields(value)
+        )
+        return ("dataclass", type(value).__module__, type(value).__qualname__, fields_tuple)
+
+    attrs: dict[str, tp.Any] = {}
+    has_structured_state = False
+    if hasattr(value, "__dict__"):
+        has_structured_state = True
+        attrs.update(vars(value))
+    for cls in type(value).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot in {"__dict__", "__weakref__"}:
+                continue
+            has_structured_state = True
+            if hasattr(value, slot):
+                attrs[slot] = getattr(value, slot)
+    if has_structured_state:
+        return (
+            "object",
+            type(value).__module__,
+            type(value).__qualname__,
+            tuple((k, _canonicalize_cache_value(v, next_seen)) for k, v in sorted(attrs.items())),
+        )
+
+    if type(value).__repr__ is not object.__repr__:
+        return ("repr", type(value).__module__, type(value).__qualname__, _HEX_ADDR_RE.sub("", repr(value)))
+
+    return ("object", type(value).__module__, type(value).__qualname__)
 
 
 @auto_pytree
@@ -157,19 +295,49 @@ class vWhisperInferenceConfig:
     language: str | None = None
     is_multilingual: bool | None = None
 
-    def __hash__(self):
-        """Compute a hash value for the configuration.
+    def cache_key(self) -> tuple[tp.Any, ...]:
+        """Build a canonical, deterministic cache key for JIT compilation caching.
+
+        Normalizes ``return_timestamps=None`` and ``return_timestamps=False``
+        identically, normalizes ``batch_size=None`` to ``1``, and hashes custom
+        ``logits_processor`` / ``generation_config`` objects structurally without
+        memory-address ``0x...`` reprs.
+        """
+        normalized_batch_size = 1 if self.batch_size is None else self.batch_size
+        normalized_return_timestamps = bool(self.return_timestamps)
+        return (
+            ("batch_size", _canonicalize_cache_value(normalized_batch_size)),
+            ("max_length", _canonicalize_cache_value(self.max_length)),
+            ("generation_config", _canonicalize_cache_value(self.generation_config)),
+            ("logits_processor", _canonicalize_cache_value(self.logits_processor)),
+            ("return_timestamps", _canonicalize_cache_value(normalized_return_timestamps)),
+            ("task", _canonicalize_cache_value(self.task)),
+            ("language", _canonicalize_cache_value(self.language)),
+            ("is_multilingual", _canonicalize_cache_value(self.is_multilingual)),
+        )
+
+    def get_generation_kwargs(self) -> dict[str, tp.Any]:
+        """Return optional generation keyword arguments configured on this object."""
+        kwargs: dict[str, tp.Any] = {}
+        if self.max_length is not None:
+            kwargs["max_length"] = self.max_length
+        if self.logits_processor is not None:
+            kwargs["logits_processor"] = self.logits_processor
+        return kwargs
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, vWhisperInferenceConfig):
+            return NotImplemented
+        return self.cache_key() == other.cache_key()
+
+    def __hash__(self) -> int:
+        """Compute a deterministic hash value for the configuration.
 
         Creates a deterministic hash based on all configuration parameters,
         enabling use of the config as a dictionary key or with JAX's
         static_argnames for JIT compilation caching.
 
         Returns:
-            int: A hash value derived from all configuration attributes.
-
-        Note:
-            The hash is computed by concatenating string representations
-            of all key-value pairs and passing through get_safe_hash_int
-            for a stable integer hash.
+            int: A hash value derived from the canonical cache key.
         """
-        return get_safe_hash_int("".join(str(k) + str(v) for k, v in self.__dict__.items()))
+        return get_safe_hash_int(repr(self.cache_key()))

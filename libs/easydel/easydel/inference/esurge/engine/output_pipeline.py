@@ -31,12 +31,14 @@ matches are forwarded to the scheduler through the injected
 
 from __future__ import annotations
 
+import itertools
 import queue
 import threading
 import time
 import traceback
 import typing
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from easydel.inference.stream_protocol import compute_stream_delta_text
 from easydel.workers.esurge.pipeline import DetokenizerResult
@@ -50,22 +52,104 @@ if typing.TYPE_CHECKING:
     from .registry import RequestRegistry
 
 _STOP_SENTINEL = None
+_MAX_TOOL_CALL_DELTA_HISTORY = 4096
 
 
-class _TokenPrefixView(Sequence[int]):
-    """Fixed-length view over an append-only token list.
+def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_cache_page_size: int) -> dict:
+    """Return request-level prefix-cache usage.
 
-    Streaming parsers need the previous token count to compute the current
-    delta. Keeping a prefix view avoids copying the full token history every
-    token while still behaving like the previous list for ``len()``,
-    iteration, indexing, and membership checks.
+    Args:
+        num_prompt_tokens: Prompt length in tokens.
+        cached_tokens: Prompt tokens read from the prefix cache.
+        prefix_cache_page_size: KV page size when prefix caching is enabled, ``0`` when it is disabled.
+
+    Returns:
+        ``cache_read`` (prompt tokens served from cache), ``uncached_input`` (prompt tokens prefilled),
+        ``cache_written`` (prompt tokens newly committed to the prefix cache: only whole pages are hashed,
+        so a partial last page is not counted) and ``cache_hit``.
+    """
+    prompt = max(0, int(num_prompt_tokens))
+    cache_read = max(0, min(int(cached_tokens), prompt))
+    uncached_input = prompt - cache_read
+    page = int(prefix_cache_page_size)
+    cache_written = max(0, (prompt // page) * page - cache_read) if page > 0 else 0
+    return {
+        "cache_hit": cache_read > 0,
+        "cache_read": cache_read,
+        "cache_written": cache_written,
+        "uncached_input": uncached_input,
+    }
+
+
+def _record_weight_version(comp, start_token_index: int, weight_version: int) -> None:
+    """Open a ``(start_token_index, weight_version)`` segment on ``comp`` when the version changes.
+
+    Segments stay run-length encoded: consecutive steps under the same version extend the last segment
+    instead of adding one. The list is replaced rather than mutated so snapshots already handed to
+    consumers keep their own value.
+
+    Args:
+        comp: Completion output receiving tokens starting at ``start_token_index``.
+        start_token_index: Index of the first new token within the completion.
+        weight_version: Engine weight version whose forward produced the new tokens.
+    """
+    segments = comp.weight_version_segments
+    if segments and segments[-1][1] == weight_version:
+        return
+    comp.weight_version_segments = [*(segments or ()), (int(start_token_index), int(weight_version))]
+
+
+def _record_kv_weight_version(comp, weight_version: int) -> None:
+    """Lower ``comp.oldest_kv_weight_version`` to ``weight_version`` (set it when unset).
+
+    Args:
+        comp: Completion output of the request whose KV was computed with ``weight_version``.
+        weight_version: Engine weight version that computed some of the request's KV.
+    """
+    current = comp.oldest_kv_weight_version
+    if current is None or int(weight_version) < current:
+        comp.oldest_kv_weight_version = int(weight_version)
+
+
+@dataclass(frozen=True)
+class _KVVersionUpdate:
+    """Queue item: requests whose live KV was computed with an older weight version (see ``submit_kv_versions``)."""
+
+    versions: dict[str, int]
+    targets: dict[str, tuple[str, int]] | None = None
+
+
+@dataclass(frozen=True)
+class _KVVersionClear:
+    """Queue item: requests whose live KV was freed by preemption (clear pre-token ``oldest_kv_weight_version``)."""
+
+    request_ids: frozenset[str]
+
+
+@dataclass
+class _Barrier:
+    """Queue item: signals ``event`` once all earlier items in ``OutputPipeline.queue`` have been processed."""
+
+    event: threading.Event
+    completed: bool = False
+
+
+class _PrefixView(Sequence):
+    """Fixed-length view over an append-only list.
+
+    Streaming parsers need the previous token count, and every streamed
+    snapshot needs the token ids and log probabilities emitted so far. A
+    prefix view of the growing list gives each of them a stable value without
+    copying the whole history on every step, while behaving like the list it
+    stands for under ``len()``, iteration, indexing, slicing, membership and
+    equality. Finished outputs get a real list instead.
     """
 
-    __slots__ = ("_length", "_tokens")
+    __slots__ = ("_items", "_length")
 
-    def __init__(self, tokens: list[int], length: int):
-        """Bind this view to the live ``tokens`` list at the given prefix ``length``."""
-        self._tokens = tokens
+    def __init__(self, items: list, length: int):
+        """Bind this view to the live ``items`` list at the given prefix ``length``."""
+        self._items = items
         self._length = int(length)
 
     def __len__(self) -> int:
@@ -82,19 +166,47 @@ class _TokenPrefixView(Sequence[int]):
         """
         if isinstance(index, slice):
             start, stop, step = index.indices(self._length)
-            return [self._tokens[idx] for idx in range(start, stop, step)]
+            if step == 1:
+                return self._items[start:stop]
+            return [self._items[idx] for idx in range(start, stop, step)]
         if index < 0:
             index += self._length
         if index < 0 or index >= self._length:
             raise IndexError(index)
-        return self._tokens[index]
+        return self._items[index]
+
+    def __iter__(self):
+        """Iterate over the prefix window without copying it."""
+        return itertools.islice(self._items, self._length)
 
     def __contains__(self, value: object) -> bool:
         """Return whether ``value`` appears in the prefix window."""
-        for idx in range(self._length):
-            if self._tokens[idx] == value:
-                return True
-        return False
+        try:
+            self._items.index(value, 0, self._length)
+        except ValueError:
+            return False
+        return True
+
+    def __eq__(self, other: object) -> bool:
+        """Compare element-wise with any sequence, like the list it stands for."""
+        if not isinstance(other, list | _PrefixView):
+            return NotImplemented
+        return len(other) == self._length and all(a == b for a, b in zip(self, other, strict=False))
+
+    __hash__ = None
+
+    def __repr__(self) -> str:
+        """Render like the list prefix it views."""
+        return repr(self._items[: self._length])
+
+    @property
+    def items(self) -> list:
+        """The live backing list."""
+        return self._items
+
+    def covers_items(self) -> bool:
+        """Whether this view spans the whole backing list, so the list may grow in place."""
+        return self._length == len(self._items)
 
 
 class OutputPipeline:
@@ -136,6 +248,7 @@ class OutputPipeline:
         on_stop_strings: typing.Callable[[dict[str, str]], None],
         on_activity: typing.Callable[[], None],
         on_fatal: typing.Callable[[BaseException, str], None],
+        prefix_cache_page_size: int = 0,
     ) -> None:
         self.queue: queue.Queue = queue.Queue()
         self._on_fatal = on_fatal
@@ -146,6 +259,7 @@ class OutputPipeline:
         self._eos_set = {int(tid) for tid in eos_token_ids if tid is not None}
         self.decode_interval_tokens = int(decode_interval_tokens)
         self.decode_interval_secs = float(decode_interval_secs)
+        self._prefix_cache_page_size = max(0, int(prefix_cache_page_size))
         self._on_stop_strings = on_stop_strings
         self._on_activity = on_activity
 
@@ -172,7 +286,7 @@ class OutputPipeline:
         self._thread = threading.Thread(target=self._loop, name="eSurgeOutputWorker", daemon=True)
         self._thread.start()
 
-    def submit(self, engine_outputs) -> None:
+    def submit(self, engine_outputs, weight_version: int | None = None) -> None:
         """Queue a bundle for ordered processing; process inline if stopped.
 
         The inline fallback keeps lightweight harnesses (and the window
@@ -182,13 +296,137 @@ class OutputPipeline:
         Args:
             engine_outputs: Scheduler-produced output bundle from
                 ``update_from_output``. Falsy bundles are ignored.
+            weight_version: Engine weight version whose forward produced the
+                bundle's tokens; recorded on each completion's
+                ``weight_version_segments``. ``None`` records nothing.
         """
         if not engine_outputs:
             return
         if not self.running:
-            self._process_engine_outputs(engine_outputs)
+            self._process_engine_outputs(engine_outputs, weight_version=weight_version)
             return
-        self.queue.put(engine_outputs)
+        self.queue.put((engine_outputs, weight_version))
+
+    def submit_kv_versions(
+        self,
+        versions: dict[str, int],
+        *,
+        targets: dict[str, tuple[str, int]] | None = None,
+    ) -> None:
+        """Queue KV weight versions for requests, in order with the token bundles; apply inline if stopped.
+
+        Each request's completion lowers ``oldest_kv_weight_version`` to the given version. Queued with the bundles,
+        the update lands after every token sampled before it and before every token sampled after it.
+
+        Args:
+            versions: Engine request id (an ``n>1`` child id for samples) -> weight version that computed some of
+                its live KV. Unknown ids are ignored; an empty mapping does nothing.
+            targets: Optional mapping from engine request id to ``(parent_request_id, sample_index)`` so updates can
+                still be applied to ``_request_outputs`` if the request is aborted before the worker drains.
+        """
+        if not versions:
+            return
+        item = _KVVersionUpdate(dict(versions), dict(targets) if targets else None)
+        if not self.running:
+            self._apply_kv_versions(item)
+            return
+        self.queue.put(item)
+
+    def clear_kv_versions(self, request_ids: typing.Iterable[str]) -> None:
+        """Queue clearing pre-token ``oldest_kv_weight_version`` for preempted requests whose KV was freed.
+
+        Ordered in FIFO with token bundles and KV version updates; applies inline when the worker is stopped.
+        Completions that already emitted at least one token keep their ``oldest_kv_weight_version``.
+        """
+        frozen = frozenset(request_ids)
+        if not frozen:
+            return
+        item = _KVVersionClear(frozen)
+        if not self.running:
+            self._clear_kv_versions(item)
+            return
+        self.queue.put(item)
+
+    def flush(self, timeout: float | None = 5.0) -> bool:
+        """Wait until all items already queued on the output worker have been processed.
+
+        Returns ``True`` if the barrier completed (or the worker is not running), ``False`` on timeout or if the
+        worker exited before reaching the barrier.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        if threading.current_thread() is thread:
+            return True
+        barrier = _Barrier(threading.Event())
+        self.queue.put(barrier)
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        while True:
+            if deadline is None:
+                step = 0.05
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return barrier.event.is_set() and barrier.completed
+                step = min(0.05, remaining)
+            if barrier.event.wait(timeout=step):
+                return barrier.completed
+            if not thread.is_alive():
+                return barrier.event.is_set() and barrier.completed
+
+    def _resolve_output_slot_locked(
+        self,
+        request_id: str,
+        targets: dict[str, tuple[str, int]] | None = None,
+    ) -> tuple[typing.Any, int] | None:
+        """Resolve ``(RequestOutput, sample_index)`` even if ``abort_request`` already cleared ``_active_requests``."""
+        rd = self._active_requests.get(request_id)
+        if rd is not None:
+            parent_id = rd.parent_request_id or request_id
+            sample_index = rd.sample_index
+        elif targets is not None and request_id in targets:
+            parent_id, sample_index = targets[request_id]
+        elif request_id in self._request_outputs:
+            parent_id, sample_index = request_id, 0
+        else:
+            parent_id, sep, idx_str = request_id.rpartition("-")
+            if sep and idx_str.isdigit() and parent_id in self._request_outputs:
+                sample_index = int(idx_str)
+            else:
+                return None
+        ro = self._request_outputs.get(parent_id)
+        if ro is None or not 0 <= sample_index < len(ro.outputs):
+            return None
+        return ro, sample_index
+
+    def _apply_kv_versions(self, item: _KVVersionUpdate) -> None:
+        with self._request_lock, self._output_lock:
+            for request_id, version in item.versions.items():
+                slot = self._resolve_output_slot_locked(request_id, item.targets)
+                if slot is None:
+                    continue
+                ro, sample_index = slot
+                _record_kv_weight_version(ro.outputs[sample_index], int(version))
+                ro.update_seq += 1
+
+    def _clear_kv_versions(self, item: _KVVersionClear) -> None:
+        with self._request_lock, self._output_lock:
+            for request_id in item.request_ids:
+                rd = self._active_requests.get(request_id)
+                if rd is None:
+                    continue
+                # Once a completion has emitted any token, that token attended to the earlier KV; never clear it.
+                if rd.generated_tokens:
+                    continue
+                ro = self._request_outputs.get(rd.parent_request_id or request_id)
+                if ro is None or not 0 <= rd.sample_index < len(ro.outputs):
+                    continue
+                comp = ro.outputs[rd.sample_index]
+                if comp.weight_version_segments:
+                    continue
+                if comp.oldest_kv_weight_version is not None:
+                    comp.oldest_kv_weight_version = None
+                    ro.update_seq += 1
 
     def stop(self, timeout: float = 5.0) -> None:
         """Drain the queue and stop the worker via the ``None`` sentinel."""
@@ -204,20 +442,50 @@ class OutputPipeline:
         if self._thread is thread:
             self._thread = None
 
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the worker thread and break engine callback references."""
+        self.stop(timeout=timeout)
+        self._on_stop_strings = None
+        self._on_activity = None
+        self._on_fatal = None
+
     def _loop(self) -> None:
         """Drain bundles in FIFO order until the sentinel or a fatal error."""
-        while True:
-            engine_outputs = self.queue.get()
-            try:
-                if engine_outputs is _STOP_SENTINEL:
-                    return
-                self._process_engine_outputs(engine_outputs)
-            except Exception as exc:
-                traceback.print_exc()
-                logger.error("Engine output worker failed: %s", exc)
-                self._on_fatal(exc, traceback.format_exc())
-            finally:
-                self.queue.task_done()
+        try:
+            while True:
+                item = self.queue.get()
+                try:
+                    if item is _STOP_SENTINEL:
+                        return
+                    if isinstance(item, _Barrier):
+                        item.completed = True
+                        item.event.set()
+                        continue
+                    if isinstance(item, _KVVersionUpdate):
+                        self._apply_kv_versions(item)
+                        continue
+                    if isinstance(item, _KVVersionClear):
+                        self._clear_kv_versions(item)
+                        continue
+                    engine_outputs, weight_version = item
+                    self._process_engine_outputs(engine_outputs, weight_version=weight_version)
+                except Exception as exc:
+                    traceback.print_exc()
+                    logger.error("Engine output worker failed: %s", exc)
+                    self._on_fatal(exc, traceback.format_exc())
+                finally:
+                    self.queue.task_done()
+        finally:
+            while True:
+                try:
+                    pending = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if isinstance(pending, _Barrier):
+                        pending.event.set()
+                finally:
+                    self.queue.task_done()
 
     # Decode helpers
 
@@ -256,6 +524,37 @@ class OutputPipeline:
             return tokens
         return [tok for tok in tokens if tok not in eos_set]
 
+    @staticmethod
+    def _decode_request(
+        request_id: str,
+        tokens: list[int],
+        *,
+        token_offset: int,
+        text_offset: int,
+        finished: bool,
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool,
+        prompt_context: list[int] | None,
+        tokens_delta: list[int] | None = None,
+    ) -> dict:
+        """Build one bounded native decode request, carrying only unsubmitted tokens."""
+        if tokens_delta is None:
+            if token_offset < 0 or token_offset > len(tokens):
+                token_offset = 0
+            delta = tokens[token_offset:]
+        else:
+            delta = tokens_delta
+        return {
+            "request_id": request_id,
+            "tokens_delta": delta,
+            "token_offset": token_offset,
+            "text_offset": text_offset,
+            "finished": finished,
+            "skip_special_tokens": skip_special_tokens,
+            "spaces_between_special_tokens": spaces_between_special_tokens,
+            "prompt_context": prompt_context,
+        }
+
     def _decode_with_pipeline(
         self,
         request_id: str,
@@ -266,35 +565,110 @@ class OutputPipeline:
         spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
         tokens_are_eos_filtered: bool = False,
+        token_offset: int = 0,
+        text_offset: int = 0,
+        decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
     ) -> DetokenizerResult:
-        """Decode tokens using the detokenizer worker pipeline.
-
-        Performs incremental detokenization with streaming text delta support.
-
-        Args:
-            request_id: Request ID for tracking state in the detokenizer.
-            generated_tokens: Full list of generated tokens so far.
-            finished: Whether generation is complete (triggers final flush).
-            skip_special_tokens: Whether to skip special tokens in output.
-            spaces_between_special_tokens: Whether to preserve tokenizer-inserted
-                spacing between adjacent special tokens.
-            prompt_context: Last N prompt token IDs for first-token context.
-            tokens_are_eos_filtered: Set when ``generated_tokens`` has already
-                had EOS ids removed by the caller. This avoids another
-                full-list walk in the hot streaming path.
-
-        Returns:
-            DetokenizerResult with accumulated_text, delta_text, and indices.
-        """
+        """Consume a planned native decode or submit one terminal flush through the same batch API."""
         tokens_for_decode = generated_tokens if tokens_are_eos_filtered else self._filter_eos_tokens(generated_tokens)
-        return self._detokenizer_client.decode(
+        key = (request_id, finished)
+        if decode_results is not None:
+            planned = decode_results.pop(key, None)
+            if planned is not None:
+                if planned.last_decoded_index != len(tokens_for_decode):
+                    raise RuntimeError(
+                        f"Planned detokenization for {request_id!r} decoded {planned.last_decoded_index} tokens, "
+                        f"but the output stream has {len(tokens_for_decode)}."
+                    )
+                return planned
+        request = self._decode_request(
             request_id,
             tokens_for_decode,
+            token_offset=token_offset,
+            text_offset=text_offset,
             finished=finished,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_context,
         )
+        return self._detokenizer_client.decode_batch([request])[0]
+
+    def _should_decode(self, rd, num_decodable: int, now: float, finished: bool) -> bool:
+        """Apply the streaming interval policy without mutating request state."""
+        last_idx = rd.last_decoded_index
+        if finished:
+            return num_decodable != 0 or last_idx != 0
+        sampling_params = rd.sampling_params
+        if getattr(sampling_params, "stop", None):
+            interval_tokens = min(self.decode_interval_tokens, 4)
+            interval_secs = min(self.decode_interval_secs, 0.02)
+        else:
+            interval_tokens = self.decode_interval_tokens
+            interval_secs = self.decode_interval_secs
+        should_decode = num_decodable - last_idx >= interval_tokens or (now - rd.last_decode_time) >= interval_secs
+        return should_decode and num_decodable > last_idx
+
+    def _plan_decode_batch(self, engine_outputs) -> dict[tuple[str, bool], DetokenizerResult]:
+        """Decode every due request in an output bundle with one native call.
+
+        Token/logprob bookkeeping still happens in the main ordered pass. This planning pass only reads it and sends
+        the unsubmitted suffix, so its cost does not grow with text already emitted. Terminal calls carrying new
+        tokens first need their ordinary streaming decode; their final flush is submitted later through the same API.
+        """
+        requests = []
+        keys = []
+        for client_outputs in engine_outputs.values():
+            now = float(client_outputs.timestamp or time.perf_counter())
+            for engine_output in client_outputs.outputs:
+                request_id = engine_output.request_id
+                rd = self._active_requests.get(request_id)
+                if rd is None:
+                    continue
+                parent_request_id = rd.parent_request_id or request_id
+                if parent_request_id not in self._request_outputs:
+                    continue
+                new_tokens = engine_output.new_token_ids
+                if new_tokens:
+                    decodable = rd.decodable_tokens
+                    filtered_new = [token for token in new_tokens if token not in self._eos_set]
+                    num_decodable = len(decodable) + len(filtered_new)
+                    finished = False
+                elif engine_output.finished:
+                    decodable = self._get_decodable_tokens_for_final(rd)
+                    filtered_new = []
+                    num_decodable = len(decodable)
+                    finished = True
+                else:
+                    continue
+                if not self._should_decode(rd, num_decodable, now, finished):
+                    continue
+
+                token_offset = rd.detokenizer_token_count
+                if token_offset < 0 or token_offset > num_decodable:
+                    token_offset = 0
+                previous = decodable[token_offset:] if token_offset <= len(decodable) else []
+                sampling_params = rd.sampling_params
+                prompt_ctx = rd.prompt_token_ids if rd.last_decoded_index == 0 else None
+                request = self._decode_request(
+                    request_id,
+                    decodable if not new_tokens else [],
+                    token_offset=token_offset,
+                    text_offset=len(rd.detokenized_text),
+                    finished=finished,
+                    skip_special_tokens=bool(getattr(sampling_params, "skip_special_tokens", False)),
+                    spaces_between_special_tokens=bool(getattr(sampling_params, "spaces_between_special_tokens", True)),
+                    prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
+                    tokens_delta=[*previous, *filtered_new],
+                )
+                requests.append(request)
+                keys.append((request_id, finished))
+
+        if not requests:
+            return {}
+        results = self._detokenizer_client.decode_batch(requests)
+        if len(results) != len(keys):
+            raise RuntimeError(f"Detokenizer returned {len(results)} results for {len(keys)} requests.")
+        return dict(zip(keys, results, strict=True))
 
     # Stop-string policy and parser drive
 
@@ -385,9 +759,28 @@ class OutputPipeline:
             stop_sequences = [str(s) for s in (getattr(sampling_params, "stop", None) or []) if s]
             include_stop = bool(getattr(sampling_params, "include_stop_str_in_output", False))
             if stop_sequences:
-                matched = self._find_first_stop_string(accumulated_text, stop_sequences)
+                # Text already scanned without a match cannot hold one, so a streaming step searches only the
+                # new text plus the longest stop's length - 1 characters before it. The final step scans it all.
+                # The window is used only while the scanned text still ends the same way (append-only growth).
+                scan_from = 0
+                scanned = rd.stop_scan_chars
+                overlap = max(len(stop) for stop in stop_sequences) - 1
+                # Keep at least a 1-character tail guard so 1-char stop strings (overlap == 0)
+                # still detect rewrites instead of comparing "" == "".
+                tail_guard = max(1, overlap)
+                if (
+                    not finished
+                    and 0 < scanned <= len(accumulated_text)
+                    and accumulated_text[max(0, scanned - tail_guard) : scanned] == rd.stop_scan_tail
+                ):
+                    scan_from = max(0, scanned - overlap)
+                matched = self._find_first_stop_string(accumulated_text[scan_from:], stop_sequences)
+                if matched is None:
+                    rd.stop_scan_chars = len(accumulated_text)
+                    rd.stop_scan_tail = accumulated_text[max(0, len(accumulated_text) - tail_guard) :]
                 if matched is not None:
                     stop_index, stop_reason = matched
+                    stop_index += scan_from
                     cutoff = stop_index + len(stop_reason) if include_stop else stop_index
                     visible_text = accumulated_text[:cutoff]
                     stop_triggered = True
@@ -495,7 +888,7 @@ class OutputPipeline:
             visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
                 rd,
                 accumulated_text=parsed["accumulated_content"],
-                fallback_delta=parsed["delta_content"] or delta_text,
+                fallback_delta=parsed["delta_content"] or "",
                 finished=finished,
             )
             rd.decoder_visible_text = visible_text
@@ -587,7 +980,7 @@ class OutputPipeline:
             result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
         rd.parser_previous_text = accumulated_text
-        rd.parser_previous_token_ids = _TokenPrefixView(token_ids, len(token_ids))
+        rd.parser_previous_token_ids = _PrefixView(token_ids, len(token_ids))
 
         return result.to_dict()
 
@@ -674,6 +1067,7 @@ class OutputPipeline:
             return
 
         comp = ro.outputs[sample_index]
+        self._materialize_completion(rd, comp)
         if comp.finish_reason is None:
             logger.warning(
                 "Finishing request %s from scheduler finished_requests without a terminal EngineCoreOutput; "
@@ -726,6 +1120,7 @@ class OutputPipeline:
         decodable_tokens: list[int],
         now: float,
         finished: bool,
+        decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
     ) -> tuple[dict | None, str, str, bool, str | None]:
         """Decode tokens and run the parser pipeline for a single update.
 
@@ -758,21 +1153,8 @@ class OutputPipeline:
         skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
         spaces_between_special_tokens = bool(getattr(sampling_params, "spaces_between_special_tokens", True))
 
-        if not finished:
-            has_stop_strings = bool(getattr(sampling_params, "stop", None))
-            if has_stop_strings:
-                interval_tokens = min(self.decode_interval_tokens, 4)
-                interval_secs = min(self.decode_interval_secs, 0.02)
-            else:
-                interval_tokens = self.decode_interval_tokens
-                interval_secs = self.decode_interval_secs
-
-            should_decode = num_decodable - last_idx >= interval_tokens or (now - rd.last_decode_time) >= interval_secs
-            if not should_decode or num_decodable <= last_idx:
-                return None, "", "", False, None
-        else:
-            if num_decodable == 0 and last_idx == 0:
-                return None, "", "", False, None
+        if not self._should_decode(rd, num_decodable, now, finished):
+            return None, "", "", False, None
 
         prompt_ctx = rd.prompt_token_ids if last_idx == 0 else None
         pipeline_result = self._decode_with_pipeline(
@@ -783,18 +1165,26 @@ class OutputPipeline:
             spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
             tokens_are_eos_filtered=True,
+            token_offset=rd.detokenizer_token_count,
+            text_offset=len(rd.detokenized_text),
+            decode_results=decode_results,
         )
         rd.last_decoded_index = pipeline_result.last_decoded_index
+        rd.detokenizer_token_count = len(decodable_tokens)
         if not finished:
             rd.last_decode_time = now
 
-        raw_accumulated = pipeline_result.accumulated_text
         raw_delta = pipeline_result.delta_text or ""
+        if pipeline_result.accumulated_text is None:
+            raw_accumulated = rd.detokenized_text + raw_delta
+        else:
+            raw_accumulated = pipeline_result.accumulated_text
+        rd.detokenized_text = raw_accumulated
 
         parsed, _visible, _vis_delta, stop_hit, stop_reason = self._parse_with_stop_string_policy(
             rd,
-            accumulated_text=pipeline_result.accumulated_text,
-            delta_text=pipeline_result.delta_text,
+            accumulated_text=raw_accumulated,
+            delta_text=raw_delta,
             token_ids=decodable_tokens,
             finished=finished,
         )
@@ -811,7 +1201,9 @@ class OutputPipeline:
         rollout consumers look up each sampled id in the corresponding map.
         A backend may omit probabilities altogether, but partially populated
         sequences or malformed rows are rejected rather than silently shifted.
-        Fresh lists preserve previously yielded streaming snapshots.
+        The maps are appended in place to the completion's backing list and
+        exposed as a new prefix view, so previously yielded streaming
+        snapshots keep their length without copying the whole history.
 
         Args:
             comp: Completion receiving the token maps and sampled logprob sum.
@@ -848,8 +1240,21 @@ class OutputPipeline:
                 raise ValueError(f"Engine log probabilities omit sampled token {token}.")
             maps.append(probabilities)
             sampled_sum += probabilities[token]
-        comp.logprobs = [*(comp.logprobs or []), *maps]
+        existing = comp.logprobs
+        if isinstance(existing, _PrefixView) and existing.covers_items():
+            backing = existing.items
+        else:
+            backing = list(existing or [])
+        backing.extend(maps)
+        comp.logprobs = _PrefixView(backing, len(backing))
         comp.cumulative_logprob = (comp.cumulative_logprob or 0.0) + sampled_sum
+
+    @staticmethod
+    def _materialize_completion(rd, comp) -> None:
+        """Give a finishing completion real lists, built once from the streamed prefix views."""
+        comp.token_ids = list(rd.generated_tokens)
+        if isinstance(comp.logprobs, _PrefixView):
+            comp.logprobs = list(comp.logprobs)
 
     def _append_decodable_tokens(self, rd, new_tokens: list[int]) -> list[int]:
         """Append newly generated tokens to the per-request decode stream.
@@ -908,6 +1313,7 @@ class OutputPipeline:
         raw_accumulated: str,
         raw_delta: str,
         visible_delta: str = "",
+        step_tool_deltas: list | None = None,
     ) -> tuple[bool, bool]:
         """Write parser output back into ``CompletionOutput`` / ``RequestOutput``.
 
@@ -963,6 +1369,15 @@ class OutputPipeline:
             ro.delta_text = effective_delta or ""
             ro.delta_reasoning_content = parsed["delta_reasoning"]
             ro.reasoning_content = parsed["accumulated_reasoning"] or None
+            if parsed["delta_tool_calls"]:
+                if step_tool_deltas is not None:
+                    step_tool_deltas.extend(parsed["delta_tool_calls"])
+                history = getattr(ro, "tool_call_delta_history", None)
+                if history is not None:
+                    history.extend(parsed["delta_tool_calls"])
+                    overflow = len(history) - _MAX_TOOL_CALL_DELTA_HISTORY
+                    if overflow > 0:
+                        del history[:overflow]
             ro.delta_tool_calls = parsed["delta_tool_calls"]
             if parsed["tool_calls"]:
                 ro.tool_calls = parsed["tool_calls"]
@@ -1028,6 +1443,8 @@ class OutputPipeline:
         stop_string_finishes: dict[str, str],
         metrics_collector,
         now: float,
+        decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
+        step_tool_deltas: list | None = None,
     ) -> tuple[bool, bool]:
         """Run the terminal-step pipeline for a finishing request/sample.
 
@@ -1086,14 +1503,18 @@ class OutputPipeline:
             decodable_tokens,
             now,
             finished=True,
+            decode_results=decode_results,
         )
 
-        if stop_hit and stop_reason:
-            stop_string_finishes[request_id] = stop_reason
+        if stop_hit:
+            if stop_reason:
+                stop_string_finishes[request_id] = stop_reason
+            if comp.finish_reason != "abort":
+                comp.finish_reason = "stop"
 
+        self._materialize_completion(rd, comp)
         if parsed is not None:
-            comp.token_ids = list(rd.generated_tokens)
-            if parsed["tool_calls"]:
+            if parsed["tool_calls"] and not (force_finished or stop_hit):
                 comp.finish_reason = "tool_calls"
             text_changed, structured_changed = self._update_outputs(
                 comp,
@@ -1102,6 +1523,7 @@ class OutputPipeline:
                 parsed,
                 raw_accumulated,
                 raw_delta,
+                step_tool_deltas=step_tool_deltas,
             )
 
         elapsed = now - rd.start_time
@@ -1115,6 +1537,11 @@ class OutputPipeline:
             ro.tokens_per_second = ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
         else:
             ro.tokens_per_second = 0.0
+        cache_metrics = _cache_usage_metrics(
+            num_prompt_tokens,
+            engine_output.num_cached_tokens,
+            self._prefix_cache_page_size,
+        )
         ro.metrics = {
             "prompt_tokens": num_prompt_tokens,
             "generated_tokens": ro.num_generated_tokens,
@@ -1122,8 +1549,11 @@ class OutputPipeline:
             "processing_time": elapsed,
             "first_token_time": ro.first_token_time,
             "tokens_per_second": ro.tokens_per_second,
+            **cache_metrics,
         }
 
+        if metrics_collector:
+            metrics_collector.record_cache_read(parent_request_id, cache_metrics["cache_read"])
         if metrics_collector and ro.finished:
             metrics_collector.complete_request(
                 parent_request_id,
@@ -1139,7 +1569,9 @@ class OutputPipeline:
 
         return text_changed, structured_changed
 
-    def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
+    def _process_engine_outputs(
+        self, engine_outputs: dict[int, EngineCoreOutputs], weight_version: int | None = None
+    ) -> None:
         """Process engine outputs and update request outputs (thread-safe).
 
         Decodes tokens, runs reasoning + tool parsers, updates metrics, and
@@ -1164,6 +1596,7 @@ class OutputPipeline:
         stop_string_finishes: dict[str, str] = {}
 
         with self._request_lock, self._output_lock:
+            decode_results = self._plan_decode_batch(engine_outputs)
             for client_outputs in engine_outputs.values():
                 now = float(client_outputs.timestamp or time.perf_counter())
                 for engine_output in client_outputs.outputs:
@@ -1182,16 +1615,22 @@ class OutputPipeline:
                     structured_changed = False
                     force_finished = False
                     new_tokens = engine_output.new_token_ids
+                    step_tool_deltas: list | None = [] if sample_index == 0 else None
 
                     if new_tokens:
                         comp = ro.outputs[sample_index]
+                        if weight_version is not None:
+                            _record_weight_version(comp, len(rd.generated_tokens), int(weight_version))
+                            if comp.oldest_kv_weight_version is None:
+                                # No swap reported older KV, so the weights that sampled this token computed it all.
+                                comp.oldest_kv_weight_version = int(weight_version)
                         self._append_token_logprobs(
                             comp, new_tokens, engine_output.new_logprobs, len(rd.generated_tokens)
                         )
                         rd.generated_tokens.extend(new_tokens)
                         # Token/probability alignment is independent of decoding
                         # intervals, EOS-only updates and text stop trimming.
-                        comp.token_ids = list(rd.generated_tokens)
+                        comp.token_ids = _PrefixView(rd.generated_tokens, len(rd.generated_tokens))
                         num_generated = len(rd.generated_tokens)
 
                         if rd.first_token_time is None and num_generated > 0:
@@ -1213,6 +1652,7 @@ class OutputPipeline:
                             decodable_tokens,
                             now,
                             finished=False,
+                            decode_results=decode_results,
                         )
                         if stop_hit:
                             force_finished = True
@@ -1227,6 +1667,7 @@ class OutputPipeline:
                                 parsed,
                                 raw_accumulated,
                                 raw_delta,
+                                step_tool_deltas=step_tool_deltas,
                             )
 
                         self._update_metrics(rd, ro, now, num_generated)
@@ -1245,9 +1686,18 @@ class OutputPipeline:
                             stop_string_finishes,
                             metrics_collector,
                             now,
+                            decode_results=decode_results,
+                            step_tool_deltas=step_tool_deltas,
                         )
                         text_changed = text_changed or tc
                         structured_changed = structured_changed or sc
+
+                    if step_tool_deltas:
+                        # Preserve all tool-call deltas emitted during this step (including when
+                        # _decode_and_parse(finished=False) and _finalize_request(finished=True)
+                        # both run inside the same _output_lock critical section).
+                        ro.delta_tool_calls = list(step_tool_deltas)
+                        structured_changed = True
 
                     ro.update_seq += 1
                     if text_changed or structured_changed or engine_output.finished or force_finished:
@@ -1265,4 +1715,7 @@ class OutputPipeline:
         if stop_string_finishes:
             self._on_stop_strings(stop_string_finishes)
 
-        self._output_event.set()
+        if hasattr(self._registry, "notify_output_change"):
+            self._registry.notify_output_change()
+        else:
+            self._output_event.set()

@@ -30,6 +30,7 @@ from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutp
 from easydel.inference.parsing.delegating_parser import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.tools.parsers.hermes_tool_parser import HermesToolParser
+from easydel.workers.esurge.pipeline import Detokenizer
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -95,14 +96,7 @@ def test_output_pipeline_preserves_public_streamed_ids_through_finalization(call
     )
     pipeline = OutputPipeline(
         registry=registry,
-        detokenizer_client=SimpleNamespace(
-            decode=lambda request_id, tokens, **kwargs: SimpleNamespace(
-                accumulated_text=tokenizer.decode(tokens),
-                delta_text=tokenizer.decode(tokens),
-                last_decoded_index=len(tokens),
-            ),
-            reset=lambda request_id: None,
-        ),
+        detokenizer_client=Detokenizer(tokenizer, context_window=0),
         eos_token_ids=[],
         decode_interval_tokens=1 if stream_first else len(tokens) + 1,
         decode_interval_secs=1000.0,

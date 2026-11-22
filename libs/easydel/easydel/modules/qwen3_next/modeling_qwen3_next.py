@@ -84,6 +84,7 @@ from easydel.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
+from easydel.caching.shared_prefix import is_shared_prefix_recurrent_view
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -2346,21 +2347,12 @@ class Qwen3NextSparseMoeBlock(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            shared_expert=self.gated_shared_expert_call(
+                self.shared_expert,
+                self.shared_expert_gate,
+                fp32_combine=self.dtype in lowfloats,
+            ),
         )
-
-        stage_mesh = resolve_stage_mesh(self.config.mesh, arr=hidden_states)
-        with spx.use_mesh(stage_mesh):
-            shared_out = self.shared_expert(hidden_states)
-            gate_input = self.shared_expert_gate(hidden_states)
-        needs_upcast = self.dtype in lowfloats
-        if needs_upcast:
-            gate = jax.nn.sigmoid(gate_input.astype(jnp.float32))
-            shared_out = shared_out.astype(jnp.float32) * gate
-            out = (out.astype(jnp.float32) + shared_out).astype(self.dtype)
-        else:
-            gate = jax.nn.sigmoid(gate_input)
-            shared_out = shared_out * gate
-            out = out + shared_out
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
@@ -2678,6 +2670,10 @@ class Qwen3NextLinearAttention(spx.Module):
         config: Model configuration.
         layer_idx: Index of this layer.
     """
+
+    # eSurge (runners/slot_contract.py): row r of every serving step reads and writes pool slot
+    # cache_metadata.recurrent_state_indices[r], so requests keep stable slots across row moves and row windows.
+    esurge_recurrent_slot_contract: typing.ClassVar[str] = "slots"
 
     def __init__(
         self,
@@ -3069,6 +3065,13 @@ class Qwen3NextLinearAttention(spx.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
+        if is_shared_prefix_recurrent_view(cache_view):
+            # Prefix-shared training views run only the multi-token chunked path (verified with gradients
+            # through the initial state); keep them out of the packed, grouped-decode and single-step branches.
+            if seq_len < 2:
+                raise NotImplementedError("Prefix-shared linear attention requires at least two tokens per pass.")
+            if cache_metadata is not None:
+                raise NotImplementedError("Prefix-shared linear attention does not take cache metadata.")
         expand_ratio = self.num_v_heads // self.num_k_heads
         if self.uses_merged_split_proj:
             projected_qkvz = self.in_proj_qkvz(hidden_states)
@@ -3299,6 +3302,18 @@ class Qwen3NextLinearAttention(spx.Module):
                 query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
                 num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
                 num_requests = num_seqs_arr[0]
+                # eSurge names every row's pool slot (``recurrent_state_indices``) when a row window can start past
+                # slot 0 (several row windows per step, sparse row packing): run the rows on their gathered slots and
+                # scatter the new states back below. The speculative candidate layout keeps row r on slot r.
+                num_rows = int(query_start_loc.shape[0]) - 1
+                pool_states = None
+                if packed_recurrent_state_indices is not None and packed_spec_recurrent_commit is None:
+                    pool_states = (conv_states, recurrent_states)
+                    num_pool_slots = int(conv_states.shape[0])
+                    row_slots = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32).reshape(-1)[:num_rows]
+                    read_slots = jnp.clip(row_slots, 0, num_pool_slots - 1)
+                    conv_states = conv_states[read_slots]
+                    recurrent_states = recurrent_states[read_slots]
 
                 conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
                     conv_states=conv_states,
@@ -3329,6 +3344,23 @@ class Qwen3NextLinearAttention(spx.Module):
                     force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
                     recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
                 )
+                if pool_states is not None:
+                    # Rows without tokens (eSurge points padding rows at slot 0) and out-of-range slots write nothing.
+                    row_lens = query_start_loc[1:] - query_start_loc[:-1]
+                    live = (
+                        (jnp.arange(num_rows, dtype=jnp.int32) < num_requests)
+                        & (row_lens > 0)
+                        & (row_slots >= 0)
+                        & (row_slots < num_pool_slots)
+                    )
+                    write_slots = jnp.where(live, row_slots, num_pool_slots)
+                    pool_conv, pool_recurrent = pool_states
+                    conv_states = pool_conv.at[write_slots].set(
+                        conv_states[:num_rows].astype(pool_conv.dtype), mode="drop"
+                    )
+                    recurrent_states = pool_recurrent.at[write_slots].set(
+                        recurrent_states[:num_rows].astype(pool_recurrent.dtype), mode="drop"
+                    )
                 output = token_outputs[None, ...]
 
             new_cache_view = cache_view.replace(

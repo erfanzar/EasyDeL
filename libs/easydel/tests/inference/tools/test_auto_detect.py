@@ -62,6 +62,8 @@ class TestDetectToolParserModelType:
             ("mistral3", "mistral"),
             ("gemma4", "gemma4"),
             ("glm4_moe", "glm47"),
+            ("glm5_next", "glm47"),
+            ("glm5_next_text", "glm47"),
             ("olmo3", "olmo3"),
             ("phi4", "phi4_mini_json"),
             ("kimi_k2", "kimi_k2"),

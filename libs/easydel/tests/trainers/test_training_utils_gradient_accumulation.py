@@ -268,7 +268,7 @@ def test_ce_aux_split_matches_full_batch_ce_plus_mean_aux():
     assert not jnp.allclose(old, want, rtol=1e-3)
 
 
-def test_minibatch_call_all_zero_weights_fall_back_to_uniform_average():
+def test_minibatch_call_all_zero_weights_return_zeros():
     state = _DummyState(graphstate=jnp.asarray(2.0, dtype=jnp.float32))
     batch = {"x": jnp.asarray([1.0, -2.0, 3.0, -4.0], dtype=jnp.float32)}
 
@@ -277,7 +277,6 @@ def test_minibatch_call_all_zero_weights_fall_back_to_uniform_average():
         return loss, loss
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    uniform_grads, uniform_metrics = minibatch_call(state=state, batch=batch, minibatch_size=2, grad_fn=grad_fn)
     grads, metrics = minibatch_call(
         state=state,
         batch=batch,
@@ -285,8 +284,8 @@ def test_minibatch_call_all_zero_weights_fall_back_to_uniform_average():
         grad_fn=grad_fn,
         microbatch_weight_fn=lambda _tree, _mb: jnp.float32(0.0),
     )
-    assert jnp.allclose(grads, uniform_grads)
-    assert jnp.allclose(metrics, uniform_metrics)
+    assert jnp.allclose(grads, 0.0)
+    assert jnp.allclose(metrics, 0.0)
 
 
 def test_compile_trainer_step_delegates_to_spx_jit(monkeypatch):

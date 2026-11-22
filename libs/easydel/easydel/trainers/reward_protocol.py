@@ -159,8 +159,8 @@ def align_reward_sidechannels(batch, *, prompt_count: int, completion_count: int
     Scalars and mappings are shared metadata. Sequence/array columns must be
     prompt-aligned or already completion-aligned; ambiguous lengths are rejected.
     """
-    if prompt_count < 1 or completion_count % prompt_count:
-        raise ValueError("Reward completions must form an integral number of candidates per prompt.")
+    if prompt_count < 1 or completion_count < 1 or completion_count % prompt_count:
+        raise ValueError("Reward completions must form a positive integral number of candidates per prompt.")
     factor = completion_count // prompt_count
     aligned = {}
     for key, value in batch.items():
@@ -212,13 +212,34 @@ def as_messages(prompt: PromptType | None, completion: CompletionType) -> list[C
     return [*base, {"role": "assistant", "content": completion}]
 
 
+def _extract_content_text(content: tp.Any) -> str:
+    """Extract plain text from a message ``content`` field (string, multimodal part list, or None)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    chunks.append(item)
+            elif isinstance(item, dict):
+                item_type = item.get("type")
+                text_val = item.get("text")
+                if isinstance(text_val, str) and text_val and (item_type == "text" or item_type is None):
+                    chunks.append(text_val)
+        return "\n".join(chunks)
+    return str(content)
+
+
 def text_of(value: PromptType | CompletionType | None) -> str:
     """Flatten a single prompt/completion to plain text.
 
     A single prompt/completion is a string in plain-text mode but a chat
     message list in conversational mode; this returns the text either way
-    (joining message ``content`` fields), so per-example ``compute`` always
-    receives a ``str``.
+    (joining message ``content`` fields, including multimodal text parts), so
+    per-example ``compute`` always receives a ``str``.
     """
     if value is None:
         return ""
@@ -227,9 +248,18 @@ def text_of(value: PromptType | CompletionType | None) -> str:
     if isinstance(value, list):
         parts: list[str] = []
         for message in value:
-            content = message.get("content", "") if isinstance(message, dict) else message
-            parts.append(content if isinstance(content, str) else str(content))
-        return "\n".join(part for part in parts if part)
+            if isinstance(message, dict):
+                if "content" in message:
+                    extracted = _extract_content_text(message.get("content"))
+                elif message.get("type") == "text" and isinstance(message.get("text"), str):
+                    extracted = message["text"]
+                else:
+                    extracted = ""
+            else:
+                extracted = _extract_content_text(message)
+            if extracted:
+                parts.append(extracted)
+        return "\n".join(parts)
     return str(value)
 
 
@@ -253,11 +283,17 @@ class RewardProtocol:
             ``reward_weights`` in the trainer config still overrides these.
         name: Optional display name used for logged metrics; falls back to the
             class name.
+        discard_unscorable: When ``True``, a ``None`` score from this reward marks
+            the sample unscorable and (under the GRPO default
+            ``discard_unscorable_groups=None``) drops its whole prompt group from
+            the update. Defaults to ``False``: a ``None`` is skipped by the
+            nan-aware reward statistics instead.
     """
 
     reduction: Reduction = "mean"
     weight: float = 1.0
     name: str | None = None
+    discard_unscorable: bool = False
 
     def __init__(
         self,
@@ -411,7 +447,21 @@ class RewardProtocol:
         """
         completions = list(completions)
         n = len(completions)
-        prompts = list(prompts) if prompts is not None else [None] * n
+        if n == 0:
+            return []
+        if prompts is None:
+            aligned_prompts: list[PromptType | None] = [None] * n
+        else:
+            prompt_list = list(prompts)
+            if len(prompt_list) == n:
+                aligned_prompts = prompt_list
+            elif len(prompt_list) > 0 and n % len(prompt_list) == 0:
+                factor = n // len(prompt_list)
+                aligned_prompts = [prompt for prompt in prompt_list for _ in range(factor)]
+            else:
+                raise ValueError(
+                    f"prompts length ({len(prompt_list)}) must match completions length ({n}) or divide it evenly."
+                )
         # Reassemble the per-example-indexable payload (named fields + overflow).
         batch_fields = {
             "completion_texts": completion_texts,
@@ -428,9 +478,26 @@ class RewardProtocol:
             "batch": batch,
             **kwargs,
         }
+        try:
+            sig = inspect.signature(self.compute)
+            accepts_varkw = any(param.kind is inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
+            allowed_names = frozenset(
+                name
+                for name, param in sig.parameters.items()
+                if param.kind
+                not in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                )
+            )
+        except (TypeError, ValueError):
+            accepts_varkw = True
+            allowed_names = frozenset()
+
         results: list[float | None] = []
         for i in range(n):
-            prompt = prompts[i] if i < len(prompts) else None
+            prompt = aligned_prompts[i]
             completion = completions[i]
             per_item = self._index_batch_field(batch_fields, i, n)
             call_kwargs = {
@@ -441,22 +508,27 @@ class RewardProtocol:
                 "messages": as_messages(prompt, completion),
                 **per_item,
             }
-            results.append(self.compute(**filter_kwargs_for_callable(self.compute, call_kwargs)))
+            filtered = call_kwargs if accepts_varkw else {k: v for k, v in call_kwargs.items() if k in allowed_names}
+            results.append(self.compute(**filtered))
         return results
 
     @staticmethod
     def _index_batch_field(kwargs: tp.Mapping[str, tp.Any], i: int, n: int) -> dict[str, tp.Any]:
         """Project batch-level kwargs onto example ``i``.
 
-        List/tuple values of length ``n`` are indexed to their ``i``-th element
-        (renamed to a singular form where applicable); everything else (scalars,
-        the ``batch`` dict, ``max_length``) is passed through unchanged.
+        Sequence (``list``/``tuple``) and array-like (``np.ndarray``/``jax.Array``)
+        values whose leading axis has length ``n`` are indexed to their ``i``-th
+        element (renamed to a singular form where applicable); everything else
+        (scalars, the ``batch`` dict, ``max_length``) is passed through unchanged.
         """
         out: dict[str, tp.Any] = {}
         for key, value in kwargs.items():
             name = _PER_ITEM_RENAME.get(key, key)
             if isinstance(value, (list, tuple)) and len(value) == n:
                 out[name] = value[i]
+            elif hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == n:
+                item = value[i]
+                out[name] = item.item() if getattr(item, "ndim", -1) == 0 else item
             else:
                 out[name] = value
         return out

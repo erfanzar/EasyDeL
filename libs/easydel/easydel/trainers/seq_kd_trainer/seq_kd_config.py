@@ -124,6 +124,7 @@ class SeqKDConfig(TrainingArguments):
                 ``max_prompt_length + max_completion_length`` exceeds
                 ``max_length``.
         """
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
@@ -141,6 +142,8 @@ class SeqKDConfig(TrainingArguments):
                 )
 
         self.max_length = self.max_prompt_length + self.max_completion_length
+        if self.generation_top_k is None:
+            self.generation_top_k = 0 if self.top_k is None else self.top_k
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

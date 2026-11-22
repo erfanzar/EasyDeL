@@ -169,7 +169,6 @@ def test_agentic_generate_fn_keeps_raw_text_but_returns_post_strip_action_text()
 def test_agentic_rollout_releases_esurge_after_rollout_failure():
     trainer = object.__new__(AgenticMoshPitTrainer)
     trainer.arguments = SimpleNamespace(
-        use_esurge_generation=True,
         group_size=1,
         num_env_groups=1,
     )
@@ -319,13 +318,15 @@ def test_rollout_manager_replays_structured_tool_calls_in_follow_up_prompts_and_
         num_groups=1,
     )
 
+    expected_raw_call = f'<tool_call>{{"name":"{tool.name}","arguments":{{"value":"ok"}}}}</tool_call>'
     assert len(prompts_seen) == 2
-    assert "<tool_calls>" in prompts_seen[1]
+    assert expected_raw_call in prompts_seen[1]
     assert tool.name in prompts_seen[1]
 
     full_text = "".join(chr(int(token)) for token in trajectories[0].input_ids.tolist())
     assert "<tool_calls>" not in full_text
-    assert f'<tool_call>{{"name":"{tool.name}","arguments":{{"value":"ok"}}}}</tool_call>' in full_text
+    assert expected_raw_call in full_text
+    assert full_text.startswith(prompts_seen[1])
 
 
 def test_agentic_aux_rewards_update_final_step_and_receive_metadata():
@@ -689,6 +690,8 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
     tool = _EchoTool()
     captured = {}
     prompts_seen = []
+    followup_ids = []
+    followup_masks = []
     trainer = object.__new__(GRPOTrainer)
     trainer.arguments = SimpleNamespace(
         max_length=64,
@@ -716,7 +719,7 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
     trainer._purify_batch = lambda batch: batch
     trainer._make_attn_mask = lambda ids: (ids != 0).astype(jnp.int32)
     trainer._all_gather = lambda value: value
-    trainer.compute_refmodel_logps = lambda graphstate, graphother, ids, mask, kwargs: jnp.zeros(
+    trainer.compute_refmodel_logps = lambda graphstate, graphother, ids, mask, kwargs, prompt_length=None: jnp.zeros(
         (ids.shape[0], 8),
         dtype=jnp.float32,
     )
@@ -761,6 +764,8 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
                 raw_text=["<tool_call>{}</tool_call>"],
             )
         prompts_seen.extend(kwargs["prompts"])
+        followup_ids.append(np.asarray(kwargs["input_ids"]).tolist())
+        followup_masks.append(np.asarray(kwargs["attention_mask"]).tolist())
         return GenerationResults(
             generation_results=["final"],
             prompt_ids=jnp.asarray([[1, 2, 11, 70]], dtype=jnp.int32),
@@ -789,6 +794,9 @@ def test_grpo_tool_call_loop_appends_tool_result_and_regenerates():
     )
 
     assert prompts_seen and "echo:ok" in prompts_seen[0]
+    # The follow-up request is the exact prompt row, the sampled completion and the observation tokens.
+    assert followup_ids == [[[1, 2, 11, 70]]]
+    assert followup_masks == [[[1, 1, 1, 1]]]
     assert captured["raw_text"] == [f"<tool_call>{{}}</tool_call>\n[{tool.name}]: echo:ok\nfinal"]
     assert captured["completions"] == [f"need tool\n[{tool.name}]: echo:ok\nfinal"]
     assert captured["tool_calls"] == [None]

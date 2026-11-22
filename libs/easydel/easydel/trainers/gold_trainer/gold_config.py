@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..distillation_trainer import DistillationConfig
 
@@ -48,6 +49,8 @@ class GOLDConfig(DistillationConfig):
     uld_teacher_temperature: float = field(default=1.0)
     uld_skip_student_eos: bool = field(default=True)
     uld_skip_teacher_eos: bool = field(default=True)
+
+    __hash__ = hash_fn
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None) -> None:
         """Validate GOLD/ULD compatibility fields after base distillation setup.

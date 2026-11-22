@@ -60,6 +60,9 @@ class RuleCheck:
     action: RuleAction
     reason_code: str = "rule"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "action", RuleAction(self.action))
+
 
 @dataclass(frozen=True, slots=True)
 class JudgeCheck:
@@ -67,6 +70,9 @@ class JudgeCheck:
 
     action: GuardAction
     reason_code: str = "intent_judge"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "action", GuardAction(self.action))
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +118,20 @@ def _reason_code(value: str, fallback: str) -> str:
     return normalized or fallback
 
 
+def _iter_extracted_strings(value: tp.Any) -> tp.Iterator[str]:
+    """Recursively yield all unescaped string values and mapping keys from parsed JSON."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, tp.Mapping):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _iter_extracted_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_extracted_strings(item)
+
+
 class RegexRuleFilter:
     """Mark calls matching configured regular expressions for review.
 
@@ -119,8 +139,9 @@ class RegexRuleFilter:
     events only expose a stable ``pattern_<index>`` reason code.
 
     Args:
-        patterns: Regular expressions matched against canonical
-            ``"<tool-name>\\n<arguments-json>"`` text.
+        patterns: Regular expressions matched against both canonical
+            ``"<tool-name>\\n<arguments-json>"`` text and recursively extracted
+            unescaped string values from parsed call arguments.
         match_action: Outcome for a match. ``review`` is the normal first
             stage for a two-stage guard; ``block`` supports unconditional
             deny rules.
@@ -139,9 +160,13 @@ class RegexRuleFilter:
 
     def __call__(self, call: NormalizedToolCall, context: GuardContext) -> RuleCheck:
         del context
-        candidate = f"{call.name}\n{call.arguments_json}"
+        extracted = list(_iter_extracted_strings(call.arguments))
+        candidates: list[str] = [f"{call.name}\n{call.arguments_json}"]
+        if extracted:
+            candidates.append(f"{call.name}\n" + "\n".join(extracted))
+            candidates.extend(extracted)
         for index, pattern in enumerate(self._patterns):
-            if pattern.search(candidate):
+            if any(pattern.search(candidate) for candidate in candidates):
                 return RuleCheck(self._match_action, f"pattern_{index}")
         return RuleCheck(RuleAction.ALLOW, "no_rule_match")
 

@@ -76,14 +76,14 @@ def find_common_prefix(s1: str, s2: str) -> str:
     Note:
         The order of arguments does not matter as the function is symmetric.
     """
-    prefix = ""
     min_length = min(len(s1), len(s2))
-    for i in range(0, min_length):
+    matched = 0
+    for i in range(min_length):
         if s1[i] == s2[i]:
-            prefix += s1[i]
+            matched = i + 1
         else:
             break
-    return prefix
+    return s1[:matched]
 
 
 def find_common_suffix(s1: str, s2: str) -> str:
@@ -115,14 +115,14 @@ def find_common_suffix(s1: str, s2: str) -> str:
         The suffix matching stops at alphanumeric characters to prevent
         matching partial words.
     """
-    suffix = ""
     min_length = min(len(s1), len(s2))
+    matched = 0
     for i in range(1, min_length + 1):
         if s1[-i] == s2[-i] and not s1[-i].isalnum():
-            suffix = s1[-i] + suffix
+            matched = i
         else:
             break
-    return suffix
+    return s1[len(s1) - matched :] if matched else ""
 
 
 def extract_intermediate_diff(curr: str, old: str) -> str:
@@ -241,6 +241,8 @@ def partial_json_loads(input_str: str, flags: Allow) -> tuple[Any, int]:
     """
     try:
         return (partial_json_parser.loads(input_str, flags), len(input_str))
+    except (AssertionError, IndexError) as e:
+        raise partial_json_parser.core.exceptions.MalformedJSON(str(e) or "Malformed partial JSON") from e
     except JSONDecodeError as e:
         if "Extra data" in e.msg:
             dec = JSONDecoder()
@@ -276,7 +278,7 @@ def is_complete_json(input_str: str) -> bool:
     try:
         json.loads(input_str)
         return True
-    except JSONDecodeError:
+    except (JSONDecodeError, ValueError, RecursionError, MemoryError):
         return False
 
 

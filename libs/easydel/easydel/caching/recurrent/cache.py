@@ -291,7 +291,11 @@ class RecurrentCacheView(BaseCacheView):
                 arr=jnp.zeros(recurrent_state_shape, dtype=dtype),
                 sharding=partition_specs,
             ),
-            positions=jnp.zeros((config.batch_size,), dtype=jnp.int32),
+            # Committed replicated over the mesh, the layout the model step returns (see the KDA cache).
+            positions=with_sharding_constraint(
+                arr=jnp.zeros((config.batch_size,), dtype=jnp.int32),
+                sharding=PartitionSpec(),
+            ),
             seqlen_offset=jnp.array(config.seqlen_offset, dtype=jnp.int32),
             metadata=config,
             layer_index=layer_index,

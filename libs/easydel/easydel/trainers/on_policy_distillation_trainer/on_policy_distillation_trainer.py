@@ -36,7 +36,9 @@ from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
 from .._shared import drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..metrics import _host_mean_float
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -53,7 +55,7 @@ logger = get_logger(__name__)
 
 
 @Registry.register("trainer", "on_policy_distillation")
-class OnPolicyDistillationTrainer(Trainer):
+class OnPolicyDistillationTrainer(AsyncRolloutMixin, Trainer):
     """On-policy knowledge distillation trainer.
 
     Unlike standard (offline) distillation which distills on a fixed dataset,
@@ -135,12 +137,29 @@ class OnPolicyDistillationTrainer(Trainer):
 
         self.arguments = arguments
 
+        if isinstance(student_model, str):
+            reject_string_model_id(student_model, role="student model")
+        if student_model is None:
+            raise ValueError("`student_model` must be provided for OnPolicyDistillationTrainer.")
+        if isinstance(teacher_model, str):
+            reject_string_model_id(teacher_model, role="teacher model")
+        if teacher_model is None:
+            raise ValueError("`teacher_model` must be provided for OnPolicyDistillationTrainer.")
+
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
         if not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+            teacher_model.eval()
+            teacher_model = teacher_model.to_state()
+        if getattr(arguments, "disable_dropout", False):
+            student_model = disable_state_dropout(student_model)
+        teacher_model = disable_state_dropout(teacher_model)
 
-        self.teacher_state = drop_optimizer_state(teacher_model)
+        self.teacher_state = self._share_esurge_cache_scope_if_compatible(
+            drop_optimizer_state(teacher_model),
+            primary_state=student_model,
+        )
+        self._eval_teacher_graphdef = None
         self.processing_class = processing_class
 
         pad_token_id = getattr(processing_class, "pad_token_id", None)
@@ -156,6 +175,11 @@ class OnPolicyDistillationTrainer(Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+        if self.teacher_state is not None:
+            self.teacher_state = self._share_esurge_cache_scope_if_compatible(
+                self.teacher_state,
+                primary_state=self.model_state,
+            )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
         """Build the lazy prompt-only preprocessing transform for the training source.
@@ -265,6 +289,29 @@ class OnPolicyDistillationTrainer(Trainer):
             pad_token_id=self.padding_value,
         )
 
+    def _configure_eval_config_override(self):
+        """Apply evaluation config overrides to the frozen teacher forward as well."""
+        super()._configure_eval_config_override()
+        self._eval_teacher_graphdef = None
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is not None and overrides and self.teacher_state is not None:
+            teacher_graphstate = self.teacher_state.graphstate
+            if hasattr(teacher_graphstate, "items"):
+                selected_keys = {(collection, path) for collection, path, _ in teacher_graphstate.items()}
+
+                def teacher_selector(v, path):
+                    return (v.kind, path) in selected_keys
+            else:
+                teacher_selector = None
+            self._eval_teacher_graphdef = self._build_config_override_graphdef(
+                model=self.teacher_state.model,
+                overrides=overrides,
+                reference_graphstate=teacher_graphstate,
+                trainable_selector=teacher_selector,
+                label="eval_config_overrides (teacher)",
+                eval_mode=True,
+            )
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Compile the training/eval distillation steps with teacher-state plumbing.
 
@@ -324,9 +371,13 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.cakld_gamma,
             self.arguments.loss_top_k,
             self.arguments.loss_add_tail,
+            self.arguments.distillation_mode,
+            self.arguments.trust_region_top_k,
+            self.arguments.trust_region_seed,
+            self.arguments.trust_region_sampling_temperature,
         )
 
-        static_argnames = tuple(range(3, 16))
+        static_argnames = tuple(range(3, 20))
 
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
@@ -355,12 +406,17 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.cakld_gamma,
             self.arguments.loss_top_k,
             self.arguments.loss_add_tail,
+            self.arguments.distillation_mode,
+            self.arguments.trust_region_top_k,
+            self.arguments.trust_region_seed,
+            self.arguments.trust_region_sampling_temperature,
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")
+        eval_teacher_state = self._eval_shared_fn_extra_args[0]
         sharded_evaluation_step_function = compile_trainer_step(
             on_policy_distillation_step,
-            in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
+            in_shardings=(self.eval_state_shardings, empty_sharding, eval_teacher_state.shardings),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
             mesh=self.model.mesh,
@@ -369,9 +425,9 @@ class OnPolicyDistillationTrainer(Trainer):
         )
         self._runtime_trace("eval.compile_wrapper.end")
 
-        flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)
+        flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=False)
         self._extra_forward_flops_per_token = flops_per_tkn
-        self._extra_backward_flops_per_token = flops_per_tkn
+        self._extra_backward_flops_per_token = 0.0
 
         self.arguments.ensure_checkpoint_path()
         return TrainerConfigureFunctionOutput(
@@ -416,6 +472,9 @@ class OnPolicyDistillationTrainer(Trainer):
 
             if self.arguments.generate_with_teacher:
                 gen_state = self.teacher_state
+                eval_teacher_graphdef = getattr(self, "_eval_teacher_graphdef", None)
+                if not is_train and eval_teacher_graphdef is not None and gen_state is not None:
+                    gen_state = gen_state.replace(graphdef=eval_teacher_graphdef)
             else:
                 gen_state = state
 
@@ -434,8 +493,12 @@ class OnPolicyDistillationTrainer(Trainer):
 
             generation_time = generation_time_fn()
 
-            # Build completion mask (mask up to first EOS, inclusive)
+            # Build completion mask (mask up to first EOS, inclusive) and intersect
+            # with the rollout engine's valid-token mask so stop-string / non-EOS
+            # completions do not train on right-padded PAD tokens.
             completion_mask = self._make_attn_mask(completion_ids)
+            if results.completion_mask is not None:
+                completion_mask = completion_mask * results.completion_mask.astype(completion_mask.dtype)
 
             # Derive generation factor from actual shapes
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
@@ -465,23 +528,26 @@ class OnPolicyDistillationTrainer(Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
-        self._log_training_generations_to_wandb(
-            state=state,
-            prompts=expanded_prompt_ids,
-            prompt_mask=expanded_prompt_mask,
-            completion_ids=completion_ids,
-            completion_mask=completion_mask,
-            generation_time=generation_time,
-            reasoning=self._coerce_optional_generation_texts(
-                results.reasoning,
-                target_len=int(completion_ids.shape[0]),
-            ),
-            tool_calls=self._coerce_generation_metadata_list(
-                results.tool_calls,
-                target_len=int(completion_ids.shape[0]),
-            ),
-            source="teacher" if self.arguments.generate_with_teacher else "policy",
-        )
+        if is_train:
+            completion_texts = self._coerce_generation_texts(results.text, fallback=results.raw_text) or None
+            self._log_training_generations_to_wandb(
+                state=state,
+                prompts=expanded_prompt_ids,
+                prompt_mask=expanded_prompt_mask,
+                completions=completion_texts,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                generation_time=generation_time,
+                reasoning=self._coerce_optional_generation_texts(
+                    results.reasoning,
+                    target_len=int(completion_ids.shape[0]),
+                ),
+                tool_calls=self._coerce_generation_metadata_list(
+                    results.tool_calls,
+                    target_len=int(completion_ids.shape[0]),
+                ),
+                source="teacher" if self.arguments.generate_with_teacher else "policy",
+            )
 
         return (
             {
@@ -506,6 +572,11 @@ class OnPolicyDistillationTrainer(Trainer):
         """Extra positional args appended to the evaluation step call.
 
         Returns:
-            tuple[tp.Any]: Single-element tuple containing the teacher state.
+            tuple[tp.Any]: Single-element tuple containing the teacher state
+            (with the eval override graphdef when configured).
         """
-        return (self.teacher_state,)
+        teacher_state = self.teacher_state
+        graphdef = getattr(self, "_eval_teacher_graphdef", None)
+        if graphdef is not None and teacher_state is not None:
+            teacher_state = teacher_state.replace(graphdef=graphdef)
+        return (teacher_state,)

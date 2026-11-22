@@ -42,13 +42,24 @@ def test_remote_stream_preserves_owned_probabilities_across_wire_updates(monkeyp
         def __init__(self):
             self.previous = {}
 
-        def decode(self, request_id, tokens, **kwargs):
-            text = tokenizer.decode(tokens)
-            previous = self.previous.get(request_id, "")
-            self.previous[request_id] = text
-            return SimpleNamespace(
-                accumulated_text=text, delta_text=text[len(previous) :], last_decoded_index=len(tokens)
-            )
+        def decode_batch(self, requests):
+            results = []
+            for request in requests:
+                request_id = request["request_id"]
+                previous_tokens = [] if request["token_offset"] == 0 else self.previous.get(request_id, [])
+                assert request["token_offset"] == len(previous_tokens)
+                tokens = [*previous_tokens, *request["tokens_delta"]]
+                text = tokenizer.decode(tokens)
+                previous_text = tokenizer.decode(previous_tokens)
+                self.previous[request_id] = tokens
+                results.append(
+                    SimpleNamespace(
+                        accumulated_text=text,
+                        delta_text=text[len(previous_text) :],
+                        last_decoded_index=len(tokens),
+                    )
+                )
+            return results
 
         def reset(self, request_id):
             self.previous.pop(request_id, None)

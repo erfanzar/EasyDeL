@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import spectrax as spx
 from datasets import Dataset
+from easydel.trainers._shared.esurge_generation import resolve_sampling
 from easydel.trainers.base_trainer import BaseTrainer
 from easydel.trainers.batch_prefetcher import TrainBatchPrefetcher
 from easydel.trainers.binary_classifier_optimization_trainer import _fn
@@ -165,8 +166,7 @@ def generation_args(**kwargs):
     ],
 )
 def test_sampling_preserves_zeros_and_greedy_backend_parity(overrides, do_sample, temperature):
-    trainer = object.__new__(Trainer)
-    params = trainer._build_generation_sampling_params(generation_args(generation_do_sample=do_sample), overrides)
+    params = resolve_sampling(generation_args(generation_do_sample=do_sample), overrides)
     assert params.temperature == temperature
     assert params.top_k == 0
     assert params.top_p == 1.0

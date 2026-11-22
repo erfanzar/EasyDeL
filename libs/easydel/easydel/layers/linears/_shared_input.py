@@ -22,6 +22,12 @@ it again. Under rematerialization XLA gathers the recomputed input separately fo
 same gathered value, and its custom VJP constrains the summed input cotangent straight back to the tp-sharded hidden
 layout (one reduce-scatter instead of an all-reduce). The projections themselves are untouched: each still runs its
 own module call, so quantized, LoRA and hooked layers keep working, and parameters and checkpoints do not change.
+
+:func:`resolve_gather_shared_projection_input` decides whether a layer uses it, from
+``config.gather_shared_projection_input``: ``True`` on, ``False`` off (the escape hatch), ``None`` (the default)
+automatic: on in inference mode (:func:`easydel.utils.set_inference_mode`, which eSurge's model step enters) when the
+hidden axis of the projections' input is sharded over a mesh axis larger than 1 under the active layout, off
+otherwise. Outside inference mode ``None`` behaves like ``False``, so training compiles do not change.
 """
 
 from __future__ import annotations
@@ -83,4 +89,61 @@ def gather_shared_input(x: Array, config: tp.Any) -> Array:
     return gather(x)
 
 
-__all__ = ("HiddenStateTPReplicated", "gather_shared_input")
+def _hidden_axis_is_sharded(x: Array, config: tp.Any) -> bool:
+    """Whether the hidden (last) axis of the ``[B, S, D]`` input ``x`` lives on a mesh axis of size > 1.
+
+    Resolved through the config's runtime sharding resolver on the stage mesh of ``x``, so the active layout scope
+    counts: under :func:`easydel.infra.sharding.decode_mode_specs` (eSurge's pure-decode buckets) the decode hidden
+    axis applies, which is replicated by default.
+
+    Args:
+        x: The shared projection input.
+        config: Owning model config (mesh and runtime sharding resolver).
+
+    Returns:
+        ``True`` when the resolved hidden axis spans more than one device.
+    """
+    resolver = getattr(config, "runtime_sharding_resolver", None)
+    shape = tuple(getattr(x, "shape", ()))
+    if resolver is None or len(shape) != 3:
+        return False
+    from easydel.infra.sharding import mesh_axis_size, resolve_stage_mesh  # lazy, like the layouts import above
+
+    mesh = resolve_stage_mesh(getattr(config, "mesh", None), arr=x)
+    if mesh is None:
+        return False
+    spec = resolver.with_mesh(mesh).resolve(dynamic_axes=ct.HiddenStateSharding, shape=shape)
+    return len(spec) > 2 and mesh_axis_size(mesh, spec[2]) > 1
+
+
+def resolve_gather_shared_projection_input(config: tp.Any, x: Array) -> bool:
+    """Whether the column projections reading ``x`` share one gathered copy of it (:func:`gather_shared_input`).
+
+    The single decision point for ``config.gather_shared_projection_input``. The field is read with ``getattr``, so
+    a config object without it takes the automatic rule.
+
+    - ``True``: gather. :func:`gather_shared_input` stays a no-op where it cannot apply (no tensor parallelism; no
+      runtime sharding resolver, which it warns about once).
+    - ``False``: never gather (the escape hatch).
+    - ``None``: automatic. Gather in inference mode when the hidden axis of ``x`` is sharded over a mesh axis of
+      size > 1 under the active layout: eSurge's prefill and mixed buckets on a tensor-parallel mesh, where every
+      column projection needs the whole hidden state anyway. eSurge's pure-decode buckets keep the hidden state
+      replicated (``decode_mode_specs``), so they take the ``False`` path. Outside inference mode ``None`` is off,
+      so training compiles keep today's program.
+
+    Args:
+        config: Owning model config.
+        x: The shared projection input ``[batch, seq, hidden]``.
+
+    Returns:
+        Whether to route ``x`` through :func:`gather_shared_input`.
+    """
+    value = getattr(config, "gather_shared_projection_input", None)
+    if value is not None:
+        return bool(value)
+    from easydel.utils.inference_mode import is_inference_mode  # lazy, like the imports above
+
+    return is_inference_mode() and _hidden_axis_is_sharded(x, config)
+
+
+__all__ = ("HiddenStateTPReplicated", "gather_shared_input", "resolve_gather_shared_projection_input")

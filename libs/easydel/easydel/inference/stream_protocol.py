@@ -147,15 +147,44 @@ class RequestOutputLike(Protocol):
     tool_calls: list[ToolCall] | None
 
 
+def _longest_suffix_prefix_overlap(previous_text: str, current_text: str) -> int:
+    """Return length of the longest suffix of ``previous_text`` matching a prefix of ``current_text`` in O(L) time."""
+    max_overlap = min(len(previous_text), len(current_text))
+    if max_overlap == 0:
+        return 0
+
+    pattern = current_text[:max_overlap]
+    pi = [0] * max_overlap
+    k = 0
+    for i in range(1, max_overlap):
+        ch = pattern[i]
+        while k > 0 and pattern[k] != ch:
+            k = pi[k - 1]
+        if pattern[k] == ch:
+            k += 1
+        pi[i] = k
+
+    k = 0
+    start = len(previous_text) - max_overlap
+    for i in range(start, len(previous_text)):
+        ch = previous_text[i]
+        while k > 0 and pattern[k] != ch:
+            k = pi[k - 1]
+        if pattern[k] == ch:
+            k += 1
+    return k
+
+
 def compute_stream_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
     """Compute a safe streaming delta from two accumulated text snapshots.
 
     The primary strategy is a simple prefix check: if ``current_text``
-    starts with ``previous_text``, the delta is the tail. When that fails
-    (e.g. the parser rewrote a boundary, or reasoning extraction shifted
-    indices), the function walks backwards looking for the longest suffix of
-    ``previous_text`` that matches a prefix of ``current_text`` and returns
-    the non-overlapping tail.
+    starts with ``previous_text``, the delta is the tail. If ``previous_text``
+    starts with non-empty ``current_text`` (e.g. stop-string trimming shrank
+    the snapshot back to an already-emitted prefix), an empty delta is
+    returned without re-emitting prior text. Otherwise, linear-time KMP
+    prefix-function matching finds the longest suffix of ``previous_text``
+    matching a prefix of ``current_text`` and returns the non-overlapping tail.
 
     Args:
         current_text: Current cumulative output text from the engine.
@@ -176,13 +205,15 @@ def compute_stream_delta_text(current_text: str, previous_text: str, fallback_de
     if current_text.startswith(previous_text):
         return current_text[len(previous_text) :]
 
+    if current_text and previous_text.startswith(current_text):
+        return ""
+
     if not current_text and previous_text and not fallback_delta:
         return ""
 
-    max_overlap = min(len(previous_text), len(current_text))
-    for overlap in range(max_overlap, 0, -1):
-        if previous_text.endswith(current_text[:overlap]):
-            return current_text[overlap:]
+    overlap = _longest_suffix_prefix_overlap(previous_text, current_text)
+    if overlap > 0:
+        return current_text[overlap:]
 
     if len(current_text) <= len(previous_text):
         if fallback_delta and not previous_text.endswith(fallback_delta):
@@ -653,102 +684,204 @@ def iter_chat_completion_stream_responses(
     generation_time = 0.0
     tokens_per_second = 0.0
     last_output = None
-    saw_tool_call_delta = False
-    sent_role = False
+    saw_tool_call_delta_by_choice: set[int] = set()
+    sent_role_by_choice: set[int] = set()
+    previous_texts_by_choice: dict[int, str] = {}
+    previous_reasonings_by_choice: dict[int, str] = {}
+    emitted_tool_calls_by_choice: dict[int, int] = {}
 
-    for output in outputs:
-        if usage_callback is not None:
-            usage_callback(prompt_token_count_from_output(output), int(output.num_generated_tokens or 0))
-        last_output = output
-        if not prompt_tokens:
-            prompt_tokens = prompt_token_count_from_output(output)
+    try:
+        for output in outputs:
+            if usage_callback is not None:
+                usage_callback(prompt_token_count_from_output(output), int(output.num_generated_tokens or 0))
+            last_output = output
+            if not prompt_tokens:
+                prompt_tokens = prompt_token_count_from_output(output)
 
-        current_completion_tokens = int(output.num_generated_tokens or 0)
-        current_tps = output.tokens_per_second
-        elapsed_time = output.processing_time
+            current_completion_tokens = int(output.num_generated_tokens or 0)
+            current_tps = output.tokens_per_second
+            elapsed_time = output.processing_time
 
-        delta_message = coerce_stream_delta_message(
-            DeltaMessage(
-                role="assistant",
-                content=output.delta_text or None,
-                tool_calls=normalize_delta_tool_calls(output.delta_tool_calls),
-                reasoning_content=output.delta_reasoning_content,
-            ),
-            fallback_text=output.delta_text or "",
-            default_role="assistant",
-        )
-        if delta_message is None or not stream_delta_has_payload(delta_message):
+            sample_outputs = output.outputs or []
+            choices: list[ChatCompletionStreamResponseChoice] = []
+
+            if not sample_outputs:
+                primary_delta = coerce_stream_delta_message(
+                    DeltaMessage(
+                        role="assistant",
+                        content=output.delta_text or None,
+                        tool_calls=normalize_delta_tool_calls(output.delta_tool_calls),
+                        reasoning_content=output.delta_reasoning_content,
+                    ),
+                    fallback_text=output.delta_text or "",
+                    default_role="assistant",
+                )
+                if primary_delta is not None and stream_delta_has_payload(primary_delta):
+                    if primary_delta.tool_calls:
+                        saw_tool_call_delta_by_choice.add(0)
+                    if 0 in sent_role_by_choice:
+                        primary_delta.role = None
+                    else:
+                        sent_role_by_choice.add(0)
+                    choices.append(
+                        ChatCompletionStreamResponseChoice(
+                            index=0,
+                            delta=primary_delta,
+                            finish_reason=None,
+                        )
+                    )
+            else:
+                for pos, completion in enumerate(sample_outputs):
+                    raw_index = getattr(completion, "index", pos)
+                    choice_index = raw_index if isinstance(raw_index, int) else pos
+                    if pos == 0:
+                        delta_message = coerce_stream_delta_message(
+                            DeltaMessage(
+                                role="assistant",
+                                content=output.delta_text or None,
+                                tool_calls=normalize_delta_tool_calls(output.delta_tool_calls),
+                                reasoning_content=output.delta_reasoning_content,
+                            ),
+                            fallback_text=output.delta_text or "",
+                            default_role="assistant",
+                        )
+                    else:
+                        current_text = getattr(completion, "text", None) or ""
+                        prev_text = previous_texts_by_choice.get(choice_index, "")
+                        delta_text = compute_stream_delta_text(current_text, prev_text, "")
+                        previous_texts_by_choice[choice_index] = current_text
+
+                        current_reasoning = getattr(completion, "reasoning_content", None) or ""
+                        prev_reasoning = previous_reasonings_by_choice.get(choice_index, "")
+                        delta_reasoning = (
+                            compute_stream_delta_text(current_reasoning, prev_reasoning, "")
+                            if current_reasoning
+                            else ""
+                        )
+                        if current_reasoning:
+                            previous_reasonings_by_choice[choice_index] = current_reasoning
+
+                        normalized_tc = normalize_tool_calls(getattr(completion, "tool_calls", None)) or []
+                        prev_tc_count = emitted_tool_calls_by_choice.get(choice_index, 0)
+                        delta_tool_calls: list[DeltaToolCall] | None = None
+                        if len(normalized_tc) > prev_tc_count:
+                            delta_tool_calls = [
+                                DeltaToolCall(
+                                    index=tc_idx,
+                                    id=tc.id,
+                                    type="function",
+                                    function={"name": tc.function.name, "arguments": tc.function.arguments},
+                                )
+                                for tc_idx, tc in enumerate(normalized_tc[prev_tc_count:], start=prev_tc_count)
+                            ]
+                            emitted_tool_calls_by_choice[choice_index] = len(normalized_tc)
+
+                        delta_message = coerce_stream_delta_message(
+                            DeltaMessage(
+                                role="assistant",
+                                content=delta_text or None,
+                                tool_calls=delta_tool_calls,
+                                reasoning_content=delta_reasoning or None,
+                            ),
+                            fallback_text=delta_text,
+                            default_role="assistant",
+                        )
+
+                    if delta_message is None or not stream_delta_has_payload(delta_message):
+                        continue
+                    if delta_message.tool_calls:
+                        saw_tool_call_delta_by_choice.add(choice_index)
+                    if choice_index in sent_role_by_choice:
+                        delta_message.role = None
+                    else:
+                        sent_role_by_choice.add(choice_index)
+                    choices.append(
+                        ChatCompletionStreamResponseChoice(
+                            index=choice_index,
+                            delta=delta_message,
+                            finish_reason=None,
+                        )
+                    )
+
             total_generated = current_completion_tokens
             generation_time = elapsed_time
             tokens_per_second = current_tps
-            continue
 
-        if delta_message.tool_calls:
-            saw_tool_call_delta = True
+            if not choices:
+                continue
 
-        if sent_role:
-            delta_message.role = None
+            yield ChatCompletionStreamResponse(
+                id=stream_id,
+                object="chat.completion.chunk",
+                created=created_at,
+                model=model,
+                choices=choices,
+                usage=None,
+            )
+
+        if last_output is None:
+            raise RuntimeError("Streaming finished without any output")
+
+        final_sample_outputs = last_output.outputs or []
+        final_choices: list[ChatCompletionStreamResponseChoice] = []
+        if not final_sample_outputs:
+            final_tool_calls = normalize_tool_calls(last_output.tool_calls)
+            has_tool_calls = (0 in saw_tool_call_delta_by_choice) or bool(final_tool_calls)
+            finish_reason = "tool_calls" if has_tool_calls else "stop"
+            final_choices.append(
+                ChatCompletionStreamResponseChoice(
+                    index=0,
+                    delta=DeltaMessage(
+                        content=None if has_tool_calls else "",
+                        role=None if 0 in sent_role_by_choice else "assistant",
+                    ),
+                    finish_reason=finish_reason,
+                )
+            )
         else:
-            sent_role = True
+            for pos, completion in enumerate(final_sample_outputs):
+                raw_index = getattr(completion, "index", pos)
+                choice_index = raw_index if isinstance(raw_index, int) else pos
+                final_tool_calls = normalize_tool_calls(
+                    (last_output.tool_calls or completion.tool_calls) if pos == 0 else completion.tool_calls
+                )
+                has_tool_calls = (choice_index in saw_tool_call_delta_by_choice) or bool(final_tool_calls)
+                finish_reason = completion.finish_reason
+                if has_tool_calls:
+                    finish_reason = "tool_calls"
+                elif finish_reason == "finished" or finish_reason is None:
+                    finish_reason = "stop"
+                final_choices.append(
+                    ChatCompletionStreamResponseChoice(
+                        index=choice_index,
+                        delta=DeltaMessage(
+                            content=None if has_tool_calls else "",
+                            role=None if choice_index in sent_role_by_choice else "assistant",
+                        ),
+                        finish_reason=finish_reason,
+                    )
+                )
 
         yield ChatCompletionStreamResponse(
             id=stream_id,
             object="chat.completion.chunk",
             created=created_at,
             model=model,
-            choices=[
-                ChatCompletionStreamResponseChoice(
-                    index=0,
-                    delta=delta_message,
-                    finish_reason=None,
-                )
-            ],
-            usage=None,
+            choices=final_choices,
+            usage=UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=total_generated,
+                total_tokens=prompt_tokens + total_generated,
+                tokens_per_second=tokens_per_second,
+                processing_time=generation_time,
+                first_token_time=last_output.first_token_time,
+                **UsageInfo.cache_fields(last_output),
+            ),
         )
-        total_generated = current_completion_tokens
-        generation_time = elapsed_time
-        tokens_per_second = current_tps
-
-    if last_output is None:
-        raise RuntimeError("Streaming finished without any output")
-
-    primary_output = last_output.outputs[0] if last_output.outputs else None
-    final_tool_calls = normalize_tool_calls(
-        last_output.tool_calls or (primary_output.tool_calls if primary_output else None)
-    )
-    has_tool_calls = saw_tool_call_delta or bool(final_tool_calls)
-    finish_reason = primary_output.finish_reason if primary_output is not None else None
-    if has_tool_calls:
-        finish_reason = "tool_calls"
-    elif finish_reason == "finished":
-        finish_reason = "stop"
-    elif finish_reason is None:
-        finish_reason = "stop"
-
-    yield ChatCompletionStreamResponse(
-        id=stream_id,
-        object="chat.completion.chunk",
-        created=created_at,
-        model=model,
-        choices=[
-            ChatCompletionStreamResponseChoice(
-                index=0,
-                delta=DeltaMessage(
-                    content=None if has_tool_calls else "",
-                    role=None if sent_role else "assistant",
-                ),
-                finish_reason=finish_reason,
-            )
-        ],
-        usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=total_generated,
-            total_tokens=prompt_tokens + total_generated,
-            tokens_per_second=tokens_per_second,
-            processing_time=generation_time,
-            first_token_time=last_output.first_token_time,
-        ),
-    )
+    finally:
+        close_outputs = getattr(outputs, "close", None)
+        if callable(close_outputs):
+            close_outputs()
 
 
 class ResponsesStreamAccumulator:
@@ -908,12 +1041,16 @@ class ResponsesStreamAccumulator:
         self.reasoning_state = ReasoningStreamState(item=reasoning_item, output_index=self.next_output_index)
         self.next_output_index += 1
         self.output_items_stream.append(reasoning_item)
+        added_snapshot = reasoning_item.model_copy(
+            deep=True,
+            update={"summary": [ResponseSummaryText(text="")], "status": "in_progress"},
+        )
         return [
             self._frame(
                 "response.output_item.added",
                 ResponseOutputItemAddedEvent(
                     output_index=self.reasoning_state.output_index,
-                    item=reasoning_item,
+                    item=added_snapshot,
                 ),
             )
         ]
@@ -933,12 +1070,16 @@ class ResponsesStreamAccumulator:
         self.message_state = MessageStreamState(item=message_item, output_index=self.next_output_index)
         self.next_output_index += 1
         self.output_items_stream.append(message_item)
+        added_snapshot = message_item.model_copy(
+            deep=True,
+            update={"content": [], "status": "in_progress"},
+        )
         return [
             self._frame(
                 "response.output_item.added",
                 ResponseOutputItemAddedEvent(
                     output_index=self.message_state.output_index,
-                    item=message_item,
+                    item=added_snapshot,
                 ),
             ),
             self._frame(
@@ -957,6 +1098,7 @@ class ResponsesStreamAccumulator:
         *,
         call_index: int,
         call_id: str | None,
+        name: str = "",
     ) -> tuple[FunctionCallStreamState, list[StreamEventFrame]]:
         """Return (or create) the state tracker for a streaming function call.
 
@@ -969,6 +1111,8 @@ class ResponsesStreamAccumulator:
             call_index: Positional index of the call within the engine's
                 ``delta_tool_calls`` array.
             call_id: Optional stable identifier emitted by the engine.
+            name: Optional initial function name when already known on the
+                first delta or batch item.
 
         Returns:
             Tuple of (state, frames). ``frames`` contains the
@@ -993,7 +1137,7 @@ class ResponsesStreamAccumulator:
 
         function_item = ResponseFunctionCallItem(
             call_id=resolved_call_id,
-            name="",
+            name=name or "",
             arguments="",
             status="in_progress",
         )
@@ -1002,10 +1146,14 @@ class ResponsesStreamAccumulator:
         self.function_order.append(call_key)
         self.output_items_stream.append(function_item)
         self.next_output_index += 1
+        added_snapshot = function_item.model_copy(
+            deep=True,
+            update={"arguments": "", "status": "in_progress"},
+        )
         return state, [
             self._frame(
                 "response.output_item.added",
-                ResponseOutputItemAddedEvent(output_index=state.output_index, item=function_item),
+                ResponseOutputItemAddedEvent(output_index=state.output_index, item=added_snapshot),
             )
         ]
 
@@ -1068,13 +1216,15 @@ class ResponsesStreamAccumulator:
 
         for position, delta_call in enumerate(delta_tool_calls):
             call_index = delta_call.index if isinstance(delta_call.index, int) else position
+            function_payload = delta_call.function
+            initial_name = function_payload.name if (function_payload and function_payload.name) else ""
             state, added_frames = self._resolve_function_state(
                 call_index=call_index,
                 call_id=delta_call.id,
+                name=initial_name,
             )
             frames.extend(added_frames)
 
-            function_payload = delta_call.function
             if function_payload and function_payload.name:
                 state.item.name = function_payload.name
 
@@ -1178,7 +1328,7 @@ class ResponsesStreamAccumulator:
             and self.reasoning_text_accum
             and not (self.reasoning_state and self.reasoning_state.done)
         ):
-            frames.extend(self._ensure_reasoning_item(self.reasoning_text_accum))
+            frames.extend(self._ensure_reasoning_item(""))
             assert self.reasoning_state is not None
             self.reasoning_state.item.summary[0].text = self.reasoning_text_accum
             self.reasoning_state.item.status = "completed"
@@ -1198,7 +1348,7 @@ class ResponsesStreamAccumulator:
                     "response.output_item.done",
                     ResponseOutputItemDoneEvent(
                         output_index=self.reasoning_state.output_index,
-                        item=self.reasoning_state.item,
+                        item=self.reasoning_state.item.model_copy(deep=True),
                     ),
                 )
             )
@@ -1209,6 +1359,7 @@ class ResponsesStreamAccumulator:
             state, added_frames = self._resolve_function_state(
                 call_index=idx,
                 call_id=tool_call.id,
+                name=tool_call.function.name or "",
             )
             frames.extend(added_frames)
 
@@ -1249,7 +1400,10 @@ class ResponsesStreamAccumulator:
             frames.append(
                 self._frame(
                     "response.output_item.done",
-                    ResponseOutputItemDoneEvent(output_index=state.output_index, item=state.item),
+                    ResponseOutputItemDoneEvent(
+                        output_index=state.output_index,
+                        item=state.item.model_copy(deep=True),
+                    ),
                 )
             )
             state.done = True
@@ -1277,7 +1431,7 @@ class ResponsesStreamAccumulator:
                         "response.output_item.done",
                         ResponseOutputItemDoneEvent(
                             output_index=self.message_state.output_index,
-                            item=self.message_state.item,
+                            item=self.message_state.item.model_copy(deep=True),
                         ),
                     )
                 )
@@ -1293,7 +1447,7 @@ class ResponsesStreamAccumulator:
             tool_calls=tool_calls_payload,
             reasoning_text=self.reasoning_text_accum or None,
             include_reasoning_summary=self.include_reasoning_summary,
-            output_items=self.output_items_stream,
+            output_items=[item.model_copy(deep=True) for item in self.output_items_stream],
             created_at=self.created_at,
         )
         final_obj = final_obj.model_copy(update=self.final_response_overrides.as_update_dict())
@@ -1356,23 +1510,28 @@ def iter_responses_stream_frames(
         final_response_overrides=final_response_overrides,
         created_at=created_at,
     )
-    for frame in accumulator.initial_frames():
-        yield frame
-
-    prompt_tokens = 0
-    last_output = None
-    for output in outputs:
-        if usage_callback is not None:
-            usage_callback(prompt_token_count_from_output(output), int(output.num_generated_tokens or 0))
-        last_output = output
-        if not prompt_tokens:
-            prompt_tokens = prompt_token_count_from_output(output)
-        for frame in accumulator.add_output(output):
+    try:
+        for frame in accumulator.initial_frames():
             yield frame
 
-    if last_output is None:
-        raise RuntimeError("Streaming finished without any output")
+        prompt_tokens = 0
+        last_output = None
+        for output in outputs:
+            if usage_callback is not None:
+                usage_callback(prompt_token_count_from_output(output), int(output.num_generated_tokens or 0))
+            last_output = output
+            if not prompt_tokens:
+                prompt_tokens = prompt_token_count_from_output(output)
+            for frame in accumulator.add_output(output):
+                yield frame
 
-    final_frames, _final_obj = accumulator.finalize(last_output=last_output, prompt_tokens=prompt_tokens)
-    for frame in final_frames:
-        yield frame
+        if last_output is None:
+            raise RuntimeError("Streaming finished without any output")
+
+        final_frames, _final_obj = accumulator.finalize(last_output=last_output, prompt_tokens=prompt_tokens)
+        for frame in final_frames:
+            yield frame
+    finally:
+        close_outputs = getattr(outputs, "close", None)
+        if callable(close_outputs):
+            close_outputs()

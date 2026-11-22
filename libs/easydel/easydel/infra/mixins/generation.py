@@ -336,8 +336,9 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
 
     Returns:
         bool: ``True`` for ``"full"``, ``"sliding"``, ``"attention"``,
-        ``"hybrid"``, ``"parallel_hybrid"``, and ``"qwen_sparse_attention"``
-        family labels.
+        ``"hybrid"``, ``"parallel_hybrid"``, ``"qwen_sparse_attention"``,
+        ``"indexed_attention"`` and ``"deepseek_sparse_attention"`` family
+        labels.
     """
     layer_type_norm = str(layer_type).lower()
     return (
@@ -348,6 +349,7 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
         or layer_type_norm == "parallel_hybrid"
         or layer_type_norm == "qwen_sparse_attention"
         or layer_type_norm == "indexed_attention"  # transformers>=5.18 name for indexer (DSA/QSA) layers
+        or layer_type_norm == "deepseek_sparse_attention"  # GLM-5-Next MLA+DSA layers; its KDA layers own no pages
     )
 
 
@@ -955,7 +957,7 @@ def _create_mixed_turboquant_ragged_page_cache_configs(
     budget = compute_paged_cache_budget(
         {idx: _page_bytes(*geometry) for idx, geometry in geometries.items()},
         available_bytes=(
-            per_device_hbm_budget_bytes(hbm_utilization, mode="free") * kv_head_size * data_parallel_size
+            per_device_hbm_budget_bytes(hbm_utilization, mode="free", mesh=mesh) * kv_head_size * data_parallel_size
             if num_pages_override is None
             else None
         ),
@@ -1684,7 +1686,7 @@ class EasyGenerationMixin:
             recurrent_state_shape=(int(conv_dim), int(d_state)),
         )
 
-    def create_kda_cache_config(self, batch_size: int):
+    def create_kda_cache_config(self, batch_size: int, *, serving: bool = False):
         """Create KDACacheConfig from model configuration.
 
         Creates cache configuration for models using Key-Dependent Attention (KDA)
@@ -1692,6 +1694,9 @@ class EasyGenerationMixin:
 
         Args:
             batch_size (int): Batch size for inference.
+            serving (bool): Whether the cache serves eSurge. Only serving caches split their heads over the head
+                and expert-parallel axes (``kda_serving_ep_split``, see
+                :func:`easydel.layers.linear_attention._kda.kda_serving_head_axes`); ``init_cache`` caches never do.
 
         Returns:
             KDACacheConfig: Cache configuration for KDA-style attention layers.
@@ -1701,6 +1706,7 @@ class EasyGenerationMixin:
         """
         from easydel.caching import KDACacheConfig
         from easydel.layers.linear_attention import kda_layer_spec  # lazy: layers import this mixin's package
+        from easydel.layers.linear_attention._kda import kda_serving_head_axes
 
         text_config = self.config.get_text_config()
 
@@ -1718,6 +1724,8 @@ class EasyGenerationMixin:
             value_dim=spec.value_dim,
             d_conv=spec.d_conv,
             recurrent_state_shape=(spec.num_heads, spec.head_k_dim, spec.head_v_dim),
+            # Serving caches: heads over (head axis, ep axis) where the mesh allows it; None keeps the head axis.
+            head_shard_axes=kda_serving_head_axes(text_config, serving=serving),
         )
 
     def _create_standard_ragged_page_cache_config(
@@ -1815,6 +1823,18 @@ class EasyGenerationMixin:
             version=version,
             max_cache_tokens=max_cache_tokens,
         )
+
+    def num_draft_cache_layers(self) -> int:
+        """Draft layers (a nextn/MTP head) that write into the target's paged attention pool.
+
+        The paged pool budgets their pages and :meth:`init_operations_cache` allocates their views after the decoder
+        layers, so a compiled model step returns the cache with the structure it was built from. Models with such a
+        head override this; the default is none.
+
+        Returns:
+            The number of draft layers needing a paged view.
+        """
+        return 0
 
     def _create_mla_ragged_page_cache_config(
         self,
@@ -1945,6 +1965,7 @@ class EasyGenerationMixin:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_cache_tokens=max_cache_tokens,
+            num_draft_layers=int(self.num_draft_cache_layers()),
             **indexer_kwargs,
         )
 
@@ -2489,7 +2510,11 @@ class EasyGenerationMixin:
                     config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = config
                 elif view_class is KDACacheView:
-                    config = self.create_kda_cache_config(batch_size=batch_size)
+                    # eSurge passes its paged-cache config; ``init_cache`` passes none, so its KDA heads never split.
+                    config = self.create_kda_cache_config(
+                        batch_size=batch_size,
+                        serving=ragged_config is not None or unified_config is not None,
+                    )
                     views_config[idx] = config
                 elif view_class is MLARaggedPagesCacheView:
                     if shared_mla_ragged_config is None:
@@ -2785,7 +2810,7 @@ class EasyGenerationMixin:
                         view = view_class.init(
                             config=config_classes,
                             layer_index=idx,
-                            dtype=dtype,
+                            dtype=recurrent_cache_dtype,
                         )
                     elif isinstance(view_class, type) and issubclass(
                         view_class, (RaggedPagesCacheView, MLARaggedPagesCacheView)
@@ -2835,6 +2860,31 @@ class EasyGenerationMixin:
             # KV sharing: shared layers do NOT get their own cache views. They
             # are left as None and the model loop passes the donor's cache view
             # at runtime. This avoids duplicate JAX buffer donation errors.
+
+            # Draft layers writing into the paged MLA pool get their views after the decoder layers, from the pool's
+            # config (which budgets them), so no forward has to add a view inside a compiled step.
+            num_draft = int(self.num_draft_cache_layers())
+            base_mla = next((v for v in reversed(views) if isinstance(v, MLARaggedPagesCacheView)), None)
+            if num_draft > 0 and base_mla is not None:
+                last = num_hidden_layers - 1
+                if pipeline_plan is not None and pipeline_plan.is_enabled:
+                    stage = int(pipeline_plan.layer_to_stage[last])
+                    draft_mesh = pipeline_plan.stage_meshes[stage]
+                    draft_context = spx.assign_stage(total=int(pipeline_plan.mpmd_dim), current=stage)
+                else:
+                    draft_mesh = text_config.mesh
+                    draft_context = self._layer_stage_context(last, total_layers=num_hidden_layers)
+                with draft_context:
+                    for i in range(num_draft):
+                        views.append(
+                            MLARaggedPagesCacheView.init(
+                                config=base_mla.metadata,
+                                layer_index=num_hidden_layers + i,
+                                mesh=draft_mesh,
+                                runtime_sharding_resolver=text_config.runtime_sharding_resolver,
+                                quantizer=quantizer,
+                            )
+                        )
 
             return HybridCache(views=views)
 
@@ -5472,6 +5522,8 @@ class EasyGenerationMixin:
                     async_scheduling=extra_dict["async_scheduling"],
                     overlap_execution=extra_dict["overlap_execution"],
                     runner_verbose=extra_dict["runner_verbose"],
+                    # This engine shares the process with training and user code: leave their garbage collection alone.
+                    freeze_startup_heap=False,
                 ),
                 cache=eSurgeCacheRuntimeConfig.from_dict(
                     hbm_utilization=extra_dict["hbm_utilization"],

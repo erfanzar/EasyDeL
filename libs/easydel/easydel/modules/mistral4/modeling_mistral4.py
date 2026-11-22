@@ -509,9 +509,8 @@ class Mistral4MoE(BaseMoeModule):
             # The standard path uses layer_idx to emit tensor-valued debug callbacks.
             # Keep ordinary forwards silent; layer identity is supplied only on explicit opt-in.
             layer_idx=self.layer_idx if self.config.moe_debug else None,
+            shared_expert=self.shared_experts if self.config.n_shared_experts is not None else None,
         )
-        if self.config.n_shared_experts is not None:
-            out = out + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 

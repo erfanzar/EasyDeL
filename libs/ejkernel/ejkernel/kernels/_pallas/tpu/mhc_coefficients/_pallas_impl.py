@@ -54,16 +54,24 @@ def _gates(z, n_iters, eps):
 
 
 def _forward(logits, base, scale, n_iters, eps):
-    """Pack tokens into lanes, compute all coefficients, and remove tail lanes."""
+    """Pack tokens into lanes, compute all coefficients, and remove tail lanes.
+
+    Fewer than ``_BLOCK`` tokens run as one block of exactly ``tokens`` lanes, with no lane padding and no output
+    slices. Every token's coefficients come from its own lane only, so this equals the padded block bit for bit.
+    """
     tokens = logits.shape[0]
-    padded = ((tokens + _BLOCK - 1) // _BLOCK) * _BLOCK
-    packed = jnp.pad(logits.T, ((0, 0), (0, padded - tokens)))
+    if tokens < _BLOCK:
+        block, padded, packed = tokens, tokens, logits.T
+    else:
+        block = _BLOCK
+        padded = ((tokens + _BLOCK - 1) // _BLOCK) * _BLOCK
+        packed = jnp.pad(logits.T, ((0, 0), (0, padded - tokens)))
 
     def kernel(lr, br, sr, pr, qr, cr):
         l, b, s = lr[...], br[...], sr[...]
         pre_logits = l[:4, :] * s[0, 0] + b[:4, :]
         post_logits = l[4:8, :] * s[1, 0] + b[4:8, :]
-        mix_logits = (l[8:, :] * s[2, 0] + b[8:, :]).reshape(4, 4, _BLOCK)
+        mix_logits = (l[8:, :] * s[2, 0] + b[8:, :]).reshape(4, 4, block)
         pr[...] = jax.nn.sigmoid(pre_logits) + eps
         qr[...] = 2 * jax.nn.sigmoid(post_logits)
         matrix = jnp.exp(mix_logits - jnp.max(mix_logits, axis=1, keepdims=True))
@@ -83,20 +91,22 @@ def _forward(logits, base, scale, n_iters, eps):
             _out_shape((4, padded), packed, base, scale),
             _out_shape((4, 4, padded), packed, base, scale),
         ),
-        grid=(padded // _BLOCK,),
+        grid=(padded // block,),
         in_specs=(
-            pl.BlockSpec((24, _BLOCK), lambda t: (0, t)),
+            pl.BlockSpec((24, block), lambda t: (0, t)),
             pl.BlockSpec((24, 1), lambda t: (0, 0)),
             pl.BlockSpec((3, 1), lambda t: (0, 0)),
         ),
         out_specs=(
-            pl.BlockSpec((4, _BLOCK), lambda t: (0, t)),
-            pl.BlockSpec((4, _BLOCK), lambda t: (0, t)),
-            pl.BlockSpec((4, 4, _BLOCK), lambda t: (0, 0, t)),
+            pl.BlockSpec((4, block), lambda t: (0, t)),
+            pl.BlockSpec((4, block), lambda t: (0, t)),
+            pl.BlockSpec((4, 4, block), lambda t: (0, 0, t)),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         name="mhc_coefficients_packed",
     )(packed, base[:, None], scale[:, None])
+    if tokens < _BLOCK:
+        return pre.T, post.T, comb.transpose(2, 0, 1)
     return pre.T[:tokens], post.T[:tokens], comb.transpose(2, 0, 1)[:tokens]
 
 

@@ -58,6 +58,15 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _selector_matching_graphstate(reference_graphstate: tp.Any) -> tp.Any:
+    """Return a SpectraX selector predicate matching ``reference_graphstate``'s exact leaves."""
+    paths_fn = getattr(reference_graphstate, "paths", None)
+    if not callable(paths_fn):
+        return None
+    selected = frozenset(paths_fn())
+    return lambda variable, path: (getattr(variable, "kind", None), path) in selected
+
+
 @Registry.register("trainer", ["speculative_decoding", "spec_decoding", "spec"])
 class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
     """Train a speculative-decoding drafter against a frozen verifier model.
@@ -150,23 +159,28 @@ class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
             target_model_revision=arguments.target_model_revision,
         )
 
-        # When the caller does not pass an explicit trainable_selector, defer to
-        # the drafter model's own property so that e.g. DSpark's
-        # freeze_embeddings_and_lm_head is honoured automatically. Reassign the
-        # local `arguments` (not self.arguments) so the SAME instance reaches
-        # super().__init__ — otherwise the base trainer re-binds the original
-        # and every arguments-derived re-split disagrees with the drafter state.
-        if arguments.trainable_selector is None and hasattr(drafter_model, "trainable_selector"):
-            arguments = dataclasses.replace(arguments, trainable_selector=drafter_model.trainable_selector)
+        # When the caller leaves `trainable_selector` at its default (`None` or
+        # `"parameters"`), defer to the drafter module's own selector so that e.g.
+        # DSpark's `freeze_embeddings_and_lm_head` is honoured automatically for
+        # both raw modules and pre-split `EasyDeLState` inputs. Reassign both
+        # `arguments` and `self.arguments` so the SAME instance reaches
+        # `super().__init__` and every arguments-derived re-split agrees.
+        drafter_module = drafter_model.model if isinstance(drafter_model, EasyDeLState) else drafter_model
+        expected_selector = self._expected_drafter_selector(arguments, drafter_module)
+        if expected_selector is not arguments.trainable_selector:
+            arguments = dataclasses.replace(arguments, trainable_selector=expected_selector)
+            self.arguments = arguments
 
         if isinstance(drafter_model, EasyDeLState):
             self._validate_pre_split_drafter_state(
                 drafter_state=drafter_model,
-                trainable_selector=self._expected_drafter_selector(arguments, drafter_model.model),
+                trainable_selector=expected_selector,
             )
         else:
             drafter_model = drafter_model.to_state(trainable_selector=arguments.trainable_selector)
-        if not isinstance(target_model, EasyDeLState):
+        if isinstance(target_model, EasyDeLState):
+            target_model = disable_state_dropout(target_model)
+        else:
             target_model.eval()
             target_model = target_model.to_state()
         if arguments.disable_dropout:
@@ -432,22 +446,25 @@ class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
             )
         self._runtime_trace("train.compile_wrapper.end")
 
+        eval_target_state = getattr(self, "_eval_target_state", None) or self.target_state
+        eval_in_shardings = (self.eval_state_shardings, empty_sharding, eval_target_state.shardings)
+        eval_batch_spec = replicated_batch_slot_spec(self.arguments, self.model.mesh, eval_in_shardings)
         self._runtime_trace("eval.compile_wrapper.begin")
         if self.arguments.mpmd_scheduler is None:
             sharded_evaluation_step_function = spx.jit(
                 speculative_decoding_step,
-                in_shardings=release_batch_slot(in_shardings, batch_spec),
+                in_shardings=release_batch_slot(eval_in_shardings, eval_batch_spec),
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 **_step_jit_options,
             )
             sharded_evaluation_step_function = wrap_batch_placed(
-                sharded_evaluation_step_function, batch_spec, self.model.mesh
+                sharded_evaluation_step_function, eval_batch_spec, self.model.mesh
             )
         else:
             sharded_evaluation_step_function = compile_trainer_step(
                 speculative_decoding_step,
-                in_shardings=in_shardings,
+                in_shardings=eval_in_shardings,
                 out_shardings=empty_sharding,
                 static_argnums=static_argnums,
                 mesh=self.model.mesh,
@@ -589,12 +606,33 @@ class SpeculativeDecodingTrainer(AssistantOnlyMaskMixin, Trainer):
         """
         return (self.target_state,)
 
+    def _configure_eval_config_override(self):
+        """Extend the base override with a matching target-side eval graphdef."""
+        super()._configure_eval_config_override()
+        self._eval_target_state = None
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is None or not overrides or self.target_state is None:
+            return
+        target_graphdef = self._build_config_override_graphdef(
+            model=self.target_state.model,
+            overrides=overrides,
+            reference_graphstate=self.target_state.graphstate,
+            trainable_selector=_selector_matching_graphstate(self.target_state.graphstate),
+            label="eval_config_overrides (target)",
+            eval_mode=True,
+        )
+        self._eval_target_state = self.target_state.replace(graphdef=target_graphdef)
+
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[EasyDeLState]:
         """Return the frozen target state passed beside every eval batch.
 
         Returns:
-            tuple[EasyDeLState]: A one-element tuple containing
+            tuple[EasyDeLState]: A one-element tuple containing the eval-overridden
+            target state when ``eval_config_overrides`` is active, else
             :attr:`target_state`.
         """
+        eval_target_state = getattr(self, "_eval_target_state", None)
+        if eval_target_state is not None:
+            return (eval_target_state,)
         return (self.target_state,)

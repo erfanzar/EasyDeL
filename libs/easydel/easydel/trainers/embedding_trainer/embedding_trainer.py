@@ -43,7 +43,7 @@ from easydel.utils.helpers import get_logger
 from ..prompt_transforms import EmbeddingPreprocessTransform
 from ..trainer import Trainer
 from ..trainer.trainer import TrainerConfigureFunctionOutput
-from ..training_utils import compile_trainer_step
+from ..training_utils import compile_trainer_step, resolve_straight_through_emulator
 from ..utils import EmbeddingDataCollatorGrain, EmbeddingDataCollatorTFDS
 from ._fn import embedding_evaluation_step, embedding_training_step
 from .embedding_config import EmbeddingConfig
@@ -131,10 +131,20 @@ class EmbeddingTrainer(Trainer):
         if not isinstance(arguments, EmbeddingConfig):
             raise TypeError(f"arguments must be EmbeddingConfig, got {type(arguments)}")
 
-        self._embedding_config = arguments
-        self._apply_pooling_strategy(model, arguments.pooling_strategy)
+        tokenizer = getattr(processing_class, "tokenizer", processing_class) if processing_class is not None else None
+        if tokenizer is not None:
+            if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        pad_token_id = getattr(processing_class, "pad_token_id", None) if processing_class else None
+        pad_token_id = getattr(tokenizer, "pad_token_id", None) if tokenizer is not None else None
+        if pad_token_id is None and processing_class is not None:
+            pad_token_id = getattr(processing_class, "pad_token_id", None)
+
+        self._embedding_config = arguments
+        self._apply_pooling_strategy(model, arguments.pooling_strategy, pad_token_id=pad_token_id)
+
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
 
         if isinstance(model, EasyDeLState):
@@ -157,7 +167,11 @@ class EmbeddingTrainer(Trainer):
             )
 
     @staticmethod
-    def _apply_pooling_strategy(model: EasyDeLBaseModule | EasyDeLState | None, pooling_strategy: str | None) -> None:
+    def _apply_pooling_strategy(
+        model: EasyDeLBaseModule | EasyDeLState | None,
+        pooling_strategy: str | None,
+        pad_token_id: int | None = None,
+    ) -> None:
         """Apply a requested embedding pooling strategy to a mutable module."""
         if pooling_strategy is None:
             return
@@ -173,12 +187,16 @@ class EmbeddingTrainer(Trainer):
             raise ValueError(
                 "`pooling_strategy` was set, but the provided embedding model does not expose a pooling feature."
             )
-        pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", None)
-        if pad_token_id is None:
-            pad_token_id = -1
+        resolved_pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", None)
+        if resolved_pad_token_id is None:
+            resolved_pad_token_id = getattr(pooling_feature, "pad_token_id", None)
+        if resolved_pad_token_id is None:
+            resolved_pad_token_id = pad_token_id
+        if resolved_pad_token_id is None and pooling_strategy == "last":
+            resolved_pad_token_id = -1
         model._pooling_feature = pooling_feature.__class__(
             strategy=pooling_strategy,
-            pad_token_id=pad_token_id,
+            pad_token_id=resolved_pad_token_id,
         )
 
     def _get_preprocess_transform(self) -> EmbeddingPreprocessTransform | None:
@@ -197,13 +215,42 @@ class EmbeddingTrainer(Trainer):
         if self._is_pretokenized():
             return None
 
+        tokenizer = (
+            getattr(self.processing_class, "tokenizer", self.processing_class)
+            if self.processing_class is not None
+            else None
+        )
         return EmbeddingPreprocessTransform(
-            tokenizer=self.processing_class,
+            tokenizer=tokenizer,
             max_length=self.arguments.max_length or 512,
             query_field=self.arguments.query_field,
             positive_field=self.arguments.positive_field,
             negative_field=self.arguments.negative_field,
         )
+
+    def _has_negatives(self) -> bool:
+        """Return whether hard-negative columns are configured or present in pretokenized sources."""
+        if getattr(self.arguments, "negative_field", None) is not None:
+            return True
+        for source in (getattr(self, "_train_source", None), getattr(self, "_eval_source", None)):
+            if source is None:
+                continue
+            try:
+                shard_names = getattr(source, "shard_names", None)
+                if not shard_names:
+                    continue
+                sample = next(iter(source.open_shard(shard_names[0])))
+                if isinstance(sample, tp.Mapping) and "negative_input_ids" in sample:
+                    return True
+            except Exception:
+                continue
+        for dataset in (getattr(self, "dataset_train", None), getattr(self, "dataset_eval", None)):
+            if dataset is None:
+                continue
+            column_names = getattr(dataset, "column_names", None)
+            if column_names and "negative_input_ids" in column_names:
+                return True
+        return False
 
     def _is_pretokenized(self) -> bool:
         """Detect whether the training source already exposes tokenised fields.
@@ -243,6 +290,14 @@ class EmbeddingTrainer(Trainer):
             the streaming checkpoint manager.
         """
         empty_sharding = replicated_named_sharding(self.model.mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=getattr(self.arguments, "quantization_mode", None),
+            quantization_group_size=getattr(self.arguments, "quantization_group_size", None),
+            quantization_bits=getattr(self.arguments, "quantization_bits", None),
+            tensor_straight_through=getattr(self.arguments, "tensor_straight_through", None),
+            straight_through_emulator=getattr(self.arguments, "straight_through_emulator", None),
+        )
+        self._straight_through_emulator = straight_through_emulator
 
         _step_fn = partial(
             embedding_training_step,
@@ -254,6 +309,8 @@ class EmbeddingTrainer(Trainer):
             learning_rate_fn=self.scheduler,
             partition_spec=self.arguments.step_partition_spec,
             gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+            loss_config=getattr(self.arguments, "loss_config", None),
+            straight_through_emulator=straight_through_emulator,
         )
 
         self._train_shared_fn_extra_args = ()
@@ -325,7 +382,7 @@ class EmbeddingTrainer(Trainer):
         return EmbeddingDataCollatorTFDS(
             pad_token_id=self.padding_value,
             max_length=self.arguments.max_length or 512,
-            has_negatives=self.arguments.negative_field is not None,
+            has_negatives=self._has_negatives(),
         )
 
     def create_grain_collect_function(
@@ -350,5 +407,5 @@ class EmbeddingTrainer(Trainer):
         return EmbeddingDataCollatorGrain(
             pad_token_id=self.padding_value,
             max_length=self.arguments.max_length or 512,
-            has_negatives=self.arguments.negative_field is not None,
+            has_negatives=self._has_negatives(),
         )

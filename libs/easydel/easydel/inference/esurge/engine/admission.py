@@ -40,7 +40,7 @@ from easydel.inference.tools.tool_calling_mixin import build_tool_parser_or_none
 
 from ..logger import logger
 from ..metrics import get_metrics_collector
-from ..request import EngineRequest
+from ..request import AdmissionRecord
 from ..utils import truncate_tokens
 from .chat_templating import normalize_stop_sequences
 from .registry import RequestRecord, RequestRegistry
@@ -80,6 +80,55 @@ def compute_admission_key(
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
+def _derive_child_seed(base_seed: int, sample_idx: int) -> int:
+    """Derive a distinct, deterministic int64 child seed for ``n > 1`` parallel sampling."""
+    if sample_idx == 0:
+        return int(base_seed)
+    digest = hashlib.blake2b(f"{int(base_seed)}:{int(sample_idx)}".encode(), digest_size=8).digest()
+    derived = int.from_bytes(digest, "little") & ((1 << 63) - 1)
+    if derived == int(base_seed):
+        derived = (derived + 1) & ((1 << 63) - 1)
+    return derived
+
+
+class _ToolAdjustProxy:
+    """Adapter exposing ``tools``/``tool_choice`` from a chat request while routing mutations to ``SamplingParams``."""
+
+    def __init__(self, sampling_params: SamplingParams, tool_request: Any | None) -> None:
+        object.__setattr__(self, "_sampling_params", sampling_params)
+        object.__setattr__(self, "_tool_request", tool_request)
+
+    @property
+    def tools(self) -> Any:
+        return getattr(self._tool_request, "tools", None)
+
+    @property
+    def tool_choice(self) -> Any:
+        return getattr(self._tool_request, "tool_choice", None)
+
+    def __getattr__(self, name: str) -> Any:
+        sampling_params = object.__getattribute__(self, "_sampling_params")
+        if hasattr(sampling_params, name):
+            return getattr(sampling_params, name)
+        tool_request = object.__getattribute__(self, "_tool_request")
+        if tool_request is not None and hasattr(tool_request, name):
+            return getattr(tool_request, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_sampling_params"), name, value)
+
+
+def _apply_tool_parser_adjust_request(tool_parser: Any | None, sampling_params: SamplingParams, tool_request: Any | None) -> None:
+    """Invoke ``tool_parser.adjust_request(...)`` so special tool delimiters are preserved on ``sampling_params``."""
+    if tool_parser is None or not hasattr(tool_parser, "adjust_request"):
+        return
+    try:
+        tool_parser.adjust_request(_ToolAdjustProxy(sampling_params, tool_request))
+    except Exception:
+        logger.debug("Failed to apply tool parser adjust_request hook", exc_info=True)
+
+
 def clone_sampling_params(sampling_params: SamplingParams) -> SamplingParams:
     """Create a deep copy of sampling parameters.
 
@@ -116,6 +165,61 @@ def _set_requested_new(sp, n: int):
         sp.max_new_tokens = int(n)
 
 
+def check_image_spans_fit(spans: Sequence[tuple[int, int]], max_tokens: int, request_id: str) -> None:
+    """Reject requests that hold an image span longer than the per-step token budget.
+
+    Args:
+        spans: Half-open ``(start, stop)`` position ranges of the image spans.
+        max_tokens: Per-step token budget (``max_num_batched_tokens``).
+        request_id: Request id used in the error message.
+
+    Raises:
+        ValueError: If a span cannot be scheduled in one step.
+    """
+    for start, stop in spans:
+        if stop - start > int(max_tokens):
+            raise ValueError(
+                f"Request {request_id} holds an image span of {stop - start} tokens (positions {start}..{stop}) "
+                f"which exceeds max_num_batched_tokens={int(max_tokens)}; an image span must be prefilled in one "
+                "step. Raise max_num_batched_tokens or send a smaller image."
+            )
+
+
+def expand_request_images(
+    request: AdmissionRecord,
+    image_expander: Any | None,
+    *,
+    max_num_scheduled_tokens: int,
+    max_model_len: int,
+) -> None:
+    """Expand a request's image placeholders into image spans and attach the preprocessed patches.
+
+    Runs once, on the host that owns scheduling, before the request enters the engine core.
+
+    Args:
+        request: Admission record carrying ``images``; updated in place via ``set_expanded_prompt``.
+        image_expander: Model-provided expander (``esurge_image_expander_builder``) or ``None``.
+        max_num_scheduled_tokens: Per-step token budget an image span must fit in.
+        max_model_len: Maximum context length the expanded prompt must stay below.
+
+    Raises:
+        ValueError: If the served model declares no image support, an image span exceeds the per-step budget, or the
+            expanded prompt does not fit ``max_model_len``.
+    """
+    if image_expander is None:
+        raise ValueError(
+            f"Request {request.request_id} carries images but the served model does not declare image support."
+        )
+    expanded = image_expander.expand(request.prompt_token_ids, request.images)
+    check_image_spans_fit(expanded.spans, max_num_scheduled_tokens, request.request_id)
+    if len(expanded.token_ids) >= max_model_len:
+        raise ValueError(
+            f"Request {request.request_id}: image-expanded prompt has {len(expanded.token_ids)} tokens, "
+            f"which does not fit max_model_len={max_model_len}."
+        )
+    request.set_expanded_prompt(expanded.token_ids, expanded.token_types, expanded.spans, expanded.features)
+
+
 class RequestAdmission:
     """Admission component turning prompts into scheduler-ready requests.
 
@@ -128,7 +232,7 @@ class RequestAdmission:
         registry: Shared :class:`RequestRegistry` holding request records,
             outputs, events, and their locks.
         scheduler_submit: Engine callable that acquires the scheduler lock
-            and enqueues a batch of :class:`EngineRequest` objects.
+            and enqueues a batch of :class:`AdmissionRecord` objects.
         tokenizer_client: Worker-pipeline tokenizer client
             (``tokenize(request_id, prompt) -> list[int]``).
         tokenizer: In-process tokenizer used for segment tokenization,
@@ -160,7 +264,7 @@ class RequestAdmission:
         self,
         *,
         registry: RequestRegistry,
-        scheduler_submit: typing.Callable[[list[EngineRequest]], None],
+        scheduler_submit: typing.Callable[[list[AdmissionRecord]], None],
         tokenizer_client,
         tokenizer,
         context_config,
@@ -177,6 +281,7 @@ class RequestAdmission:
         on_activity: typing.Callable[[], None],
         info: typing.Callable[..., None],
         callback_engine: Any = None,
+        model_name: str | None = None,
     ) -> None:
         self._registry = registry
         self._scheduler_submit = scheduler_submit
@@ -196,6 +301,7 @@ class RequestAdmission:
         self._on_activity = on_activity
         self._info = info
         self._callback_engine = callback_engine
+        self._model_name = model_name
 
         # Registry aliases keep the moved method bodies verbatim.
         self._request_lock = registry.request_lock
@@ -206,6 +312,14 @@ class RequestAdmission:
 
         self._request_counter = 0
         self._counter_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Break engine callback references so closed engines do not retain reference cycles."""
+        self._callback_engine = None
+        self._scheduler_submit = None
+        self._sampling_params_callback = None
+        self._on_activity = None
+        self._info = None
 
     def generate_request_id(self) -> str:
         """Allocate a fresh request id under the counter lock.
@@ -446,6 +560,47 @@ class RequestAdmission:
         except Exception:
             logger.debug("Failed to configure reasoning parser prompt context", exc_info=True)
 
+    def rollback_request(self, request_id: str, child_request_ids: Sequence[str] = ()) -> None:
+        """Roll back registry and metrics entries for a request whose admission failed."""
+        self._registry.rollback(request_id, child_request_ids)
+        metrics_collector = get_metrics_collector()
+        if metrics_collector is not None:
+            if hasattr(metrics_collector, "cancel_request"):
+                metrics_collector.cancel_request(request_id)
+            elif hasattr(metrics_collector, "request_metrics"):
+                lock = getattr(metrics_collector, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        metrics_collector.request_metrics.pop(request_id, None)
+                else:
+                    metrics_collector.request_metrics.pop(request_id, None)
+
+    def _build_parsers_for_sample(
+        self,
+        *,
+        sample_request_id: str,
+        sampling_params: SamplingParams,
+        prompt_text: str,
+        prompt_token_ids: Sequence[int],
+        tool_parser_request: Any | None,
+    ) -> DelegatingParser:
+        """Instantiate per-sample reasoning/tool parsers and run each ``adjust_request`` hook once."""
+        _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
+        if _rp is not None:
+            _rp.adjust_request(sampling_params)
+        self._configure_reasoning_parser_for_prompt(
+            reasoning_parser=_rp,
+            prompt_text=prompt_text,
+            prompt_token_ids=prompt_token_ids,
+        )
+        _tp = build_tool_parser_or_none(self._tool_parser_class, self.tokenizer, context=f"request {sample_request_id}")
+        _apply_tool_parser_adjust_request(_tp, sampling_params, tool_parser_request)
+        return DelegatingParser(
+            reasoning_parser=_rp,
+            tool_parser=_tp,
+            tool_request=tool_parser_request,
+        )
+
     def add_request(
         self,
         request_id: str,
@@ -460,7 +615,9 @@ class RequestAdmission:
         pixel_values_videos: Any | None = None,
         video_grid_thw: Any | None = None,
         mm_features: list | None = None,
-    ) -> list[EngineRequest] | None:
+        *,
+        track_tool_call_delta_history: bool = True,
+    ) -> list[AdmissionRecord] | None:
         """Add a new request to the scheduler queue with intelligent context management.
 
         Tokenizes the prompt, applies context length management policies,
@@ -479,7 +636,7 @@ class RequestAdmission:
                 handed to the request's tool parser so it can disambiguate
                 forced-function calls.
             defer_scheduler_enqueue: When ``True``, return the constructed
-                :class:`EngineRequest` objects to the caller instead of
+                :class:`AdmissionRecord` objects to the caller instead of
                 enqueueing them on the scheduler. Used by :meth:`eSurge.generate`
                 to batch-add all sample children under a single
                 scheduler-lock window.
@@ -494,7 +651,7 @@ class RequestAdmission:
                 across ``n>1`` samples.
 
         Returns:
-            List of :class:`EngineRequest` to enqueue when
+            List of :class:`AdmissionRecord` to enqueue when
             ``defer_scheduler_enqueue=True``; otherwise ``None`` (the
             requests are enqueued internally before returning).
 
@@ -655,6 +812,25 @@ class RequestAdmission:
             requested_new = allowed_new_final
             _set_requested_new(sampling_params, requested_new)
 
+        if requested_new < 1:
+            # A request that fills its context budget still samples one token and finishes on length. A prompt that
+            # fills the whole model length has no position for that token, so it loses one more prompt token.
+            if prompt_len + self.reserve_tokens >= max_model_len:
+                if not self.context_config.auto_truncate_prompt or max_model_len - self.reserve_tokens < 2:
+                    raise ValueError(
+                        f"Prompt leaves no room for a new token: prompt_len={prompt_len}, "
+                        f"max_model_len={max_model_len}, reserve={self.reserve_tokens}."
+                    )
+                new_tokens, dropped = truncate_tokens(
+                    token_ids, max_model_len - self.reserve_tokens - 1, self.context_config.truncate_mode
+                )
+                token_ids = new_tokens
+                prompt_len = len(token_ids)
+                truncated = truncated or dropped > 0
+                tokens_dropped += dropped
+            requested_new = 1
+            _set_requested_new(sampling_params, requested_new)
+
         prompt_for_engine = prompt
         if truncated and self.context_config.decode_truncated_prompt:
             try:
@@ -664,41 +840,6 @@ class RequestAdmission:
                 logger.warn("Failed to decode truncated prompt; keeping original prompt text.")
 
         start_ts = time.perf_counter()
-        ev = threading.Event()
-
-        with self._request_lock:
-            self._request_events[request_id] = ev
-            self._active_requests[request_id] = RequestRecord(
-                prompt=prompt_for_engine,
-                prompt_token_ids=token_ids,
-                sampling_params=sampling_params,
-                start_time=start_ts,
-                last_decode_time=start_ts,
-                truncated=truncated,
-                tokens_dropped=tokens_dropped,
-                requested_new_tokens_original=original_requested_new,
-                requested_new_tokens_final=requested_new,
-                reserve_tokens=self.reserve_tokens,
-                max_model_len=max_model_len,
-            )
-            _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
-            if _rp is not None:
-                _rp.adjust_request(sampling_params)
-            self._configure_reasoning_parser_for_prompt(
-                reasoning_parser=_rp,
-                prompt_text=prompt_for_engine,
-                prompt_token_ids=token_ids,
-            )
-            _tp = build_tool_parser_or_none(self._tool_parser_class, self.tokenizer, context=f"request {request_id}")
-            self._active_requests[request_id].delegating_parser = DelegatingParser(
-                reasoning_parser=_rp,
-                tool_parser=_tp,
-                tool_request=tool_parser_request,
-            )
-
-        metrics_collector = get_metrics_collector()
-        if metrics_collector:
-            metrics_collector.start_request(request_id, len(token_ids))
 
         # Execution ids are authoritative: decoding and re-tokenizing can lose
         # processor-expanded placeholders or undo context truncation.
@@ -708,8 +849,30 @@ class RequestAdmission:
             if [token for segment in segments for token in segment] == token_ids:
                 prompt_token_segments = segments
 
-        # Handle n > 1 sampling: create multiple EngineRequest objects
+        # Handle n > 1 sampling: create one AdmissionRecord per sample
         n_samples = getattr(sampling_params, "n", 1) or 1
+
+        eos_token_ids = [int(tid) for tid in (self._eos_ids or []) if tid is not None]
+
+        if not eos_token_ids:
+            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+            fallback_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
+            eos_token_ids = [int(tid) for tid in fallback_ids if tid is not None]
+
+        # Use the first EOS token as the primary one for backwards compatibility
+        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else self._primary_eos_token_id
+
+        # Every EOS id stops the request unless it asked to ignore EOS; stop ids the caller passed always stop.
+        if eos_token_ids and not sampling_params.ignore_eos:
+            current_stop_ids = set(sampling_params.stop_token_ids or [])
+            all_stop_ids = getattr(sampling_params, "_all_stop_token_ids", None)
+            if all_stop_ids is None:
+                all_stop_ids = set(current_stop_ids)
+                sampling_params._all_stop_token_ids = all_stop_ids
+            for eos_id in eos_token_ids:
+                if eos_id not in all_stop_ids:
+                    sampling_params.stop_token_ids.append(eos_id)
+                    all_stop_ids.add(eos_id)
 
         completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
 
@@ -730,121 +893,132 @@ class RequestAdmission:
             processing_time=0.0,
             update_seq=0,
             delta_seq=0,
+            tool_call_delta_history=[] if track_tool_call_delta_history else None,
         )
-        self._registry.register(request_id, self._registry.get_record(request_id), output)
 
-        eos_token_ids = [int(tid) for tid in (self._eos_ids or []) if tid is not None]
+        # Snapshot base SamplingParams before any per-sample parser adjust_request mutation so n > 1
+        # children each receive an isolated clone adjusted exactly once with a distinct child seed.
+        base_seed = getattr(sampling_params, "seed", None)
+        base_template_sp = self._clone_sampling_params(sampling_params) if n_samples > 1 else sampling_params
 
-        if not eos_token_ids:
-            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
-            fallback_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
-            eos_token_ids = [int(tid) for tid in fallback_ids if tid is not None]
-
-        # Use the first EOS token as the primary one for backwards compatibility
-        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else self._primary_eos_token_id
-
-        # Add all EOS tokens to sampling_params.stop_token_ids if not already present
-        if eos_token_ids:
-            current_stop_ids = set(sampling_params.stop_token_ids or [])
-            all_stop_ids = getattr(sampling_params, "_all_stop_token_ids", None)
-            if all_stop_ids is None:
-                all_stop_ids = set(current_stop_ids)
-                sampling_params._all_stop_token_ids = all_stop_ids
-            for eos_id in eos_token_ids:
-                if eos_id not in all_stop_ids:
-                    sampling_params.stop_token_ids.append(eos_id)
-                    all_stop_ids.add(eos_id)
-
-        mm_features_cache_key_only = None
-        if mm_features and n_samples > 1:
-            mm_features_cache_key_only = []
-            for feat in mm_features:
-                try:
-                    mm_features_cache_key_only.append(
-                        type(feat)(
-                            mm_hash=getattr(feat, "mm_hash", ""),
-                            modality=getattr(feat, "modality", "image"),
-                            pixel_values=None,
-                            grid_thw=None,
-                        )
-                    )
-                except Exception:
-                    # Worst-case fallback: keep the original feature object.
-                    # This preserves correctness at the cost of extra memory.
-                    mm_features_cache_key_only.append(feat)
-
-        scheduler_requests: list[EngineRequest] = []
-        for sample_idx in range(n_samples):
+        created_child_ids: list[str] = []
+        metrics_started = False
+        try:
+            parent_record = RequestRecord(
+                prompt=prompt_for_engine,
+                prompt_token_ids=token_ids,
+                sampling_params=sampling_params,
+                start_time=start_ts,
+                last_decode_time=start_ts,
+                truncated=truncated,
+                tokens_dropped=tokens_dropped,
+                requested_new_tokens_original=original_requested_new,
+                requested_new_tokens_final=requested_new,
+                reserve_tokens=self.reserve_tokens,
+                max_model_len=max_model_len,
+            )
             if n_samples == 1:
-                child_request_id = request_id
-                parent_id = None
-            else:
-                child_request_id = f"{request_id}-{sample_idx}"
-                parent_id = request_id
+                parent_record.delegating_parser = self._build_parsers_for_sample(
+                    sample_request_id=request_id,
+                    sampling_params=sampling_params,
+                    prompt_text=prompt_for_engine,
+                    prompt_token_ids=token_ids,
+                    tool_parser_request=tool_parser_request,
+                )
 
-                # Create tracking entries for child requests
-                # IMPORTANT: Create a fresh dict for each sample to avoid sharing mutable objects
-                with self._request_lock:
-                    self._request_events[child_request_id] = self._request_events[request_id]
-                    self._active_requests[child_request_id] = RequestRecord(
-                        prompt=prompt_for_engine,
-                        prompt_token_ids=token_ids,
-                        sampling_params=sampling_params,
-                        start_time=start_ts,
-                        last_decode_time=start_ts,
-                        truncated=truncated,
-                        tokens_dropped=tokens_dropped,
-                        requested_new_tokens_original=original_requested_new,
-                        requested_new_tokens_final=requested_new,
-                        reserve_tokens=self.reserve_tokens,
-                        max_model_len=max_model_len,
-                        sample_index=sample_idx,
-                        parent_request_id=request_id,
-                    )
-                    _rp2 = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
-                    if _rp2 is not None:
-                        _rp2.adjust_request(sampling_params)
-                    self._configure_reasoning_parser_for_prompt(
-                        reasoning_parser=_rp2,
+            self._registry.register(request_id, parent_record, output)
+
+            metrics_collector = get_metrics_collector()
+            if metrics_collector:
+                metrics_collector.start_request(request_id, len(token_ids), model_name=self._model_name)
+                metrics_started = True
+
+            scheduler_requests: list[AdmissionRecord] = []
+            for sample_idx in range(n_samples):
+                if n_samples == 1:
+                    child_request_id = request_id
+                    parent_id = None
+                    child_sp = sampling_params
+                else:
+                    child_request_id = f"{request_id}-{sample_idx}"
+                    parent_id = request_id
+                    created_child_ids.append(child_request_id)
+                    child_sp = self._clone_sampling_params(base_template_sp)
+                    if base_seed is not None:
+                        child_sp.seed = _derive_child_seed(int(base_seed), sample_idx)
+
+                    child_parser = self._build_parsers_for_sample(
+                        sample_request_id=child_request_id,
+                        sampling_params=child_sp,
                         prompt_text=prompt_for_engine,
                         prompt_token_ids=token_ids,
+                        tool_parser_request=tool_parser_request,
                     )
-                    _tp2 = build_tool_parser_or_none(
-                        self._tool_parser_class, self.tokenizer, context=f"request {child_request_id}"
-                    )
-                    self._active_requests[child_request_id].delegating_parser = DelegatingParser(
-                        reasoning_parser=_rp2,
-                        tool_parser=_tp2,
-                        tool_request=tool_parser_request,
-                    )
+                    if sample_idx == 0:
+                        # Mirror the first child's adjusted params onto the parent record for inspection.
+                        parent_record.sampling_params = child_sp
+                        parent_record.delegating_parser = child_parser
 
-            # In multi-host mode, use a deterministic arrival_time so all
-            # hosts agree on preemption/priority ordering.
-            _arrival = float(self._request_counter) if jax.process_count() > 1 else None
-            scheduler_requests.append(
-                EngineRequest(
-                    request_id=child_request_id,
-                    prompt_token_ids=token_ids,
-                    sampling_params=sampling_params,
-                    eos_token_id=primary_eos_token_id,
-                    parent_request_id=parent_id,
-                    sample_index=sample_idx,
-                    arrival_time=_arrival,
-                    # Vision-language model data (only for first sample to save memory)
-                    pixel_values=pixel_values if sample_idx == 0 else None,
-                    image_grid_thw=image_grid_thw if sample_idx == 0 else None,
-                    pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
-                    video_grid_thw=video_grid_thw if sample_idx == 0 else None,
-                    # Keep multimodal cache keys for all samples so n>1 can share
-                    # KV-prefix pages via prefix caching without duplicating pixel buffers.
-                    mm_features=mm_features if sample_idx == 0 else mm_features_cache_key_only,
+                    # Create tracking entries for child requests
+                    with self._request_lock:
+                        self._request_events[child_request_id] = self._request_events[request_id]
+                        self._active_requests[child_request_id] = RequestRecord(
+                            prompt=prompt_for_engine,
+                            prompt_token_ids=token_ids,
+                            sampling_params=child_sp,
+                            start_time=start_ts,
+                            last_decode_time=start_ts,
+                            truncated=truncated,
+                            tokens_dropped=tokens_dropped,
+                            requested_new_tokens_original=original_requested_new,
+                            requested_new_tokens_final=requested_new,
+                            reserve_tokens=self.reserve_tokens,
+                            max_model_len=max_model_len,
+                            delegating_parser=child_parser,
+                            sample_index=sample_idx,
+                            parent_request_id=request_id,
+                        )
+
+                # In multi-host mode, advance the lock-protected monotonic arrival stamp so all
+                # hosts agree on FCFS/priority tie-breaking (even with explicit request IDs).
+                _arrival = self.next_arrival_stamp() if jax.process_count() > 1 else None
+                # Give each n > 1 sibling shallow-copied MultiModalFeature containers so read-only
+                # array views are shared zero-copy while per-request lifecycle mutations (e.g.
+                # clearing raw pixels after prefill/finish) can never corrupt waiting siblings.
+                sibling_mm_features = (
+                    [copy.copy(feat) for feat in mm_features]
+                    if (mm_features and n_samples > 1)
+                    else mm_features
                 )
-            )
+                scheduler_requests.append(
+                    AdmissionRecord(
+                        request_id=child_request_id,
+                        prompt_token_ids=token_ids,
+                        sampling_params=child_sp,
+                        eos_token_id=primary_eos_token_id,
+                        parent_request_id=parent_id,
+                        sample_index=sample_idx,
+                        arrival_time=_arrival,
+                        # Share zero-copy vision-language inputs across all n siblings so sample_idx >= 1
+                        # never crashes VLM prefill; VisionEncoderCache deduplicates vision encoding.
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        pixel_values_videos=pixel_values_videos,
+                        video_grid_thw=video_grid_thw,
+                        mm_features=sibling_mm_features,
+                    )
+                )
 
-        if defer_scheduler_enqueue:
-            return scheduler_requests
+            if defer_scheduler_enqueue:
+                return scheduler_requests
 
-        self._scheduler_submit(scheduler_requests)
+            self._scheduler_submit(scheduler_requests)
+        except BaseException:
+            if metrics_started:
+                self.rollback_request(request_id, created_child_ids)
+            else:
+                self._registry.rollback(request_id, created_child_ids)
+            raise
 
         self._info(
             f"Queued request {request_id}: prompt_len={prompt_len}, "

@@ -115,6 +115,26 @@ def test_case_a_validate_raises_with_actionable_message():
     assert "int32" in message
 
 
+@pytest.mark.cpu_ok
+def test_auto_chunk_size_caps_the_dispatch_buffer_with_equal_chunks():
+    """``moe_chunk_size=None`` keeps one pass up to a 2 GiB dispatch buffer, else the fewest equal chunks under it."""
+    from easydel.layers.moe import auto_moe_chunk_size
+
+    shape = dict(num_experts_per_tok=8, hidden_size=4096, dtype_bytes=2)
+    row_bytes = 8 * 4096 * 2
+    max_tokens = 2**31 // row_bytes
+    assert auto_moe_chunk_size(4096, **shape) is None
+    assert auto_moe_chunk_size(max_tokens, **shape) is None
+    assert auto_moe_chunk_size(131072, **shape) == 32768
+    for tokens in (max_tokens + 1, 100_000, 140_000, 131072 * 3 + 5):
+        chunk = auto_moe_chunk_size(tokens, **shape)
+        num_chunks = -(-tokens // chunk)
+        assert chunk % 1024 == 0
+        assert chunk * row_bytes <= 2**31
+        assert num_chunks == -(-tokens // max_tokens)
+        assert num_chunks * chunk - tokens < 1024 * num_chunks
+
+
 def test_case_b_ep_unbound_131k_bucket_warns_but_does_not_raise():
     """(b) 17.2 GB/core: over the 4-byte-word band, but not provably fatal."""
     est = _estimate(MESH_FSDP64_EP4_TP4, TOKENS_131K_BUCKET, fsdp_is_ep_bound=False)

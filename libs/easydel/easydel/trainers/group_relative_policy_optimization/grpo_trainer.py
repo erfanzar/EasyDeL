@@ -23,9 +23,13 @@ the KL penalty, and dispatches to the JIT-compiled GRPO step.
 
 from __future__ import annotations
 
+import collections.abc
+import contextlib
 import inspect
 import json
+import pickle
 import typing as tp
+import weakref
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -35,6 +39,7 @@ import numpy as np
 import spectrax as spx
 from eformer.paths import UniversalPath, ePath, is_remote_path
 from jax import numpy as jnp
+from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from spectrax import with_sharding_constraint
 from transformers import AutoTokenizer
@@ -49,9 +54,13 @@ from easydel.utils.helpers import (  # pyright: ignore[reportPrivateLocalImportU
     get_logger,
 )
 
-from .._shared import copy_frozen_policy, polyak_update_reference_graphstate
+from .._shared import copy_frozen_policy, drop_optimizer_state, polyak_update_reference_graphstate
 from .._shared.environment import ToolEnvWrapper, create_tool_call_parser
+from .._shared.esurge_generation import clamp_new_tokens_to_bound, generation_length_bound
+from .._shared.off_policy import check_startup_behavior_parity
 from .._shared.tools import function_to_json, make_tool
+from ..async_rollout_mixin import AsyncRolloutMixin
+from ..base_trainer import GenerationResults
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
@@ -185,6 +194,132 @@ def _clip_rewards_if_configured(rewards: jax.Array, arguments: GRPOConfig) -> ja
     return jnp.clip(rewards, -reward_clip_range, reward_clip_range)
 
 
+def _unscorable_group_rows(
+    rewards_per_func: jax.Array,
+    generation_factor: int,
+    discard_columns: np.ndarray | jax.Array | None = None,
+) -> jax.Array:
+    """Flag every row of a prompt group that holds an unscorable (NaN / ``None``) reward.
+
+    Args:
+        rewards_per_func: Rewards ``[completions, reward_funcs]``; ``None`` rewards arrive as NaN.
+        generation_factor: Completions per prompt group.
+        discard_columns: Optional boolean ``[reward_funcs]``; only NaNs in ``True`` columns
+            count. ``None`` counts every column.
+
+    Returns:
+        Boolean ``[completions]``; ``True`` for all rows of a group in which any reward function
+        failed to score any sample.
+    """
+    nan = jnp.isnan(rewards_per_func)
+    if discard_columns is not None:
+        nan = nan & jnp.asarray(discard_columns, dtype=bool)[None, :]
+    row_bad = jnp.any(nan, axis=-1)
+    group_bad = jnp.any(row_bad.reshape(-1, generation_factor), axis=-1)
+    return jnp.repeat(group_bad, generation_factor, axis=0)
+
+
+def _feedback_unscorable(result: object | None) -> bool:
+    """Whether an environment ``reset``/``step`` result carries no usable reward.
+
+    Applies :func:`easydel.environments.auto.is_unscorable` (``info["discard"]`` or
+    ``info["env_error"]``) to any result object exposing an ``info`` mapping; ``None`` and results
+    without ``info`` are scorable.
+    """
+    if result is None:
+        return False
+    info = getattr(result, "info", None)
+    if not isinstance(info, dict):
+        return False
+    from easydel.environments.auto import is_unscorable  # lazy: environments imports trainer modules
+
+    return is_unscorable(result)  # type: ignore[arg-type]
+
+
+def _resolve_discard_columns(
+    discard_unscorable_groups: bool | None,
+    reward_funcs: tp.Sequence[object],
+    num_columns: int,
+) -> np.ndarray | None:
+    """Return which reward columns drop their prompt group on a ``None`` (NaN) reward.
+
+    Args:
+        discard_unscorable_groups: The ``GRPOConfig`` policy. ``True`` marks every column,
+            ``False`` none, ``None`` (default) only the columns whose reward function sets
+            ``discard_unscorable = True``.
+        reward_funcs: The trainer's reward functions, one per leading column.
+        num_columns: Total reward columns; columns beyond ``reward_funcs`` are the
+            environment-feedback reward, which opts in under the ``None`` policy.
+
+    Returns:
+        Boolean ``[num_columns]`` or ``None`` when no column can discard a group.
+    """
+    if discard_unscorable_groups is False:
+        return None
+    if discard_unscorable_groups is True:
+        return np.ones((num_columns,), dtype=bool)
+    marked = [bool(getattr(func, "discard_unscorable", False)) for func in reward_funcs]
+    marked = (marked + [True] * num_columns)[:num_columns]
+    columns = np.asarray(marked, dtype=bool)
+    return columns if columns.any() else None
+
+
+def _apply_discarded_groups(
+    model_batch: dict[str, jax.Array],
+    discarded_rows: jax.Array,
+    generation_factor: int,
+) -> tuple[dict[str, jax.Array], dict[str, float]]:
+    """Drop discarded groups from the loss: zero their advantages, completion-mask rows and weights.
+
+    ``num_items_in_batch`` is recomputed from the masked completion mask so token-count
+    normalisers exclude the discarded tokens. When any group is discarded, the discarded rows'
+    ``difficulty_weights`` are zeroed (created as ones first when absent) so the sequence-count
+    normalisers (``grpo``/``gmpo``/``sapo``/``dr_grpo``/``luspo``) exclude them too. With nothing
+    discarded the batch structure is unchanged.
+
+    Returns:
+        ``(model_batch, metrics)`` with ``rewards/discarded_groups`` and
+        ``rewards/discarded_group_fraction``.
+    """
+    model_batch = dict(model_batch)
+    keep = ~discarded_rows
+    completion_mask = model_batch["completion_mask"]
+    model_batch["completion_mask"] = completion_mask * keep[:, None].astype(completion_mask.dtype)
+    advantages = model_batch["advantages"]
+    model_batch["advantages"] = jnp.where(keep.reshape((-1,) + (1,) * (advantages.ndim - 1)), advantages, 0.0)
+    model_batch["num_items_in_batch"] = jnp.sum(model_batch["completion_mask"])
+    groups = discarded_rows.reshape(-1, max(int(generation_factor), 1))[:, 0]
+    num_discarded = int(jax.device_get(jnp.sum(groups)))
+    if num_discarded > 0:
+        weights = model_batch.get("difficulty_weights")
+        if weights is None:
+            weights = jnp.ones((keep.shape[0],), dtype=jnp.float32)
+        keep_w = keep.reshape((-1,) + (1,) * (weights.ndim - 1)).astype(weights.dtype)
+        model_batch["difficulty_weights"] = weights * keep_w
+    return model_batch, {
+        "rewards/discarded_groups": num_discarded,
+        "rewards/discarded_group_fraction": num_discarded / max(int(groups.shape[0]), 1),
+    }
+
+
+def _leave_one_out_group_baseline(grouped: jax.Array, *, axis: int) -> tuple[jax.Array, jax.Array]:
+    """Compute NaN-aware leave-one-out group baseline and centered advantages.
+
+    Divides each sibling's leave-one-out sum by the actual count of finite
+    siblings rather than ``generation_factor - 1``, preventing NaN siblings from
+    biasing the baseline or producing NaN advantages.
+    """
+    valid_mask = ~jnp.isnan(grouped)
+    valid_f = valid_mask.astype(grouped.dtype)
+    valid_count = jnp.sum(valid_f, axis=axis, keepdims=True)
+    safe_vals = jnp.where(valid_mask, grouped, 0.0)
+    other_sum = jnp.sum(safe_vals, axis=axis, keepdims=True) - safe_vals
+    other_count = valid_count - valid_f
+    baseline = jnp.where(other_count > 0, other_sum / jnp.maximum(other_count, 1.0), safe_vals)
+    centered = jnp.where(valid_mask & (other_count > 0), grouped - baseline, 0.0)
+    return baseline, centered
+
+
 def _compute_rewards_and_advantages(
     *,
     rewards_per_func: jax.Array,
@@ -194,6 +329,7 @@ def _compute_rewards_and_advantages(
     multi_objective_aggregation: str,
     arguments: GRPOConfig,
     group_reduction: str = "mean",
+    discard_columns: np.ndarray | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Aggregate reward-function outputs and compute grouped advantages.
 
@@ -205,18 +341,50 @@ def _compute_rewards_and_advantages(
     rewards is reduced over the ``num_generations`` completions: ``"mean"``
     (the classic GRPO baseline) or ``"sum"``.  It applies to the ``group_mean``
     advantage estimator only; ``leave_one_out`` keeps its own RLOO baseline.
+
+    ``scale_rewards`` selects the advantage scaling:
+
+    * ``"group"``: ``A / (std_group(r) + eps)``,
+    * ``"batch"``: ``A / (std_batch(r) + eps)`` (raw rewards, including between-group variance),
+    * ``"batch_advantage"``: ``(A - mean_batch(A)) / (std_batch(A) + eps)`` over the group-centred
+      advantages ``A = r - baseline``, so only within-group variance sets the scale,
+    * ``"none"``: no scaling.
+
+    Discard protocol: a NaN reward (a reward function returned ``None``) in a *discarding* column
+    marks its whole prompt group as unscorable. Those rows get a NaN aggregated reward, are ignored
+    by every mean/std statistic, and receive a zero advantage. NaNs in other columns keep the
+    nan-aware aggregation (``nansum``/``nanmean``). ``discard_columns`` (boolean per column, see
+    :func:`_resolve_discard_columns`) selects the discarding columns; when omitted, every column
+    discards iff ``arguments.discard_unscorable_groups is True``. ``discard_unscorable_groups=False``
+    always disables discarding.
     """
+    if scale_rewards not in ("batch", "batch_advantage", "group", "none"):
+        raise ValueError(
+            f"Invalid value for scale_rewards: {scale_rewards}. "
+            "Must be 'batch', 'batch_advantage', 'group', or 'none'."
+        )
+    advantage_estimator = getattr(arguments, "advantage_estimator", "group_mean")
+    policy = getattr(arguments, "discard_unscorable_groups", None)
+    if policy is False:
+        discard_columns = None
+    elif discard_columns is None and policy is True:
+        discard_columns = np.ones((rewards_per_func.shape[-1],), dtype=bool)
+    discarded_rows = (
+        _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns)
+        if discard_columns is not None and bool(np.any(discard_columns))
+        else None
+    )
     if multi_objective_aggregation == "sum_then_normalize":
         rewards = jnp.nansum(rewards_per_func * reward_weights[None, :], axis=1)
         rewards = _clip_rewards_if_configured(rewards, arguments)
+        if discarded_rows is not None:
+            rewards = jnp.where(discarded_rows, jnp.nan, rewards)
         grouped_rewards = rewards.reshape(-1, generation_factor)
-        if getattr(arguments, "advantage_estimator", "group_mean") == "leave_one_out":
+        if advantage_estimator == "leave_one_out":
             if generation_factor <= 1:
                 raise ValueError("RLOO leave-one-out advantages require `num_generations > 1`.")
-            grouped_baseline = (jnp.nansum(grouped_rewards, axis=-1, keepdims=True) - grouped_rewards) / (
-                generation_factor - 1
-            )
-            advantages = (grouped_rewards - grouped_baseline).reshape(-1)
+            _, centered = _leave_one_out_group_baseline(grouped_rewards, axis=-1)
+            advantages = centered.reshape(-1)
         else:
             if group_reduction == "sum":
                 grouped_baseline = jnp.nansum(grouped_rewards, axis=-1)
@@ -230,30 +398,123 @@ def _compute_rewards_and_advantages(
         elif scale_rewards == "batch":
             std_rewards = jnp.nanstd(rewards)
             std_rewards = jnp.broadcast_to(std_rewards, advantages.shape)
+        elif scale_rewards == "batch_advantage":
+            std_rewards = jnp.broadcast_to(jnp.nanstd(advantages), advantages.shape)
+            advantages = advantages - jnp.nanmean(advantages)
         else:
-            raise ValueError(f"Invalid value for scale_rewards: {scale_rewards}. Must be 'batch', 'group', or 'none'.")
+            raise ValueError(
+                f"Invalid value for scale_rewards: {scale_rewards}. "
+                "Must be 'batch', 'batch_advantage', 'group', or 'none'."
+            )
         is_std_zero = jnp.isclose(std_rewards, 0.0)
         if scale_rewards != "none":
             advantages = advantages / (std_rewards + 1e-4)
         return rewards, jnp.nan_to_num(advantages), std_rewards, is_std_zero
 
     if multi_objective_aggregation == "normalize_then_sum":
+        if discarded_rows is not None:
+            rewards_per_func = jnp.where(discarded_rows[:, None], jnp.nan, rewards_per_func)
         grouped = rewards_per_func.reshape(-1, generation_factor, rewards_per_func.shape[-1])
-        mean_per_reward = jnp.nanmean(grouped, axis=1, keepdims=True)
+        if advantage_estimator == "leave_one_out":
+            if generation_factor <= 1:
+                raise ValueError("RLOO leave-one-out advantages require `num_generations > 1`.")
+            _, centered_per_reward = _leave_one_out_group_baseline(grouped, axis=1)
+        elif group_reduction == "sum":
+            centered_per_reward = grouped - jnp.nansum(grouped, axis=1, keepdims=True)
+        else:
+            centered_per_reward = grouped - jnp.nanmean(grouped, axis=1, keepdims=True)
         std_per_reward = jnp.nanstd(grouped, axis=1, keepdims=True)
-        normalized_per_reward = (grouped - mean_per_reward) / (std_per_reward + 1e-4)
+        if scale_rewards == "none":
+            normalized_per_reward = centered_per_reward
+        else:
+            normalized_per_reward = centered_per_reward / (std_per_reward + 1e-4)
         normalized_per_reward = normalized_per_reward.reshape(-1, rewards_per_func.shape[-1])
         rewards = jnp.nansum(normalized_per_reward * reward_weights[None, :], axis=1)
         rewards = _clip_rewards_if_configured(rewards, arguments)
+        if discarded_rows is not None:
+            rewards = jnp.where(discarded_rows, jnp.nan, rewards)
         std_rewards = jnp.broadcast_to(jnp.nanstd(rewards), rewards.shape)
-        advantages = (rewards - jnp.nanmean(rewards)) / (std_rewards + 1e-4)
         is_std_zero = jnp.isclose(std_rewards, 0.0)
+        if scale_rewards == "none":
+            advantages = rewards - jnp.nanmean(rewards)
+        else:
+            advantages = (rewards - jnp.nanmean(rewards)) / (std_rewards + 1e-4)
         return rewards, jnp.nan_to_num(advantages), std_rewards, is_std_zero
 
     raise ValueError(
         "Invalid multi_objective_aggregation: "
         f"{multi_objective_aggregation}. Must be 'sum_then_normalize' or 'normalize_then_sum'."
     )
+
+
+_COMPLETION_ALIGNED_BATCH_KEYS = (
+    "completion_ids",
+    "completion_mask",
+    "completion_attention_mask",
+    "ref_per_token_logps",
+    "old_per_token_logps",
+    "sampling_per_token_logps",
+    "importance_sampling_ratio",
+    "sampling_topk_indices",
+    "sampling_topk_logps",
+    "difficulty_weights",
+    "behavior_per_token_logps",
+)
+"""GRPO model-batch keys holding one row per completion (swapped row-wise by dynamic sampling)."""
+
+
+class _ScoredRollout(tp.NamedTuple):
+    """One generated and scored GRPO batch before batch-reuse buffering.
+
+    Attributes:
+        model_batch: Batch consumed by ``grpo_step``.
+        metrics: Host-side rollout metrics.
+        rewards_per_func: Gathered rewards, shape ``[completions, reward_funcs]``.
+        reward_weights: Weights used to aggregate ``rewards_per_func``.
+    """
+
+    model_batch: dict[str, jax.Array]
+    metrics: dict[str, float | int | str]
+    rewards_per_func: jax.Array
+    reward_weights: jax.Array
+
+
+def _zero_variance_groups(
+    *,
+    rewards_per_func: jax.Array,
+    reward_weights: jax.Array,
+    generation_factor: int,
+    multi_objective_aggregation: str,
+    arguments: GRPOConfig,
+    discard_columns: np.ndarray | None = None,
+) -> np.ndarray:
+    """Flag prompt groups whose aggregated reward is constant (DAPO dynamic-sampling filter).
+
+    The aggregated reward is built exactly as for advantages (weighted sum, or
+    per-function group normalisation then sum for ``normalize_then_sum``), so a
+    group is flagged precisely when it would contribute a zero advantage.
+
+    Args:
+        rewards_per_func: Rewards of shape ``[completions, reward_funcs]``.
+        reward_weights: Per-function weights.
+        generation_factor: Completions per prompt group.
+        multi_objective_aggregation: ``"sum_then_normalize"`` or ``"normalize_then_sum"``.
+        arguments: GRPO config (reward clipping / advantage estimator).
+
+    Returns:
+        Host boolean array of shape ``[groups]``.
+    """
+    rewards, _, _, _ = _compute_rewards_and_advantages(
+        rewards_per_func=rewards_per_func,
+        reward_weights=reward_weights,
+        generation_factor=generation_factor,
+        scale_rewards="none",
+        multi_objective_aggregation=multi_objective_aggregation,
+        arguments=arguments,
+        discard_columns=discard_columns,
+    )
+    group_std = jnp.nanstd(rewards.reshape(-1, generation_factor), axis=-1)
+    return np.asarray(jax.device_get(jnp.isclose(group_std, 0.0) | jnp.isnan(group_std)), dtype=bool)
 
 
 def _fileaf(x):
@@ -289,7 +550,7 @@ def delete_tree(pytree):
 
 
 @Registry.register("trainer", "grpo")
-class GRPOTrainer(Trainer):
+class GRPOTrainer(AsyncRolloutMixin, Trainer):
     """Group Relative Policy Optimization trainer for RLHF.
 
     GRPO is a reinforcement learning method that optimizes policies by comparing
@@ -386,6 +647,7 @@ class GRPOTrainer(Trainer):
         self.epsilon = arguments.epsilon
         self.epsilon_high = arguments.epsilon_high
         self.delta = arguments.delta
+        self.kl_estimator = str(getattr(arguments, "kl_estimator", "k3")).lower()
         self.importance_sampling_level = arguments.importance_sampling_level
         if isinstance(self.importance_sampling_level, str):
             self.importance_sampling_level = self.importance_sampling_level.lower()
@@ -400,9 +662,15 @@ class GRPOTrainer(Trainer):
         self.num_iterations = arguments.num_iterations
         self.steps_per_generation = int(arguments.steps_per_generation or 1)
         self._buffered_grpo_batch: tuple[dict[str, jax.Array], dict[str, float | int | str]] | None = None
+        self._buffered_grpo_queue: list[tuple[dict[str, jax.Array], dict[str, float | int | str]]] = []
         self._buffered_grpo_remaining = 0
+        self._grpo_fetch_cycle_pos = 0
+        self._grpo_cached_raw_batch: object | None = None
         self._completion_log_dir: Path | None = None
         self._completion_commit_scheduler: object | None = None
+        self._completion_hub_staging: TemporaryDirectory | None = None
+        self._completion_hub_dir: Path | None = None
+        self._completion_hub_finalizer: weakref.finalize | None = None
 
         if isinstance(model, str):
             reject_string_model_id(model, role="policy model")
@@ -457,6 +725,7 @@ class GRPOTrainer(Trainer):
             if isinstance(reward_func, EasyDeLBaseModule | EasyDeLState):
                 if isinstance(reward_func, EasyDeLBaseModule):
                     reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
+                reward_func = drop_optimizer_state(reward_func)
                 if reward_func.apply_fn is None:
                     sharding = reward_func.shardings
 
@@ -606,6 +875,14 @@ class GRPOTrainer(Trainer):
             )
         return reductions.pop() if reductions else "mean"
 
+    def _discard_columns(self, num_columns: int) -> np.ndarray | None:
+        """Reward columns whose ``None`` drops the prompt group (see :func:`_resolve_discard_columns`)."""
+        return _resolve_discard_columns(
+            getattr(self.arguments, "discard_unscorable_groups", None),
+            getattr(self, "reward_funcs", []),
+            num_columns,
+        )
+
     @staticmethod
     def _resolve_reward_func_model(reward_func: RewardFunc) -> RewardFunc:
         """Reject string reward identifiers and return a concrete reward object.
@@ -639,7 +916,138 @@ class GRPOTrainer(Trainer):
         """
         steps_per_generation = int(getattr(self, "steps_per_generation", 1) or 1)
         num_iterations = int(getattr(self, "num_iterations", 1) or 1)
-        return max(1, steps_per_generation * num_iterations)
+        span = max(1, steps_per_generation * num_iterations)
+        if bool(getattr(self, "_async_grpo_force_old_logps", False)):
+            return max(span, 2)
+        return span
+
+    def _concat_raw_prompt_batches(self, chunks: list[object]) -> object:
+        """Concatenate ``steps_per_generation`` raw prompt batches into one generation batch."""
+        if len(chunks) == 1:
+            return chunks[0]
+        if all(isinstance(chunk, list) for chunk in chunks):
+            return [item for chunk in chunks for item in chunk]
+        if not all(isinstance(chunk, dict) for chunk in chunks):
+            return chunks[0]
+
+        pad_token_id = int(getattr(self, "padding_value", 0) or 0)
+        combined: dict[str, object] = {}
+        keys = list(chunks[0].keys())
+        for key in keys:
+            values = [chunk[key] for chunk in chunks if key in chunk]
+            if len(values) != len(chunks):
+                continue
+            first = values[0]
+            if isinstance(first, (list, tuple)):
+                merged: list[object] = []
+                for val in values:
+                    merged.extend(list(val))
+                combined[key] = merged if isinstance(first, list) else tuple(merged)
+                continue
+            if isinstance(first, (np.ndarray, jax.Array)):
+                arrays = [np.asarray(val) for val in values]
+                if all(arr.ndim == 2 for arr in arrays) and len({arr.shape[1] for arr in arrays}) > 1:
+                    max_width = max(arr.shape[1] for arr in arrays)
+                    pad_val = 0 if "mask" in key else pad_token_id
+                    padded = []
+                    for arr in arrays:
+                        pad_len = max_width - arr.shape[1]
+                        if pad_len > 0:
+                            pad_block = np.full((arr.shape[0], pad_len), pad_val, dtype=arr.dtype)
+                            arr = np.concatenate([pad_block, arr], axis=1)
+                        padded.append(arr)
+                    arrays = padded
+                combined[key] = np.concatenate(arrays, axis=0)
+                continue
+            combined[key] = first
+        return combined
+
+    def _get_next_batch(self, data_iter, dataloader):
+        """Pause training dataloader advancement while reusing buffered GRPO steps.
+
+        When ``num_iterations > 1`` or ``steps_per_generation > 1``, fetching a
+        fresh batch on every optimizer step would discard ``(reuse_span - 1) / reuse_span``
+        of the training dataset. Instead, we pull ``steps_per_generation`` distinct
+        batches once per generation cycle and return a lightweight placeholder
+        during the remaining buffered steps without advancing ``data_iter``.
+        """
+        if bool(getattr(self.arguments, "async_mode", False)):
+            return super()._get_next_batch(data_iter, dataloader)
+        reuse_span = self._generation_reuse_span()
+        steps_per_generation = max(1, int(getattr(self, "steps_per_generation", 1) or 1))
+        train_loader = getattr(self, "dataloader_train", None)
+        is_train_loader = train_loader is not None and dataloader is train_loader
+        if not is_train_loader or reuse_span <= 1:
+            return super()._get_next_batch(data_iter, dataloader)
+
+        cycle_pos = int(getattr(self, "_grpo_fetch_cycle_pos", 0))
+        cached_raw = getattr(self, "_grpo_cached_raw_batch", None)
+        if cycle_pos > 0 and cached_raw is not None:
+            self._grpo_fetch_cycle_pos = (cycle_pos + 1) % reuse_span
+            return cached_raw, data_iter
+
+        if steps_per_generation <= 1:
+            batch, data_iter = super()._get_next_batch(data_iter, dataloader)
+            self._grpo_cached_raw_batch = batch
+            self._grpo_fetch_cycle_pos = 1 % reuse_span
+            return batch, data_iter
+
+        chunks: list[object] = []
+        for _ in range(steps_per_generation):
+            chunk, data_iter = super()._get_next_batch(data_iter, dataloader)
+            chunks.append(chunk)
+        combined = self._concat_raw_prompt_batches(chunks)
+        self._grpo_cached_raw_batch = chunks[0]
+        self._grpo_fetch_cycle_pos = 1 % reuse_span
+        return combined, data_iter
+
+    @staticmethod
+    def _slice_model_batch_chunks(
+        model_batch: dict[str, jax.Array],
+        num_chunks: int,
+    ) -> list[dict[str, jax.Array]]:
+        """Slice a multi-step generated ``model_batch`` into ``num_chunks`` distinct minibatches."""
+        prompt_ids = model_batch.get("prompt_ids")
+        completion_ids = model_batch.get("completion_ids")
+        if prompt_ids is None or completion_ids is None or num_chunks <= 1:
+            return [model_batch]
+        prompt_rows = int(prompt_ids.shape[0])
+        completion_rows = int(completion_ids.shape[0])
+        if prompt_rows < num_chunks or prompt_rows % num_chunks != 0 or completion_rows % num_chunks != 0:
+            return [model_batch]
+        prompt_step = prompt_rows // num_chunks
+        completion_step = completion_rows // num_chunks
+
+        def _slice_leaf(val, p_start: int, p_end: int, c_start: int, c_end: int):
+            if not hasattr(val, "shape") or len(val.shape) == 0:
+                return val
+            lead = int(val.shape[0])
+            if lead == completion_rows:
+                return val[c_start:c_end]
+            if lead == prompt_rows:
+                return val[p_start:p_end]
+            return val
+
+        chunks: list[dict[str, jax.Array]] = []
+        for chunk_idx in range(num_chunks):
+            p_start = chunk_idx * prompt_step
+            p_end = p_start + prompt_step
+            c_start = chunk_idx * completion_step
+            c_end = c_start + completion_step
+            sub: dict[str, jax.Array] = {}
+            for key, value in model_batch.items():
+                if key == "num_items_in_batch":
+                    continue
+                sub[key] = jax.tree_util.tree_map(
+                    lambda leaf, ps=p_start, pe=p_end, cs=c_start, ce=c_end: _slice_leaf(leaf, ps, pe, cs, ce),
+                    value,
+                )
+            if "completion_mask" in sub:
+                sub["num_items_in_batch"] = jnp.sum(sub["completion_mask"])
+            elif "num_items_in_batch" in model_batch:
+                sub["num_items_in_batch"] = model_batch["num_items_in_batch"]
+            chunks.append(sub)
+        return chunks
 
     def _take_buffered_grpo_batch(self) -> tuple[dict[str, jax.Array], dict[str, float | int | str]] | None:
         """Return a cached generated/scored batch when GRPO reuse is active.
@@ -649,13 +1057,24 @@ class GRPOTrainer(Trainer):
         and annotated with ``generation_reused`` plus the remaining reuse count
         for logging and debugging.
         """
-        buffered_batch = getattr(self, "_buffered_grpo_batch", None)
         buffered_remaining = int(getattr(self, "_buffered_grpo_remaining", 0))
-        if buffered_batch is None or buffered_remaining <= 0:
+        if buffered_remaining <= 0:
             return None
-        buffered_remaining -= 1
-        self._buffered_grpo_remaining = buffered_remaining
-        model_batch, metrics = buffered_batch
+        queued = getattr(self, "_buffered_grpo_queue", None)
+        if isinstance(queued, list) and queued:
+            model_batch, metrics = queued.pop(0)
+            buffered_remaining = len(queued)
+            self._buffered_grpo_remaining = buffered_remaining
+            self._buffered_grpo_batch = queued[0] if queued else None
+        else:
+            buffered_batch = getattr(self, "_buffered_grpo_batch", None)
+            if buffered_batch is None:
+                return None
+            buffered_remaining -= 1
+            self._buffered_grpo_remaining = buffered_remaining
+            model_batch, metrics = buffered_batch
+            if buffered_remaining <= 0:
+                self._buffered_grpo_batch = None
         reused_metrics = dict(metrics)
         reused_metrics["generation_reused"] = 1
         reused_metrics["generation_reuse_remaining"] = buffered_remaining
@@ -668,25 +1087,68 @@ class GRPOTrainer(Trainer):
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
         """Cache a newly generated/scored GRPO batch for configured reuse.
 
-        The method records reuse metrics on every fresh rollout. When the reuse
-        span is one, any previous cache is cleared and the batch is returned as
-        a normal one-shot update. When reuse is enabled, shallow copies of the
-        model batch and metrics are stored for subsequent optimizer steps while
-        the current fresh batch is returned unchanged.
+        When ``steps_per_generation > 1`` and the generated batch carries
+        ``steps_per_generation`` distinct prompt chunks, the batch is sliced
+        into distinct minibatches cycled ``num_iterations`` times instead of
+        repeating one identical minibatch. When reuse is inactive (span 1), any
+        previous cache is cleared and the batch is returned directly.
         """
+        if bool(getattr(self, "_async_grpo_force_old_logps", False)):
+            metrics = dict(metrics)
+            metrics["generation_reused"] = 0
+            metrics["generation_reuse_span"] = 1
+            metrics["generation_reuse_remaining"] = 0
+            self._buffered_grpo_batch = None
+            self._buffered_grpo_queue = []
+            self._buffered_grpo_remaining = 0
+            if bool(getattr(self.arguments, "async_mode", False)):
+                metrics.update(
+                    {
+                        "async_rollout/max_inflight_tasks": int(self.arguments.max_inflight_tasks),
+                        "async_rollout/max_staleness": int(self.arguments.max_staleness),
+                        "async_rollout/weight_sync_steps": int(self.arguments.weight_sync_steps),
+                        "async_rollout/esurge_async_scheduling": int(bool(self.arguments.esurge_async_scheduling)),
+                        "async_rollout/esurge_overlap_execution": int(bool(self.arguments.esurge_overlap_execution)),
+                    }
+                )
+            return model_batch, metrics
+
         reuse_span = self._generation_reuse_span()
+        steps_per_generation = max(1, int(getattr(self, "steps_per_generation", 1) or 1))
+        num_iterations = max(1, int(getattr(self, "num_iterations", 1) or 1))
         metrics = dict(metrics)
         metrics["generation_reused"] = 0
         metrics["generation_reuse_span"] = reuse_span
         if reuse_span <= 1:
             self._buffered_grpo_batch = None
+            self._buffered_grpo_queue = []
             self._buffered_grpo_remaining = 0
             metrics["generation_reuse_remaining"] = 0
             return model_batch, metrics
-        self._buffered_grpo_batch = (dict(model_batch), dict(metrics))
-        self._buffered_grpo_remaining = reuse_span - 1
+
+        prompt_ids = model_batch.get("prompt_ids")
+        args_obj = getattr(self, "arguments", None)
+        expected_step_batch = int(getattr(args_obj, "total_batch_size", 1) or 1)
+        can_slice_distinct = (
+            steps_per_generation > 1
+            and prompt_ids is not None
+            and int(prompt_ids.shape[0]) >= steps_per_generation * expected_step_batch
+            and int(prompt_ids.shape[0]) % steps_per_generation == 0
+        )
+        if can_slice_distinct:
+            minibatches = self._slice_model_batch_chunks(model_batch, steps_per_generation)
+            schedule = [mb for _ in range(num_iterations) for mb in minibatches]
+            first_batch = schedule[0]
+            remaining_queue = [(dict(mb), dict(metrics)) for mb in schedule[1:]]
+        else:
+            first_batch = model_batch
+            remaining_queue = [(dict(model_batch), dict(metrics)) for _ in range(reuse_span - 1)]
+
+        self._buffered_grpo_queue = remaining_queue
+        self._buffered_grpo_batch = remaining_queue[0] if remaining_queue else None
+        self._buffered_grpo_remaining = len(remaining_queue)
         metrics["generation_reuse_remaining"] = self._buffered_grpo_remaining
-        return model_batch, metrics
+        return first_batch, metrics
 
     @staticmethod
     def _is_tool_like(tool: object) -> tp.TypeGuard[_ToolLike]:
@@ -871,8 +1333,16 @@ class GRPOTrainer(Trainer):
 
             try:
                 reset = getattr(env, "reset", None)
-                if callable(reset):
-                    reset()
+                reset_result = reset() if callable(reset) else None
+                if _feedback_unscorable(reset_result):
+                    # The episode never started (sandbox/infra failure): report NaN, never a 0.0 reward,
+                    # so the environment column (a discarding column) drops the prompt group.
+                    observations.append(getattr(reset_result, "observation", ""))
+                    rewards.append(float("nan"))
+                    terminated.append(True)
+                    truncated.append(False)
+                    infos.append(dict(getattr(reset_result, "info", None) or {}))
+                    continue
 
                 step_with_tool_calls = getattr(env, "step_with_tool_calls", None)
                 if callable(step_with_tool_calls):
@@ -890,7 +1360,9 @@ class GRPOTrainer(Trainer):
                     step_result = step(action_text)
 
                 observations.append(getattr(step_result, "observation", ""))
-                rewards.append(float(getattr(step_result, "reward", 0.0)))
+                rewards.append(
+                    float("nan") if _feedback_unscorable(step_result) else float(getattr(step_result, "reward", 0.0))
+                )
                 terminated.append(bool(getattr(step_result, "terminated", False)))
                 truncated.append(bool(getattr(step_result, "truncated", False)))
                 infos.append(getattr(step_result, "info", {}))
@@ -988,17 +1460,72 @@ class GRPOTrainer(Trainer):
             observations.append(f"[{name}]: {result}")
         return "\n".join(observations) if observations else None
 
-    def _generation_config_overrides_for_phase(self, is_train: bool) -> dict[str, int] | None:
-        """Return generation overrides for train/eval GRPO rollout count."""
-        if is_train:
-            num_generations = getattr(self.arguments, "num_generations", None)
-            if num_generations is None:
+    def _generation_config_overrides_for_phase(self, is_train: bool, step: int | None = None) -> dict[str, int] | None:
+        """Return generation overrides for the train/eval rollout count and the Toggle budget.
+
+        Args:
+            is_train: Whether the rollout feeds a training step.
+            step: Optimizer step of the rollout; only read when Toggle budget
+                alternation is enabled.
+
+        Returns:
+            Generation-config overrides, or ``None`` when nothing is overridden.
+        """
+        overrides: dict[str, int] = {}
+        num_generations = getattr(self.arguments, "num_generations" if is_train else "num_generations_eval", None)
+        if num_generations is not None:
+            overrides["num_return_sequences"] = int(num_generations)
+        if is_train and self._toggle_budget_active(step):
+            overrides["max_new_tokens"] = int(self.arguments.toggle_max_completion_length)
+        return overrides or None
+
+    def _toggle_enabled(self) -> bool:
+        """Return whether Kimi Toggle budget alternation is configured."""
+        return int(getattr(self.arguments, "toggle_budget_interval", 0) or 0) > 0
+
+    def _toggle_budget_active(self, step: int | None) -> bool:
+        """Return whether ``step`` falls in a constrained-budget Toggle period.
+
+        Periods of ``toggle_budget_interval`` steps alternate between the full
+        completion budget (even periods) and ``toggle_max_completion_length``
+        (odd periods).
+        """
+        interval = int(getattr(self.arguments, "toggle_budget_interval", 0) or 0)
+        if interval <= 0 or step is None:
+            return False
+        return (int(step) // interval) % 2 == 1
+
+    def _full_completion_width(self) -> int:
+        """Completion width produced by an unconstrained rollout."""
+        return int(getattr(self.arguments, "generation_max_new_tokens", None) or self.arguments.max_completion_length)
+
+    def _pad_rollout_to_completion_width(self, results: GenerationResults, width: int) -> GenerationResults:
+        """Right-pad a budget-constrained rollout to ``width`` completion tokens.
+
+        Keeps the compiled GRPO step shapes fixed while Toggle shortens the
+        generation budget; padded tokens are masked out and carry zero
+        sampling log-probabilities.
+        """
+        pad = width - int(results.completion_ids.shape[1])
+        if pad <= 0:
+            return results
+        pad_token_id = int(self._pad_token_id or 0)
+
+        def right_pad(value: jax.Array | None, fill: float) -> jax.Array | None:
+            if value is None:
                 return None
-            return {"num_return_sequences": int(num_generations)}
-        num_generations_eval = getattr(self.arguments, "num_generations_eval", None)
-        if num_generations_eval is None:
-            return None
-        return {"num_return_sequences": int(num_generations_eval)}
+            return jnp.pad(value, ((0, 0), (0, pad)), constant_values=fill)
+
+        completion_mask = results.completion_mask
+        if completion_mask is None:
+            completion_mask = jnp.ones_like(results.completion_ids, dtype=jnp.int32)
+
+        return results._replace(
+            completion_ids=right_pad(results.completion_ids, pad_token_id),
+            completion_mask=right_pad(completion_mask, 0),
+            sequences=right_pad(results.sequences, pad_token_id),
+            sampling_per_token_logps=right_pad(results.sampling_per_token_logps, 0.0),
+        )
 
     def _select_completion_log_rows(
         self,
@@ -1057,6 +1584,86 @@ class GRPOTrainer(Trainer):
             self._write_completion_log_rows(rows, step=step)
         return rows
 
+    @staticmethod
+    def _cleanup_completion_hub_resources(
+        scheduler: object | None,
+        staging: TemporaryDirectory | None,
+    ) -> None:
+        """Stop a Hub completion CommitScheduler and delete any temporary staging directory."""
+        if scheduler is not None:
+            stop_fn = getattr(scheduler, "stop", None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception as exc:  # pragma: no cover - best-effort cleanup
+                    logger.debug("Failed to stop completion commit scheduler: %s", exc)
+            last_future = getattr(scheduler, "last_future", None)
+            if last_future is not None and callable(getattr(last_future, "done", None)) and not last_future.done():
+                try:
+                    last_future.result(timeout=5.0)
+                except Exception:  # pragma: no cover - best-effort flush
+                    pass
+        if staging is not None:
+            try:
+                staging.cleanup()
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.debug("Failed to clean up completion hub staging directory: %s", exc)
+
+    def close_completion_hub_logging(self) -> None:
+        """Stop the background Hub completion scheduler and remove temporary staging files."""
+        finalizer = getattr(self, "_completion_hub_finalizer", None)
+        self._completion_hub_finalizer = None
+        if finalizer is not None:
+            finalizer.detach()
+        scheduler = getattr(self, "_completion_commit_scheduler", None)
+        staging = getattr(self, "_completion_hub_staging", None)
+        self._completion_commit_scheduler = None
+        self._completion_hub_staging = None
+        self._completion_hub_dir = None
+        self._cleanup_completion_hub_resources(scheduler, staging)
+
+    def finish(self) -> None:
+        """Release GRPO Hub completion logging resources before base trainer teardown."""
+        try:
+            self.close_completion_hub_logging()
+        finally:
+            super().finish()
+
+    def _prune_completion_hub_staging(self, *, max_staged_files: int = 32) -> None:
+        """Prune uploaded and excess staging parquets inside the remote Hub staging tempdir."""
+        staging = getattr(self, "_completion_hub_staging", None)
+        hub_dir = getattr(self, "_completion_hub_dir", None)
+        if staging is None or hub_dir is None:
+            return
+        scheduler = getattr(self, "_completion_commit_scheduler", None)
+        lock = getattr(scheduler, "lock", None)
+        lock_ctx = lock if lock is not None else contextlib.nullcontext()
+        with lock_ctx:
+            resolved_hub_dir = hub_dir.resolve()
+            last_uploaded = getattr(scheduler, "last_uploaded", None)
+            if isinstance(last_uploaded, dict):
+                for uploaded_path in list(last_uploaded.keys()):
+                    try:
+                        candidate = Path(uploaded_path)
+                        if candidate.parent.resolve() == resolved_hub_dir and candidate.exists():
+                            candidate.unlink(missing_ok=True)
+                            last_uploaded.pop(uploaded_path, None)
+                    except OSError:
+                        pass
+            try:
+                staged_files = [p for p in hub_dir.glob("*.parquet") if p.is_file()]
+            except OSError:
+                return
+            if len(staged_files) > max_staged_files:
+                staged_files.sort(key=lambda p: (p.stat().st_mtime, p.name))
+                for stale in staged_files[: len(staged_files) - max_staged_files]:
+                    try:
+                        stale.unlink(missing_ok=True)
+                        if isinstance(last_uploaded, dict):
+                            last_uploaded.pop(stale, None)
+                    except OSError:
+                        pass
+
     def _setup_completion_hub_logging(self) -> None:
         """Prepare local completion logs and optional Hub background uploads."""
         if not bool(getattr(self.arguments, "log_completions", False)):
@@ -1077,22 +1684,46 @@ class GRPOTrainer(Trainer):
         repo_id = self.arguments.log_completions_hub_repo
         if repo_id is None:
             return
+        if getattr(self, "_completion_commit_scheduler", None) is not None:
+            return
 
         from huggingface_hub import CommitScheduler, create_repo
 
+        staging: TemporaryDirectory | None = None
         if is_remote_path(completion_log_dir):
-            self._completion_hub_staging = TemporaryDirectory(prefix="easydel-completions-")
-            completion_log_dir = Path(self._completion_hub_staging.name)
+            staging = TemporaryDirectory(prefix="easydel-completions-")
+            hub_dir = Path(staging.name)
         else:
-            completion_log_dir = Path(str(completion_log_dir))
-        self._completion_hub_dir = completion_log_dir
-        create_repo(repo_id, repo_type="dataset", exist_ok=True)
-        self._completion_commit_scheduler = CommitScheduler(
-            repo_id=repo_id,
-            repo_type="dataset",
-            folder_path=completion_log_dir,
-            every=2,
-            allow_patterns=["*.parquet"],
+            hub_dir = Path(str(completion_log_dir))
+
+        try:
+            create_repo(repo_id, repo_type="dataset", exist_ok=True)
+            scheduler = CommitScheduler(
+                repo_id=repo_id,
+                repo_type="dataset",
+                folder_path=hub_dir,
+                every=2,
+                allow_patterns=["*.parquet"],
+            )
+        except BaseException:
+            if staging is not None:
+                try:
+                    staging.cleanup()
+                except Exception:
+                    pass
+            self._completion_hub_staging = None
+            self._completion_hub_dir = None
+            self._completion_commit_scheduler = None
+            raise
+
+        self._completion_hub_staging = staging
+        self._completion_hub_dir = hub_dir
+        self._completion_commit_scheduler = scheduler
+        self._completion_hub_finalizer = weakref.finalize(
+            self,
+            self._cleanup_completion_hub_resources,
+            scheduler,
+            staging,
         )
 
     def _write_completion_log_rows(self, rows: list[dict[str, object]], *, step: int | None) -> UniversalPath | None:
@@ -1122,14 +1753,36 @@ class GRPOTrainer(Trainer):
         parquet_bytes = pd.DataFrame(enriched_rows).to_parquet(index=False)
         path.write_bytes(parquet_bytes)
         hub_dir = getattr(self, "_completion_hub_dir", None)
-        if hub_dir is not None and is_remote_path(path):
-            (hub_dir / filename).write_bytes(parquet_bytes)
-
         scheduler = getattr(self, "_completion_commit_scheduler", None)
+        if hub_dir is not None and is_remote_path(path):
+            self._prune_completion_hub_staging()
+            lock = getattr(scheduler, "lock", None)
+            lock_ctx = lock if lock is not None else contextlib.nullcontext()
+            with lock_ctx:
+                (hub_dir / filename).write_bytes(parquet_bytes)
+            self._prune_completion_hub_staging()
+
         trigger = getattr(scheduler, "trigger", None)
         if callable(trigger):
             trigger()
         return path
+
+    @staticmethod
+    def _broadcast_host_object(obj: tp.Any) -> tp.Any:
+        """Broadcast a Python object from process 0 to all hosts on multi-host meshes."""
+        if int(jax.process_count()) <= 1:
+            return obj
+        is_primary = int(jax.process_index()) == 0
+        payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL) if is_primary else b""
+        length = int(multihost_utils.broadcast_one_to_all(np.asarray(len(payload), dtype=np.int64)))
+        if length == 0:
+            return None
+        if is_primary:
+            buf = np.frombuffer(payload, dtype=np.uint8).copy()
+        else:
+            buf = np.zeros((length,), dtype=np.uint8)
+        synced = np.asarray(multihost_utils.broadcast_one_to_all(buf), dtype=np.uint8)
+        return pickle.loads(synced.tobytes())
 
     def _maybe_run_tool_call_generation_loop(
         self,
@@ -1146,6 +1799,15 @@ class GRPOTrainer(Trainer):
         visible_texts = self._coerce_generation_texts(results.text, fallback=raw_texts)
         target_len = int(results.completion_ids.shape[0])
         tool_call_records = self._coerce_generation_metadata_list(results.tool_calls, target_len=target_len)
+        finish_reason_records = self._coerce_generation_metadata_list(
+            getattr(results, "finish_reason", None),
+            target_len=target_len,
+        )
+        # Synchronize tool-call state from process 0 on multi-host meshes so every
+        # host enters and exits collective `self.rollout(...)` calls in lockstep.
+        if int(jax.process_count()) > 1:
+            tool_call_records = self._broadcast_host_object(tool_call_records)
+            finish_reason_records = self._broadcast_host_object(finish_reason_records)
         if not any(tool_call_records):
             return results, completion_mask
 
@@ -1180,95 +1842,186 @@ class GRPOTrainer(Trainer):
         if len(completion_prompts) < target_len:
             completion_prompts = [*completion_prompts, *([None] * (target_len - len(completion_prompts)))]
 
+        # Follow-up requests condition on exact tokens: the prompt row's real ids, then the completion so far.
+        host_prompt_ids = np.asarray(jax.device_get(results.prompt_ids), dtype=np.int32)
+        host_prompt_mask = np.asarray(jax.device_get(results.prompt_mask), dtype=np.int32)
+        if host_prompt_ids.ndim == 1:
+            host_prompt_ids = host_prompt_ids[None, :]
+            host_prompt_mask = host_prompt_mask[None, :]
+        rows_per_prompt = max(target_len // max(host_prompt_ids.shape[0], 1), 1)
+        prompt_token_rows = [
+            [int(token) for token in ids[keep.astype(bool)]]
+            for ids, keep in zip(host_prompt_ids, host_prompt_mask, strict=True)
+        ]
+
         active_indices = [idx for idx, calls in enumerate(tool_call_records) if calls]
         max_iterations = self.arguments.max_tool_calling_iterations
         if max_iterations is None:
             max_iterations = max_completion_length
 
+        is_multihost = int(jax.process_count()) > 1
+        is_primary = int(jax.process_index()) == 0
+
         iteration = 0
-        while active_indices and iteration < max_iterations:
-            loop_prompts: list[str] = []
-            loop_indices: list[int] = []
-            for idx in active_indices:
-                observation = self._execute_tool_calls_as_observation(tool_call_records[idx])
-                if not observation:
-                    continue
+        ran_followup_rollout = False
+        try:
+            while active_indices and iteration < max_iterations:
+                if not is_multihost or is_primary:
+                    observations_by_idx: dict[int, str] = {}
+                    for idx in active_indices:
+                        obs = self._execute_tool_calls_as_observation(tool_call_records[idx])
+                        if obs:
+                            observations_by_idx[idx] = obs
+                else:
+                    observations_by_idx = {}
+                if is_multihost:
+                    observations_by_idx = self._broadcast_host_object(observations_by_idx)
 
-                observation_text = f"\n{observation}\n"
-                observation_tokens = self._encode_tool_loop_fragment(observation_text)
-                remaining = max_completion_length - len(completion_rows[idx])
-                if remaining <= 0:
-                    continue
-                observation_tokens = observation_tokens[:remaining]
-                completion_rows[idx].extend(observation_tokens)
-                completion_mask_rows[idx].extend([0] * len(observation_tokens))
-                if sampling_rows is not None:
-                    sampling_rows[idx].extend([0.0] * len(observation_tokens))
-                raw_texts[idx] = f"{raw_texts[idx]}{observation_text}"
-                visible_texts[idx] = f"{visible_texts[idx]}{observation_text}"
+                loop_prompts: list[str] = []
+                loop_indices: list[int] = []
+                for idx in active_indices:
+                    observation = observations_by_idx.get(idx)
+                    if not observation:
+                        continue
 
-                remaining = max_completion_length - len(completion_rows[idx])
-                if remaining <= 0:
-                    continue
-                prompt_text = self._completion_prompt_to_text(completion_prompts[idx])
-                loop_prompts.append(f"{prompt_text}{raw_texts[idx]}")
-                loop_indices.append(idx)
+                    observation_text = f"\n{observation}\n"
+                    observation_tokens = self._encode_tool_loop_fragment(observation_text)
+                    remaining = max_completion_length - len(completion_rows[idx])
+                    if remaining <= 0:
+                        finish_reason_records[idx] = "length"
+                        continue
+                    if len(observation_tokens) >= remaining:
+                        observation_tokens = observation_tokens[:remaining]
+                        finish_reason_records[idx] = "length"
+                    completion_rows[idx].extend(observation_tokens)
+                    completion_mask_rows[idx].extend([0] * len(observation_tokens))
+                    if sampling_rows is not None:
+                        sampling_rows[idx].extend([0.0] * len(observation_tokens))
+                    raw_texts[idx] = f"{raw_texts[idx]}{observation_text}"
+                    visible_texts[idx] = f"{visible_texts[idx]}{observation_text}"
 
-            if not loop_prompts:
-                break
+                    remaining = max_completion_length - len(completion_rows[idx])
+                    if remaining <= 0:
+                        finish_reason_records[idx] = "length"
+                        continue
+                    prompt_text = self._completion_prompt_to_text(completion_prompts[idx])
+                    loop_prompts.append(f"{prompt_text}{raw_texts[idx]}")
+                    loop_indices.append(idx)
 
-            max_new_tokens = max(max_completion_length - len(completion_rows[idx]) for idx in loop_indices)
-            followup_results = self.rollout(
-                prompts=loop_prompts,
-                state=state,
-                apply_chat_template=False,
-                shard_inputs=True,
-                all_gather=False,
-                release_runtime_after_generation=False,
-                config_overrides={
-                    "max_new_tokens": max_new_tokens,
-                    "num_return_sequences": 1,
-                },
-            )
-            followup_mask = np.asarray(jax.device_get(followup_results.completion_mask), dtype=np.int32)
-            followup_ids = np.asarray(jax.device_get(followup_results.completion_ids), dtype=np.int32)
-            followup_raw = self._coerce_generation_texts(followup_results.raw_text, fallback=followup_results.text)
-            followup_visible = self._coerce_generation_texts(followup_results.text, fallback=followup_raw)
-            followup_tool_calls = self._coerce_generation_metadata_list(
-                followup_results.tool_calls,
-                target_len=len(loop_indices),
-            )
+                if is_multihost:
+                    synced_step = self._broadcast_host_object(
+                        (
+                            loop_indices,
+                            loop_prompts,
+                            [prompt_token_rows[idx // rows_per_prompt] + completion_rows[idx] for idx in loop_indices],
+                            max((max_completion_length - len(completion_rows[idx]) for idx in loop_indices), default=0),
+                        )
+                    )
+                    loop_indices, loop_prompts, loop_token_rows, max_new_tokens = synced_step
+                else:
+                    loop_token_rows = [
+                        prompt_token_rows[idx // rows_per_prompt] + completion_rows[idx] for idx in loop_indices
+                    ]
+                    max_new_tokens = max(
+                        (max_completion_length - len(completion_rows[idx]) for idx in loop_indices),
+                        default=0,
+                    )
 
-            followup_logps = getattr(followup_results, "sampling_per_token_logps", None)
-            if followup_logps is None:
-                sampling_rows = None
-            else:
-                followup_logps = np.asarray(jax.device_get(followup_logps), dtype=np.float32)
-            next_active: list[int] = []
-            for row, idx in enumerate(loop_indices):
-                remaining = max_completion_length - len(completion_rows[idx])
-                if remaining <= 0:
-                    continue
-                active_tokens = [
-                    int(token)
-                    for token, keep in zip(followup_ids[row].tolist(), followup_mask[row].tolist(), strict=True)
-                    if keep
-                ][:remaining]
-                completion_rows[idx].extend(active_tokens)
-                completion_mask_rows[idx].extend([1] * len(active_tokens))
-                if sampling_rows is not None:
-                    sampled = followup_logps[row][followup_mask[row].astype(bool)][:remaining]
-                    sampling_rows[idx].extend(sampled.tolist())
-                if row < len(followup_raw):
-                    raw_texts[idx] = f"{raw_texts[idx]}{followup_raw[row]}"
-                if row < len(followup_visible):
-                    visible_texts[idx] = f"{visible_texts[idx]}{followup_visible[row]}"
-                tool_call_records[idx] = followup_tool_calls[row]
-                if followup_tool_calls[row] and len(completion_rows[idx]) < max_completion_length:
-                    next_active.append(idx)
+                if not loop_prompts or max_new_tokens <= 0:
+                    break
 
-            active_indices = next_active
-            iteration += 1
+                length_bound = generation_length_bound(self.arguments)
+                if length_bound > 1:
+                    max_loop_prompt = length_bound - 1
+                    loop_token_rows = [
+                        row[-max_loop_prompt:] if len(row) > max_loop_prompt else row for row in loop_token_rows
+                    ]
+                loop_width = max(len(row) for row in loop_token_rows)
+                max_new_tokens = clamp_new_tokens_to_bound(
+                    self.arguments,
+                    prompt_len=loop_width,
+                    max_new_tokens=max_new_tokens,
+                )
+                loop_input_ids = np.asarray(
+                    [[pad_token_id] * (loop_width - len(row)) + row for row in loop_token_rows], dtype=np.int32
+                )
+                loop_attention_mask = np.asarray(
+                    [[0] * (loop_width - len(row)) + [1] * len(row) for row in loop_token_rows], dtype=np.int32
+                )
+                ran_followup_rollout = True
+                followup_results = self.rollout(
+                    input_ids=loop_input_ids,
+                    attention_mask=loop_attention_mask,
+                    prompts=loop_prompts,
+                    state=state,
+                    apply_chat_template=False,
+                    shard_inputs=True,
+                    all_gather=False,
+                    release_runtime_after_generation=False,
+                    config_overrides={
+                        "max_new_tokens": max_new_tokens,
+                        "num_return_sequences": 1,
+                    },
+                )
+                followup_mask = np.asarray(jax.device_get(followup_results.completion_mask), dtype=np.int32)
+                followup_ids = np.asarray(jax.device_get(followup_results.completion_ids), dtype=np.int32)
+                followup_raw = self._coerce_generation_texts(followup_results.raw_text, fallback=followup_results.text)
+                followup_visible = self._coerce_generation_texts(followup_results.text, fallback=followup_raw)
+                followup_tool_calls = self._coerce_generation_metadata_list(
+                    followup_results.tool_calls,
+                    target_len=len(loop_indices),
+                )
+                followup_finish_reasons = self._coerce_generation_metadata_list(
+                    getattr(followup_results, "finish_reason", None),
+                    target_len=len(loop_indices),
+                )
+                if is_multihost:
+                    followup_tool_calls = self._broadcast_host_object(followup_tool_calls)
+                    followup_finish_reasons = self._broadcast_host_object(followup_finish_reasons)
+
+                followup_logps = getattr(followup_results, "sampling_per_token_logps", None)
+                if followup_logps is None:
+                    sampling_rows = None
+                else:
+                    followup_logps = np.asarray(jax.device_get(followup_logps), dtype=np.float32)
+                next_active: list[int] = []
+                for row, idx in enumerate(loop_indices):
+                    remaining = max_completion_length - len(completion_rows[idx])
+                    if remaining <= 0:
+                        finish_reason_records[idx] = "length"
+                        continue
+                    raw_active_tokens = [
+                        int(token)
+                        for token, keep in zip(followup_ids[row].tolist(), followup_mask[row].tolist(), strict=True)
+                        if keep
+                    ]
+                    truncated_by_budget = len(raw_active_tokens) > remaining
+                    active_tokens = raw_active_tokens[:remaining]
+                    completion_rows[idx].extend(active_tokens)
+                    completion_mask_rows[idx].extend([1] * len(active_tokens))
+                    if sampling_rows is not None:
+                        sampled = followup_logps[row][followup_mask[row].astype(bool)][:remaining]
+                        sampling_rows[idx].extend(sampled.tolist())
+                    if row < len(followup_raw):
+                        raw_texts[idx] = f"{raw_texts[idx]}{followup_raw[row]}"
+                    if row < len(followup_visible):
+                        visible_texts[idx] = f"{visible_texts[idx]}{followup_visible[row]}"
+                    tool_call_records[idx] = followup_tool_calls[row]
+                    row_finish_reason = followup_finish_reasons[row] if row < len(followup_finish_reasons) else None
+                    if truncated_by_budget or row_finish_reason == "length":
+                        finish_reason_records[idx] = "length"
+                    elif row_finish_reason is not None:
+                        finish_reason_records[idx] = row_finish_reason
+                    if followup_tool_calls[row] and len(completion_rows[idx]) < max_completion_length:
+                        next_active.append(idx)
+
+                active_indices = next_active
+                iteration += 1
+        finally:
+            if ran_followup_rollout and state is not None:
+                release_runtime = getattr(self, "release_generation_runtime", None)
+                if callable(release_runtime):
+                    release_runtime(state=state)
 
         padded_ids = []
         padded_masks = []
@@ -1287,9 +2040,11 @@ class GRPOTrainer(Trainer):
         generation_factor = max(generation_factor, 1)
         prompt_rows = results.prompt_ids.repeat(generation_factor, 0)
         sequences = jnp.concatenate([prompt_rows, completion_ids], axis=-1)
-        sampling_updates = {}
+        extra_updates: dict[str, tp.Any] = {}
+        if hasattr(results, "finish_reason"):
+            extra_updates["finish_reason"] = finish_reason_records
         if hasattr(results, "sampling_per_token_logps"):
-            sampling_updates["sampling_per_token_logps"] = (
+            extra_updates["sampling_per_token_logps"] = (
                 None
                 if sampling_rows is None
                 else jnp.asarray(
@@ -1310,7 +2065,7 @@ class GRPOTrainer(Trainer):
                 text=visible_texts,
                 raw_text=raw_texts,
                 tool_calls=tool_call_records,
-                **sampling_updates,
+                **extra_updates,
             ),
             completion_mask,
         )
@@ -1321,6 +2076,61 @@ class GRPOTrainer(Trainer):
         return NamedSharding(
             mesh=self.model.mesh,
             spec=self.arguments.step_partition_spec,
+        )
+
+    def _grpo_step_static_args(
+        self,
+        *,
+        num_generations: int,
+        is_train: bool,
+        straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None,
+    ) -> tuple[tp.Any, ...]:
+        """Positional static arguments bound to :func:`grpo_step` after ``(state, batch)``.
+
+        The order matches ``grpo_step``'s signature from ``num_generations`` onward.
+
+        Args:
+            num_generations: Completions per prompt for this phase.
+            is_train: Whether the tuple drives the training (``True``) or evaluation step.
+            straight_through_emulator: Optional QAT straight-through emulator.
+
+        Returns:
+            The static-argument tuple.
+        """
+        return (
+            num_generations,
+            self.arguments.beta,
+            self.arguments.loss_config,
+            self.scheduler,
+            self.arguments.step_partition_spec,
+            self.arguments.gradient_accumulation_steps if is_train else 1,
+            is_train,
+            self.loss_type,
+            self.epsilon,
+            self.epsilon_high,
+            self.delta,
+            self.importance_sampling_level,
+            self.top_entropy_quantile,
+            self.arguments.completion_chunk_size,
+            self.arguments.max_loss_completion_tokens,
+            self.arguments.logprob_vocab_chunk_size,
+            self.arguments.sapo_temperature_pos,
+            self.arguments.sapo_temperature_neg,
+            self.arguments.vespo_k_pos,
+            self.arguments.vespo_lambda_pos,
+            self.arguments.vespo_k_neg,
+            self.arguments.vespo_lambda_neg,
+            self.arguments.off_policy_mask_threshold,
+            self.arguments.use_bias_correction_kl,
+            straight_through_emulator,
+            getattr(self.arguments, "divergence_type", None) if self.loss_type == "dppo" else None,
+            getattr(self.arguments, "clip_ratio_c", 20.0),
+            self.kl_estimator,
+            self.arguments.off_policy_k3_threshold,
+            self.arguments.off_policy_min_acceptance,
+            self.arguments.startup_behavior_k3_max,
+            self.arguments.startup_behavior_tail_fraction_max,
+            bool(getattr(self.arguments, "prefix_shared_forward", False)),
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
@@ -1351,37 +2161,13 @@ class GRPOTrainer(Trainer):
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
 
-        self._train_shared_fn_static_args = (
-            self.num_generations,
-            self.arguments.beta,
-            self.arguments.loss_config,
-            self.scheduler,
-            self.arguments.step_partition_spec,
-            self.arguments.gradient_accumulation_steps,
-            True,  # is_train
-            self.loss_type,
-            self.epsilon,
-            self.epsilon_high,
-            self.delta,
-            self.importance_sampling_level,
-            self.top_entropy_quantile,
-            self.arguments.completion_chunk_size,
-            self.arguments.max_loss_completion_tokens,
-            self.arguments.logprob_vocab_chunk_size,
-            self.arguments.sapo_temperature_pos,
-            self.arguments.sapo_temperature_neg,
-            self.arguments.vespo_k_pos,
-            self.arguments.vespo_lambda_pos,
-            self.arguments.vespo_k_neg,
-            self.arguments.vespo_lambda_neg,
-            self.arguments.off_policy_mask_threshold,
-            self.arguments.use_bias_correction_kl,
-            straight_through_emulator,
-            getattr(self.arguments, "divergence_type", None) if self.loss_type == "dppo" else None,
-            getattr(self.arguments, "clip_ratio_c", 20.0),
+        self._train_shared_fn_static_args = self._grpo_step_static_args(
+            num_generations=self.num_generations,
+            is_train=True,
+            straight_through_emulator=straight_through_emulator,
         )
 
-        static_argnames = tuple(range(2, 29))
+        static_argnames = tuple(range(2, 2 + len(self._train_shared_fn_static_args)))
 
         self._runtime_trace("train.compile_wrapper.begin")
         sharded_training_step_function = compile_trainer_step(
@@ -1396,40 +2182,16 @@ class GRPOTrainer(Trainer):
         )
         self._runtime_trace("train.compile_wrapper.end")
 
-        self._eval_shared_fn_static_args = (
-            self.eval_num_generations,
-            self.arguments.beta,
-            self.arguments.loss_config,
-            self.scheduler,
-            self.arguments.step_partition_spec,
-            self.arguments.gradient_accumulation_steps,
-            False,  # is_train
-            self.loss_type,
-            self.epsilon,
-            self.epsilon_high,
-            self.delta,
-            self.importance_sampling_level,
-            self.top_entropy_quantile,
-            self.arguments.completion_chunk_size,
-            self.arguments.max_loss_completion_tokens,
-            self.arguments.logprob_vocab_chunk_size,
-            self.arguments.sapo_temperature_pos,
-            self.arguments.sapo_temperature_neg,
-            self.arguments.vespo_k_pos,
-            self.arguments.vespo_lambda_pos,
-            self.arguments.vespo_k_neg,
-            self.arguments.vespo_lambda_neg,
-            self.arguments.off_policy_mask_threshold,
-            self.arguments.use_bias_correction_kl,
-            straight_through_emulator,
-            getattr(self.arguments, "divergence_type", None) if self.loss_type == "dppo" else None,
-            getattr(self.arguments, "clip_ratio_c", 20.0),
+        self._eval_shared_fn_static_args = self._grpo_step_static_args(
+            num_generations=self.eval_num_generations,
+            is_train=False,
+            straight_through_emulator=straight_through_emulator,
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             grpo_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnames,
             mesh=self.model.mesh,
@@ -1438,62 +2200,71 @@ class GRPOTrainer(Trainer):
         )
         self._runtime_trace("eval.compile_wrapper.end")
 
-        def _compute_refmodel_logps(graphtree, graphother, ids, mask, model_kwargs=None, graphdef=None):
-            """Sharded reference-model per-token log-prob forward.
-
-            Stops gradients through the reference parameters, applies
-            the trainer's step partition spec, and dispatches to
-            :func:`get_per_token_logps` with the configured vocab chunk
-            size.
-
-            Args:
-                graphtree: Reference trainable graphstate.
-                graphother: Reference frozen graphother.
-                ids: Token id array ``[batch, seq_len]``.
-                mask: Attention mask ``[batch, seq_len]``.
-                model_kwargs: Optional dict of additional model kwargs
-                    (forwarded after normalization).
-                graphdef: Reference graphdef captured via partial.
-
-            Returns:
-                ``[batch, seq_len]`` reference log-probabilities.
-            """
-            graphother = jax.tree_util.tree_map(
-                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
-                graphother,
-            )
-            apply = spx.bind(graphdef, graphtree.merge(graphother, copy=False))
-            with apply.mesh:
-                ids = with_sharding_constraint(
-                    ids,
-                    self.arguments.step_partition_spec,
-                    mesh=apply.mesh,
-                    ignore_mpmd=True,
-                )
-                mask = with_sharding_constraint(
-                    mask,
-                    self.arguments.step_partition_spec,
-                    mesh=apply.mesh,
-                    ignore_mpmd=True,
-                )
-                model_kwargs = normalize_generation_model_kwargs(
-                    model_kwargs,
-                    model_callable=getattr(apply, "forward", apply),
-                )
-                return get_per_token_logps(
-                    apply,
-                    ids,
-                    mask,
-                    self.arguments.max_prompt_length,
-                    model_kwargs=model_kwargs,
-                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
-                )
-
         if self.ref_state is not None:
-            self.compute_refmodel_logps = compile_trainer_step(
-                partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
+            ref_graphdef = self.ref_state.graphdef
+            ref_model_callable = getattr(self.model, "forward", self.model)
+
+            def _compute_refmodel_logps(
+                graphtree,
+                graphother,
+                ids,
+                mask,
+                model_kwargs,
+                prompt_length: int,
+            ):
+                """Sharded reference-model per-token log-prob forward.
+
+                Stops gradients through the reference parameters, applies
+                the trainer's step partition spec, and dispatches to
+                :func:`get_per_token_logps` with the runtime ``prompt_length`` and
+                configured vocab chunk size.
+
+                Args:
+                    graphtree: Reference trainable graphstate.
+                    graphother: Reference frozen graphother.
+                    ids: Token id array ``[batch, seq_len]``.
+                    mask: Attention mask ``[batch, seq_len]``.
+                    model_kwargs: Normalized dict of additional model kwargs.
+                    prompt_length: Static runtime prompt width ``prompt_ids.shape[-1]``.
+
+                Returns:
+                    ``[batch, seq_len - prompt_length]`` reference log-probabilities.
+                """
+                graphother = jax.tree_util.tree_map(
+                    lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                    graphother,
+                )
+                apply = spx.bind(ref_graphdef, graphtree.merge(graphother, copy=False))
+                with apply.mesh:
+                    ids = with_sharding_constraint(
+                        ids,
+                        self.arguments.step_partition_spec,
+                        mesh=apply.mesh,
+                        ignore_mpmd=True,
+                    )
+                    mask = with_sharding_constraint(
+                        mask,
+                        self.arguments.step_partition_spec,
+                        mesh=apply.mesh,
+                        ignore_mpmd=True,
+                    )
+                    normalized_kwargs = normalize_generation_model_kwargs(
+                        model_kwargs,
+                        model_callable=getattr(apply, "forward", apply),
+                    )
+                    return get_per_token_logps(
+                        apply,
+                        ids,
+                        mask,
+                        prompt_length,
+                        model_kwargs=normalized_kwargs,
+                        logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                    )
+
+            compiled_refmodel_logps = compile_trainer_step(
+                _compute_refmodel_logps,
                 mesh=mesh,
-                static_argnames=("graphdef"),
+                static_argnums=(5,),
                 in_shardings=(
                     self.ref_state.shardings.graphstate,
                     self.ref_state.shardings.graphother,
@@ -1503,6 +2274,32 @@ class GRPOTrainer(Trainer):
                 ),
                 out_shardings=empty_sharding,
             )
+
+            def _call_refmodel_logps(
+                graphtree,
+                graphother,
+                ids,
+                mask,
+                model_kwargs=None,
+                prompt_length: int | None = None,
+            ):
+                resolved_prompt_length = (
+                    self.arguments.max_prompt_length if prompt_length is None else int(prompt_length)
+                )
+                normalized_kwargs = normalize_generation_model_kwargs(
+                    model_kwargs,
+                    model_callable=ref_model_callable,
+                )
+                return compiled_refmodel_logps(
+                    graphtree,
+                    graphother,
+                    ids,
+                    mask,
+                    normalized_kwargs,
+                    resolved_prompt_length,
+                )
+
+            self.compute_refmodel_logps = _call_refmodel_logps
         else:
             # beta == 0: no reference model, so no reference-logps function.
             self.compute_refmodel_logps = None
@@ -1612,12 +2409,20 @@ class GRPOTrainer(Trainer):
         log_ratio = policy_logps.astype(jnp.float32) - sampling_logps.astype(jnp.float32)
         mode = self.arguments.esurge_importance_sampling_mode
         cap = float(self.arguments.esurge_importance_sampling_cap)
+        cap_low = getattr(self.arguments, "esurge_importance_sampling_cap_low", None)
         if mode.startswith("sequence_"):
             log_ratio = jnp.sum(jnp.where(completion_mask > 0, log_ratio, 0.0), axis=-1, keepdims=True)
+        log_cap = jnp.log(cap)
         if mode.endswith("_truncate"):
-            ratio = jnp.exp(jnp.minimum(log_ratio, jnp.log(cap)))
+            ratio = jnp.exp(jnp.minimum(log_ratio, log_cap))
+        elif mode.endswith("_log_mask"):
+            ratio = (jnp.abs(log_ratio) <= log_cap).astype(jnp.float32)
+        elif mode.endswith("_icepop"):
+            log_cap_low = -log_cap if cap_low is None else jnp.log(float(cap_low))
+            in_band = (log_ratio >= log_cap_low) & (log_ratio <= log_cap)
+            ratio = jnp.where(in_band, jnp.exp(jnp.clip(log_ratio, log_cap_low, log_cap)), 0.0)
         else:
-            ratio = jnp.where(log_ratio <= jnp.log(cap), jnp.exp(jnp.minimum(log_ratio, jnp.log(cap))), 0.0)
+            ratio = jnp.where(log_ratio <= log_cap, jnp.exp(jnp.minimum(log_ratio, log_cap)), 0.0)
         if mode.startswith("token_"):
             ratio = jnp.where(completion_mask > 0, ratio, 1.0)
         return jax.lax.stop_gradient(ratio)
@@ -1625,6 +2430,102 @@ class GRPOTrainer(Trainer):
     def _select_rollout_indices(self, completion_ids, completion_mask, rewards, generation_factor):
         """Optionally select completion rows before computing final advantages."""
         return None
+
+    def _should_compute_old_per_token_logps(
+        self,
+        *,
+        is_train: bool,
+        needs_dppo: bool,
+        needs_esurge_correction: bool,
+        needs_off_policy_mask: bool,
+    ) -> bool:
+        """Return whether training preprocessing should snapshot ``old_per_token_logps``."""
+        return bool(
+            is_train
+            and (
+                self._generation_reuse_span() > 1
+                or needs_dppo
+                or needs_esurge_correction
+                or needs_off_policy_mask
+            )
+        )
+
+    def _call_compute_refmodel_logps(
+        self,
+        graphstate,
+        graphother,
+        ids,
+        mask,
+        model_kwargs,
+        *,
+        prompt_length: int,
+    ):
+        """Invoke ``compute_refmodel_logps`` positionally when supported, with safe fallbacks.
+
+        Prefers a 6-argument positional call whenever ``compute_refmodel_logps``
+        accepts ``prompt_length`` as its 6th positional parameter, avoiding JAX's
+        ``ValueError: pjit does not support kwargs when in_shardings is specified``
+        on compiled callables. Falls back to keyword dispatch for keyword-only
+        ``prompt_length`` / ``**kwargs`` callables, and to the legacy 5-argument
+        signature when ``prompt_length`` is unsupported or rejected by ``pjit``.
+        """
+        fn = self.compute_refmodel_logps
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            sig = None
+
+        call_mode = "positional"
+        has_var_positional = False
+        if sig is not None:
+            params = list(sig.parameters.values())
+            positional_params = [
+                p
+                for p in params
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            has_var_positional = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params)
+            has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+            prompt_param = sig.parameters.get("prompt_length")
+
+            if prompt_param is not None:
+                if prompt_param.kind is inspect.Parameter.KEYWORD_ONLY:
+                    call_mode = "keyword"
+                elif len(positional_params) >= 6 and positional_params[5].name == "prompt_length":
+                    call_mode = "positional"
+                else:
+                    call_mode = "keyword"
+            elif has_var_keyword:
+                call_mode = "keyword"
+            elif has_var_positional:
+                call_mode = "positional"
+            else:
+                call_mode = "legacy5"
+
+        if call_mode == "legacy5":
+            return fn(graphstate, graphother, ids, mask, model_kwargs)
+
+        if call_mode == "positional":
+            try:
+                return fn(graphstate, graphother, ids, mask, model_kwargs, prompt_length)
+            except TypeError as exc:
+                msg = str(exc)
+                if "positional argument" in msg or "prompt_length" in msg:
+                    return fn(graphstate, graphother, ids, mask, model_kwargs)
+                raise
+
+        try:
+            return fn(graphstate, graphother, ids, mask, model_kwargs, prompt_length=prompt_length)
+        except TypeError as exc:
+            if "prompt_length" in str(exc):
+                return fn(graphstate, graphother, ids, mask, model_kwargs)
+            raise
+        except ValueError as exc:
+            if "pjit does not support kwargs" in str(exc):
+                if has_var_positional:
+                    return fn(graphstate, graphother, ids, mask, model_kwargs, prompt_length)
+                return fn(graphstate, graphother, ids, mask, model_kwargs)
+            raise
 
     def _preprocess_batch_input(
         self,
@@ -1659,8 +2560,218 @@ class GRPOTrainer(Trainer):
         if is_train:
             cached = self._take_buffered_grpo_batch()
             if cached is not None:
-                return cached
+                return self._with_behavior_parity_gate(*cached)
 
+        scored = self._generate_and_score_batch(state, batch, is_train)
+        if is_train and bool(getattr(self.arguments, "dynamic_sampling", False)):
+            scored = self._apply_dynamic_sampling(state, batch, scored)
+        if is_train:
+            return self._with_behavior_parity_gate(*self._store_buffered_grpo_batch(scored.model_batch, scored.metrics))
+        return scored.model_batch, scored.metrics
+
+    def _accepts_batch_key(self, key: str) -> bool:
+        """Whether a subclass that whitelists model-batch keys (replay buffers) can carry ``key``.
+
+        Subclasses exposing ``_replay_known_batch_keys`` skip replay entirely when the batch holds
+        an unknown key, so optional side tensors are only attached once the subclass lists them.
+        Without the key the off-policy contract fails closed (gated steps are skipped).
+        """
+        known = getattr(self, "_replay_known_batch_keys", None)
+        if known is not None and key not in known():
+            return False
+        if key == "behavior_per_token_logps":
+            # Only carried when the off-policy contract is configured, so default batches keep their
+            # existing structure (downstream key whitelists, compiled shapes).
+            return any(
+                getattr(self.arguments, knob, None) is not None
+                for knob in ("off_policy_k3_threshold", "off_policy_min_acceptance", "startup_behavior_k3_max")
+            )
+        return True
+
+    def _with_behavior_parity_gate(
+        self,
+        model_batch: dict[str, jax.Array],
+        metrics: dict[str, float | int | str],
+    ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        """Attach the 0-dim ``behavior_parity_gate`` flag used by the first-step parity check.
+
+        The flag is ``1`` until the host-side check in :meth:`on_step_end` has run once and ``0``
+        afterwards; it is always present when ``startup_behavior_k3_max`` is set so the batch
+        structure (and the compiled step) never changes between steps.
+        """
+        if getattr(self.arguments, "startup_behavior_k3_max", None) is None:
+            return model_batch, metrics
+        model_batch = dict(model_batch)
+        pending = not bool(getattr(self, "_startup_behavior_parity_checked", False))
+        model_batch["behavior_parity_gate"] = jnp.asarray(int(pending), dtype=jnp.int32)
+        return model_batch, metrics
+
+    def _refresh_behavior_parity_gate_for_step(
+        self,
+        batch: dict[str, jax.Array],
+    ) -> dict[str, jax.Array]:
+        """Refresh ``behavior_parity_gate`` on the learner thread right before executing a step.
+
+        In ``async_mode=True``, background rollout workers can preprocess lookahead batches
+        before step 0 completes :meth:`on_step_end` (which sets
+        ``_startup_behavior_parity_checked = True``). Refreshing the 0-dim flag immediately
+        before step dispatch ensures step 0 enforces the startup parity gate while every
+        subsequent step (including prefetched lookahead batches) clears it to ``0`` without
+        altering the batch pytree structure.
+        """
+        if not isinstance(batch, collections.abc.Mapping):
+            return batch
+        if getattr(self.arguments, "startup_behavior_k3_max", None) is None:
+            return batch
+        pending = not bool(getattr(self, "_startup_behavior_parity_checked", False))
+        refreshed = dict(batch)
+        existing = refreshed.get("behavior_parity_gate")
+        if isinstance(existing, jax.Array):
+            refreshed["behavior_parity_gate"] = jnp.full_like(existing, int(pending), dtype=jnp.int32)
+        else:
+            refreshed["behavior_parity_gate"] = jnp.asarray(int(pending), dtype=jnp.int32)
+        return refreshed
+
+    def _apply_dynamic_sampling(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        scored: _ScoredRollout,
+    ) -> _ScoredRollout:
+        """Re-sample prompt groups whose rewards have zero variance (DAPO dynamic sampling).
+
+        The raw prompt batch is rolled out again up to
+        ``dynamic_sampling_max_attempts`` times in total. Each still-uninformative
+        group takes its rows from the first later attempt in which that group has
+        non-zero reward variance; advantages are then recomputed from the merged
+        rewards so batch-level normalisation stays consistent. Groups that remain
+        uninformative are removed from the loss by zeroing their completion mask,
+        which keeps every compiled shape fixed.
+
+        Args:
+            state: Current policy state used for the extra rollouts.
+            batch: Raw dataloader batch of the first rollout.
+            scored: First scored rollout of ``batch``.
+
+        Returns:
+            The merged rollout with ``dynamic_sampling/*`` metrics added.
+        """
+        model_batch = dict(scored.model_batch)
+        metrics = dict(scored.metrics)
+        rewards_per_func = scored.rewards_per_func
+        reward_weights = scored.reward_weights
+        num_rows = int(model_batch["completion_ids"].shape[0])
+        generation_factor = max(num_rows // max(int(model_batch["prompt_ids"].shape[0]), 1), 1)
+        aggregation = self.multi_objective_aggregation
+        discard_columns = self._discard_columns(int(rewards_per_func.shape[-1]))
+
+        def zero_variance(rewards: jax.Array) -> np.ndarray:
+            return _zero_variance_groups(
+                rewards_per_func=rewards,
+                reward_weights=reward_weights,
+                generation_factor=generation_factor,
+                multi_objective_aggregation=aggregation,
+                arguments=self.arguments,
+                discard_columns=discard_columns,
+            )
+
+        zero = zero_variance(rewards_per_func)
+        num_groups = max(int(zero.size), 1)
+        initial_zero = int(zero.sum())
+        attempts = 1
+        max_attempts = int(self.arguments.dynamic_sampling_max_attempts)
+        while zero.any() and attempts < max_attempts:
+            candidate = self._generate_and_score_batch(state, batch, True)
+            attempts += 1
+            metrics["generation_time"] = float(metrics.get("generation_time", 0.0)) + float(
+                candidate.metrics.get("generation_time", 0.0)
+            )
+            if (
+                candidate.model_batch["completion_ids"].shape != model_batch["completion_ids"].shape
+                or candidate.rewards_per_func.shape != rewards_per_func.shape
+            ):
+                continue
+            take = zero & ~zero_variance(candidate.rewards_per_func)
+            if not take.any():
+                continue
+            row_take = jnp.asarray(np.repeat(take, generation_factor))
+            for key in _COMPLETION_ALIGNED_BATCH_KEYS:
+                current = model_batch.get(key)
+                replacement = candidate.model_batch.get(key)
+                if key == "difficulty_weights" and current is not None and replacement is None:
+                    # A candidate without weights discarded nothing and carries no dataset weights, so
+                    # every row it contributes has the implicit weight 1. Keeping ``current`` would let a
+                    # resampled group inherit the zero weight of the discarded group it replaces.
+                    replacement = jnp.ones_like(current)
+                if current is None or replacement is None or current.shape != replacement.shape:
+                    continue
+                selector = row_take.reshape((num_rows,) + (1,) * (current.ndim - 1))
+                model_batch[key] = jnp.where(selector, replacement, current)
+            rewards_per_func = jnp.where(row_take[:, None], candidate.rewards_per_func, rewards_per_func)
+            zero = zero & ~take
+
+        resampled = initial_zero - int(zero.sum())
+        if resampled > 0:
+            rewards, advantages, std_rewards, is_std_zero = _compute_rewards_and_advantages(
+                rewards_per_func=rewards_per_func,
+                reward_weights=reward_weights,
+                generation_factor=generation_factor,
+                scale_rewards=self.scale_rewards,
+                multi_objective_aggregation=aggregation,
+                arguments=self.arguments,
+                group_reduction=getattr(self, "_group_reduction", "mean"),
+                discard_columns=discard_columns,
+            )
+            model_batch["advantages"] = advantages
+            metrics["reward_mean"] = _host_mean_float(jnp.nanmean(rewards, -1))
+            metrics["reward_std"] = _host_scalar_float(jnp.nanmean(std_rewards))
+            metrics["frac_reward_zero_std"] = _host_mean_float(is_std_zero.astype(jnp.float32))
+            if discard_columns is not None:
+                discarded_rows = _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns)
+                discarded_groups = discarded_rows.reshape(-1, max(int(generation_factor), 1))[:, 0]
+                num_discarded = int(jax.device_get(jnp.sum(discarded_groups)))
+                metrics["rewards/discarded_groups"] = num_discarded
+                metrics["rewards/discarded_group_fraction"] = num_discarded / max(int(discarded_groups.shape[0]), 1)
+        if zero.any():
+            keep_rows = jnp.asarray(np.repeat(~zero, generation_factor))
+            completion_mask = model_batch["completion_mask"]
+            model_batch["completion_mask"] = completion_mask * keep_rows[:, None].astype(completion_mask.dtype)
+            advantages = model_batch["advantages"]
+            model_batch["advantages"] = jnp.where(
+                keep_rows.reshape((-1,) + (1,) * (advantages.ndim - 1)),
+                advantages,
+                0.0,
+            )
+            weights = model_batch.get("difficulty_weights")
+            if weights is None:
+                weights = jnp.ones((keep_rows.shape[0],), dtype=jnp.float32)
+            keep_w = keep_rows.reshape((-1,) + (1,) * (weights.ndim - 1)).astype(weights.dtype)
+            model_batch["difficulty_weights"] = weights * keep_w
+        model_batch["num_items_in_batch"] = jnp.sum(model_batch["completion_mask"])
+        metrics["dynamic_sampling/attempts"] = attempts
+        metrics["dynamic_sampling/initial_zero_std_group_frac"] = initial_zero / num_groups
+        metrics["dynamic_sampling/resampled_group_frac"] = resampled / num_groups
+        metrics["dynamic_sampling/filtered_group_frac"] = int(zero.sum()) / num_groups
+        return _ScoredRollout(model_batch, metrics, rewards_per_func, reward_weights)
+
+    def _generate_and_score_batch(
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        is_train: bool,
+    ) -> _ScoredRollout:
+        """Generate, score, and pack one GRPO rollout of ``batch`` without batch reuse.
+
+        Args:
+            state: Current policy state.
+            batch: Raw dataloader batch; it is not mutated, so it can be
+                rolled out again (dynamic sampling).
+            is_train: Whether the rollout feeds a training step.
+
+        Returns:
+            The packed model batch, its metrics, and the gathered per-function
+            rewards with the weights used to aggregate them.
+        """
         batch = self._apply_user_data_collator(batch)
         reward_sidechannels = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
@@ -1680,6 +2791,7 @@ class GRPOTrainer(Trainer):
                 prompt_batch_size=prompt_ids.shape[0],
             )
 
+            rollout_step = int(jax.device_get(state.step)) if is_train and self._toggle_enabled() else None
             with capture_time() as generation_time_fn:
                 results = self.rollout(
                     input_ids=prompt_ids,
@@ -1689,8 +2801,11 @@ class GRPOTrainer(Trainer):
                     apply_chat_template=False,  # GRPO doesn't apply chat template to prompts
                     shard_inputs=False,  # Already sharded
                     all_gather=False,  # We'll handle gathering ourselves
-                    config_overrides=self._generation_config_overrides_for_phase(is_train),
+                    config_overrides=self._generation_config_overrides_for_phase(is_train, step=rollout_step),
                 )
+                toggle_constrained = self._toggle_budget_active(rollout_step)
+                if toggle_constrained:
+                    results = self._pad_rollout_to_completion_width(results, self._full_completion_width())
                 prompt_ids = results.prompt_ids
                 prompt_mask = results.prompt_mask
                 completion_ids = results.completion_ids
@@ -1711,13 +2826,29 @@ class GRPOTrainer(Trainer):
             completion_attention_mask = results.completion_mask
             if completion_attention_mask is None:
                 completion_attention_mask = self._make_attn_mask(completion_ids)
+            unmasked_completion_mask = completion_mask
             if self.arguments.mask_truncated_completions:
                 eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
-                has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
-                completion_mask = completion_mask * has_eos[:, None].astype(completion_mask.dtype)
+                active_bool = completion_mask > 0
+                has_active = jnp.any(active_bool, axis=1)
+                positions = jnp.arange(completion_ids.shape[1], dtype=jnp.int32)[None, :]
+                last_active_idx = jnp.max(jnp.where(active_bool, positions, 0), axis=1)
+                last_token = jnp.take_along_axis(completion_ids, last_active_idx[:, None], axis=1).squeeze(-1)
+                ends_with_eos = has_active & jnp.isin(last_token, eos_tokens)
+                finish_reasons_raw = self._coerce_generation_metadata_list(
+                    getattr(results, "finish_reason", None),
+                    target_len=int(completion_ids.shape[0]),
+                )
+                is_finish_length = jnp.asarray(
+                    [reason == "length" for reason in finish_reasons_raw],
+                    dtype=jnp.bool_,
+                )
+                not_truncated = ends_with_eos & (~is_finish_length)
+                completion_mask = completion_mask * not_truncated[:, None].astype(completion_mask.dtype)
             # Derive how many completions we have per prompt instead of trusting config-only value.
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
             generation_factor = max(generation_factor, 1)
+            prompt_length = int(prompt_ids.shape[-1])
             prompt_completion_ids = jnp.concatenate([prompt_ids.repeat(generation_factor, 0), completion_ids], axis=-1)
             difficulty_weights = None
             difficulty_key = getattr(self.arguments, "difficulty_key", None)
@@ -1763,7 +2894,7 @@ class GRPOTrainer(Trainer):
                         for start in range(0, full_batch_size, self.ref_logps_chunk_size):
                             end = min(start + self.ref_logps_chunk_size, full_batch_size)
                             ref_chunks.append(
-                                self.compute_refmodel_logps(
+                                self._call_compute_refmodel_logps(
                                     self.ref_state.graphstate,
                                     self.ref_state.graphother,
                                     prompt_completion_ids[start:end],
@@ -1774,16 +2905,18 @@ class GRPOTrainer(Trainer):
                                         end,
                                         prompt_batch_size=full_batch_size,
                                     ),
+                                    prompt_length=prompt_length,
                                 )
                             )
                         ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
                     else:
-                        ref_per_token_logps = self.compute_refmodel_logps(
+                        ref_per_token_logps = self._call_compute_refmodel_logps(
                             self.ref_state.graphstate,
                             self.ref_state.graphother,
                             prompt_completion_ids,
                             prompt_completion_mask,
                             normalized_repeated_model_kwargs,
+                            prompt_length=prompt_length,
                         )
             token_logps_time = token_logps_time_fn()
             old_token_logps_time = 0.0
@@ -1791,13 +2924,20 @@ class GRPOTrainer(Trainer):
             sampling_topk_logps = None
             loss_type = getattr(self, "loss_type", getattr(self.arguments, "loss_type", None))
             dppo_divergence_type = getattr(self.arguments, "divergence_type", None) if loss_type == "dppo" else None
+            needs_dppo = dppo_divergence_type is not None
             needs_dppo_topk = dppo_divergence_type in {"topk_tv", "topk_kl"}
             rollout_logps = getattr(results, "sampling_per_token_logps", None)
             needs_esurge_correction = (
                 bool(getattr(self.arguments, "esurge_importance_sampling_correction", False))
                 and rollout_logps is not None
             )
-            if is_train and (self._generation_reuse_span() > 1 or needs_dppo_topk or needs_esurge_correction):
+            needs_off_policy_mask = getattr(self.arguments, "off_policy_mask_threshold", None) is not None
+            if self._should_compute_old_per_token_logps(
+                is_train=is_train,
+                needs_dppo=needs_dppo,
+                needs_esurge_correction=needs_esurge_correction,
+                needs_off_policy_mask=needs_off_policy_mask,
+            ):
                 with capture_time() as old_token_logps_time_fn:
                     if needs_dppo_topk:
                         (
@@ -1809,7 +2949,7 @@ class GRPOTrainer(Trainer):
                             prompt_completion_ids,
                             prompt_completion_mask,
                             policy_repeated_model_kwargs,
-                            prompt_length=self.arguments.max_prompt_length,
+                            prompt_length=prompt_length,
                             topk=int(getattr(self.arguments, "divergence_topk", 20)),
                         )
                     else:
@@ -1818,15 +2958,18 @@ class GRPOTrainer(Trainer):
                             prompt_completion_ids,
                             prompt_completion_mask,
                             policy_repeated_model_kwargs,
-                            prompt_length=self.arguments.max_prompt_length,
+                            prompt_length=prompt_length,
                             logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                         )
                 old_token_logps_time = old_token_logps_time_fn()
             importance_sampling_ratio = None
+            behavior_per_token_logps = None
             if is_train and needs_esurge_correction:
                 importance_sampling_ratio = self._esurge_importance_sampling_ratio(
                     old_per_token_logps, rollout_logps, completion_mask
                 )
+                # Rollout-engine sampling log-probs feed the off-policy contract and diagnostics.
+                behavior_per_token_logps = jnp.asarray(rollout_logps, dtype=jnp.float32)
 
             raw_completions_text = self._coerce_generation_texts(
                 results.raw_text,
@@ -1838,7 +2981,7 @@ class GRPOTrainer(Trainer):
             )
             if not raw_completions_text or not clean_completions_text:
                 host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
-                host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                host_completion_mask = np.asarray(jax.device_get(unmasked_completion_mask), dtype=np.int32)
                 if not raw_completions_text:
                     raw_completions_text = self._decode_prompt_batch(
                         self.processing_class,
@@ -1887,9 +3030,9 @@ class GRPOTrainer(Trainer):
             truncated_records = [
                 (reason == "length") if isinstance(reason, str) else None for reason in finish_reason_records
             ]
-            host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+            host_unmasked_mask = np.asarray(jax.device_get(unmasked_completion_mask), dtype=np.int32)
             host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
-            completion_token_lengths = host_completion_mask.sum(axis=-1).tolist()
+            completion_token_lengths = host_unmasked_mask.sum(axis=-1).tolist()
             completion_length_records = self._coerce_generation_metadata_list(
                 [int(length) for length in completion_token_lengths],
                 target_len=target_len,
@@ -1897,7 +3040,7 @@ class GRPOTrainer(Trainer):
             completion_ids_records = self._coerce_generation_metadata_list(
                 [
                     row[mask.astype(bool)].tolist()
-                    for row, mask in zip(host_completion_ids, host_completion_mask, strict=True)
+                    for row, mask in zip(host_completion_ids, host_unmasked_mask, strict=True)
                 ],
                 target_len=target_len,
             )
@@ -1999,7 +3142,7 @@ class GRPOTrainer(Trainer):
                     )
                     rewards_per_func = jnp.concatenate([rewards_per_func, environment_rewards], axis=1)
             rewarding_time = rewarding_time_fn()
-            log_completion_length = jnp.sum(completion_mask, -1)
+            log_completion_length = jnp.sum(unmasked_completion_mask, -1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
@@ -2009,8 +3152,12 @@ class GRPOTrainer(Trainer):
             ref_per_token_logps = self._all_gather(ref_per_token_logps)
             if old_per_token_logps is not None:
                 old_per_token_logps = self._all_gather(old_per_token_logps)
+            if rollout_logps is not None:
+                rollout_logps = self._all_gather(rollout_logps)
             if importance_sampling_ratio is not None:
                 importance_sampling_ratio = self._all_gather(importance_sampling_ratio)
+            if behavior_per_token_logps is not None:
+                behavior_per_token_logps = self._all_gather(behavior_per_token_logps)
             if sampling_topk_indices is not None:
                 sampling_topk_indices = self._all_gather(sampling_topk_indices)
             if sampling_topk_logps is not None:
@@ -2029,6 +3176,12 @@ class GRPOTrainer(Trainer):
                 reward_weights = self.reward_weights
                 if environment_feedback is not None:
                     reward_weights = jnp.concatenate([reward_weights, jnp.ones((1,), dtype=reward_weights.dtype)])
+                discard_columns = self._discard_columns(int(rewards_per_func.shape[-1]))
+                discarded_rows = (
+                    _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns)
+                    if discard_columns is not None
+                    else None
+                )
                 rewards, advantages, std_rewards, is_std_zero = _compute_rewards_and_advantages(
                     rewards_per_func=rewards_per_func,
                     reward_weights=reward_weights,
@@ -2037,6 +3190,7 @@ class GRPOTrainer(Trainer):
                     multi_objective_aggregation=self.multi_objective_aggregation,
                     arguments=self.arguments,
                     group_reduction=getattr(self, "_group_reduction", "mean"),
+                    discard_columns=discard_columns,
                 )
                 with capture_time() as filter_time_fn:
                     selected_indices = self._select_rollout_indices(
@@ -2048,10 +3202,21 @@ class GRPOTrainer(Trainer):
                         completion_attention_mask = completion_attention_mask[selected_indices]
                         ref_per_token_logps = ref_per_token_logps[selected_indices]
                         rewards_per_func = rewards_per_func[selected_indices]
+                        if discarded_rows is not None:
+                            discarded_rows = discarded_rows[selected_indices]
+                            rewards_per_func = jnp.where(
+                                discarded_rows[:, None] & jnp.asarray(discard_columns, dtype=bool)[None, :],
+                                jnp.nan,
+                                rewards_per_func,
+                            )
                         if old_per_token_logps is not None:
                             old_per_token_logps = old_per_token_logps[selected_indices]
+                        if rollout_logps is not None:
+                            rollout_logps = rollout_logps[selected_indices]
                         if importance_sampling_ratio is not None:
                             importance_sampling_ratio = importance_sampling_ratio[selected_indices]
+                        if behavior_per_token_logps is not None:
+                            behavior_per_token_logps = behavior_per_token_logps[selected_indices]
                         if sampling_topk_indices is not None:
                             sampling_topk_indices = sampling_topk_indices[selected_indices]
                         if sampling_topk_logps is not None:
@@ -2067,6 +3232,7 @@ class GRPOTrainer(Trainer):
                             multi_objective_aggregation=self.multi_objective_aggregation,
                             arguments=self.arguments,
                             group_reduction=getattr(self, "_group_reduction", "mean"),
+                            discard_columns=discard_columns,
                         )
                 filter_time = filter_time_fn()
             grouped_comp_time = grouped_comp_time_fn()
@@ -2125,15 +3291,27 @@ class GRPOTrainer(Trainer):
             model_batch["importance_sampling_ratio"] = importance_sampling_ratio
         if old_per_token_logps is not None:
             model_batch["old_per_token_logps"] = old_per_token_logps
+        if rollout_logps is not None:
+            model_batch["sampling_per_token_logps"] = rollout_logps
+        elif old_per_token_logps is not None:
             model_batch["sampling_per_token_logps"] = old_per_token_logps
         if sampling_topk_indices is not None and sampling_topk_logps is not None:
             model_batch["sampling_topk_indices"] = sampling_topk_indices
             model_batch["sampling_topk_logps"] = sampling_topk_logps
         if difficulty_weights is not None:
             model_batch["difficulty_weights"] = difficulty_weights
-        if is_train:
-            return self._store_buffered_grpo_batch(model_batch, metrics_dict)
-        return (model_batch, metrics_dict)
+        if behavior_per_token_logps is not None and self._accepts_batch_key("behavior_per_token_logps"):
+            model_batch["behavior_per_token_logps"] = behavior_per_token_logps
+        if discarded_rows is not None:
+            model_batch, discard_metrics = _apply_discarded_groups(
+                model_batch,
+                discarded_rows,
+                generation_factor,
+            )
+            metrics_dict.update(discard_metrics)
+        if self._toggle_enabled() and is_train:
+            metrics_dict["toggle/budget_constrained"] = int(toggle_constrained)
+        return _ScoredRollout(model_batch, metrics_dict, rewards_per_func, reward_weights)
 
     def on_step_end(
         self,
@@ -2158,6 +3336,17 @@ class GRPOTrainer(Trainer):
                 and metrics, passed through for further processing.
         """
 
+        k3_max = getattr(self.arguments, "startup_behavior_k3_max", None)
+        if k3_max is not None and not bool(getattr(self, "_startup_behavior_parity_checked", False)):
+            self._startup_behavior_parity_checked = True
+            other_metrics = getattr(metrics, "other_metrics", None)
+            if other_metrics is None and isinstance(metrics, dict):
+                other_metrics = metrics
+            check_startup_behavior_parity(
+                other_metrics,
+                k3_max=float(k3_max),
+                tail_fraction_max=float(self.arguments.startup_behavior_tail_fraction_max),
+            )
         if (
             self.arguments.sync_ref_model
             and self.ref_state is not None

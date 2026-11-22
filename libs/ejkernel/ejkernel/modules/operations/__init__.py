@@ -68,6 +68,10 @@ Available Operations:
             single-step GDR decode (XLA reference + TPU Pallas for head sharding);
             ``gated_delta_rule_grouped_decode_op`` is a back-compat alias of the functional op.
         - RaggedGatedDeltaRule / ragged_gated_delta_rule: GDR for ragged sequences.
+        - RaggedKDA / ragged_kda: Per-channel-decay KDA over a flat packed token stream with a
+            recurrent-state pool (``query_start_loc`` / ``state_indices``); single-token rows take one
+            vectorised decode step, longer rows run the chunked math on their own chunks only.
+            ``ragged_kda_head_sharded`` adds the head-axis ``shard_map`` path.
         - RaggedGatedDeltaRuleV2 / ragged_gated_delta_rule_v2: Packed continuous-batch
             GDN v2 (mixed prefill+decode); consumes a packed mixed-QKV buffer plus
             per-token gates and a recurrent state pool, returns the updated state pool
@@ -212,6 +216,7 @@ from .configs import (
     KernelDeltaAttentionConfig,
     LightningAttentionConfig,
     MeanPoolingConfig,
+    MoeDecodeFusedW8A8Config,
     MultiLatentRaggedPageAttentionConfig,
     MultiLatentRaggedPageAttentionV2Config,
     NativeSparseAttentionConfig,
@@ -224,6 +229,9 @@ from .configs import (
     RaggedGatedDeltaRuleV2Config,
     RaggedGatherConfig,
     RaggedGatherReduceConfig,
+    RaggedKDAConfig,
+    RaggedKDAConvDecodeConfig,
+    RaggedKDADecodeConfig,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3Config,
@@ -238,6 +246,7 @@ from .configs import (
     RWKV7Config,
     RWKV7MulConfig,
     ScaledDotProductAttentionConfig,
+    SharedExpertW8A8Config,
     SparseMultiLatentRaggedPageAttentionConfig,
     StateSpaceV1Config,
     StateSpaceV2Config,
@@ -279,6 +288,10 @@ from .grouped_matmul import (
     GroupedMatmulChannelwise,
     grouped_matmul,
     grouped_matmul_channelwise,
+    grouped_matmul_channelwise_packed_pair_width,
+    grouped_matmul_channelwise_pallas_tiles,
+    grouped_matmul_channelwise_quantize_rows,
+    grouped_matmul_channelwise_slab_tiles,
     grouped_matmul_w8a8,
 )
 from .indexer_scores import IndexerScores, indexer_scores
@@ -287,7 +300,38 @@ from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_
 from .lightning_attention import LightningAttention, lightning_attention
 from .mhc import MHCCollapse, MHCExpand, MHCFusedConfig, mhc_collapse, mhc_expand
 from .mhc_coefficients import MHCCoefficients, MHCCoefficientsConfig, mhc_coefficients
-from .moe_row_gather import row_gather_sum_unsupported_reason, row_gather_unsupported_reason
+from .mhc_decode_fused import (
+    MHCDecodeFusedConfig,
+    MHCDecodeRead,
+    MHCDecodeWrite,
+    mhc_decode_gate_layout,
+    mhc_decode_read,
+    mhc_decode_supports,
+    mhc_decode_table_gates,
+    mhc_decode_write,
+)
+from .mhc_prefill_fused import (
+    MHCPrefillFusedConfig,
+    MHCPrefillProject,
+    MHCPrefillRead,
+    MHCPrefillWrite,
+    mhc_prefill_project,
+    mhc_prefill_read,
+    mhc_prefill_stats_rows,
+    mhc_prefill_supports,
+    mhc_prefill_write,
+)
+from .moe_decode_fused_w8a8 import (
+    MoeDecodeFusedW8A8,
+    moe_decode_fused_w8a8,
+    moe_decode_fused_w8a8_unsupported_reason,
+)
+from .moe_row_gather import (
+    packed_row_gather_sum_unsupported_reason,
+    quantized_row_gather_unsupported_reason,
+    row_gather_sum_unsupported_reason,
+    row_gather_unsupported_reason,
+)
 from .multi_head_latent_attention import FlashMLA, flash_mla
 from .multi_latent_ragged_page_attention import (
     MultiLatentRaggedPageAttention,
@@ -325,6 +369,14 @@ from .ragged_gated_delta_rule_v2 import (
 )
 from .ragged_gather import RaggedGather, ragged_gather
 from .ragged_gather_reduce import RaggedGatherReduce, ragged_gather_reduce
+from .ragged_kda import RaggedKDA, ragged_kda, ragged_kda_head_sharded
+from .ragged_kda_conv_decode import (
+    RaggedKDAConvDecode,
+    ragged_kda_conv_decode,
+    ragged_kda_conv_decode_head_sharded,
+    ragged_kda_conv_decode_unsupported_reason,
+)
+from .ragged_kda_decode import RaggedKDADecode, ragged_kda_decode, ragged_kda_decode_head_sharded
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import (
     RaggedPageAttentionv2TurboQuant,
@@ -344,6 +396,7 @@ from .rwkv4 import RWKV4, rwkv4
 from .rwkv6 import RWKV6, rwkv6
 from .rwkv7 import RWKV7, RWKV7Mul, rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
+from .shared_expert_w8a8 import SharedExpertW8A8, shared_expert_w8a8, shared_expert_w8a8_unsupported_reason
 from .sinkhorn_knopp import SinkhornKnopp, sinkhorn_knopp
 from .sparse_multi_latent_ragged_page_attention import (
     SparseMultiLatentRaggedPageAttention,
@@ -431,10 +484,19 @@ __all__ = (
     "MHCCoefficients",
     "MHCCoefficientsConfig",
     "MHCCollapse",
+    "MHCDecodeFusedConfig",
+    "MHCDecodeRead",
+    "MHCDecodeWrite",
     "MHCExpand",
     "MHCFusedConfig",
+    "MHCPrefillFusedConfig",
+    "MHCPrefillProject",
+    "MHCPrefillRead",
+    "MHCPrefillWrite",
     "MeanPooling",
     "MeanPoolingConfig",
+    "MoeDecodeFusedW8A8",
+    "MoeDecodeFusedW8A8Config",
     "MultiLatentRaggedPageAttention",
     "MultiLatentRaggedPageAttentionConfig",
     "MultiLatentRaggedPageAttentionV2",
@@ -464,6 +526,12 @@ __all__ = (
     "RaggedGatherConfig",
     "RaggedGatherReduce",
     "RaggedGatherReduceConfig",
+    "RaggedKDA",
+    "RaggedKDAConfig",
+    "RaggedKDAConvDecode",
+    "RaggedKDAConvDecodeConfig",
+    "RaggedKDADecode",
+    "RaggedKDADecodeConfig",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv2TurboQuant",
@@ -485,6 +553,8 @@ __all__ = (
     "RowPermuteConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
+    "SharedExpertW8A8",
+    "SharedExpertW8A8Config",
     "SinkhornKnopp",
     "SparseMultiLatentRaggedPageAttention",
     "SparseMultiLatentRaggedPageAttentionConfig",
@@ -529,6 +599,10 @@ __all__ = (
     "gla_attention",
     "grouped_matmul",
     "grouped_matmul_channelwise",
+    "grouped_matmul_channelwise_packed_pair_width",
+    "grouped_matmul_channelwise_pallas_tiles",
+    "grouped_matmul_channelwise_quantize_rows",
+    "grouped_matmul_channelwise_slab_tiles",
     "grouped_matmul_w8a8",
     "indexer_scores",
     "kda_attention",
@@ -538,16 +612,30 @@ __all__ = (
     "mean_pooling",
     "mhc_coefficients",
     "mhc_collapse",
+    "mhc_decode_gate_layout",
+    "mhc_decode_read",
+    "mhc_decode_supports",
+    "mhc_decode_table_gates",
+    "mhc_decode_write",
     "mhc_expand",
+    "mhc_prefill_project",
+    "mhc_prefill_read",
+    "mhc_prefill_stats_rows",
+    "mhc_prefill_supports",
+    "mhc_prefill_write",
+    "moe_decode_fused_w8a8",
+    "moe_decode_fused_w8a8_unsupported_reason",
     "multi_latent_ragged_page_attention",
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
     "normalize_kernel_tile_policy",
     "pack_int4_adjacent",
     "pack_pool_bits",
+    "packed_row_gather_sum_unsupported_reason",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
+    "quantized_row_gather_unsupported_reason",
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",
     "ragged_causal_conv1d_op",
@@ -560,6 +648,13 @@ __all__ = (
     "ragged_gated_delta_rule_v2_with_window_states",
     "ragged_gather",
     "ragged_gather_reduce",
+    "ragged_kda",
+    "ragged_kda_conv_decode",
+    "ragged_kda_conv_decode_head_sharded",
+    "ragged_kda_conv_decode_unsupported_reason",
+    "ragged_kda_decode",
+    "ragged_kda_decode_head_sharded",
+    "ragged_kda_head_sharded",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
@@ -580,6 +675,8 @@ __all__ = (
     "rwkv7_mul",
     "scaled_dot_product_attention",
     "set_gdn_kernel_tile_policy",
+    "shared_expert_w8a8",
+    "shared_expert_w8a8_unsupported_reason",
     "sinkhorn_knopp",
     "sparse_multi_latent_ragged_page_attention",
     "split_gate_up",

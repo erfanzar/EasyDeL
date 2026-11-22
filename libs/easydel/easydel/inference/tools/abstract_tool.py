@@ -294,10 +294,10 @@ class ToolParser:
             ("tool_calls_start_token", "tool_calls_end_token"),
             ("tool_call_prefix", "function_end_token"),
             ("parameter_prefix", "parameter_end_token"),
-            ("bot_token", None),
-            ("bot_string", None),
-            ("tool_start_token", None),
-            ("trigger_start", None),
+            ("bot_token", "eot_token"),
+            ("bot_string", "eot_string"),
+            ("tool_start_token", "tool_end_token"),
+            ("trigger_start", "trigger_end"),
             ("TOOL_CALLS_BEGIN", "TOOL_CALLS_END"),
             ("TOOL_CALL_BEGIN", "TOOL_CALL_END"),
         ):
@@ -351,6 +351,20 @@ class ToolParser:
 
         return self.get_streaming_buffer_hints()
 
+    @staticmethod
+    def _has_trailing_marker_prefix(text: str, markers: Sequence[str]) -> bool:
+        """Return whether *text* ends with a non-empty strict prefix of any marker."""
+        if not text:
+            return False
+        for marker in markers:
+            if not isinstance(marker, str) or len(marker) < 2:
+                continue
+            max_prefix = min(len(marker) - 1, len(text))
+            for k in range(1, max_prefix + 1):
+                if text.endswith(marker[:k]):
+                    return True
+        return False
+
     def is_buffering_protocol(
         self,
         *,
@@ -379,16 +393,7 @@ class ToolParser:
             if self._tool_protocol_has_unclosed_marker(current_text, start_marker, end_marker):
                 return True
 
-        normalized_current = current_text.strip()
-        for hint in self.get_streaming_buffer_hints():
-            if hint in delta_text or (normalized_current and hint in normalized_current):
-                return True
-            if not normalized_current or len(hint) < 2:
-                continue
-            window = normalized_current[-(len(hint) - 1) :]
-            if window and hint.startswith(window):
-                return True
-        return False
+        return self._has_trailing_marker_prefix(current_text, self.get_streaming_buffer_hints())
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output (batch mode).

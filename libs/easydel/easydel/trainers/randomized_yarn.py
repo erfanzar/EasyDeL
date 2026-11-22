@@ -163,7 +163,9 @@ def validate_randomized_yarn_target(config: RandomizedYaRNConfig, *, model_max_f
 
 def randomized_yarn_rng(seed: int, step: int) -> np.random.Generator:
     """Generator for one microbatch, keyed on ``(seed, step)`` so distinct pairs never share a stream."""
-    return np.random.default_rng(np.random.SeedSequence([int(seed) & 0xFFFFFFFF, int(step), _RNG_STREAM]))
+    st = int(step)
+    entropy = [int(seed) & 0xFFFFFFFF, st, _RNG_STREAM] if st >= 0 else [int(seed) & 0xFFFFFFFF, -st, _RNG_STREAM, 1]
+    return np.random.default_rng(np.random.SeedSequence(entropy))
 
 
 def sample_monotone_positions(rng: np.random.Generator, *, n: int, l_max: int, run_length: int = 1) -> np.ndarray:
@@ -205,6 +207,8 @@ def apply_randomized_yarn_to_positions(
     cu_seqlens: np.ndarray | None = None,
     cu_seqlens_num: np.ndarray | None = None,
     image_token_id: int | None = None,
+    attention_mask: np.ndarray | None = None,
+    segment_ids: np.ndarray | None = None,
 ) -> None:
     """Apply Randomized YaRN in place to a writable rank-2 ``[B, S]`` position array.
 
@@ -223,11 +227,28 @@ def apply_randomized_yarn_to_positions(
         return
 
     for sample_idx in range(positions.shape[0]):
-        valid_end = valid_sequence_end(sample_idx, seq_len, tokens, labels, pad_id, ignore_index)
+        valid_end = valid_sequence_end(
+            sample_idx,
+            seq_len,
+            tokens,
+            labels,
+            pad_id,
+            ignore_index,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+        )
         if valid_end < 2:
             continue
         segment_ranges = document_segment_ranges(
-            sample_idx, valid_end, positions, seq_lens, seq_lens_num, cu_seqlens, cu_seqlens_num
+            sample_idx,
+            valid_end,
+            positions,
+            seq_lens,
+            seq_lens_num,
+            cu_seqlens,
+            cu_seqlens_num,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
         )
         sample_pos = positions[sample_idx]
         seg_bases = {start: int(sample_pos[start]) for start, end in segment_ranges if end - start >= 2}

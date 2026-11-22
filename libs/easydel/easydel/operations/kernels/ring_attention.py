@@ -82,6 +82,33 @@ from ._mask_info import align_mask_info_to_qkv_specs
 from .vanilla_attention import VanillaAttn
 
 
+def _resolve_contraction_precision(precision: jax.lax.PrecisionLike | None) -> jax.lax.PrecisionLike:
+    """Resolve the contraction precision handed to ejkernel's ring attention.
+
+    ejkernel takes an explicit precision, and an explicit ``Precision.DEFAULT``
+    overrides an ambient ``jax.default_matmul_precision(...)`` scope (on TPU that
+    means bf16 matmul passes even for fp32 inputs). An explicit ``precision``
+    argument wins; otherwise the ambient JAX setting is honoured. Without either,
+    ``Precision.DEFAULT`` is returned, exactly as before.
+
+    Args:
+        precision: Precision requested by the caller, or ``None``.
+
+    Returns:
+        The precision to forward to the kernel.
+    """
+    if precision is not None:
+        return precision
+    ambient = jax.config.jax_default_matmul_precision
+    if ambient is None:
+        return jax.lax.Precision.DEFAULT
+    try:
+        return jax.lax.Precision(ambient)
+    except ValueError:
+        # Dot-algorithm preset names: only the XLA ring consumes them, and it does.
+        return ambient
+
+
 @OperationRegistry.register
 class RingAttn(OperationImpl):
     """
@@ -332,9 +359,21 @@ class RingAttn(OperationImpl):
             causal_computed = False
         if mask_info is not None and mask_info.sliding_window_baked_in:
             sliding_window = None
+        bias_spec = getattr(shardings, "bias", None)
         if dense_bias is not None:
             dense_bias = jnp.broadcast_to(dense_bias, (query.shape[0], query.shape[2], query.shape[1], key.shape[1]))
-        bias_sharding = self.create_stable_sharding(getattr(shardings, "bias", None), dep=dense_bias, tensor=dense_bias)
+            if query_sharding is not None:
+                # ``dense_bias`` is broadcast to global ``(batch, num_heads, q_len, kv_len)``, so its
+                # batch, head, and query-sequence axes must follow ``query_sharding`` (e.g. TP head
+                # sharding), while KV columns remain global for ring-step indexing.
+                q_axes = (*tuple(query_sharding), None, None, None, None)[:4]
+                bias_spec = jax.sharding.PartitionSpec(q_axes[0], q_axes[2], q_axes[1], None)
+        bias_sharding = self.create_stable_sharding(
+            bias_spec,
+            dep=dense_bias,
+            tensor=dense_bias,
+            preserved_indices=[0, 1, 2],
+        )
         outputs: Float[Array, "batch seq_len_q num_heads head_dim"] = ring_attention(
             query,
             key,
@@ -348,7 +387,7 @@ class RingAttn(OperationImpl):
             sliding_window=sliding_window,
             causal=causal_computed,
             fused_backward=fused_backward,
-            precision=ignore.get("precision", jax.lax.Precision.DEFAULT),
+            precision=_resolve_contraction_precision(ignore.get("precision")),
             cfg=self.metadata.get_operation_config("ring"),
             # The Pallas splash ring path cannot represent additive pairwise
             # bias or per-head sinks. The registered XLA ring supports both,

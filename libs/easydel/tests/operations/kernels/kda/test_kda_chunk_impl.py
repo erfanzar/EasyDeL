@@ -141,6 +141,28 @@ def test_fused_four_device_shard_map_matches_scan():
         assert _rel(a, c) < 1e-3
 
 
+@pytest.mark.skipif(jax.default_backend() != "tpu" or jax.device_count() < 4, reason="needs 4 TPU devices")
+def test_fused_falls_back_to_the_scan_where_the_kernel_cannot_be_partitioned():
+    """With ``fallback_to_scan`` (the automatic ``kda_chunk_impl``), a mesh layout the kernel cannot be partitioned
+    over (no ``kernel_lead_specs``) runs the chunk scan, so values and gradients equal the scan's bit for bit."""
+    q, k, v, b, g, s0 = _inputs(2, 4, L, seed=8)
+    seg = _segments(PACKED, L)
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("dp", "tp"))
+    ct = jax.random.normal(jax.random.PRNGKey(4), (2, 4, L, V))
+
+    def run(fn, **extra):
+        def loss(q, k, v, b, g):
+            o, s = fn(q, k, v, b, g, chunk_size=64, initial_state=s0, segment_ids=seg, kernel_mesh=mesh, **extra)
+            return jnp.sum(o * ct) + jnp.sum(s), (o, s)
+
+        return jax.jit(jax.value_and_grad(loss, argnums=range(5), has_aux=True))(q, k, v, b, g)
+
+    (_, scan_out), scan_grads = run(_chunk_kda_per_channel_fwd)
+    (_, fused_out), fused_grads = run(_chunk_kda_per_channel_fused, decay_lower_bound=-5.0, fallback_to_scan=True)
+    for a, c in zip((*fused_out, *fused_grads), (*scan_out, *scan_grads), strict=True):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(c))
+
+
 def test_op_seam_selects_fused_impl():
     q, k, v, b, g, s0 = _inputs(1, 2, 128, seed=11)
     seg = _segments([[40, -8, 80]], 128)

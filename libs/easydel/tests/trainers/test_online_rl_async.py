@@ -153,3 +153,50 @@ def test_close_cancels_pending_work_and_rejects_new_submissions():
     assert coordinator.outstanding_count == 0
     with pytest.raises(RuntimeError, match="closed"):
         coordinator.submit("late", snapshot=snapshot)
+
+
+def test_close_wakes_concurrent_blocked_next_completed():
+    gate = threading.Event()
+    started = threading.Event()
+
+    def worker(_snapshot, payload):
+        started.set()
+        gate.wait(timeout=5.0)
+        return payload
+
+    snapshot = PolicySnapshot(version=0, state=None)
+    coordinator = BoundedAsyncRolloutCoordinator(worker, max_workers=1, max_outstanding=2)
+    coordinator.submit("slow", snapshot=snapshot)
+    assert started.wait(timeout=2.0)
+
+    errors: list[BaseException] = []
+    waiter_started = threading.Event()
+
+    def waiter():
+        waiter_started.set()
+        try:
+            coordinator.next_completed(timeout=None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=waiter) for _ in range(2)]
+    for t in threads:
+        t.start()
+    assert waiter_started.wait(timeout=2.0)
+    # Wait briefly until both threads are blocked inside next_completed(timeout=None).
+    deadline = threading.Event()
+    for _ in range(50):
+        with coordinator._lock:
+            if coordinator._waiters == 2:
+                break
+        deadline.wait(0.01)
+
+    try:
+        coordinator.close(wait=False, cancel_pending=True)
+        for t in threads:
+            t.join(timeout=2.0)
+            assert not t.is_alive(), "next_completed(timeout=None) hung after close()"
+        assert len(errors) == 2
+        assert all(isinstance(exc, RuntimeError) and "closed" in str(exc) for exc in errors)
+    finally:
+        gate.set()

@@ -5,7 +5,7 @@
 workspace:
   kind: uv-workspace monorepo (source of truth; libs mirrored to standalone repos on push)
   layering_contract:
-    rule: only easydel may import spectrax/ejkernel/eformer/eray; foundation libs independent of each other
+    rule: only easydel may import spectrax/ejkernel/eformer/eray/surgecore; foundation libs and surgecore independent of each other
     enforced_by: [ uv run lint-imports, .github/workflows/workspace-ci.yaml ]
   # Computation tests MUST run on an accelerator (XERXES.md golden rule 5); conftest guards refuse them on CPU.
   test_env_accelerator: "env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu"
@@ -101,6 +101,14 @@ packages:
     tests: libs/eray/tests
     owns: [ cli (eray tpu connect/status/health/list), execution (RayExecutor, autoscale_execute_resumable),
             pool (SlicePoolManager/SliceActor/DeviceHostActor), resources (accelerator configs), docker ]
+  surgecore:
+    path: libs/surgecore
+    role: EasyDeL's native host library for eSurge (Rust crate; PyO3 abi3-py311 extension surgecore._native, built by maturin)
+    tests: libs/surgecore/tests   # pytest, cpu_ok; plus cargo test --locked in libs/surgecore
+    imports: numpy only; imported only by easydel (eSurge host path)
+    build: uv sync compiles it through maturin, so a Rust toolchain (cargo) is required
+    release: surgecore-v* tags -> publish.yaml surgecore-* jobs (manylinux_2_28 x86_64/aarch64 + macOS arm64 wheels, sdist)
+    mirror: erfanzar/esurgecore (subtree, like the foundation libs)
   external optimizer package:
     path: external optimizer package
     role: quantization-aware optimizers registered into easydel via @register_optimizer
@@ -116,7 +124,7 @@ flows:
     - compiled sharded step (compile_trainer_step) -> data/ Pipeline batches -> async TensorStore checkpoints
     - online-RL variants generate rollouts via eSurge inside the loop (esurge_rollout/, async_grpo)
   inference:
-    - request -> eSurge engine (mixins/io) -> scheduler (continuous batching, prefix-cached PagePool)
+    - request -> eSurge engine (mixins/io) -> surgecore EngineCore (continuous batching; paged KV + prefix cache in KvCore)
     - runner compile-bucketed forward (ragged page attention) -> SamplerExecutor -> stream/generate output
     - server/api_server.py exposes OpenAI-compatible endpoints; tools+reasoning parsers post-process
   pipeline_parallelism:

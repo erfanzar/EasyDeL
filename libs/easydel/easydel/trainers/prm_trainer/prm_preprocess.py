@@ -37,6 +37,7 @@ class PRMPreprocessTransform:
         train_on_last_step_only: bool = False,
         is_eval: bool = False,
         pad_to_multiple_of: int | None = None,
+        padding: bool | str = "max_length",
     ) -> None:
         """Store tokenizer and labeling options for PRM row conversion.
 
@@ -55,6 +56,9 @@ class PRMPreprocessTransform:
                 last-step-only training is requested.
             pad_to_multiple_of: Optional padding multiple used after
                 ``max_length`` is selected.
+            padding: Padding strategy (``"max_length"`` / ``True`` to pad to
+                ``max_length``, or ``False`` / ``"do_not_pad"`` to leave rows
+                unpadded for sequence packing).
         """
         self._tokenizer = tokenizer
         self._step_separator = step_separator
@@ -63,7 +67,9 @@ class PRMPreprocessTransform:
         self._train_on_last_step_only = train_on_last_step_only
         self._is_eval = is_eval
         self._pad_to_multiple_of = pad_to_multiple_of
-        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        self._padding = padding
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        self._pad_token_id = 0 if pad_id is None else int(pad_id)
 
     def __call__(self, example: dict[str, tp.Any]) -> dict[str, tp.Any]:
         """Tokenize a raw PRM example unless it already contains model fields.
@@ -85,6 +91,7 @@ class PRMPreprocessTransform:
             is_eval=self._is_eval,
             pad_token_id=self._pad_token_id,
             pad_to_multiple_of=self._pad_to_multiple_of,
+            padding=self._padding,
         )
 
     @staticmethod
@@ -99,14 +106,17 @@ class PRMPreprocessTransform:
         is_eval: bool,
         pad_token_id: int | None = None,
         pad_to_multiple_of: int | None = None,
+        padding: bool | str = "max_length",
     ) -> dict[str, list[int]]:
         """Tokenize one PRM row into input ids, attention mask, and step labels.
 
         Prompt tokens are masked with ``-100``. Each completion step contributes
-        its label only on the separator-final token for that step, optionally
-        limiting supervision to the final step.
+        its label only on the separator-final token for that step; when
+        ``train_on_last_step_only`` is active during training, truncation is
+        applied before masking non-final steps so the last surviving step
+        retains supervision.
         """
-        prompt_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
+        prompt_ids = list(tokenizer(features["prompt"], add_special_tokens=False)["input_ids"])
         completions = list(features["completions"])
         raw_labels = list(features["labels"])
         if len(completions) != len(raw_labels):
@@ -115,24 +125,21 @@ class PRMPreprocessTransform:
             raise ValueError("PRM examples require at least one completion step.")
 
         step_labels = [int(label) for label in raw_labels]
-        if train_on_last_step_only and not is_eval:
-            step_labels = [-100] * (len(step_labels) - 1) + [step_labels[-1]]
-
         separator_ids = tokenizer.encode(step_separator, add_special_tokens=False)
         completion_pieces = [
-            tokenizer(completion, add_special_tokens=False)["input_ids"] + separator_ids for completion in completions
+            list(tokenizer(completion, add_special_tokens=False)["input_ids"]) + list(separator_ids)
+            for completion in completions
         ]
 
         def build_completion_labels(token_budget: int | None = None) -> tuple[list[int], list[int]]:
             """Build completion tokens and sparse PRM labels within a token budget.
 
-            The budget is applied across the concatenated completion steps. Each
-            emitted step contributes separator-terminated tokens and a single
-            supervised label on its final token.
+            Applies truncation across completion steps first, then optionally
+            masks non-final surviving steps when ``train_on_last_step_only`` is
+            enabled so truncated rows never collapse to all ``-100`` labels.
             """
             remaining = token_budget
-            out_completion_ids: list[int] = []
-            out_labels: list[int] = []
+            emitted_steps: list[tuple[list[int], int]] = []
             for completion_ids, step_label in zip(completion_pieces, step_labels, strict=True):
                 if remaining is not None:
                     if remaining <= 0:
@@ -141,13 +148,24 @@ class PRMPreprocessTransform:
                     remaining -= len(completion_ids)
                 if not completion_ids:
                     continue
+                emitted_steps.append((completion_ids, step_label))
+
+            out_completion_ids: list[int] = []
+            out_labels: list[int] = []
+            mask_non_final = bool(train_on_last_step_only and not is_eval)
+            last_idx = len(emitted_steps) - 1
+            for idx, (completion_ids, step_label) in enumerate(emitted_steps):
                 out_completion_ids.extend(completion_ids)
-                out_labels.extend([-100] * (len(completion_ids) - 1) + [step_label])
+                effective_label = -100 if (mask_non_final and idx < last_idx) else step_label
+                out_labels.extend([-100] * (len(completion_ids) - 1) + [effective_label])
             return out_completion_ids, out_labels
 
         bos_token_id = getattr(tokenizer, "bos_token_id", None)
-        if bos_token_id is not None:
-            prompt_ids = [bos_token_id, *prompt_ids]
+        has_bos = bos_token_id is not None
+        if has_bos and prompt_ids and prompt_ids[0] == bos_token_id:
+            prompt_body = prompt_ids[1:]
+        else:
+            prompt_body = prompt_ids
 
         completion_budget = max_completion_length
         if max_length is not None:
@@ -156,21 +174,35 @@ class PRMPreprocessTransform:
 
         if max_length is not None:
             prompt_budget = max(max_length - len(completion_ids), 0)
-            if len(prompt_ids) > prompt_budget:
-                prompt_ids = prompt_ids[-prompt_budget:] if prompt_budget > 0 else []
+            if has_bos:
+                if prompt_budget == 0:
+                    prompt_ids = []
+                elif prompt_budget == 1:
+                    prompt_ids = [bos_token_id]
+                else:
+                    body_budget = prompt_budget - 1
+                    prompt_ids = [bos_token_id, *prompt_body[-body_budget:]]
+            else:
+                prompt_ids = prompt_body[-prompt_budget:] if prompt_budget > 0 else []
+        else:
+            prompt_ids = [bos_token_id, *prompt_body] if has_bos else prompt_body
 
         input_ids = prompt_ids + completion_ids
         labels = [-100] * len(prompt_ids) + labels
 
         attention_mask = [1] * len(input_ids)
-        target_length = max_length
-        if target_length is not None and pad_to_multiple_of is not None and target_length % pad_to_multiple_of != 0:
-            target_length = ((target_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
-        if target_length is not None and len(input_ids) < target_length:
-            pad_id = 0 if pad_token_id is None else int(pad_token_id)
-            pad_len = target_length - len(input_ids)
-            input_ids = input_ids + [pad_id] * pad_len
-            attention_mask = attention_mask + [0] * pad_len
-            labels = labels + [-100] * pad_len
+        should_pad = padding is not False and padding != "do_not_pad"
+        if should_pad:
+            target_length = max_length if padding in ("max_length", True) else None
+            if target_length is None and pad_to_multiple_of is not None and len(input_ids) % pad_to_multiple_of != 0:
+                target_length = ((len(input_ids) // pad_to_multiple_of) + 1) * pad_to_multiple_of
+            elif target_length is not None and pad_to_multiple_of is not None and target_length % pad_to_multiple_of != 0:
+                target_length = ((target_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
+            if target_length is not None and len(input_ids) < target_length:
+                pad_id = 0 if pad_token_id is None else int(pad_token_id)
+                pad_len = target_length - len(input_ids)
+                input_ids = input_ids + [pad_id] * pad_len
+                attention_mask = attention_mask + [0] * pad_len
+                labels = labels + [-100] * pad_len
 
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}

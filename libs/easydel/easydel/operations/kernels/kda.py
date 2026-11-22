@@ -894,6 +894,7 @@ def _chunk_kda_per_channel_fused(
     precision: str = "highest",
     cfg: KdaChunkConfig | None = None,
     decay_lower_bound: float | None = None,
+    fallback_to_scan: bool = False,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -902,8 +903,10 @@ def _chunk_kda_per_channel_fused(
 
     Same contract as :func:`_chunk_kda_per_channel_fwd` (packed ``segment_ids`` with negative padding,
     ``continue_initial_state``). The Mosaic kernel cannot be SPMD-partitioned, so on TPU it runs directly on one
-    device, under ``shard_map`` over ``kernel_lead_specs = (batch_axes, head_axes)`` on a multi-device mesh, or
-    falls back to the ejkernel XLA implementation when neither is safe (see :func:`run_mosaic_kernel`).
+    device or under ``shard_map`` over ``kernel_lead_specs = (batch_axes, head_axes)`` on a multi-device mesh. Where
+    neither is safe (see :func:`run_mosaic_kernel`) it runs the ejkernel XLA implementation with a warning, as it
+    does without a warning on other backends; with ``fallback_to_scan`` both cases run
+    :func:`_chunk_kda_per_channel_fwd` instead.
 
     Args:
         query: ``(batch, num_heads, seq_len, head_dim)``.
@@ -923,6 +926,8 @@ def _chunk_kda_per_channel_fused(
         decay_lower_bound: Promise that every log-decay ``decay >= decay_lower_bound`` (a safe-gate bound). It lets
             the kernel factor the pairwise decay into MXU matmuls instead of a ``[cs, cs, K]`` VPU tensor
             (``cfg.pairwise="dense"`` opts out); ``None`` keeps the dense form.
+        fallback_to_scan: Run :func:`_chunk_kda_per_channel_fwd` where the Pallas kernel cannot run (set for the
+            automatic ``kda_chunk_impl``).
 
     Returns:
         tuple: ``(outputs, final_state)`` float32.
@@ -950,10 +955,28 @@ def _chunk_kda_per_channel_fused(
             cfg=cfg,
         )
 
+    def scan():
+        return _chunk_kda_per_channel_fwd(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            use_qk_l2norm=use_qk_l2norm,
+            segment_ids=segment_ids,
+            kernel_mesh=kernel_mesh,
+            kernel_lead_specs=kernel_lead_specs,
+            continue_initial_state=continue_initial_state,
+        )
+
     if jax.default_backend() != "tpu":
-        return call(*args, platform="xla")
+        return scan() if fallback_to_scan else call(*args, platform="xla")
 
     def fallback(reason):
+        if fallback_to_scan:
+            return scan()
         logger.warning_once(f"kda_chunk: {reason}; using the XLA implementation.")
         return call(*args, platform="xla")
 
@@ -1144,158 +1167,6 @@ def _chunked_scan_per_channel_rows(
     return core_attn_out, final_state
 
 
-def _packed_segment_kda_per_channel(
-    query: Float[Array, "rows heads seq_len head_dim"],
-    key: Float[Array, "rows heads seq_len head_dim"],
-    value: Float[Array, "rows heads seq_len d_state"],
-    beta: Float[Array, "rows heads seq_len"],
-    decay: Float[Array, "rows heads seq_len head_dim"],
-    initial_state: Float[Array, "rows heads head_dim d_state"] | None,
-    token_valid: Float[Array, "rows seq_len"],
-    chunk_size: int = 64,
-    use_qk_l2norm: bool = True,
-    max_tokens: int | None = None,
-) -> tuple[Float[Array, "rows heads seq_len d_state"], Float[Array, "rows heads head_dim d_state"]]:
-    """Serving prefill for per-channel KDA over packed rows, without per-row bucket padding.
-
-    Same contract and math as :func:`_chunked_scan_per_channel_rows`, restructured for
-    eSurge prefill steps:
-
-    - **Segment-aligned chunks.** The row layout pads every row to the full bucket, so the
-      row scan processes ``rows * seq_len`` token slots for a step holding at most
-      ``max_tokens`` real ones. Here each row's valid tokens are laid out back-to-back, every
-      row starting on a chunk boundary, giving a static budget of
-      ``ceil(max_tokens / chunk_size) + rows`` chunks. Each chunk belongs to exactly one row.
-    - **One batched triangular solve.** The chunk-local ``(I - A)^-1`` is solved for all
-      chunks in a single ``triangular_solve`` instead of a ``chunk_size``-step serial
-      forward substitution inside every chunk step.
-    - **State-only scan.** The chunk scan carries only the recurrent state; it restarts from
-      the row's initial state at the row's first chunk and records the row's final state at
-      its last chunk. Rows with no valid tokens keep their initial state.
-
-    Differs from the row scan only by float32 reassociation. Not intended for differentiation.
-
-    Args:
-        query: ``(rows, heads, seq_len, head_dim)`` window queries.
-        key: ``(rows, heads, seq_len, head_dim)``.
-        value: ``(rows, heads, seq_len, d_state)``.
-        beta: ``(rows, heads, seq_len)`` gating.
-        decay: ``(rows, heads, seq_len, head_dim)`` per-channel log-decay.
-        initial_state: ``(rows, heads, head_dim, d_state)`` starting state, or ``None``.
-        token_valid: ``(rows, seq_len)`` validity mask. Must be prefix-valid per row (each row
-            owns its first ``lens[r]`` positions), as in eSurge packed rows.
-        chunk_size: Chunk granularity.
-        use_qk_l2norm: Whether to L2-normalize Q and K first.
-        max_tokens: Static upper bound on the total valid tokens over all rows. Serving passes
-            the packed stream length, since rows are segments of that stream. Tokens beyond
-            this budget are dropped, so callers must honour the bound. ``None`` means
-            ``rows * seq_len`` (no saving from segment packing).
-
-    Returns:
-        tuple: ``(outputs, final_state)`` — outputs ``(rows, heads, seq_len, d_state)``
-        float32 (zero at invalid positions) and final state
-        ``(rows, heads, head_dim, d_state)`` float32.
-    """
-    R, H, L, K_dim = query.shape
-    V_dim = value.shape[-1]
-    cs = chunk_size
-    if max_tokens is None:
-        max_tokens = R * L
-    num_chunks = min(-(-max_tokens // cs) + R, R * (-(-L // cs)))  # static chunk budget
-
-    lens = jnp.sum(jnp.asarray(token_valid) > 0, axis=1).astype(jnp.int32)  # (R,)
-    row_chunks = (lens + cs - 1) // cs
-    chunk_end = jnp.cumsum(row_chunks)  # exclusive end chunk per row
-    chunk_start = chunk_end - row_chunks
-    c = jnp.arange(num_chunks)
-    chunk_row = jnp.clip(jnp.sum(chunk_end[None, :] <= c[:, None], axis=1), 0, R - 1)  # (C,)
-    chunk_in_row = c - chunk_start[chunk_row]
-    live = c < chunk_end[-1]
-    pos = chunk_in_row[:, None] * cs + jnp.arange(cs)[None, :]  # (C, cs) position within the row
-    tok = live[:, None] & (pos >= 0) & (pos < lens[chunk_row][:, None])  # (C, cs)
-    pos = jnp.clip(pos, 0, L - 1)
-    tok4 = tok[:, None, :, None]
-
-    def gather(x):  # (R, H, L, D) -> (C, H, cs, D), zero outside the row's valid tokens
-        g = x[chunk_row[:, None], :, pos].transpose(0, 2, 1, 3)
-        return jnp.where(tok4, g.astype(jnp.float32), 0.0)
-
-    q = gather(query)
-    k = gather(key)
-    v = gather(value)
-    g = gather(decay)
-    b = jnp.where(tok[:, None, :], beta[chunk_row[:, None], :, pos].transpose(0, 2, 1).astype(jnp.float32), 0.0)
-    if use_qk_l2norm:
-        q = l2norm(q, axis=-1, eps=1e-6)
-        k = l2norm(k, axis=-1, eps=1e-6)
-    q = q * (1.0 / (K_dim**0.5))
-
-    mask_tril = jnp.tril(jnp.ones((cs, cs), dtype=bool), k=0)
-    mask_triu = jnp.triu(jnp.ones((cs, cs), dtype=bool), k=0)
-    mask_triu_inner = jnp.triu(jnp.ones((cs, cs), dtype=bool), k=1)
-    eye = jnp.eye(cs, dtype=jnp.float32)
-
-    g_cumsum = jnp.cumsum(g, axis=-2)  # (C, H, cs, K)
-    k_beta = k * b[..., None]
-    v_beta = v * b[..., None]
-
-    def chunk_local(args):
-        # Pair difference before exp, masked on both sides: see the overflow note in
-        # :func:`_chunked_scan_per_channel_rows`. The (cs, cs, K) decay tensor stays chunk-local.
-        kb, kk, qq, gc = args  # (H, cs, K)
-        g_diff = jnp.where(mask_tril[:, :, None], gc[:, :, None, :] - gc[:, None, :, :], 0.0)
-        decay_mask = jnp.where(mask_tril[:, :, None], jnp.exp(g_diff), 0.0)
-        attn = -jnp.einsum("hik,hjk,hijk->hij", kb, kk, decay_mask, precision=_MATMUL_PRECISION)
-        attn = jnp.where(mask_triu, 0.0, attn)
-        attn_qk = jnp.einsum("hik,hjk,hijk->hij", qq, kk, decay_mask, precision=_MATMUL_PRECISION)
-        attn_qk = jnp.where(mask_triu_inner, 0.0, attn_qk)
-        return attn, attn_qk
-
-    attn, attn_qk = lax.map(chunk_local, (k_beta, k, q, g_cumsum))  # (C, H, cs, cs)
-    # (I - attn)^-1 for every chunk at once; equals the forward-substitution resolve + I.
-    lower = eye - attn
-    attn_resolved = lax.linalg.triangular_solve(
-        lower, jnp.broadcast_to(eye, lower.shape), left_side=True, lower=True, unit_diagonal=True
-    )
-    value_local = jnp.einsum("chij,chjv->chiv", attn_resolved, v_beta, precision=_MATMUL_PRECISION)
-    k_cumdecay = jnp.einsum("chij,chjk->chik", attn_resolved, k_beta * jnp.exp(g_cumsum), precision=_MATMUL_PRECISION)
-    q_scaled = q * jnp.exp(g_cumsum)
-    g_end = g_cumsum[:, :, -1, :]  # (C, H, K)
-    k_scaled = k * jnp.exp(g_end[:, :, None, :] - g_cumsum)
-    decay_end = jnp.exp(g_end)
-
-    is_first = live & (chunk_in_row == 0)
-    is_last = live & (c == chunk_end[chunk_row] - 1)
-    if initial_state is None:
-        init = jnp.zeros((R, H, K_dim, V_dim), dtype=jnp.float32)
-    else:
-        init = initial_state.astype(jnp.float32)
-
-    def state_step(carry, xs):
-        state, finals = carry
-        kcd, vl, qs, aqk, ks, de, row, first, last = xs
-        state = jnp.where(first, init[row], state)
-        v_new = vl - jnp.einsum("hik,hkv->hiv", kcd, state, precision=_MATMUL_PRECISION)
-        out = jnp.einsum("hik,hkv->hiv", qs, state, precision=_MATMUL_PRECISION) + jnp.einsum(
-            "hij,hjv->hiv", aqk, v_new, precision=_MATMUL_PRECISION
-        )
-        state = state * de[..., None] + jnp.einsum("hik,hiv->hkv", ks, v_new, precision=_MATMUL_PRECISION)
-        finals = finals.at[row].set(jnp.where(last, state, finals[row]))
-        return (state, finals), out
-
-    (_, final_state), chunk_out = lax.scan(
-        state_step,
-        (jnp.zeros((H, K_dim, V_dim), jnp.float32), init),
-        (k_cumdecay, value_local, q_scaled, attn_qk, k_scaled, decay_end, chunk_row, is_first, is_last),
-    )  # chunk_out (C, H, cs, V)
-
-    j = jnp.arange(L)
-    out_chunk = jnp.clip(chunk_start[:, None] + j[None, :] // cs, 0, num_chunks - 1)  # (R, L)
-    out = chunk_out[out_chunk, :, (j % cs)[None, :]]  # (R, L, H, V)
-    out = jnp.where((j[None, :] < lens[:, None])[:, :, None, None], out, 0.0)
-    return out.transpose(0, 2, 1, 3), final_state
-
-
 def _single_step_kda_per_channel_fwd_bthd(
     query: Float[Array, "batch 1 num_heads head_dim"],
     key: Float[Array, "batch 1 num_heads head_dim"],
@@ -1354,324 +1225,6 @@ def _single_step_kda_per_channel_fwd_bthd(
     new_state = recurrent_state + key[:, 0, :, :, None] * delta[:, :, None, :]
     output = jnp.sum(new_state * query[:, 0, :, :, None], axis=-2)
     return output.astype(input_dtype)[:, None, :, :], new_state
-
-
-_SHORT_WINDOW_MAX = 8
-
-
-def _short_window_kda_per_channel(
-    query: Float[Array, "rows heads seq_len head_dim"],
-    key: Float[Array, "rows heads seq_len head_dim"],
-    value: Float[Array, "rows heads seq_len d_state"],
-    beta: Float[Array, "rows heads seq_len"],
-    decay: Float[Array, "rows heads seq_len head_dim"],
-    initial_state: Float[Array, "rows heads head_dim d_state"],
-    lens: Array,
-    max_steps: int,
-    stack_steps: int = 0,
-) -> tuple[Array, ...]:
-    """Advance per-channel KDA rows of at most ``max_steps`` tokens with the per-token decode recurrence.
-
-    Applies :func:`_single_step_kda_per_channel_fwd_bthd` once per position (a ``fori_loop`` whose trip count is
-    the longest row, capped at ``max_steps``), masking each row past its own length. Between steps the carried
-    state is stored in ``initial_state``'s dtype, exactly as decode stores it in the cache, so every token sees
-    plain decode's arithmetic. Used for short windows (speculative verify), where the chunked prefill kernel would
-    build full ``chunk_size`` chunks for a handful of tokens per row.
-
-    Args:
-        query: ``(rows, heads, seq_len, head_dim)`` post-conv queries (row ``r`` owns its first ``lens[r]`` slots).
-        key: ``(rows, heads, seq_len, head_dim)``.
-        value: ``(rows, heads, seq_len, d_state)``.
-        beta: ``(rows, heads, seq_len)`` gating.
-        decay: ``(rows, heads, seq_len, head_dim)`` per-channel log-decay.
-        initial_state: ``(rows, heads, head_dim, d_state)`` carried state (its dtype is the storage dtype).
-        lens: ``(rows,)`` valid tokens per row.
-        max_steps: Static upper bound on ``lens``; positions at or past it are not processed.
-        stack_steps: When positive, also return the state after each of the first ``stack_steps`` tokens
-            (speculative candidate rows), stored in ``initial_state``'s dtype.
-
-    Returns:
-        tuple: ``(outputs, final_state)`` — outputs ``(rows, heads, seq_len, d_state)`` float32 (zero at
-        positions past a row's length) and final state float32. Rows with ``lens == 0`` keep their state. With
-        ``stack_steps > 0`` a third element ``(stack_steps, rows, heads, head_dim, d_state)`` holds the state after
-        ``t + 1`` tokens at index ``t`` (entries past a row's length are unspecified).
-    """
-    rows, heads, seq, _ = query.shape
-    d_state = value.shape[-1]
-    state_dtype = initial_state.dtype
-    trips = jnp.minimum(jnp.max(lens), max_steps).astype(jnp.int32)
-    stack0 = jnp.zeros((stack_steps, *initial_state.shape), state_dtype) if stack_steps > 0 else None
-
-    def body(t, carry):
-        state, out, stack = carry
-
-        def at(x):
-            return lax.dynamic_slice_in_dim(x, t, 1, axis=2)
-
-        o, s = _single_step_kda_per_channel_fwd_bthd(
-            query=at(query).transpose(0, 2, 1, 3),
-            key=at(key).transpose(0, 2, 1, 3),
-            value=at(value).transpose(0, 2, 1, 3),
-            beta=at(beta).transpose(0, 2, 1),
-            decay=at(decay).transpose(0, 2, 1, 3),
-            recurrent_state=state,
-            use_qk_l2norm=True,
-        )
-        live = (t < lens)[:, None, None, None]
-        state = jnp.where(live, s.astype(state_dtype), state)
-        o = jnp.where(live, o.astype(jnp.float32), 0.0).transpose(0, 2, 1, 3)  # (R, H, 1, V)
-        out = lax.dynamic_update_slice_in_dim(out, o, t, axis=2)
-        if stack is not None:
-            idx = jnp.minimum(t, stack_steps - 1)
-            entry = jnp.where(t < stack_steps, state, lax.dynamic_index_in_dim(stack, idx, axis=0, keepdims=False))
-            stack = lax.dynamic_update_index_in_dim(stack, entry, idx, axis=0)
-        return state, out, stack
-
-    out0 = jnp.zeros((rows, heads, seq, d_state), jnp.float32)
-    state, out, stack = lax.fori_loop(0, trips, body, (initial_state, out0, stack0))
-    if stack is None:
-        return out, state.astype(jnp.float32)
-    return out, state.astype(jnp.float32), stack
-
-
-def kda_packed_rows_forward(
-    query: Float[Array, "1 seq_len key_dim"],
-    key: Float[Array, "1 seq_len key_dim"],
-    value: Float[Array, "1 seq_len value_dim"],
-    beta: Float[Array, "1 seq_len num_heads"],
-    decay: Float[Array, "1 seq_len num_heads head_dim"],
-    conv_kernels: tuple[Array, Array, Array],
-    cache_view: KDACacheView,
-    query_start_loc: Array,
-    context_lens: Array | None = None,
-    conv_dtype: jnp.dtype = jnp.bfloat16,
-    chunk_size: int = 64,
-    spec_recurrent_commit: Array | None = None,
-) -> tuple[Float[Array, "1 seq_len num_heads d_state"], KDACacheView]:
-    """Advance per-request per-channel KDA state over an eSurge packed token stream.
-
-    Model-agnostic serving driver shared by every per-channel KDA layer (GLM-5-Next,
-    Kimi Linear). The runner flattens all scheduled requests into one token stream
-    ``[1, T, D]``; ``query_start_loc`` gives each request's (row's) segment as
-    ``[start_i, start_{i+1})``, and per-request conv windows and recurrent memory live
-    in per-row cache slots. This function splits the stream into rows, runs the causal
-    depthwise conv per row (with the carried window as prefix for rows that already
-    hold context), advances the delta-rule state per row -- single-step on pure decode
-    steps, :func:`_packed_segment_kda_per_channel` otherwise -- and gathers the per-row
-    outputs back into the packed stream.
-
-    The caller owns the model-specific parts: projections, the decay gate, the output
-    gate/norm and the output projection.
-
-    Args:
-        query: Packed Q projection (pre-conv) ``[1, T, key_dim]``.
-        key: Packed K projection (pre-conv) ``[1, T, key_dim]``.
-        value: Packed V projection (pre-conv) ``[1, T, value_dim]``.
-        beta: Packed per-head gating ``[1, T, heads]`` (sigmoid applied).
-        decay: Packed per-channel log-decay ``[1, T, heads, head_dim]``.
-        conv_kernels: Depthwise causal conv kernels for q, k, v, each ``[dim, d_conv]``
-            (``conv1d.weight.value.squeeze(1).T`` for a grouped ``nn.Conv1d``).
-        cache_view: Per-layer KDA cache view with one slot per row.
-        query_start_loc: Cumulative segment offsets ``[rows + 1]``. Rank-major DP metadata
-            (``[dp, rows + 1]``) is rejected with ``ValueError``.
-        context_lens: Tokens per row *including* this step; a row with
-            ``context_lens > scheduled`` continues from its carried conv window. When
-            ``None``, only single-token rows are treated as continuations.
-        conv_dtype: Output dtype of the causal conv (matches the dense path).
-        chunk_size: Chunk size of the prefill kernel.
-        spec_recurrent_commit: Optional ``[2, >= rows]`` int32 speculative commit (row 0: active flag, row 1:
-            accepted prefix length). Used only when the cache pool holds speculative candidate rows (pool size
-            ``rows * (1 + C)``, prefix-major layout ``rows + (prefix - 1) * rows + row``): the accepted prefix's
-            candidate row is copied into the live row before this step runs. Candidate rows are rewritten for every
-            speculative row (``2 <= lens <= C`` with prior context) with the decode-exact state after each prefix.
-
-    Returns:
-        tuple: ``(outputs, new_cache_view)`` -- outputs ``[1, T, heads, head_v_dim]``
-        float32 (zero at bucket padding), and the cache view with updated conv windows
-        and recurrent states.
-    """
-    if query_start_loc.ndim != 1:
-        # Rank-major DP metadata ([dp, rows + 1]) would need per-rank state scatter and a
-        # ``context_lens`` slice; using only rank 0 would leave every other rank's rows
-        # un-advanced with no error, so refuse instead.
-        raise ValueError(
-            "kda_packed_rows_forward requires 1-D query_start_loc [rows + 1]; rank-major DP metadata "
-            f"(got shape {tuple(query_start_loc.shape)}) is not supported for per-channel KDA layers."
-        )
-    rows = query_start_loc.shape[0] - 1
-    seq = query.shape[1]
-    starts = query_start_loc[:-1]
-    lens = query_start_loc[1:] - starts  # [rows]
-    ar = jnp.arange(seq)
-
-    # Index-clamped gather (NOT start-clamped slicing): the token bucket is padded to the
-    # compile width, so `starts[i] + seq` routinely overruns the buffer and a start-clamped
-    # dynamic_slice would clamp back to 0, silently feeding row 0's tokens to later rows.
-    def gather(x):
-        idx = jnp.clip(starts[:, None] + ar[None, :], 0, x.shape[0] - 1)
-        return x[idx]
-
-    q_r, k_r, v_r = gather(query[0]), gather(key[0]), gather(value[0])
-    b_r, g_r = gather(beta[0]), gather(decay[0])
-    valid = (ar[None, :] < lens[:, None]).astype(q_r.dtype)  # [rows, T]
-
-    def mask(x):
-        shape = valid.shape + (1,) * (x.ndim - 2)
-        return jnp.where(valid.reshape(shape), x, 0.0)
-
-    q_r, k_r, v_r, b_r, g_r = mask(q_r), mask(k_r), mask(v_r), mask(b_r), mask(g_r)
-
-    # The pool may hold ``C`` candidate rows per request row after the live rows (prefix-major). Apply a pending
-    # commit (accepted prefix -> live row) first, then work on the live rows only.
-    pool_leaves = (cache_view.q_conv_state, cache_view.k_conv_state, cache_view.v_conv_state, cache_view.recurrent_state)
-    pool = int(cache_view.recurrent_state.shape[0])
-    cand = (pool - rows) // rows if rows > 0 and pool > rows else 0
-    if cand > 0 and spec_recurrent_commit is not None:
-        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
-        if commit.shape[1] < rows:
-            commit = jnp.pad(commit, ((0, 0), (0, rows - commit.shape[1])))
-        prefix_sel = commit[1, :rows]
-        commit_active = (commit[0, :rows] > 0) & (prefix_sel > 0) & (prefix_sel <= cand)
-        src_rows = jnp.clip(rows + (prefix_sel - 1) * rows + jnp.arange(rows), 0, pool - 1)
-
-        def _apply_commit(leaf):
-            mask_c = commit_active.reshape((rows,) + (1,) * (leaf.ndim - 1))
-            live_rows = jnp.where(mask_c, leaf[src_rows], leaf[:rows]).astype(leaf.dtype)
-            return lax.dynamic_update_slice_in_dim(leaf, live_rows, 0, axis=0)
-
-        pool_leaves = tuple(_apply_commit(leaf) for leaf in pool_leaves)
-    base_leaves = tuple(leaf[:rows] for leaf in pool_leaves) if pool != rows else pool_leaves
-    if context_lens is None:
-        context_before = jnp.zeros_like(lens)
-    else:
-        context_before = jnp.asarray(context_lens, dtype=jnp.int32)[:rows] - lens
-    spec_mask = (lens >= 2) & (lens <= cand) & (context_before > 0)
-
-    conv_states = base_leaves[:3]
-    cand_conv = []
-    if context_lens is None:
-        has_prefix = lens <= 1
-    else:
-        has_prefix = context_lens > lens
-    conv_outs = []
-    new_conv = []
-    for x_in, kern, state in zip((q_r, k_r, v_r), conv_kernels, conv_states, strict=True):
-        x_rows = x_in.astype(jnp.float32)
-        st = state.astype(jnp.float32)  # [rows, d, d_conv]
-        d_conv = st.shape[-1]
-        prefix = jnp.where(has_prefix[:, None, None], st[:, :, 1:], 0.0).transpose(0, 2, 1)  # [rows, dc-1, d]
-        stream = jnp.concatenate([prefix, x_rows], axis=1)  # [rows, T + dc - 1, d]
-        out = jnp.zeros_like(stream[:, :seq, :])
-        kern = kern.astype(jnp.float32)
-        for m in range(d_conv):
-            out = out + stream[:, m : m + seq, :] * kern[:, m][None, None, :]
-        conv_outs.append(jax.nn.silu(out).astype(conv_dtype))
-        # New state = the trailing window ending at this row's LAST real token
-        # (stream offset dc-1+lens), not the padded bucket tail.
-        win_start = jnp.clip(lens - 1, 0, seq - 1)
-        win_idx = win_start[:, None] + jnp.arange(d_conv)[None, :]
-        candidate = stream[jnp.arange(rows)[:, None], win_idx].transpose(0, 2, 1)  # [rows, d, d_conv]
-        keep = (lens > 0)[:, None, None]
-        new_conv.append(jnp.where(keep, candidate, st).astype(state.dtype))
-        if cand > 0:
-            # Window after prefix ``t + 1``: stream offsets ``[t, t + d_conv)`` (decode-exact; raw inputs).
-            c_idx = jnp.clip(jnp.arange(cand)[:, None] + jnp.arange(d_conv)[None, :], 0, stream.shape[1] - 1)
-            cand_conv.append(stream[:, c_idx].transpose(1, 0, 3, 2))  # [cand, rows, d, d_conv]
-
-    num_heads = b_r.shape[-1]
-    head_k = q_r.shape[-1] // num_heads
-    head_v = v_r.shape[-1] // num_heads
-    qh = conv_outs[0].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)  # [R, H, T, K]
-    kh = conv_outs[1].reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
-    vh = conv_outs[2].reshape(rows, seq, num_heads, head_v).transpose(0, 2, 1, 3)
-    bh = b_r.transpose(0, 2, 1)  # [R, H, T]
-    gh = g_r.reshape(rows, seq, num_heads, head_k).transpose(0, 2, 1, 3)
-    init_state = base_leaves[3]  # [R, H, K, V]
-    rec_dtype = init_state.dtype
-    zero_stack = jnp.zeros((cand, *init_state.shape), rec_dtype) if cand > 0 else None
-
-    def _spec_stack():
-        # Decode-exact per-prefix states of the speculative rows, for branches whose recurrence does not produce them.
-        spec_lens = jnp.where(spec_mask, jnp.minimum(lens, cand), 0)
-        return _short_window_kda_per_channel(qh, kh, vh, bh, gh, init_state, spec_lens, cand, stack_steps=cand)[2]
-
-    def _single_path():
-        out1, new_state = _single_step_kda_per_channel_fwd_bthd(
-            query=qh[:, :, :1, :].transpose(0, 2, 1, 3),
-            key=kh[:, :, :1, :].transpose(0, 2, 1, 3),
-            value=vh[:, :, :1, :].transpose(0, 2, 1, 3),
-            beta=bh[:, :, :1].transpose(0, 2, 1),
-            decay=gh[:, :, :1, :].transpose(0, 2, 1, 3),
-            recurrent_state=init_state,
-            use_qk_l2norm=True,
-        )
-        out1 = jnp.transpose(out1, (0, 2, 1, 3)).astype(jnp.float32)  # [R, H, 1, V]
-        out1 = jnp.pad(out1, ((0, 0), (0, 0), (0, seq - 1), (0, 0)))
-        return out1, new_state.astype(jnp.float32), zero_stack
-
-    def _chunk_path():
-        # Rows are segments of one packed ``seq``-token stream, so their valid tokens total
-        # at most ``seq``: segment-aligned chunks skip the per-row bucket padding.
-        out, new_state = _packed_segment_kda_per_channel(
-            query=qh,
-            key=kh,
-            value=vh,
-            beta=bh,
-            decay=gh,
-            initial_state=init_state,
-            token_valid=valid,
-            chunk_size=chunk_size,
-            max_tokens=seq,
-        )
-        return out, new_state.astype(jnp.float32), (_spec_stack() if cand > 0 else None)
-
-    short_max = min(_SHORT_WINDOW_MAX, seq)
-    if short_max > 1:
-
-        def _short_path():
-            # Short windows (speculative verify: 1 + draft tokens per row) run the decode recurrence per token:
-            # cheaper than building full chunks, and arithmetically identical to plain decode.
-            if cand > 0:
-                return _short_window_kda_per_channel(qh, kh, vh, bh, gh, init_state, lens, short_max, stack_steps=cand)
-            out_s, state_s = _short_window_kda_per_channel(qh, kh, vh, bh, gh, init_state, lens, short_max)
-            return out_s, state_s, None
-
-        max_len = jnp.max(lens)
-        branch = jnp.where(max_len <= 1, 0, jnp.where(max_len <= short_max, 1, 2))
-        out_h, new_recurrent, cand_states = lax.switch(branch, (_single_path, _short_path, _chunk_path))
-    else:
-        out_h, new_recurrent, cand_states = lax.cond(jnp.all(lens <= 1), _single_path, _chunk_path)
-
-    # Gather per-row outputs back into the packed stream.
-    out_rows = out_h.transpose(0, 2, 1, 3)  # [R, T, H, V]
-    seg_ids = jnp.clip(jnp.sum(query_start_loc[1:, None] <= ar[None, :], axis=0), 0, rows - 1)  # [T]
-    pos_in_row = jnp.clip(ar - query_start_loc[seg_ids], 0, seq - 1)
-    in_stream = ar < query_start_loc[-1]
-    out_packed = jnp.where(in_stream[:, None, None], out_rows[seg_ids, pos_in_row], 0.0)[None]  # [1, T, H, V]
-
-    def _merge(pool_leaf, new_live, cand_vals):
-        # Live rows <- this step's final state; speculative rows' candidate rows <- per-prefix states; rest kept.
-        new_live = new_live.astype(pool_leaf.dtype)
-        if pool_leaf.shape[0] == rows:
-            return new_live
-        used = rows * (1 + cand)
-        tail_shape = pool_leaf.shape[1:]
-        parts = [new_live]
-        if cand > 0:
-            old = pool_leaf[rows:used].reshape((cand, rows, *tail_shape))
-            m = spec_mask.reshape((1, rows) + (1,) * len(tail_shape))
-            parts.append(jnp.where(m, cand_vals.astype(pool_leaf.dtype), old).reshape((cand * rows, *tail_shape)))
-        if pool_leaf.shape[0] > used:
-            parts.append(pool_leaf[used:])
-        return jnp.concatenate(parts, axis=0)
-
-    new_cache_view = cache_view.update_kda_states(
-        new_q_conv_state=_merge(pool_leaves[0], new_conv[0], cand_conv[0] if cand > 0 else None),
-        new_k_conv_state=_merge(pool_leaves[1], new_conv[1], cand_conv[1] if cand > 0 else None),
-        new_v_conv_state=_merge(pool_leaves[2], new_conv[2], cand_conv[2] if cand > 0 else None),
-        new_recurrent_state=_merge(pool_leaves[3], new_recurrent, cand_states),
-    )
-    return out_packed, new_cache_view
 
 
 @OperationRegistry.register
@@ -1767,6 +1320,7 @@ class KernelDeltaAttnOp(OperationImpl):
         chunk_impl: str = "scan",
         chunk_precision: str = "highest",
         decay_lower_bound: float | None = None,
+        fallback_to_scan: bool = False,
         **kwargs,
     ) -> KDAOutput:
         """Forward pass for KDA attention.
@@ -1805,6 +1359,9 @@ class KernelDeltaAttnOp(OperationImpl):
                 lets the kernel factor the pairwise decay into MXU matmuls (see ejkernel
                 ``KdaChunkConfig.pairwise``); ``None`` keeps the dense form. Other paths
                 ignore it (they are exact for any decay).
+            fallback_to_scan: On the ``"kda_chunk"`` path, run the ``"scan"`` implementation where the Pallas
+                kernel cannot run (another backend, or a mesh layout it cannot be partitioned over) instead of
+                ejkernel's XLA ``kda_chunk``, and without a warning. Set for the automatic ``kda_chunk_impl``.
             **kwargs: Additional ignored arguments
 
         Returns:
@@ -1918,6 +1475,7 @@ class KernelDeltaAttnOp(OperationImpl):
                         extra["precision"] = chunk_precision
                         extra["cfg"] = self.metadata.get_operation_config("kda_chunk")
                         extra["decay_lower_bound"] = decay_lower_bound
+                        extra["fallback_to_scan"] = fallback_to_scan
                     if shardings is not None and mesh is not None:
 
                         def _eff(axes):
@@ -2012,6 +1570,7 @@ class KernelDeltaAttnOp(OperationImpl):
         chunk_impl: str = "scan",
         chunk_precision: str = "highest",
         decay_lower_bound: float | None = None,
+        fallback_to_scan: bool = False,
         **kwargs,
     ) -> KDAOutput:
         """Execute the KDA operation.
@@ -2040,6 +1599,7 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_impl: ``"scan"`` (default) or ``"kda_chunk"``; see :meth:`forward_native`.
             chunk_precision: ``"highest"`` (default) or ``"default"``; see :meth:`forward_native`.
             decay_lower_bound: Promised log-decay lower bound or ``None``; see :meth:`forward_native`.
+            fallback_to_scan: See :meth:`forward_native`.
             **kwargs: Additional arguments
 
         Returns:
@@ -2062,5 +1622,6 @@ class KernelDeltaAttnOp(OperationImpl):
             chunk_impl=chunk_impl,
             chunk_precision=chunk_precision,
             decay_lower_bound=decay_lower_bound,
+            fallback_to_scan=fallback_to_scan,
             **kwargs,
         )

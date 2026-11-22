@@ -537,9 +537,13 @@ class DistributedConfig:
                 device_ids,
                 initialization_timeout=initialization_timeout,
             )
+            # No jax.device_count()/process_count() here: they start the backend, and a caller may still need to
+            # change the device environment (e.g. join a sub-slice world) before it starts.
+            from jax._src.distributed import global_state
+
             logger.info(
-                f"Initialized jax.distributed with {jax.device_count()} devices, {jax.process_count()} processes,"
-                f" coordinator_address={coordinator_address}, process_id={self.process_id}, my"
+                f"Initialized jax.distributed with {global_state.num_processes} processes,"
+                f" coordinator_address={coordinator_address}, process_id={global_state.process_id}, my"
                 f" device_ids={device_ids}."
             )
         else:

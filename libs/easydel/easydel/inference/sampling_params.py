@@ -43,12 +43,14 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
 from typing import Annotated, Any
 
 import jax
+import numpy as np
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from eformer.pytree import field as pytree_field
@@ -157,7 +159,7 @@ class GuidedDecodingParams:
                 self.regex is not None,
                 self.choice is not None,
                 self.grammar is not None,
-                self.json_object is not None,
+                bool(self.json_object),
             )
         )
         if guide_count > 1:
@@ -222,11 +224,112 @@ class JitableSamplingParams:
             New JitableSamplingParams with the second sample inserted at slot.
         """
         self = self.view_1d()
+        batch_size = int(self.temperature.shape[0])
 
         def update_idx1d(x, y):
-            """Update array x at the given slot with values from y, preserving sharding."""
-            sharding = getattr(x, "sharding", PartitionSpec())
-            return with_sharding_constraint(jax.lax.dynamic_update_slice(x, y, (slot,)), sharding)
+            """Update array x at the given slot with values from y, preserving NamedSharding."""
+            sharding = getattr(x, "sharding", None)
+            y_1d = jnp.asarray(y, dtype=x.dtype).reshape(-1)
+            updated = jax.lax.dynamic_update_slice(x, y_1d, (slot,))
+            if isinstance(sharding, (jax.sharding.NamedSharding, PartitionSpec)):
+                return with_sharding_constraint(updated, sharding)
+            return updated
+
+        def update_row_2d(dst, src, pad_value: int):
+            """Update row ``slot`` of a ``(batch, width)`` 2D buffer, growing or trimming trailing pad columns."""
+            dst_arr = jnp.asarray(dst, dtype=jnp.int32)
+            if dst_arr.ndim == 1:
+                dst_arr = (
+                    dst_arr.reshape(batch_size, -1)
+                    if dst_arr.size % batch_size == 0
+                    else jnp.full((batch_size, dst_arr.size), pad_value, dtype=jnp.int32)
+                )
+            elif dst_arr.shape[0] != batch_size:
+                dst_arr = jnp.full((batch_size, dst_arr.shape[-1]), pad_value, dtype=jnp.int32)
+            src_arr = jnp.asarray(src, dtype=jnp.int32)
+            src_2d = src_arr.reshape(1, -1) if src_arr.ndim <= 1 else src_arr
+            width = max(int(dst_arr.shape[1]), int(src_2d.shape[1]))
+            if int(dst_arr.shape[1]) < width:
+                dst_arr = jnp.pad(dst_arr, ((0, 0), (0, width - int(dst_arr.shape[1]))), constant_values=pad_value)
+            if int(src_2d.shape[1]) < width:
+                src_2d = jnp.pad(src_2d, ((0, 0), (0, width - int(src_2d.shape[1]))), constant_values=pad_value)
+            if width == 0:
+                return dst_arr
+            updated = jax.lax.dynamic_update_slice(dst_arr, src_2d, (slot, 0))
+            if not isinstance(updated, jax.core.Tracer) and int(updated.shape[1]) > 0:
+                col_has_data = np.any(np.asarray(updated != pad_value), axis=0)
+                if not np.any(col_has_data):
+                    return jnp.empty((batch_size, 0), dtype=updated.dtype)
+                last_valid = int(np.max(np.flatnonzero(col_has_data))) + 1
+                if last_valid < int(updated.shape[1]):
+                    updated = updated[:, :last_valid]
+            return updated
+
+        def update_row_3d(dst, src, pad_value: int = -100):
+            """Update row ``slot`` of a ``(batch, num_words, word_len)`` 3D buffer, trimming trailing pad axes."""
+            dst_arr = jnp.asarray(dst, dtype=jnp.int32)
+            if dst_arr.ndim != 3 or int(dst_arr.shape[0]) != batch_size:
+                dst_arr = jnp.empty((batch_size, 0, 0), dtype=jnp.int32)
+            src_arr = jnp.asarray(src, dtype=jnp.int32)
+            if src_arr.ndim == 2:
+                src_3d = jnp.empty((1, 0, 0), dtype=jnp.int32) if src_arr.size == 0 else src_arr[None, :, :]
+            elif src_arr.ndim == 3:
+                src_3d = src_arr
+            else:
+                src_3d = jnp.empty((1, 0, 0), dtype=jnp.int32)
+            n_words = max(int(dst_arr.shape[1]), int(src_3d.shape[1]))
+            w_len = max(int(dst_arr.shape[2]), int(src_3d.shape[2]))
+            if int(dst_arr.shape[1]) < n_words or int(dst_arr.shape[2]) < w_len:
+                dst_arr = jnp.pad(
+                    dst_arr,
+                    ((0, 0), (0, n_words - int(dst_arr.shape[1])), (0, w_len - int(dst_arr.shape[2]))),
+                    constant_values=pad_value,
+                )
+            if int(src_3d.shape[1]) < n_words or int(src_3d.shape[2]) < w_len:
+                src_3d = jnp.pad(
+                    src_3d,
+                    ((0, 0), (0, n_words - int(src_3d.shape[1])), (0, w_len - int(src_3d.shape[2]))),
+                    constant_values=pad_value,
+                )
+            if n_words == 0 or w_len == 0:
+                return dst_arr
+            updated = jax.lax.dynamic_update_slice(dst_arr, src_3d, (slot, 0, 0))
+            if not isinstance(updated, jax.core.Tracer) and int(updated.shape[1]) > 0 and int(updated.shape[2]) > 0:
+                non_pad = np.asarray(updated != pad_value)
+                word_has_data = np.any(non_pad, axis=(0, 2))
+                pos_has_data = np.any(non_pad, axis=(0, 1))
+                if not np.any(word_has_data) or not np.any(pos_has_data):
+                    return jnp.empty((batch_size, 0, 0), dtype=updated.dtype)
+                last_word = int(np.max(np.flatnonzero(word_has_data))) + 1
+                last_pos = int(np.max(np.flatnonzero(pos_has_data))) + 1
+                if last_word < int(updated.shape[1]) or last_pos < int(updated.shape[2]):
+                    updated = updated[:, :last_word, :last_pos]
+            return updated
+
+        all_stop_token_ids = update_row_2d(self.all_stop_token_ids, second_sample.all_stop_token_ids, pad_value=-1)
+        bad_words_lengths = update_row_2d(self.bad_words_lengths, second_sample.bad_words_lengths, pad_value=0)
+        bad_words_token_ids = update_row_3d(self.bad_words_token_ids, second_sample.bad_words_token_ids, pad_value=-100)
+        if self.allowed_token_ids is None and second_sample.allowed_token_ids is None:
+            allowed_token_ids = None
+        elif second_sample.allowed_token_ids is not None:
+            base_allowed = (
+                self.allowed_token_ids
+                if self.allowed_token_ids is not None
+                else jnp.empty((batch_size, 0), dtype=jnp.int32)
+            )
+            allowed_token_ids = update_row_2d(base_allowed, second_sample.allowed_token_ids, pad_value=-1)
+        else:
+            allowed_token_ids = update_row_2d(
+                self.allowed_token_ids,
+                jnp.empty((1, 0), dtype=jnp.int32),
+                pad_value=-1,
+            )
+        if (
+            allowed_token_ids is not None
+            and not isinstance(allowed_token_ids, jax.core.Tracer)
+            and int(allowed_token_ids.shape[1]) == 0
+        ):
+            allowed_token_ids = None
 
         return JitableSamplingParams(
             random_sampling=update_idx1d(self.random_sampling, second_sample.random_sampling),
@@ -239,17 +342,21 @@ class JitableSamplingParams:
             presence_penalty=update_idx1d(self.presence_penalty, second_sample.presence_penalty),
             max_tokens=update_idx1d(self.max_tokens, second_sample.max_tokens),
             min_tokens=update_idx1d(self.min_tokens, second_sample.min_tokens),
-            all_stop_token_ids=self.all_stop_token_ids,
-            bad_words_token_ids=self.bad_words_token_ids,
-            bad_words_lengths=self.bad_words_lengths,
-            allowed_token_ids=self.allowed_token_ids,
+            all_stop_token_ids=all_stop_token_ids,
+            bad_words_token_ids=bad_words_token_ids,
+            bad_words_lengths=bad_words_lengths,
+            allowed_token_ids=allowed_token_ids,
         )
 
     def view_1d(self) -> JitableSamplingParams:
-        """Reshape all parameter arrays to 1D (batch_size,).
+        """Reshape per-sample scalar parameter arrays to 1D ``(batch_size,)``.
+
+        Preserves structured multi-dimensional token-list fields (``all_stop_token_ids``,
+        ``bad_words_token_ids``, ``bad_words_lengths``, ``allowed_token_ids``) without
+        flattening them.
 
         Returns:
-            New JitableSamplingParams with all arrays reshaped to 1D.
+            New JitableSamplingParams with scalar per-row arrays reshaped to 1D.
         """
         return JitableSamplingParams(
             random_sampling=self.random_sampling.reshape(-1),
@@ -262,17 +369,19 @@ class JitableSamplingParams:
             presence_penalty=self.presence_penalty.reshape(-1),
             max_tokens=self.max_tokens.reshape(-1),
             min_tokens=self.min_tokens.reshape(-1),
-            all_stop_token_ids=self.all_stop_token_ids.reshape(-1),
-            bad_words_token_ids=self.bad_words_token_ids.reshape(-1),
-            bad_words_lengths=self.bad_words_lengths.reshape(-1),
-            allowed_token_ids=self.allowed_token_ids.reshape(-1) if self.allowed_token_ids is not None else None,
+            all_stop_token_ids=self.all_stop_token_ids,
+            bad_words_token_ids=self.bad_words_token_ids,
+            bad_words_lengths=self.bad_words_lengths,
+            allowed_token_ids=self.allowed_token_ids,
         )
 
     def view_2d(self) -> JitableSamplingParams:
-        """Reshape all parameter arrays to 2D (batch_size, 1).
+        """Reshape per-sample scalar parameter arrays to 2D ``(batch_size, 1)``.
+
+        Preserves structured multi-dimensional token-list fields without flattening.
 
         Returns:
-            New JitableSamplingParams with all arrays reshaped to 2D.
+            New JitableSamplingParams with scalar per-row arrays reshaped to 2D.
         """
         return JitableSamplingParams(
             random_sampling=self.random_sampling.reshape(-1, 1),
@@ -285,36 +394,36 @@ class JitableSamplingParams:
             presence_penalty=self.presence_penalty.reshape(-1, 1),
             max_tokens=self.max_tokens.reshape(-1, 1),
             min_tokens=self.min_tokens.reshape(-1, 1),
-            all_stop_token_ids=self.all_stop_token_ids.reshape(-1, 1),
-            bad_words_token_ids=self.bad_words_token_ids.reshape(-1, 1),
-            bad_words_lengths=self.bad_words_lengths.reshape(-1, 1),
-            allowed_token_ids=self.allowed_token_ids.reshape(-1, 1) if self.allowed_token_ids is not None else None,
+            all_stop_token_ids=self.all_stop_token_ids,
+            bad_words_token_ids=self.bad_words_token_ids,
+            bad_words_lengths=self.bad_words_lengths,
+            allowed_token_ids=self.allowed_token_ids,
         )
 
     @classmethod
     def init_empty(cls, batch_size: int):
-        """Create an empty JitableSamplingParams with default values.
+        """Create an empty JitableSamplingParams with safe neutral defaults.
 
         Args:
             batch_size: Number of samples in the batch.
 
         Returns:
-            JitableSamplingParams initialized with zeros for the given batch size.
+            JitableSamplingParams initialized with neutral no-op values for the given batch size.
         """
         return cls(
-            random_sampling=jnp.zeros([batch_size], dtype="b1"),
-            temperature=jnp.zeros([batch_size], dtype="f4"),
-            top_k=jnp.zeros([batch_size], dtype="i4"),
-            top_p=jnp.zeros([batch_size], dtype="f4"),
-            min_p=jnp.zeros([batch_size], dtype="f4"),
-            repetition_penalty=jnp.zeros([batch_size], dtype="f4"),
-            frequency_penalty=jnp.zeros([batch_size], dtype="f4"),
-            presence_penalty=jnp.zeros([batch_size], dtype="f4"),
-            max_tokens=jnp.zeros([batch_size], dtype="i4"),
-            min_tokens=jnp.zeros([batch_size], dtype="i4"),
-            all_stop_token_ids=jnp.array([[]], dtype=jnp.int32),
-            bad_words_token_ids=jnp.array([[]], dtype=jnp.int32),
-            bad_words_lengths=jnp.array([[]], dtype=jnp.int32),
+            random_sampling=jnp.zeros([batch_size], dtype=jnp.bool_),
+            temperature=jnp.full([batch_size], -1.0, dtype=jnp.float32),
+            top_k=jnp.zeros([batch_size], dtype=jnp.int32),
+            top_p=jnp.ones([batch_size], dtype=jnp.float32),
+            min_p=jnp.zeros([batch_size], dtype=jnp.float32),
+            repetition_penalty=jnp.ones([batch_size], dtype=jnp.float32),
+            frequency_penalty=jnp.zeros([batch_size], dtype=jnp.float32),
+            presence_penalty=jnp.zeros([batch_size], dtype=jnp.float32),
+            max_tokens=jnp.full([batch_size], -1, dtype=jnp.int32),
+            min_tokens=jnp.zeros([batch_size], dtype=jnp.int32),
+            all_stop_token_ids=jnp.empty((batch_size, 0), dtype=jnp.int32),
+            bad_words_token_ids=jnp.empty((batch_size, 0, 0), dtype=jnp.int32),
+            bad_words_lengths=jnp.empty((batch_size, 0), dtype=jnp.int32),
         )
 
     @classmethod
@@ -335,8 +444,8 @@ class JitableSamplingParams:
                 dtype=jnp.int32,
             )
         else:
-            lengths = jnp.array([], dtype=jnp.int32)
-            padded_ids = jnp.array([[]], dtype=jnp.int32)
+            lengths = jnp.empty((0,), dtype=jnp.int32)
+            padded_ids = jnp.empty((0, 0), dtype=jnp.int32)
 
         return cls(
             random_sampling=jnp.asarray(params.sampling_type.value == SamplingType.RANDOM.value, dtype=jnp.bool),
@@ -550,7 +659,7 @@ class SamplingParams:
             self.prompt_logprobs = 1
 
         if self.stop and not self.include_stop_str_in_output:
-            buffer_len = max(len(s) for s in self.stop) - 1
+            buffer_len = max(0, max(len(s) for s in self.stop) - 1)
             self._output_text_buffer_length = buffer_len
 
         self._verify_args()
@@ -571,18 +680,28 @@ class SamplingParams:
         """
         if self.n < 1:
             raise ValueError(f"n must be at least 1, got {self.n}.")
-        if not -2.0 <= self.presence_penalty <= 2.0:
+        if not math.isfinite(self.presence_penalty) or not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(f"presence_penalty must be in [-2, 2], got {self.presence_penalty}.")
-        if self.repetition_penalty <= 0.0:
+        if not math.isfinite(self.frequency_penalty) or not -2.0 <= self.frequency_penalty <= 2.0:
+            raise ValueError(f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}.")
+        if not math.isfinite(self.repetition_penalty) or self.repetition_penalty <= 0.0:
             raise ValueError(f"repetition_penalty must be > 0, got {self.repetition_penalty}.")
         if self.temperature is None:
             raise ValueError("temperature must be set before validation")
-        if self.temperature < 0.0:
+        if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
-        if not 0.0 < self.top_p <= 1.0:
+        if not math.isfinite(self.top_p) or not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
+        if not math.isfinite(self.min_p) or not 0.0 <= self.min_p <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
+        if self.top_k < -1:
+            raise ValueError(f"top_k must be >= -1, got {self.top_k}.")
+        if self.min_tokens < 0:
+            raise ValueError(f"min_tokens must be non-negative, got {self.min_tokens}.")
         if self.max_tokens is not None and self.min_tokens > self.max_tokens:
             raise ValueError(f"min_tokens ({self.min_tokens}) must be <= max_tokens ({self.max_tokens}).")
+        if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
+            raise ValueError(f"truncate_prompt_tokens must be >= 1, got {self.truncate_prompt_tokens}.")
         if self.stop and not self.detokenize:
             raise ValueError("stop strings require detokenize=True.")
 
@@ -598,28 +717,34 @@ class SamplingParams:
     def update_with_generation_config(
         self,
         generation_config: dict[str, Any],
-        model_eos_token_id: int | None = None,
+        model_eos_token_id: int | list[int] | tuple[int, ...] | None = None,
     ) -> SamplingParams:
         """Update sampling parameters with model's generation config.
 
-        Incorporates EOS token IDs from the model's configuration.
+        Incorporates EOS token IDs from the model's configuration unless
+        ``self.ignore_eos`` is enabled.
 
         Args:
             generation_config: Dictionary containing model generation settings.
-            model_eos_token_id: Primary EOS token ID from the model.
+            model_eos_token_id: Primary EOS token ID (or iterable of IDs) from the model.
 
         Returns:
             Self with updated stop token IDs.
         """
         all_stop_ids = self._all_stop_token_ids.copy()
+        model_eos_set: set[int] = set()
         if model_eos_token_id is not None:
-            all_stop_ids.add(model_eos_token_id)
+            if isinstance(model_eos_token_id, int):
+                model_eos_set.add(model_eos_token_id)
+            else:
+                model_eos_set.update(int(tid) for tid in model_eos_token_id if tid is not None)
+        if model_eos_set and not self.ignore_eos:
+            all_stop_ids.update(model_eos_set)
 
         new_stop_token_ids = self.stop_token_ids
         if (eos_ids := generation_config.get("eos_token_id")) is not None:
-            eos_ids_set = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
-            if model_eos_token_id is not None:
-                eos_ids_set.discard(model_eos_token_id)
+            eos_ids_set = {eos_ids} if isinstance(eos_ids, int) else {int(tid) for tid in eos_ids if tid is not None}
+            eos_ids_set -= model_eos_set
             if eos_ids_set and not self.ignore_eos:
                 new_stop_token_ids = list(set(self.stop_token_ids) | eos_ids_set)
                 all_stop_ids.update(eos_ids_set)
@@ -655,7 +780,14 @@ class SamplingParams:
                 ):
                     bad_words_token_ids.append(token_ids)
 
-        vocab_size = getattr(tokenizer, "vocab_size", tokenizer.model_max_length)
+        raw_vocab_size = getattr(tokenizer, "vocab_size", 0) or 0
+        try:
+            total_vocab_size = len(tokenizer)
+        except TypeError:
+            total_vocab_size = 0
+        vocab_size = max(int(raw_vocab_size), int(total_vocab_size))
+        if vocab_size <= 0:
+            vocab_size = int(getattr(tokenizer, "model_max_length", 0) or 0)
         invalid_ids = [tid for ids in bad_words_token_ids for tid in ids if not (0 <= tid < vocab_size)]
         if invalid_ids:
             raise ValueError(
@@ -666,7 +798,7 @@ class SamplingParams:
         self._bad_words_token_ids = bad_words_token_ids
         return self
 
-    @cached_property
+    @property
     def sampling_type(self) -> SamplingType:
         """Determine the sampling type based on temperature.
 

@@ -26,6 +26,7 @@ back-reference).
 
 from __future__ import annotations
 
+import functools
 import math
 import time
 import typing
@@ -37,13 +38,17 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
+from easydel.caching import RaggedPagesMetadata
 from easydel.utils import flags
 
 from ...config import normalize_draft_schedule, resolve_num_draft_tokens
-from ...core.binary_search import apply_topk_mask, apply_topp_mask
+from ...core.binary_search import apply_topk_mask, apply_topk_mask_bf16, apply_topp_mask, apply_topp_mask_bf16
 from ..executors.model_executor import resolve_lm_logit_postprocess
+from ..host_sync import host_payload_broadcast_needed, put_host_payload
 from .penalties import HistoryCountCache, VerifyPenaltyRows, history_penalty_params, penalized_verify_argmax
+from .rejection import spec_rejection_sample
 from .support import build_target_kv_pairs, gather_paged_kv
+from .verify import pack_pooled_drafts, split_packed
 
 if typing.TYPE_CHECKING:
     from easydel.inference.speculative import DrafterProtocol
@@ -76,6 +81,53 @@ class _SpecVerifyMetadata:
         return len(self.buffer_draft_tokens)
 
 
+def window_hidden_index(
+    hidden_len: int,
+    *,
+    row_pos: int,
+    token_offset: int,
+    token_index: int,
+    total_window_tokens: int,
+    padded_reqs: int,
+    output_layout: typing.Literal["tokens", "requests"] | None = None,
+) -> int:
+    """Index of a token or request row in a window's hidden output, using an explicit layout when available.
+
+    ``None`` falls back to a shape heuristic. Runner executions supply their bucket's layout, since active token
+    counts alone cannot distinguish full outputs from padded gathered request rows.
+
+    Args:
+        hidden_len: Rows of the window's hidden output.
+        row_pos: The request's row in the window (its row in a request-layout output).
+        token_offset: The request's first token in the window's flat token stream.
+        token_index: The wanted token's offset within the request's scheduled tokens.
+        total_window_tokens: Tokens scheduled in the window.
+        padded_reqs: The window's padded request count.
+        output_layout: ``"tokens"`` (one row per token), ``"requests"`` (one row per request) or ``None``.
+
+    Returns:
+        The row index, in ``[0, hidden_len)``.
+
+    Raises:
+        ValueError: If ``output_layout`` is not a known layout.
+        IndexError: If an explicit layout's row is outside the output.
+    """
+    hidden_len = int(hidden_len)
+    full_index = int(token_offset) + int(token_index)
+    if output_layout is not None:
+        if output_layout not in ("tokens", "requests"):
+            raise ValueError(f"Unknown hidden output layout: {output_layout!r}")
+        index = full_index if output_layout == "tokens" else int(row_pos)
+        if not 0 <= index < hidden_len:
+            raise IndexError(f"Hidden row {index} is outside the {output_layout} output of length {hidden_len}.")
+        return index
+    if hidden_len >= int(total_window_tokens) and 0 <= full_index < hidden_len:
+        return full_index
+    if hidden_len >= int(padded_reqs) and 0 <= int(row_pos) < hidden_len:
+        return int(row_pos)
+    return min(max(full_index, 0), hidden_len - 1)
+
+
 def window_hidden_row(
     hidden_states: jax.Array,
     *,
@@ -86,26 +138,121 @@ def window_hidden_row(
     padded_reqs: int,
     output_layout: typing.Literal["tokens", "requests"] | None = None,
 ) -> jax.Array:
-    """Select a token or request row using an explicit layout when available.
+    """Select a token or request row of a window's hidden output (the row :func:`window_hidden_index` picks)."""
+    index = window_hidden_index(
+        int(hidden_states.shape[0]),
+        row_pos=row_pos,
+        token_offset=token_offset,
+        token_index=token_index,
+        total_window_tokens=total_window_tokens,
+        padded_reqs=padded_reqs,
+        output_layout=output_layout,
+    )
+    return hidden_states[index]
 
-    ``None`` falls back to a shape heuristic. Runner
-    executions supply their bucket's layout, since active token counts alone
-    cannot distinguish full outputs from padded gathered request rows.
+
+def _replicated_over(array: typing.Any) -> jax.sharding.Sharding | None:
+    """A sharding replicating over the mesh ``array`` is placed on, or ``None`` when it is not on a mesh."""
+    sharding = getattr(array, "sharding", None)
+    if isinstance(sharding, jax.sharding.NamedSharding):
+        return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec())
+    return None
+
+
+@functools.cache
+def _hidden_row_programs(out_sharding: jax.sharding.Sharding | None) -> tuple[typing.Callable, typing.Callable]:
+    """The row gathers of :func:`take_hidden_rows` and :func:`pool_seed_hidden`, with outputs on ``out_sharding``.
+
+    Args:
+        out_sharding: Output placement, or ``None`` to leave it to the compiler.
+
+    Returns:
+        ``(take_rows, pool_seeds)`` jitted programs.
     """
-    hidden_len = int(hidden_states.shape[0])
-    full_index = int(token_offset) + int(token_index)
-    if output_layout is not None:
-        if output_layout not in ("tokens", "requests"):
-            raise ValueError(f"Unknown hidden output layout: {output_layout!r}")
-        index = full_index if output_layout == "tokens" else int(row_pos)
-        if not 0 <= index < hidden_len:
-            raise IndexError(f"Hidden row {index} is outside the {output_layout} output of length {hidden_len}.")
-        return hidden_states[index]
-    if hidden_len >= int(total_window_tokens) and 0 <= full_index < hidden_len:
-        return hidden_states[full_index]
-    if hidden_len >= int(padded_reqs) and 0 <= int(row_pos) < hidden_len:
-        return hidden_states[int(row_pos)]
-    return hidden_states[min(max(full_index, 0), hidden_len - 1)]
+    kwargs = {} if out_sharding is None else {"out_shardings": out_sharding}
+
+    def take_rows(hidden_states: jax.Array, rows: jax.Array) -> jax.Array:
+        return hidden_states[rows]
+
+    def pool_seeds(matrix: jax.Array, source_rows: jax.Array, live: jax.Array) -> jax.Array:
+        rows = matrix[source_rows]
+        return jnp.where((live != 0)[:, None], rows, jnp.zeros_like(rows))[:, None, :]
+
+    return jax.jit(take_rows, **kwargs), jax.jit(pool_seeds, **kwargs)
+
+
+def take_hidden_rows(hidden_states: jax.Array, rows: jax.Array) -> jax.Array:
+    """``hidden_states[rows]`` as one compiled program, replicated over the mesh ``hidden_states`` is placed on.
+
+    Eager advanced indexing runs one program per primitive of the gather (index normalization, broadcasts, the
+    gather itself), and on a multi-host mesh every launch waits for all hosts. The fixed output placement gives the
+    drafter programs that read the rows one input placement, at warm-up and in serving alike.
+
+    Args:
+        hidden_states: ``[R, H]`` hidden rows.
+        rows: ``[M]`` row indices (host or device).
+
+    Returns:
+        ``[M, H]`` rows.
+    """
+    if not isinstance(rows, jax.Array):
+        # A plain transfer: a cast or reshape on the device would run a program of its own.
+        rows = jax.device_put(np.asarray(rows, dtype=np.int32))
+    return _hidden_row_programs(_replicated_over(hidden_states))[0](hidden_states, rows)
+
+
+def pool_seed_hidden(matrix: jax.Array, source_rows: jax.Array, live: jax.Array) -> jax.Array:
+    """Draft seeds in request-pool order, gathered by one fixed-shape program.
+
+    Args:
+        matrix: ``[R, H]`` hidden rows the seeds come from.
+        source_rows: ``(N,)`` host row of ``matrix`` per pool row (any valid row for an idle one).
+        live: ``(N,)`` host values, nonzero for pool rows that are drafted.
+
+    Returns:
+        ``[N, 1, H]``: ``matrix[source_rows[r]]`` for live rows ``r``, zeros elsewhere, replicated over the mesh
+        ``matrix`` is placed on (see :func:`take_hidden_rows`).
+    """
+    source_rows = jax.device_put(np.asarray(source_rows, dtype=np.int32))
+    live = jax.device_put(np.asarray(live).astype(np.int32))
+    return _hidden_row_programs(_replicated_over(matrix))[1](matrix, source_rows, live)
+
+
+@functools.cache
+def _id_pad_program(width: int) -> typing.Callable:
+    """A program padding a flat token-id buffer with zeros to ``width`` (one executable per input length)."""
+
+    def pad(ids: jax.Array) -> jax.Array:
+        return jnp.pad(ids, (0, width - ids.shape[0]))
+
+    return jax.jit(pad)
+
+
+def fixed_width_ids(ids: jax.Array | None, width: int | None) -> jax.Array | None:
+    """The step's token-id buffer padded to ``width``, so programs reading it see one shape for every token bucket.
+
+    The buffer the model step returns is sized to the step's token bucket; a drafter program that took it as is
+    would compile again for each bucket serving uses. Indices into the buffer stay below the bucket, so the padding
+    never changes a value they read.
+
+    Args:
+        ids: ``(T,)`` token ids of the step, or ``None``.
+        width: Target length, at least ``T`` (the largest token bucket), or ``None`` to keep ``ids`` as it is.
+
+    Returns:
+        ``(width,)`` ids, ``ids`` itself when it already has that length or no width is given, or ``None``.
+
+    Raises:
+        ValueError: If ``ids`` is longer than ``width``.
+    """
+    if ids is None or width is None:
+        return ids
+    length, width = int(ids.shape[0]), int(width)
+    if length == width:
+        return ids
+    if length > width:
+        raise ValueError(f"A token-id buffer of {length} entries does not fit the {width}-entry width.")
+    return _id_pad_program(width)(ids)
 
 
 # Device-array fields carried by a recurrent cache view. These are the only
@@ -117,19 +264,86 @@ _REC_ARRAY_FIELDS = ("conv_state", "recurrent_state", "positions", "seqlen_offse
 _KDA_ARRAY_FIELDS = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state", "positions")
 
 
+def _sorted_device_ids(sharding: typing.Any) -> tuple[int, ...]:
+    devices = getattr(sharding, "device_set", None)
+    if not devices:
+        return ()
+    return tuple(sorted(int(getattr(dev, "id", 0)) for dev in devices))
+
+
+@functools.lru_cache(maxsize=64)
+def _sharding_device_key(sharding: typing.Any) -> tuple[int, ...]:
+    return _sorted_device_ids(sharding)
+
+
+def _device_key(array: typing.Any) -> tuple[int, ...]:
+    sharding = getattr(array, "sharding", None)
+    if sharding is None:
+        return ()
+    try:
+        return _sharding_device_key(sharding)
+    except TypeError:
+        return _sorted_device_ids(sharding)
+
+
+def _pool_replicated_sharding(array: typing.Any) -> jax.sharding.Sharding | None:
+    """Return a replicated sharding on ``array``'s mesh/device set for host index/mask vectors."""
+    sharding = getattr(array, "sharding", None)
+    if isinstance(sharding, jax.sharding.NamedSharding):
+        return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec())
+    if isinstance(sharding, jax.sharding.Sharding):
+        return sharding
+    return None
+
+
+def _place_host_for_array(
+    values: typing.Any,
+    target_array: typing.Any,
+    *,
+    host_payloads_replicated: bool | None = None,
+) -> typing.Any:
+    """Broadcast (when needed on replicated multi-host drivers) and place host values on ``target_array``'s mesh."""
+    sharding = _pool_replicated_sharding(target_array)
+    if host_payload_broadcast_needed(host_payloads_replicated):
+        from jax.experimental import multihost_utils
+
+        values = multihost_utils.broadcast_one_to_all(values)
+    if sharding is None:
+        return jnp.asarray(values)
+    return put_host_payload(values, sharding, host_payloads_replicated=host_payloads_replicated)
+
+
 @jax.jit
+def _jit_copy_tuple(arrays: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+    """Copy a homogeneous-device-set tuple of arrays in a single fused dispatch."""
+    return tuple(jnp.array(a, copy=True) for a in arrays)
+
+
 def _jit_copy_arrays(arrays: list[jax.Array]) -> list[jax.Array]:
-    """Copy a flat list of device arrays in a SINGLE fused dispatch.
+    """Copy a flat list of device arrays in one fused dispatch per device set.
 
     Eager ``jnp.array(x, copy=True)`` per leaf costs one host dispatch each; a
     hybrid model has ~4 recurrent leaves per linear layer (~200 for a 64-layer
     27B), so per-leaf copying spent ~30 ms/spec-step purely on dispatch. Copying
-    the whole flat list under one ``jax.jit`` collapses that to one dispatch.
+    each device-set bucket under one ``jax.jit`` collapses SPMD to one dispatch
+    and keeps MPMD pipeline stages on their own disjoint stage meshes.
     ``jax.jit`` outputs are freshly allocated buffers (no input-output aliasing
     without ``donate_argnums``), so the copies survive the KV-buffer donation the
     fused forward performs on the originals.
     """
-    return [jnp.array(a, copy=True) for a in arrays]
+    if not arrays:
+        return []
+    by_device: dict[tuple[int, ...], list[int]] = {}
+    for idx, arr in enumerate(arrays):
+        by_device.setdefault(_device_key(arr), []).append(idx)
+    if len(by_device) == 1:
+        return list(_jit_copy_tuple(tuple(arrays)))
+    copied: list[jax.Array | None] = [None] * len(arrays)
+    for indices in by_device.values():
+        group_copied = _jit_copy_tuple(tuple(arrays[i] for i in indices))
+        for idx, arr in zip(indices, group_copied, strict=True):
+            copied[idx] = arr
+    return copied  # type: ignore[return-value]
 
 
 def _recurrent_view_of(view: typing.Any, recurrent_cls: type, parallel_cls: type) -> typing.Any:
@@ -310,6 +524,136 @@ def snapshot_recurrent_state(kv_pages: typing.Any) -> typing.Any:
     if not flat:
         return None
     return (layout, _jit_copy_arrays(flat))
+
+
+@jax.jit
+def _gather_spec_delta(last_delta: jax.Array, row_pos: jax.Array) -> jax.Array:
+    """Gather window-local ``last_spec_window_delta`` entries by ``row_pos`` on device (0 for inactive rows)."""
+    delta = jnp.asarray(last_delta, dtype=jnp.int32).reshape(-1)
+    idx = jnp.asarray(row_pos, dtype=jnp.int32).reshape(-1)
+    n_delta = int(delta.shape[0])
+    if n_delta <= 0:
+        return jnp.zeros_like(idx, dtype=jnp.int32)
+    valid = (idx >= 0) & (idx < n_delta)
+    safe = jnp.clip(idx, 0, n_delta - 1)
+    return jnp.where(valid, delta[safe], jnp.int32(0))
+
+
+@functools.cache
+def _jit_merge_slot_rows(shardings: tuple[typing.Any, ...]) -> typing.Callable:
+    """Fused slot-selective restore: overwrite only masked leading-axis rows from snapshot."""
+    use_shardings = bool(shardings) and all(isinstance(s, jax.sharding.Sharding) for s in shardings)
+    jit_kwargs = {"out_shardings": shardings} if use_shardings else {}
+
+    def _merge(
+        live_arrays: tuple[jax.Array, ...],
+        snap_arrays: tuple[jax.Array, ...],
+        restore_mask: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        out = []
+        for live_arr, snap_arr in zip(live_arrays, snap_arrays, strict=True):
+            mask = restore_mask.reshape((restore_mask.shape[0],) + (1,) * (live_arr.ndim - 1))
+            out.append(jnp.where(mask, snap_arr, live_arr))
+        return tuple(out)
+
+    return jax.jit(_merge, **jit_kwargs)
+
+
+def _merge_slot_arrays(
+    live_arrays: list[jax.Array],
+    snap_arrays: list[jax.Array],
+    slots: typing.Sequence[int],
+    *,
+    host_payloads_replicated: bool | None = None,
+) -> list[jax.Array]:
+    """Replace only ``slots`` along axis 0 in ``live_arrays`` using values from ``snap_arrays``."""
+    by_pool: dict[tuple[int, tuple[int, ...]], list[int]] = {}
+    for idx, (live_arr, snap_arr) in enumerate(zip(live_arrays, snap_arrays, strict=True)):
+        if live_arr.ndim >= 1 and live_arr.shape == snap_arr.shape:
+            by_pool.setdefault((int(live_arr.shape[0]), _device_key(live_arr)), []).append(idx)
+    merged = list(live_arrays)
+    for (n_slots, _devices), group_indices in by_pool.items():
+        valid_slots = sorted({int(s) for s in slots if 0 <= int(s) < n_slots})
+        if not valid_slots:
+            continue
+        mask_np = np.zeros((n_slots,), dtype=bool)
+        mask_np[np.asarray(valid_slots, dtype=np.int64)] = True
+        live_group = tuple(live_arrays[i] for i in group_indices)
+        snap_group = tuple(snap_arrays[i] for i in group_indices)
+        shardings = tuple(getattr(a, "sharding", None) for a in live_group)
+        mask_dev = _place_host_for_array(
+            mask_np, live_group[0], host_payloads_replicated=host_payloads_replicated
+        )
+        updated = _jit_merge_slot_rows(shardings)(live_group, snap_group, mask_dev)
+        for idx, arr in zip(group_indices, updated, strict=True):
+            merged[idx] = arr
+    return merged
+
+
+def _restore_recurrent_state_for_slots(
+    live_kv_pages: typing.Any,
+    snapshot: typing.Any,
+    slots: typing.Sequence[int],
+    *,
+    host_payloads_replicated: bool | None = None,
+) -> typing.Any:
+    """Restore ONLY ``slots`` from ``snapshot`` into ``live_kv_pages``, leaving all other rows intact."""
+    from easydel.caching import HybridCache
+
+    if snapshot is None:
+        return live_kv_pages
+    slot_list = [int(s) for s in slots if int(s) >= 0]
+    if not slot_list:
+        return live_kv_pages
+    if isinstance(snapshot, _CompressedWindowSnapshot):
+        live_leaves, live_treedef = jax.tree_util.tree_flatten(live_kv_pages)
+        if live_treedef != snapshot.treedef:
+            raise ValueError("compressed-window cache structure changed between snapshot and restore")
+        live_arrays = [live_leaves[i] for i in snapshot.array_indices]
+        merged_arrays = _merge_slot_arrays(
+            live_arrays, snapshot.copied, slot_list, host_payloads_replicated=host_payloads_replicated
+        )
+        leaves = list(live_leaves)
+        for index, array in zip(snapshot.array_indices, merged_arrays, strict=True):
+            leaves[index] = array
+        return jax.tree_util.tree_unflatten(snapshot.treedef, leaves)
+
+    if not isinstance(snapshot, tuple) or len(snapshot) != 2:
+        return _restore_recurrent_state(live_kv_pages, snapshot)
+    layout, copied = snapshot
+    views = list(live_kv_pages.views)
+    live_flat: list[jax.Array] = []
+    snap_flat: list[jax.Array] = []
+    flat_targets: list[tuple[int, str]] = []
+    for pos, (view_idx, is_parallel, field_map) in enumerate(layout):
+        live_view = views[view_idx]
+        rec = live_view.recurrent if is_parallel else live_view
+        for name, snap_idx in field_map.items():
+            if snap_idx is None:
+                continue
+            live_val = getattr(rec, name, None)
+            if isinstance(live_val, jax.Array):
+                live_flat.append(live_val)
+                snap_flat.append(copied[snap_idx])
+                flat_targets.append((pos, name))
+    if not live_flat:
+        return live_kv_pages
+    merged_flat = _merge_slot_arrays(
+        live_flat, snap_flat, slot_list, host_payloads_replicated=host_payloads_replicated
+    )
+    updates_by_pos: dict[int, dict[str, jax.Array]] = {}
+    for (pos, name), arr in zip(flat_targets, merged_flat, strict=True):
+        updates_by_pos.setdefault(pos, {})[name] = arr
+    for pos, (view_idx, is_parallel, _field_map) in enumerate(layout):
+        updates = updates_by_pos.get(pos)
+        if not updates:
+            continue
+        live_view = views[view_idx]
+        if is_parallel:
+            views[view_idx] = live_view.replace(recurrent=live_view.recurrent.replace(**updates), **updates)
+        else:
+            views[view_idx] = live_view.replace(**updates)
+    return HybridCache(views=views)
 
 
 def _restore_recurrent_state(live_kv_pages: typing.Any, snapshot: typing.Any) -> typing.Any:
@@ -499,29 +843,52 @@ class DrafterSpeculation:
         if row is not None:
             return row
         if not self._mtp_row_free:
-            # Self-heal: reclaim rows whose owners are no longer live.
-            live_reqs = getattr(self._runner, "requests", {}) or {}
-            for other_rid in [r for r in self._mtp_row_by_req if r not in live_reqs]:
-                self._mtp_row_free.append(self._mtp_row_by_req.pop(other_rid))
+            # Self-heal: reclaim rows whose owners are no longer active in the sequence buffer
+            # (preempted requests stay in ``runner.requests`` so checking ``requests`` misses them).
+            seq_buf = getattr(self._runner, "sequence_buffer", None)
+            live_reqs = (
+                getattr(seq_buf, "req_id_to_index", None)
+                if seq_buf is not None and getattr(seq_buf, "req_id_to_index", None) is not None
+                else (getattr(self._runner, "requests", {}) or {})
+            )
+            stale_rids = sorted(str(r) for r in self._mtp_row_by_req if r not in live_reqs)
+            for other_rid in stale_rids:
+                self._release_drafter_request(other_rid)
         row = self._mtp_row_free.pop() if self._mtp_row_free else int(fallback_row)
         self._mtp_row_by_req[rid] = row
         return row
 
-    def _release_finished_drafter_rows(self, scheduler_output: SchedulerOutput) -> None:
-        """Free the stable drafter rows of requests the scheduler finished."""
-        finished = getattr(scheduler_output, "finished_req_ids", None) or ()
-        for rid in finished:
-            self._history_counts.drop(str(rid))
-            self._penalty_counts_stale.discard(str(rid))
-            row = self._mtp_row_by_req.pop(str(rid), None)
-            if row is None:
-                continue
+    def _release_drafter_request(self, rid: str) -> None:
+        """Release all per-request drafter state and stable pool row for ``rid``."""
+        rid = str(rid)
+        self._history_counts.drop(rid)
+        self._penalty_counts_stale.discard(rid)
+        self.draft_full_log_probs_by_req.pop(rid, None)
+        self._backoff_by_req.pop(rid, None)
+        self._whole_block_window.pop(rid, None)
+        release_req = getattr(self.drafter, "release_request", None)
+        if callable(release_req):
+            release_req(rid)
+        row = self._mtp_row_by_req.pop(rid, None)
+        if row is None:
+            return
+        if row not in self._mtp_row_free:
             self._mtp_row_free.append(row)
-            if self._mtp_persist_req_by_row.get(row) == str(rid):
-                self._mtp_persist_req_by_row.pop(row, None)
-                self._mtp_persist_base_pos_by_row.pop(row, None)
-                self._mtp_persist_last_seed_by_row.pop(row, None)
-                self._mtp_persist_written_by_row.pop(row, None)
+        if self._mtp_persist_req_by_row.get(row) == rid:
+            self._mtp_persist_req_by_row.pop(row, None)
+            self._mtp_persist_base_pos_by_row.pop(row, None)
+            self._mtp_persist_last_seed_by_row.pop(row, None)
+            self._mtp_persist_written_by_row.pop(row, None)
+
+    def _release_finished_drafter_rows(self, scheduler_output: SchedulerOutput) -> None:
+        """Free the stable drafter rows and per-request state of finished and preempted requests."""
+        finished = getattr(scheduler_output, "finished_req_ids", None) or ()
+        preempted = getattr(scheduler_output, "preempted_req_ids", None) or ()
+        # Sorted: a set's order follows each process's string-hash seed, and the free-row order decides which pool
+        # row the next request drafts in, so every process of a multi-host engine must release in the same order.
+        to_release = sorted({str(r) for r in finished} | {str(r) for r in preempted})
+        for rid in to_release:
+            self._release_drafter_request(rid)
 
     def _mtp_persist_committed_len(self, row: int, seed_position: int) -> int:
         """Return ``row``'s committed MTP slot count for a window seeded at ``seed_position``.
@@ -584,8 +951,8 @@ class DrafterSpeculation:
         """Whether hybrid recurrent caches keep speculative candidate rows."""
         return bool(getattr(self._runner, "spec_decode_recurrent_candidates", False))
 
-    def resolve_step_draft_budget(self, concurrency: int) -> int:
-        """Resolve this step's draft-token budget from the live concurrency.
+    def resolve_step_draft_budget(self, concurrency: int, *, num_draft_tokens_next: int | None = None) -> int:
+        """Resolve this step's draft-token budget from the live concurrency and core verify budget.
 
         Called ONCE per scheduler step by the runner (never per request) with
         the number of requests scheduled in the step. Drafts produced during a
@@ -594,30 +961,32 @@ class DrafterSpeculation:
         predictor. Gap semantics follow
         :func:`~easydel.inference.esurge.config.resolve_num_draft_tokens`:
         concurrencies no range covers fall back to the static
-        ``num_draft_tokens``. The ``EASYDEL_DISABLE_DYNAMIC_SPEC`` flag (read
-        at call time) forces the static count for A/B comparisons.
-
-        A budget of ``0`` makes every draft path a no-op for the step: no
-        drafter forward runs, requests carry no spec tokens into the next
-        step, and the next step therefore takes the plain single-token decode
-        path. No hysteresis is applied — the inclusive ranges provide natural
-        bands; add a hysteresis knob only if oscillation shows up in practice.
+        ``num_draft_tokens``. When the scheduler core supplies a nonnegative
+        ``num_draft_tokens_next`` verify budget, the budget is capped to it.
+        The ``EASYDEL_DISABLE_DYNAMIC_SPEC`` flag (read at call time) forces
+        the static count for A/B comparisons.
 
         Args:
             concurrency: Number of requests scheduled in this step.
+            num_draft_tokens_next: Optional scheduler-core verify-budget cap
+                (nonnegative int when active; ``None`` or negative when unset).
 
         Returns:
             The resolved live budget in ``[0, num_draft_tokens]`` (also stored
             on :attr:`live_num_draft_tokens`).
         """
-        if self.draft_schedule is None or flags.get_bool(flags.EASYDEL_DISABLE_DYNAMIC_SPEC):
-            self.live_num_draft_tokens = int(self.num_draft_tokens)
+        disable_dynamic = flags.get_bool(flags.EASYDEL_DISABLE_DYNAMIC_SPEC)
+        if self.draft_schedule is None or disable_dynamic:
+            budget = int(self.num_draft_tokens)
         else:
-            self.live_num_draft_tokens = resolve_num_draft_tokens(
+            budget = resolve_num_draft_tokens(
                 self.draft_schedule,
                 batch_size=int(concurrency),
                 num_draft_tokens=self.num_draft_tokens,
             )
+        if not disable_dynamic and num_draft_tokens_next is not None and int(num_draft_tokens_next) >= 0:
+            budget = min(budget, int(num_draft_tokens_next))
+        self.live_num_draft_tokens = max(0, min(int(budget), int(self.num_draft_tokens)))
         return self.live_num_draft_tokens
 
     def on_reset(self) -> None:
@@ -638,6 +1007,9 @@ class DrafterSpeculation:
         self._whole_block_window.clear()
         self._history_counts.clear()
         self._penalty_counts_stale.clear()
+        self.last_spec_emitted = None
+        self.last_spec_accepted = None
+        self.last_spec_drafts = None
         self.live_num_draft_tokens = int(self.num_draft_tokens)
         if self.drafter is not None:
             try:
@@ -647,6 +1019,61 @@ class DrafterSpeculation:
                 self.drafter.reset(batch_size=max(1, int(self._runner.max_num_reqs)))
             except Exception:
                 logger.debug("Speculative drafter reset failed.", exc_info=True)
+
+    def update_target_model(self, model: typing.Any) -> None:
+        """Bind a refreshed target model on the attached drafter and invalidate cached weights."""
+        if self.drafter is None:
+            return
+        update_fn = getattr(self.drafter, "update_target_model", None)
+        if callable(update_fn):
+            update_fn(model)
+            return
+        if hasattr(self.drafter, "model"):
+            self.drafter.model = model
+        if hasattr(self.drafter, "target_model"):
+            self.drafter.target_model = model
+        for cache_attr in ("_graphdef", "_bundle_graphdefs", "_programs"):
+            if hasattr(self.drafter, cache_attr):
+                setattr(self.drafter, cache_attr, None)
+
+    def release_target_model(self) -> None:
+        """Release target model references and device buffers held by the strategy and drafter."""
+        self._whole_block_hidden = None
+        self._whole_block_window.clear()
+        self.draft_full_log_probs_by_req.clear()
+        self.last_spec_emitted = None
+        self.last_spec_accepted = None
+        self.last_spec_drafts = None
+        if self.drafter is None:
+            return
+        release_fn = getattr(self.drafter, "release_target_model", None)
+        if callable(release_fn):
+            release_fn()
+            return
+        if hasattr(self.drafter, "model"):
+            self.drafter.model = None
+        if hasattr(self.drafter, "target_model"):
+            self.drafter.target_model = None
+
+    def close(self) -> None:
+        """Release drafter state/references and break runner cycles on terminal engine close."""
+        try:
+            self.on_reset()
+        except Exception:
+            logger.debug("Speculative strategy reset failed during close.", exc_info=True)
+        try:
+            self.release_target_model()
+        except Exception:
+            logger.debug("Speculative strategy target release failed during close.", exc_info=True)
+        self._filter_sample_fns.clear()
+        self._verify_sample_fns.clear()
+        self._recurrent_commit_fn = None
+        self.debug_traces.clear()
+        self.drafter = None
+        self._runner = None
+        for cache_attr in ("_graphdef", "_bundle_graphdefs", "_programs", "_mtp_cache"):
+            if hasattr(self.drafter, cache_attr):
+                setattr(self.drafter, cache_attr, None)
 
     def is_greedy_request(self, req_state: CachedRequestState | None) -> bool:
         """Return whether speculative decoding should use the greedy path for ``req_state``.
@@ -685,6 +1112,16 @@ class DrafterSpeculation:
             return False
         sampling_params = req_state.sampling_params
         if getattr(sampling_params, "n", 1) != 1:
+            return False
+        # Requests with per-token sampling constraints (logit_bias, allowed_token_ids,
+        # bad_words_token_ids) fall back to the standard sampler path so every emitted
+        # token strictly enforces those constraints.
+        if (
+            bool(getattr(sampling_params, "logit_bias", None))
+            or getattr(sampling_params, "allowed_token_ids", None) is not None
+            or bool(getattr(sampling_params, "bad_words_token_ids", None))
+            or bool(getattr(sampling_params, "bad_words", None))
+        ):
             return False
         # Sampled verification uses the drafter's unpenalised q, so penalties are only speculated greedily.
         if self.uses_history_penalties(req_state) and not self.is_greedy_request(req_state):
@@ -875,22 +1312,30 @@ class DrafterSpeculation:
             axis, ``float32``.
         """
         sampling_params = req_state.sampling_params
-        logits = logits_or_log_probs.astype(jnp.float32)
+        use_bf16 = logits_or_log_probs.dtype == jnp.bfloat16
+        logits = logits_or_log_probs if use_bf16 else logits_or_log_probs.astype(jnp.float32)
+        topk_mask = apply_topk_mask_bf16 if use_bf16 else apply_topk_mask
+        topp_mask = apply_topp_mask_bf16 if use_bf16 else apply_topp_mask
         min_val = -1e10
 
-        top_k = int(getattr(sampling_params, "top_k", 0) or 0)
+        raw_top_k = getattr(sampling_params, "top_k", None)
+        top_k = 0 if raw_top_k is None else int(raw_top_k)
         if top_k > 0:
-            logits = apply_topk_mask(logits, jnp.asarray(top_k, dtype=jnp.int32), min_val)
+            logits = topk_mask(logits, jnp.asarray(top_k, dtype=jnp.int32), min_val)
 
-        top_p = float(getattr(sampling_params, "top_p", 1.0) or 1.0)
+        raw_top_p = getattr(sampling_params, "top_p", None)
+        top_p = 1.0 if raw_top_p is None else float(raw_top_p)
         if top_p < 1.0:
-            logits = apply_topp_mask(logits, jnp.asarray(top_p, dtype=jnp.float32), min_val)
+            logits = topp_mask(logits, jnp.asarray(top_p, dtype=jnp.bfloat16 if use_bf16 else jnp.float32), min_val)
 
-        temperature = float(getattr(sampling_params, "temperature", 1.0) or 1.0)
+        logits = logits.astype(jnp.float32)
+        raw_temperature = getattr(sampling_params, "temperature", None)
+        temperature = 1.0 if raw_temperature is None else float(raw_temperature)
         if temperature > 0.0 and temperature != 1.0:
             logits = logits / jnp.asarray(temperature, dtype=jnp.float32)
 
-        min_p = float(getattr(sampling_params, "min_p", 0.0) or 0.0)
+        raw_min_p = getattr(sampling_params, "min_p", None)
+        min_p = 0.0 if raw_min_p is None else float(raw_min_p)
         if min_p > 0.0:
             # Min-p in PROBABILITY space (matches the production sampler's
             # `apply_min_p_mask`): keep tokens whose probability is
@@ -922,23 +1367,57 @@ class DrafterSpeculation:
         self._runner.executor_manager.rng_key = keys[0]
         return list(keys[1:])
 
-    def sample_distribution(self, log_probs: jax.Array, req_state: CachedRequestState) -> int:
+    def request_rng_key(
+        self,
+        req_state: CachedRequestState | None,
+        *,
+        position: int | None = None,
+        stream: int = 0,
+    ) -> jax.Array:
+        """Return a per-request deterministic PRNG key when seeded, else split the engine key."""
+        seed = getattr(getattr(req_state, "sampling_params", None), "seed", None) if req_state is not None else None
+        if seed is None:
+            return self.rng_split(1)[0]
+        base_rng = self._runner.executor_manager.rng_key
+        impl = jax.random.key_impl(base_rng)
+        unsigned_seed = int(seed) & ((1 << 64) - 1)
+        low = jnp.uint32(unsigned_seed & 0xFFFFFFFF)
+        high = jnp.uint32(unsigned_seed >> 32)
+        key = jax.random.PRNGKey(low, impl=impl)
+        if jax.dtypes.issubdtype(base_rng.dtype, jax.dtypes.prng_key):
+            key = jax.random.wrap_key_data(key, impl=impl)
+        key = jax.random.fold_in(key, high)
+        pos = int(req_state.num_tokens if position is None else position)
+        key = jax.random.fold_in(key, jnp.int32(pos))
+        if stream != 0:
+            key = jax.random.fold_in(key, jnp.int32(int(stream)))
+        return key
+
+    def sample_distribution(
+        self,
+        log_probs: jax.Array,
+        req_state: CachedRequestState,
+        *,
+        position: int | None = None,
+    ) -> int:
         """Sample one token id from ``log_probs`` using the request's mode.
 
         Returns the argmax for greedy requests; otherwise draws a categorical
-        sample with a freshly split RNG key.
+        sample with a deterministic seeded key (if configured) or a freshly
+        split RNG key.
 
         Args:
             log_probs: Per-position log probabilities with vocabulary as the
                 last axis.
             req_state: Cached request state used to detect the greedy path.
+            position: Optional sequence position for per-request seeded keys.
 
         Returns:
             Sampled token id as a Python int.
         """
         if self.is_greedy_request(req_state):
             return int(np.asarray(jnp.argmax(log_probs, axis=-1)).reshape(-1)[0])
-        key = self.rng_split(1)[0]
+        key = self.request_rng_key(req_state, position=position)
         return int(np.asarray(jax.random.categorical(key, log_probs)).reshape(-1)[0])
 
     @staticmethod
@@ -954,37 +1433,29 @@ class DrafterSpeculation:
 
         Conditionally applies top-k masking, top-p (nucleus) masking, temperature
         scaling, and min-p masking using ``jax.lax.cond`` so the function stays
-        jit-traceable with scalar gate values. Filters that are at their no-op
-        value (``top_k <= 0``, ``top_p >= 1``, ``temperature <= 0``,
-        ``min_p <= 0``) are skipped.
-
-        Args:
-            logits_or_log_probs: Logits (or log probabilities) with shape
-                ``[..., vocab_size]``; cast to float32 internally.
-            temperature: Scalar device array temperature divisor.
-            top_p: Scalar device array nucleus probability threshold.
-            top_k: Scalar device array top-k count.
-            min_p: Scalar device array min-p relative threshold.
-
-        Returns:
-            Filtered logits (float32) with masked entries set to a large
-            negative value, ready for ``log_softmax``.
+        jit-traceable with scalar gate values. Preserves bfloat16 through top-k
+        and top-p masking to match the runner sampler before upcasting to float32.
         """
-        logits = logits_or_log_probs.astype(jnp.float32)
+        use_bf16 = logits_or_log_probs.dtype == jnp.bfloat16
+        logits = logits_or_log_probs if use_bf16 else logits_or_log_probs.astype(jnp.float32)
+        topk_mask = apply_topk_mask_bf16 if use_bf16 else apply_topk_mask
+        topp_mask = apply_topp_mask_bf16 if use_bf16 else apply_topp_mask
+        top_p_val = top_p.astype(jnp.bfloat16 if use_bf16 else jnp.float32)
         min_val = -1e10
 
         logits = jax.lax.cond(
             top_k > 0,
-            lambda legi: apply_topk_mask(legi, top_k.astype(jnp.int32), min_val),
+            lambda legi: topk_mask(legi, top_k.astype(jnp.int32), min_val),
             lambda legi: legi,
             logits,
         )
         logits = jax.lax.cond(
             top_p < 1.0,
-            lambda legi: apply_topp_mask(legi, top_p.astype(jnp.float32), min_val),
+            lambda legi: topp_mask(legi, top_p_val, min_val),
             lambda legi: legi,
             logits,
         )
+        logits = logits.astype(jnp.float32)
         logits = jax.lax.cond(
             temperature > 0.0,
             lambda legi: legi / temperature.astype(jnp.float32),
@@ -993,12 +1464,7 @@ class DrafterSpeculation:
         )
 
         def _apply_min_p(legi):
-            """Mask tokens whose probability is below ``min_p * max_prob``.
-
-            Min-p in PROBABILITY space, matching the production sampler's
-            ``apply_min_p_mask`` (``prob >= min_p * max_prob``); the ``min_p == 0``
-            case is a no-op via the ``jax.lax.cond`` gate below.
-            """
+            """Mask tokens whose probability is below ``min_p * max_prob``."""
             probs = jax.nn.softmax(legi, axis=-1)
             max_probs = jnp.max(probs, axis=-1, keepdims=True)
             return jnp.where(
@@ -1023,10 +1489,14 @@ class DrafterSpeculation:
             the dtypes expected by :meth:`filter_logits_for_sampling`.
         """
         sampling_params = req_state.sampling_params
-        temperature = float(getattr(sampling_params, "temperature", 1.0) or 1.0)
-        top_p = float(getattr(sampling_params, "top_p", 1.0) or 1.0)
-        top_k = int(getattr(sampling_params, "top_k", 0) or 0)
-        min_p = float(getattr(sampling_params, "min_p", 0.0) or 0.0)
+        raw_temperature = getattr(sampling_params, "temperature", None)
+        temperature = 1.0 if raw_temperature is None else float(raw_temperature)
+        raw_top_p = getattr(sampling_params, "top_p", None)
+        top_p = 1.0 if raw_top_p is None else float(raw_top_p)
+        raw_top_k = getattr(sampling_params, "top_k", None)
+        top_k = 0 if raw_top_k is None else int(raw_top_k)
+        raw_min_p = getattr(sampling_params, "min_p", None)
+        min_p = 0.0 if raw_min_p is None else float(raw_min_p)
         return (
             jnp.asarray(temperature, dtype=jnp.float32),
             jnp.asarray(top_p, dtype=jnp.float32),
@@ -1038,21 +1508,15 @@ class DrafterSpeculation:
         self,
         logits_or_log_probs: jax.Array,
         req_state: CachedRequestState,
+        *,
+        position: int | None = None,
+        stream: int = 1,
     ) -> tuple[jax.Array, jax.Array]:
         """Return sampled token IDs and filtered log-probs using one cached JIT.
 
         Looks up (or compiles and caches, keyed by shape+dtype) a jitted filter +
         categorical sampler, then runs it with the request's sampling scalars and
-        a freshly split RNG key.
-
-        Args:
-            logits_or_log_probs: Per-row logits (or log probabilities) with shape
-                ``[..., vocab_size]``.
-            req_state: Request state providing the sampling parameters.
-
-        Returns:
-            Tuple ``(token_ids, log_probs)`` where ``token_ids`` are the sampled
-            int32 ids and ``log_probs`` are the filtered log-softmax values.
+        a deterministic seeded key (when configured) or freshly split RNG key.
         """
         key = (tuple(logits_or_log_probs.shape), str(logits_or_log_probs.dtype))
         fn = self._filter_sample_fns.get(key)
@@ -1078,7 +1542,7 @@ class DrafterSpeculation:
         temperature, top_p, top_k, min_p = self.sampling_args(req_state)
         return fn(
             logits_or_log_probs,
-            self.rng_split(1)[0],
+            self.request_rng_key(req_state, position=position, stream=stream),
             temperature,
             top_p,
             top_k,
@@ -1092,26 +1556,15 @@ class DrafterSpeculation:
         draft_log_probs: jax.Array,
         draft_tokens: list[int],
         req_state: CachedRequestState,
+        start_position: int = 0,
     ) -> tuple[int, int]:
         """Compiled rejection sampler for one non-greedy spec window.
 
-        Looks up (or compiles and caches by shape) a jitted speculative
-        rejection sampler that verifies each draft token against the target
-        distribution, drawing a residual-distribution replacement on the first
-        rejection and a bonus token if all drafts are accepted.
-
-        Args:
-            target_logits: Target-model logits for the draft + bonus positions,
-                shape ``[num_drafts + 1, vocab_size]``.
-            draft_log_probs: Draft-model log probabilities for the draft
-                positions, shape ``[num_drafts, vocab_size]``.
-            draft_tokens: The drafted token ids being verified.
-            req_state: Request state providing the sampling parameters.
-
-        Returns:
-            Tuple ``(accepted, corrected)`` where ``accepted`` is the number of
-            leading accepted draft tokens and ``corrected`` is the replacement
-            or bonus token id (both Python ints).
+        Looks up (or compiles and caches by shape) a jitted program that filters
+        the target window and runs :func:`spec_rejection_sample` on it: each draft
+        is accepted with probability ``min(1, p_target / p_draft)`` up to the first
+        rejection, which draws from the residual ``max(p_target - p_draft, 0)``;
+        when every draft is accepted the bonus token is drawn from the target.
         """
         draft_token_arr = jnp.asarray(draft_tokens, dtype=jnp.int32)
         key = (
@@ -1125,8 +1578,18 @@ class DrafterSpeculation:
         if fn is None:
 
             @jax.jit
-            def _fn(target_logits_i, draft_log_probs_i, draft_token_ids, rng_key, temperature, top_p, top_k, min_p):
-                """JIT-compiled rejection sampler for one non-greedy spec window."""
+            def _fn(
+                target_logits_i,
+                draft_log_probs_i,
+                draft_token_ids,
+                rng_key,
+                position,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+            ):
+                """Filter the target window, then run the batched rejection sampler on its single row."""
                 target_filtered = DrafterSpeculation.filter_logits_for_sampling(
                     target_logits_i,
                     temperature=temperature,
@@ -1136,57 +1599,27 @@ class DrafterSpeculation:
                 )
                 target_log_probs = jax.nn.log_softmax(target_filtered, axis=-1)
                 num_drafts = draft_token_ids.shape[0]
-                keys = jax.random.split(rng_key, num_drafts * 2 + 1)
-
-                def _resample_residual(t_lp, d_lp, key_i):
-                    """Draw a single replacement from the ``(p_target - p_draft)+`` residual."""
-                    p_target = jnp.exp(t_lp)
-                    p_draft = jnp.exp(d_lp)
-                    residual = jnp.maximum(p_target - p_draft, 0.0)
-                    residual = residual / jnp.maximum(jnp.sum(residual, axis=-1, keepdims=True), 1e-9)
-                    return jax.random.categorical(key_i, jnp.log(residual + 1e-9)).astype(jnp.int32)[0]
-
-                def _body(i, carry):
-                    """One rejection-sampling step over draft index ``i`` carrying accept state."""
-                    accepted, corrected, rejected = carry
-                    tok = draft_token_ids[i]
-                    target_full = jax.lax.dynamic_slice_in_dim(target_log_probs, i, 1, axis=0)
-                    draft_full = jax.lax.dynamic_slice_in_dim(draft_log_probs_i, i, 1, axis=0)
-                    tok_2d = tok.reshape(1, 1)
-                    d_lp = jnp.take_along_axis(draft_full, tok_2d, axis=-1).squeeze()
-                    t_lp = jnp.take_along_axis(target_full, tok_2d, axis=-1).squeeze()
-                    accept_prob = jnp.minimum(1.0, jnp.exp(t_lp - d_lp))
-                    accept = jax.random.uniform(keys[i], (), dtype=jnp.float32) < accept_prob
-                    replacement = _resample_residual(target_full, draft_full, keys[num_drafts + i])
-                    still_verifying = ~rejected
-                    take_accept = still_verifying & accept
-                    take_reject = still_verifying & (~accept)
-                    accepted = accepted + take_accept.astype(jnp.int32)
-                    corrected = jnp.where(take_reject, replacement, corrected)
-                    rejected = rejected | take_reject
-                    return accepted, corrected, rejected
-
-                accepted, corrected, rejected = jax.lax.fori_loop(
-                    0,
-                    num_drafts,
-                    _body,
-                    (jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)),
+                accepted, emitted = spec_rejection_sample(
+                    target_log_probs[: num_drafts + 1][None],
+                    draft_log_probs_i[None],
+                    draft_token_ids[None],
+                    jnp.full((1,), num_drafts, dtype=jnp.int32),
+                    rng_key,
+                    jnp.reshape(position.astype(jnp.int32), (1,)),
                 )
-                bonus = jax.random.categorical(keys[-1], target_log_probs[num_drafts : num_drafts + 1]).astype(
-                    jnp.int32
-                )[0]
-                corrected = jnp.where(rejected, corrected, bonus)
-                return accepted, corrected
+                return accepted[0], emitted[0, accepted[0]]
 
             fn = _fn
             self._verify_sample_fns[key] = fn
 
         temperature, top_p, top_k, min_p = self.sampling_args(req_state)
+        rng_key = self.request_rng_key(req_state, position=int(start_position), stream=2)
         accepted, corrected = fn(
             target_logits,
             draft_log_probs,
             draft_token_arr,
-            self.rng_split(1)[0],
+            rng_key,
+            jnp.asarray(int(start_position), dtype=jnp.int32),
             temperature,
             top_p,
             top_k,
@@ -1573,6 +2006,21 @@ class DrafterSpeculation:
             return flags.get_bool(flags.EASYDEL_MTP_PERSIST_KV)
         return bool(getattr(self.drafter, "persist_kv", False))
 
+    def _persisted_drafter_capacity(self, persist_on: bool) -> int | None:
+        """Slots per row of the drafter cache that persisted rows must stay inside, or ``None`` when unbounded.
+
+        Args:
+            persist_on: Whether drafter rows persist across verify windows (:meth:`_mtp_persist_enabled`).
+
+        Returns:
+            The capacity, or ``None`` without persistence or without an allocated drafter cache.
+        """
+        if not persist_on:
+            return None
+        capacity_fn = getattr(self.drafter, "mtp_cache_capacity", None)
+        capacity = capacity_fn() if callable(capacity_fn) else None
+        return None if capacity is None else int(capacity)
+
     def _adaptive_conf_threshold(self) -> float:
         """Return the adaptive (early-exit) draft confidence threshold.
 
@@ -1633,7 +2081,10 @@ class DrafterSpeculation:
             a live budget of ``0`` returns ``[]`` without any drafter call.
         """
         k_live = int(self.live_num_draft_tokens)
-        if self.drafter is None or k_live <= 0 or not self.is_spec_request(req_state):
+        if self.drafter is None or not self.is_spec_request(req_state):
+            return []
+        if k_live <= 0:
+            self._mtp_persist_checkpoint_skipped_window(str(req_id), int(seed_position))
             return []
         backoff = int(self._backoff_by_req.get(str(req_id), 0))
         if backoff > 0:
@@ -1739,15 +2190,22 @@ class DrafterSpeculation:
                 committed_len = self._mtp_persist_committed_len(row, int(seed_position))
                 self.drafter.rollback_to(committed_len, row_pos=row)
                 write_from = int(committed_len)
-            # Capacity guard: the persisted row is written from ``write_from`` on, and a dense transformer cache
-            # clamps writes past its end onto the last slots (``dynamic_update_slice``), silently corrupting the
-            # drafter context. Skip drafting for a window that would overflow; verification is unaffected and the
-            # persist bookkeeping above already recorded this window (nothing written).
-            capacity_fn = getattr(self.drafter, "mtp_cache_capacity", None)
-            capacity = capacity_fn() if callable(capacity_fn) else None
+            # Capacity: the persisted row is written from ``write_from`` on and must stay inside the drafter cache.
+            # A full row restarts from this window (its history is dropped, as for a fresh row); a window whose own
+            # writes do not fit drafts nothing (verification is unaffected).
+            capacity = self._persisted_drafter_capacity(persist_on)
             if capacity is not None:
-                prefix_slots = int(np.asarray(prefix_position_ids).size) if use_prefix else 0
-                if write_from + prefix_slots + int(k_live) > int(capacity):
+                window_slots = (int(np.asarray(prefix_position_ids).size) if use_prefix else 0) + int(k_live)
+                if write_from > 0 and write_from + window_slots > capacity:
+                    if use_prefix and prefix_position_ids is not None:
+                        self._mtp_persist_base_pos_by_row[row] = int(np.asarray(prefix_position_ids).reshape(-1)[0])
+                    else:
+                        self._mtp_persist_base_pos_by_row[row] = int(seed_position)
+                    self._mtp_persist_last_seed_by_row[row] = int(seed_position)
+                    self._mtp_persist_written_by_row[row] = 0
+                    self.drafter.rollback_to(0, row_pos=row)
+                    write_from = 0
+                if window_slots > capacity:
                     return []
         elif callable(reset_request):
             reset_request(request_id=str(req_id))
@@ -1775,6 +2233,9 @@ class DrafterSpeculation:
                     k_max=k_live,
                     conf_threshold=adaptive_conf,
                     row_pos=(row if persist_on else None),
+                    logit_bias=self._drafter_sampling_processors()[0],
+                    allowed_token_ids_mask=self._drafter_sampling_processors()[1],
+                    bad_words_token_ids=self._drafter_sampling_processors()[2],
                 )
             except Exception:
                 logger.warning(
@@ -1790,6 +2251,12 @@ class DrafterSpeculation:
                 # One MTP cache slot per executed loop iteration.
                 self._mtp_persist_written_by_row[row] = valid
             drafted = [int(t) for t in np.asarray(drafts_host).reshape(-1)[:valid]]
+            self._record_single_draft(
+                str(req_id),
+                int(self._runner.sequence_buffer.req_id_to_index.get(str(req_id), int(row))),
+                int(seed_token),
+                drafted,
+            )
             self.num_drafts_generated += len(drafted)
             return drafted
         for draft_idx in range(k_live):
@@ -1837,7 +2304,12 @@ class DrafterSpeculation:
             else:
                 if step.full_log_probs is None or req_state is None:
                     return []
-                sampled_ids, filtered = self.filter_and_sample_log_probs(step.full_log_probs, req_state)
+                sampled_ids, filtered = self.filter_and_sample_log_probs(
+                    step.full_log_probs,
+                    req_state,
+                    position=cur_position,
+                    stream=1,
+                )
                 draft_fulls.append(filtered[0])
                 tok_dev = sampled_ids.reshape(-1)[:1].astype(jnp.int32)
             drafted_dev.append(tok_dev)
@@ -1856,6 +2328,12 @@ class DrafterSpeculation:
         # blocking ``int(np.asarray(...))`` per draft token, which serialized the K
         # chained MTP forwards on the host). Argmax/sample values are unchanged.
         drafted = [int(t) for t in np.asarray(jnp.concatenate(drafted_dev, axis=0)).reshape(-1)]
+        self._record_single_draft(
+            str(req_id),
+            int(self._runner.sequence_buffer.req_id_to_index.get(str(req_id), int(row))),
+            int(seed_token),
+            drafted,
+        )
         self.num_drafts_generated += len(drafted)
         if not greedy and draft_fulls:
             self.draft_full_log_probs_by_req[str(req_id)] = jnp.stack(draft_fulls, axis=0)
@@ -2018,8 +2496,8 @@ class DrafterSpeculation:
         request is eligible only when the attached drafter exposes
         :meth:`~easydel.inference.speculative.Qwen3_5MTPDrafter.draft_batched`, the
         request is spec-eligible, and it is greedy (temperature ``<= 0``). Sampled
-        requests, non-MTP drafters, and the prefix-draft first window fall back to
-        the per-request :meth:`draft_next` path.
+        requests and non-MTP drafters fall back to the per-request
+        :meth:`draft_next` path.
 
         Args:
             req_state: The cached request state to inspect.
@@ -2067,6 +2545,65 @@ class DrafterSpeculation:
         """
         return self.finish_batched_draft(self.begin_batched_draft(seeds))
 
+    def _record_single_draft(self, req_id: str, output_row: int, seed_token: int, drafted: list[int]) -> None:
+        """Record a per-request draft in the packed layout consumed by an overlapped step."""
+        if not drafted:
+            return
+        n = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
+        if not 0 <= int(output_row) < n:
+            return
+        spec_out = pack_pooled_drafts(
+            jnp.asarray([int(seed_token)], dtype=jnp.int32),
+            jnp.asarray([drafted], dtype=jnp.int32),
+            jnp.asarray([int(output_row)], dtype=jnp.int32),
+            num_rows=n,
+            num_draft_tokens=int(self.num_draft_tokens),
+        )
+        record = getattr(self._runner, "record_spec_out", None)
+        if callable(record):
+            record(spec_out)
+
+    def _drafter_cache_io(self):
+        """Return the next-token MLA view and shortened ragged metadata for a drafter that writes draft KV."""
+        if not getattr(self.drafter, "writes_draft_kv", False):
+            return None, None
+        manager = getattr(self._runner, "executor_manager", None)
+        if manager is None:
+            return None, None
+        pages = getattr(manager, "kv_pages", None)
+        if pages is None or not getattr(pages, "views", None):
+            return None, None
+        # Only a pool that really holds the draft layer's view (one past the target's layers) is shared; otherwise
+        # the drafter keeps its own cache.
+        num_layers = int(self._runner.model.config.get_text_config().num_hidden_layers)
+        if len(pages.views) <= num_layers or int(getattr(pages.views[num_layers], "layer_index", -1)) != num_layers:
+            return None, None
+        view = pages.views[num_layers]
+        batch = getattr(manager, "last_batch_metadata", None)
+        if batch is None:
+            return view, None
+        metadata = RaggedPagesMetadata(
+            pages_tables=batch.pages_tables,
+            context_lens=batch.seq_lens,
+            query_start_loc=batch.query_start_loc,
+            num_seqs=batch.num_requests,
+            position_ids=batch.position_ids_buf,
+        )
+        shorten = getattr(self._runner.model, "_nextn_metadata", None)
+        if shorten is not None:
+            metadata = shorten(metadata)
+        return view, metadata
+
+    def _drafter_sampling_processors(self):
+        """Per-request constraints for the drafter and verify programs: none.
+
+        Those programs index logits by pool or verify row, while a step's constraints are keyed by its window rows
+        (``SamplingConstraints``), so they are not applied there. A drafted token only changes acceptance; a verified
+        draft position is emitted without the request's logit bias, allow-list or banned tokens. The step's bonus
+        token, drawn by the step sampler, applies them.
+        """
+        return None, None, None
+
     def begin_batched_draft(
         self,
         seeds: list[tuple[str, int, int, int, typing.Any]],
@@ -2103,12 +2640,11 @@ class DrafterSpeculation:
         # this step's concurrency — return the empty handle before any device
         # work so a K=0 step carries no drafter overhead at all.
         k_live = int(self.live_num_draft_tokens)
-        if (
-            not seeds
-            or self.drafter is None
-            or k_live <= 0
-            or not callable(getattr(self.drafter, "draft_batched", None))
-        ):
+        if not seeds or self.drafter is None or not callable(getattr(self.drafter, "draft_batched", None)):
+            return {"out": out, "drafts_dev": None, "active_reqs": []}
+        if k_live <= 0:
+            for rid, _row, _seed_token, seed_position, _seed_hidden in seeds:
+                self._mtp_persist_checkpoint_skipped_window(str(rid), int(seed_position))
             return {"out": out, "drafts_dev": None, "active_reqs": []}
 
         n = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
@@ -2117,17 +2653,18 @@ class DrafterSpeculation:
         if callable(ensure):
             ensure(n)
 
+        capacity = self._persisted_drafter_capacity(persist_on)
         seed_tokens = np.zeros((n,), dtype=np.int32)
         seed_positions = np.zeros((n,), dtype=np.int32)
         committed_lens = np.zeros((n,), dtype=np.int32)
         collected_mask = np.zeros((n,), dtype=bool)
-        active_rows: list[int] = []
-        active_hidden: list[jax.Array] = []
-        active_hidden_rows: list[int] = []
+        seed_rows: list[tuple[int, typing.Any]] = []
         active_reqs: list[tuple[str, int]] = []
+        output_rows = np.full((n,), -1, dtype=np.int32)
 
         for rid, row, seed_token, seed_position, seed_hidden in seeds:
             rid = str(rid)
+            output_row = int(row)
             # Remap the runner's (unstable) req_idx to this request's
             # lifetime-stable drafter row (see __init__ note).
             row = self._stable_drafter_row(rid, int(row)) if persist_on else int(row)
@@ -2150,6 +2687,11 @@ class DrafterSpeculation:
                     committed = 0
                 else:
                     committed = self._mtp_persist_committed_len(row, int(seed_position))
+                    if capacity is not None and committed + k_live > capacity:
+                        # The row is full: restart it from this window (its history is dropped) instead of
+                        # writing past the drafter cache.
+                        self._mtp_persist_base_pos_by_row[row] = int(seed_position)
+                        committed = 0
                 # ``draft_batched`` writes ``k_live`` slots for every collected row.
                 self._mtp_persist_written_by_row[row] = k_live
             else:
@@ -2158,45 +2700,61 @@ class DrafterSpeculation:
             seed_positions[row] = int(seed_position)
             committed_lens[row] = int(committed)
             collected_mask[row] = True
-            active_rows.append(row)
-            if seed_hidden_matrix is not None and isinstance(seed_hidden, (int, np.integer)):
-                active_hidden_rows.append(int(seed_hidden))
-            else:
-                active_hidden.append(jnp.asarray(seed_hidden).reshape(-1))
+            output_rows[row] = output_row
+            seed_rows.append((row, seed_hidden))
             active_reqs.append((rid, row))
 
-        if not active_rows:
+        if not active_reqs:
             return {"out": out, "drafts_dev": None, "active_reqs": []}
 
-        rows_arr = jnp.asarray(active_rows, dtype=jnp.int32)
-        if seed_hidden_matrix is not None and active_hidden_rows and not active_hidden:
-            # One fused gather of all seed rows out of the pre-pass hidden
-            # matrix, instead of one eager device slice per request.
-            matrix = jnp.asarray(seed_hidden_matrix)
-            stacked_hidden = matrix[jnp.asarray(active_hidden_rows, dtype=jnp.int32)][:, None, :]
+        # The seeds in request-pool order, gathered by one fixed-shape program (see ``pool_seed_hidden``).
+        source_rows = np.zeros((n,), dtype=np.int32)
+        if seed_hidden_matrix is not None and all(isinstance(seed, (int, np.integer)) for _row, seed in seed_rows):
+            # Rows of the step's hidden matrix (the runner's pooled drafts).
+            matrix = seed_hidden_matrix
+            for row, seed in seed_rows:
+                source_rows[row] = int(seed)
         else:
-            if seed_hidden_matrix is not None and active_hidden_rows:
-                # Mixed int/array seeds (not produced by the runner today):
-                # materialize the int rows so both kinds stack uniformly.
-                matrix = jnp.asarray(seed_hidden_matrix)
-                active_hidden.extend(matrix[int(i)].reshape(-1) for i in active_hidden_rows)
-            stacked_hidden = jnp.stack(active_hidden, axis=0)[:, None, :]
-        hidden_dim = int(stacked_hidden.shape[-1])
-        hidden_full = jnp.zeros((n, 1, hidden_dim), dtype=stacked_hidden.dtype)
-        hidden_full = hidden_full.at[rows_arr].set(stacked_hidden)
+            # Per-request seed arrays (and, never from the runner, matrix rows mixed with them): stack them.
+            stacked = []
+            for i, (row, seed) in enumerate(seed_rows):
+                if seed_hidden_matrix is not None and isinstance(seed, (int, np.integer)):
+                    stacked.append(jnp.asarray(seed_hidden_matrix)[int(seed)].reshape(-1))
+                else:
+                    stacked.append(jnp.asarray(seed).reshape(-1))
+                source_rows[row] = i
+            matrix = jnp.stack(stacked, axis=0)
+        hidden_full = pool_seed_hidden(matrix, source_rows, collected_mask)
 
+        cache_view, cache_metadata = self._drafter_cache_io()
         drafts_dev = self.drafter.draft_batched(
-            seed_tokens=jnp.asarray(seed_tokens),
+            # Host arrays: the drafter shapes the seeds and picks its cache window on the host, without a device read.
+            seed_tokens=seed_tokens,
             seed_hidden=hidden_full,
-            seed_positions=jnp.asarray(seed_positions),
-            committed_lens=jnp.asarray(committed_lens),
-            collected_mask=jnp.asarray(collected_mask),
+            seed_positions=seed_positions,
+            committed_lens=committed_lens,
+            collected_mask=collected_mask,
             # The drafter compile-keys on k (unrolled recurrence); a schedule
             # contributes one compile per distinct k, warmed by
             # ``eSurgeRunner.compile`` so serving never JITs mid-flight.
             num_draft_tokens=k_live,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            logit_bias=self._drafter_sampling_processors()[0],
+            allowed_token_ids_mask=self._drafter_sampling_processors()[1],
+            bad_words_token_ids=self._drafter_sampling_processors()[2],
         )
-        return {"out": out, "drafts_dev": drafts_dev, "active_reqs": active_reqs}
+        spec_out = pack_pooled_drafts(
+            jnp.asarray(seed_tokens, dtype=jnp.int32),
+            drafts_dev,
+            jnp.asarray(output_rows, dtype=jnp.int32),
+            num_rows=n,
+            num_draft_tokens=int(self.num_draft_tokens),
+        )
+        record = getattr(self._runner, "record_spec_out", None)
+        if callable(record):
+            record(spec_out)
+        return {"out": out, "drafts_dev": drafts_dev, "spec_out": spec_out, "active_reqs": active_reqs}
 
     def finish_batched_draft(self, handle: dict) -> dict[str, list[int]]:
         """Read back a batched draft dispatched by :meth:`begin_batched_draft`.
@@ -2320,7 +2878,12 @@ class DrafterSpeculation:
             to the two-dispatch flow with no state disturbed).
         """
         k_live = int(self.live_num_draft_tokens)
-        if not entries or k_live <= 0 or int(k_pad) != k_live or not self.can_draft_in_verify():
+        has_overlapped = any(
+            any(int(t) < 0 for t in getattr(meta, "scheduled_draft_tokens", ())) for meta, _off, _cnt in entries
+        )
+        if not entries or not self.can_draft_in_verify():
+            return None
+        if not has_overlapped and (k_live <= 0 or int(k_pad) != k_live):
             return None
         n = max(1, int(getattr(self._runner, "max_num_reqs", 1)))
         persist_on = self._mtp_persist_enabled()
@@ -2342,44 +2905,67 @@ class DrafterSpeculation:
         ensure = getattr(self.drafter, "ensure_batch_size", None)
         if callable(ensure):
             ensure(n)
+        capacity = self._persisted_drafter_capacity(persist_on)
 
         row_offsets = np.zeros((n,), dtype=np.int32)
         draft_tokens = np.zeros((n, int(k_pad)), dtype=np.int32)
+        draft_indices = np.zeros((n, int(k_pad)), dtype=np.int32)
         draft_counts = np.zeros((n,), dtype=np.int32)
         seed_pos_base = np.zeros((n,), dtype=np.int32)
         committed_base = np.zeros((n,), dtype=np.int32)
         fresh_mask = np.zeros((n,), dtype=bool)
         collected_mask = np.zeros((n,), dtype=bool)
-        active: list[tuple[str, int, int, int]] = []
+        output_rows = np.full((n,), -1, dtype=np.int32)
+        delta_row_pos = np.full((n,), -1, dtype=np.int32)
+        last_delta = getattr(getattr(self._runner, "executor_manager", None), "last_spec_window_delta", None)
+        active: list[tuple[str, int, int, int, int, int]] = []
 
         for (meta, off, cnt), row in zip(entries, rows_by_entry, strict=True):
             rid = str(meta.request_id)
             base_known = int(meta.start_pos) + int(meta.real_count) - 1
+            drafts_row = [int(t) for t in meta.buffer_draft_tokens]
             if persist_on:
-                if self._mtp_persist_req_by_row.get(row) != rid:
-                    # Fresh request or a slot reused by a different request:
-                    # claim the row, drop any stale base (so a fallback after an
-                    # abort computes committed == 0 too), and roll to 0
+                fresh = self._mtp_persist_req_by_row.get(row) != rid
+                if not fresh:
+                    base = int(self._mtp_persist_base_pos_by_row.get(row, base_known))
+                    committed_base[row] = base_known - base
+                    # A row this window could write past the drafter cache restarts from the window, as a fresh row.
+                    fresh = capacity is not None and int(committed_base[row]) + len(drafts_row) + k_live > capacity
+                if fresh:
+                    # Fresh request, a slot reused by a different request, or a
+                    # full row: claim the row, drop any stale base (so a fallback
+                    # after an abort computes committed == 0 too), and roll to 0
                     # in-program. The base is re-recorded post-readback.
                     self._mtp_persist_req_by_row[row] = rid
                     self._mtp_persist_base_pos_by_row.pop(row, None)
                     self._mtp_persist_last_seed_by_row.pop(row, None)
                     self._mtp_persist_written_by_row.pop(row, None)
+                    committed_base[row] = 0
                     fresh_mask[row] = True
-                else:
-                    base = int(self._mtp_persist_base_pos_by_row.get(row, base_known))
-                    committed_base[row] = base_known - base
             else:
                 fresh_mask[row] = True
-            drafts_row = [int(t) for t in meta.buffer_draft_tokens]
             draft_tokens[row, : len(drafts_row)] = drafts_row
+            draft_indices[row, : len(drafts_row)] = np.asarray(meta.target_local_indices, dtype=np.int32) + 1
             draft_counts[row] = len(drafts_row)
             row_offsets[row] = int(off)
             seed_pos_base[row] = base_known
+            delta_row_pos[row] = int(meta.row_pos)
             collected_mask[row] = True
-            active.append((rid, row, int(off), int(cnt)))
+            output_rows[row] = int(meta.req_idx)
+            active.append((rid, row, int(off), int(cnt), base_known, int(meta.req_idx)))
 
-        arg_mat, accepted, seed_positions, drafts = self.drafter.verify_draft_batched(
+        if last_delta is not None:
+            delta_row_pos_dev = _place_host_for_array(
+                np.asarray(delta_row_pos, dtype=np.int32),
+                last_delta,
+                host_payloads_replicated=getattr(self._runner.executor_manager, "host_payloads_replicated", None),
+            )
+            spec_delta: typing.Any = _gather_spec_delta(last_delta, delta_row_pos_dev)
+        else:
+            spec_delta = np.zeros((n,), dtype=np.int32)
+
+        cache_view, cache_metadata = self._drafter_cache_io()
+        arg_mat, accepted, seed_positions, spec_out = self.drafter.spec_step(
             gathered_hidden=gathered_hidden,
             row_offsets=row_offsets,
             draft_tokens=draft_tokens,
@@ -2389,13 +2975,27 @@ class DrafterSpeculation:
             fresh_mask=fresh_mask,
             collected_mask=collected_mask,
             num_draft_tokens=k_live,
+            output_rows=output_rows,
+            input_ids=fixed_width_ids(
+                getattr(self._runner, "input_ids_buf", None), getattr(self._runner, "max_num_tokens", None)
+            ),
+            draft_indices=draft_indices,
+            spec_delta=spec_delta,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            logit_bias=self._drafter_sampling_processors()[0],
+            allowed_token_ids_mask=self._drafter_sampling_processors()[1],
+            bad_words_token_ids=self._drafter_sampling_processors()[2],
             project_fn=self.draft_in_verify_project_fn(),
         )
+        record = getattr(self._runner, "record_spec_out", None)
+        if callable(record):
+            record(spec_out, replace=True)
         return {
             "arg_mat": arg_mat,
             "accepted": accepted,
             "seed_positions": seed_positions,
-            "drafts": drafts,
+            "spec_out": spec_out,
             "active": active,
             "fresh": fresh_mask,
             "persist_on": persist_on,
@@ -2406,9 +3006,9 @@ class DrafterSpeculation:
         """Read back a fused verify+draft dispatched by :meth:`begin_draft_in_verify`.
 
         The step's single host sync: one ``jax.device_get`` over the argmax
-        stripes, accepted counts, seed positions, and next-window drafts. Also
-        records a fresh row's persist base (its committed-origin) from the
-        read-back seed position — the deferred half of the bookkeeping
+        stripes and the packed emitted/accepted/draft result. Also records a
+        fresh row's persist base (its committed-origin) from the accepted count —
+        the deferred half of the bookkeeping
         :meth:`begin_draft_in_verify` could not do before acceptance was known.
 
         Args:
@@ -2421,21 +3021,28 @@ class DrafterSpeculation:
             rows), and ``known_len`` is ``start + real + accepted + 1`` (the
             emitted-through length the runner writes drafts after).
         """
-        arg_np, acc_np, pos_np, drafts_np = jax.device_get(
-            (handle["arg_mat"], handle["accepted"], handle["seed_positions"], handle["drafts"])
-        )
+        arg_np, packed, seed_pos_np = jax.device_get((handle["arg_mat"], handle["spec_out"], handle["seed_positions"]))
         arg_np = np.asarray(arg_np)
-        acc_np = np.asarray(acc_np)
-        pos_np = np.asarray(pos_np)
-        drafts_np = np.asarray(drafts_np)
+        packed_np = np.asarray(packed)
+        seed_pos_np = np.asarray(seed_pos_np)
+        k_live = int(handle["k_live"])
+        k_packed = max(0, (int(packed_np.shape[1]) - 2) // 2)
+        emitted, accepted, drafts = split_packed(packed_np, k_packed)
+        self.last_spec_emitted = emitted
+        self.last_spec_accepted = accepted
+        self.last_spec_drafts = drafts
         persist_on = bool(handle["persist_on"])
         fresh = handle["fresh"]
         out: dict[str, dict[str, typing.Any]] = {}
         total = 0
-        for rid, row, _off, cnt in handle["active"]:
-            drafted = [int(t) for t in drafts_np[row, :]]
+        for rid, row, _off, cnt, base_known, out_row in handle["active"]:
+            accepted_count = int(accepted[out_row])
+            emitted_row = [int(t) for t in emitted[out_row, :] if int(t) >= 0]
+            drafted = [int(t) for t in drafts[out_row, :] if int(t) >= 0]
+            seed_pos = int(seed_pos_np[row]) if 0 <= int(row) < int(seed_pos_np.shape[0]) else (
+                int(base_known) + accepted_count
+            )
             if persist_on:
-                seed_pos = int(pos_np[row])
                 if bool(fresh[row]):
                     self._mtp_persist_base_pos_by_row[row] = seed_pos
                     self._mtp_persist_last_seed_by_row[row] = seed_pos
@@ -2444,11 +3051,12 @@ class DrafterSpeculation:
                     # written extent; re-base for any fully-accepted gap so the
                     # NEXT window's ``committed_base`` stays exact.
                     self._mtp_persist_committed_len(row, seed_pos)
-                self._mtp_persist_written_by_row[row] = int(handle.get("k_live", len(drafted)))
+                self._mtp_persist_written_by_row[row] = k_live
             out[rid] = {
                 "argmaxes": [int(t) for t in arg_np[row, : int(cnt)]],
-                "accepted": int(acc_np[row]),
-                "known_len": int(pos_np[row]) + 2,
+                "accepted": accepted_count,
+                "emitted": emitted_row,
+                "known_len": seed_pos + 2,
                 "drafts": drafted,
             }
             total += len(drafted)
@@ -2544,6 +3152,9 @@ class DrafterSpeculation:
         if self.rolls_back_cache:
             return True
         if not self.cache_has_recurrent_state():
+            return False
+        if int(getattr(self._runner, "recurrent_slot_group_size", 1) or 1) > 1:
+            # Slot groups: the next step reads the accepted prefix's state by index (slot g + accepted drafts).
             return False
         return self.recurrent_candidate_count() <= 0
 
@@ -2971,6 +3582,21 @@ class DrafterSpeculation:
         self._runner.record_speculative_execution_time(suffix=time.time() - suffix_timer_start)
         return suffix_token, suffix_hidden
 
+    def _slots_for_replay_row(self, row_pos: int, recurrent_slot_indices_cpu: typing.Any) -> list[int]:
+        """Resolve the physical recurrent/compressed-window cache slot(s) owned by ``row_pos``."""
+        if recurrent_slot_indices_cpu is not None and 0 <= int(row_pos) < len(recurrent_slot_indices_cpu):
+            base_slot = int(recurrent_slot_indices_cpu[int(row_pos)])
+        else:
+            base_slot = int(row_pos)
+        group_size = max(1, int(getattr(self._runner, "recurrent_slot_group_size", 1) or 1))
+        slots = [base_slot + j for j in range(group_size)]
+        candidate_count = max(0, int(self.recurrent_candidate_count() or 0))
+        if candidate_count > 0:
+            base_slots = int(getattr(self._runner, "max_num_reqs", 0) or 0)
+            if 0 <= base_slot < base_slots:
+                slots.extend(base_slots + k * base_slots + base_slot for k in range(candidate_count))
+        return slots
+
     def replay_prefix_sample(
         self,
         row_pos: int,
@@ -3021,8 +3647,12 @@ class DrafterSpeculation:
         replay_req_num_tokens = np.asarray(num_computed_tokens_window_cpu).copy()
         replay_req_num_tokens[int(row_pos)] = int(num_computed_tokens_window_cpu[int(row_pos)]) + int(prefix_len)
 
-        self._runner.executor_manager.kv_pages = _restore_recurrent_state(
-            self._runner.executor_manager.kv_pages, pre_step_kv_pages
+        replay_slots = self._slots_for_replay_row(int(row_pos), recurrent_slot_indices_cpu)
+        self._runner.executor_manager.kv_pages = _restore_recurrent_state_for_slots(
+            self._runner.executor_manager.kv_pages,
+            pre_step_kv_pages,
+            replay_slots,
+            host_payloads_replicated=getattr(self._runner.executor_manager, "host_payloads_replicated", None),
         )
         out_tokens_replay, _, _, _, hidden_replay, _, _ = self._runner.executor_manager.execute(
             num_tokens=num_tokens_static,
@@ -3123,8 +3753,12 @@ class DrafterSpeculation:
         if prefix_len <= 0:
             raise ValueError("prefix_len must be positive for speculative sequential replay.")
 
-        self._runner.executor_manager.kv_pages = _restore_recurrent_state(
-            self._runner.executor_manager.kv_pages, pre_step_kv_pages
+        replay_slots = self._slots_for_replay_row(int(row_pos), recurrent_slot_indices_cpu)
+        self._runner.executor_manager.kv_pages = _restore_recurrent_state_for_slots(
+            self._runner.executor_manager.kv_pages,
+            pre_step_kv_pages,
+            replay_slots,
+            host_payloads_replicated=getattr(self._runner.executor_manager, "host_payloads_replicated", None),
         )
         replay_scheduled = self._runner.scheduled_token_counts_cpu.copy()
         replay_active = self._runner.active_request_mask_cpu.copy()

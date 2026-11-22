@@ -19,6 +19,9 @@ easydel.operations.kernels package
    kda
    multi_latent_ragged_page_attention
    paged_flash_attention
+   ragged_kda
+   ragged_kda_decode
+   ragged_kda_rank_major
    ragged_page_attention
    ring_attention
    scaled_dot_product_attention

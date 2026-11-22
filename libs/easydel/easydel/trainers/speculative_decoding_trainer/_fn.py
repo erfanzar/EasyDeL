@@ -39,14 +39,15 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info
 
 from ..training_utils import (
     ScheduledLossAdapter,
     bind_scheduled_module,
     constrain_batch_sharding,
-    constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     sanitize_model_call_kwargs,
@@ -218,16 +219,18 @@ def _module_accepts_block_loss_kwargs(module: tp.Any, method_name: str | None) -
 
     Args:
         module: The model module to inspect.
-        method_name: Method name to inspect.  ``None`` maps to ``__call__``.
+        method_name: Method name to inspect.  ``None`` maps to ``forward``/``__call__``.
 
     Returns:
         ``True`` if the method signature accepts ``loss_mask`` or
         ``return_block_outputs``, or if the method accepts ``**kwargs`` and the
         module config has ``block_size``.  ``False`` otherwise.
     """
-    method = module.__call__ if method_name in (None, "", "__call__", "forward") else getattr(module, method_name)
+    uses_call = method_name in (None, "", "__call__", "forward")
+    method = module.__call__ if uses_call else getattr(module, method_name)
+    signature_source = getattr(module, "forward", method) if uses_call else method
     try:
-        signature = inspect.signature(method)
+        signature = inspect.signature(signature_source)
     except (TypeError, ValueError):
         return getattr(getattr(module, "config", None), "block_size", None) is not None
     parameters = signature.parameters
@@ -235,6 +238,18 @@ def _module_accepts_block_loss_kwargs(module: tp.Any, method_name: str | None) -
         return True
     has_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
     return has_var_kwargs and getattr(getattr(module, "config", None), "block_size", None) is not None
+
+
+def _module_accepts_return_logits(module: tp.Any, method_name: str | None) -> bool:
+    """Return whether the drafter forward exposes an explicit ``return_logits`` kwarg (e.g. EAGLE3)."""
+    uses_call = method_name in (None, "", "__call__", "forward")
+    method = module.__call__ if uses_call else getattr(module, method_name)
+    signature_source = getattr(module, "forward", method) if uses_call else method
+    try:
+        signature = inspect.signature(signature_source)
+    except (TypeError, ValueError):
+        return False
+    return "return_logits" in signature.parameters
 
 
 def _deepspec_block_loss_requires_target_distribution(config: tp.Any) -> bool:
@@ -314,12 +329,13 @@ def _call_chain_method(
     base_outputs: tp.Any,
     batch: collections.abc.Mapping[str, tp.Any],
     num_draft_tokens: int,
-) -> jax.Array:
+) -> jax.Array | None:
     """Call a drafter method that expands base outputs into draft-step logits.
 
     Methods such as ``compute_mtp_chain`` receive the normal forward output,
-    ``input_ids``, and the requested number of draft steps.  ``attention_mask``
-    is passed only when the method signature can accept it.
+    ``input_ids``, and the requested number of draft steps.  ``attention_mask``,
+    ``mask_info``, and ``position_ids`` are passed when present in ``batch``
+    and accepted by the method signature.
 
     Args:
         module: The model module containing the chain method.
@@ -329,7 +345,7 @@ def _call_chain_method(
         num_draft_tokens: Number of draft tokens to generate.
 
     Returns:
-        Draft logits returned by the chain method.
+        Draft logits returned by the chain method, or ``None`` if the head is inactive.
 
     Raises:
         ValueError: If ``input_ids`` is not present in ``batch``.
@@ -339,13 +355,16 @@ def _call_chain_method(
         raise ValueError(f"`{method_name}` requires `input_ids` in the batch.")
     method = getattr(module, method_name)
     kwargs: dict[str, tp.Any] = {}
-    attention_mask = batch.get("attention_mask")
+    optional_keys = ("attention_mask", "mask_info", "position_ids")
     try:
         signature = inspect.signature(method)
         accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
-        if attention_mask is not None and (accepts_kwargs or "attention_mask" in signature.parameters):
-            kwargs["attention_mask"] = attention_mask
+        for key in optional_keys:
+            val = batch.get(key)
+            if val is not None and (accepts_kwargs or key in signature.parameters):
+                kwargs[key] = val
     except (TypeError, ValueError):
+        attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask
     return method(base_outputs, input_ids, int(num_draft_tokens), **kwargs)
@@ -382,7 +401,9 @@ def _resolve_draft_logits(
     """
     chain_name = _chain_method_name(module, draft_chain_method, num_draft_tokens)
     if chain_name is not None:
-        return _call_chain_method(module, chain_name, drafter_outputs, batch, num_draft_tokens)
+        chain_logits = _call_chain_method(module, chain_name, drafter_outputs, batch, num_draft_tokens)
+        if chain_logits is not None:
+            return _normalize_draft_logits(chain_logits, target_logits, num_draft_tokens=num_draft_tokens)
     logits = _extract_logits(drafter_outputs, attr=draft_logits_attr, role="drafter")
     return _normalize_draft_logits(logits, target_logits, num_draft_tokens=num_draft_tokens)
 
@@ -574,6 +595,19 @@ def _loss_mask_from_batch(batch: collections.abc.Mapping[str, tp.Any]) -> jax.Ar
     return None
 
 
+def _resolve_segment_ids(
+    segment_ids: jax.Array | None,
+    mask_info: tp.Any,
+    seq_len: int,
+) -> jax.Array | None:
+    """Resolve ``[B, S]`` packing segment ids from explicit ``segment_ids`` or ``mask_info``."""
+    if segment_ids is not None:
+        return segment_ids
+    if mask_info is not None:
+        return packed_segment_ids_from_mask_info(mask_info, seq_len)
+    return None
+
+
 def _aligned_step_components(
     draft_logits: jax.Array,
     target_logits: jax.Array,
@@ -584,16 +618,19 @@ def _aligned_step_components(
     loss_mask: jax.Array | None,
     temperature: float,
     target_offset: int,
+    segment_ids: jax.Array | None = None,
+    mask_info: tp.Any = None,
 ) -> dict[str, jax.Array]:
     """Compute masked KL, CE, and acceptance numerators for one draft step.
 
     ``target_offset`` aligns drafter position ``t`` with the target
-    distribution used to score the drafted token.  Attention, completion, and
-    ``-100`` label masks are multiplied into one denominator so every reported
-    numerator uses the same active-token set.  The acceptance-rate numerator is
-    the distribution overlap ``sum(min(p_target, p_draft))`` at the loss
-    temperature, which is the expected stochastic acceptance probability under
-    the target/drafter distributions used by the KL term.
+    distribution used to score the drafted token.  Attention, completion,
+    packed-segment, and ``-100`` label masks are multiplied into one
+    denominator so every reported numerator uses the same active-token set.
+    The acceptance-rate numerator is the distribution overlap
+    ``sum(min(p_target, p_draft))`` at the loss temperature, which is the
+    expected stochastic acceptance probability under the target/drafter
+    distributions used by the KL term.
 
     Args:
         draft_logits: Drafter logits for this step ``[batch, sequence, vocab]``.
@@ -605,6 +642,10 @@ def _aligned_step_components(
         temperature: Softmax temperature for the KL and acceptance terms.
         target_offset: Position offset between drafter and target logits.
             Must be non-negative.
+        segment_ids: Optional ``[batch, sequence]`` packing segment IDs; pairs
+            crossing a document boundary or padding segment (< 0) are masked.
+        mask_info: Optional ``MaskInfo`` used to recover ``segment_ids`` when
+            ``segment_ids`` is not explicitly supplied.
 
     Returns:
         Dictionary of numerators and the unclamped active-token count containing:
@@ -634,6 +675,14 @@ def _aligned_step_components(
     if loss_mask is not None:
         weights = weights * loss_mask[:, mask_slice].astype(jnp.float32)
 
+    resolved_segments = _resolve_segment_ids(segment_ids, mask_info, int(target_logits.shape[1]))
+    if resolved_segments is not None:
+        src_seg = resolved_segments[:, :max_tokens]
+        same_segment = src_seg >= 0
+        for offset_k in range(1, target_offset + 2):
+            same_segment = same_segment & (src_seg == resolved_segments[:, offset_k : offset_k + max_tokens])
+        weights = weights * same_segment.astype(jnp.float32)
+
     hard_labels = labels if labels is not None else input_ids
     aligned_labels = None
     if hard_labels is not None:
@@ -645,7 +694,10 @@ def _aligned_step_components(
     teacher_probs = jnp.exp(teacher_log_probs)
     student_log_probs_t = jax.nn.log_softmax(student / temp, axis=-1)
     student_probs_t = jnp.exp(student_log_probs_t)
-    kl = jnp.sum(teacher_probs * (teacher_log_probs - student_log_probs_t), axis=-1) * (temp**2)
+    positive_teacher = teacher_probs > 0.0
+    safe_teacher_log_probs = jnp.where(positive_teacher, teacher_log_probs, jnp.asarray(0.0, dtype=jnp.float32))
+    safe_student_log_probs_t = jnp.where(positive_teacher, student_log_probs_t, jnp.asarray(0.0, dtype=jnp.float32))
+    kl = jnp.sum(teacher_probs * (safe_teacher_log_probs - safe_student_log_probs_t), axis=-1) * (temp**2)
     expected_acceptance = jnp.sum(jnp.minimum(teacher_probs, student_probs_t), axis=-1)
 
     target_top = jnp.argmax(teacher, axis=-1)
@@ -822,20 +874,20 @@ def _deepspec_block_loss(output: tp.Any, config: tp.Any) -> tuple[jax.Array, Los
     if block_keep_mask is not None:
         valid_blocks = valid_blocks * block_keep_mask.astype(jnp.float32)
     block_count = jnp.sum(valid_blocks)
-    valid_accept_rate = accept_rate * eval_mask
-    expected_draft_accepted = jnp.sum(jnp.cumprod(valid_accept_rate, axis=-1), axis=-1)
-    _pooled_ratio(pooled, "tau_probabilistic", _masked_sum(expected_draft_accepted + 1.0, valid_blocks), block_count)
-    _pooled_ratio(pooled, "draft_accept_rate", _masked_sum(accept_rate, eval_mask), eval_count)
-    for step in range(block_size):
-        step_mask = eval_mask[:, :, step]
-        _pooled_ratio(
-            pooled,
-            f"draft_step{step + 1}_accept_rate",
-            _masked_sum(accept_rate[:, :, step], step_mask),
-            jnp.sum(step_mask),
-        )
 
     if aligned_target_logits is not None:
+        valid_accept_rate = accept_rate * eval_mask
+        expected_draft_accepted = jnp.sum(jnp.cumprod(valid_accept_rate, axis=-1), axis=-1)
+        _pooled_ratio(pooled, "tau_probabilistic", _masked_sum(expected_draft_accepted + 1.0, valid_blocks), block_count)
+        _pooled_ratio(pooled, "draft_accept_rate", _masked_sum(accept_rate, eval_mask), eval_count)
+        for step in range(block_size):
+            step_mask = eval_mask[:, :, step]
+            _pooled_ratio(
+                pooled,
+                f"draft_step{step + 1}_accept_rate",
+                _masked_sum(accept_rate[:, :, step], step_mask),
+                jnp.sum(step_mask),
+            )
         greedy_match = (draft_top == jnp.argmax(aligned_target_logits, axis=-1)).astype(jnp.float32)
         prefix_eligible = jnp.cumprod(eval_mask, axis=-1)
         prefix_survival = jnp.cumprod(greedy_match * eval_mask, axis=-1)
@@ -888,6 +940,8 @@ def speculative_draft_loss(
     num_draft_tokens: int = 1,
     draft_target_offset: int = 0,
     step_loss_decay: float | None = None,
+    segment_ids: jax.Array | None = None,
+    mask_info: tp.Any = None,
 ) -> tuple[jax.Array, LossMetrics]:
     """Compute the full speculative-decoding objective and metrics.
 
@@ -907,7 +961,11 @@ def speculative_draft_loss(
         alpha: Interpolation weight between KL and CE losses.
         num_draft_tokens: Number of draft tokens to evaluate.
         draft_target_offset: Offset between drafter and target positions.
-        step_loss_decay: Optional geometric decay weight per draft step.
+        step_loss_decay: Optional geometric decay weight per draft step
+            (normalized by the sum of active step weights so ``decay=1.0``
+            matches the unweighted step mean).
+        segment_ids: Optional packing segment IDs to prevent cross-document leakage.
+        mask_info: Optional ``MaskInfo`` for packed-segment recovery.
 
     Returns:
         Tuple of ``(loss, metrics)`` where ``loss`` is the scalar speculative
@@ -926,6 +984,7 @@ def speculative_draft_loss(
     }
     per_step: dict[str, jax.Array] = {}
     weighted_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    step_weight_sum = jnp.asarray(0.0, dtype=jnp.float32)
     use_weighted_steps = step_loss_decay is not None
     for step in range(steps):
         components = _aligned_step_components(
@@ -937,6 +996,8 @@ def speculative_draft_loss(
             loss_mask=loss_mask,
             temperature=temperature,
             target_offset=int(draft_target_offset) + step,
+            segment_ids=segment_ids,
+            mask_info=mask_info,
         )
         step_count = components["weight_sum"]
         denom = jnp.maximum(step_count, jnp.asarray(1.0, dtype=jnp.float32))
@@ -947,10 +1008,12 @@ def speculative_draft_loss(
         _pooled_ratio(per_step, f"draft_step{step + 1}_acceptance_match", components["acceptance_num"], step_count)
         if use_weighted_steps:
             step_weight = jnp.asarray(float(step_loss_decay) ** step, dtype=jnp.float32)
+            active_weight = jnp.where(step_count > 0.0, step_weight, jnp.asarray(0.0, dtype=jnp.float32))
             alpha_value = jnp.asarray(alpha, dtype=jnp.float32)
-            weighted_loss = weighted_loss + step_weight * (
+            weighted_loss = weighted_loss + active_weight * (
                 alpha_value * step_kl_loss + (1.0 - alpha_value) * step_ce_loss
             )
+            step_weight_sum = step_weight_sum + active_weight
         for key, value in components.items():
             totals[key] = totals[key] + value
 
@@ -958,7 +1021,11 @@ def speculative_draft_loss(
     kl_loss = totals["kl_num"] / denom
     ce_loss = totals["ce_num"] / denom
     alpha_value = jnp.asarray(alpha, dtype=jnp.float32)
-    total_loss = weighted_loss if use_weighted_steps else alpha_value * kl_loss + (1.0 - alpha_value) * ce_loss
+    total_loss = (
+        weighted_loss / jnp.maximum(step_weight_sum, jnp.asarray(1.0, dtype=jnp.float32))
+        if use_weighted_steps
+        else alpha_value * kl_loss + (1.0 - alpha_value) * ce_loss
+    )
     other_metrics: dict[str, jax.Array] = {
         "spec_kl_loss": kl_loss,
         "spec_ce_loss": ce_loss,
@@ -1013,13 +1080,30 @@ def _target_forward_bundle_from_module(
         ``last_hidden_state``, and ``outputs``.
     """
     cached_logits = batch.get("_target_logits", batch.get("target_logits"))
-    if cached_logits is not None:
-        result: dict[str, tp.Any] = {"logits": jax.lax.stop_gradient(cached_logits)}
-        hidden_states = batch.get("_target_hidden_states", batch.get("target_hidden_states"))
-        last_hidden_state = batch.get("_target_last_hidden_state", batch.get("target_last_hidden_state"))
-        use_last_hidden_as_context = _target_layer_ids_are_final(
-            target_module, target_layer_ids, target_num_hidden_layers
-        )
+    cached_hidden_states = batch.get("_target_hidden_states", batch.get("target_hidden_states"))
+    cached_last_hidden = batch.get("_target_last_hidden_state", batch.get("target_last_hidden_state"))
+    use_last_hidden_as_context = _target_layer_ids_are_final(
+        target_module, target_layer_ids, target_num_hidden_layers
+    )
+    has_cached_logits = cached_logits is not None
+    has_cached_context = (
+        cached_hidden_states is not None
+        or (use_last_hidden_as_context and cached_last_hidden is not None)
+    )
+    can_use_cache = (
+        has_cached_logits
+        and (not target_output_hidden_states or has_cached_context or cached_last_hidden is not None)
+    ) or (
+        not require_logits
+        and (cached_hidden_states is not None or cached_last_hidden is not None)
+        and (not target_output_hidden_states or has_cached_context)
+    )
+    if can_use_cache:
+        result: dict[str, tp.Any] = {}
+        if has_cached_logits:
+            result["logits"] = jax.lax.stop_gradient(cached_logits)
+        hidden_states = cached_hidden_states
+        last_hidden_state = cached_last_hidden
         if last_hidden_state is None and isinstance(hidden_states, list | tuple) and hidden_states:
             last_hidden_state = hidden_states[-1]
         if hidden_states is not None:
@@ -1032,7 +1116,6 @@ def _target_forward_bundle_from_module(
             result["last_hidden_state"] = jax.lax.stop_gradient(last_hidden_state)
         return result
 
-    use_last_hidden_as_context = _target_layer_ids_are_final(target_module, target_layer_ids, target_num_hidden_layers)
     target_extra_kwargs = {"apply_lm_head": False} if not require_logits else None
     outputs = _call_module_or_method(
         target_module,
@@ -1154,17 +1237,21 @@ def _speculative_loss_for_module(
     extra_kwargs: dict[str, tp.Any] = {}
     if "hidden_states" in target_bundle:
         extra_kwargs["target_hidden_states"] = target_bundle["hidden_states"]
-    if pass_target_outputs:
+    loss_mask = _loss_mask_from_batch(batch)
+    use_native_block_loss = loss_mask is not None and _module_accepts_block_loss_kwargs(module, drafter_forward_method)
+    need_target_dist = use_native_block_loss and _deepspec_block_loss_requires_target_distribution(module_config)
+    if pass_target_outputs or need_target_dist:
         if target_logits is not None:
             extra_kwargs["target_logits"] = target_logits
         if "last_hidden_state" in target_bundle:
             extra_kwargs["target_last_hidden_state"] = target_bundle["last_hidden_state"]
-        if "outputs" in target_bundle:
-            extra_kwargs["target_outputs"] = target_bundle["outputs"]
-    loss_mask = _loss_mask_from_batch(batch)
-    if loss_mask is not None and _module_accepts_block_loss_kwargs(module, drafter_forward_method):
+    if pass_target_outputs and "outputs" in target_bundle:
+        extra_kwargs["target_outputs"] = target_bundle["outputs"]
+    if use_native_block_loss:
         extra_kwargs["loss_mask"] = loss_mask
         extra_kwargs["return_block_outputs"] = True
+    if _module_accepts_return_logits(module, drafter_forward_method):
+        extra_kwargs["return_logits"] = True
 
     drafter_outputs = _call_module_or_method(
         module,
@@ -1186,18 +1273,21 @@ def _speculative_loss_for_module(
         draft_chain_method=draft_chain_method,
         num_draft_tokens=num_draft_tokens,
     )
+    draft_loss_mask = _first_present(batch.get("completion_mask"), batch.get("loss_mask"), batch.get("assistant_masks"))
     loss, metrics = speculative_draft_loss(
         draft_logits,
         target_logits,
         labels=batch.get("labels"),
         input_ids=batch.get("input_ids"),
         attention_mask=batch.get("attention_mask"),
-        loss_mask=batch.get("completion_mask"),
+        loss_mask=draft_loss_mask,
         temperature=temperature,
         alpha=alpha,
         num_draft_tokens=num_draft_tokens,
         draft_target_offset=draft_target_offset,
         step_loss_decay=getattr(module_config, "step_loss_decay", None),
+        segment_ids=batch.get("segment_ids"),
+        mask_info=batch.get("mask_info"),
     )
     aux_loss = getattr(drafter_outputs, "aux_loss", None)
     if aux_loss is not None:
@@ -1207,6 +1297,49 @@ def _speculative_loss_for_module(
         other_metrics["aux_loss"] = aux_loss
         metrics = metrics.replace(loss=loss, other_metrics=other_metrics)
     return loss, metrics
+
+
+def _speculative_token_mass(
+    batch: collections.abc.Mapping[str, tp.Any],
+    *,
+    num_draft_tokens: int,
+    draft_target_offset: int,
+) -> jax.Array:
+    """Return total active token mass of a speculative minibatch for weighted GA."""
+    ids = _first_present(batch.get("input_ids"), batch.get("inputs_embeds"))
+    attention_mask = batch.get("attention_mask")
+    loss_mask = _first_present(batch.get("completion_mask"), batch.get("loss_mask"), batch.get("assistant_masks"))
+    labels = batch.get("labels")
+    seq_ref = _first_present(ids, labels, loss_mask, attention_mask)
+    if seq_ref is None:
+        return jnp.asarray(1.0, dtype=jnp.float32)
+    batch_size, seq_len = int(seq_ref.shape[0]), int(seq_ref.shape[1])
+    resolved_segments = _resolve_segment_ids(batch.get("segment_ids"), batch.get("mask_info"), seq_len)
+    total = jnp.asarray(0.0, dtype=jnp.float32)
+    steps = max(int(num_draft_tokens), 1)
+    base_offset = max(int(draft_target_offset), 0)
+    for step in range(steps):
+        target_offset = base_offset + step
+        max_tokens = seq_len - target_offset - 1
+        if max_tokens <= 0:
+            break
+        weights = jnp.ones((batch_size, max_tokens), dtype=jnp.float32)
+        mask_slice = slice(target_offset + 1, target_offset + 1 + max_tokens)
+        if attention_mask is not None:
+            weights = weights * attention_mask[:, mask_slice].astype(jnp.float32)
+        if loss_mask is not None:
+            weights = weights * loss_mask[:, mask_slice].astype(jnp.float32)
+        hard_labels = labels if labels is not None else ids
+        if hard_labels is not None:
+            weights = weights * (hard_labels[:, mask_slice] != -100).astype(jnp.float32)
+        if resolved_segments is not None:
+            src_seg = resolved_segments[:, :max_tokens]
+            same_seg = src_seg >= 0
+            for offset_k in range(1, target_offset + 2):
+                same_seg = same_seg & (src_seg == resolved_segments[:, offset_k : offset_k + max_tokens])
+            weights = weights * same_seg.astype(jnp.float32)
+        total = total + jnp.sum(weights)
+    return total
 
 
 def speculative_decoding_step(
@@ -1275,6 +1408,21 @@ def speculative_decoding_step(
     batch = constrain_batch_sharding(batch, partition_spec, mesh=drafter_state.model.mesh, ignore_mpmd=True)
     batch = dict(batch)
 
+    drafter_cfg = getattr(drafter_state.model, "config", None)
+    effective_num_draft_tokens = (
+        int(drafter_cfg.ttt_length)
+        if int(num_draft_tokens) == 1 and getattr(drafter_cfg, "ttt_length", None) is not None
+        else int(num_draft_tokens)
+    )
+    use_weighted_ga = is_training and gradient_accumulation_steps > 1
+
+    def _microbatch_weight(_tree, minibatch) -> jax.Array:
+        return _speculative_token_mass(
+            minibatch,
+            num_draft_tokens=effective_num_draft_tokens,
+            draft_target_offset=draft_target_offset,
+        )
+
     def loss_fn(tree, minibatch):
         """Compute loss for a single minibatch.
 
@@ -1308,7 +1456,7 @@ def speculative_decoding_step(
             target_layer_ids=target_layer_ids,
             target_num_hidden_layers=target_num_hidden_layers,
         )
-        return _speculative_loss_for_module(
+        loss, metrics = _speculative_loss_for_module(
             module,
             minibatch,
             target_bundle,
@@ -1322,6 +1470,18 @@ def speculative_decoding_step(
             draft_target_offset=draft_target_offset,
             pass_target_outputs=pass_target_outputs,
         )
+        if use_weighted_ga and metrics.other_metrics:
+            # Divide pooled numerator/denominator pairs by this microbatch's weight so
+            # minibatch_call's weighted combination `(w_i / W) * (pair_i / w_i)` cancels `w_i`
+            # and `_finalize_pooled_metrics` recovers the exact pooled ratio `(sum num) / (sum den)`.
+            mb_w = _microbatch_weight(tree, minibatch)
+            safe_w = jnp.where(mb_w > 0.0, mb_w, jnp.asarray(1.0, dtype=jnp.float32))
+            other = dict(metrics.other_metrics)
+            for key in list(other.keys()):
+                if key.startswith(_POOLED_NUM_PREFIX) or key.startswith(_POOLED_DEN_PREFIX):
+                    other[key] = other[key] / safe_w
+            metrics = metrics.replace(other_metrics=other)
+        return loss, metrics
 
     if is_training:
         gradients, metrics = minibatch_call(
@@ -1329,6 +1489,7 @@ def speculative_decoding_step(
             batch=batch,
             minibatch_size=minibatch_size,
             grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            microbatch_weight_fn=_microbatch_weight if use_weighted_ga else None,
         )
         metrics = _finalize_pooled_metrics(metrics)
         drafter_state = update_state_respectfully(
@@ -1389,6 +1550,25 @@ def _speculative_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     )
 
 
+def _make_speculative_microbatch_weight(call):
+    """Build the per-microbatch token-weight callable for scheduled MPMD."""
+    num_draft_tokens = int(call.get("num_draft_tokens", 1))
+    draft_target_offset = int(call.get("draft_target_offset", 0))
+    drafter_cfg = getattr(getattr(call, "state", None), "model", None)
+    drafter_cfg = getattr(drafter_cfg, "config", None)
+    if num_draft_tokens == 1 and getattr(drafter_cfg, "ttt_length", None) is not None:
+        num_draft_tokens = int(drafter_cfg.ttt_length)
+
+    def _weight(_tree, batch):
+        return _speculative_token_mass(
+            batch,
+            num_draft_tokens=num_draft_tokens,
+            draft_target_offset=draft_target_offset,
+        )
+
+    return _weight
+
+
 def _make_speculative_scheduled_loss(call):
     """Build the scalar loss closure used by SpectraX MPMD scheduling.
 
@@ -1417,6 +1597,8 @@ def _make_speculative_scheduled_loss(call):
     target_output_hidden_states = bool(call.get("target_output_hidden_states", False))
     pass_target_outputs = bool(call.get("pass_target_outputs", False))
     target_state = call.get("target_state")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute scalar speculative loss for a scheduled training step.
@@ -1433,10 +1615,12 @@ def _make_speculative_scheduled_loss(call):
         """
         if target_state is None:
             raise RuntimeError("Speculative-decoding scheduled MPMD training requires target_state.")
-        module = bind_scheduled_module(call, tree)
-        call_batch = constrain_scheduled_batch(module, batch, partition_spec)
-        target_module = target_state.merge(target_state.graphstate)
-        sync_module_schedule_config(target_module, call.schedule)
+        module = bind_module(tree)
+        call_batch = dict(
+            constrain_batch_sharding(batch, partition_spec, mesh=getattr(module, "mesh", None), ignore_mpmd=True)
+        )
+        target_module = target_state.merge(jax.lax.stop_gradient(target_state.graphstate))
+        sync_module_schedule_config(target_module, schedule)
         loss_mask = _loss_mask_from_batch(call_batch)
         use_native_block_loss = loss_mask is not None and _module_accepts_block_loss_kwargs(
             module, drafter_forward_method
@@ -1483,5 +1667,6 @@ register_scheduled_loss_adapter(
         make_loss=_make_speculative_scheduled_loss,
         make_cache_key=_speculative_scheduled_loss_cache_key,
         prepare_batch=_prepare_speculative_scheduled_batch,
+        make_microbatch_weight=_make_speculative_microbatch_weight,
     ),
 )

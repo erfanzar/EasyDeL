@@ -795,8 +795,14 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
         activation_bits=16,
         preferred_element_type=jnp.bfloat16,
         tiling=None,
+        mask_padding=True,
+        lhs_scale=None,
+        packed_pair_width=None,
         cfg: GroupedMatmulConfig,
     ):
+        extra = {} if lhs_scale is None else {"lhs_scale": lhs_scale}
+        if packed_pair_width is not None:
+            extra["packed_pair_width"] = int(packed_pair_width)
         return self.get_impl(cfg)(
             lhs,
             codes,
@@ -805,6 +811,8 @@ class GroupedMatmulChannelwise(Kernel[GroupedMatmulConfig, Array]):
             activation_bits=activation_bits,
             preferred_element_type=preferred_element_type,
             tiling=tiling,
+            mask_padding=mask_padding,
+            **extra,
         )
 
 
@@ -823,8 +831,21 @@ def grouped_matmul_channelwise(
     preferred_element_type: DTypeLike = jnp.bfloat16,
     tiling: tuple[int, int, int] | None = None,
     platform: Literal["xla", "pallas"] = "xla",
+    mask_padding: bool = True,
+    lhs_scale: Array | None = None,
+    packed_pair_width: int | None = None,
 ) -> Array:
     """Explicit W4A16/W8A16/W4A4/W8A8 CHANNELWISE grouped matmul.
+
+    ``packed_pair_width=W`` (forward only, bfloat16 output) returns the output's
+    bits as int32 ``[M * N / 256, 128]`` in the ``moe_row_gather_sum_packed``
+    layout; with ``W`` from :func:`grouped_matmul_channelwise_packed_pair_width`
+    the TPU Pallas A8 slab kernel writes it from its epilogue.
+
+    With ``lhs_scale[M,1]`` (A8, forward only) ``lhs`` holds the int8 codes of
+    :func:`grouped_matmul_channelwise_quantize_rows`, e.g. token rows quantized
+    once before a dispatch gather; the result equals the float-``lhs`` call's
+    bit for bit.
 
     Codes are signed int4/int8 [E,K,N], scales floating [E,1,N], lhs [M,K].
     Group sizes [E] must be nonnegative and sum to at most M. Empty groups
@@ -840,7 +861,16 @@ def grouped_matmul_channelwise(
     RHS INT4 storage remains packed in HBM. Scales apply after the dot.
     Tiling is (M,K,N): an XLA hint or explicit Pallas tiles. A16 uses full K
     on measured decode matrix families; A4/A8 choose M=32 and full K subject
-    to the RHS buffer budget. Explicit tiles override these heuristics.
+    to the RHS buffer budget, and A8 with int8 codes streams one whole
+    128-aligned (K, N) expert slab that fits 2 MiB, with both scales applied
+    in the kernel, at up to 81,920 rows for any expert count, with a row tile
+    chosen from the rows per expert (:func:`grouped_matmul_channelwise_slab_tiles`).
+    Explicit tiles override these heuristics.
+    ``mask_padding=False`` lets the rows past ``sum(group_sizes)`` be
+    unspecified (possibly non-finite; forward use only, for consumers that
+    never read them): the Pallas A8 slab path then writes its output dtype
+    from the kernel and skips the tail mask and cast pass. Routed rows are
+    unchanged.
     Pallas AD uses the XLA reference for activation/scale derivatives and
     may materialize floating weights: no backward memory saving is promised.
     There is no automatic mode or platform selection.
@@ -868,8 +898,116 @@ def grouped_matmul_channelwise(
         activation_bits=activation_bits,
         preferred_element_type=preferred_element_type,
         tiling=tiling,
+        mask_padding=bool(mask_padding),
         _cfg=cfg,
+        **({} if lhs_scale is None else {"lhs_scale": lhs_scale}),
+        **({} if packed_pair_width is None else {"packed_pair_width": int(packed_pair_width)}),
     )
+
+
+def grouped_matmul_channelwise_packed_pair_width(
+    rows: int,
+    codes_shape: tuple[int, int, int],
+    codes_dtype: DTypeLike,
+    *,
+    activation_bits: int,
+) -> int | None:
+    """Pair width at which the TPU Pallas A8 slab path writes ``packed_pair_width`` output itself, or ``None``.
+
+    The per-TensorCore output-column tile of the whole-slab kernel (:func:`grouped_matmul_channelwise_slab_tiles`).
+    """
+    import importlib
+
+    impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
+    e, k, n = (int(d) for d in codes_shape)
+    return impl.packed_pair_width_for(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
+
+
+def grouped_matmul_channelwise_quantize_rows(x: Array, activation_bits: int = 8) -> tuple[Array, Array]:
+    """Row quantization of :func:`grouped_matmul_channelwise`'s A8 path, for rows quantized before a gather.
+
+    Per row: an absmax (a max, so any reduction order gives the same value), then elementwise divide, round to
+    nearest even and clip. Gathering rows of the result therefore equals quantizing the gathered rows bit for bit.
+
+    Args:
+        x: Floating rows ``[M, K]``.
+        activation_bits: Activation bits; only ``8`` is supported.
+
+    Returns:
+        ``(codes int8 [M, K], scale float32 [M, 1])`` for ``grouped_matmul_channelwise(..., lhs_scale=scale)``.
+
+    Raises:
+        ValueError: ``activation_bits`` is not 8 or ``x`` is not a floating ``[M, K]`` array.
+    """
+    from ejkernel.kernels._xla.quantized_matmul._integer_quantization import quantize_rows
+
+    if activation_bits != 8 or x.ndim != 2 or not jnp.issubdtype(x.dtype, jnp.floating):
+        raise ValueError("expected floating rows [M, K] and activation_bits=8")
+    # The barrier keeps ``x`` rounded to its own dtype. Without it XLA may fold an upstream f32 -> bf16 cast into the
+    # quantization's bf16 -> f32 cast (excess precision), which never happens to the materialized rows the entry reads.
+    codes, scale = quantize_rows(jax.lax.optimization_barrier(x), activation_bits)
+    return codes.astype(jnp.int8), scale.astype(jnp.float32)
+
+
+def grouped_matmul_channelwise_slab_tiles(
+    rows: int,
+    codes_shape: tuple[int, int, int],
+    codes_dtype: DTypeLike,
+    *,
+    activation_bits: int,
+) -> tuple[int, int, int] | None:
+    """The whole-slab ``(tile_m, K, N)`` tiles of :func:`grouped_matmul_channelwise`'s TPU Pallas entry, or ``None``.
+
+    The rule ``platform='pallas'`` applies when ``tiling`` is not given: A8 activations with int8 or int4 codes whose
+    128-aligned ``(K, N)`` expert slab fits one 2 MiB RHS buffer at the codes' bit width, at up to 81,920 rows, for any
+    expert count; the row tile follows the rows per expert. Pure shape policy: it queries no device.
+
+    Args:
+        rows: Rows of ``lhs`` (``M``).
+        codes_shape: ``(E, K, N)`` of the expert codes.
+        codes_dtype: Dtype of the codes.
+        activation_bits: Activation precision of the call (4, 8 or 16).
+
+    Returns:
+        ``(tile_m, K, N)`` when the entry streams one whole slab per expert, else ``None`` (it streams partial slabs).
+    """
+    import importlib
+
+    impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
+    e, k, n = (int(d) for d in codes_shape)
+    return impl._a8_slab_tiles(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
+
+
+def grouped_matmul_channelwise_pallas_tiles(
+    rows: int,
+    codes_shape: tuple[int, int, int],
+    codes_dtype: DTypeLike,
+    *,
+    activation_bits: int,
+) -> tuple[int, int, int] | None:
+    """Tiles of the measured-fast TPU Pallas path of :func:`grouped_matmul_channelwise` for a call, or ``None``.
+
+    One rule per activation width, from the weight shape, the codes' bit width (``jax.dtypes.itemsize_bits``),
+    128-alignment, the 2 MiB RHS buffer and row bounds only, for any expert count: A8 (int8 or int4 codes) the
+    whole-slab tiles of :func:`grouped_matmul_channelwise_slab_tiles`; A16 full-K tiles with the widest 128-multiple
+    ``N`` tile that divides ``N`` and fits the buffer, at up to 12,288 rows; A4 (int4 codes) the streaming tiles at up
+    to 128 and at 1,280 ... 81,920 rows. A caller that chooses the platform per call asks this, so its selection and the
+    kernel's tiles follow one rule. Pure shape policy: it queries no device.
+
+    Args:
+        rows: Rows of ``lhs`` (``M``).
+        codes_shape: ``(E, K, N)`` of the expert codes.
+        codes_dtype: Dtype of the codes.
+        activation_bits: Activation precision of the call (4, 8 or 16).
+
+    Returns:
+        ``(tile_m, tile_k, tile_n)`` when the Pallas entry has a measured-fast path for the call, else ``None``.
+    """
+    import importlib
+
+    impl = importlib.import_module("ejkernel.kernels._pallas.tpu.grouped_matmul_channelwise._interface")
+    e, k, n = (int(d) for d in codes_shape)
+    return impl._pallas_path_tiles(int(rows), int(activation_bits), e, k, n, jnp.dtype(codes_dtype))
 
 
 def grouped_matmul_w8a8(

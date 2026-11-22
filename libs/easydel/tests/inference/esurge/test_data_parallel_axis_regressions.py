@@ -14,13 +14,16 @@
 
 from types import SimpleNamespace
 
+import pytest
 from easydel.axis import (
     register_attention_data_parallel_axis,
     reset_attention_data_parallel_axis,
     resolve_attention_data_parallel_axis,
 )
-from easydel.inference.esurge.esurge_engine import eSurge
+from easydel.inference.esurge.esurge_engine import _resolve_cache_attention_axis, eSurge
 from spectrax import PartitionAxis, PartitionManager
+
+pytestmark = pytest.mark.cpu_ok
 
 
 def test_attention_data_parallel_axis_resolves_independently_from_model_dp():
@@ -31,6 +34,14 @@ def test_attention_data_parallel_axis_resolves_independently_from_model_dp():
         assert resolve_attention_data_parallel_axis(pm) == "ep"
     finally:
         reset_attention_data_parallel_axis()
+
+
+@pytest.mark.cpu_ok
+def test_cache_attention_axis_can_differ_from_request_dp():
+    cfg = SimpleNamespace(data_parallelism_axis="dp", attention_data_parallel_axis="tp")
+    assert _resolve_cache_attention_axis(cfg) == "tp"
+    cfg.attention_data_parallel_axis = None
+    assert _resolve_cache_attention_axis(cfg) == "dp"
 
 
 def test_esurge_does_not_mutate_model_partition_axis():

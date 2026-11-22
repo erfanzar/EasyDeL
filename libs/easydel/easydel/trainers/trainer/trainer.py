@@ -33,6 +33,7 @@ and multimodal architectures.
 
 import collections.abc
 import json as _json
+import logging
 import time as _time
 import typing as tp
 import uuid
@@ -55,6 +56,46 @@ from ..training_utils import compile_trainer_step, resolve_straight_through_emul
 from ._fn import evaluation_step, training_step
 
 logger = get_logger(__name__)
+
+_CAUSAL_LM_SEQUENCE_KEYS = frozenset(
+    {
+        "input_ids",
+        "attention_mask",
+        "labels",
+        "position_ids",
+        "token_type_ids",
+        "segment_ids",
+        "completion_mask",
+        "assistant_masks",
+        "loss_mask",
+        "decoder_input_ids",
+        "decoder_attention_mask",
+        "decoder_labels",
+    }
+)
+_CAUSAL_LM_SEQUENCE_SUFFIXES = (
+    "_input_ids",
+    "_attention_mask",
+    "_labels",
+    "_position_ids",
+    "_token_type_ids",
+    "_segment_ids",
+    "_completion_mask",
+    "_loss_mask",
+)
+
+
+def _is_causal_lm_sequence_key(key: str) -> bool:
+    """Return True for token/sequence fields eligible for causal-LM sequence truncation."""
+    if key == "pixel_attention_mask":
+        return False
+    return key in _CAUSAL_LM_SEQUENCE_KEYS or key.endswith(_CAUSAL_LM_SEQUENCE_SUFFIXES)
+
+
+def _runtime_trace_enabled() -> bool:
+    """Return whether DEBUG-level runtime breadcrumbs are enabled without evaluating args."""
+    is_enabled = getattr(logger, "isEnabledFor", None)
+    return bool(is_enabled(logging.DEBUG)) if callable(is_enabled) else False
 
 
 @Registry.register("trainer", "base")
@@ -194,8 +235,10 @@ class Trainer(BaseTrainer):
                     data_sample = jax.numpy.array(data_sample)
                 except TypeError:
                     continue
-                if self.model.lossfn_type == "ForCausalLM":
-                    if truncation_mode == "keep_end":
+                if self.model.lossfn_type == "ForCausalLM" and _is_causal_lm_sequence_key(key) and data_sample.ndim >= 1:
+                    if max_sequence_length <= 0:
+                        corrected_sequence = [jax.numpy.array(f[key])[..., :0] for f in batch]
+                    elif truncation_mode == "keep_end":
                         corrected_sequence = [jax.numpy.array(f[key])[..., -max_sequence_length:] for f in batch]
                     else:
                         corrected_sequence = [jax.numpy.array(f[key])[..., :max_sequence_length] for f in batch]
@@ -416,32 +459,37 @@ class Trainer(BaseTrainer):
 
         initial_step = int(jax.device_get(state.step))
         start_epoch = 0
-        train_iter = iter(self.dataloader_train)
-        self._runtime_trace("training_loop.iterator.created", initial_step=initial_step)
+        self.model_state = state
+        # Release the frame-local reference so Step-0 state buffers are not pinned
+        # across the entire first epoch while self.model_state advances per step.
+        state = None
+        train_iter = None
+        try:
+            train_iter = iter(self.dataloader_train)
+            self._runtime_trace("training_loop.iterator.created", initial_step=initial_step)
 
-        if initial_step > 0:
-            if self.max_training_steps is None:
-                raise RuntimeError("max_training_steps must be set before training")
-            pbar.update(min(initial_step, self.max_training_steps))
-            start_epoch = self._get_resume_epoch(initial_step)
-            if initial_step < self.max_training_steps:
-                if getattr(self.arguments, "dataloader_fast_forward_on_resume", True):
-                    logger.info(
-                        f"Resuming training from step {initial_step}; fast-forwarding dataloader by "
-                        f"{initial_step} batches."
-                    )
-                    train_iter = self._fast_forward_batches(train_iter, self.dataloader_train, initial_step)
+            if initial_step > 0:
+                if self.max_training_steps is None:
+                    raise RuntimeError("max_training_steps must be set before training")
+                pbar.update(min(initial_step, self.max_training_steps))
+                start_epoch = self._get_resume_epoch(initial_step)
+                if initial_step < self.max_training_steps:
+                    if getattr(self.arguments, "dataloader_fast_forward_on_resume", True):
+                        logger.info(
+                            f"Resuming training from step {initial_step}; fast-forwarding dataloader by "
+                            f"{initial_step} batches."
+                        )
+                        train_iter = self._fast_forward_batches(train_iter, self.dataloader_train, initial_step)
+                    else:
+                        logger.info(
+                            f"Resuming training from step {initial_step} WITHOUT dataloader fast-forward "
+                            "(dataloader_fast_forward_on_resume=False); the train stream restarts from batch 0."
+                        )
                 else:
                     logger.info(
-                        f"Resuming training from step {initial_step} WITHOUT dataloader fast-forward "
-                        "(dataloader_fast_forward_on_resume=False); the train stream restarts from batch 0."
+                        f"Resumed state is already at step {initial_step}, which is at or beyond "
+                        f"max_training_steps={self.max_training_steps}."
                     )
-            else:
-                logger.info(
-                    f"Resumed state is already at step {initial_step}, which is at or beyond "
-                    f"max_training_steps={self.max_training_steps}."
-                )
-        try:
             run_exception = None
             self._runtime_trace("training_loop.mesh.enter")
             with self.mesh:
@@ -456,8 +504,8 @@ class Trainer(BaseTrainer):
                         epoch_start_step=epoch_start_step,
                         epoch_end_step=epoch_end_step,
                     )
-                    state, run_exception, train_iter = self._train_epoch(
-                        state=state,
+                    next_state, run_exception, train_iter = self._train_epoch(
+                        state=self.model_state,
                         train_dataset=self.dataloader_train,
                         train_iter=train_iter,
                         metrics_tracker=metrics_tracker,
@@ -467,8 +515,10 @@ class Trainer(BaseTrainer):
                         epoch_start_step=epoch_start_step,
                         epoch_end_step=epoch_end_step,
                     )
+                    self.model_state = next_state
+                    del next_state
 
-                    current_step = int(jax.device_get(state.step))
+                    current_step = int(jax.device_get(self.model_state.step))
                     self._runtime_trace(
                         "training_loop.epoch.end",
                         epoch=epoch,
@@ -481,10 +531,10 @@ class Trainer(BaseTrainer):
                         break
             self._runtime_trace(
                 "training_loop.end",
-                final_step=int(jax.device_get(state.step)),
+                final_step=int(jax.device_get(self.model_state.step)),
                 run_exception=type(run_exception).__name__ if run_exception is not None else None,
             )
-            return self._prepare_training_output(state=state, run_exception=run_exception), run_exception
+            return self._prepare_training_output(state=self.model_state, run_exception=run_exception), run_exception
         except BaseException as exc:
             self._runtime_trace("training_loop.exception", exc_type=type(exc).__name__, exc=str(exc))
             raise
@@ -492,6 +542,7 @@ class Trainer(BaseTrainer):
             # Stop the JAX profiler trace (if one was started after step 1).
             # Guarded internally so this is a no-op when profiling was disabled.
             self._stop_profiler()
+            BaseTrainer._close_iterator(train_iter)
             pbar.close()
 
     def _run_evaluation(
@@ -524,9 +575,12 @@ class Trainer(BaseTrainer):
             desc="evaluation process",
         )
 
-        eval_iter = iter(self.dataloader_eval)
+        eval_iter = None
+        eval_iter_handed_off = False
         try:
+            eval_iter = iter(self.dataloader_eval)
             with self.mesh:
+                eval_iter_handed_off = True
                 yield from self._eval_epoch(
                     state=state,
                     eval_dataset=self.dataloader_eval,
@@ -536,6 +590,8 @@ class Trainer(BaseTrainer):
                     pbar=pbar,
                 )
         finally:
+            if not eval_iter_handed_off:
+                BaseTrainer._close_iterator(eval_iter)
             pbar.close()
 
     def _train_epoch(
@@ -640,312 +696,381 @@ class Trainer(BaseTrainer):
             bucket_prefetchers.clear()
             return train_iter
 
-        if bool(getattr(self.arguments, "dataloader_prefetch", False)):
-            if self._has_buckets:
-                # One prefetcher per bucket keeps the per-step loader/collator
-                # swap exact while still overlapping host-side fetch+collate
-                # with device work: each step consumes its own bucket's pending
-                # batch and warms the rule's next bucket (see the fetch path).
-                for i in sorted(self._bucket_loaders):
-                    bucket_prefetchers[i] = TrainBatchPrefetcher(
+        trace_enabled = _runtime_trace_enabled()
+        max_consecutive_skips_cfg = getattr(self.arguments, "max_consecutive_skipped_steps", None)
+        max_consecutive_skips = (
+            max(int(max_consecutive_skips_cfg), 1)
+            if max_consecutive_skips_cfg is not None
+            else max(min(int(self.max_training_steps), 100), 10)
+        )
+        consecutive_skipped_steps = 0
+        current_step = int(jax.device_get(state.step))
+        initial_train_iter = train_iter
+
+        try:
+            if bool(getattr(self.arguments, "dataloader_prefetch", False)):
+                if self._has_buckets:
+                    # One prefetcher per bucket keeps the per-step loader/collator
+                    # swap exact while still overlapping host-side fetch+collate
+                    # with device work: each step consumes its own bucket's pending
+                    # batch and warms the rule's next bucket (see the fetch path).
+                    for i in sorted(self._bucket_loaders):
+                        bucket_prefetchers[i] = TrainBatchPrefetcher(
+                            fetch_fn=self._get_next_batch,
+                            data_iter=self._bucket_iters[i],
+                            dataloader=self._bucket_loaders[i],
+                            data_collator=self._bucket_collators[i],
+                            worker_count=prefetch_workers,
+                            buffer_size=prefetch_buffer,
+                        )
+                    self._runtime_trace(
+                        "train_epoch.prefetch.buckets_enabled", epoch=epoch, num_buckets=len(bucket_prefetchers)
+                    )
+                else:
+                    prefetcher = TrainBatchPrefetcher(
                         fetch_fn=self._get_next_batch,
-                        data_iter=self._bucket_iters[i],
-                        dataloader=self._bucket_loaders[i],
-                        data_collator=self._bucket_collators[i],
+                        data_iter=train_iter,
+                        dataloader=train_dataset,
+                        data_collator=data_collator,
                         worker_count=prefetch_workers,
                         buffer_size=prefetch_buffer,
                     )
-                self._runtime_trace(
-                    "train_epoch.prefetch.buckets_enabled", epoch=epoch, num_buckets=len(bucket_prefetchers)
-                )
-            else:
-                prefetcher = TrainBatchPrefetcher(
-                    fetch_fn=self._get_next_batch,
-                    data_iter=train_iter,
-                    dataloader=train_dataset,
-                    data_collator=data_collator,
-                    worker_count=prefetch_workers,
-                    buffer_size=prefetch_buffer,
-                )
-                self._runtime_trace(
-                    "train_epoch.prefetch.enabled",
-                    epoch=epoch,
-                    worker_count=prefetch_workers,
-                    buffer_size=prefetch_buffer if prefetch_buffer is not None else prefetch_workers,
-                )
-
-        while True:
-            with capture_time() as iteration_time:
-                current_step = int(jax.device_get(state.step))
-                if current_step >= self.max_training_steps or current_step >= epoch_end_step:
                     self._runtime_trace(
-                        "train_epoch.break",
+                        "train_epoch.prefetch.enabled",
                         epoch=epoch,
-                        current_step=current_step,
-                        max_training_steps=self.max_training_steps,
-                        epoch_end_step=epoch_end_step,
+                        worker_count=prefetch_workers,
+                        buffer_size=prefetch_buffer if prefetch_buffer is not None else prefetch_workers,
                     )
-                    break
-                # Per-step bucket selection: pick the active bucket's dataloader
-                # and compiled fn for this step. `self._bucket_for_step` is read
-                # by `_execute_train_step` to choose the graphdef + fn. With
-                # prefetch enabled, each bucket owns its own prefetcher so the
-                # per-step loader/collator swap stays exact.
-                step_prefetcher = prefetcher
-                if self._has_buckets:
-                    bi = self._bucket_rule.select(current_step)
-                    self._bucket_for_step = bi
-                    train_dataset = self._bucket_loaders[bi]
-                    train_iter = self._bucket_iters[bi]
-                    # Use the bucket's own collator (applies its max_length).
-                    data_collator = self._bucket_collators[bi]
-                    step_prefetcher = bucket_prefetchers.get(bi)
-                try:
-                    self._runtime_trace("train_step.batch_fetch.begin", epoch=epoch, current_step=current_step)
-                    prefetch_wait_time: float | None = None
-                    prefetch_producer_time: float | None = None
-                    with capture_time() as data_collection_time:
-                        if step_prefetcher is None:
-                            batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                            self._runtime_trace(
-                                "train_step.batch_fetch.end",
-                                epoch=epoch,
-                                current_step=current_step,
-                                batch=self._runtime_batch_summary(batch),
-                                prefetch=False,
-                            )
-                            self._runtime_trace("train_step.collate.begin", epoch=epoch, current_step=current_step)
-                            batch = data_collator(batch)
-                        else:
-                            schedule_next = (
-                                current_step + 1 < self.max_training_steps and current_step + 1 < epoch_end_step
-                            )
-                            if bucket_prefetchers:
-                                # Consume this bucket's pending batch, then warm
-                                # the bucket the rule selects for the NEXT step
-                                # (which may be a different bucket than this one).
-                                batch, prefetch_wait_time, prefetch_producer_time = step_prefetcher.next(
-                                    schedule_next=False
-                                )
-                                if schedule_next:
-                                    next_bucket = self._bucket_rule.select(current_step + 1)
-                                    bucket_prefetchers[next_bucket].ensure_scheduled()
-                            else:
-                                batch, prefetch_wait_time, prefetch_producer_time = step_prefetcher.next(
-                                    schedule_next=schedule_next
-                                )
-                            train_iter = step_prefetcher.data_iter
-                            self._runtime_trace(
-                                "train_step.batch_fetch.end",
-                                epoch=epoch,
-                                current_step=current_step,
-                                batch=self._runtime_batch_summary(batch),
-                                prefetch=True,
-                                prefetch_wait_time=prefetch_wait_time,
-                                prefetch_producer_time=prefetch_producer_time,
-                                prefetch_next_scheduled=schedule_next,
-                            )
+
+            while True:
+                with capture_time() as iteration_time:
+                    if current_step >= self.max_training_steps or current_step >= epoch_end_step:
                         self._runtime_trace(
-                            "train_step.collate.end",
+                            "train_epoch.break",
                             epoch=epoch,
                             current_step=current_step,
-                            batch=self._runtime_batch_summary(batch),
-                            prefetch=step_prefetcher is not None,
+                            max_training_steps=self.max_training_steps,
+                            epoch_end_step=epoch_end_step,
                         )
-                        # PoSE (text-only): host-side position_ids skip, once per microbatch
-                        # before the forward (no-op unless arguments.pose.enabled).
-                        batch = self._apply_pose_to_batch(batch, current_step)
-                        batch = self._apply_randomized_yarn_to_batch(batch, current_step)
-                        # Vision encoder: run the tower out of band on the vision-bearing
-                        # rows and swap in precomputed features, once per microbatch before
-                        # the forward (no-op unless arguments.process_encoder.enabled).
-                        batch = self._apply_process_encoder_to_batch(batch, current_step)
-                    # Persist the (possibly re-created on exhaustion) bucket iterator.
+                        break
+                    prev_step = current_step
+                    # Per-step bucket selection: pick the active bucket's dataloader
+                    # and compiled fn for this step. `self._bucket_for_step` is read
+                    # by `_execute_train_step` to choose the graphdef + fn. With
+                    # prefetch enabled, each bucket owns its own prefetcher so the
+                    # per-step loader/collator swap stays exact.
+                    step_prefetcher = prefetcher
                     if self._has_buckets:
-                        self._bucket_iters[self._bucket_for_step] = train_iter
-                    step_metrics.start_step()
-                    self._runtime_trace("train_step.on_step_start.begin", epoch=epoch, current_step=current_step)
-                    state = self.on_step_start(state=state, step=current_step)
-                    self._runtime_trace("train_step.on_step_start.end", epoch=epoch, current_step=current_step)
-                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
-                    self._runtime_trace(
-                        "train_step.setup.interrupt",
-                        epoch=epoch,
-                        current_step=current_step,
-                        exc_type=type(exc).__name__,
-                        exc=str(exc),
-                    )
-                    return state, exc, close_prefetcher()
+                        bi = self._bucket_rule.select(current_step)
+                        self._bucket_for_step = bi
+                        train_dataset = self._bucket_loaders[bi]
+                        train_iter = self._bucket_iters[bi]
+                        # Use the bucket's own collator (applies its max_length).
+                        data_collator = self._bucket_collators[bi]
+                        step_prefetcher = bucket_prefetchers.get(bi)
+                    try:
+                        self._runtime_trace("train_step.batch_fetch.begin", epoch=epoch, current_step=current_step)
+                        prefetch_wait_time: float | None = None
+                        prefetch_producer_time: float | None = None
+                        with capture_time() as data_collection_time:
+                            if step_prefetcher is None:
+                                batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                                if trace_enabled:
+                                    self._runtime_trace(
+                                        "train_step.batch_fetch.end",
+                                        epoch=epoch,
+                                        current_step=current_step,
+                                        batch=self._runtime_batch_summary(batch),
+                                        prefetch=False,
+                                    )
+                                self._runtime_trace("train_step.collate.begin", epoch=epoch, current_step=current_step)
+                                batch = data_collator(batch)
+                            else:
+                                schedule_next = (
+                                    current_step + 1 < self.max_training_steps and current_step + 1 < epoch_end_step
+                                )
+                                if bucket_prefetchers:
+                                    # Consume this bucket's pending batch, then warm
+                                    # the bucket the rule selects for the NEXT step
+                                    # (which may be a different bucket than this one).
+                                    batch, prefetch_wait_time, prefetch_producer_time = step_prefetcher.next(
+                                        schedule_next=False
+                                    )
+                                    if schedule_next:
+                                        next_bucket = self._bucket_rule.select(current_step + 1)
+                                        bucket_prefetchers[next_bucket].ensure_scheduled()
+                                else:
+                                    batch, prefetch_wait_time, prefetch_producer_time = step_prefetcher.next(
+                                        schedule_next=schedule_next
+                                    )
+                                train_iter = step_prefetcher.data_iter
+                                if trace_enabled:
+                                    self._runtime_trace(
+                                        "train_step.batch_fetch.end",
+                                        epoch=epoch,
+                                        current_step=current_step,
+                                        batch=self._runtime_batch_summary(batch),
+                                        prefetch=True,
+                                        prefetch_wait_time=prefetch_wait_time,
+                                        prefetch_producer_time=prefetch_producer_time,
+                                        prefetch_next_scheduled=schedule_next,
+                                    )
+                            if trace_enabled:
+                                self._runtime_trace(
+                                    "train_step.collate.end",
+                                    epoch=epoch,
+                                    current_step=current_step,
+                                    batch=self._runtime_batch_summary(batch),
+                                    prefetch=step_prefetcher is not None,
+                                )
+                            # PoSE (text-only): host-side position_ids skip, once per microbatch
+                            # before the forward (no-op unless arguments.pose.enabled).
+                            batch = self._apply_pose_to_batch(batch, current_step)
+                            batch = self._apply_randomized_yarn_to_batch(batch, current_step)
+                            # Vision encoder: run the tower out of band on the vision-bearing
+                            # rows and swap in precomputed features, once per microbatch before
+                            # the forward (no-op unless arguments.process_encoder.enabled).
+                            self.model_state = state
+                            try:
+                                batch = self._apply_process_encoder_to_batch(batch, current_step, state=state)
+                            except TypeError as exc:
+                                if "state" not in str(exc):
+                                    raise
+                                batch = self._apply_process_encoder_to_batch(batch, current_step)
+                        # Persist the (possibly re-created on exhaustion) bucket iterator.
+                        if self._has_buckets:
+                            self._bucket_iters[self._bucket_for_step] = train_iter
+                        step_metrics.start_step()
+                        self._runtime_trace("train_step.on_step_start.begin", epoch=epoch, current_step=current_step)
+                        state = self.on_step_start(state=state, step=current_step)
+                        self.model_state = state
+                        self._runtime_trace("train_step.on_step_start.end", epoch=epoch, current_step=current_step)
+                    except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
+                        self._runtime_trace(
+                            "train_step.setup.interrupt",
+                            epoch=epoch,
+                            current_step=current_step,
+                            exc_type=type(exc).__name__,
+                            exc=str(exc),
+                        )
+                        return state, exc, close_prefetcher()
 
-                self._runtime_trace("train_step.execute.begin", epoch=epoch, current_step=current_step)
-                if getattr(self.arguments, "profiler_include_compile", False):
-                    self._maybe_start_profiler(current_step)
-                with jax.profiler.StepTraceAnnotation("train", step_num=current_step + 1):
-                    with self.train_tracker.trace_compilation():
-                        with capture_time() as execution_time:
-                            state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
-                            metrics.execution_time = execution_time()
-                            current_step = int(jax.device_get(state.step))
-                self._runtime_trace(
-                    "train_step.execute.end",
-                    epoch=epoch,
-                    current_step=current_step,
-                    execution_time=float(execution_time()),
-                    run_exception=type(run_exception).__name__ if run_exception is not None else None,
-                )
-                if run_exception is not None:
+                    self._runtime_trace("train_step.execute.begin", epoch=epoch, current_step=current_step)
+                    if getattr(self.arguments, "profiler_include_compile", False):
+                        self._maybe_start_profiler(current_step)
+                    with jax.profiler.StepTraceAnnotation("train", step_num=current_step + 1):
+                        with self.train_tracker.trace_compilation():
+                            with capture_time() as execution_time:
+                                state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
+                                self.model_state = state
+                                metrics.execution_time = execution_time()
+                                new_step = int(jax.device_get(state.step))
+                    step_skipped = new_step == prev_step
+                    current_step = new_step
                     self._runtime_trace(
-                        "train_step.execute.run_exception",
+                        "train_step.execute.end",
                         epoch=epoch,
                         current_step=current_step,
-                        exc_type=type(run_exception).__name__,
-                        exc=str(run_exception),
+                        step_skipped=step_skipped,
+                        execution_time=float(execution_time()),
+                        run_exception=type(run_exception).__name__ if run_exception is not None else None,
                     )
-                    return state, run_exception, close_prefetcher()
-                # Start the JAX profiler once step 1 has fully completed.
-                # The first step's wall-time is dominated by JIT compile;
-                # skipping it gives a profile of steady-state training.
-                self._maybe_start_profiler(current_step)
-                self._maybe_stop_profiler(current_step)
-                try:
-                    self._runtime_trace("train_step.host_metrics.begin", epoch=epoch, current_step=current_step)
-                    loss_value = self._metric_scalar_to_float(metrics.loss)
-                    mean_loss, mean_accuracy = metrics_tracker.update(
-                        loss=loss_value,
-                        accuracy=metrics.accuracy,
-                        step=current_step,
-                    )
-                    metrics = self.apply_training_hooks(metrics=metrics, loss_value=loss_value)
-                    train_metrics = step_metrics.calculate(
-                        metrics=metrics,
-                        current_step=current_step,
-                        learning_rate=(
-                            self.scheduler(current_step) if self.scheduler is not None else self.arguments.learning_rate
-                        ),
-                        epoch=epoch,
-                        epoch_progress=min(max((current_step - epoch_start_step) / epoch_total_steps, 0.0), 1.0),
-                        flops_per_token=self._backward_flops_per_token,
-                        extra_flops_per_token=self._extra_backward_flops_per_token,
-                        batch_size=self.training_batch_size,
-                        seq_length=self.arguments.max_length,
-                        mean_loss=mean_loss,
-                        mean_accuracy=mean_accuracy,
-                        mode="train",
-                    )
-                    train_metrics["performance/data_collection_time"] = float(data_collection_time())
-                    if prefetch_wait_time is not None:
-                        train_metrics["performance/data_prefetch_wait_time"] = float(prefetch_wait_time)
-                    if prefetch_producer_time is not None:
-                        train_metrics["performance/data_prefetch_producer_time"] = float(prefetch_producer_time)
-                    if step_prefetcher is not None:
-                        if step_prefetcher.last_fetch_seconds is not None:
-                            train_metrics["performance/data_fetch_time"] = float(step_prefetcher.last_fetch_seconds)
-                        if step_prefetcher.last_collate_seconds is not None:
-                            train_metrics["performance/data_collate_time"] = float(step_prefetcher.last_collate_seconds)
-                    for attr, metric in (
-                        ("_last_step_preprocess_seconds", "performance/step_preprocess_time"),
-                        ("_last_step_put_dispatch_seconds", "performance/step_put_dispatch_time"),
-                        ("_last_step_device_sync_seconds", "performance/step_device_sync_time"),
-                    ):
-                        value = getattr(self, attr, None)
-                        if value is not None:
-                            train_metrics[metric] = float(value)
-                    train_step_time = train_metrics.get("performance/train_step_time")
-                    if train_step_time is not None:
-                        remaining_steps = max(self.max_training_steps - current_step, 0)
-                        remaining_seconds = remaining_steps * float(train_step_time)
-                        train_metrics["performance/remaining_minutes"] = remaining_seconds / 60.0
-                        train_metrics["performance/remaining_hours"] = remaining_seconds / 3600.0
-                    state, metrics = self.on_step_end(
-                        state=state,
-                        metrics=metrics,
-                        step=current_step,
-                    )
-                    with capture_time() as logging_time:
+                    if run_exception is not None:
+                        self._runtime_trace(
+                            "train_step.execute.run_exception",
+                            epoch=epoch,
+                            current_step=current_step,
+                            exc_type=type(run_exception).__name__,
+                            exc=str(run_exception),
+                        )
+                        return state, run_exception, close_prefetcher()
+                    # Start the JAX profiler once step 1 has fully completed.
+                    # The first step's wall-time is dominated by JIT compile;
+                    # skipping it gives a profile of steady-state training.
+                    self._maybe_start_profiler(current_step)
+                    self._maybe_stop_profiler(current_step)
+                    try:
+                        self._runtime_trace("train_step.host_metrics.begin", epoch=epoch, current_step=current_step)
+                        loss_value = self._metric_scalar_to_float(metrics.loss)
+                        metrics = self.apply_training_hooks(metrics=metrics, loss_value=loss_value)
+                        if step_skipped:
+                            consecutive_skipped_steps += 1
+                            logger.warning(
+                                "Skipping non-finite optimizer update at step %d "
+                                "(consecutive skipped updates: %d/%d).",
+                                current_step,
+                                consecutive_skipped_steps,
+                                max_consecutive_skips,
+                            )
+                            if consecutive_skipped_steps >= max_consecutive_skips:
+                                raise EasyDeLBreakRequest(
+                                    f"Aborting training after {consecutive_skipped_steps} consecutive skipped "
+                                    f"non-finite updates at step {current_step}."
+                                )
+                            continue
+                        consecutive_skipped_steps = 0
+                        mean_loss, mean_accuracy = metrics_tracker.update(
+                            loss=loss_value,
+                            accuracy=metrics.accuracy,
+                            step=current_step,
+                        )
+                        if getattr(metrics, "learning_rate", None) is not None:
+                            step_lr = self._metric_scalar_to_float(metrics.learning_rate)
+                        elif self.scheduler is not None:
+                            step_lr = self.scheduler(prev_step)
+                        else:
+                            step_lr = self.arguments.learning_rate
+                        step_batch_size = self.training_batch_size
+                        step_seq_length = self.arguments.max_length
+                        if self._has_buckets:
+                            buckets = getattr(self, "_buckets", None)
+                            if buckets and 0 <= self._bucket_for_step < len(buckets):
+                                active_bucket = buckets[self._bucket_for_step]
+                                if active_bucket.total_batch_size is not None:
+                                    step_batch_size = active_bucket.total_batch_size
+                                step_seq_length = active_bucket.max_length
+                        train_metrics = step_metrics.calculate(
+                            metrics=metrics,
+                            current_step=current_step,
+                            learning_rate=step_lr,
+                            epoch=epoch,
+                            epoch_progress=min(max((current_step - epoch_start_step) / epoch_total_steps, 0.0), 1.0),
+                            flops_per_token=self._backward_flops_per_token,
+                            extra_flops_per_token=self._extra_backward_flops_per_token,
+                            batch_size=step_batch_size,
+                            seq_length=step_seq_length,
+                            mean_loss=mean_loss,
+                            mean_accuracy=mean_accuracy,
+                            mode="train",
+                        )
+                        train_metrics["performance/data_collection_time"] = float(data_collection_time())
+                        if prefetch_wait_time is not None:
+                            train_metrics["performance/data_prefetch_wait_time"] = float(prefetch_wait_time)
+                        if prefetch_producer_time is not None:
+                            train_metrics["performance/data_prefetch_producer_time"] = float(prefetch_producer_time)
+                        if step_prefetcher is not None:
+                            if step_prefetcher.last_fetch_seconds is not None:
+                                train_metrics["performance/data_fetch_time"] = float(step_prefetcher.last_fetch_seconds)
+                            if step_prefetcher.last_collate_seconds is not None:
+                                train_metrics["performance/data_collate_time"] = float(
+                                    step_prefetcher.last_collate_seconds
+                                )
+                        for attr, metric in (
+                            ("_last_step_preprocess_seconds", "performance/step_preprocess_time"),
+                            ("_last_step_put_dispatch_seconds", "performance/step_put_dispatch_time"),
+                            ("_last_step_device_sync_seconds", "performance/step_device_sync_time"),
+                        ):
+                            value = getattr(self, attr, None)
+                            if value is not None:
+                                train_metrics[metric] = float(value)
+                        train_step_time = train_metrics.get("performance/train_step_time")
+                        if train_step_time is not None:
+                            remaining_steps = max(self.max_training_steps - current_step, 0)
+                            remaining_seconds = remaining_steps * float(train_step_time)
+                            train_metrics["performance/remaining_minutes"] = remaining_seconds / 60.0
+                            train_metrics["performance/remaining_hours"] = remaining_seconds / 3600.0
+                        state, metrics = self.on_step_end(
+                            state=state,
+                            metrics=metrics,
+                            step=current_step,
+                        )
+                        self.model_state = state
+                        with capture_time() as logging_time:
+                            self.log_metrics(
+                                metrics=train_metrics,
+                                pbar=pbar,
+                                step=current_step,
+                                mode="train",
+                            )
+                        if self._should_save_tpu_preemption_checkpoint(current_step):
+                            if jax.process_index() == 0 or self.arguments.log_all_workers:
+                                logger.warning(
+                                    f"TPU preemption sync point reached at step {current_step}. "
+                                    "Saving coordinated checkpoint."
+                                )
+                            self._save_tpu_preemption_checkpoint(state=state, step=current_step)
+                            return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), close_prefetcher()
+                        with capture_time() as weight_distribution_time:
+                            self.log_weight_distribution(state=state, step=current_step)
+                        with capture_time() as watchers_time:
+                            self.log_watchers(state=state, step=current_step)
+                        with capture_time() as generation_time:
+                            try:
+                                self.maybe_generate(state=state, step=current_step, metrics=metrics)
+                            except Exception as exc:  # pragma: no cover - preview must not interrupt training
+                                logger.warning(f"Preview generation hook failed: {exc}")
+                        with capture_time() as benchmark_time:
+                            try:
+                                self.maybe_benchmark(state=state, step=current_step)
+                            except Exception as exc:  # pragma: no cover - benchmarks must not interrupt training
+                                logger.warning(f"Benchmark hook failed: {exc}")
+
+                        with capture_time() as checkpoint_time:
+                            self._save_checkpoint_for_step(
+                                state=state,
+                                step=current_step,
+                                merge_lora_before_save=self.arguments.merge_lora_before_save,
+                            )
+                        with capture_time() as evaluation_time:
+                            if self._should_run_evaluation(current_step):
+                                for _ in self.eval(model_state=state):
+                                    ...
                         self.log_metrics(
-                            metrics=train_metrics,
+                            metrics={
+                                "performance/logging_time": float(logging_time()),
+                                "performance/weight_distribution_time": float(weight_distribution_time()),
+                                "performance/watchers_time": float(watchers_time()),
+                                "performance/generation_time": float(generation_time()),
+                                "performance/benchmark_time": float(benchmark_time()),
+                                "performance/checkpoint_time": float(checkpoint_time()),
+                                "performance/evaluation_time": float(evaluation_time()),
+                                "performance/iteration_time": float(iteration_time()),
+                            },
                             pbar=pbar,
                             step=current_step,
                             mode="train",
+                            update_progress=False,
                         )
-                    if self._should_save_tpu_preemption_checkpoint(current_step):
-                        if jax.process_index() == 0 or self.arguments.log_all_workers:
-                            logger.warning(
-                                f"TPU preemption sync point reached at step {current_step}. Saving coordinated checkpoint."
+                        if self._profiler_should_block_until_ready():
+                            self._runtime_trace(
+                                "train_step.profiler_block.begin", epoch=epoch, current_step=current_step
                             )
-                        self._save_tpu_preemption_checkpoint(state=state, step=current_step)
-                        return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), close_prefetcher()
-                    with capture_time() as weight_distribution_time:
-                        self.log_weight_distribution(state=state, step=current_step)
-                    with capture_time() as watchers_time:
-                        self.log_watchers(state=state, step=current_step)
-                    with capture_time() as generation_time:
-                        try:
-                            self.maybe_generate(state=state, step=current_step, metrics=metrics)
-                        except Exception as exc:  # pragma: no cover - preview must not interrupt training
-                            logger.warning(f"Preview generation hook failed: {exc}")
-                    with capture_time() as benchmark_time:
-                        try:
-                            self.maybe_benchmark(state=state, step=current_step)
-                        except Exception as exc:  # pragma: no cover - benchmarks must not interrupt training
-                            logger.warning(f"Benchmark hook failed: {exc}")
-
-                    with capture_time() as checkpoint_time:
-                        self._save_checkpoint_for_step(
-                            state=state,
-                            step=current_step,
-                            merge_lora_before_save=self.arguments.merge_lora_before_save,
+                            state, metrics = jax.block_until_ready((state, metrics))
+                            self._runtime_trace(
+                                "train_step.profiler_block.end", epoch=epoch, current_step=current_step
+                            )
+                        self._runtime_trace("train_step.host_metrics.end", epoch=epoch, current_step=current_step)
+                    except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as exc:
+                        self._runtime_trace(
+                            "train_step.host_metrics.interrupt",
+                            epoch=epoch,
+                            current_step=current_step,
+                            exc_type=type(exc).__name__,
+                            exc=str(exc),
                         )
-                    with capture_time() as evaluation_time:
-                        if self._should_run_evaluation(current_step):
-                            for _ in self.eval(model_state=state):
-                                ...
-                    self.log_metrics(
-                        metrics={
-                            "performance/logging_time": float(logging_time()),
-                            "performance/weight_distribution_time": float(weight_distribution_time()),
-                            "performance/watchers_time": float(watchers_time()),
-                            "performance/generation_time": float(generation_time()),
-                            "performance/benchmark_time": float(benchmark_time()),
-                            "performance/checkpoint_time": float(checkpoint_time()),
-                            "performance/evaluation_time": float(evaluation_time()),
-                            "performance/iteration_time": float(iteration_time()),
-                        },
-                        pbar=pbar,
-                        step=current_step,
-                        mode="train",
-                        update_progress=False,
-                    )
-                    if self._profiler_should_block_until_ready():
-                        self._runtime_trace("train_step.profiler_block.begin", epoch=epoch, current_step=current_step)
-                        state, metrics = jax.block_until_ready((state, metrics))
-                        self._runtime_trace("train_step.profiler_block.end", epoch=epoch, current_step=current_step)
-                    self._runtime_trace("train_step.host_metrics.end", epoch=epoch, current_step=current_step)
-                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as exc:
-                    self._runtime_trace(
-                        "train_step.host_metrics.interrupt",
-                        epoch=epoch,
-                        current_step=current_step,
-                        exc_type=type(exc).__name__,
-                        exc=str(exc),
-                    )
-                    return state, exc, close_prefetcher()
-                except TypeError as exc:
-                    self._runtime_trace(
-                        "train_step.host_metrics.type_error",
-                        epoch=epoch,
-                        current_step=current_step,
-                        exc_type=type(exc).__name__,
-                        exc=str(exc),
-                    )
-                    return state, exc, close_prefetcher()
-                if run_exception is not None:
-                    break
-        close_prefetcher()
+                        return state, exc, close_prefetcher()
+                    except TypeError as exc:
+                        self._runtime_trace(
+                            "train_step.host_metrics.type_error",
+                            epoch=epoch,
+                            current_step=current_step,
+                            exc_type=type(exc).__name__,
+                            exc=str(exc),
+                        )
+                        return state, exc, close_prefetcher()
+                    if run_exception is not None:
+                        break
+        except BaseException:
+            close_prefetcher()
+            if not self._has_buckets and train_iter is not initial_train_iter:
+                BaseTrainer._close_iterator(train_iter)
+            raise
+        finally:
+            close_prefetcher()
         self._runtime_trace(
             "train_epoch.end",
             epoch=epoch,
-            final_step=int(jax.device_get(state.step)),
+            final_step=current_step,
             run_exception=type(run_exception).__name__ if run_exception is not None else None,
         )
         return state, run_exception, train_iter
@@ -984,98 +1109,101 @@ class Trainer(BaseTrainer):
         Raises:
             ValueError: If ``eval_dataset`` is ``None``.
         """
-        if eval_dataset is None:
-            raise ValueError("Make sure to pass eval dataset to trainer or set `do_eval` to `False`.")
-        data_collator = self.data_collator
-        if data_collator is None:
+        try:
+            if eval_dataset is None:
+                raise ValueError("Make sure to pass eval dataset to trainer or set `do_eval` to `False`.")
+            data_collator = self.data_collator
+            if data_collator is None:
 
-            def data_collator(x):
-                """Identity collator used as a fallback when no collator is configured.
+                def data_collator(x):
+                    """Identity collator used as a fallback when no collator is configured.
 
-                Args:
-                    x: Already-batched input.
+                    Args:
+                        x: Already-batched input.
 
-                Returns:
-                    The input unchanged.
-                """
-                return x
+                    Returns:
+                        The input unchanged.
+                    """
+                    return x
 
-        global_step = int(jax.device_get(state.step))
-        final_eval_metrics = None
-        summary_metric_sums: dict[str, float] = {}
-        summary_metric_counts: dict[str, int] = {}
-        summary_metrics_helper = (
-            step_metrics
-            if hasattr(step_metrics, "accumulate_summary_metric") and hasattr(step_metrics, "summarize_metrics")
-            else StepMetrics(self.arguments)
-        )
+            global_step = int(jax.device_get(state.step))
+            final_eval_metrics = None
+            summary_metric_sums: dict[str, float] = {}
+            summary_metric_counts: dict[str, int] = {}
+            summary_metrics_helper = (
+                step_metrics
+                if hasattr(step_metrics, "accumulate_summary_metric") and hasattr(step_metrics, "summarize_metrics")
+                else StepMetrics(self.arguments)
+            )
 
-        for current_step in range(1, self.max_evaluation_steps + 1):
-            try:
-                with capture_time() as data_collection_time:
-                    batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
-                    batch = data_collator(batch)
-                step_metrics.start_step()
-                with self.evalu_tracker.trace_compilation():
-                    with capture_time() as execution_time:
-                        metrics = self._execute_eval_step(state, batch)
-                        metrics.execution_time = execution_time()
-                mean_loss, mean_accuracy = metrics_tracker.update(
-                    metrics.loss,
-                    metrics.accuracy,
-                    current_step,
-                )
-                eval_metrics = step_metrics.calculate(
-                    metrics=metrics,
-                    current_step=current_step,
-                    learning_rate=0.000,
-                    epoch=0,
-                    epoch_progress=None,
-                    flops_per_token=self._forward_flops_per_token,
-                    extra_flops_per_token=self._extra_forward_flops_per_token,
-                    batch_size=self.evaluation_batch_size,
-                    seq_length=self.arguments.max_length,
-                    mean_loss=mean_loss,
-                    mean_accuracy=mean_accuracy,
-                    mode="eval",
-                )
-                eval_metrics["performance/eval/data_collection_time"] = float(data_collection_time())
-                for metric_name, metric_value in eval_metrics.items():
-                    summary_metrics_helper.accumulate_summary_metric(
-                        summary_metric_sums=summary_metric_sums,
-                        summary_metric_counts=summary_metric_counts,
-                        metric_name=metric_name,
-                        metric_value=metric_value,
+            for current_step in range(1, self.max_evaluation_steps + 1):
+                try:
+                    with capture_time() as data_collection_time:
+                        batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
+                        batch = data_collator(batch)
+                    step_metrics.start_step()
+                    with self.evalu_tracker.trace_compilation():
+                        with capture_time() as execution_time:
+                            metrics = self._execute_eval_step(state, batch)
+                            metrics.execution_time = execution_time()
+                    mean_loss, mean_accuracy = metrics_tracker.update(
+                        metrics.loss,
+                        metrics.accuracy,
+                        current_step,
+                    )
+                    eval_metrics = step_metrics.calculate(
+                        metrics=metrics,
+                        current_step=current_step,
+                        learning_rate=0.000,
+                        epoch=0,
+                        epoch_progress=None,
+                        flops_per_token=self._forward_flops_per_token,
+                        extra_flops_per_token=self._extra_forward_flops_per_token,
+                        batch_size=self.evaluation_batch_size,
+                        seq_length=self.arguments.max_length,
+                        mean_loss=mean_loss,
+                        mean_accuracy=mean_accuracy,
                         mode="eval",
                     )
-                self.log_metrics(
-                    metrics=eval_metrics,
-                    pbar=pbar,
-                    step=current_step,
+                    eval_metrics["performance/eval/data_collection_time"] = float(data_collection_time())
+                    for metric_name, metric_value in eval_metrics.items():
+                        summary_metrics_helper.accumulate_summary_metric(
+                            summary_metric_sums=summary_metric_sums,
+                            summary_metric_counts=summary_metric_counts,
+                            metric_name=metric_name,
+                            metric_value=metric_value,
+                            mode="eval",
+                        )
+                    self.log_metrics(
+                        metrics=eval_metrics,
+                        pbar=pbar,
+                        step=current_step,
+                        mode="eval",
+                        log_to_backends=False,
+                    )
+                    final_eval_metrics = eval_metrics
+                    yield eval_metrics
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
+                    break
+                except TypeError:
+                    raise
+            if final_eval_metrics is not None:
+                summary_eval_metrics = summary_metrics_helper.summarize_metrics(
+                    last_metrics=final_eval_metrics,
+                    summary_metric_sums=summary_metric_sums,
+                    summary_metric_counts=summary_metric_counts,
                     mode="eval",
-                    log_to_backends=False,
                 )
-                final_eval_metrics = eval_metrics
-                yield eval_metrics
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
-                break
-            except TypeError:
-                raise
-        if final_eval_metrics is not None:
-            summary_eval_metrics = summary_metrics_helper.summarize_metrics(
-                last_metrics=final_eval_metrics,
-                summary_metric_sums=summary_metric_sums,
-                summary_metric_counts=summary_metric_counts,
-                mode="eval",
-            )
-            self.log_metrics(
-                metrics=summary_eval_metrics,
-                pbar=pbar,
-                step=global_step,
-                mode="eval",
-                update_progress=False,
-                force_report=True,
-            )
+                self.log_metrics(
+                    metrics=summary_eval_metrics,
+                    pbar=pbar,
+                    step=global_step,
+                    mode="eval",
+                    update_progress=False,
+                    force_report=True,
+                )
+        finally:
+            BaseTrainer._close_iterator(eval_iter)
 
     def _execute_eval_step(self, state, batch) -> LossMetrics:
         """Run one evaluation step end-to-end (preprocess + compiled forward).
@@ -1214,7 +1342,9 @@ class Trainer(BaseTrainer):
             )
         metrics = LossMetrics()
         try:
-            self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
+            trace_enabled = _runtime_trace_enabled()
+            if trace_enabled:
+                self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
             with capture_time() as _preprocess_time:
                 batch, informations = self._preprocess_batch_input(
                     state=state,
@@ -1222,13 +1352,15 @@ class Trainer(BaseTrainer):
                     is_train=True,
                 )
             self._last_step_preprocess_seconds = float(_preprocess_time())
-            self._runtime_trace(
-                "execute_train_step.preprocess.end",
-                batch=self._runtime_batch_summary(batch),
-                information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
-            )
+            if trace_enabled:
+                self._runtime_trace(
+                    "execute_train_step.preprocess.end",
+                    batch=self._runtime_batch_summary(batch),
+                    information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
+                )
 
             self._runtime_trace("execute_train_step.compiled_call.begin")
+            sync_device_for_host_log = bool(getattr(self.arguments, "host_phase_log_path", None))
             if self._has_buckets:
                 # Swap the bucket's graphdef (carrying its attn kernel) into the
                 # state before calling the bucket's compiled fn, then restore the
@@ -1242,8 +1374,8 @@ class Trainer(BaseTrainer):
                 bucket_state = state.replace(graphdef=self._bucket_graphdefs[bi])
                 # Split "collated batch in hand -> outputs on host" into the
                 # host put/dispatch phase (arg transfer + enqueue; returns
-                # async) and the device+fleet-sync phase (execution, all-host
-                # collectives, retirement).
+                # async) and optional device+fleet-sync phase when host phase
+                # logging is active.
                 with capture_time() as _put_dispatch_time:
                     _result = self._bucket_step_fns[bi](
                         bucket_state,
@@ -1252,24 +1384,33 @@ class Trainer(BaseTrainer):
                         *self._bucket_static_args[bi],
                     )
                 self._last_step_put_dispatch_seconds = float(_put_dispatch_time())
-                with capture_time() as _device_sync_time:
-                    state, metrics = jax.block_until_ready(_result)
-                self._last_step_device_sync_seconds = float(_device_sync_time())
-                self._append_host_phase_log()
+                if sync_device_for_host_log:
+                    with capture_time() as _device_sync_time:
+                        state, metrics = jax.block_until_ready(_result)
+                    self._last_step_device_sync_seconds = float(_device_sync_time())
+                    self._append_host_phase_log()
+                else:
+                    state, metrics = _result
+                    self._last_step_device_sync_seconds = None
                 state = state.replace(graphdef=base_graphdef)
             else:
                 with capture_time() as _put_dispatch_time:
                     _result = self._dispatch_train_step(state, batch)
                 self._last_step_put_dispatch_seconds = float(_put_dispatch_time())
-                with capture_time() as _device_sync_time:
-                    state, metrics = jax.block_until_ready(_result)
-                self._last_step_device_sync_seconds = float(_device_sync_time())
-                self._append_host_phase_log()
-            self._runtime_trace(
-                "execute_train_step.compiled_call.end",
-                step=int(jax.device_get(state.step)),
-                metrics_type=type(metrics).__name__,
-            )
+                if sync_device_for_host_log:
+                    with capture_time() as _device_sync_time:
+                        state, metrics = jax.block_until_ready(_result)
+                    self._last_step_device_sync_seconds = float(_device_sync_time())
+                    self._append_host_phase_log()
+                else:
+                    state, metrics = _result
+                    self._last_step_device_sync_seconds = None
+            if trace_enabled:
+                self._runtime_trace(
+                    "execute_train_step.compiled_call.end",
+                    step=int(jax.device_get(state.step)),
+                    metrics_type=type(metrics).__name__,
+                )
 
             if len(informations) != 0:
                 if metrics.other_metrics is not None:
@@ -1342,7 +1483,7 @@ class Trainer(BaseTrainer):
             The final output object.
         """
         try:
-            if self.arguments.do_eval:
+            if run_exception is None and self.arguments.do_eval:
                 for _ in self.eval(output.state):
                     ...
         finally:
@@ -1385,15 +1526,15 @@ class Trainer(BaseTrainer):
             - Can be interrupted with Ctrl+C without losing progress
         """
         self._runtime_trace("train.begin")
+        finalized = False
         try:
             self._runtime_trace("train.start_training_hook.begin")
             self.start_training_hook()
             self._runtime_trace("train.start_training_hook.end")
-            state = self.model_state
             metrics_tracker = MetricsTracker()
             step_metrics = StepMetrics(self.arguments)
             self._runtime_trace("train.setup_initial_metrics.begin")
-            self._setup_initial_metrics(state)
+            self._setup_initial_metrics(self.model_state)
             self._runtime_trace("train.setup_initial_metrics.end")
             output, run_exception = self._run_training_loop(
                 state=self.model_state,
@@ -1404,12 +1545,18 @@ class Trainer(BaseTrainer):
                 "train.finalize.begin",
                 run_exception=type(run_exception).__name__ if run_exception is not None else None,
             )
-            output = self._finalize_training(output, run_exception)
+            try:
+                output = self._finalize_training(output, run_exception)
+            finally:
+                finalized = True
             self._runtime_trace("train.end")
             return output
         except BaseException as exc:
             self._runtime_trace("train.exception", exc_type=type(exc).__name__, exc=str(exc))
             raise
+        finally:
+            if not finalized:
+                self.finish()
 
     def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """

@@ -25,6 +25,7 @@ multiple tool calls are concatenated without separators.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Sequence
 from functools import cached_property
@@ -43,6 +44,7 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
+from ..utils import stable_json_stream_prefix
 
 logger = get_logger(__name__)
 
@@ -50,21 +52,54 @@ logger = get_logger(__name__)
 TOOL_CALL_START = "<|tool_call>"
 TOOL_CALL_END = "<tool_call|>"
 STRING_DELIM = '<|"|>'
+_FUNC_NAME_RE = re.compile(r"^[\w\-\.]+$")
+_BRACE_OR_DELIM_RE = re.compile(r'[{}]|<\|"\|>')
+_BRACKET_OR_DELIM_RE = re.compile(r'[\[\]]|<\|"\|>')
+_ARGS_BARE_END_RE = re.compile(r"[,}\]]")
+_ARR_BARE_END_RE = re.compile(r"[,\]]")
+_MAX_GEMMA4_NESTING_DEPTH = 128
+
+
+def _strip_trailing_partial_marker(text: str, marker: str) -> str:
+    """Withhold any trailing non-empty proper prefix of *marker* from *text*."""
+    max_len = min(len(marker) - 1, len(text))
+    for k in range(max_len, 0, -1):
+        if text.endswith(marker[:k]):
+            return text[:-k]
+    return text
+
+
+def _has_open_marker_or_trailing_prefix(text: str, start_token: str, end_token: str) -> bool:
+    """Return True if *text* has an unclosed block or ends with a partial start marker."""
+    pos = 0
+    n = len(text)
+    start_len = len(start_token)
+    end_len = len(end_token)
+    while pos < n:
+        start_idx = text.find(start_token, pos)
+        if start_idx == -1:
+            return ToolParser._has_trailing_marker_prefix(text[pos:], (start_token,))
+        end_idx = text.find(end_token, start_idx + start_len)
+        if end_idx == -1:
+            return True
+        pos = end_idx + end_len
+    return False
 
 
 def _parse_gemma4_value(value_str: str) -> object:
     """Parse a single Gemma4 value (after ``key:``) into a Python object.
 
-    Recognises ``true``/``false`` literals, integer / float numbers, and
-    falls back to the raw string when no other interpretation applies.
+    Recognises ``true``/``false``/``null`` literals, integer / float /
+    scientific-notation numbers, and falls back to the raw string when no
+    other interpretation applies.
 
     Args:
         value_str: The bare value substring extracted from a Gemma4 args
             block (no surrounding ``<|"|>`` string delimiters).
 
     Returns:
-        ``True``/``False`` for boolean literals, ``int``/``float`` for
-        numeric literals, otherwise the trimmed source string.
+        ``True``/``False``/``None`` for boolean/null literals, ``int``/``float``
+        for finite numeric literals, otherwise the trimmed source string.
     """
     value_str = value_str.strip()
     if not value_str:
@@ -73,13 +108,198 @@ def _parse_gemma4_value(value_str: str) -> object:
         return True
     if value_str == "false":
         return False
+    if value_str == "null":
+        return None
     try:
-        if "." in value_str:
-            return float(value_str)
+        if "." in value_str or "e" in value_str or "E" in value_str:
+            val = float(value_str)
+            return val if math.isfinite(val) else value_str
         return int(value_str)
     except ValueError:
         pass
     return value_str
+
+
+def _skip_balanced_container(
+    text: str,
+    pos: int,
+    n: int,
+    open_ch: str,
+    pattern: re.Pattern[str],
+) -> int:
+    """Linearly skip a container body starting immediately after *open_ch*."""
+    depth = 1
+    i = pos
+    while depth > 0:
+        m = pattern.search(text, i)
+        if m is None:
+            return n
+        tok = m.group(0)
+        if tok == STRING_DELIM:
+            next_delim = text.find(STRING_DELIM, m.end())
+            if next_delim == -1:
+                return n
+            i = next_delim + len(STRING_DELIM)
+        elif tok == open_ch:
+            depth += 1
+            i = m.end()
+        else:
+            depth -= 1
+            i = m.end()
+    return i
+
+
+def _parse_gemma4_object_at(
+    args_str: str,
+    pos: int,
+    n: int,
+    *,
+    partial: bool = False,
+    depth: int = 0,
+) -> tuple[dict, int]:
+    """Parse a Gemma4 object body in a single linear pass starting at *pos*."""
+    result: dict = {}
+    i = pos
+
+    while i < n:
+        while i < n and args_str[i] in (" ", ",", "\n", "\t"):
+            i += 1
+        if i >= n:
+            break
+        if args_str[i] == "}":
+            if depth > 0:
+                return result, i + 1
+            i += 1
+            continue
+
+        # Parse key (unquoted, ends at ':' or closing '}' of nested object)
+        colon_idx = args_str.find(":", i)
+        if depth > 0:
+            close_idx = args_str.find("}", i)
+            if close_idx != -1 and (colon_idx == -1 or close_idx < colon_idx):
+                return result, close_idx + 1
+        if colon_idx == -1:
+            return result, n
+        key = args_str[i:colon_idx].strip()
+        i = colon_idx + 1
+
+        while i < n and args_str[i] in (" ", "\n", "\t"):
+            i += 1
+        if i >= n:
+            if not partial and depth == 0:
+                result[key] = ""
+            return result, n
+        if depth > 0 and args_str[i] == "}":
+            result[key] = ""
+            return result, i + 1
+
+        # String value: <|"|>...<|"|>
+        if args_str[i] == "<" and args_str.startswith(STRING_DELIM, i):
+            i += len(STRING_DELIM)
+            val_start = i
+            end_pos = args_str.find(STRING_DELIM, i)
+            if end_pos == -1:
+                result[key] = args_str[val_start:]
+                return result, n
+            result[key] = args_str[val_start:end_pos]
+            i = end_pos + len(STRING_DELIM)
+
+        # Nested object: {...}
+        elif args_str[i] == "{":
+            if depth >= _MAX_GEMMA4_NESTING_DEPTH:
+                i = _skip_balanced_container(args_str, i + 1, n, "{", _BRACE_OR_DELIM_RE)
+                result[key] = {}
+            else:
+                result[key], i = _parse_gemma4_object_at(args_str, i + 1, n, partial=partial, depth=depth + 1)
+
+        # Array: [...]
+        elif args_str[i] == "[":
+            if depth >= _MAX_GEMMA4_NESTING_DEPTH:
+                i = _skip_balanced_container(args_str, i + 1, n, "[", _BRACKET_OR_DELIM_RE)
+                result[key] = []
+            else:
+                result[key], i = _parse_gemma4_array_at(args_str, i + 1, n, partial=partial, depth=depth + 1)
+
+        # Bare value (number, boolean, etc.)
+        else:
+            val_start = i
+            m_end = _ARGS_BARE_END_RE.search(args_str, i)
+            if m_end is None:
+                if partial or depth > 0:
+                    return result, n
+                result[key] = _parse_gemma4_value(args_str[val_start:n])
+                return result, n
+            if m_end.start() == i:
+                if depth > 0 and args_str[i] == "}":
+                    return result, i + 1
+                i += 1
+                continue
+            i = m_end.start()
+            result[key] = _parse_gemma4_value(args_str[val_start:i])
+
+    return result, i
+
+
+def _parse_gemma4_array_at(
+    arr_str: str,
+    pos: int,
+    n: int,
+    *,
+    partial: bool = False,
+    depth: int = 0,
+) -> tuple[list, int]:
+    """Parse a Gemma4 array body in a single linear pass starting at *pos*."""
+    items: list = []
+    i = pos
+
+    while i < n:
+        while i < n and arr_str[i] in (" ", ",", "\n", "\t"):
+            i += 1
+        if i >= n:
+            break
+        if arr_str[i] == "]":
+            return items, i + 1
+
+        if arr_str[i] == "<" and arr_str.startswith(STRING_DELIM, i):
+            i += len(STRING_DELIM)
+            end_pos = arr_str.find(STRING_DELIM, i)
+            if end_pos == -1:
+                items.append(arr_str[i:])
+                return items, n
+            items.append(arr_str[i:end_pos])
+            i = end_pos + len(STRING_DELIM)
+
+        elif arr_str[i] == "{":
+            if depth >= _MAX_GEMMA4_NESTING_DEPTH:
+                i = _skip_balanced_container(arr_str, i + 1, n, "{", _BRACE_OR_DELIM_RE)
+                items.append({})
+            else:
+                obj, i = _parse_gemma4_object_at(arr_str, i + 1, n, partial=partial, depth=depth + 1)
+                items.append(obj)
+
+        elif arr_str[i] == "[":
+            if depth >= _MAX_GEMMA4_NESTING_DEPTH:
+                i = _skip_balanced_container(arr_str, i + 1, n, "[", _BRACKET_OR_DELIM_RE)
+                items.append([])
+            else:
+                sub, i = _parse_gemma4_array_at(arr_str, i + 1, n, partial=partial, depth=depth + 1)
+                items.append(sub)
+
+        else:
+            val_start = i
+            m_end = _ARR_BARE_END_RE.search(arr_str, i)
+            if m_end is None:
+                if partial or depth > 0:
+                    return items, n
+                items.append(_parse_gemma4_value(arr_str[val_start:n]))
+                return items, n
+            if m_end.start() == i:
+                i += 1
+                continue
+            i = m_end.start()
+            items.append(_parse_gemma4_value(arr_str[val_start:i]))
+
+    return items, i
 
 
 def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
@@ -102,101 +322,8 @@ def _parse_gemma4_args(args_str: str, *, partial: bool = False) -> dict:
     """
     if not args_str or not args_str.strip():
         return {}
-
-    result: dict = {}
-    i = 0
-    n = len(args_str)
-
-    while i < n:
-        while i < n and args_str[i] in (" ", ",", "\n", "\t"):
-            i += 1
-        if i >= n:
-            break
-
-        # Parse key (unquoted, ends at ':')
-        key_start = i
-        while i < n and args_str[i] != ":":
-            i += 1
-        if i >= n:
-            break
-        key = args_str[key_start:i].strip()
-        i += 1  # skip ':'
-
-        if i >= n:
-            if not partial:
-                result[key] = ""
-            break
-
-        while i < n and args_str[i] in (" ", "\n", "\t"):
-            i += 1
-        if i >= n:
-            if not partial:
-                result[key] = ""
-            break
-
-        # String value: <|"|>...<|"|>
-        if args_str[i:].startswith(STRING_DELIM):
-            i += len(STRING_DELIM)
-            val_start = i
-            end_pos = args_str.find(STRING_DELIM, i)
-            if end_pos == -1:
-                result[key] = args_str[val_start:]
-                break
-            result[key] = args_str[val_start:end_pos]
-            i = end_pos + len(STRING_DELIM)
-
-        # Nested object: {...}
-        elif args_str[i] == "{":
-            depth = 1
-            obj_start = i + 1
-            i += 1
-            while i < n and depth > 0:
-                if args_str[i:].startswith(STRING_DELIM):
-                    i += len(STRING_DELIM)
-                    next_delim = args_str.find(STRING_DELIM, i)
-                    i = n if next_delim == -1 else next_delim + len(STRING_DELIM)
-                    continue
-                if args_str[i] == "{":
-                    depth += 1
-                elif args_str[i] == "}":
-                    depth -= 1
-                i += 1
-            if depth > 0:
-                result[key] = _parse_gemma4_args(args_str[obj_start:i], partial=True)
-            else:
-                result[key] = _parse_gemma4_args(args_str[obj_start : i - 1])
-
-        # Array: [...]
-        elif args_str[i] == "[":
-            depth = 1
-            arr_start = i + 1
-            i += 1
-            while i < n and depth > 0:
-                if args_str[i:].startswith(STRING_DELIM):
-                    i += len(STRING_DELIM)
-                    next_delim = args_str.find(STRING_DELIM, i)
-                    i = n if next_delim == -1 else next_delim + len(STRING_DELIM)
-                    continue
-                if args_str[i] == "[":
-                    depth += 1
-                elif args_str[i] == "]":
-                    depth -= 1
-                i += 1
-            if depth > 0:
-                result[key] = _parse_gemma4_array(args_str[arr_start:i], partial=True)
-            else:
-                result[key] = _parse_gemma4_array(args_str[arr_start : i - 1])
-
-        # Bare value (number, boolean, etc.)
-        else:
-            val_start = i
-            while i < n and args_str[i] not in (",", "}", "]"):
-                i += 1
-            if partial and i >= n:
-                break
-            result[key] = _parse_gemma4_value(args_str[val_start:i])
-
-    return result
+    parsed, _ = _parse_gemma4_object_at(args_str, 0, len(args_str), partial=partial, depth=0)
+    return parsed
 
 
 def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
@@ -214,74 +341,10 @@ def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
     Returns:
         The list of decoded Python values.
     """
-    items: list = []
-    i = 0
-    n = len(arr_str)
-
-    while i < n:
-        while i < n and arr_str[i] in (" ", ",", "\n", "\t"):
-            i += 1
-        if i >= n:
-            break
-
-        if arr_str[i:].startswith(STRING_DELIM):
-            i += len(STRING_DELIM)
-            end_pos = arr_str.find(STRING_DELIM, i)
-            if end_pos == -1:
-                items.append(arr_str[i:])
-                break
-            items.append(arr_str[i:end_pos])
-            i = end_pos + len(STRING_DELIM)
-
-        elif arr_str[i] == "{":
-            depth = 1
-            obj_start = i + 1
-            i += 1
-            while i < n and depth > 0:
-                if arr_str[i:].startswith(STRING_DELIM):
-                    i += len(STRING_DELIM)
-                    nd = arr_str.find(STRING_DELIM, i)
-                    i = nd + len(STRING_DELIM) if nd != -1 else n
-                    continue
-                if arr_str[i] == "{":
-                    depth += 1
-                elif arr_str[i] == "}":
-                    depth -= 1
-                i += 1
-            if depth > 0:
-                items.append(_parse_gemma4_args(arr_str[obj_start:i], partial=True))
-            else:
-                items.append(_parse_gemma4_args(arr_str[obj_start : i - 1]))
-
-        elif arr_str[i] == "[":
-            depth = 1
-            sub_start = i + 1
-            i += 1
-            while i < n and depth > 0:
-                if arr_str[i:].startswith(STRING_DELIM):
-                    i += len(STRING_DELIM)
-                    next_delim = arr_str.find(STRING_DELIM, i)
-                    i = n if next_delim == -1 else next_delim + len(STRING_DELIM)
-                    continue
-                if arr_str[i] == "[":
-                    depth += 1
-                elif arr_str[i] == "]":
-                    depth -= 1
-                i += 1
-            if depth > 0:
-                items.append(_parse_gemma4_array(arr_str[sub_start:i], partial=True))
-            else:
-                items.append(_parse_gemma4_array(arr_str[sub_start : i - 1]))
-
-        else:
-            val_start = i
-            while i < n and arr_str[i] not in (",", "]"):
-                i += 1
-            if partial and i >= n:
-                break
-            items.append(_parse_gemma4_value(arr_str[val_start:i]))
-
-    return items
+    if not arr_str:
+        return []
+    parsed, _ = _parse_gemma4_array_at(arr_str, 0, len(arr_str), partial=partial, depth=0)
+    return parsed
 
 
 @ToolParserManager.register_module("gemma4")  # pyright: ignore[reportUntypedClassDecorator]
@@ -313,6 +376,15 @@ class Gemma4ToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
+        self._tool_name_sent: list[bool] = []
+        self._tool_call_ids: list[str] = []
+        self._emitted_content_pos: int | None = None
+        self._pending_tail_start: int | None = None
+        self._last_current_text: str = ""
+        self._streaming_initialized: bool = False
+        self._in_open_call: bool = False
+        self._scan_pos: int = 0
+        self._closed_emitted_idx: int = 0
 
         start_tok = re.escape(TOOL_CALL_START)
         end_tok = re.escape(TOOL_CALL_END)
@@ -322,6 +394,48 @@ class Gemma4ToolParser(ToolParser):
         )
 
         self.buffered_delta_text = ""
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether a ``<|tool_call>`` block or partial start marker is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return self._in_open_call or self._pending_tail_start is not None
+        return _has_open_marker_or_trailing_prefix(
+            current_text,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+        )
+
+    def _reset_streaming_state(self, emitted_pos: int = 0) -> None:
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.current_tool_id = -1
+        self.streamed_args_for_tool = []
+        self._tool_name_sent = []
+        self._tool_call_ids = []
+        self._emitted_content_pos = emitted_pos
+        self._pending_tail_start = None
+        self._last_current_text = ""
+        self.buffered_delta_text = ""
+        self._streaming_initialized = False
+        self._in_open_call = False
+        self._scan_pos = 0
+        self._closed_emitted_idx = 0
+
+    def flush_streaming_content(self) -> str | None:
+        """Flush any trailing partial ``<|tool_call>`` prefix withheld at EOS."""
+        flushed: str | None = None
+        if self._pending_tail_start is not None and self._pending_tail_start < len(self._last_current_text):
+            flushed = self._last_current_text[self._pending_tail_start :] or None
+            self._emitted_content_pos = len(self._last_current_text)
+            self._pending_tail_start = None
+        self._last_current_text = ""
+        return flushed
 
     @cached_property
     def tool_call_start_token_ids(self) -> list[int]:
@@ -399,22 +513,41 @@ class Gemma4ToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
         try:
-            matches = self.tool_call_regex.findall(model_output)
-            if not matches:
-                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
-
             tool_calls: list[ToolCall] = []
-            for func_name, args_str in matches:
-                arguments = _parse_gemma4_args(args_str)
-                tool_calls.append(
-                    ToolCall(
-                        type="function",
-                        function=FunctionCall(
-                            name=func_name,
-                            arguments=json.dumps(arguments, ensure_ascii=False),
-                        ),
+            start_len = len(TOOL_CALL_START)
+            end_len = len(TOOL_CALL_END)
+            pos = 0
+            n = len(model_output)
+            cached_end = -1
+            while pos < n:
+                call_start = model_output.find(TOOL_CALL_START, pos)
+                if call_start == -1:
+                    break
+                body_start = call_start + start_len
+                if cached_end < body_start:
+                    cached_end = model_output.find(TOOL_CALL_END, body_start)
+                if cached_end == -1:
+                    break
+                body = model_output[body_start:cached_end]
+                func_name, args_str, args_closed = self._split_call_body(body)
+                if func_name is not None and args_closed and body.endswith("}"):
+                    arguments = _parse_gemma4_args(args_str)
+                    tool_calls.append(
+                        ToolCall(
+                            type="function",
+                            function=FunctionCall(
+                                name=func_name,
+                                arguments=json.dumps(arguments, ensure_ascii=False),
+                            ),
+                        )
                     )
-                )
+                    pos = cached_end + end_len
+                else:
+                    next_start = model_output.find(TOOL_CALL_START, body_start, cached_end)
+                    pos = next_start if next_start != -1 else cached_end + end_len
+
+            if not tool_calls:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
             content_end = model_output.find(TOOL_CALL_START)
             content = model_output[:content_end].strip() if content_end > 0 else None
@@ -427,6 +560,47 @@ class Gemma4ToolParser(ToolParser):
         except Exception:
             logger.exception("Error extracting tool calls from Gemma4 response")
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+    @staticmethod
+    def _split_call_body(body: str) -> tuple[str | None, str, bool]:
+        """Parse ``call:name{args[}]`` into ``(func_name, args_body, args_closed)``.
+
+        Tracks brace depth outside ``<|"|>`` string literals so a trailing ``}``
+        is only stripped when it closes the outer call argument object (depth 0),
+        never when it closes a nested object or lives inside a string.
+        """
+        if not body.startswith("call:"):
+            return None, "", False
+        func_part = body[5:]
+        brace_pos = func_part.find("{")
+        if brace_pos == -1:
+            return None, "", False
+        func_name = func_part[:brace_pos].strip()
+        if not func_name or _FUNC_NAME_RE.fullmatch(func_name) is None:
+            return None, "", False
+
+        args_raw = func_part[brace_pos + 1 :]
+        depth = 1
+        i = 0
+        while depth > 0:
+            m = _BRACE_OR_DELIM_RE.search(args_raw, i)
+            if m is None:
+                return func_name, args_raw, False
+            tok = m.group(0)
+            if tok == STRING_DELIM:
+                end_delim = args_raw.find(STRING_DELIM, m.end())
+                if end_delim == -1:
+                    return func_name, args_raw, False
+                i = end_delim + len(STRING_DELIM)
+            elif tok == "{":
+                depth += 1
+                i = m.end()
+            else:
+                depth -= 1
+                if depth == 0:
+                    return func_name, args_raw[: m.start()], True
+                i = m.end()
+        return func_name, args_raw, False
 
     def extract_tool_calls_streaming(
         self,
@@ -454,10 +628,17 @@ class Gemma4ToolParser(ToolParser):
             content or tool-call deltas, or ``None`` when nothing should be
             emitted in this step.
         """
-        delta_text = self._buffer_delta_text(delta_text)
+        if not previous_text:
+            self._reset_streaming_state(0)
+        elif self._emitted_content_pos is None:
+            self._reset_streaming_state(len(previous_text))
+        elif self._scan_pos > len(current_text):
+            self._reset_streaming_state(0)
 
-        if TOOL_CALL_START not in current_text:
-            return DeltaMessage(content=delta_text) if delta_text else None
+        self._streaming_initialized = True
+        self._last_current_text = current_text
+        self._pending_tail_start = None
+        self._in_open_call = False
 
         try:
             return self._extract_streaming(previous_text, current_text, delta_text)
@@ -471,50 +652,135 @@ class Gemma4ToolParser(ToolParser):
         current_text: str,
         delta_text: str,
     ) -> DeltaMessage | None:
-        """Drive the streaming state machine for Gemma4 tool calls.
+        """Drive span-based streaming extraction for Gemma4 tool calls.
 
-        Counts open/close markers between ``previous_text`` and
-        ``current_text`` to decide whether the current step opens a new
-        call, continues a call's body, or closes a call.
-
-        Args:
-            previous_text: Cumulative output up to the previous step.
-            current_text: Cumulative output including the current step.
-            delta_text: Newly produced text in this step.
-
-        Returns:
-            The :class:`DeltaMessage` to forward to the client, or ``None``
-            when no client-visible event should be emitted.
+        Partitions cumulative ``current_text`` into visible content segments and
+        ``<|tool_call>...<tool_call|>`` call spans, flushing closing calls before
+        opening subsequent calls and never rewinding ``streamed_args_for_tool``.
         """
-        start_count = current_text.count(TOOL_CALL_START)
-        end_count = current_text.count(TOOL_CALL_END)
-        prev_start_count = previous_text.count(TOOL_CALL_START)
-        prev_end_count = previous_text.count(TOOL_CALL_END)
+        del previous_text, delta_text
+        pos = self._scan_pos
+        next_scan_pos = pos
+        spans: list[tuple[str, bool]] = []
+        visible_parts: list[tuple[int, int]] = []
+        while pos < len(current_text):
+            call_start = current_text.find(TOOL_CALL_START, pos)
+            if call_start == -1:
+                tail = current_text[pos:]
+                safe_tail = _strip_trailing_partial_marker(tail, TOOL_CALL_START)
+                safe_end = pos + len(safe_tail)
+                if safe_tail:
+                    visible_parts.append((pos, safe_end))
+                if len(safe_tail) < len(tail):
+                    self._pending_tail_start = safe_end
+                next_scan_pos = safe_end
+                break
+            if call_start > pos:
+                visible_parts.append((pos, call_start))
+            body_start = call_start + len(TOOL_CALL_START)
+            call_end = current_text.find(TOOL_CALL_END, body_start)
+            if call_end == -1:
+                spans.append((current_text[body_start:], False))
+                self._in_open_call = True
+                next_scan_pos = call_start
+                break
+            spans.append((current_text[body_start:call_end], True))
+            pos = call_end + len(TOOL_CALL_END)
+            next_scan_pos = pos
 
-        if start_count == end_count and prev_end_count == end_count and TOOL_CALL_END not in delta_text:
-            if delta_text:
-                return DeltaMessage(content=delta_text)
-            return None
+        content_chunks: list[str] = []
+        emitted_pos = self._emitted_content_pos or 0
+        for seg_start, seg_end in visible_parts:
+            if seg_end > emitted_pos:
+                content_chunks.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                emitted_pos = seg_end
+        self._emitted_content_pos = emitted_pos
+        content_out = "".join(content_chunks)
 
-        if start_count > prev_start_count:
-            self.current_tool_id += 1
-            self.current_tool_name_sent = False
-            self.streamed_args_for_tool.append("")
-            self.prev_tool_call_arr.append({})
-            if len(delta_text) <= len(TOOL_CALL_START):
-                return None
+        deltas: list[DeltaToolCall] = []
+        emitted_idx = self._closed_emitted_idx
+        next_closed_emitted_idx = self._closed_emitted_idx
+        for body, is_closed in spans:
+            clean_body = body if is_closed else _strip_trailing_partial_marker(body, TOOL_CALL_END)
+            func_name, args_part, args_closed = self._split_call_body(clean_body)
+            if func_name is None:
+                continue
 
-        # Tool call just ended
-        if end_count > prev_end_count:
-            return self._handle_tool_call_end(current_text)
+            idx = emitted_idx
+            emitted_idx += 1
+            if is_closed:
+                next_closed_emitted_idx = emitted_idx
+            while len(self.prev_tool_call_arr) <= idx:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= idx:
+                self.streamed_args_for_tool.append("")
+            while len(self._tool_name_sent) <= idx:
+                self._tool_name_sent.append(False)
+            while len(self._tool_call_ids) <= idx:
+                self._tool_call_ids.append("")
 
-        if start_count > end_count:
-            return self._handle_tool_call_middle(current_text)
+            if idx > self.current_tool_id:
+                self.current_tool_id = idx
+                self.current_tool_name_sent = self._tool_name_sent[idx]
 
-        if delta_text:
-            text = delta_text.replace(TOOL_CALL_START, "").replace(TOOL_CALL_END, "")
-            if text:
-                return DeltaMessage(content=text)
+            first = not self._tool_name_sent[idx]
+            if first:
+                self._tool_call_ids[idx] = f"chatcmpl-tool-{uuid4()}"
+                self._tool_name_sent[idx] = True
+                if idx == self.current_tool_id:
+                    self.current_tool_name_sent = True
+
+            prev_streamed = self.streamed_args_for_tool[idx]
+            diff = ""
+
+            if is_closed or args_closed:
+                final_args = _parse_gemma4_args(args_part, partial=False)
+                final_args_json = json.dumps(final_args, ensure_ascii=False)
+                self.prev_tool_call_arr[idx] = {"name": func_name, "arguments": final_args}
+                if final_args_json.startswith(prev_streamed):
+                    diff = final_args_json[len(prev_streamed) :]
+                    if diff:
+                        self.streamed_args_for_tool[idx] = final_args_json
+            else:
+                self.prev_tool_call_arr[idx].setdefault("name", func_name)
+                if args_part:
+                    try:
+                        current_args = _parse_gemma4_args(args_part, partial=True)
+                    except Exception:
+                        current_args = {}
+                    if current_args:
+                        current_args_json = json.dumps(current_args, ensure_ascii=False)
+                        safe_json = stable_json_stream_prefix(current_args_json)
+                        while safe_json and safe_json[-1] in ("}", '"', "]", "<", "|", "\\", ">"):
+                            safe_json = safe_json[:-1]
+                        # Never rewind already-emitted streamed_args_for_tool; only extend on prefix match.
+                        if safe_json and safe_json.startswith(prev_streamed) and len(safe_json) > len(prev_streamed):
+                            diff = safe_json[len(prev_streamed) :]
+                            self.streamed_args_for_tool[idx] = safe_json
+                            self.prev_tool_call_arr[idx] = {"name": func_name, "arguments": current_args}
+
+            if first or diff:
+                deltas.append(
+                    DeltaToolCall(
+                        index=idx,
+                        type="function" if first else None,
+                        id=self._tool_call_ids[idx] if first else None,
+                        function=DeltaFunctionCall(
+                            name=func_name if first else None,
+                            arguments=diff if diff else ("" if first else None),
+                        ).model_dump(exclude_none=True),
+                    )
+                )
+
+        self._scan_pos = next_scan_pos
+        self._closed_emitted_idx = next_closed_emitted_idx
+
+        if content_out and deltas:
+            return DeltaMessage(content=content_out, tool_calls=deltas)
+        if deltas:
+            return DeltaMessage(tool_calls=deltas)
+        if content_out:
+            return DeltaMessage(content=content_out)
         return None
 
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
@@ -527,7 +793,7 @@ class Gemma4ToolParser(ToolParser):
         Returns:
             Tuple ``(func_name, args_part)`` where ``func_name`` is ``None``
             when no usable call is detected, and ``args_part`` is the body
-            of the partial argument block (without enclosing braces).
+            of the partial argument block (without enclosing outer braces).
         """
         last_start = current_text.rfind(TOOL_CALL_START)
         if last_start == -1:
@@ -537,19 +803,7 @@ class Gemma4ToolParser(ToolParser):
         if TOOL_CALL_END in partial_call:
             partial_call = partial_call.split(TOOL_CALL_END)[0]
 
-        if not partial_call.startswith("call:"):
-            return None, ""
-
-        func_part = partial_call[5:]
-        if "{" not in func_part:
-            return None, ""
-
-        func_name, _, args_part = func_part.partition("{")
-        func_name = func_name.strip()
-
-        if args_part.endswith("}"):
-            args_part = args_part[:-1]
-
+        func_name, args_part, _ = self._split_call_body(partial_call)
         return func_name, args_part
 
     def _handle_tool_call_middle(self, current_text: str) -> DeltaMessage | None:
@@ -621,7 +875,7 @@ class Gemma4ToolParser(ToolParser):
                 )
 
             prev_streamed = self.streamed_args_for_tool[self.current_tool_id]
-            if len(final_args_json) > len(prev_streamed):
+            if final_args_json.startswith(prev_streamed) and len(final_args_json) > len(prev_streamed):
                 diff = final_args_json[len(prev_streamed) :]
                 self.streamed_args_for_tool[self.current_tool_id] = final_args_json
                 self.prev_tool_call_arr[self.current_tool_id]["arguments"] = final_args
@@ -666,7 +920,7 @@ class Gemma4ToolParser(ToolParser):
 
         # Withhold trailing closing characters that may shift as more
         # tokens arrive (e.g. a string value is still being streamed).
-        safe_json = current_args_json
+        safe_json = stable_json_stream_prefix(current_args_json)
         while safe_json and safe_json[-1] in ("}", '"', "]", "<", "|", "\\", ">"):
             safe_json = safe_json[:-1]
 
@@ -676,14 +930,8 @@ class Gemma4ToolParser(ToolParser):
             return None
 
         if prev_streamed:
-            prefix_len = 0
-            min_len = min(len(prev_streamed), len(safe_json))
-            while prefix_len < min_len and prev_streamed[prefix_len] == safe_json[prefix_len]:
-                prefix_len += 1
-
-            if prefix_len < len(prev_streamed):
-                # Structure changed — wait for final flush.
-                self.streamed_args_for_tool[self.current_tool_id] = safe_json[:prefix_len]
+            if not safe_json.startswith(prev_streamed):
+                # Structure changed — never rewind already-emitted text.
                 return None
 
             diff = safe_json[len(prev_streamed) :]

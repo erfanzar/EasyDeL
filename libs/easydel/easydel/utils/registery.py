@@ -367,6 +367,10 @@ class Registry:
             except Exception as exc:
                 wakeup_error = exc
                 logger.debug("Registry wakeup failed while importing EasyDeL built-ins.", exc_info=True)
+            try:
+                from easydel import environments  # noqa  # pyright: ignore[reportUnusedImport]
+            except Exception:
+                logger.debug("Optional environments registry wakeup failed.", exc_info=True)
         impl_cls = cls.get(category, impl_name)
         if impl_cls is None:
             available = cls.list_implementations(category)
@@ -455,6 +459,10 @@ class Registry:
                 from easydel import inference, infra, layers, modules, operations, trainers  # noqa  # pyright: ignore[reportUnusedImport]
             except Exception:
                 logger.debug("Registry wakeup failed while importing EasyDeL built-ins.", exc_info=True)
+            try:
+                from easydel import environments  # noqa  # pyright: ignore[reportUnusedImport]
+            except Exception:
+                logger.debug("Optional environments registry wakeup failed.", exc_info=True)
         with cls._lock:
             return dict(cls._registry.get(category, {}))
 

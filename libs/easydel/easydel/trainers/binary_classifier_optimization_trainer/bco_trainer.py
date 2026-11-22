@@ -24,7 +24,9 @@ imbalanced.
 from __future__ import annotations
 
 import json
+import math
 import typing as tp
+from functools import partial
 
 import jax
 import numpy as np
@@ -461,9 +463,17 @@ class BCOTrainer(Trainer):
             attention_mask = attention_mask[None, :]
         if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
             raise ValueError("UDM input_ids and attention_mask must have matching [batch, seq] shapes.")
+        emb_tok = getattr(self.embedding_tokenizer, "tokenizer", self.embedding_tokenizer)
+        emb_pad_id = getattr(emb_tok, "pad_token_id", None)
+        if emb_pad_id is None:
+            emb_pad_id = getattr(emb_tok, "eos_token_id", None)
+        if emb_pad_id is None:
+            emb_pad_id = 0
+        if isinstance(emb_pad_id, (list, tuple)):
+            emb_pad_id = emb_pad_id[0] if emb_pad_id else 0
         input_ids = np.where(
-            input_ids == self.processing_class.pad_token_id,
-            getattr(self.embedding_tokenizer, "pad_token_id", self.processing_class.pad_token_id),
+            attention_mask == 0,
+            np.asarray(int(emb_pad_id), dtype=input_ids.dtype),
             input_ids,
         )
         embeddings = self.embedding_func(
@@ -502,29 +512,55 @@ class BCOTrainer(Trainer):
             logger.warning("Cannot train UDM classifier: _train_source is not available.")
             return
 
+        sample_size = int(self.arguments.prompt_sample_size or 0)
+        if sample_size <= 0:
+            logger.warning("Cannot train UDM classifier: prompt_sample_size must be positive.")
+            return
+
         desirable_embeddings: list[np.ndarray] = []
         undesirable_embeddings: list[np.ndarray] = []
-        sample_size = self.arguments.prompt_sample_size
+        desirable_seen = 0
+        undesirable_seen = 0
 
         for shard_name in self._train_source.shard_names:
             for example in self._train_source.open_shard(shard_name):
                 if "embedding_input_ids" not in example:
                     continue
 
-                emb = self._vectorize_prompt(
-                    np.asarray(example["embedding_input_ids"], dtype=np.int32),
-                    np.asarray(example["embedding_attention_mask"], dtype=np.int32),
-                )
-                if emb.size == 0:
-                    continue
-
-                pooled = emb[0]
-                if example.get("label", True):
-                    desirable_embeddings.append(pooled)
+                is_desirable = bool(example.get("label", True))
+                bucket = desirable_embeddings if is_desirable else undesirable_embeddings
+                if len(bucket) < sample_size:
+                    emb = self._vectorize_prompt(
+                        np.asarray(example["embedding_input_ids"], dtype=np.int32),
+                        np.asarray(example["embedding_attention_mask"], dtype=np.int32),
+                    )
+                    if emb.size == 0:
+                        continue
+                    bucket.append(emb[0])
+                    if is_desirable:
+                        desirable_seen += 1
+                    else:
+                        undesirable_seen += 1
                 else:
-                    undesirable_embeddings.append(pooled)
+                    # Reservoir sampling (Algorithm R) caps per-class host RAM at
+                    # ``sample_size`` while keeping a uniform sample across all
+                    # scanned majority-class examples.
+                    if is_desirable:
+                        desirable_seen += 1
+                        seen = desirable_seen
+                    else:
+                        undesirable_seen += 1
+                        seen = undesirable_seen
+                    slot = int(self._rng.integers(0, seen))
+                    if slot < sample_size:
+                        emb = self._vectorize_prompt(
+                            np.asarray(example["embedding_input_ids"], dtype=np.int32),
+                            np.asarray(example["embedding_attention_mask"], dtype=np.int32),
+                        )
+                        if emb.size > 0:
+                            bucket[slot] = emb[0]
 
-                # Early stop if we have enough samples
+                # Early stop once both classes have filled their reservoirs.
                 if len(desirable_embeddings) >= sample_size and len(undesirable_embeddings) >= sample_size:
                     break
             else:
@@ -534,16 +570,6 @@ class BCOTrainer(Trainer):
         if not desirable_embeddings or not undesirable_embeddings:
             logger.warning("UDM was requested but dataset does not include both desirable and undesirable samples.")
             return
-
-        n_d = min(len(desirable_embeddings), sample_size)
-        n_u = min(len(undesirable_embeddings), sample_size)
-
-        if n_d < len(desirable_embeddings):
-            indices = self._rng.choice(len(desirable_embeddings), size=n_d, replace=False)
-            desirable_embeddings = [desirable_embeddings[i] for i in indices]
-        if n_u < len(undesirable_embeddings):
-            indices = self._rng.choice(len(undesirable_embeddings), size=n_u, replace=False)
-            undesirable_embeddings = [undesirable_embeddings[i] for i in indices]
 
         chosen_embeddings = np.stack(desirable_embeddings, axis=0)
         rejected_embeddings = np.stack(undesirable_embeddings, axis=0)
@@ -636,33 +662,32 @@ class BCOTrainer(Trainer):
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
 
-        def forward_fn(model, batch, vocab_shard_stage=None):
-            """Compute the BCO concatenated forward pass for ``batch``.
+        aux_loss_enabled = bool(getattr(self.model_state.model, "output_router_logits", False))
+        forward_fn = partial(
+            concatenated_forward,
+            is_encoder_decoder=self.arguments.is_encoder_decoder,
+            label_pad_token_id=self.arguments.label_pad_token_id,
+            padding_value=self.padding_value,
+            max_length=self.arguments.max_length,
+            truncation_mode=self.arguments.truncation_mode,
+            aux_loss_enabled=aux_loss_enabled,
+            logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+        )
 
-            Args:
-                model: The current policy or reference model module.
-                batch: The collated BCO batch.
-                vocab_shard_stage: Terminal pipeline-stage rank forwarded by the scheduled (MPMD)
-                    loss for vocab-sharded LM-head scoring; ``None`` outside pipeline schedules.
-
-            Returns:
-                Dict with ``completion_logps``, ``completion_logits``, ``mean_completion_logits``
-                and optionally ``aux_loss`` (see :func:`concatenated_forward`).
-            """
-            return concatenated_forward(
-                model,
-                batch,
-                vocab_shard_stage=vocab_shard_stage,
-                is_encoder_decoder=self.arguments.is_encoder_decoder,
-                label_pad_token_id=self.arguments.label_pad_token_id,
-                padding_value=self.padding_value,
-                max_length=self.arguments.max_length,
-                truncation_mode=self.arguments.truncation_mode,
-                aux_loss_enabled=getattr(self.model_state.model, "output_router_logits", False),
-                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
-            )
-
-        self.concatenated_forward = compile_trainer_auxiliary(forward_fn, mesh=mesh, static_argnames=())
+        self.concatenated_forward = compile_trainer_auxiliary(
+            forward_fn,
+            mesh=mesh,
+            static_argnames=(
+                "is_encoder_decoder",
+                "label_pad_token_id",
+                "padding_value",
+                "max_length",
+                "truncation_mode",
+                "aux_loss_enabled",
+                "logprob_vocab_chunk_size",
+                "vocab_shard_stage",
+            ),
+        )
 
         self._train_shared_fn_static_args = (
             self.scheduler,
@@ -692,10 +717,12 @@ class BCOTrainer(Trainer):
 
         self._eval_shared_fn_static_args = (forward_fn, self.arguments.beta)
         eval_static_argnums = (3, 4)
+        eval_ref_state = self._eval_shared_fn_extra_args[0]
+        eval_ref_sharding = eval_ref_state.shardings if eval_ref_state is not None else empty_sharding
         self._runtime_trace("eval.compile_wrapper.begin")
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
-            in_shardings=(self.state_shardings, empty_sharding, ref_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding, eval_ref_sharding),
             out_shardings=empty_sharding,
             static_argnums=eval_static_argnums,
             mesh=self.model.mesh,
@@ -706,8 +733,6 @@ class BCOTrainer(Trainer):
 
         self.sharded_training_step_function = sharded_training_step_function
         self.sharded_evaluation_step_function = sharded_evaluation_step_function
-        self._train_shared_fn_extra_args = (self.reference_state,)
-        self._eval_shared_fn_extra_args = (self.reference_state,)
 
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
 
@@ -717,6 +742,48 @@ class BCOTrainer(Trainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    @property
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Forward the reference state alongside the shared BCO training step."""
+        return (self.reference_state,)
+
+    @property
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+        """Use live reference buffers with evaluation-only static metadata."""
+        graphdef = getattr(self, "_eval_reference_graphdef", None)
+        reference = self.reference_state
+        if graphdef is not None and reference is not None:
+            reference = reference.replace(graphdef=graphdef)
+        return (reference,)
+
+    def _configure_eval_config_override(self):
+        """Apply evaluation config overrides to the BCO reference state as well."""
+        super()._configure_eval_config_override()
+        self._eval_reference_graphdef = None
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is not None and overrides and self.reference_state is not None:
+            selector = getattr(self.arguments, "trainable_selector", None)
+            try:
+                self._eval_reference_graphdef = self._build_config_override_graphdef(
+                    model=self.reference_state.model,
+                    overrides=overrides,
+                    reference_graphstate=self.reference_state.graphstate,
+                    trainable_selector=selector,
+                    label="eval_config_overrides (reference)",
+                    eval_mode=True,
+                )
+            except ValueError:
+                if selector is None:
+                    raise
+                self._eval_reference_graphdef = self._build_config_override_graphdef(
+                    model=self.reference_state.model,
+                    overrides=overrides,
+                    reference_graphstate=self.reference_state.graphstate,
+                    trainable_selector=None,
+                    label="eval_config_overrides (reference)",
+                    eval_mode=True,
+                )
 
     def create_grain_collect_function(
         self,
@@ -826,6 +893,19 @@ class BCOTrainer(Trainer):
                     desc="Eval dataset reference log probs",
                 )
 
+        has_any_split = self.dataset_train is not None or self.dataset_eval is not None
+        train_ready = self.dataset_train is None or bool(self._precomputed_train_ref_log_probs)
+        eval_ready = self.dataset_eval is None or bool(self._precomputed_eval_ref_log_probs)
+        if (
+            self.arguments.precompute_ref_log_probs
+            and has_any_split
+            and train_ready
+            and eval_ready
+            and getattr(self, "reference_state", None) is not None
+        ):
+            self.reference_state = None
+            self._eval_reference_graphdef = None
+
         return super().configure_dataloaders()
 
     def _precompute_reference_log_probs_for_split(
@@ -913,14 +993,21 @@ class BCOTrainer(Trainer):
         state, metrics = super().on_step_end(state, metrics, step)
         other = getattr(metrics, "other_metrics", None) or {}
         count = other.get("reward_moments/count")
-        if count is not None:
+        total_val = other.get("reward_moments/sum")
+        total_sq_val = other.get("reward_moments/sumsq")
+        if count is not None and total_val is not None and total_sq_val is not None:
             # ``minibatch_call`` averages metrics over the accumulation microbatches, so all three
             # reported moments are the true totals divided by ``gradient_accumulation_steps``.
             # Ratios (mean, variance) are therefore exact; only the count needs rescaling.
-            reported_count = float(jax.device_get(count))
-            if reported_count > 0:
-                total = float(jax.device_get(other["reward_moments/sum"]))
-                total_sq = float(jax.device_get(other["reward_moments/sumsq"]))
+            reported_count, total, total_sq = (
+                float(value) for value in jax.device_get((count, total_val, total_sq_val))
+            )
+            if (
+                math.isfinite(reported_count)
+                and reported_count > 0.0
+                and math.isfinite(total)
+                and math.isfinite(total_sq)
+            ):
                 mean = total / reported_count
                 variance = total_sq / reported_count - mean * mean
                 true_count = reported_count * max(int(self.arguments.gradient_accumulation_steps), 1)
@@ -996,15 +1083,23 @@ class BCOTrainer(Trainer):
         """
         batch = self._apply_user_data_collator(batch)
         # Purify batch first to handle list of dicts (uncollated batch)
-        batch = self._purify_batch(batch)
+        batch = dict(self._purify_batch(batch))
         batch["running_mean"] = jnp.asarray(self.running.mean, dtype=jnp.float32)
         informations: dict[str, tp.Any] = {}
 
-        if self.clf_weights is not None and "embedding_input_ids" in batch:
+        # Always pop dynamic-width host-only UDM embedding inputs before JIT
+        # compilation so varying prompt-embedding widths never trigger recompiles.
+        embedding_input_ids = batch.pop("embedding_input_ids", None)
+        embedding_attention_mask = batch.pop("embedding_attention_mask", None)
+        if (
+            self.clf_weights is not None
+            and embedding_input_ids is not None
+            and embedding_attention_mask is not None
+        ):
             weights, bias = self.clf_weights
             embeddings = self._vectorize_prompt(
-                np.asarray(batch["embedding_input_ids"]),
-                np.asarray(batch["embedding_attention_mask"]),
+                np.asarray(embedding_input_ids),
+                np.asarray(embedding_attention_mask),
             )
             if embeddings.size > 0:
                 logits = embeddings @ weights + bias

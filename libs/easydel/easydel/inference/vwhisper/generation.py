@@ -117,10 +117,18 @@ def _compiled_generate(  # pyright: ignore[reportUnusedFunction]
         generation_kwargs["max_length"] = inference_config.max_length
     if inference_config.logits_processor is not None:
         generation_kwargs["logits_processor"] = inference_config.logits_processor
+    forced_decoder_ids = decoder_input_ids
+    if forced_decoder_ids is None or (
+        isinstance(forced_decoder_ids, dict | list | tuple) and len(forced_decoder_ids) == 0
+    ):
+        # WhisperForConditionalGeneration._force_generate always constructs a
+        # ForceTokensLogitsProcessor, which treats {0: None} as a no-op while
+        # avoiding ValueError on an empty mapping.
+        forced_decoder_ids = {0: None}
     with model.mesh:
         return model._force_generate(
             input_features=input_features,
-            forced_decoder_ids=decoder_input_ids,
+            forced_decoder_ids=forced_decoder_ids,
             return_timestamps=return_timestamps,
             generation_config=inference_config.generation_config,
             **generation_kwargs,
@@ -214,8 +222,9 @@ def get_decoder_input_ids(
             ... )
 
     Note:
-        - For non-multilingual models, this function returns an empty list
-          as language/task tokens are not needed.
+        - For non-multilingual models, language/task tokens are omitted; when
+          ``return_timestamps=False``, ``(1, no_timestamps_token_id)`` is still
+          forced if configured.
         - The TO_LANGUAGE_CODE mapping from transformers is used to
           convert language names to codes.
         - Invalid language specifications raise ValueError with helpful
@@ -224,6 +233,8 @@ def get_decoder_input_ids(
     generation_config = generation_config or model_config
     if is_multilingual is None:
         is_multilingual = getattr(generation_config, "is_multilingual", None)
+        if is_multilingual is None:
+            is_multilingual = getattr(model_config, "is_multilingual", None)
     decoder_input_ids = []
     if is_multilingual:
         if language is not None:
@@ -253,12 +264,12 @@ def get_decoder_input_ids(
         else:
             decoder_input_ids.append((2, generation_config.task_to_id["transcribe"]))
 
-    if (
-        not return_timestamps
-        and decoder_input_ids
-        and decoder_input_ids[-1][1] != generation_config.no_timestamps_token_id
-    ):
-        next_idx = (decoder_input_ids[-1][0] + 1) if decoder_input_ids else 1
-        decoder_input_ids.append((next_idx, generation_config.no_timestamps_token_id))
+    if not return_timestamps:
+        no_timestamps_token_id = getattr(generation_config, "no_timestamps_token_id", None)
+        if no_timestamps_token_id is not None and (
+            not decoder_input_ids or decoder_input_ids[-1][1] != no_timestamps_token_id
+        ):
+            next_idx = (decoder_input_ids[-1][0] + 1) if decoder_input_ids else 1
+            decoder_input_ids.append((next_idx, no_timestamps_token_id))
 
     return decoder_input_ids

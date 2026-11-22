@@ -21,6 +21,7 @@ are useful as metadata when mirroring TRL/mergekit-style config surfaces.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .merge_methods import get_merge_method
@@ -78,20 +79,34 @@ class MergeConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        """Validate method names, weights, and density schedules.
+        """Validate method names, weights, interpolation scalars, and density schedules.
 
         Raises:
-            ValueError: If the method is not registered, any merge weight
-                is negative, or any configured density is
-                outside ``[0, 1]``.
+            ValueError: If the method is not registered, any numeric parameter
+                is non-finite (NaN/inf), any merge weight is negative, both
+                merge weights are zero, or any configured density is outside
+                ``[0, 1]``.
         """
         get_merge_method(self.method)
+        for name, value in (
+            ("policy_model_weight", self.policy_model_weight),
+            ("target_model_weight", self.target_model_weight),
+            ("t_values", self.t_values),
+            ("normalize", self.normalize),
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"`{name}` must be finite, got {value!r}.")
         if self.policy_model_weight < 0.0 or self.target_model_weight < 0.0:
             raise ValueError("Merge weights must be non-negative.")
-        if any(density < 0.0 for density in (*self.policy_model_density, *self.target_model_density)):
-            raise ValueError("Merge densities must be non-negative.")
-        if any(density > 1.0 for density in (*self.policy_model_density, *self.target_model_density)):
-            raise ValueError("Merge densities must be <= 1.0.")
+        if self.policy_model_weight + self.target_model_weight <= 0.0:
+            raise ValueError("At least one of `policy_model_weight` or `target_model_weight` must be positive.")
+        for density in (*self.policy_model_density, *self.target_model_density):
+            if not math.isfinite(float(density)):
+                raise ValueError(f"Merge densities must be finite, got {density!r}.")
+            if density < 0.0:
+                raise ValueError("Merge densities must be non-negative.")
+            if density > 1.0:
+                raise ValueError("Merge densities must be <= 1.0.")
 
     def create(self) -> dict[str, object]:
         """Serialize merge settings into a plain dictionary.

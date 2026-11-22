@@ -18,7 +18,7 @@ The eSurge greedy spec-decode step used to be TWO device dispatches separated by
 a host round-trip: (1) project + argmax the verify rows, block on the argmax
 readback, compute acceptance on host, then (2) dispatch the batched MTP drafter
 with the host-derived seeds and read the drafts back after the emission loop.
-The fused draft-in-verify program (``Qwen3_5MTPDrafter.verify_draft_batched``)
+The fused draft-in-verify program (``Qwen3_5MTPDrafter.spec_step``)
 folds the argmax, the greedy acceptance compare, the seed selection, the per-row
 EAGLE rollback, and the K recursive MTP forwards into ONE compiled program, so
 the drafter dispatch and its preceding host round-trip disappear.
@@ -56,16 +56,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec.strategy import DrafterSpeculation, _SpecVerifyMetadata
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
 
 try:
+    from ._common import make_core_for_runner, served_request
     from ._common import make_tiny_qwen35 as make_tiny_model
 except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
     from _common import make_tiny_qwen35 as make_tiny_model
 
 _VOCAB = 256
@@ -234,7 +234,7 @@ def test_fused_multi_window_persistence_and_rollback(monkeypatch):
             f"row {row}: cache write index diverged between fused and two-dispatch"
         )
     # One executable across all windows (rollback targets are traced inputs).
-    assert len(spec_fus.drafter._jit_verify_draft) == 1
+    assert len(spec_fus.drafter._jit_spec_step) == 1
 
 
 def test_fused_mixed_fresh_and_persisted_rows(monkeypatch):
@@ -422,7 +422,7 @@ _PROMPTS = [
 
 
 def _serve(runner, prompts, *, max_new=10):
-    scheduler = Scheduler.from_runner(
+    scheduler = make_core_for_runner(
         runner,
         max_num_batched_tokens=64,
         enable_prefix_caching=False,
@@ -431,7 +431,7 @@ def _serve(runner, prompts, *, max_new=10):
     )
     reqs = []
     for i, prompt in enumerate(prompts):
-        r = EngineRequest(
+        r = served_request(
             request_id=f"r-{i}",
             prompt_token_ids=list(prompt),
             sampling_params=SamplingParams(max_tokens=max_new, temperature=0.0, ignore_eos=True),
@@ -442,7 +442,7 @@ def _serve(runner, prompts, *, max_new=10):
     for _ in range(4000):
         so = scheduler.schedule()
         out = runner.execute_model(so)
-        scheduler.update_from_output(so, out)
+        scheduler.commit(so, out)
         if all(r.is_finished() for r in reqs):
             break
     else:
@@ -454,16 +454,18 @@ def _serve(runner, prompts, *, max_new=10):
 
 
 def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
-    """B=3 greedy serving: the fused program is the default steady-state path
-    (>= 2 spec rows per call, no two-dispatch drafter dispatch), and the escape
-    hatch restores the two-dispatch flow."""
+    """B=3 greedy serving: the fused program serves the steady-state verify windows (>= 2 spec rows per call; the
+    two-dispatch drafter drafts only the requests with nothing to verify yet and a request verifying alone), and the
+    escape hatch restores the two-dispatch flow."""
     monkeypatch.setenv("EASYDEL_MTP_PERSIST_KV", "1")
     monkeypatch.delenv("EASYDEL_DISABLE_DRAFT_IN_VERIFY", raising=False)
     model = make_tiny_model()
 
     fused_rows: list[int] = []
-    two_dispatch_calls: list[int] = []
-    orig_fused = Qwen3_5MTPDrafter.verify_draft_batched
+    # Per two-dispatch drafter call: (rows drafted, rows with drafter history). A row without history belongs to a
+    # request with nothing to verify yet (its first window), which always drafts through the two-dispatch drafter.
+    two_dispatch_calls: list[tuple[int, int]] = []
+    orig_fused = Qwen3_5MTPDrafter.spec_step
     orig_batched = Qwen3_5MTPDrafter.draft_batched
 
     def _spy_fused(self, **kwargs):
@@ -471,12 +473,14 @@ def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
         return orig_fused(self, **kwargs)
 
     def _spy_batched(self, **kwargs):
-        two_dispatch_calls.append(int(np.asarray(kwargs["collected_mask"]).sum()))
+        rows = np.asarray(kwargs["collected_mask"]).astype(bool)
+        history = rows & (np.asarray(kwargs["committed_lens"]) > 0)
+        two_dispatch_calls.append((int(rows.sum()), int(history.sum())))
         return orig_batched(self, **kwargs)
 
     drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=3, persist_kv=True)
     runner = _make_runner(model, n_seqs=3, drafter=drafter)
-    monkeypatch.setattr(Qwen3_5MTPDrafter, "verify_draft_batched", _spy_fused)
+    monkeypatch.setattr(Qwen3_5MTPDrafter, "spec_step", _spy_fused)
     monkeypatch.setattr(Qwen3_5MTPDrafter, "draft_batched", _spy_batched)
     toks = _serve(runner, _PROMPTS)
     for rid, out in toks.items():
@@ -484,7 +488,10 @@ def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
         assert min(out) >= 0 and max(out) < _VOCAB
     engaged = [c for c in fused_rows if c >= 2]
     assert engaged, "fused draft-in-verify never engaged for a 3-request greedy batch"
-    assert two_dispatch_calls == [], (
+    assert (3, 0) in two_dispatch_calls, f"the three first windows were not drafted together: {two_dispatch_calls}"
+    # Verify windows of two or more requests draft inside the fused program; only a request verifying alone still
+    # takes the two-dispatch drafter.
+    assert all(history == 0 or rows == 1 for rows, history in two_dispatch_calls), (
         f"steady-state serving still dispatched the two-dispatch batched drafter: {two_dispatch_calls}"
     )
 
@@ -498,7 +505,9 @@ def test_runner_fused_engages_by_default_and_flag_falls_back(monkeypatch):
     for rid, out in toks2.items():
         assert len(out) == 10, f"{rid} did not complete: {out}"
     assert fused_rows == [], "EASYDEL_DISABLE_DRAFT_IN_VERIFY=1 must silence the fused program"
-    assert any(c >= 2 for c in two_dispatch_calls), "fallback did not engage the two-dispatch batched drafter"
+    assert any(history >= 2 for _rows, history in two_dispatch_calls), (
+        "fallback did not engage the two-dispatch batched drafter"
+    )
 
 
 def test_runner_fused_executable_count_one_per_bucket_k(monkeypatch):
@@ -514,15 +523,57 @@ def test_runner_fused_executable_count_one_per_bucket_k(monkeypatch):
     buckets = {int(b) for b in runner.active_num_seq_buckets}
     k_values = {int(runner.num_draft_tokens)}
     expected = len(buckets) * len(k_values)
-    warmed = set(drafter._jit_verify_draft.keys())
+    warmed = set(drafter._jit_spec_step.keys())
     assert len(warmed) == expected, (
         f"warmup minted {len(warmed)} fused executables, expected {expected} "
         f"(buckets={sorted(buckets)}, ks={sorted(k_values)})"
     )
 
     _ = _serve(runner, _PROMPTS)
-    assert set(drafter._jit_verify_draft.keys()) == warmed, (
+    assert set(drafter._jit_spec_step.keys()) == warmed, (
         "serving compiled new fused draft-in-verify variants beyond the warmed (bucket, K) grid"
+    )
+
+
+def test_runner_serving_runs_the_warmed_drafter_executables(monkeypatch):
+    """Serving calls the drafter programs ``compile()`` warmed and compiles none of them again.
+
+    A warmed program compiles again when serving passes an input placed differently from the warm-up's (the verify
+    rows and the draft seeds are committed to the model mesh), and a request's first window must not compile the
+    per-request draft, whose programs are keyed on the prompt length.
+    """
+    from easydel.inference.esurge.runners.spec import strategy as _strategy
+    from easydel.infra.sharding import replicated_named_sharding
+
+    monkeypatch.setenv("EASYDEL_MTP_PERSIST_KV", "1")
+    monkeypatch.delenv("EASYDEL_DISABLE_DRAFT_IN_VERIFY", raising=False)
+    model = make_tiny_model()
+    drafter = Qwen3_5MTPDrafter(model, num_draft_tokens=3, persist_kv=True)
+    runner = _make_runner(model, n_seqs=3, drafter=drafter)
+
+    def executables():
+        return {
+            (name, key): fn._cache_size()
+            for name, table in (("verify", drafter._jit_spec_step), ("batched", drafter._jit_batched))
+            for key, fn in table.items()
+        }
+
+    # The verify-row and seed gathers, warmed on the placement of the model step's hidden output.
+    gathers = _strategy._hidden_row_programs(replicated_named_sharding(runner.mesh))
+    gather_placements = _strategy._hidden_row_programs.cache_info().currsize
+    warmed_gathers = [fn._cache_size() for fn in gathers]
+    assert all(size > 0 for size in warmed_gathers), f"the warm-up placed the hidden rows elsewhere: {warmed_gathers}"
+
+    warmed = executables()
+    assert warmed and set(warmed.values()) == {1}, warmed
+    toks = _serve(runner, _PROMPTS)
+    for rid, out in toks.items():
+        assert len(out) == 10, f"{rid} did not complete: {out}"
+    assert executables() == warmed, "serving compiled a warmed drafter program again"
+    assert not drafter._jit_mtp, "a first window compiled the per-request draft"
+    assert [fn._cache_size() for fn in gathers] == warmed_gathers, "serving compiled a hidden-row gather again"
+    assert _strategy._hidden_row_programs.cache_info().currsize == gather_placements, (
+        "serving placed the hidden rows differently from the warm-up"
     )
 
 
@@ -615,14 +666,14 @@ def test_runner_fused_dynamic_k_uses_live_budget(monkeypatch):
     drafter.num_draft_tokens_per_batch_size = [(1, 2, 3), (3, 1 << 30, 2)]
 
     fused_ks: list[int] = []
-    orig_fused = Qwen3_5MTPDrafter.verify_draft_batched
+    orig_fused = Qwen3_5MTPDrafter.spec_step
 
     def _spy_fused(self, **kwargs):
         fused_ks.append(int(kwargs["num_draft_tokens"]))
         return orig_fused(self, **kwargs)
 
     runner = _make_runner(model, n_seqs=3, drafter=drafter)
-    monkeypatch.setattr(Qwen3_5MTPDrafter, "verify_draft_batched", _spy_fused)
+    monkeypatch.setattr(Qwen3_5MTPDrafter, "spec_step", _spy_fused)
     toks = _serve(runner, _PROMPTS)
     for rid, out in toks.items():
         assert len(out) == 10, f"{rid} did not complete: {out}"

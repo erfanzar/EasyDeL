@@ -231,9 +231,10 @@ class CPOConfig(TrainingArguments):
                 size; forwarded to the base class.
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
+        if self.beta <= 0.0:
+            raise ValueError(f"`beta` must be positive; got {self.beta}.")
         if self.generate_during_eval:
             self.generation_interval = self.generation_interval or self.evaluation_steps or 1
-            self.use_esurge_generation = True
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)

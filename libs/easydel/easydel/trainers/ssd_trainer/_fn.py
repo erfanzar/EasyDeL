@@ -87,8 +87,9 @@ def ssd_step(
             prompt_ids.shape[-1],
             logprob_vocab_chunk_size=logprob_vocab_chunk_size,
         )
-        token_count = jnp.sum(completion_mask)
-        loss = -jnp.sum(per_token_logps * completion_mask) / jnp.maximum(token_count, 1.0)
+        mask_f32 = completion_mask.astype(jnp.float32)
+        token_count = jnp.sum(mask_f32)
+        loss = -jnp.sum(per_token_logps.astype(jnp.float32) * mask_f32) / jnp.maximum(token_count, 1.0)
         return loss, LossMetrics(
             loss=loss,
             accuracy=1,
@@ -98,12 +99,16 @@ def ssd_step(
             },
         )
 
+    def loss_token_mass(_tree, minibatch) -> jax.Array:
+        return jnp.sum(minibatch["completion_mask"].astype(jnp.float32))
+
     if is_training:
         gradients, metrics = minibatch_call(
             state=state,
             batch=batch,
             minibatch_size=minibatch_size,
             grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+            microbatch_weight_fn=loss_token_mass if gradient_accumulation_steps > 1 else None,
         )
         state = update_state_respectfully(
             state=state,

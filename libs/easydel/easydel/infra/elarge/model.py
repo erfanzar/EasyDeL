@@ -31,6 +31,7 @@ Key Features:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import os
@@ -85,6 +86,7 @@ from .types import (
     get_training_arguments_class,
     normalize_trainer_config,
 )
+from .types.training import ELARGE_ENVIRONMENT_TRAINER_KEYS, _normalize_trainer_type
 
 if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -1400,6 +1402,13 @@ class eLargeModel:
             >>> results = engine.generate(prompts, max_tokens=100)
         """
         with phase_timer("build_esurge.total", tag="eLargeModel"):
+            if self._model is None:
+                # dp > 1: each replica loads the model inside its own JAX world, never in the slice-wide one.
+                from easydel.inference.esurge.serving.host_replicas import launch_dp_replicas
+
+                replicas = launch_dp_replicas(self._config)
+                if replicas is not None:
+                    return replicas
             self.build_model()
             with phase_timer("build_esurge.engine", tag="eLargeModel"):
                 return build_esurge(self._config, self._model)
@@ -1610,15 +1619,110 @@ class eLargeModel:
         Constructor errors propagate without a retry. ``explicit_keys`` remains
         accepted for compatibility but does not change option filtering.
         """
+        params = inspect.signature(args_class).parameters
+        # Environment keys are eLarge-only for most trainers, but argument classes that declare them
+        # (AgentFlow, AsyncGRPO) read the environment from their own config, so forward them there.
         config_for_args = {
             key: value
             for key, value in trainer_cfg.items()
-            if key != "trainer_type" and key not in ELARGE_ONLY_TRAINER_KEYS
+            if key != "trainer_type"
+            and (key not in ELARGE_ONLY_TRAINER_KEYS or (key in ELARGE_ENVIRONMENT_TRAINER_KEYS and key in params))
         }
-        params = inspect.signature(args_class).parameters
         if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
             config_for_args = {key: value for key, value in config_for_args.items() if key in params}
         return args_class(**config_for_args)
+
+    @staticmethod
+    def _agent_flow_inner_trainer_params(base_type: str) -> Mapping[str, inspect.Parameter] | None:
+        """Constructor parameters of AgentFlow's inner trainer, or ``None`` when it accepts ``**kwargs``."""
+        try:
+            normalized = _normalize_trainer_type(str(base_type).strip())
+            params = inspect.signature(get_trainer_class(normalized)).parameters
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return None
+        return params
+
+    def _agent_flow_base_config(self, training_args: Any, raw_trainer_cfg: Mapping[str, Any]) -> Any | None:
+        """Build the inner trainer's arguments for an ``agent_flow`` run from the same YAML section.
+
+        Without this, ``AgentFlowTrainer`` would build the inner config from a fixed handful of fields and
+        drop every algorithm hyperparameter (``beta``, ``loss_type``, ``max_new_tokens``, ...). The inner
+        config is seeded with the fields AgentFlow has always forwarded, then receives every key the user
+        set explicitly in the trainer section; keys the inner argument class does not declare are dropped,
+        and unset keys keep that class's own dataclass defaults. AgentFlow-only fields (environment,
+        episode controls, ``trainer_prefix``) stay on the wrapper.
+
+        Returns:
+            The constructed inner ``TrainingArguments``, or ``None`` when the user already supplied
+            ``base_config`` (AgentFlow then uses it as given).
+        """
+        if getattr(training_args, "base_config", None) is not None:
+            return None
+        from easydel.trainers.agent_flow_trainer import AgentFlowConfig
+        from easydel.trainers.training_configurations import TrainingArguments
+
+        base_type = _normalize_trainer_type(str(training_args.base_trainer_type).strip())
+        wrapper_only = (
+            {f.name for f in dataclasses.fields(AgentFlowConfig)}
+            - {f.name for f in dataclasses.fields(TrainingArguments)}
+        ) - {"gamma", "max_prompt_length", "max_completion_length", "num_generations", "skip_apply_chat_template"}
+        wrapper_only |= {"trainer_type", "trainer_prefix", *ELARGE_ONLY_TRAINER_KEYS}
+
+        cfg: dict[str, Any] = {}
+        for key in (
+            "learning_rate",
+            "max_training_steps",
+            "save_directory",
+            "async_mode",
+            "max_prompt_length",
+            "max_completion_length",
+            "total_batch_size",
+            "gradient_accumulation_steps",
+            "num_generations",
+        ):
+            value = getattr(training_args, key, None)
+            if value is not None:
+                cfg[key] = value
+        normalized = normalize_trainer_config(dict(raw_trainer_cfg))
+        for key in raw_trainer_cfg:
+            if key not in wrapper_only and key in normalized:
+                cfg[key] = normalized[key]
+
+        args_class = get_training_arguments_class(base_type)
+        params = inspect.signature(args_class).parameters
+        cfg = {key: value for key, value in cfg.items() if key in params}
+        # OnlineDPOConfig.__post_init__ overwrites max_completion_length with max_new_tokens (default 64)
+        # and DPOConfig defaults max_length to 512; keep completion and total lengths aligned unless explicitly set.
+        if "max_new_tokens" in params and "max_new_tokens" not in raw_trainer_cfg and "max_new_tokens" not in cfg:
+            comp_len = cfg.get("max_completion_length")
+            if comp_len is not None:
+                cfg["max_new_tokens"] = int(comp_len)
+        if "max_length" in params and "max_length" not in raw_trainer_cfg and "max_length" not in cfg:
+            default_ml = params["max_length"].default
+            if isinstance(default_ml, int):
+                eff_prompt = cfg.get("max_prompt_length")
+                if (
+                    eff_prompt is None
+                    and "max_prompt_length" in params
+                    and isinstance(params["max_prompt_length"].default, int)
+                ):
+                    eff_prompt = params["max_prompt_length"].default
+                eff_comp = cfg.get("max_new_tokens")
+                if eff_comp is None:
+                    eff_comp = cfg.get("max_completion_length")
+                if (
+                    eff_comp is None
+                    and "max_new_tokens" in params
+                    and isinstance(params["max_new_tokens"].default, int)
+                ):
+                    eff_comp = params["max_new_tokens"].default
+                if eff_prompt is not None and eff_comp is not None:
+                    needed = int(eff_prompt) + int(eff_comp)
+                    if needed > default_ml:
+                        cfg["max_length"] = needed
+        return args_class(**cfg)
 
     def _build_pre_tokenize_transform(
         self,
@@ -1761,11 +1865,14 @@ class eLargeModel:
             )
 
         prompt_only_trainers = {
+            "agent_flow",
             "agentic-moshpit",
             "async_grpo",
             "compaction_rl",
             "dppo",
+            "gdpo",
             "gfpo",
+            "gmpo",
             "grpo",
             "grpo_with_replay_buffer",
             "gspo",
@@ -1776,6 +1883,7 @@ class eLargeModel:
             "on_policy_distillation",
             "papo",
             "ppo",
+            "reinforce_plus_plus",
             "rlvr",
             "rloo",
             "sao",
@@ -1784,11 +1892,14 @@ class eLargeModel:
             "seq_kd",
             "sparse_distillation",
             "ssd",
+            "vapo",
             "xpo",
         }
         if trainer_type in prompt_only_trainers:
             transform_cls = (
-                PPOPreprocessTransform if trainer_type in {"compaction_rl", "ppo", "sao"} else GRPOPreprocessTransform
+                PPOPreprocessTransform
+                if trainer_type in {"compaction_rl", "ppo", "sao", "vapo"}
+                else GRPOPreprocessTransform
             )
             return transform_cls(
                 tokenizer=tokenizer,
@@ -2481,7 +2592,19 @@ class eLargeModel:
         arguments_accept_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in argument_params.values())
         trainer_accepts_extra = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in constructor_params.values())
         argument_overrides = {}
+        inner_argument_overrides = {}
         runtime_overrides = {}
+        agent_flow_inner_arg_params: Mapping[str, inspect.Parameter] | None = None
+        agent_flow_inner_ctor_params: Mapping[str, inspect.Parameter] | None = None
+        if trainer_type == "agent_flow":
+            raw_base_type = kwargs.get("base_trainer_type") or trainer_cfg.get("base_trainer_type") or "grpo"
+            try:
+                norm_base_type = _normalize_trainer_type(str(raw_base_type).strip())
+                agent_flow_inner_arg_params = inspect.signature(get_training_arguments_class(norm_base_type)).parameters
+                agent_flow_inner_ctor_params = self._agent_flow_inner_trainer_params(norm_base_type)
+            except (KeyError, TypeError, ValueError):
+                agent_flow_inner_arg_params = None
+                agent_flow_inner_ctor_params = None
         for key, value in kwargs.items():
             # Declared runtime extensions beat an arguments **kwargs catch-all;
             # declared argument fields remain arguments, never trainer kwargs.
@@ -2491,6 +2614,12 @@ class eLargeModel:
                 argument_overrides[key] = value
             elif key in constructor_params:
                 runtime_overrides[key] = value
+            elif (
+                agent_flow_inner_arg_params is not None
+                and key in agent_flow_inner_arg_params
+                and (agent_flow_inner_ctor_params is None or key not in agent_flow_inner_ctor_params)
+            ):
+                inner_argument_overrides[key] = value
             elif arguments_accept_extra:
                 argument_overrides[key] = value
             elif trainer_accepts_extra:
@@ -2539,6 +2668,7 @@ class eLargeModel:
                         self._config["mixture"] = original_mixture
 
         trainer_kwargs = {}
+        owned_env_runtime = None
         model = self._state if self._state is not None else self._model
 
         if base_state_class is not None and not isinstance(model, EasyDeLState):
@@ -2647,21 +2777,117 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type == "agent_flow":
+            base_type = _normalize_trainer_type(
+                str(getattr(training_args, "base_trainer_type", "grpo") or "grpo").strip()
+            )
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            if reward_funcs is not None or reward_model is not None:
+                trainer_kwargs["reward_funcs"] = reward_funcs if reward_funcs is not None else reward_model
+            elif base_type in {"ppo", "vapo"}:
+                reward_model = self.build_reward_model()
+                if reward_model is not None:
+                    trainer_kwargs["reward_funcs"] = reward_model
+            base_params = self._agent_flow_inner_trainer_params(base_type)
+            # Only forward runtime options the inner trainer's constructor declares (OnlineDPO, for
+            # example, takes reward_processing_classes but not data_tokenize_fn).
+            for key in ("reward_processing_classes", "data_tokenize_fn"):
+                if kwargs.get(key) is not None and (base_params is None or key in base_params):
+                    trainer_kwargs[key] = kwargs[key]
+            base_config = self._agent_flow_base_config(
+                training_args,
+                {**dict(self._config.get("trainer", {})), **argument_overrides, **inner_argument_overrides},
+            )
+            if base_config is not None:
+                training_args.base_config = base_config
+            if (base_params is None and reference_model is not None) or (
+                base_params is not None and "reference_model" in base_params
+            ):
+                # Preference inners (OnlineDPO) take a frozen reference; build it from YAML when configured,
+                # otherwise the inner trainer falls back to a frozen copy of the policy.
+                if reference_model is None:
+                    reference_model = self.build_reference_model()
+                if reference_model is not None and base_state_class is not None:
+                    reference_model = reference_model.to_state(base_state_class)
+                if reference_model is not None:
+                    trainer_kwargs["reference_model"] = reference_model
+            if (base_params is None and teacher_model is not None) or (
+                base_params is not None and "teacher_model" in base_params
+            ):
+                # Distillation inners (GKD, OPD, SeqKD, MiniLLM) take a teacher model; build from YAML when configured.
+                if teacher_model is None:
+                    teacher_model = self.build_teacher_model()
+                if teacher_model is not None and base_state_class is not None:
+                    teacher_model = teacher_model.to_state(base_state_class)
+                if teacher_model is not None:
+                    trainer_kwargs["teacher_model"] = teacher_model
+            if kwargs.get("environment") is not None:
+                trainer_kwargs["environment"] = kwargs["environment"]
+            af_env_factory = kwargs.get("environment_factory", kwargs.get("env_factory"))
+            if af_env_factory is not None:
+                trainer_kwargs["environment_factory"] = af_env_factory
+
         elif trainer_type in {
             "grpo",
+            "gdpo",
             "gfpo",
+            "gmpo",
             "gspo",
             "async_grpo",
             "dppo",
             "grpo_with_replay_buffer",
             "gspo_token",
             "papo",
+            "reinforce_plus_plus",
             "rloo",
         }:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
+            env_spec = self.config.get("trainer", {}).get("environment")
+            env_factory = kwargs.get("environment_factory", kwargs.get("env_factory", None))
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if env_spec is not None and (env_factory is None or resolved_reward is None):
+                from easydel.trainers.async_grpo_trainer import environment_reward_placeholder
+
+                if env_factory is None:
+                    if callable(env_spec) and not isinstance(env_spec, type):
+                        env_factory = env_spec
+                    else:
+                        from easydel.environments import AutoEnvironment, KiriRuntime, SandboxPool
+
+                        env_runtime = None
+                        if not (isinstance(env_spec, Mapping) and env_spec.get("runtime") is not None):
+                            tcfg = self.config.get("trainer", {})
+                            env_backend = str(tcfg.get("environment_backend", "kiri"))
+                            env_endpoints = tcfg.get("environment_endpoints")
+                            env_runtime = (
+                                SandboxPool(endpoints=env_endpoints, backend=env_backend)
+                                if env_endpoints
+                                else KiriRuntime(backend=env_backend)
+                            )
+                            owned_env_runtime = env_runtime
+                        try:
+                            env_factory = AutoEnvironment.as_factory(env_spec, runtime=env_runtime)
+                        except BaseException:
+                            if owned_env_runtime is not None:
+                                close_rt = getattr(owned_env_runtime, "close", None)
+                                if callable(close_rt):
+                                    try:
+                                        close_rt()
+                                    except Exception:
+                                        pass
+                                owned_env_runtime = None
+                            raise
+                if resolved_reward is None:
+                    # GRPO appends the stepped environment rewards as their own column; a zero-weight
+                    # placeholder keeps the environment reward counted exactly once.
+                    resolved_reward = environment_reward_placeholder
+
             if resolved_reward is None:
                 raise ValueError(
                     f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
@@ -2676,7 +2902,7 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
             trainer_kwargs["tools"] = kwargs.get("tools", None)
-            trainer_kwargs["environment_factory"] = kwargs.get("environment_factory", kwargs.get("env_factory", None))
+            trainer_kwargs["environment_factory"] = env_factory
 
         elif trainer_type == "nemo_gym":
             trainer_kwargs["arguments"] = training_args
@@ -2772,7 +2998,7 @@ class eLargeModel:
                 trainer_kwargs["compaction_controller"] = kwargs.get("compaction_controller")
                 trainer_kwargs["tool_guard"] = kwargs.get("tool_guard")
 
-        elif trainer_type == "ppo":
+        elif trainer_type in {"ppo", "vapo"}:
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
@@ -2999,8 +3225,45 @@ class eLargeModel:
             if key not in trainer_kwargs and value is not None:
                 trainer_kwargs[key] = value
 
-        with phase_timer(f"build_trainer.init.{trainer_type}", tag="eLargeModel"):
-            trainer = trainer_class(**trainer_kwargs)
+        try:
+            with phase_timer(f"build_trainer.init.{trainer_type}", tag="eLargeModel"):
+                trainer = trainer_class(**trainer_kwargs)
+        except BaseException:
+            if owned_env_runtime is not None:
+                close_rt = getattr(owned_env_runtime, "close", None)
+                if callable(close_rt):
+                    try:
+                        close_rt()
+                    except Exception:
+                        pass
+            raise
+
+        if owned_env_runtime is not None:
+            trainer._owned_env_runtime = owned_env_runtime
+            orig_teardown = getattr(trainer, "_teardown_resources", None)
+
+            def _close_elarge_env_runtime() -> None:
+                rt = getattr(trainer, "_owned_env_runtime", None)
+                trainer._owned_env_runtime = None
+                if rt is not None:
+                    close_rt = getattr(rt, "close", None)
+                    if callable(close_rt):
+                        try:
+                            close_rt()
+                        except Exception:
+                            pass
+
+            if callable(orig_teardown):
+
+                def _wrapped_elarge_teardown() -> None:
+                    try:
+                        orig_teardown()
+                    finally:
+                        _close_elarge_env_runtime()
+
+                trainer._teardown_resources = _wrapped_elarge_teardown
+            else:
+                trainer._teardown_resources = _close_elarge_env_runtime
 
         # Label the per-dataset census with the mixture's own names, from the same walk that assigns the ids.
         # The grain lanes set their own (sorted-name) map while configuring their loader; keep it.

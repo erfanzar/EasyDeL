@@ -154,6 +154,52 @@ def ep_carries_batch_inactive_reason(
     return None
 
 
+AUTO_CHUNK_BUFFER_BYTES = 2**31
+"""Largest per-core dispatch buffer the automatic ``moe_chunk_size`` keeps in one pass, and the most a chunk holds.
+
+Measured on GLM-5.3-Flash training on TPU v5p (hidden 4096, top-8, bf16 rows, 131072 tokens per core, 4-way tensor
+parallelism): a 12-layer grad step took 12.90 s with 32768-token chunks (a 2 GiB buffer) at a compiled peak of 66.7 GB
+per chip, against 13.02 s and 94.3 GB for the single pass. An earlier configuration of the same step took 24.07 s
+with 4096-token chunks, 22.06-22.51 s with 16384 and 21.32-21.60 s with 32768.
+"""
+
+AUTO_CHUNK_ALIGN = 1024
+"""Automatic chunks hold a multiple of this many tokens, so ``tokens * top_k`` suits the row-gather kernels."""
+
+
+def auto_moe_chunk_size(
+    dispatch_tokens: int,
+    *,
+    num_experts_per_tok: int,
+    hidden_size: int,
+    dtype_bytes: int,
+) -> int | None:
+    """Tokens per chunk of the automatic ``moe_chunk_size`` for one fused-MoE shard (``None``: a single pass).
+
+    A shard whose single-pass dispatch buffer, ``dispatch_tokens * num_experts_per_tok * hidden_size * dtype_bytes``
+    bytes, fits in :data:`AUTO_CHUNK_BUFFER_BYTES` keeps the single pass. A larger one runs in the fewest chunks that
+    each fit, all of one size rounded up to :data:`AUTO_CHUNK_ALIGN` tokens, so the padded tail adds at most
+    ``AUTO_CHUNK_ALIGN`` tokens per chunk instead of most of a chunk.
+
+    Args:
+        dispatch_tokens: Tokens one shard dispatches, its share of the batch (every expert shard holds it under the ring).
+        num_experts_per_tok: Experts per token (``top_k``).
+        hidden_size: Hidden width of the dispatched rows.
+        dtype_bytes: Bytes per element of the dispatched rows.
+
+    Returns:
+        Tokens per chunk, or ``None`` for the single pass.
+    """
+    row_bytes = int(num_experts_per_tok) * int(hidden_size) * int(dtype_bytes)
+    tokens = int(dispatch_tokens)
+    if tokens * row_bytes <= AUTO_CHUNK_BUFFER_BYTES:
+        return None
+    max_tokens = max(AUTO_CHUNK_ALIGN, AUTO_CHUNK_BUFFER_BYTES // row_bytes // AUTO_CHUNK_ALIGN * AUTO_CHUNK_ALIGN)
+    num_chunks = -(-tokens // max_tokens)
+    chunk = -(-tokens // num_chunks)
+    return -(-chunk // AUTO_CHUNK_ALIGN) * AUTO_CHUNK_ALIGN
+
+
 @dataclasses.dataclass(frozen=True)
 class MoeLayoutEstimate:
     """Static-shape estimate of the fused-MoE memory/communication footprint.

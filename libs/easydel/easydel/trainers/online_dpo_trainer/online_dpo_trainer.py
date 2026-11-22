@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 from itertools import chain
 
@@ -27,6 +28,8 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.utils import Registry
 from easydel.utils.helpers import capture_time
 
+from .._shared import drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..direct_preference_optimization_trainer import DPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..reward_protocol import (
@@ -41,7 +44,7 @@ from .online_dpo_config import OnlineDPOConfig
 
 
 @Registry.register("trainer", "online_dpo")
-class OnlineDPOTrainer(DPOTrainer):
+class OnlineDPOTrainer(AsyncRolloutMixin, DPOTrainer):
     """Online DPO trainer using eSurge generation and EasyDeL's JAX DPO loss.
 
     The trainer accepts raw prompt batches, generates two completions per prompt
@@ -92,7 +95,11 @@ class OnlineDPOTrainer(DPOTrainer):
         """
         if not isinstance(arguments, OnlineDPOConfig):
             raise TypeError(f"arguments must be OnlineDPOConfig, got {type(arguments)}")
-        reward_func_list = list(reward_funcs) if isinstance(reward_funcs, list) else [reward_funcs]
+        reward_func_list = (
+            list(reward_funcs)
+            if isinstance(reward_funcs, collections.abc.Sequence) and not isinstance(reward_funcs, (str, bytes))
+            else [reward_funcs]
+        )
         if not reward_func_list:
             raise ValueError("`reward_funcs` must contain at least one callable or EasyDeL reward state.")
         for reward_func in reward_func_list:
@@ -103,8 +110,8 @@ class OnlineDPOTrainer(DPOTrainer):
                 )
         if reward_processing_classes is None:
             reward_processing_class_list = [None] * len(reward_func_list)
-        elif isinstance(reward_processing_classes, list):
-            reward_processing_class_list = reward_processing_classes
+        elif isinstance(reward_processing_classes, (list, tuple)):
+            reward_processing_class_list = list(reward_processing_classes)
         else:
             reward_processing_class_list = [reward_processing_classes]
         if len(reward_processing_class_list) != len(reward_func_list):
@@ -117,6 +124,7 @@ class OnlineDPOTrainer(DPOTrainer):
             if isinstance(reward_func, EasyDeLBaseModule):
                 reward_func = reward_func.to_state(trainable_selector=arguments.trainable_selector)
             if isinstance(reward_func, EasyDeLState):
+                reward_func = drop_optimizer_state(reward_func)
                 reward_func = normalize_reward_state(reward_func, forward=self._reward_model_forward)
             reward_func_list[index] = reward_func
         self.reward_funcs = reward_func_list
@@ -126,6 +134,7 @@ class OnlineDPOTrainer(DPOTrainer):
             resolve_reward_weights(reward_func_list, arguments.reward_weights),
             dtype=jnp.float32,
         )
+        self._custom_data_collator = data_collator
         super().__init__(
             arguments=arguments,
             model=model,
@@ -137,23 +146,23 @@ class OnlineDPOTrainer(DPOTrainer):
         )
 
     @staticmethod
-    def _bound_reward_forward(graphdef, graphstate, graphother, batch, *, apply_fn):
-        """Adapt a graphdef-bound custom reward forward without changing its behavior."""
-        return apply_fn(graphstate, graphother, batch)
-
-    @staticmethod
     def _reward_model_forward(graphdef, graphstate, graphother, batch):
         """Run a reward state with the same graphdef-first signature for all rewards."""
         return reward_model_forward(graphdef, graphstate, graphother, batch)
 
     @staticmethod
-    def _online_prompt_collator(examples: list[dict[str, object]]) -> dict[str, object]:
+    def _online_prompt_collator(
+        examples: list[dict[str, object]] | dict[str, object],
+    ) -> dict[str, object]:
         """Collate raw prompt rows without tokenizing before online generation.
 
         Online DPO must keep prompt text and side-channel fields intact until
-        generation. The collator therefore returns lists per key instead of
-        applying tokenizer padding or truncation.
+        generation. Supports both single-row dicts (from Grain's
+        ``CollateMapTransform``) and lists of row dicts (TFDS / batched
+        collation).
         """
+        if isinstance(examples, dict):
+            return dict(examples)
         if not examples:
             return {}
         keys = set().union(*(example.keys() for example in examples))
@@ -164,27 +173,28 @@ class OnlineDPOTrainer(DPOTrainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Return the raw prompt collator used by Grain dataloaders.
+        """Return the prompt collator used by Grain dataloaders.
 
-        ``max_sequence_length`` and ``truncation_mode`` are accepted for trainer
-        interface compatibility, but online DPO generation handles sequence
-        length later through eSurge generation settings.
+        Respects a caller-supplied ``data_collator`` when provided; otherwise
+        falls back to :meth:`_online_prompt_collator`.
         """
         del max_sequence_length, truncation_mode
-        return self._online_prompt_collator
+        custom = getattr(self, "_custom_data_collator", None)
+        return custom if custom is not None else self._online_prompt_collator
 
     def create_tfds_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Return the raw prompt collator used by TFDS-style dataloaders.
+        """Return the prompt collator used by TFDS-style dataloaders.
 
-        The TFDS path uses the same raw prompt representation as Grain so
-        generated completions can be produced from identical prompt payloads.
+        Respects a caller-supplied ``data_collator`` when provided; otherwise
+        falls back to :meth:`_online_prompt_collator`.
         """
         del max_sequence_length, truncation_mode
-        return self._online_prompt_collator
+        custom = getattr(self, "_custom_data_collator", None)
+        return custom if custom is not None else self._online_prompt_collator
 
     def _build_source_from_dataset(self, dataset: object | None):
         """Build a sharded source for raw online prompts without preprocessing.
@@ -227,7 +237,6 @@ class OnlineDPOTrainer(DPOTrainer):
             "top_k": self.arguments.generation_top_k,
             "repetition_penalty": self.arguments.generation_repetition_penalty,
         }
-        overrides["num_return_sequences"] = 2
         return {key: value for key, value in overrides.items() if value is not None}
 
     @staticmethod
@@ -312,7 +321,9 @@ class OnlineDPOTrainer(DPOTrainer):
                 jnp.asarray([jnp.nan if value is None else value for value in reward_values], dtype=jnp.float32)
             )
         rewards_per_func = jnp.stack(reward_rows, axis=1)
-        return jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
+        weighted = rewards_per_func * self.reward_weights[None, :]
+        has_valid_reward = jnp.any(~jnp.isnan(weighted), axis=1)
+        return jnp.where(has_valid_reward, jnp.nansum(weighted, axis=1), jnp.nan)
 
     def _build_online_dpo_batch(
         self,
@@ -328,21 +339,30 @@ class OnlineDPOTrainer(DPOTrainer):
         For each prompt, the first two generated completions are compared by
         reward. The higher-scoring completion becomes ``chosen`` and the other
         becomes ``rejected``; optional EOS penalties are applied before ranking.
+        Completion-only tensors are emitted under ``chosen_input_ids`` /
+        ``rejected_input_ids`` to match :meth:`DPOTrainer.concatenated_forward`.
         """
         prompt_count = int(prompt_ids.shape[0])
         generation_factor = int(completion_ids.shape[0]) // max(prompt_count, 1)
         if generation_factor < 2:
             raise RuntimeError("OnlineDPO requires at least two generated completions per prompt.")
+        eos_token_id = getattr(self, "_eos_token_id", None)
+        eos_tokens = None if eos_token_id is None else jnp.asarray(eos_token_id).reshape(-1)
         adjusted_rewards = rewards
-        if self.arguments.missing_eos_penalty is not None:
-            eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
-            has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=-1)
+        if self.arguments.missing_eos_penalty is not None and eos_tokens is not None and eos_tokens.size > 0:
+            has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens) & completion_mask.astype(bool), axis=-1)
             adjusted_rewards = rewards - float(self.arguments.missing_eos_penalty) * (~has_eos).astype(jnp.float32)
         first_indices = jnp.arange(prompt_count) * generation_factor
         second_indices = first_indices + 1
         first_rewards = adjusted_rewards[first_indices]
         second_rewards = adjusted_rewards[second_indices]
-        choose_first = first_rewards >= second_rewards
+        first_valid = ~jnp.isnan(first_rewards)
+        second_valid = ~jnp.isnan(second_rewards)
+        choose_first = jnp.where(
+            first_valid & second_valid,
+            first_rewards >= second_rewards,
+            first_valid,
+        )
         chosen_indices = jnp.where(choose_first, first_indices, second_indices)
         rejected_indices = jnp.where(choose_first, second_indices, first_indices)
 
@@ -350,34 +370,32 @@ class OnlineDPOTrainer(DPOTrainer):
         rejected_completion_ids = completion_ids[rejected_indices]
         chosen_completion_mask = completion_mask[chosen_indices]
         rejected_completion_mask = completion_mask[rejected_indices]
-        chosen_input_ids = jnp.concatenate([prompt_ids, chosen_completion_ids], axis=-1)
-        rejected_input_ids = jnp.concatenate([prompt_ids, rejected_completion_ids], axis=-1)
-        chosen_attention_mask = jnp.concatenate([prompt_mask, chosen_completion_mask], axis=-1)
-        rejected_attention_mask = jnp.concatenate([prompt_mask, rejected_completion_mask], axis=-1)
 
-        eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
-        chosen_has_eos = jnp.any(jnp.isin(chosen_completion_ids, eos_tokens), axis=-1)
-        rejected_has_eos = jnp.any(jnp.isin(rejected_completion_ids, eos_tokens), axis=-1)
+        if eos_tokens is not None and eos_tokens.size > 0:
+            chosen_has_eos = jnp.any(
+                jnp.isin(chosen_completion_ids, eos_tokens) & chosen_completion_mask.astype(bool),
+                axis=-1,
+            )
+            rejected_has_eos = jnp.any(
+                jnp.isin(rejected_completion_ids, eos_tokens) & rejected_completion_mask.astype(bool),
+                axis=-1,
+            )
+        else:
+            chosen_has_eos = jnp.zeros((prompt_count,), dtype=jnp.bool_)
+            rejected_has_eos = jnp.zeros((prompt_count,), dtype=jnp.bool_)
         score_margin = adjusted_rewards[chosen_indices] - adjusted_rewards[rejected_indices]
 
+        label_pad_token_id = self.arguments.label_pad_token_id
         batch = {
             "prompt_input_ids": prompt_ids,
             "prompt_attention_mask": prompt_mask,
-            "chosen_input_ids": chosen_input_ids,
-            "chosen_attention_mask": chosen_attention_mask,
-            "chosen_labels": self._make_online_dpo_labels(
-                prompt_mask,
-                chosen_completion_ids,
-                chosen_completion_mask,
-                label_pad_token_id=self.arguments.label_pad_token_id,
-            ),
-            "rejected_input_ids": rejected_input_ids,
-            "rejected_attention_mask": rejected_attention_mask,
-            "rejected_labels": self._make_online_dpo_labels(
-                prompt_mask,
-                rejected_completion_ids,
-                rejected_completion_mask,
-                label_pad_token_id=self.arguments.label_pad_token_id,
+            "chosen_input_ids": chosen_completion_ids,
+            "chosen_attention_mask": chosen_completion_mask,
+            "chosen_labels": jnp.where(chosen_completion_mask.astype(bool), chosen_completion_ids, label_pad_token_id),
+            "rejected_input_ids": rejected_completion_ids,
+            "rejected_attention_mask": rejected_completion_mask,
+            "rejected_labels": jnp.where(
+                rejected_completion_mask.astype(bool), rejected_completion_ids, label_pad_token_id
             ),
         }
         metrics = {

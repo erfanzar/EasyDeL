@@ -29,6 +29,8 @@ SnapshotT = tp.TypeVar("SnapshotT")
 PayloadT = tp.TypeVar("PayloadT")
 ResultT = tp.TypeVar("ResultT")
 
+_CLOSE_SENTINEL = object()
+
 
 def _immutable_metadata(metadata: tp.Mapping[str, tp.Any] | None) -> tp.Mapping[str, tp.Any]:
     """Return a shallow immutable metadata mapping."""
@@ -63,14 +65,98 @@ class PolicySnapshot(tp.Generic[SnapshotT]):
         object.__setattr__(self, "metadata", _immutable_metadata(self.metadata))
 
 
+def admission_is_feasible(
+    deadlines: tp.Iterable[int],
+    *,
+    head_version: int,
+    groups_per_update: int = 1,
+) -> bool:
+    """Return whether every outstanding rollout can still be consumed before its deadline.
+
+    The trainer consumes ``groups_per_update`` rollouts per policy version,
+    starting at ``head_version``, in earliest-deadline order. With the deadlines
+    sorted ascending, the ``i``-th (1-based) deadline ``d_(i)`` is met iff
+    ``d_(i) >= head_version`` and ``i <= groups_per_update * (d_(i) - head_version + 1)``.
+
+    Args:
+        deadlines: Last policy version at which each rollout may be consumed.
+        head_version: Policy version the trainer consumes next.
+        groups_per_update: Rollouts consumed per policy version.
+
+    Returns:
+        ``True`` if all deadlines are simultaneously satisfiable.
+
+    Raises:
+        ValueError: If ``groups_per_update`` is not positive.
+    """
+
+    if groups_per_update <= 0:
+        raise ValueError(f"groups_per_update must be positive, got {groups_per_update}")
+    for index, deadline in enumerate(sorted(int(value) for value in deadlines), start=1):
+        if deadline < head_version or index > groups_per_update * (deadline - head_version + 1):
+            return False
+    return True
+
+
+def min_admissible_version(
+    outstanding_deadlines: tp.Iterable[int],
+    *,
+    head_version: int,
+    max_staleness: int,
+    groups_per_update: int = 1,
+) -> int:
+    """Return the earliest policy version at which a freshly anchored rollout is admissible.
+
+    Assumes the outstanding rollouts are consumed in deadline order,
+    ``groups_per_update`` per version, and that the retried rollout is
+    anchored at the version it is resubmitted at (deadline
+    ``version + max_staleness``).
+
+    Args:
+        outstanding_deadlines: Deadlines of the rollouts already admitted.
+        head_version: Policy version the trainer consumes next.
+        max_staleness: Allowed version lag of the retried rollout.
+        groups_per_update: Rollouts consumed per policy version.
+
+    Returns:
+        The minimum version ``>= head_version`` at which to retry.
+
+    Raises:
+        ValueError: If ``max_staleness`` is negative or ``groups_per_update`` is not positive.
+    """
+
+    if max_staleness < 0:
+        raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
+    if groups_per_update <= 0:
+        raise ValueError(f"groups_per_update must be positive, got {groups_per_update}")
+    ordered = sorted(int(value) for value in outstanding_deadlines)
+    version = int(head_version)
+    while True:
+        remaining = [value for value in ordered[groups_per_update * (version - head_version) :] if value >= version]
+        candidate = [*remaining, version + max_staleness]
+        if admission_is_feasible(candidate, head_version=version, groups_per_update=groups_per_update):
+            return version
+        version += 1
+
+
 @dataclass(frozen=True, slots=True)
 class RolloutTicket:
-    """Stable identity and version metadata for one submitted rollout."""
+    """Stable identity and version metadata for one submitted rollout.
+
+    Attributes:
+        submission_id: Coordinator-unique submission number.
+        policy_version: Snapshot version the rollout is anchored at.
+        submitted_at: Monotonic submission timestamp.
+        metadata: Immutable per-request metadata.
+        deadline_version: Last policy version at which the rollout may be
+            consumed, or ``None`` when deadline admission is disabled.
+    """
 
     submission_id: int
     policy_version: int
     submitted_at: float
     metadata: tp.Mapping[str, tp.Any] = field(default_factory=dict)
+    deadline_version: int | None = None
 
     def __post_init__(self) -> None:
         """Freeze request metadata."""
@@ -126,6 +212,26 @@ class AsyncRolloutError(RuntimeError):
         self.ticket = ticket
 
 
+class AsyncRolloutAdmissionDeferred(RuntimeError):
+    """Raised when a submission would miss its staleness deadline; the rollout was not started.
+
+    Attributes:
+        retry_at_version: Minimum policy version at which a rollout anchored at
+            that version becomes admissible.
+        deadline_version: Deadline the rejected submission would have had.
+        head_version: Coordinator head version at rejection time.
+    """
+
+    def __init__(self, *, retry_at_version: int, deadline_version: int, head_version: int) -> None:
+        super().__init__(
+            f"rollout with deadline version {deadline_version} is infeasible at head version {head_version}; "
+            f"retry from policy version {retry_at_version}"
+        )
+        self.retry_at_version = retry_at_version
+        self.deadline_version = deadline_version
+        self.head_version = head_version
+
+
 class AsyncRolloutCancelled(AsyncRolloutError):
     """Raised when the next completion was cancelled before execution."""
 
@@ -175,6 +281,7 @@ class _SubmissionRecord(tp.Generic[ResultT]):
     snapshot_created_at: float
     snapshot_metadata: tp.Mapping[str, tp.Any]
     future: concurrent.futures.Future[_WorkerSuccess[ResultT]]
+    settled: bool = False
 
 
 class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
@@ -185,12 +292,27 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
     execution and the completion queue, preventing fast producers from
     accumulating unbounded model batches while the learner is busy.
 
+    Each admitted rollout holds exactly one capacity credit, returned exactly
+    once when the rollout is settled: consumed by :meth:`next_completed`
+    (success, cancellation, or worker error) or discarded by :meth:`close`.
+
+    With ``max_staleness`` set, submissions use deadline admission: a rollout
+    anchored at snapshot version ``v`` must be consumed by version
+    ``v + max_staleness``. A submission is only started when every outstanding
+    deadline stays satisfiable given the consumer takes ``groups_per_update``
+    rollouts per version from :attr:`head_version` (see
+    :func:`admission_is_feasible`); otherwise :class:`AsyncRolloutAdmissionDeferred`
+    is raised and no work starts.
+
     Args:
         worker: Callable receiving ``(snapshot, payload)``.
         max_workers: Number of worker threads.
         max_outstanding: Maximum submitted-but-unconsumed rollouts. Defaults to
             ``max_workers``.
         thread_name_prefix: Worker thread prefix.
+        max_staleness: Enables deadline admission when not ``None``.
+        groups_per_update: Rollouts the consumer takes per policy version.
+        head_version: Initial policy version the consumer takes next.
     """
 
     def __init__(
@@ -200,6 +322,9 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         max_workers: int = 1,
         max_outstanding: int | None = None,
         thread_name_prefix: str = "online-rl-rollout",
+        max_staleness: int | None = None,
+        groups_per_update: int = 1,
+        head_version: int = 0,
     ) -> None:
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}")
@@ -209,18 +334,32 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             raise ValueError(f"max_outstanding must be positive, got {max_outstanding}")
         if max_outstanding < max_workers:
             raise ValueError(f"max_outstanding ({max_outstanding}) cannot be smaller than max_workers ({max_workers})")
+        if max_staleness is not None and max_staleness < 0:
+            raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
+        if groups_per_update <= 0:
+            raise ValueError(f"groups_per_update must be positive, got {groups_per_update}")
 
         self._worker = worker
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix=thread_name_prefix,
         )
+        self._max_outstanding = max_outstanding
         self._capacity = threading.BoundedSemaphore(max_outstanding)
-        self._completion_ids: queue.Queue[int] = queue.Queue(maxsize=max_outstanding)
+        # Backpressure is enforced by `_capacity`; keep `_completion_ids` unbounded so
+        # close() can always enqueue wakeup sentinels without blocking or raising queue.Full.
+        self._completion_ids: queue.Queue[int | object] = queue.Queue()
         self._records: dict[int, _SubmissionRecord[ResultT]] = {}
         self._lock = threading.Lock()
         self._next_submission_id = 0
+        self._waiters = 0
         self._closed = False
+        self._closed_event = threading.Event()
+        self._credits_in_use = 0
+        self._max_staleness = max_staleness
+        self._groups_per_update = int(groups_per_update)
+        self._head_version = int(head_version)
+        self._admission_deferred = 0
 
     @property
     def outstanding_count(self) -> int:
@@ -230,11 +369,86 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             return len(self._records)
 
     @property
+    def credits_in_use(self) -> int:
+        """Capacity credits currently held by admitted, unsettled rollouts."""
+
+        with self._lock:
+            return self._credits_in_use
+
+    @property
     def closed(self) -> bool:
         """Whether new submissions are disabled."""
 
         with self._lock:
             return self._closed
+
+    @property
+    def head_version(self) -> int:
+        """Policy version the consumer takes next (deadline admission reference)."""
+
+        with self._lock:
+            return self._head_version
+
+    @property
+    def admission_deferred_count(self) -> int:
+        """Number of submissions rejected by deadline admission."""
+
+        with self._lock:
+            return self._admission_deferred
+
+    def advance_head(self, version: int) -> None:
+        """Move the consumer head forward; the head never moves backwards.
+
+        Args:
+            version: Policy version the consumer takes next.
+        """
+
+        with self._lock:
+            self._head_version = max(self._head_version, int(version))
+
+    def _check_admission_locked(self, snapshot_version: int) -> int | None:
+        """Raise :class:`AsyncRolloutAdmissionDeferred` if infeasible; return the deadline."""
+
+        if self._max_staleness is None:
+            return None
+        deadline = int(snapshot_version) + self._max_staleness
+        head = self._head_version
+        # Rollouts already past their deadline are discarded by the consumer and occupy no update slot.
+        outstanding = [
+            record.ticket.deadline_version
+            for record in self._records.values()
+            if record.ticket.deadline_version is not None and record.ticket.deadline_version >= head
+        ]
+        if admission_is_feasible([*outstanding, deadline], head_version=head, groups_per_update=self._groups_per_update):
+            return deadline
+        self._admission_deferred += 1
+        retry = min_admissible_version(
+            outstanding,
+            head_version=head,
+            max_staleness=self._max_staleness,
+            groups_per_update=self._groups_per_update,
+        )
+        raise AsyncRolloutAdmissionDeferred(retry_at_version=retry, deadline_version=deadline, head_version=head)
+
+    def _settle_locked(self, submission_id: int) -> _SubmissionRecord[ResultT] | None:
+        """Remove a record and return its credit exactly once. Caller holds ``_lock``."""
+
+        record = self._records.pop(submission_id, None)
+        if record is None or record.settled:
+            return None
+        record.settled = True
+        self._credits_in_use -= 1
+        self._capacity.release()
+        return record
+
+    def _on_future_done(self, submission_id: int) -> None:
+        """Publish a completion unless the record was already settled by ``close``."""
+
+        if self._closed_event.is_set():
+            return
+        with self._lock:
+            if not self._closed and submission_id in self._records:
+                self._completion_ids.put_nowait(submission_id)
 
     def submit(
         self,
@@ -248,7 +462,8 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
 
         Args:
             payload: Request payload passed to the worker.
-            snapshot: Inference-safe policy snapshot.
+            snapshot: Inference-safe policy snapshot; its version is the
+                rollout's anchor.
             metadata: Per-request metadata copied onto the returned ticket.
             timeout: Maximum seconds to wait for backpressure capacity. ``None``
                 waits indefinitely.
@@ -257,6 +472,9 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             A stable ticket used for cancellation and diagnostics.
 
         Raises:
+            AsyncRolloutAdmissionDeferred: If deadline admission is enabled and
+                the rollout could not be consumed before its deadline. No work
+                is started and no capacity is held.
             RuntimeError: If the coordinator is closed.
             TimeoutError: If capacity is not available before ``timeout``.
             ValueError: If ``timeout`` is negative.
@@ -267,34 +485,40 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         with self._lock:
             if self._closed:
                 raise RuntimeError("cannot submit to a closed rollout coordinator")
+            # Fail fast before blocking on capacity; re-checked atomically below.
+            self._check_admission_locked(snapshot.version)
 
         acquired = self._capacity.acquire() if timeout is None else self._capacity.acquire(timeout=timeout)
         if not acquired:
             raise TimeoutError("timed out waiting for asynchronous rollout capacity")
 
         with self._lock:
-            if self._closed:
+            try:
+                if self._closed:
+                    raise RuntimeError("cannot submit to a closed rollout coordinator")
+                deadline = self._check_admission_locked(snapshot.version)
+                submission_id = self._next_submission_id
+                ticket = RolloutTicket(
+                    submission_id=submission_id,
+                    policy_version=snapshot.version,
+                    submitted_at=time.monotonic(),
+                    metadata=_immutable_metadata(metadata),
+                    deadline_version=deadline,
+                )
+                future = self._executor.submit(self._run_worker, snapshot, payload)
+            except BaseException:
                 self._capacity.release()
-                raise RuntimeError("cannot submit to a closed rollout coordinator")
-            submission_id = self._next_submission_id
+                raise
             self._next_submission_id += 1
-            ticket = RolloutTicket(
-                submission_id=submission_id,
-                policy_version=snapshot.version,
-                submitted_at=time.monotonic(),
-                metadata=_immutable_metadata(metadata),
-            )
-            future = self._executor.submit(self._run_worker, snapshot, payload)
-            record = _SubmissionRecord(
+            self._credits_in_use += 1
+            self._records[submission_id] = _SubmissionRecord(
                 ticket=ticket,
                 snapshot_created_at=snapshot.created_at,
                 snapshot_metadata=snapshot.metadata,
                 future=future,
             )
-            self._records[submission_id] = record
-            future.add_done_callback(
-                lambda _future, completed_id=submission_id: self._completion_ids.put_nowait(completed_id)
-            )
+        # Registered outside the lock: an already-finished future runs the callback inline.
+        future.add_done_callback(lambda _future, completed_id=submission_id: self._on_future_done(completed_id))
         return ticket
 
     def _run_worker(
@@ -314,8 +538,8 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
     def next_completed(self, *, timeout: float | None = None) -> CompletedRollout[ResultT]:
         """Consume the next rollout in completion order.
 
-        Consuming a success, cancellation, or failure releases one unit of
-        backpressure capacity.
+        Consuming a success, cancellation, or failure settles the rollout and
+        releases its backpressure credit exactly once.
 
         Args:
             timeout: Maximum seconds to wait. ``None`` waits indefinitely.
@@ -328,7 +552,8 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             AsyncRolloutWorkerError: If its worker raised. The original
                 exception is available as ``__cause__``.
             TimeoutError: If no completion arrives before ``timeout``.
-            RuntimeError: If there is no outstanding work.
+            RuntimeError: If there is no outstanding work or the coordinator
+                was closed while waiting.
             ValueError: If ``timeout`` is negative.
         """
 
@@ -337,17 +562,38 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         with self._lock:
             if not self._records:
                 raise RuntimeError("no outstanding rollouts")
+            if self._closed:
+                raise RuntimeError("rollout coordinator is closed")
+            self._waiters += 1
 
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            submission_id = self._completion_ids.get() if timeout is None else self._completion_ids.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise TimeoutError("timed out waiting for an asynchronous rollout") from exc
-
-        with self._lock:
-            record = self._records.pop(submission_id, None)
-        if record is None:
-            raise RuntimeError(f"completion for unknown rollout {submission_id}")
-        self._capacity.release()
+            while True:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    submission_id = (
+                        self._completion_ids.get()
+                        if remaining is None
+                        else self._completion_ids.get(timeout=remaining)
+                    )
+                except queue.Empty as exc:
+                    raise TimeoutError("timed out waiting for an asynchronous rollout") from exc
+                if submission_id is _CLOSE_SENTINEL:
+                    # Keep waking any other blocked consumer.
+                    self._completion_ids.put_nowait(_CLOSE_SENTINEL)
+                    raise RuntimeError("rollout coordinator was closed while waiting for completion")
+                with self._lock:
+                    closed = self._closed
+                    record = self._settle_locked(tp.cast(int, submission_id))
+                if record is not None:
+                    break
+                if closed:
+                    raise RuntimeError("rollout coordinator was closed while waiting for completion")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for an asynchronous rollout")
+        finally:
+            with self._lock:
+                self._waiters -= 1
 
         if record.future.cancelled():
             raise AsyncRolloutCancelled(
@@ -390,9 +636,10 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         submission_id = ticket if isinstance(ticket, int) else ticket.submission_id
         with self._lock:
             record = self._records.get(submission_id)
-            if record is None:
-                return False
-            return record.future.cancel()
+            future = None if record is None else record.future
+        if future is None:
+            return False
+        return future.cancel()
 
     def cancel_pending(self) -> int:
         """Cancel every future that has not started and return the count."""
@@ -408,10 +655,12 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         cancel_pending: bool = True,
         on_idle: tp.Callable[[], None] | None = None,
     ) -> None:
-        """Stop accepting work and release all outstanding capacity.
+        """Stop accepting work and settle every outstanding rollout.
 
-        Closing discards unconsumed completion records. With ``wait=True`` the
-        method waits for already-running worker calls.
+        Closing discards unconsumed completion records and returns their
+        credits; a consumer blocked in :meth:`next_completed` is woken with
+        ``RuntimeError``. Calling ``close`` again is a no-op. With
+        ``wait=True`` the method waits for already-running worker calls.
 
         Args:
             wait: Wait for running workers to finish.
@@ -424,20 +673,23 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             if self._closed:
                 return
             self._closed = True
+            self._closed_event.set()
             futures = [record.future for record in self._records.values()]
+            for submission_id in tuple(self._records):
+                self._settle_locked(submission_id)
+            waiters = self._waiters
+            while True:
+                try:
+                    self._completion_ids.get_nowait()
+                except queue.Empty:
+                    break
+            # Enqueue wakeup sentinels so any concurrent blocked next_completed(timeout=None)
+            # wakes up and exits cleanly instead of hanging forever.
+            for _ in range(max(waiters, 1)):
+                self._completion_ids.put_nowait(_CLOSE_SENTINEL)
         self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
         if on_idle is not None:
             after_futures(futures, on_idle)
-        with self._lock:
-            outstanding = len(self._records)
-            self._records.clear()
-        for _ in range(outstanding):
-            self._capacity.release()
-        while True:
-            try:
-                self._completion_ids.get_nowait()
-            except queue.Empty:
-                break
 
     def __enter__(self) -> BoundedAsyncRolloutCoordinator[SnapshotT, PayloadT, ResultT]:
         """Return this coordinator as a context manager."""
@@ -456,6 +708,7 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
 
 
 __all__ = (
+    "AsyncRolloutAdmissionDeferred",
     "AsyncRolloutCancelled",
     "AsyncRolloutError",
     "AsyncRolloutWorkerError",
@@ -463,4 +716,6 @@ __all__ = (
     "CompletedRollout",
     "PolicySnapshot",
     "RolloutTicket",
+    "admission_is_feasible",
+    "min_admissible_version",
 )

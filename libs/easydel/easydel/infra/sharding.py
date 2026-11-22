@@ -134,6 +134,66 @@ def moe_fsdp_shard_expert_weights_enabled() -> bool:
     return _MOE_FSDP_SHARD_EXPERT_WEIGHTS.get()
 
 
+_ACTIVE_DP_SPMD_AXIS: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "easydel_active_dp_spmd_axis",
+    default=None,
+)
+
+
+def active_dp_spmd_axis() -> str | None:
+    """Return the mesh axis name currently mapped by an outer ``dp`` ``spmd_axis_name`` ``vmap``, or ``None``."""
+    return _ACTIVE_DP_SPMD_AXIS.get()
+
+
+@contextmanager
+def dp_spmd_vmap_scope(dp_axis: str = "dp") -> Iterator[None]:
+    """Scope an enclosing ``jax.vmap(..., spmd_axis_name=dp_axis)`` trace so inner specs omit ``dp_axis``."""
+    token = _ACTIVE_DP_SPMD_AXIS.set(str(dp_axis))
+    try:
+        yield
+    finally:
+        _ACTIVE_DP_SPMD_AXIS.reset(token)
+
+
+def _strip_compound_axis_entry(entry: tp.Any, axis_name: str) -> tp.Any:
+    if isinstance(entry, tuple):
+        kept = tuple(a for a in entry if a != axis_name)
+        return kept[0] if len(kept) == 1 else (kept if kept else None)
+    return entry
+
+
+def _strip_axis_entry(entry: tp.Any, axis_name: str) -> tp.Any:
+    if entry == axis_name:
+        return None
+    return _strip_compound_axis_entry(entry, axis_name)
+
+
+def strip_compound_axis_from_spec(spec: tp.Any, axis_name: str = "dp") -> tp.Any:
+    """Remove ``axis_name`` from compound axis tuples in ``spec`` while preserving single-axis queries."""
+    if spec is None:
+        return None
+    if isinstance(spec, PartitionSpec):
+        return PartitionSpec(*(_strip_compound_axis_entry(d, axis_name) for d in spec))
+    if isinstance(spec, list):
+        return [_strip_compound_axis_entry(d, axis_name) for d in spec]
+    if isinstance(spec, tuple):
+        return tuple(_strip_compound_axis_entry(d, axis_name) for d in spec)
+    return spec
+
+
+def strip_axis_from_spec(spec: tp.Any, axis_name: str = "dp") -> tp.Any:
+    """Remove ``axis_name`` from a ``PartitionSpec`` (or tuple/list of axis entries)."""
+    if spec is None:
+        return None
+    if isinstance(spec, PartitionSpec):
+        return PartitionSpec(*(_strip_axis_entry(d, axis_name) for d in spec))
+    if isinstance(spec, list):
+        return [_strip_axis_entry(d, axis_name) for d in spec]
+    if isinstance(spec, tuple):
+        return tuple(_strip_axis_entry(d, axis_name) for d in spec)
+    return spec
+
+
 CANONICAL_MESH_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp")
 _SIMPLE_SEMANTIC_AXES: tuple[str, ...] = (
     common_types.DATA_PARALLEL,
@@ -1068,6 +1128,72 @@ def inference_mode_forces_decode() -> bool:
 _inference_mode_forces_decode = inference_mode_forces_decode
 
 
+_single_token_rows_var: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "easydel_single_token_rows", default=False
+)
+
+
+@dataclasses.dataclass(slots=True)
+class SingleTokenRowsQueries:
+    """Whether code traced inside :func:`record_single_token_rows_queries` read the single-token promise."""
+
+    asked: bool = False
+
+
+_single_token_rows_queries_var: "contextvars.ContextVar[SingleTokenRowsQueries | None]" = contextvars.ContextVar(
+    "easydel_single_token_rows_queries", default=None
+)
+
+
+@contextmanager
+def single_token_rows(enabled: bool = True) -> tp.Iterator[bool]:
+    """Scope promising that every request row of the traced step schedules at most one token.
+
+    eSurge traces the program it runs only on pure-decode windows inside this scope (every row the batch builder packs
+    holds at most one token; ``ExecutionManager._is_decode_only_window``). A layer that otherwise chooses its decode
+    path at run time (a ``lax.cond`` on the row lengths) can take it statically there, without the conditional and the
+    copies of the state it carries. Outside the scope :func:`inference_mode_single_token_rows` is ``False``.
+
+    Args:
+        enabled: Whether the promise holds inside the block.
+
+    Yields:
+        The ``enabled`` value.
+    """
+    token = _single_token_rows_var.set(bool(enabled))
+    try:
+        yield bool(enabled)
+    finally:
+        _single_token_rows_var.reset(token)
+
+
+def inference_mode_single_token_rows() -> bool:
+    """Whether an enclosing :func:`single_token_rows` scope promises at most one token per row.
+
+    Ask only where the answer changes the traced program: an enclosing :func:`record_single_token_rows_queries` notes
+    the question, and eSurge compiles a single-token program only for bucket pairs whose trace asked it.
+    """
+    queries = _single_token_rows_queries_var.get()
+    if queries is not None:
+        queries.asked = True
+    return _single_token_rows_var.get()
+
+
+@contextmanager
+def record_single_token_rows_queries() -> tp.Iterator[SingleTokenRowsQueries]:
+    """Scope recording whether code traced inside it asked :func:`inference_mode_single_token_rows`.
+
+    Yields:
+        A :class:`SingleTokenRowsQueries` whose ``asked`` turns ``True`` once code inside the block asks.
+    """
+    queries = SingleTokenRowsQueries()
+    token = _single_token_rows_queries_var.set(queries)
+    try:
+        yield queries
+    finally:
+        _single_token_rows_queries_var.reset(token)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class AxisPolicy:
     """Immutable wrapper around a :class:`PartitionAxis` that exposes EasyDeL's logical axis vocabulary.
@@ -1417,7 +1543,11 @@ class RuntimeShardingResolver:
             tuple: Tuple of ``(logical_name, mesh_axis_or_None)`` pairs.
         """
         resolved_mode = self._resolve_mode(mode=mode, shape=shape, layout_mode=MODE_TRAIN)
-        return self.axis_policy.logical_axis_rule_pairs(mode=resolved_mode, overrides=overrides)
+        pairs = self.axis_policy.logical_axis_rule_pairs(mode=resolved_mode, overrides=overrides)
+        dp_ax = active_dp_spmd_axis()
+        if dp_ax is not None:
+            pairs = tuple((k, _strip_compound_axis_entry(v, dp_ax)) for k, v in pairs)
+        return pairs
 
     @contextmanager
     def logical_axis_rules(
@@ -1449,6 +1579,9 @@ class RuntimeShardingResolver:
         Returns:
             PartitionSpec: The (possibly relaxed) safe partition spec.
         """
+        dp_ax = active_dp_spmd_axis()
+        if dp_ax is not None:
+            spec = strip_compound_axis_from_spec(spec, dp_ax)
         active_mesh = self.mesh if mesh is None else mesh
         if active_mesh is None or shape is NOT_GIVEN:
             return spec
@@ -2088,6 +2221,7 @@ __all__ = [
     "OptionalMesh",
     "PipelineStageRankResolver",
     "RuntimeShardingResolver",
+    "SingleTokenRowsQueries",
     "StageMesh",
     "StageRankResolver",
     "TensorLayout",
@@ -2098,6 +2232,7 @@ __all__ = [
     "decode_mode_specs",
     "final_stage_replicated_sharding",
     "inference_mode_forces_decode",
+    "inference_mode_single_token_rows",
     "is_mpmd_mesh",
     "is_valid_mesh",
     "logical_axis_rules",
@@ -2109,6 +2244,7 @@ __all__ = [
     "partition_spec_for_mesh",
     "pick_array_mesh",
     "pick_mesh",
+    "record_single_token_rows_queries",
     "replicate_on_array_mesh",
     "replicated_named_sharding",
     "resolve_array_mesh",
@@ -2119,5 +2255,6 @@ __all__ = [
     "sanitize_partition_specs_for_shape_tree",
     "sanitize_sharding_axes_for_shape",
     "sharding_for_layout",
+    "single_token_rows",
     "specs_to_named_sharding",
 ]

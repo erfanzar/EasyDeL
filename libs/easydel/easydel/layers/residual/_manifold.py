@@ -27,7 +27,20 @@ from dataclasses import dataclass
 import jax
 import spectrax as spx
 from eformer import common_types
-from ejkernel.modules import MHCFusedConfig, mhc_coefficients, mhc_collapse, mhc_expand, sinkhorn_knopp
+from ejkernel.modules import (
+    MHCFusedConfig,
+    mhc_coefficients,
+    mhc_collapse,
+    mhc_decode_read,
+    mhc_decode_supports,
+    mhc_decode_write,
+    mhc_expand,
+    mhc_prefill_project,
+    mhc_prefill_read,
+    mhc_prefill_supports,
+    mhc_prefill_write,
+    sinkhorn_knopp,
+)
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding
@@ -47,10 +60,14 @@ class HyperStreamSharding(common_types.DynamicShardingAxes):
     mode: tp.ClassVar = 1
 
 
-def _stream_layout(mesh_source: object | None, shape: tuple[int, ...]):
-    """Resolve the current mesh and optional logical stream layout dynamically."""
-    mesh = getattr(mesh_source, "mesh", mesh_source)
-    mesh = getattr(mesh, "jax_mesh", mesh)
+def _stream_layout(mesh_source: object | None, shape: tuple[int, ...], *, arr: Array | None = None):
+    """Resolve the current stage-local mesh and optional logical stream layout dynamically."""
+    raw_mesh = getattr(mesh_source, "mesh", mesh_source)
+    if raw_mesh is None:
+        return None, None
+    mesh = spx.get_current_stage_mesh(raw_mesh, arr=arr, raise_error=False)
+    if mesh is None:
+        mesh = getattr(raw_mesh, "jax_mesh", raw_mesh)
     resolver = getattr(mesh_source, "runtime_sharding_resolver", None)
     if mesh is None or resolver is None:
         return mesh, None
@@ -72,6 +89,20 @@ class ManifoldHyperConnectionConfig:
         use_fused_coefficients: Opt into packed TPU gate/Sinkhorn forward and
             backward kernels. First-order reverse AD only on the optimized path;
             leave disabled for higher derivatives. Does not change parameters.
+        decode_fused_kernels: Serving decode only, APPROXIMATE class, off by default. Inside
+            ``set_inference_mode()`` on TPU, with at most 128 tokens per device and an unsharded hidden axis,
+            :meth:`ManifoldHyperConnection.forward` runs gates + collapse as ejkernel ``mhc_decode_read`` and
+            :meth:`ManifoldHyperConnection.residual_write` runs ``mhc_decode_write``. Collapse and write are
+            within one bf16 ulp of the unfused path (in module context on TPU v5p, 2 of 16384 collapse and 1 of
+            65536 stream elements differ); the chain is not exact. Over one GLM-5.3-Flash-shaped layer (32 rows,
+            4 x 4096 bf16 streams) 464 of 131072 sublayer inputs differ by up to 1.6e-2 and 97722 of 524288
+            stream elements by up to 0.125. Measured 25.8 instead of 39.3 us of mHC glue per layer on TPU v5p.
+        prefill_fused_kernels: Serving prefill only, APPROXIMATE class, off by default. Inside
+            ``set_inference_mode()`` on TPU, with more than 128 tokens per device (a multiple of 128), unsharded
+            streams and a lane-aligned per-device hidden width, :meth:`ManifoldHyperConnection.forward` runs the
+            stream projection, gates and collapse as ejkernel ``mhc_prefill_project`` + ``mhc_prefill_read`` and
+            :meth:`ManifoldHyperConnection.residual_write` runs ``mhc_prefill_write``. The projection, its sum of
+            squares and the write accumulate in another order than the XLA path, so outputs differ by bf16 rounding.
     """
 
     hidden_size: int
@@ -81,14 +112,21 @@ class ManifoldHyperConnectionConfig:
     iters: int = 20
     initializer: float = 0.02
     use_fused_coefficients: bool = False
+    decode_fused_kernels: bool = False
+    prefill_fused_kernels: bool = False
 
     @classmethod
     def from_model_config(cls, config: tp.Any) -> ManifoldHyperConnectionConfig:
         """Read the standard ``hc_*`` model-config fields (DeepSeek-V4 / V4.1, GLM-5-Next).
 
         Maps ``hidden_size``, ``hc_mult``, ``hc_eps``, ``rms_norm_eps`` (flattened-stream norm),
-        ``hc_sinkhorn_iters``, ``initializer_range`` and ``hc_use_fused_coefficients``.
+        ``hc_sinkhorn_iters``, ``initializer_range`` and ``hc_use_fused_coefficients``. That last one defaults to
+        ``None`` in the model families, which takes the packed coefficient kernels on TPU and the unfused path
+        elsewhere. On TPU v5p a 12-layer GLM-5.3-Flash forward and backward on 16 sequences of 131072 tokens with
+        4-way tensor parallelism took 10.00 s with them against 10.09 s, at a compiled peak of 63.7 instead of
+        91.3 GB per chip; the gradient norm moved by 0.03%.
         """
+        fused = config.hc_use_fused_coefficients
         return cls(
             hidden_size=config.hidden_size,
             hc_mult=config.hc_mult,
@@ -96,7 +134,11 @@ class ManifoldHyperConnectionConfig:
             norm_eps=config.rms_norm_eps,
             iters=config.hc_sinkhorn_iters,
             initializer=config.initializer_range,
-            use_fused_coefficients=config.hc_use_fused_coefficients,
+            use_fused_coefficients=jax.default_backend() == "tpu" if fused is None else bool(fused),
+            # Opt-in APPROXIMATE decode kernels; an absent ``hc_decode_fused_kernels`` attribute means off.
+            decode_fused_kernels=bool(getattr(config, "hc_decode_fused_kernels", False)),
+            # Opt-in APPROXIMATE prefill kernels; an absent ``hc_prefill_fused_kernels`` attribute means off.
+            prefill_fused_kernels=bool(getattr(config, "hc_prefill_fused_kernels", False)),
         )
 
 
@@ -225,6 +267,8 @@ class ManifoldHyperConnection(spx.Module):
         self.rms_norm_eps = config.norm_eps
         self.hc_sinkhorn_iters = config.iters
         self.use_fused_coefficients = config.use_fused_coefficients
+        self.decode_fused_kernels = config.decode_fused_kernels
+        self.prefill_fused_kernels = config.prefill_fused_kernels
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = ArrayParam.bound(
             shape=(mix, self.hc_mult * config.hidden_size),
@@ -249,8 +293,254 @@ class ManifoldHyperConnection(spx.Module):
         """
         if self.fused_kernel == "pallas":
             return self._fused_forward(hidden_streams)
+        decoded = self._decode_read(hidden_streams)
+        if decoded is not None:
+            return decoded
+        prefilled = self._prefill_read(hidden_streams)
+        if prefilled is not None:
+            return prefilled
         pre, post, comb = self.coefficients(hidden_streams)
         return post, comb, manifold_collapse(pre, hidden_streams)
+
+    def _decode_layout(self, hidden_streams: Array):
+        """Mesh and stream specs when the APPROXIMATE decode kernels apply to these streams, else ``None``.
+
+        Args:
+            hidden_streams: Residual streams ``[B, S, hc, D]``.
+
+        Returns:
+            ``(jax_mesh, stream_spec, manual_spec)`` with ``manual_spec`` ``None`` without a multi-device mesh, or
+            ``None`` when ``decode_fused_kernels`` is off, outside ``set_inference_mode()``, off TPU, or for shapes
+            the kernels do not support (more than 128 tokens per device, a sharded stream or hidden axis).
+        """
+        # infra.utils imports layers, so the inference-mode helper is imported lazily like ArrayParam.
+        from easydel.utils.inference_mode import is_inference_mode
+
+        if not (self.decode_fused_kernels and is_inference_mode() and jax.default_backend() == "tpu"):
+            return None
+        if hidden_streams.ndim != 4:
+            return None
+        batch, seq, hc, width = hidden_streams.shape
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
+        manual = None
+        if jax_mesh is not None and getattr(jax_mesh, "size", 1) > 1:
+            manual = Ps(*(tuple(stream_spec or ()) + (None,) * (4 - len(stream_spec or ()))))
+
+            def size(entry) -> int:
+                names = entry if isinstance(entry, tuple) else (() if entry is None else (entry,))
+                total = 1
+                for name in names:
+                    total *= jax_mesh.shape[name]
+                return total
+
+            if size(manual[2]) > 1 or size(manual[3]) > 1 or batch % size(manual[0]) or seq % size(manual[1]):
+                return None
+            batch, seq = batch // size(manual[0]), seq // size(manual[1])
+        if not mhc_decode_supports(batch * seq, hc, width):
+            return None
+        return jax_mesh, stream_spec, manual
+
+    def _decode_read(self, hidden_streams: Array) -> tuple[Array, None, Array] | None:
+        """``(gate_table, None, collapsed)`` from ejkernel ``mhc_decode_read``, or ``None`` when it does not apply.
+
+        APPROXIMATE path, see ``ManifoldHyperConnectionConfig.decode_fused_kernels``. The projection stays in XLA.
+        The gate table ``[splits, B, S, lanes]`` replaces ``post`` and is only meaningful to :meth:`residual_write`
+        of this module, which recognizes it by ``comb=None``.
+
+        Args:
+            hidden_streams: Residual streams ``[B, S, hc, D]``.
+
+        Returns:
+            ``(gate_table, None, collapsed)`` or ``None``.
+        """
+        layout = self._decode_layout(hidden_streams)
+        if layout is None:
+            return None
+        jax_mesh, stream_spec, manual = layout
+        logits = _project_streams(
+            hidden_streams, self.fn.value, self.rms_norm_eps, self.precision, jax_mesh, stream_spec
+        )
+        base = self.base.value.astype(jnp.float32)
+        scale = self.scale.value.astype(jnp.float32)
+        iters, eps = self.hc_sinkhorn_iters, self.hc_eps
+
+        def run(logits, b, s, streams):
+            lb, ls, _, width = streams.shape
+            table, collapsed = mhc_decode_read(
+                logits.reshape(lb * ls, -1), b, s, streams.reshape(lb * ls, -1), n_iters=iters, eps=eps
+            )
+            return table.reshape(table.shape[0], lb, ls, -1), collapsed.reshape(lb, ls, width)
+
+        if manual is None:
+            table, collapsed = run(logits, base, scale, hidden_streams)
+        else:
+            table, collapsed = jax.shard_map(
+                run,
+                mesh=jax_mesh,
+                in_specs=(Ps(manual[0], manual[1], None), Ps(), Ps(), manual),
+                out_specs=(Ps(None, manual[0], manual[1], None), Ps(manual[0], manual[1], None)),
+                check_vma=False,
+            )(logits, base, scale, hidden_streams)
+        return table, None, collapsed
+
+    def _decode_write(self, hidden_streams: Array, sublayer_output: Array, table: Array) -> Array:
+        """Residual write from a :meth:`_decode_read` gate table with ejkernel ``mhc_decode_write`` (APPROXIMATE).
+
+        Args:
+            hidden_streams: Residual streams ``[B, S, hc, D]`` the table was computed from.
+            sublayer_output: Sub-layer result ``[B, S, D]``.
+            table: Gate table ``[splits, B, S, lanes]``.
+
+        Returns:
+            Updated streams ``[B, S, hc, D]`` in the stream dtype.
+
+        Raises:
+            ValueError: The decode kernels do not apply to these streams.
+        """
+        layout = self._decode_layout(hidden_streams)
+        if layout is None:
+            raise ValueError("residual_write got comb=None (a decode gate table) outside the decode-kernel path")
+        jax_mesh, _, manual = layout
+
+        def run(streams, out, gates):
+            lb, ls, hc, width = streams.shape
+            flat = mhc_decode_write(
+                streams.reshape(lb * ls, -1), out.reshape(lb * ls, width), gates.reshape(gates.shape[0], lb * ls, -1)
+            )
+            return flat.reshape(lb, ls, hc, width)
+
+        if manual is None:
+            return run(hidden_streams, sublayer_output, table)
+        return jax.shard_map(
+            run,
+            mesh=jax_mesh,
+            in_specs=(manual, Ps(manual[0], manual[1], None), Ps(None, manual[0], manual[1], None)),
+            out_specs=manual,
+            check_vma=False,
+        )(hidden_streams, sublayer_output, table)
+
+    def _prefill_layout(self, hidden_streams: Array):
+        """Mesh, manual stream spec and feature axes when the APPROXIMATE prefill kernels apply, else ``None``.
+
+        Args:
+            hidden_streams: Residual streams ``[B, S, hc, D]``.
+
+        Returns:
+            ``(jax_mesh, manual_spec, feature_axes)`` with ``manual_spec`` ``None`` without a multi-device mesh, or
+            ``None`` when ``prefill_fused_kernels`` is off, outside ``set_inference_mode()``, off TPU, or for shapes
+            the kernels do not take (at most 128 or a non-multiple of 128 tokens per device, a sharded stream axis,
+            a per-device width that is not a multiple of 128).
+        """
+        from easydel.utils.inference_mode import is_inference_mode
+
+        if not (self.prefill_fused_kernels and is_inference_mode() and jax.default_backend() == "tpu"):
+            return None
+        if hidden_streams.ndim != 4:
+            return None
+        batch, seq, hc, width = hidden_streams.shape
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
+        if jax_mesh is None or getattr(jax_mesh, "size", 1) <= 1:
+            return (None, None, ()) if mhc_prefill_supports(batch * seq, hc, width) else None
+        manual = Ps(*(tuple(stream_spec or ()) + (None,) * (4 - len(stream_spec or ()))))
+
+        def names(entry) -> tuple[str, ...]:
+            return entry if isinstance(entry, tuple) else (() if entry is None else (entry,))
+
+        def size(entry) -> int:
+            total = 1
+            for name in names(entry):
+                total *= jax_mesh.shape[name]
+            return total
+
+        if size(manual[2]) > 1 or batch % size(manual[0]) or seq % size(manual[1]) or width % size(manual[3]):
+            return None
+        tokens = (batch // size(manual[0])) * (seq // size(manual[1]))
+        if not mhc_prefill_supports(tokens, hc, width // size(manual[3])):
+            return None
+        axes = tuple(name for name in names(manual[3]) if jax_mesh.shape[name] > 1)
+        return jax_mesh, manual, axes
+
+    def _prefill_read(self, hidden_streams: Array) -> tuple[Array, None, Array] | None:
+        """``(gate_table, None, collapsed)`` from ejkernel ``mhc_prefill_project`` / ``mhc_prefill_read``, or ``None``.
+
+        APPROXIMATE path, see ``ManifoldHyperConnectionConfig.prefill_fused_kernels``. The gate table ``[B, S, lanes]``
+        (three dimensions, unlike the decode table) replaces ``post`` and is only meaningful to :meth:`residual_write`
+        of this module, which recognizes it by ``comb=None``.
+
+        Args:
+            hidden_streams: Residual streams ``[B, S, hc, D]``.
+
+        Returns:
+            ``(gate_table, None, collapsed)`` or ``None``.
+        """
+        layout = self._prefill_layout(hidden_streams)
+        if layout is None:
+            return None
+        jax_mesh, manual, axes = layout
+        hc, width = hidden_streams.shape[2], hidden_streams.shape[3]
+        fn = self.fn.value.reshape(-1, hc, width)
+        base = self.base.value.astype(jnp.float32)
+        scale = self.scale.value.astype(jnp.float32)
+        kwargs = dict(
+            global_width=hc * width, norm_eps=self.rms_norm_eps, n_iters=self.hc_sinkhorn_iters, eps=self.hc_eps
+        )
+
+        def run(streams, weight, b, s):
+            lb, ls, lhc, lw = streams.shape
+            flat = streams.reshape(lb * ls, lhc * lw)
+            stats = mhc_prefill_project(flat, weight.reshape(weight.shape[0], -1))
+            if axes:
+                stats = jax.lax.psum(stats, axes)
+            table, collapsed = mhc_prefill_read(stats, b, s, flat, **kwargs)
+            return table.reshape(lb, ls, -1), collapsed.reshape(lb, ls, lw)
+
+        if manual is None:
+            table, collapsed = run(hidden_streams, fn, base, scale)
+        else:
+            table, collapsed = jax.shard_map(
+                run,
+                mesh=jax_mesh,
+                in_specs=(manual, Ps(None, None, manual[3]), Ps(), Ps()),
+                out_specs=(Ps(manual[0], manual[1], None), Ps(manual[0], manual[1], manual[3])),
+                check_vma=False,
+            )(hidden_streams, fn, base, scale)
+        return table, None, collapsed
+
+    def _prefill_write(self, hidden_streams: Array, sublayer_output: Array, table: Array) -> Array:
+        """Residual write from a :meth:`_prefill_read` gate table with ejkernel ``mhc_prefill_write`` (APPROXIMATE).
+
+        Args:
+            hidden_streams: Residual streams ``[B, S, hc, D]`` the table was computed from.
+            sublayer_output: Sub-layer result ``[B, S, D]``.
+            table: Gate table ``[B, S, lanes]``.
+
+        Returns:
+            Updated streams ``[B, S, hc, D]`` in the stream dtype.
+
+        Raises:
+            ValueError: The prefill kernels do not apply to these streams.
+        """
+        layout = self._prefill_layout(hidden_streams)
+        if layout is None:
+            raise ValueError("residual_write got a prefill gate table outside the prefill-kernel path")
+        jax_mesh, manual, _ = layout
+
+        def run(streams, out, gates):
+            lb, ls, lhc, lw = streams.shape
+            flat = mhc_prefill_write(
+                streams.reshape(lb * ls, lhc * lw), out.reshape(lb * ls, lw), gates.reshape(lb * ls, -1)
+            )
+            return flat.reshape(lb, ls, lhc, lw)
+
+        if manual is None:
+            return run(hidden_streams, sublayer_output, table)
+        return jax.shard_map(
+            run,
+            mesh=jax_mesh,
+            in_specs=(manual, Ps(manual[0], manual[1], manual[3]), Ps(manual[0], manual[1], None)),
+            out_specs=manual,
+            check_vma=False,
+        )(hidden_streams, sublayer_output, table)
 
     def _fused_cfg(self) -> MHCFusedConfig:
         """Pallas dispatch configuration of the opt-in fused path."""
@@ -264,7 +554,7 @@ class ManifoldHyperConnection(spx.Module):
 
     def _fused_specs(self, hidden_streams: Array):
         """``(jax_mesh, stream_spec)`` when the streams must run under ``shard_map``, else ``(None, None)``."""
-        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
         if jax_mesh is None or getattr(jax_mesh, "size", 1) <= 1:
             return None, None
         if stream_spec is None:
@@ -296,10 +586,33 @@ class ManifoldHyperConnection(spx.Module):
             **kwargs,
         )
 
+    def fused_post_write_gate(
+        self,
+        hidden_streams: Float[Array, "batch seq hc hidden"],
+        post: Float[Array, "batch seq hc"],
+        comb: Float[Array, "batch seq hc hc"] | None,
+    ) -> Float[Array, "batch seq hc"] | None:
+        """Return ``post`` cast to stream dtype when a sublayer may fuse ``post * output``, else ``None``.
+
+        Sublayers such as :meth:`~easydel.layers.BaseMoeModule.moe_call` can fold the write expansion
+        ``post * output`` into their chunked custom-VJP backward so outer layer remat does not replay the
+        sublayer forward solely to recover ``output`` for ``d_post``. Returns ``None`` when ``comb`` is a
+        fused decode/prefill gate table, when this connection uses the Pallas mHC kernel, or on an MPMD
+        pipeline mesh (``pp > 1``).
+        """
+        if comb is None or self.fused_kernel == "pallas":
+            return None
+        from easydel.infra.sharding import is_mpmd_mesh
+
+        raw_mesh = getattr(self.mesh_source, "mesh", self.mesh_source)
+        if is_mpmd_mesh(raw_mesh):
+            return None
+        return post.astype(hidden_streams.dtype)
+
     def residual_write(
         self,
         hidden_streams: Float[Array, "batch seq hc hidden"],
-        sublayer_output: Float[Array, "batch seq hidden"],
+        sublayer_output: Float[Array, "batch seq hidden"] | Float[Array, "batch seq hc hidden"],
         post: Float[Array, "batch seq hc"],
         comb: Float[Array, "batch seq hc hc"],
     ) -> Float[Array, "batch seq hc hidden"]:
@@ -307,17 +620,25 @@ class ManifoldHyperConnection(spx.Module):
 
         With ``fused_kernel="none"`` this is exactly :func:`manifold_residual_write` at this module's
         ``precision``; with ``"pallas"`` it runs ejkernel ``mhc_expand`` (Pallas TPU), sharded like the streams.
+        When a sublayer has already fused ``post * output`` and returns a 4-D ``[B, S, hc, D]`` contribution,
+        this adds ``comb.T @ hidden_streams`` without re-applying ``post``.
 
         Args:
             hidden_streams: Original residual streams ``[B, S, hc, D]``.
-            sublayer_output: Sub-layer result ``[B, S, D]``.
+            sublayer_output: Sub-layer result ``[B, S, D]`` or pre-expanded ``post * output`` ``[B, S, hc, D]``.
             post: Write gates ``[B, S, hc]``.
             comb: Stream mixer ``[B, S, hc, hc]``, indexed ``[source, target]``.
 
         Returns:
             Updated streams ``[B, S, hc, D]`` in the stream dtype.
         """
-        if self.fused_kernel != "pallas":
+        if comb is None and post.ndim == 3:
+            # ``post`` is the gate table of the APPROXIMATE prefill read (see :meth:`_prefill_read`).
+            return self._prefill_write(hidden_streams, sublayer_output, post)
+        if comb is None:
+            # ``post`` is the gate table of the APPROXIMATE decode read (see :meth:`_decode_read`).
+            return self._decode_write(hidden_streams, sublayer_output, post)
+        if self.fused_kernel != "pallas" or sublayer_output.ndim == hidden_streams.ndim:
             return manifold_residual_write(hidden_streams, sublayer_output, post, comb, precision=self.precision)
         jax_mesh, spec = self._fused_specs(hidden_streams)
         if jax_mesh is None:
@@ -350,7 +671,7 @@ class ManifoldHyperConnection(spx.Module):
         hc = self.hc_mult
         eps = self.hc_eps
         batch, seq = hidden_streams.shape[:2]
-        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape)
+        jax_mesh, stream_spec = _stream_layout(self.mesh_source, hidden_streams.shape, arr=hidden_streams)
         mix_logits = _project_streams(
             hidden_streams, self.fn.value, self.rms_norm_eps, self.precision, jax_mesh, stream_spec
         )
@@ -373,7 +694,7 @@ class ManifoldHyperConnection(spx.Module):
                     mesh=jax_mesh,
                     in_specs=(token_spec, Ps(), Ps()),
                     out_specs=(token_spec, token_spec, matrix_spec),
-                    check_vma=True,
+                    check_vma=False,
                 )(mix_logits, base, scale)
             else:
                 pre, post, comb = coefficients(mix_logits, base, scale)
@@ -501,7 +822,7 @@ class MeanHyperHead(spx.Module):
 
 def manifold_residual_write(
     hidden_streams: Float[Array, "batch seq hc hidden"],
-    sublayer_output: Float[Array, "batch seq hidden"],
+    sublayer_output: Float[Array, "batch seq hidden"] | Float[Array, "batch seq hc hidden"],
     post: Float[Array, "batch seq hc"],
     comb: Float[Array, "batch seq hc hc"],
     *,
@@ -511,7 +832,9 @@ def manifold_residual_write(
 
     Args:
         hidden_streams: Original residual streams ``[B, S, hc, D]``.
-        sublayer_output: Sub-layer result ``[B, S, D]``.
+        sublayer_output: Sub-layer result ``[B, S, D]``, or an already-expanded
+            ``post * output`` tensor ``[B, S, hc, D]`` produced by a sublayer
+            that fused the write gate into its own backward pass.
         post: Scalar write gates ``[B, S, hc]``.
         comb: Stream mixer ``[B, S, hc, hc]``, indexed as ``[source, target]``.
         precision: Einsum precision for the transposed stream mix.
@@ -522,6 +845,7 @@ def manifold_residual_write(
         arithmetic rather than computing in fp32 and casting the result.
     """
     dtype = hidden_streams.dtype
-    return post.astype(dtype)[..., None] * sublayer_output[..., None, :] + jnp.einsum(
-        "bsji,bsjd->bsid", comb.astype(dtype), hidden_streams, precision=precision
-    )
+    mixed = jnp.einsum("bsji,bsjd->bsid", comb.astype(dtype), hidden_streams, precision=precision)
+    if sublayer_output.ndim == hidden_streams.ndim:
+        return sublayer_output.astype(dtype) + mixed
+    return post.astype(dtype)[..., None] * sublayer_output[..., None, :] + mixed

@@ -99,28 +99,40 @@ class PAPOTrainer(GRPOTrainer):
                     break
         return columns
 
-    def _papo_objective_mask(self, completion_mask: jax.Array) -> jax.Array:
+    def _papo_objective_mask(self, completion_mask: jax.Array, *, step: int | None = None) -> jax.Array:
         """Build the token-level objective mask requested by PAPO config.
 
-        Prefix, suffix, alternate, and deterministic pseudo-random masking all
-        preserve existing padding masks. The output is multiplied into the GRPO
-        completion mask before loss computation.
+        Prefix, suffix, alternate (honoring ``mask_ratio`` via evenly spaced
+        Bresenham selection), and step-seeded pseudo-random masking all
+        preserve existing padding masks without signed ``int32`` overflow.
+        The output is multiplied into the GRPO completion mask before loss
+        computation.
         """
         mask_ratio = float(self.arguments.mask_ratio)
         if mask_ratio <= 0.0:
             return completion_mask
+        if mask_ratio >= 1.0:
+            return jnp.zeros_like(completion_mask)
         positions = jnp.arange(completion_mask.shape[1], dtype=jnp.int32)[None, :]
-        rows = jnp.arange(completion_mask.shape[0], dtype=jnp.int32)[:, None]
         active_lengths = jnp.maximum(jnp.sum(completion_mask, axis=1, keepdims=True), 1)
         if self.arguments.mask_type == "prefix":
             keep_mask = positions >= jnp.floor(active_lengths * mask_ratio).astype(jnp.int32)
         elif self.arguments.mask_type == "suffix":
             keep_mask = positions < jnp.ceil(active_lengths * (1.0 - mask_ratio)).astype(jnp.int32)
         elif self.arguments.mask_type == "alternate":
-            keep_mask = (positions % 2) == 0
+            # Evenly space masked positions at density ``mask_ratio``; matches
+            # ``(positions % 2) == 0`` exactly when ``mask_ratio == 0.5``.
+            pos_f = positions.astype(jnp.float32)
+            is_masked = jnp.floor((pos_f + 1.0) * mask_ratio) > jnp.floor(pos_f * mask_ratio)
+            keep_mask = ~is_masked
         else:
-            hashed = (positions * 1103515245 + rows * 12345 + 6789) % 10000
-            keep_mask = hashed.astype(jnp.float32) / 10000.0 >= mask_ratio
+            if step is None:
+                step = int(getattr(self, "_papo_mask_step", 0))
+                self._papo_mask_step = step + 1
+            base_seed = int(getattr(self.arguments, "seed", 0) or 0)
+            key = jax.random.fold_in(jax.random.PRNGKey(base_seed), int(step))
+            samples = jax.random.uniform(key, shape=completion_mask.shape, dtype=jnp.float32)
+            keep_mask = samples >= mask_ratio
         return completion_mask * keep_mask.astype(completion_mask.dtype)
 
     def _apply_papo_reward_columns(
@@ -198,6 +210,32 @@ class PAPOTrainer(GRPOTrainer):
             **reward_metrics,
         }
 
+    def _store_buffered_grpo_batch(
+        self,
+        model_batch: dict[str, jax.Array],
+        metrics: dict[str, float | int | str],
+    ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        """Apply PAPO shaping to the full un-sliced batch BEFORE GRPO slices it into distinct chunks.
+
+        When ``steps_per_generation > 1``, ``GRPOTrainer._store_buffered_grpo_batch``
+        slices ``model_batch`` into ``steps_per_generation`` distinct minibatches
+        inside ``_buffered_grpo_queue``. Shaping here ensures PAPO reward columns
+        match the full ``S * B`` prompt count and every queued minibatch retains
+        its own distinct shaped prompts, masks, and advantages.
+        """
+        pending = getattr(self, "_papo_pending_shaping", None)
+        if pending is not None:
+            reward_columns, local_prompt_count = pending
+            self._papo_pending_shaping = None
+            self._papo_shaped_in_store = True
+            model_batch, papo_metrics = self._apply_papo_objective_shaping(
+                model_batch,
+                reward_columns,
+                local_prompt_count,
+            )
+            metrics = {**metrics, **papo_metrics}
+        return super()._store_buffered_grpo_batch(model_batch, metrics)
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
@@ -207,8 +245,10 @@ class PAPOTrainer(GRPOTrainer):
         """Run GRPO preprocessing, then apply PAPO shaping to the model batch.
 
         Reward side columns are captured from the raw batch before GRPO purifies
-        or transforms it. The shaped batch and PAPO metrics are merged with the
-        parent GRPO preprocessing output.
+        or transforms it. On training steps, shaping runs inside
+        :meth:`_store_buffered_grpo_batch` on the full un-sliced batch prior to
+        ``steps_per_generation`` chunk slicing; on eval (or monkeypatched parent
+        calls that bypass ``_store_buffered_grpo_batch``), shaping falls back here.
         """
         if is_train and getattr(self, "_buffered_grpo_remaining", 0) > 0:
             # GRPO's cache holds the already-shaped PAPO batch (including the
@@ -218,9 +258,25 @@ class PAPOTrainer(GRPOTrainer):
         batch = self._apply_user_data_collator(batch)
         reward_columns = self._extract_papo_reward_columns(batch)
         local_prompt_count = int(batch["input_ids"].shape[0])
-        model_batch, metrics = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
-        model_batch, papo_metrics = self._apply_papo_objective_shaping(model_batch, reward_columns, local_prompt_count)
-        metrics = {**metrics, **papo_metrics}
-        if is_train and getattr(self, "_buffered_grpo_remaining", 0) > 0:
-            self._buffered_grpo_batch = (dict(model_batch), dict(metrics))
+        self._papo_pending_shaping = (reward_columns, local_prompt_count)
+        self._papo_shaped_in_store = False
+        try:
+            model_batch, metrics = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
+        finally:
+            self._papo_pending_shaping = None
+
+        if not self._papo_shaped_in_store:
+            model_batch, papo_metrics = self._apply_papo_objective_shaping(
+                model_batch,
+                reward_columns,
+                local_prompt_count,
+            )
+            metrics = {**metrics, **papo_metrics}
+            if is_train and getattr(self, "_buffered_grpo_remaining", 0) > 0:
+                self._buffered_grpo_batch = (dict(model_batch), dict(metrics))
+                queued = getattr(self, "_buffered_grpo_queue", None)
+                if isinstance(queued, list) and queued:
+                    self._buffered_grpo_queue = [
+                        (dict(model_batch), dict(metrics)) for _ in range(int(self._buffered_grpo_remaining))
+                    ]
         return model_batch, metrics

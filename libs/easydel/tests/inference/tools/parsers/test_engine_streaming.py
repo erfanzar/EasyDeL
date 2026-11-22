@@ -201,7 +201,7 @@ _TOOL_STREAM_CASES = [
     ),
     _ToolParserStreamCase(
         "functiongemma",
-        '<start_function_call>call:get_weather{location:<escape>"Paris"<escape>}<end_function_call>',
+        "<start_function_call>call:get_weather{location:<escape>Paris<escape>}<end_function_call>",
     ),
     _ToolParserStreamCase(
         "gemma4",

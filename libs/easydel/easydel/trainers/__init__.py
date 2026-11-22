@@ -34,9 +34,19 @@ configs; sub-modules expose internal helpers that are not part of the
 public API.
 """
 
-from . import prompt_transforms
+import importlib
+import typing as tp
+
+# Trainer and config classes decorated with @Registry.register("trainer", ...) /
+# @Registry.register("trainer-arguments", ...) must stay registered when
+# `easydel.trainers` is imported because `Registry.get_or_raise(..., wakeup=True)`
+# imports this package to discover built-in trainers. Non-registry utilities and
+# optional integrations (e.g. Ray, eSurge rollout, prompt transforms, PoSE/YaRN/
+# ProcessEncoder configs) are loaded lazily via PEP 562 ``__getattr__``.
+from .agent_flow_trainer import AgentFlowConfig, AgentFlowTrainer
 from .agentic_moshpit import AgenticMoshPitConfig, AgenticMoshPitTrainer
 from .async_grpo_trainer import AsyncGRPOConfig, AsyncGRPOTrainer
+from .async_rollout_mixin import AsyncRolloutMixin, AsyncRolloutResult
 from .base_trainer import BaseTrainer
 from .bema_trainer import BEMACallback, BEMAConfig, BEMADPOTrainer
 from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
@@ -46,8 +56,9 @@ from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
 from .dppo_trainer import DPPOConfig, DPPOTrainer
 from .embedding_trainer import EmbeddingConfig, EmbeddingTrainer
-from .esurge_rollout import OpenRewardSpec, eSurgeRolloutConfig, eSurgeRolloutGenerator, generate_rollout_completions
+from .gdpo_trainer import GDPOConfig, GDPOTrainer
 from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
+from .gmpo_trainer import GMPOConfig, GMPOTrainer
 from .gold_trainer import GOLDConfig, GOLDTrainer
 from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
@@ -60,31 +71,16 @@ from .grpo_replay_buffer_trainer import (
 )
 from .gspo_token_trainer import GSPOTokenConfig, GSPOTokenTrainer
 from .kto_trainer import KTOConfig, KTOTrainer
-from .merge_callback import MergeConfig, MergeModelCallback
-from .metrics import LogWatcher
 from .minillm_trainer import MiniLLMConfig, MiniLLMTrainer
 from .nash_md_trainer import NashMDConfig, NashMDTrainer
-from .nemo_gym_trainer import NeMoGymConfig, NeMoGymTrainer, load_nemo_gym_jsonl
+from .nemo_gym_trainer import NeMoGymConfig, NeMoGymTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .on_policy_distillation_trainer import OnPolicyDistillationConfig, OnPolicyDistillationTrainer
 from .online_dpo_trainer import OnlineDPOConfig, OnlineDPOTrainer
-from .packer import pack_sequences
 from .papo_trainer import PAPOConfig, PAPOTrainer
-from .prm_trainer import PRMConfig, PRMPreprocessTransform, PRMTrainer
-from .prompt_transforms import (
-    BCOPreprocessTransform,
-    CPOPreprocessTransform,
-    DPOPreprocessTransform,
-    GRPOPreprocessTransform,
-    KTOPreprocessTransform,
-    ORPOPreprocessTransform,
-    PPOPreprocessTransform,
-    RewardPreprocessTransform,
-    SFTPreprocessTransform,
-)
+from .prm_trainer import PRMConfig, PRMTrainer
 from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
-from .ray_scaler import RayDistributedTrainer
-from .reward_protocol import RewardProtocol
+from .reinforce_plus_plus_trainer import ReinforcePlusPlusConfig, ReinforcePlusPlusTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
 from .rloo_trainer import RLOOConfig, RLOOTrainer
 from .rlvr_trainer import RLVRConfig, RLVRTrainer
@@ -99,13 +95,94 @@ from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .tpo_trainer import TPOConfig, TPOTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
+from .vapo_trainer import VAPOConfig, VAPOTrainer
 from .xpo_trainer import XPOConfig, XPOTrainer
 
+if tp.TYPE_CHECKING:
+    from . import prompt_transforms
+    from .esurge_rollout import (
+        OpenRewardSpec,
+        eSurgeRolloutConfig,
+        eSurgeRolloutGenerator,
+        generate_rollout_completions,
+    )
+    from .merge_callback import MergeConfig, MergeModelCallback
+    from .metrics import LogWatcher
+    from .nemo_gym_trainer import load_nemo_gym_jsonl
+    from .packer import pack_sequences
+    from .pose import PoSEConfig
+    from .prm_trainer import PRMPreprocessTransform
+    from .process_encoder import ProcessEncoderConfig
+    from .prompt_transforms import (
+        BCOPreprocessTransform,
+        CPOPreprocessTransform,
+        DPOPreprocessTransform,
+        EmbeddingPreprocessTransform,
+        GRPOPreprocessTransform,
+        KTOPreprocessTransform,
+        ORPOPreprocessTransform,
+        PPOPreprocessTransform,
+        RewardPreprocessTransform,
+        SFTPreprocessTransform,
+    )
+    from .randomized_yarn import RandomizedYaRNConfig
+    from .ray_scaler import RayDistributedTrainer
+    from .reward_protocol import RewardProtocol
+
+_LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+    "BCOPreprocessTransform": (".prompt_transforms", "BCOPreprocessTransform"),
+    "CPOPreprocessTransform": (".prompt_transforms", "CPOPreprocessTransform"),
+    "DPOPreprocessTransform": (".prompt_transforms", "DPOPreprocessTransform"),
+    "EmbeddingPreprocessTransform": (".prompt_transforms", "EmbeddingPreprocessTransform"),
+    "GRPOPreprocessTransform": (".prompt_transforms", "GRPOPreprocessTransform"),
+    "KTOPreprocessTransform": (".prompt_transforms", "KTOPreprocessTransform"),
+    "LogWatcher": (".metrics", "LogWatcher"),
+    "MergeConfig": (".merge_callback", "MergeConfig"),
+    "MergeModelCallback": (".merge_callback", "MergeModelCallback"),
+    "ORPOPreprocessTransform": (".prompt_transforms", "ORPOPreprocessTransform"),
+    "OpenRewardSpec": (".esurge_rollout", "OpenRewardSpec"),
+    "PPOPreprocessTransform": (".prompt_transforms", "PPOPreprocessTransform"),
+    "PRMPreprocessTransform": (".prm_trainer", "PRMPreprocessTransform"),
+    "PoSEConfig": (".pose", "PoSEConfig"),
+    "ProcessEncoderConfig": (".process_encoder", "ProcessEncoderConfig"),
+    "RandomizedYaRNConfig": (".randomized_yarn", "RandomizedYaRNConfig"),
+    "RayDistributedTrainer": (".ray_scaler", "RayDistributedTrainer"),
+    "RewardPreprocessTransform": (".prompt_transforms", "RewardPreprocessTransform"),
+    "RewardProtocol": (".reward_protocol", "RewardProtocol"),
+    "SFTPreprocessTransform": (".prompt_transforms", "SFTPreprocessTransform"),
+    "eSurgeRolloutConfig": (".esurge_rollout", "eSurgeRolloutConfig"),
+    "eSurgeRolloutGenerator": (".esurge_rollout", "eSurgeRolloutGenerator"),
+    "generate_rollout_completions": (".esurge_rollout", "generate_rollout_completions"),
+    "load_nemo_gym_jsonl": (".nemo_gym_trainer", "load_nemo_gym_jsonl"),
+    "pack_sequences": (".packer", "pack_sequences"),
+    "prompt_transforms": (".prompt_transforms", None),
+}
+
+
+def __getattr__(name: str) -> tp.Any:
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = target
+    module = importlib.import_module(module_name, __name__)
+    value = module if attr_name is None else getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
+
 __all__ = (
+    "AgentFlowConfig",
+    "AgentFlowTrainer",
     "AgenticMoshPitConfig",
     "AgenticMoshPitTrainer",
     "AsyncGRPOConfig",
     "AsyncGRPOTrainer",
+    "AsyncRolloutMixin",
+    "AsyncRolloutResult",
     "BCOConfig",
     "BCOPreprocessTransform",
     "BCOTrainer",
@@ -126,11 +203,16 @@ __all__ = (
     "DistillationConfig",
     "DistillationTrainer",
     "EmbeddingConfig",
+    "EmbeddingPreprocessTransform",
     "EmbeddingTrainer",
+    "GDPOConfig",
+    "GDPOTrainer",
     "GFPOConfig",
     "GFPOTrainer",
     "GKDConfig",
     "GKDTrainer",
+    "GMPOConfig",
+    "GMPOTrainer",
     "GOLDConfig",
     "GOLDTrainer",
     "GRPOConfig",
@@ -172,11 +254,16 @@ __all__ = (
     "PRMConfig",
     "PRMPreprocessTransform",
     "PRMTrainer",
+    "PoSEConfig",
+    "ProcessEncoderConfig",
     "RLOOConfig",
     "RLOOTrainer",
     "RLVRConfig",
     "RLVRTrainer",
+    "RandomizedYaRNConfig",
     "RayDistributedTrainer",
+    "ReinforcePlusPlusConfig",
+    "ReinforcePlusPlusTrainer",
     "RewardConfig",
     "RewardPreprocessTransform",
     "RewardProtocol",
@@ -204,6 +291,8 @@ __all__ = (
     "TPOTrainer",
     "Trainer",
     "TrainingArguments",
+    "VAPOConfig",
+    "VAPOTrainer",
     "XPOConfig",
     "XPOTrainer",
     "eSurgeRolloutConfig",

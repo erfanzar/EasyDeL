@@ -131,8 +131,41 @@ class DSparkDrafter:
         del max_length
 
     def reset_request(self, request_id: str | None = None) -> None:
-        """No-op: per-request state is reset when a row changes owner (see :meth:`observe_window`)."""
-        del request_id
+        """Forget per-request ring ownership for ``request_id`` (or every row when ``None``)."""
+        if request_id is None:
+            self._owner.clear()
+            self._through.clear()
+            self._last_window.clear()
+            self._broken.clear()
+            return
+        self.release_request(str(request_id))
+
+    def release_request(self, request_id: str) -> None:
+        """Release any drafter ring row owned by ``request_id`` (on finish or preemption)."""
+        rid = str(request_id)
+        rows = [row for row, owner in self._owner.items() if owner == rid]
+        for row in rows:
+            self._owner.pop(row, None)
+            self._through.pop(row, None)
+            self._last_window.pop(row, None)
+            self._broken.discard(row)
+
+    def update_target_model(self, model: tp.Any) -> None:
+        """Bind a refreshed target model and drop cached exported weight leaves."""
+        self.target_model = model
+        self._programs = None
+        self._last_window.clear()
+
+    def release_target_model(self) -> None:
+        """Drop target model, cached program weight leaves, and ring buffers to free HBM."""
+        self.target_model = None
+        self._programs = None
+        self._rings = None
+        self._capacity = 0
+        self._owner.clear()
+        self._through.clear()
+        self._last_window.clear()
+        self._broken.clear()
 
     def reset(self, batch_size: int) -> None:
         """Re-allocate zeroed rings for ``batch_size`` rows and forget every row owner."""

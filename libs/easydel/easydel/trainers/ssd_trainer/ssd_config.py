@@ -18,20 +18,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
-from ..self_distillation_policy_optimization import SDPOConfig
+from ..group_relative_policy_optimization import GRPOConfig
 
 
 @Registry.register("trainer-arguments", "ssd")
 @dataclass
-class SSDConfig(SDPOConfig):
+class SSDConfig(GRPOConfig):
     """Configuration for single-sample self-distillation with eSurge rollouts.
 
-    SSD fixes generation to one sampled completion per prompt and optionally
-    filters empty completions before feeding the batch into the SDPO-style loss.
+    SSD fixes generation to one sampled completion per prompt, disables
+    reference-model allocation (``beta=0.0``), and optionally filters empty
+    completions before feeding the batch into the SSD cross-entropy step.
     """
 
     trainer_prefix: str | None = field(default="SSD")
+    beta: float = field(default=0.0)
     filter_empty: bool = field(default=True)
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None) -> None:
@@ -39,9 +42,11 @@ class SSDConfig(SDPOConfig):
 
         SSD trains on one self-generated completion per prompt rather than a
         grouped reward objective. The hook pins both generation aliases to one
-        and then lets the SDPO parent normalize lengths, sharding, and optimizer
-        configuration.
+        and then lets the GRPO parent normalize lengths, sharding, and optimizer
+        configuration without reserving unused SDPO feedback headroom.
         """
         self.num_generations = 1
         self.num_return_sequences = 1
         super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
+
+    __hash__ = hash_fn

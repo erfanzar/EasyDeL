@@ -12,71 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Request scheduling components for the eSurge inference engine.
+"""The runner's view of one scheduling step.
 
-This module provides the scheduling infrastructure for managing and batching
-inference requests. It includes request queues, scheduling algorithms, and
-output structures.
+eSurge schedules through surgecore's Rust ``EngineCore`` (request table, per-rank queues, token budgets, KV pages,
+prefix cache, preemption, chunked prefill, speculative drafts);
+:class:`~easydel.inference.esurge.engine.core_driver.EngineCoreDriver` owns it. This package keeps the step structures
+the runner and the multi-host followers read: :class:`SchedulerOutput`, :class:`NewRequestData` and
+:class:`CachedRequestData`.
 
-The scheduler module is responsible for:
-    - Managing request queues with different scheduling policies (FCFS, Priority)
-    - Allocating KV cache pages to requests
-    - Batching requests for efficient GPU utilization
-    - Handling request preemption when resources are constrained
-    - Managing async token generation for improved throughput
-
-Classes:
-    Scheduler: Main request scheduler that handles batching and resource allocation.
-    AsyncScheduler: Async scheduler with placeholder-based token sampling for
-        overlapping execution.
-    SchedulerInterface: Abstract base class defining the scheduler interface.
-    RequestQueue: Abstract base class for request queue implementations.
-    FCFSRequestQueue: First-come-first-served queue implementation.
-    PriorityRequestQueue: Priority-based queue with heap-based ordering.
-    SchedulerOutput: Data class containing the output of a scheduling decision.
-    NewRequestData: Data class for new requests being scheduled.
-    CachedRequestData: Data class for cached/running requests being scheduled.
-    TokenBudgetManager: Utility for managing token budgets based on KV cache capacity.
-
-Example:
-    Basic scheduler usage::
-
-        >>> from easydel.inference.esurge.scheduler import Scheduler
-        >>>
-        >>> scheduler = Scheduler(
-        ...     kv_cache_config=kv_config,
-        ...     max_num_seqs=16,
-        ...     max_num_batched_tokens=2048,
-        ...     max_model_len=8192,
-        ...     num_pages=1024,
-        ...     page_size=128,
-        ... )
-        >>> output = scheduler.schedule()
-
-    For async scheduling with improved throughput::
-
-        >>> config_async = SchedulerConfig(
-        ...     max_num_seqs=16,
-        ...     max_num_batched_tokens=2048,
-        ...     max_model_len=8192,
-        ...     async_scheduling=True
-        ... )
-        >>> async_scheduler = AsyncScheduler(config_async)
-        >>> output = async_scheduler.schedule()
-
-Note:
-    The scheduler should be created using the appropriate configuration and
-    KV cache configuration. For most use cases, creating a Scheduler from
-    an eSurgeRunner using ``Scheduler.from_runner()`` is recommended.
+The former Python scheduler classes (``Scheduler``, ``AsyncScheduler``, ``DPScheduler``, ``SchedulerInterface``,
+the request queues and ``TokenBudgetManager``) are kept as names only: using one raises :class:`RuntimeError` that
+points to ``EngineCoreDriver``.
 """
 
-from .async_scheduler import AsyncScheduler
-from .dp_scheduler import DPScheduler
-from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
-from .request_queue import FCFSRequestQueue, PriorityRequestQueue, RequestQueue
-from .scheduler import Scheduler
-from .token_budget import TokenBudgetManager
+
+
+class _RemovedMeta(type):
+    """Metaclass of a removed name: any attribute access raises, as instantiation does."""
+
+    def __getattr__(cls, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise RuntimeError(cls.__doc__)
+
+
+def _removed(name: str) -> type:
+    """A placeholder class for a scheduler name that moved into surgecore's Rust ``EngineCore``."""
+    message = (
+        f"easydel.inference.esurge.scheduler.{name} was removed: eSurge schedules through surgecore's Rust "
+        "EngineCore. Use easydel.inference.esurge.engine.core_driver.EngineCoreDriver instead."
+    )
+
+    def __new__(cls, *args, **kwargs):
+        raise RuntimeError(message)
+
+    return _RemovedMeta(name, (), {"__new__": __new__, "__doc__": message})
+
+
+AsyncScheduler = _removed("AsyncScheduler")
+DPScheduler = _removed("DPScheduler")
+FCFSRequestQueue = _removed("FCFSRequestQueue")
+PriorityRequestQueue = _removed("PriorityRequestQueue")
+RequestQueue = _removed("RequestQueue")
+Scheduler = _removed("Scheduler")
+SchedulerInterface = _removed("SchedulerInterface")
+TokenBudgetManager = _removed("TokenBudgetManager")
 
 __all__ = (
     "AsyncScheduler",

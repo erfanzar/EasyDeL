@@ -49,6 +49,7 @@ from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, TypeVar
 
+import numpy as np
 from jax import Array
 from jax import numpy as jnp
 
@@ -271,6 +272,12 @@ class ModelRunnerOutput:
 
     hidden_states: dict[str, Any] | None = None
     """Optional per-request hidden states exposed for runner-native drafters."""
+
+    spec_emitted: np.ndarray | None = None
+    """Packed emitted tokens per sequence-buffer row, including the accepted-count column."""
+
+    spec_drafts: np.ndarray | None = None
+    """Next drafts per sequence-buffer row, padded with -1."""
 
 
 def swap_dict_values(obj: dict[_K, _V], key1: _K, key2: _K) -> None:

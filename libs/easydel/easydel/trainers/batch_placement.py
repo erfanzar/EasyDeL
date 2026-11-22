@@ -51,13 +51,21 @@ def _restrict_spec_to_mesh(partition_spec: PartitionSpec, axis_names: set[str]) 
     return PartitionSpec(*(_entry(entry) for entry in partition_spec))
 
 
-def batch_leaf_sharding(shape: tuple[int, ...], partition_spec: PartitionSpec, mesh: tp.Any) -> NamedSharding:
+def batch_leaf_sharding(
+    shape: tuple[int, ...],
+    partition_spec: PartitionSpec,
+    mesh: tp.Any,
+    *,
+    key: str | None = None,
+) -> NamedSharding:
     """Return the sharding the step's ``constrain_batch_sharding`` would give a leaf of ``shape``.
 
     Args:
         shape: Global leaf shape.
         partition_spec: Trainer batch spec, e.g. ``P(("dp", "fsdp"), "sp")``.
         mesh: Mesh (JAX or SpectraX) the step runs on.
+        key: Optional dictionary key name (used to disambiguate rank-3 mRoPE
+            ``(3, B, S)`` ``position_ids`` from ``(B, S, D)`` tensors).
 
     Returns:
         A ``NamedSharding`` on ``mesh``; fully replicated when no batch axis divides the leaf.
@@ -67,7 +75,7 @@ def batch_leaf_sharding(shape: tuple[int, ...], partition_spec: PartitionSpec, m
     jax_mesh = _jax_mesh(mesh)
     axis_sizes = {str(name): int(size) for name, size in dict(jax_mesh.shape).items()}
     spec = _restrict_spec_to_mesh(partition_spec, set(axis_sizes))
-    return NamedSharding(jax_mesh, _leaf_batch_partition_spec(tuple(int(d) for d in shape), spec, axis_sizes))
+    return NamedSharding(jax_mesh, _leaf_batch_partition_spec(tuple(int(d) for d in shape), spec, axis_sizes, key=key))
 
 
 def place_batch(batch: tp.Any, partition_spec: PartitionSpec, mesh: tp.Any) -> tp.Any:
@@ -88,9 +96,10 @@ def place_batch(batch: tp.Any, partition_spec: PartitionSpec, mesh: tp.Any) -> t
         The batch with array leaves committed to their shardings.
     """
 
-    def _place(leaf: tp.Any) -> tp.Any:
+    def _place(path: tuple[tp.Any, ...], leaf: tp.Any) -> tp.Any:
+        key = next((entry.key for entry in reversed(path) if isinstance(entry, jax.tree_util.DictKey)), None)
         if isinstance(leaf, jax.Array):
-            target = batch_leaf_sharding(tuple(leaf.shape), partition_spec, mesh)
+            target = batch_leaf_sharding(tuple(leaf.shape), partition_spec, mesh, key=key)
             current = getattr(leaf, "sharding", None)
             if isinstance(current, NamedSharding) and current.is_equivalent_to(target, leaf.ndim):
                 return leaf
@@ -99,13 +108,11 @@ def place_batch(batch: tp.Any, partition_spec: PartitionSpec, mesh: tp.Any) -> t
             host = np.asarray(leaf)
             if not is_numeric_dtype(host.dtype):
                 return leaf
-            target = batch_leaf_sharding(tuple(host.shape), partition_spec, mesh)
+            target = batch_leaf_sharding(tuple(host.shape), partition_spec, mesh, key=key)
             return jax.make_array_from_callback(host.shape, target, lambda index: host[index])
         return leaf
 
-    if isinstance(batch, dict):
-        return {key: jax.tree_util.tree_map(_place, value) for key, value in batch.items()}
-    return jax.tree_util.tree_map(_place, batch)
+    return jax.tree_util.tree_map_with_path(_place, batch)
 
 
 def replicated_batch_slot_spec(arguments: tp.Any, mesh: tp.Any, in_shardings: tp.Any) -> PartitionSpec | None:

@@ -77,8 +77,10 @@ def test_selected_logps_extreme_or_masked_target_preserve_normalizer(chunk_size,
     [
         ("token_truncate", [[2.0, 1.0], [2.0, 2.0]]),
         ("token_mask", [[0.0, 1.0], [2.0, 2.0]]),
+        ("token_icepop", [[0.0, 1.0], [2.0, 2.0]]),
         ("sequence_truncate", [[2.0], [2.0]]),
         ("sequence_mask", [[0.0], [0.0]]),
+        ("sequence_icepop", [[0.0], [0.0]]),
     ],
 )
 def test_rollout_correction_modes(mode, expected):
@@ -88,6 +90,38 @@ def test_rollout_correction_modes(mode, expected):
         jnp.log(jnp.array([[4.0, 100.0], [2.0, 2.0]])), jnp.zeros((2, 2)), jnp.array([[1, 0], [1, 1]])
     )
     np.testing.assert_allclose(np.asarray(ratio), expected, atol=1e-6)
+
+
+def test_icepop_double_sided_mismatch_mask():
+    trainer = object.__new__(GRPOTrainer)
+    trainer.arguments = SimpleNamespace(
+        esurge_importance_sampling_mode="token_icepop",
+        esurge_importance_sampling_cap=2.0,
+        esurge_importance_sampling_cap_low=None,
+    )
+    # Ratios: 0.49 (< 0.5 -> 0), 0.51 (in [0.5, 2] -> 0.51), 1.5 (in [0.5, 2] -> 1.5), 2.5 (> 2 -> 0)
+    policy_logps = jnp.log(jnp.array([[0.49, 0.51, 1.5, 2.5]], dtype=jnp.float32))
+    sampling_logps = jnp.zeros_like(policy_logps)
+    completion_mask = jnp.ones_like(policy_logps)
+    ratio = trainer._esurge_importance_sampling_ratio(policy_logps, sampling_logps, completion_mask)
+    np.testing.assert_allclose(np.asarray(ratio), [[0.0, 0.51, 1.5, 0.0]], atol=1e-5)
+
+    # Asymmetric bounds [0.5, 5.0]
+    trainer.arguments.esurge_importance_sampling_cap = 5.0
+    trainer.arguments.esurge_importance_sampling_cap_low = 0.5
+    asym_logps = jnp.log(jnp.array([[0.49, 0.51, 4.9, 5.1]], dtype=jnp.float32))
+    asym_ratio = trainer._esurge_importance_sampling_ratio(asym_logps, sampling_logps, completion_mask)
+    np.testing.assert_allclose(np.asarray(asym_ratio), [[0.0, 0.51, 4.9, 0.0]], atol=1e-5)
+
+    trainer.arguments.esurge_importance_sampling_mode = "sequence_icepop"
+    trainer.arguments.esurge_importance_sampling_cap = 2.0
+    trainer.arguments.esurge_importance_sampling_cap_low = None
+    # Sequence 0 product: 0.25 * 1.0 = 0.25 (< 0.5 -> 0.0); Sequence 1 product: 0.51 * 2.0 = 1.02 (in [0.5, 2.0] -> 1.02)
+    seq_policy_logps = jnp.log(jnp.array([[0.25, 1.0], [0.51, 2.0]], dtype=jnp.float32))
+    seq_ratio = trainer._esurge_importance_sampling_ratio(
+        seq_policy_logps, jnp.zeros_like(seq_policy_logps), jnp.ones_like(seq_policy_logps)
+    )
+    np.testing.assert_allclose(np.asarray(seq_ratio), [[0.0], [1.02]], atol=1e-5)
 
 
 def test_scheduled_dppo_loss_matches_uniform_policy_reference():
@@ -138,6 +172,79 @@ def test_scheduled_dppo_loss_matches_uniform_policy_reference():
     )
     loss = get_scheduled_loss_adapter(grpo_step).make_loss(call)({}, batch)
     np.testing.assert_allclose(np.asarray(loss), np.log(4.0), rtol=1e-5)
+
+
+def test_grpo_step_icepop_masks_out_of_band_gradients():
+    mesh = Mesh(np.array(jax.devices()[:1]), ("dp",))
+
+    class Model:
+        def __init__(self, bias):
+            self.mesh = mesh
+            self.bias = bias
+
+        def __call__(self, input_ids, **kwargs):
+            # [B=1, L=3, V=4] -> completion positions are indices 0 and 1 (shifted by prompt_len=1)
+            logits = jnp.zeros((*input_ids.shape, 4), dtype=jnp.float32) + self.bias[None, :, :]
+            return SimpleNamespace(logits=logits)
+
+    bias0 = jnp.zeros((3, 4), dtype=jnp.float32)
+
+    class State:
+        def __init__(self, graphstate):
+            self.model = Model(graphstate)
+            self.graphstate = graphstate
+            self.graphdef = None
+            self.graphother = None
+
+        def replace(self, **kwargs):
+            return State(kwargs.get("graphstate", self.graphstate))
+
+        def merge(self, tree):
+            return Model(tree)
+
+    trainer = object.__new__(GRPOTrainer)
+    trainer.arguments = SimpleNamespace(
+        esurge_importance_sampling_mode="token_icepop",
+        esurge_importance_sampling_cap=2.0,
+        esurge_importance_sampling_cap_low=0.5,
+    )
+    # Token 0: ratio 0.4 (< 0.5 -> masked to 0.0); Token 1: ratio 1.5 (in [0.5, 2.0] -> kept as 1.5)
+    policy_logps = jnp.log(jnp.array([[0.4, 1.5]], dtype=jnp.float32))
+    sampling_logps = jnp.zeros_like(policy_logps)
+    completion_mask = jnp.ones((1, 2), dtype=jnp.float32)
+    icepop_ratio = trainer._esurge_importance_sampling_ratio(policy_logps, sampling_logps, completion_mask)
+
+    state = State(bias0)
+    batch = {
+        "prompt_ids": jnp.array([[0]]),
+        "prompt_mask": jnp.ones((1, 1)),
+        "completion_ids": jnp.array([[1, 2]]),
+        "completion_mask": completion_mask,
+        "advantages": jnp.ones((1,)),
+        "old_per_token_logps": jnp.full((1, 2), -jnp.log(4.0)),
+        "importance_sampling_ratio": icepop_ratio,
+    }
+    bound = inspect.signature(grpo_step).bind(
+        state,
+        batch,
+        1,
+        0.0,
+        is_training=True,
+        partition_spec=PartitionSpec(),
+        loss_type="grpo",
+        epsilon=0.2,
+        epsilon_high=0.28,
+    )
+    bound.apply_defaults()
+    call = ScheduledStepCall(
+        step_fn=grpo_step, state=state, batch=batch, args=(), kwargs={}, bound_arguments=bound.arguments, schedule=None
+    )
+    loss_fn = get_scheduled_loss_adapter(grpo_step).make_loss(call)
+    loss, grads = jax.value_and_grad(loss_fn)(bias0, batch)
+    assert jnp.isfinite(loss)
+    # Position 0 predicts completion token 0 (masked by IcePop -> zero grad); position 1 predicts token 1 (non-zero grad)
+    np.testing.assert_allclose(np.asarray(grads[0]), np.zeros((4,), dtype=np.float32), atol=1e-7)
+    assert float(jnp.max(jnp.abs(grads[1]))) > 1e-3
 
 
 def test_kto_cached_dataset_kl_does_not_change_runtime_pairing():
@@ -191,8 +298,8 @@ def test_gfpo_shared_rollout_preserves_rloo_reuse_and_log_alignment(correction_e
         reward_clip_range=None,
     )
     trainer.group_filter_func = lambda ids, rewards, mask: ids[:, 0].astype(jnp.float32)
-    trainer.steps_per_generation = 2
-    trainer.num_iterations = 1
+    trainer.steps_per_generation = 1
+    trainer.num_iterations = 2
     trainer.ref_state = None
     trainer.train_is_conversational = False
     trainer.eval_is_conversational = False

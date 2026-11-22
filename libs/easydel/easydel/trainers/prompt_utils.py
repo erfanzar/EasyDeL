@@ -34,6 +34,7 @@ import jax
 import numpy as np
 import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
 from datasets import Dataset, DatasetDict  # pyright: ignore[reportMissingTypeStubs]
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 
 from easydel.infra.utils import ProcessingClassType
@@ -67,6 +68,8 @@ from easydel.utils.prompt_utils import (
 from easydel.utils.prompt_utils import (
     convert_to_openai_format as convert_to_openai_format,
 )
+
+logger = get_logger(__name__)
 
 DatasetType = tp.TypeVar("DatasetType", Dataset, DatasetDict)
 
@@ -150,7 +153,9 @@ def normalize_message_payload(
         if isinstance(item, str):
             parsed = _maybe_json_load(item)
             if parsed is not item:
-                return normalize_message_payload(parsed, allow_plain_text=allow_plain_text)
+                res = normalize_message_payload(parsed, allow_plain_text=allow_plain_text)
+                if res is not None:
+                    return res
             if allow_plain_text:
                 return [{"role": "user", "content": item}]
             return None
@@ -164,7 +169,7 @@ def normalize_message_payload(
                 normalized.pop("value", None)
                 return [normalized]
 
-            if "role" in item:
+            if "role" in item and isinstance(item["role"], str) and ("content" in item or "tool_calls" in item):
                 normalized = dict(item)
                 tool_calls = normalized.get("tool_calls")
                 if isinstance(tool_calls, str):
@@ -179,7 +184,8 @@ def normalize_message_payload(
 
             if "content" in item and allow_plain_text:
                 normalized = dict(item)
-                normalized.setdefault("role", "user")
+                if not isinstance(normalized.get("role"), str):
+                    normalized["role"] = "user"
                 return [normalized]
             return None
 
@@ -220,8 +226,11 @@ def normalize_tool_payload(payload: tp.Any) -> tp.Any:
         shallow-copied.
     """
     if isinstance(payload, str):
-        parsed = _maybe_json_load(payload)
-        if parsed is not payload:
+        stripped = payload.strip()
+        if not stripped or stripped.lower() in {"null", "none"}:
+            return None
+        parsed = _maybe_json_load(stripped)
+        if parsed is not stripped:
             return normalize_tool_payload(parsed)
         return payload
 
@@ -229,6 +238,8 @@ def normalize_tool_payload(payload: tp.Any) -> tp.Any:
         normalized: list[tp.Any] = []
         for item in payload:
             parsed = normalize_tool_payload(item)
+            if parsed is None:
+                continue
             if isinstance(parsed, list):
                 normalized.extend(parsed)
             else:
@@ -268,9 +279,13 @@ def resolve_example_tools(
     example_tools = normalize_tool_payload(example.get("tools"))
     if isinstance(example_tools, dict):
         example_tools = [example_tools]
-    if example_tools is not None and example.get("tools") is not example_tools:
+    if example_tools is None:
+        if example.get("tools") is not None:
+            example["tools"] = None
+        return fallback_tools
+    if example.get("tools") is not example_tools:
         example["tools"] = example_tools
-    return example_tools if example_tools is not None else fallback_tools
+    return example_tools
 
 
 def reverse_openai_format(
@@ -312,7 +327,7 @@ def reverse_openai_format(
         or None if the input list structure is invalid.
     """
     if not isinstance(openai_messages, list):
-        print(f"Error: Input must be a list, but got {type(openai_messages)}.")
+        logger.warning("reverse_openai_format: Input must be a list, got %s.", type(openai_messages).__name__)
         return None
 
     if not openai_messages:
@@ -321,37 +336,41 @@ def reverse_openai_format(
 
     for i, message in enumerate(openai_messages):
         if not isinstance(message, dict):
-            print(f"Warning: Item at index {i} is not a dictionary. Skipping.")
+            logger.warning("reverse_openai_format: Item at index %d is not a dictionary. Skipping.", i)
             continue
 
         role = message.get("role")
         content_list = message.get("content")
 
         if not isinstance(role, str) or not role:
-            print(f"Warning: Message at index {i} is missing or has invalid 'role'. Skipping.")
+            logger.warning("reverse_openai_format: Message at index %d is missing or has invalid 'role'. Skipping.", i)
             continue
 
         if not isinstance(content_list, list):
-            print(f"Warning: Message at index {i} is missing or has invalid 'content' (must be a list). Skipping.")
+            logger.warning(
+                "reverse_openai_format: Message at index %d is missing or has invalid 'content' (must be a list). "
+                "Skipping.",
+                i,
+            )
             continue
-        message_text = ""
-        found_text = False
+        text_parts: list[str] = []
         for part in content_list:
             if isinstance(part, dict) and part.get("type") == "text":
                 text_val = part.get("text")
                 if isinstance(text_val, str):
-                    if not found_text:
-                        message_text = text_val
-                        found_text = True
-        if not found_text:
-            print(
-                f"Warning: Message at index {i} (role: {role}) has no 'content' "
-                "part with type 'text'. Using empty string."
+                    text_parts.append(text_val)
+        if not text_parts:
+            logger.warning(
+                "reverse_openai_format: Message at index %d (role: %s) has no 'content' part with type 'text'. "
+                "Using empty string.",
+                i,
+                role,
             )
+        message_text = "\n".join(text_parts)
         simple_dict: OutputDict = {"role": role, content_key_name: message_text}
         simple_messages.append(simple_dict)
     if len(simple_messages) == 0:
-        print("Warning: Input list contained messages, but none could be processed successfully.")
+        logger.warning("reverse_openai_format: Input list contained messages, but none could be processed.")
         return []
     elif len(simple_messages) == 1:
         return simple_messages[0]
@@ -426,20 +445,14 @@ def render_prompt_with_suffix(
     *,
     field_name: str,
     tools: list[dict | tp.Callable] | None = None,
+    prompt_text: str | None = None,
     **template_kwargs,
 ) -> tuple[str, str, str]:
     """Render a conversational prompt using a chat template and derive the rendered suffix.
 
-    The function first renders the prompt messages alone (with
-    ``add_generation_prompt=True``) to obtain the prompt text.  It then
-    renders the full conversation (prompt messages + normalized suffix
-    messages) to obtain the complete text.  The suffix text is computed as
-    the difference between the full rendering and the prompt-only
-    rendering, i.e. ``full_text[len(prompt_text):]``.
-
-    This two-step approach ensures that the suffix text is exactly what the
-    chat template would produce for the suffix portion, including any
-    special tokens or formatting that the template inserts between turns.
+    The function renders the prompt messages alone (with ``add_generation_prompt=True``)
+    unless ``prompt_text`` is already supplied, then renders the full conversation
+    (prompt messages + normalized suffix messages) and slices ``full_text[len(prompt_text):]``.
 
     Args:
         prompt_messages: List of message dicts forming the prompt portion of
@@ -453,6 +466,8 @@ def render_prompt_with_suffix(
             messages and passed through to ``_normalize_chat_suffix``.
         tools: Optional list of tool/function schemas to pass to the chat
             template (for function-calling models).
+        prompt_text: Optional pre-rendered prompt string (avoids re-rendering
+            when deriving multiple suffixes for the same prompt).
         **template_kwargs: Additional keyword arguments forwarded to
             ``tokenizer.apply_chat_template``.
 
@@ -467,13 +482,14 @@ def render_prompt_with_suffix(
             the prompt-only rendering, which indicates an incompatible chat
             template.
     """
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_messages,
-        tools=tools,
-        tokenize=False,
-        add_generation_prompt=True,
-        **template_kwargs,
-    )
+    if prompt_text is None:
+        prompt_text = tokenizer.apply_chat_template(
+            prompt_messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
     full_conversation = tokenizer.apply_chat_template(
         prompt_messages + _normalize_chat_suffix(suffix, field_name),
         tools=tools,
@@ -566,6 +582,7 @@ def apply_chat_template(
                 tokenizer,
                 field_name="chosen",
                 tools=tools,
+                prompt_text=prompt,
                 **template_kwargs,
             )
         if "rejected" in example:
@@ -575,6 +592,7 @@ def apply_chat_template(
                 tokenizer,
                 field_name="rejected",
                 tools=tools,
+                prompt_text=prompt,
                 **template_kwargs,
             )
         if "completion" in example:
@@ -584,6 +602,7 @@ def apply_chat_template(
                 tokenizer,
                 field_name="completion",
                 tools=tools,
+                prompt_text=prompt,
                 **template_kwargs,
             )
     elif "prompt" in example:
@@ -786,9 +805,13 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
     import numpy as np
 
     def is_valid_type(value):
-        """Check if value is numpy/jax array or primitive type."""
-        if isinstance(value, int | float | bool | np.ndarray | jax.Array | jnp.ndarray):
+        """Check if value is numpy/jax array or primitive/numpy scalar type."""
+        if isinstance(value, int | float | bool | np.number | np.bool_ | np.ndarray | jax.Array | jnp.ndarray):
             return True
+        if isinstance(value, np.generic):
+            dt = value.dtype
+            if dt is not object and getattr(dt, "kind", None) not in ("U", "S", "M", "m", "O"):
+                return bool(jax.dtypes.issubdtype(dt, np.number) or jax.dtypes.issubdtype(dt, np.bool_))
         return False
 
     if isinstance(example, list):
@@ -879,12 +902,14 @@ def _unpair_row(examples: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
     """
 
     batch_size = len(examples["chosen"])
-    new_rows = {
+    new_rows: dict[str, list[tp.Any]] = {
         "completion": examples["chosen"] + examples["rejected"],
         "label": [True] * batch_size + [False] * batch_size,
     }
-    if "prompt" in examples:
-        new_rows["prompt"] = examples["prompt"] + examples["prompt"]
+    for key, values in examples.items():
+        if key in {"chosen", "rejected", "completion", "label"}:
+            continue
+        new_rows[key] = values + values
     return new_rows
 
 
@@ -945,16 +970,16 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
             desc=desc,
         )
     except pa.ArrowInvalid:
-        data = {"completion": [], "label": []}
-        if "prompt" in column_names:
-            data["prompt"] = []
+        extra_columns = [col for col in column_names if col not in {"chosen", "rejected", "completion", "label"}]
+        data: dict[str, list[tp.Any]] = {"completion": [], "label": []}
+        for col in extra_columns:
+            data[col] = []
         for example in dataset:
-            prompt_value = example.get("prompt")
             for completion, label in ((example["chosen"], True), (example["rejected"], False)):
                 data["completion"].append(completion)
                 data["label"].append(label)
-                if "prompt" in column_names:
-                    data["prompt"].append(prompt_value)
+                for col in extra_columns:
+                    data[col].append(example[col])
         return Dataset.from_dict(data)  # pyright: ignore[reportReturnType]
 
 
@@ -1025,11 +1050,15 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
     # Exhaustion is a complete prefix, not an examined-but-unmatched element.
     if idx < limit and idx > 0 and example["chosen"][idx - 1] == " ":
         idx -= 1
-    # Identical message lists: an empty assistant completion cannot be rendered, so keep the final turn.
+    # Identical message lists or prefix-branch conversations ending on an assistant turn:
+    # an empty assistant completion cannot be rendered, so keep the final turn in both branches.
     if (
         idx > 0
-        and idx == len(example["chosen"]) == len(example["rejected"])
         and isinstance(example["chosen"][idx - 1], Mapping)
+        and (
+            idx == len(example["chosen"]) == len(example["rejected"])
+            or (idx == limit and example["chosen"][idx - 1].get("role") == "assistant")
+        )
     ):
         idx -= 1
     return {
@@ -1120,7 +1149,7 @@ def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
     if "prompt" in example:
         chosen_conv = is_conversational({"chosen": example["chosen"]})
         prompt_conv = is_conversational({"prompt": example["prompt"]})
-        if (chosen_conv and prompt_conv) or (not chosen_conv and not prompt_conv):
+        if prompt_conv or not chosen_conv:
             return example
     return extract_prompt({"chosen": example["chosen"], "rejected": example["rejected"]})  # pyright: ignore[reportReturnType]
 

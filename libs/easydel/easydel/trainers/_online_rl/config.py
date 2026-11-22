@@ -140,6 +140,15 @@ class OnlineActorCriticConfig(PPOConfig):
         default="recompute",
         metadata={"help": "Source of token-aligned behavior-policy log probabilities."},
     )
+    asynchronous_rollouts: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Enable bounded asynchronous rollout prefetching when running on a single host. "
+                "Set to False to collect rollouts synchronously on the learner thread."
+            )
+        },
+    )
     max_inflight_rollouts: int = field(
         default=32,
         metadata={"help": "Maximum number of asynchronous rollouts in flight."},
@@ -150,7 +159,12 @@ class OnlineActorCriticConfig(PPOConfig):
     )
     weight_sync_steps: int = field(
         default=1,
-        metadata={"help": "Actor steps between rollout-policy snapshot refreshes."},
+        metadata={
+            "help": (
+                "Actor steps between rollout-policy snapshot refreshes. "
+                "Lookahead on a snapshot is capped to the remaining batches before its next refresh."
+            )
+        },
     )
     max_policy_staleness: int | None = field(
         default=None,

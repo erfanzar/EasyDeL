@@ -67,6 +67,19 @@ from ..utils import stable_json_stream_prefix
 
 logger = get_logger(__name__)
 
+_SCRATCH_PAD_START = "<scratch_pad>"
+_SCRATCH_PAD_END = "</scratch_pad>"
+
+
+def _trailing_prefix_len(text: str, start: int, marker: str) -> int:
+    """Return length of the longest proper prefix of *marker* at the end of ``text[start:]``."""
+    avail = len(text) - start
+    max_len = min(len(marker) - 1, avail)
+    for size in range(max_len, 0, -1):
+        if text.endswith(marker[:size]):
+            return size
+    return 0
+
 
 @ToolParserManager.register_module("hermes")  # pyright: ignore[reportUntypedClassDecorator]
 class HermesToolParser(ToolParser):
@@ -109,6 +122,11 @@ class HermesToolParser(ToolParser):
         self._streamed_content_length = 0
         self._pending_content_suffix = ""
         self._streaming_initialized = False
+        self._region_to_emitted_index: dict[int, int] = {}
+        self._scan_pos: int = 0
+        self._in_scratch_pad: bool = False
+        self._emitted_source_pos: int = 0
+        self._has_open_region: bool = False
 
         self.tool_call_start_token: str = "<tool_call>"
         self.tool_call_end_token: str = "</tool_call>"
@@ -143,16 +161,49 @@ class HermesToolParser(ToolParser):
                 buffered_text = self.buffered_delta_text
                 self.buffered_delta_text = ""
                 return buffered_text + delta_text
-            else:
-                self.buffered_delta_text = self.buffered_delta_text + delta_text
+            candidate = self.buffered_delta_text + delta_text
+            if self.tool_call_start_token.startswith(candidate) or self.tool_call_end_token.startswith(candidate):
+                self.buffered_delta_text = candidate
                 return ""
-        else:
-            if self.buffered_delta_text:
-                buffered_text = self.buffered_delta_text
-                self.buffered_delta_text = ""
-                return buffered_text + delta_text
+            buffered_text = self.buffered_delta_text
+            if self.tool_call_start_token.startswith(delta_text) or self.tool_call_end_token.startswith(delta_text):
+                self.buffered_delta_text = delta_text
+                return buffered_text
+            self.buffered_delta_text = ""
+            return buffered_text + delta_text
+        if self.buffered_delta_text:
+            buffered_text = self.buffered_delta_text
+            self.buffered_delta_text = ""
+            return buffered_text + delta_text
+        return delta_text
+
+    @staticmethod
+    def _find_tool_call_end(text: str, body_start: int, end_token: str) -> int | None:
+        """Locate *end_token* at or after *body_start* outside JSON double-quoted strings."""
+        position = body_start
+        n = len(text)
+        in_string = False
+        while position < n:
+            if not in_string:
+                quote_idx = text.find('"', position)
+                end_idx = text.find(end_token, position)
+                if end_idx != -1 and (quote_idx == -1 or end_idx < quote_idx):
+                    return end_idx
+                if quote_idx == -1:
+                    return None
+                in_string = True
+                position = quote_idx + 1
             else:
-                return delta_text
+                quote_idx = text.find('"', position)
+                if quote_idx == -1:
+                    return None
+                bs_idx = text.find("\\", position, quote_idx)
+                if bs_idx == -1:
+                    in_string = False
+                    position = quote_idx + 1
+                else:
+                    position = bs_idx + 2
+        return None
 
     def _tool_call_regions(self, text: str) -> list[tuple[int, str, int | None]]:
         """Locate calls without interpreting reasoning or quoted markup as protocol.
@@ -164,43 +215,85 @@ class HermesToolParser(ToolParser):
             Tuples of opening offset, unmodified JSON body and end offset.
             The end offset is None for a still-open call.
         """
-        regions = []
+        regions: list[tuple[int, str, int | None]] = []
+        start_token = self.tool_call_start_token
+        end_token = self.tool_call_end_token
+        start_len = len(start_token)
+        end_len = len(end_token)
+        scratch_start_len = len(_SCRATCH_PAD_START)
+        scratch_end_len = len(_SCRATCH_PAD_END)
         position = 0
-        while position < len(text):
-            # Only recognize scratch pads outside tool JSON. Never mask or edit
-            # argument bytes, even if a string contains a complete reasoning block.
-            scratch_pad = self.scratch_pad_regex.match(text, position)
-            if scratch_pad:
-                position = scratch_pad.end()
-                continue
-            if not text.startswith(self.tool_call_start_token, position):
-                position += 1
-                continue
-            start = position
-            position += len(self.tool_call_start_token)
-            body_start = position
-            in_string = False
-            escaped = False
-            while position < len(text):
-                char = text[position]
-                if not in_string and text.startswith(self.tool_call_end_token, position):
-                    body = text[body_start:position]
-                    position += len(self.tool_call_end_token)
-                    regions.append((start, body, position))
-                    break
-                if in_string:
-                    if escaped:
-                        escaped = False
-                    elif char == "\\":
-                        escaped = True
-                    elif char == '"':
-                        in_string = False
-                elif char == '"':
-                    in_string = True
-                position += 1
-            else:
-                regions.append((start, text[body_start:], None))
+        n = len(text)
+        no_more_scratch = False
+
+        while position < n:
+            tc_idx = text.find(start_token, position)
+            if tc_idx == -1:
+                break
+            if not no_more_scratch:
+                sp_idx = text.find(_SCRATCH_PAD_START, position, tc_idx)
+                if sp_idx != -1:
+                    sp_end = text.find(_SCRATCH_PAD_END, sp_idx + scratch_start_len)
+                    if sp_end == -1:
+                        break
+                    position = sp_end + scratch_end_len
+                    continue
+                if text.find(_SCRATCH_PAD_START, tc_idx + start_len) == -1:
+                    no_more_scratch = True
+
+            body_start = tc_idx + start_len
+            call_end = self._find_tool_call_end(text, body_start, end_token)
+            if call_end is None:
+                regions.append((tc_idx, text[body_start:], None))
+                break
+            region_end = call_end + end_len
+            regions.append((tc_idx, text[body_start:call_end], region_end))
+            position = region_end
+
         return regions
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether a real tool-call region or trailing start-marker prefix is buffered.
+
+        Respects ``<scratch_pad>...</scratch_pad>`` blocks and JSON strings inside
+        tool calls, using dynamic ``self.tool_call_start_token`` / ``self.tool_call_end_token``
+        so subclasses such as :class:`LongcatFlashToolParser` inherit exact behavior.
+        """
+        del delta_text
+        if self._streaming_initialized:
+            return self._has_open_region or bool(self._pending_content_suffix)
+
+        start_token = self.tool_call_start_token
+        end_token = self.tool_call_end_token
+        start_len = len(start_token)
+        end_len = len(end_token)
+        scratch_start_len = len(_SCRATCH_PAD_START)
+        scratch_end_len = len(_SCRATCH_PAD_END)
+        position = 0
+        n = len(current_text)
+
+        while position < n:
+            sp_idx = current_text.find(_SCRATCH_PAD_START, position)
+            tc_idx = current_text.find(start_token, position)
+            if sp_idx != -1 and (tc_idx == -1 or sp_idx < tc_idx):
+                sp_end = current_text.find(_SCRATCH_PAD_END, sp_idx + scratch_start_len)
+                if sp_end == -1:
+                    return False
+                position = sp_end + scratch_end_len
+                continue
+            if tc_idx == -1:
+                return self._has_trailing_marker_prefix(current_text[position:], (start_token,))
+            body_start = tc_idx + start_len
+            call_end = self._find_tool_call_end(current_text, body_start, end_token)
+            if call_end is None:
+                return True
+            position = call_end + end_len
+        return False
 
     def extract_tool_calls(
         self,
@@ -220,21 +313,42 @@ class HermesToolParser(ToolParser):
             regions = self._tool_call_regions(model_output)
             if not regions:
                 return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
-            raw_calls = [json.loads(body) for _, body, _ in regions]
-            tool_calls = [
-                ToolCall(
-                    type="function",
-                    function=FunctionCall(
-                        name=call["name"],
-                        arguments=json.dumps(call["arguments"], ensure_ascii=False),
-                    ),
+
+            tool_calls: list[ToolCall] = []
+            content_parts: list[str] = []
+            content_start = 0
+            for start, body, end in regions:
+                content_parts.append(model_output[content_start:start])
+                content_start = end if end is not None else len(model_output)
+                try:
+                    call = json.loads(body)
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    continue
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                raw_args = call.get("arguments", {})
+                tool_calls.append(
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=name,
+                            arguments=json.dumps(raw_args, ensure_ascii=False),
+                        ),
+                    )
                 )
-                for call in raw_calls
-            ]
+
+            if not tool_calls:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+            content_parts.append(model_output[content_start:])
+            content = "".join(content_parts)
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
-                content=model_output[: regions[0][0]] or None,
+                content=content or None,
             )
         except Exception:
             logger.exception("Failed to extract Hermes tool calls from model output")
@@ -268,7 +382,12 @@ class HermesToolParser(ToolParser):
         Returns:
             New content and/or tool deltas, or None while waiting for more input.
         """
-        if not previous_text or not self._streaming_initialized:
+        if (
+            not previous_text
+            or not self._streaming_initialized
+            or self._scan_pos > len(current_text)
+            or self._emitted_source_pos > len(current_text)
+        ):
             self.current_tool_id = -1
             self.current_tool_name_sent = False
             self.prev_tool_call_arr = []
@@ -280,56 +399,142 @@ class HermesToolParser(ToolParser):
             self._pending_content_suffix = ""
             self.buffered_delta_text = ""
             self._streaming_initialized = True
+            self._region_to_emitted_index = {}
+            self._scan_pos = 0
+            self._in_scratch_pad = False
+            self._emitted_source_pos = len(previous_text)
+            self._has_open_region = False
 
         try:
-            regions = self._tool_call_regions(current_text)
-            deltas = []
-            content_parts = []
-            content_start = 0
-            for index, (start, body, end) in enumerate(regions):
-                content_parts.append(current_text[content_start:start])
-                content_start = end if end is not None else len(current_text)
-                while len(self.prev_tool_call_arr) <= index:
-                    self.prev_tool_call_arr.append({})
-                    self.streamed_args_for_tool.append("")
-                announced = bool(self.prev_tool_call_arr[index].get("name"))
-                self.current_tool_id = index
-                self.current_tool_name_sent = announced
+            start_token = self.tool_call_start_token
+            end_token = self.tool_call_end_token
+            start_len = len(start_token)
+            end_len = len(end_token)
+            scratch_start_len = len(_SCRATCH_PAD_START)
+            scratch_end_len = len(_SCRATCH_PAD_END)
+
+            pos = self._scan_pos
+            in_scratch = self._in_scratch_pad
+            n = len(current_text)
+            visible_spans: list[tuple[int, int]] = []
+            regions: list[tuple[int, str, int | None]] = []
+            pending_suffix = ""
+            has_open_region = False
+
+            while pos < n:
+                if in_scratch:
+                    sp_end = current_text.find(_SCRATCH_PAD_END, pos)
+                    if sp_end == -1:
+                        visible_spans.append((pos, n))
+                        hold_sp = _trailing_prefix_len(current_text, pos, _SCRATCH_PAD_END)
+                        pos = n - hold_sp
+                        break
+                    close_end = sp_end + scratch_end_len
+                    visible_spans.append((pos, close_end))
+                    pos = close_end
+                    in_scratch = False
+                    continue
+
+                sp_idx = current_text.find(_SCRATCH_PAD_START, pos)
+                tc_idx = current_text.find(start_token, pos)
+
+                if sp_idx != -1 and (tc_idx == -1 or sp_idx < tc_idx):
+                    sp_body = sp_idx + scratch_start_len
+                    visible_spans.append((pos, sp_body))
+                    pos = sp_body
+                    in_scratch = True
+                    continue
+
+                if tc_idx == -1:
+                    hold_tc = _trailing_prefix_len(current_text, pos, start_token)
+                    hold_sp = _trailing_prefix_len(current_text, pos, _SCRATCH_PAD_START)
+                    visible_end = n - hold_tc
+                    if visible_end > pos:
+                        visible_spans.append((pos, visible_end))
+                    if hold_tc > 0:
+                        pending_suffix = current_text[visible_end:]
+                    pos = n - max(hold_tc, hold_sp)
+                    break
+
+                if tc_idx > pos:
+                    visible_spans.append((pos, tc_idx))
+                body_start = tc_idx + start_len
+                call_end = self._find_tool_call_end(current_text, body_start, end_token)
+                if call_end is None:
+                    regions.append((tc_idx, current_text[body_start:], None))
+                    has_open_region = True
+                    pos = tc_idx
+                    break
+                region_end = call_end + end_len
+                regions.append((tc_idx, current_text[body_start:call_end], region_end))
+                pos = region_end
+
+            deltas: list[DeltaToolCall] = []
+            for start, body, end in regions:
+                assigned_index = self._region_to_emitted_index.get(start)
+                announced = assigned_index is not None and bool(
+                    assigned_index < len(self.prev_tool_call_arr) and self.prev_tool_call_arr[assigned_index].get("name")
+                )
                 try:
                     if end is not None:
                         call = json.loads(body)
                     else:
                         # A closing delimiter can itself be split across updates.
-                        for length in range(len(self.tool_call_end_token) - 1, 0, -1):
-                            if body.endswith(self.tool_call_end_token[:length]):
+                        for length in range(len(end_token) - 1, 0, -1):
+                            if body.endswith(end_token[:length]):
                                 body = body[:-length]
                                 break
                         flags = Allow.ALL if announced else Allow.ALL & ~Allow.STR
                         call = partial_json_parser.loads(body, flags)
-                except (partial_json_parser.core.exceptions.MalformedJSON, json.JSONDecodeError):
+                except (
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    ValueError,
+                    AssertionError,
+                    IndexError,
+                    RecursionError,
+                ):
                     continue
-                if not isinstance(call, dict) or not call.get("name"):
+                if not isinstance(call, dict) or not isinstance(call.get("name"), str) or not call.get("name"):
                     continue
+
+                if assigned_index is None:
+                    assigned_index = len(self._region_to_emitted_index)
+                    self._region_to_emitted_index[start] = assigned_index
+
+                index = assigned_index
+                while len(self.prev_tool_call_arr) <= index:
+                    self.prev_tool_call_arr.append({})
+                    self.streamed_args_for_tool.append("")
+                self.current_tool_id = index
+                self.current_tool_name_sent = announced
 
                 prefix = self.streamed_args_for_tool[index]
                 arguments = ""
-                if "arguments" in call:
+                has_arguments = "arguments" in call
+                if has_arguments or end is not None:
+                    raw_args = call.get("arguments", {})
                     # Always use exactly the batch JSON serialization, including
                     # string-valued arguments. Raw strings are not JSON prefixes.
-                    serialized = json.dumps(call["arguments"], ensure_ascii=False)
+                    serialized = json.dumps(raw_args, ensure_ascii=False)
                     if end is not None:
                         target = serialized
-                    elif isinstance(call["arguments"], (int, float)) and not isinstance(call["arguments"], bool):
+                    elif isinstance(raw_args, (int, float)) and not isinstance(raw_args, bool):
                         # Scalar numbers have no leading container delimiter for
                         # stable_json_stream_prefix to recognize. Withhold the
                         # entire value: e.g. 1 can still become 0.01 or 1e+20.
                         target = ""
                     else:
                         target = stable_json_stream_prefix(serialized)
-                    if not target.startswith(prefix):
-                        raise ValueError("Hermes argument update is not a prefix extension")
-                    arguments = target[len(prefix) :]
-                    self.streamed_args_for_tool[index] = target
+                    if target.startswith(prefix):
+                        arguments = target[len(prefix) :]
+                        self.streamed_args_for_tool[index] = target
+                    else:
+                        # Isolate non-prefix updates (e.g. duplicate JSON keys) to
+                        # this tool call instead of aborting subsequent calls/content.
+                        logger.warning(
+                            "Hermes argument update for tool index %d is not a prefix extension; skipping diff.",
+                            index,
+                        )
                 if not announced or arguments:
                     deltas.append(
                         DeltaToolCall(
@@ -345,19 +550,21 @@ class HermesToolParser(ToolParser):
                 self.prev_tool_call_arr[index] = call
                 self.current_tool_name_sent = True
 
-            # Only the trailing source segment can still become an opening tag.
-            # A prefix before a recognized call is already unambiguous content.
-            tail = current_text[content_start:]
-            self._pending_content_suffix = ""
-            for length in range(len(self.tool_call_start_token) - 1, 0, -1):
-                if tail.endswith(self.tool_call_start_token[:length]):
-                    self._pending_content_suffix = tail[-length:]
-                    tail = tail[:-length]
-                    break
-            content_parts.append(tail)
-            content = "".join(content_parts)
-            content_delta = content[self._streamed_content_length :]
-            self._streamed_content_length = len(content)
+            emitted_pos = self._emitted_source_pos
+            content_parts: list[str] = []
+            for seg_start, seg_end in visible_spans:
+                if seg_end > emitted_pos:
+                    content_parts.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                    emitted_pos = seg_end
+
+            self._emitted_source_pos = emitted_pos
+            self._scan_pos = pos
+            self._in_scratch_pad = in_scratch
+            self._has_open_region = has_open_region
+            self._pending_content_suffix = pending_suffix
+
+            content_delta = "".join(content_parts)
+            self._streamed_content_length += len(content_delta)
             if deltas or content_delta or self._pending_content_suffix:
                 # An explicit empty content delta tells orchestrators that we
                 # intentionally withheld a suffix; None may trigger raw-text
@@ -382,5 +589,7 @@ class HermesToolParser(ToolParser):
             Repeated calls without further input return an empty string.
         """
         suffix, self._pending_content_suffix = self._pending_content_suffix, ""
+        self.buffered_delta_text = ""
         self._streamed_content_length += len(suffix)
+        self._emitted_source_pos += len(suffix)
         return suffix

@@ -25,7 +25,7 @@ selected stochastically per batch:
   student samples completions from its own policy, then the teacher
   scores those samples and the student is trained to match the
   teacher's distribution under a generalized JSD divergence with
-  parameter ``beta`` (``0`` recovers reverse KL, ``1`` recovers forward
+  parameter ``beta`` (``0`` recovers forward KL, ``1`` recovers reverse
   KL, ``0.5`` recovers symmetric JSD).
 
 The trainer keeps a frozen teacher state alongside the trainable
@@ -41,10 +41,8 @@ import typing as tp
 
 import jax
 import numpy as np
-from eformer import common_types
 from eformer.loggings import get_logger
 from jax import numpy as jnp
-from transformers import GenerationConfig
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -53,6 +51,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 
 from .._shared import copy_frozen_policy, drop_optimizer_state
+from ..async_rollout_mixin import AsyncRolloutMixin
 from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..supervised_fine_tuning_trainer import SFTTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -66,9 +65,29 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+_STALE_SEQUENCE_KEYS = (
+    "token_type_ids",
+    "segment_ids",
+    "assistant_masks",
+    "loss_mask",
+    "loss_token_weights",
+    "loss_group_ids",
+    "dataset_ids",
+    "mask_info",
+)
+
+
+def _selector_matching_graphstate(reference_graphstate: tp.Any) -> tp.Any:
+    """Return a SpectraX selector predicate matching ``reference_graphstate``'s exact leaves."""
+    paths_fn = getattr(reference_graphstate, "paths", None)
+    if not callable(paths_fn):
+        return None
+    selected = frozenset(paths_fn())
+    return lambda variable, path: (getattr(variable, "kind", None), path) in selected
+
 
 @Registry.register("trainer", "gkd")
-class GKDTrainer(SFTTrainer):
+class GKDTrainer(AsyncRolloutMixin, SFTTrainer):
     """Trainer for Generalized Knowledge Distillation (GKD).
 
     Implements the GKD objective from Agarwal et al. 2024: a
@@ -139,6 +158,20 @@ class GKDTrainer(SFTTrainer):
         if not isinstance(arguments, GKDConfig):
             raise TypeError(f"`arguments` must be a `GKDConfig`, received {type(arguments)}.")
 
+        if model is None:
+            raise ValueError("`model` must be provided for GKDTrainer.")
+        if isinstance(model, str):
+            reject_string_model_id(model, role="student model")
+
+        if getattr(arguments, "packing", False):
+            logger.warning(
+                "GKDTrainer does not support `packing=True` (its on-policy / prompt-extraction data path is "
+                "incompatible); ignoring the flag."
+            )
+            arguments.packing = False
+            if getattr(arguments, "eval_packing", None):
+                arguments.eval_packing = False
+
         if isinstance(model, EasyDeLState):
             student_state = model
         else:
@@ -148,7 +181,6 @@ class GKDTrainer(SFTTrainer):
         self.seq_kd = bool(arguments.seq_kd)
         self._on_policy_rng = random.Random(getattr(arguments, "seed", None))
         self._warned_missing_prompt = False
-        self.gkd_generate_function = None
 
         teacher_model = self._resolve_teacher_model(
             teacher_model=teacher_model,
@@ -160,7 +192,8 @@ class GKDTrainer(SFTTrainer):
         elif isinstance(teacher_model, EasyDeLState):
             teacher_state = teacher_model
         else:
-            teacher_state = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+            teacher_model.eval()
+            teacher_state = teacher_model.to_state()
 
         if arguments.disable_dropout:
             student_state = disable_state_dropout(student_state)
@@ -172,6 +205,11 @@ class GKDTrainer(SFTTrainer):
         # copy is needed yet -- and copying here would leave a second teacher
         # resident for the whole run once the real copy is taken below.
         self.teacher_state = drop_optimizer_state(teacher_state)
+        if not self_distillation and self.teacher_state is not None:
+            self.teacher_state = self._share_esurge_cache_scope_if_compatible(
+                self.teacher_state,
+                primary_state=student_state,
+            )
 
         super().__init__(
             arguments=arguments,
@@ -187,64 +225,33 @@ class GKDTrainer(SFTTrainer):
             # `self.model_state` now carries optimizer slots, so a whole-pytree
             # deep copy would duplicate those too; the teacher only needs params.
             self.teacher_state = copy_frozen_policy(self.model_state)
+        elif self.teacher_state is not None:
+            self.teacher_state = self._share_esurge_cache_scope_if_compatible(
+                self.teacher_state,
+                primary_state=self.model_state,
+            )
 
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         if self.pad_token_id is None:
             raise ValueError("GKDTrainer requires a tokenizer with a defined `pad_token_id`.")
 
-        self.generation_config = GenerationConfig(
-            max_new_tokens=self.arguments.max_new_tokens,
-            temperature=self.arguments.temperature,
-            do_sample=True,
-            top_k=0,
-            pad_token_id=self.pad_token_id,
-        )
-        shard_inputs = getattr(self.arguments, "generation_shard_inputs", True)
-        try:
-            self.gkd_generate_function = self.create_generate_function(
-                generation_config=self.generation_config,
-                shard_inputs=shard_inputs,
-            )
-        except Exception as exc:  # pragma: no cover - generation is optional
-            self.gkd_generate_function = None
-            logger.warning("Failed to initialize GKD generation function, on-policy sampling disabled: %s", exc)
-        self.gkd_teacher_generate_function = (
-            self._create_teacher_generate_function(shard_inputs=shard_inputs) if self.seq_kd else None
-        )
+    def _generation_overrides(self) -> dict[str, tp.Any]:
+        """Sampling of GKD rollouts: ``temperature``, at most ``max_new_tokens``, no top-k/top-p, no penalties.
 
-    def _create_teacher_generate_function(self, *, shard_inputs: bool):
-        """Compile sequence-KD generation against the optimizer-free teacher.
-
-        Teacher architecture and optimizer metadata need not match the student,
-        so the student's compiled generation callable cannot accept this state.
+        Every key is set explicitly so the trainer-wide ``generation_*`` fallbacks (top-p 0.95, top-k 64) do
+        not apply.
         """
-        config = self._prepare_generation_config(self.generation_config)
-        mesh = self.teacher_state.model.mesh
-        empty_sharding = replicated_named_sharding(mesh)
-
-        def generate(state, input_ids, attention_mask):
-            module = state.model
-            with module.mesh:
-                if shard_inputs:
-                    resolver = getattr(module.config, "runtime_sharding_resolver", None)
-                    if resolver is not None:
-                        axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
-                        input_ids = resolver.shard(input_ids, axes=axes, mode=common_types.MODE_PREFILL)
-                        attention_mask = resolver.shard(attention_mask, axes=axes, mode=common_types.MODE_PREFILL)
-                outputs = module.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    generation_config=config,
-                )
-                sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs
-                return sequences, input_ids, attention_mask
-
-        return compile_trainer_step(
-            generate,
-            mesh=mesh,
-            in_shardings=(self.teacher_state.shardings, empty_sharding, empty_sharding),
-            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
-        )
+        return {
+            "max_new_tokens": int(self.arguments.max_new_tokens),
+            "temperature": float(self.arguments.temperature),
+            "do_sample": True,
+            "top_k": 0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "num_return_sequences": 1,
+        }
 
     @staticmethod
     def _resolve_teacher_model(
@@ -368,16 +375,29 @@ class GKDTrainer(SFTTrainer):
             teacher = teacher.replace(graphdef=graphdef)
         return (teacher,)
 
+    def _apply_preprocess_transforms(self) -> None:
+        """Disable legacy ``packing`` before delegating to :class:`SFTTrainer`."""
+        if getattr(self.arguments, "packing", False):
+            logger.warning(
+                "GKDTrainer does not support `packing=True` (its on-policy / prompt-extraction data path is "
+                "incompatible); ignoring the flag."
+            )
+            self.arguments.packing = False
+            if getattr(self.arguments, "eval_packing", None):
+                self.arguments.eval_packing = False
+        super()._apply_preprocess_transforms()
+
     def _configure_eval_config_override(self):
         """Apply evaluation config overrides to the teacher forward as well."""
         super()._configure_eval_config_override()
         self._eval_teacher_graphdef = None
-        if self._eval_graphdef is not None:
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is not None and overrides and self.teacher_state is not None:
             self._eval_teacher_graphdef = self._build_config_override_graphdef(
                 model=self.teacher_state.model,
-                overrides=self.arguments.eval_config_overrides,
+                overrides=overrides,
                 reference_graphstate=self.teacher_state.graphstate,
-                trainable_selector=None,
+                trainable_selector=_selector_matching_graphstate(self.teacher_state.graphstate),
                 label="eval_config_overrides (teacher)",
                 eval_mode=True,
             )
@@ -398,23 +418,26 @@ class GKDTrainer(SFTTrainer):
         Returns:
             Processed batch and metrics dictionary.
         """
-        batch = self._apply_user_data_collator(batch)
-        # Purify batch first to handle list of dicts (uncollated batch)
-        batch = self._purify_batch(batch)
+        batch, info = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
+        info = dict(info)
         if not is_train:
-            return batch, {}
+            return batch, info
 
         batch_copy = dict(batch)
-        info: dict[str, float | int | str] = {}
 
-        if self.seq_kd:
-            generated, meta = self._apply_generation(self.teacher_state, batch_copy, source="teacher")
+        use_student = self._should_use_student_sampling()
+        if use_student:
+            generated, meta = self._apply_generation(state, batch_copy, source="student")
             if generated is not None:
                 batch_copy = generated
                 info.update(meta)
-
-        if self.gkd_generate_function is not None and self._should_use_student_sampling():
-            generated, meta = self._apply_generation(state, batch_copy, source="student")
+            elif self.seq_kd:
+                generated, meta = self._apply_generation(self.teacher_state, batch_copy, source="teacher")
+                if generated is not None:
+                    batch_copy = generated
+                    info.update(meta)
+        elif self.seq_kd:
+            generated, meta = self._apply_generation(self.teacher_state, batch_copy, source="teacher")
             if generated is not None:
                 batch_copy = generated
                 info.update(meta)
@@ -440,6 +463,8 @@ class GKDTrainer(SFTTrainer):
     ) -> tuple[dict[str, jax.Array] | None, dict[str, float]]:
         """Generate completions using the specified model.
 
+        The prompt rows go to eSurge as token ids through :meth:`rollout`, on ``generator_state``'s engine.
+
         Args:
             generator_state: Model state to use for generation.
             batch: Input batch containing prompts.
@@ -458,24 +483,38 @@ class GKDTrainer(SFTTrainer):
                 )
                 self._warned_missing_prompt = True
             return None, {}
-        prompt_ids, prompt_mask, prompt_lengths = prompts
+        prompt_ids, prompt_mask, _prompt_lengths = prompts
         prompt_seq_len = int(prompt_ids.shape[1])
 
-        generate = self.gkd_teacher_generate_function if source == "teacher" else self.gkd_generate_function
         try:
-            sequences, _, _ = jax.block_until_ready(generate(generator_state, prompt_ids, prompt_mask))
+            results = self.rollout(
+                input_ids=prompt_ids,
+                attention_mask=prompt_mask,
+                state=generator_state,
+                apply_chat_template=False,
+                config_overrides=self._generation_overrides(),
+            )
+            sequences = jax.block_until_ready(results.sequences)
         except Exception as exc:  # pragma: no cover - generation failures are rare
             if source == "teacher":
                 raise RuntimeError("Sequence-KD teacher generation failed.") from exc
             logger.warning("Failed to generate %s continuations: %s", source, exc)
             return None, {}
 
-        new_batch = self._build_batch_from_sequences(batch, sequences, prompt_seq_len=prompt_seq_len)
-        attention_mask = np.asarray(new_batch["attention_mask"])
-        completion_lengths = attention_mask.sum(axis=-1) - np.clip(prompt_lengths, 0, attention_mask.shape[1])
+        new_batch = self._build_batch_from_sequences(
+            batch,
+            sequences,
+            prompt_seq_len=prompt_seq_len,
+            prompt_mask=getattr(results, "prompt_mask", None),
+            completion_mask=getattr(results, "completion_mask", None),
+        )
+        completion_mask_np = np.asarray(new_batch["completion_mask"], dtype=np.int32)
+        attention_mask_np = np.asarray(new_batch["attention_mask"], dtype=np.int32)
+        completion_lengths = completion_mask_np.sum(axis=-1)
+        kept_prompt_lengths = np.maximum(attention_mask_np - completion_mask_np, 0).sum(axis=-1)
         info = {
             f"gkd_completion_length_{source}": float(np.mean(completion_lengths)),
-            f"gkd_prompt_length_{source}": float(np.mean(prompt_lengths)),
+            f"gkd_prompt_length_{source}": float(np.mean(kept_prompt_lengths)),
         }
         return new_batch, info
 
@@ -503,33 +542,53 @@ class GKDTrainer(SFTTrainer):
         valid_tokens = attention_mask_np.astype(bool)
 
         completion_mask = batch.get("completion_mask")
+        assistant_masks = batch.get("assistant_masks")
         labels = batch.get("labels")
         if completion_mask is not None:
-            completion_mask_np = np.asarray(completion_mask)
-            prompt_token_mask = valid_tokens & (~completion_mask_np.astype(bool))
+            comp_bool = valid_tokens & np.asarray(completion_mask).astype(bool)
+        elif assistant_masks is not None:
+            comp_bool = valid_tokens & np.asarray(assistant_masks).astype(bool)
         elif labels is not None:
-            labels_np = np.asarray(labels)
-            prompt_token_mask = valid_tokens & (labels_np == -100)
+            comp_bool = valid_tokens & (np.asarray(labels) != -100)
         else:
             return None
 
-        prompt_lengths = np.asarray(prompt_token_mask.sum(axis=-1), dtype=np.int32)
-        max_prompt = int(prompt_lengths.max()) if prompt_lengths.size else 0
-        if max_prompt <= 0:
+        batch_size, seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+        row_tokens: list[np.ndarray] = []
+        raw_lengths: list[int] = []
+        for idx in range(batch_size):
+            comp_indices = np.flatnonzero(comp_bool[idx])
+            if comp_indices.size > 0:
+                first_comp = int(comp_indices[0])
+                tokens = input_ids[idx, :first_comp][valid_tokens[idx, :first_comp]]
+            else:
+                tokens = input_ids[idx][valid_tokens[idx]]
+            row_tokens.append(tokens)
+            raw_lengths.append(int(tokens.size))
+
+        if not raw_lengths or max(raw_lengths) <= 0:
             return None
 
-        batch_size = input_ids.shape[0]
-        prompt_ids_np = np.full((batch_size, max_prompt), self.pad_token_id, dtype=input_ids.dtype)
-        prompt_mask_np = np.zeros((batch_size, max_prompt), dtype=np.int32)
-        for idx, length in enumerate(prompt_lengths.tolist()):
-            if length <= 0:
-                continue
-            tokens = input_ids[idx][prompt_token_mask[idx]]
+        max_length = getattr(self.arguments, "max_length", None)
+        max_new_tokens = int(getattr(self.arguments, "max_new_tokens", 0) or 0)
+        if max_length is not None and int(max_length) > 0:
+            if int(max_length) > max_new_tokens:
+                target_prompt_width = int(max_length) - max_new_tokens
+            else:
+                target_prompt_width = int(max_length)
+        else:
+            target_prompt_width = seq_len
+
+        prompt_ids_np = np.full((batch_size, target_prompt_width), self.pad_token_id, dtype=input_ids.dtype)
+        prompt_mask_np = np.zeros((batch_size, target_prompt_width), dtype=np.int32)
+        prompt_lengths = np.zeros((batch_size,), dtype=np.int32)
+        for idx, tokens in enumerate(row_tokens):
             if tokens.size == 0:
                 continue
-            length = int(min(tokens.size, max_prompt))
+            length = int(min(tokens.size, target_prompt_width))
             prompt_ids_np[idx, -length:] = tokens[-length:]
             prompt_mask_np[idx, -length:] = 1
+            prompt_lengths[idx] = length
 
         return jnp.asarray(prompt_ids_np), jnp.asarray(prompt_mask_np), prompt_lengths
 
@@ -539,6 +598,8 @@ class GKDTrainer(SFTTrainer):
         sequences: jax.Array,
         *,
         prompt_seq_len: int,
+        prompt_mask: jax.Array | np.ndarray | None = None,
+        completion_mask: jax.Array | np.ndarray | None = None,
     ) -> dict[str, jax.Array]:
         """Construct training batch from generated sequences.
 
@@ -546,41 +607,62 @@ class GKDTrainer(SFTTrainer):
             original_batch: Original input batch.
             sequences: Generated token sequences.
             prompt_seq_len: Prompt token array length used during generation (includes padding).
+            prompt_mask: Optional prompt attention mask from ``rollout()`` preserving EOS when
+                ``pad_token_id == eos_token_id``.
+            completion_mask: Optional completion attention mask from ``rollout()`` preserving EOS
+                and masking right-padded tails when ``pad_token_id == eos_token_id``.
 
         Returns:
             New batch with generated completions and appropriate masks/labels.
         """
         seq_np = np.asarray(sequences)
-        seq_len = seq_np.shape[1]
+        seq_len = int(seq_np.shape[1])
         max_len = self.arguments.max_length
         prompt_cutoff = int(max(prompt_seq_len, 0))
+
+        pm_np = None if prompt_mask is None else (np.asarray(prompt_mask) != 0).astype(np.int32)
+        cm_np = None if completion_mask is None else (np.asarray(completion_mask) != 0).astype(np.int32)
+
+        if pm_np is not None and cm_np is not None and pm_np.shape[1] + cm_np.shape[1] == seq_len:
+            attention_mask = np.concatenate([pm_np, cm_np], axis=1)
+            comp_mask = np.concatenate([np.zeros_like(pm_np), cm_np], axis=1)
+        else:
+            attention_mask = (seq_np != self.pad_token_id).astype(np.int32)
+            if pm_np is not None and pm_np.shape[1] <= seq_len:
+                attention_mask[:, : pm_np.shape[1]] = pm_np
+            if cm_np is not None and prompt_cutoff + cm_np.shape[1] <= seq_len:
+                attention_mask[:, prompt_cutoff : prompt_cutoff + cm_np.shape[1]] = cm_np
+            comp_mask = np.zeros_like(attention_mask)
+            if cm_np is not None and prompt_cutoff + cm_np.shape[1] <= seq_len:
+                comp_mask[:, prompt_cutoff : prompt_cutoff + cm_np.shape[1]] = cm_np
+            elif prompt_cutoff < seq_len:
+                comp_mask[:, prompt_cutoff:] = 1
+            comp_mask *= attention_mask
+
         if max_len is not None and seq_len > max_len:
             start = seq_len - max_len
             seq_np = seq_np[:, start:]
+            attention_mask = attention_mask[:, start:]
+            comp_mask = comp_mask[:, start:]
             prompt_cutoff = max(prompt_cutoff - start, 0)
-            seq_len = max_len
-
-        attention_mask = (seq_np != self.pad_token_id).astype(np.int32)
-        completion_mask = np.zeros_like(attention_mask)
-        if prompt_cutoff < seq_len:
-            completion_mask[:, prompt_cutoff:] = 1
-        completion_mask *= attention_mask
+            seq_len = int(max_len)
 
         labels_dtype = np.asarray(original_batch.get("labels", seq_np)).dtype
         # Labels are masked in place; generated tokens may share a read-only
         # device buffer and must never be overwritten by the ignore index.
         labels = seq_np.astype(labels_dtype, copy=True)
-        labels[attention_mask == 0] = -100
-        if prompt_cutoff > 0:
-            labels[:, :prompt_cutoff] = -100
+        labels[(attention_mask == 0) | (comp_mask == 0)] = -100
 
         new_batch = dict(original_batch)
+        for stale_key in _STALE_SEQUENCE_KEYS:
+            new_batch.pop(stale_key, None)
         new_batch["input_ids"] = jnp.asarray(seq_np.astype(np.asarray(original_batch["input_ids"]).dtype, copy=False))
         attn_dtype = np.asarray(original_batch.get("attention_mask", attention_mask)).dtype
         new_batch["attention_mask"] = jnp.asarray(attention_mask.astype(attn_dtype, copy=False))
-        new_batch["completion_mask"] = jnp.asarray(completion_mask.astype(attn_dtype, copy=False))
+        new_batch["completion_mask"] = jnp.asarray(comp_mask.astype(attn_dtype, copy=False))
         new_batch["labels"] = jnp.asarray(labels)
         if "position_ids" in original_batch:
-            position_ids = np.broadcast_to(np.arange(seq_len, dtype=np.int32), seq_np.shape)
+            pos = np.cumsum(attention_mask, axis=-1, dtype=np.int32) - 1
+            position_ids = np.where(attention_mask > 0, pos, 0).astype(np.int32)
             new_batch["position_ids"] = jnp.asarray(position_ids)
         return new_batch

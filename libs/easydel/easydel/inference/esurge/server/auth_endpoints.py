@@ -35,7 +35,7 @@ import uuid
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from easydel.workers.esurge.auth import PermissionDenied, QuotaExceeded, RateLimitExceeded
 from easydel.workers.esurge.auth.auth_models import (
@@ -45,6 +45,7 @@ from easydel.workers.esurge.auth.auth_models import (
     QuotaConfig,
     RateLimitConfig,
 )
+from easydel.workers.esurge.auth.credentials import api_key_from_headers
 
 
 class CreateApiKeyRequest(BaseModel):
@@ -66,18 +67,18 @@ class CreateApiKeyRequest(BaseModel):
     expires_in_days: int | None = Field(None, description="Days until expiration (None = never expires)")
 
     # Rate limits (None = unlimited)
-    requests_per_minute: int | None = Field(None, description="Max requests per minute (None = unlimited)")
-    requests_per_hour: int | None = Field(None, description="Max requests per hour (None = unlimited)")
-    requests_per_day: int | None = Field(None, description="Max requests per day (None = unlimited)")
-    tokens_per_minute: int | None = Field(None, description="Max tokens per minute (None = unlimited)")
-    tokens_per_hour: int | None = Field(None, description="Max tokens per hour (None = unlimited)")
-    tokens_per_day: int | None = Field(None, description="Max tokens per day (None = unlimited)")
+    requests_per_minute: int | None = Field(None, ge=0, description="Max requests per minute (None = unlimited)")
+    requests_per_hour: int | None = Field(None, ge=0, description="Max requests per hour (None = unlimited)")
+    requests_per_day: int | None = Field(None, ge=0, description="Max requests per day (None = unlimited)")
+    tokens_per_minute: int | None = Field(None, ge=0, description="Max tokens per minute (None = unlimited)")
+    tokens_per_hour: int | None = Field(None, ge=0, description="Max tokens per hour (None = unlimited)")
+    tokens_per_day: int | None = Field(None, ge=0, description="Max tokens per day (None = unlimited)")
 
     # Quotas (None = unlimited)
-    max_total_tokens: int | None = Field(None, description="Lifetime token limit (None = unlimited)")
-    max_total_requests: int | None = Field(None, description="Lifetime request limit (None = unlimited)")
-    monthly_token_limit: int | None = Field(None, description="Monthly token limit (None = unlimited)")
-    monthly_request_limit: int | None = Field(None, description="Monthly request limit (None = unlimited)")
+    max_total_tokens: int | None = Field(None, ge=0, description="Lifetime token limit (None = unlimited)")
+    max_total_requests: int | None = Field(None, ge=0, description="Lifetime request limit (None = unlimited)")
+    monthly_token_limit: int | None = Field(None, ge=0, description="Monthly token limit (None = unlimited)")
+    monthly_request_limit: int | None = Field(None, ge=0, description="Monthly request limit (None = unlimited)")
 
     # Permissions (None = unrestricted access)
     allowed_models: list[str] | None = Field(None, description="Allowed models (None = all models)")
@@ -88,7 +89,9 @@ class CreateApiKeyRequest(BaseModel):
     blocked_ip_addresses: list[str] | None = Field(None, description="Blocked IPs (None = no blocks)")
     enable_streaming: bool = Field(True, description="Allow streaming requests")
     enable_function_calling: bool = Field(True, description="Allow function calling")
-    max_tokens_per_request: int | None = Field(None, description="Max tokens per single request (None = unlimited)")
+    max_tokens_per_request: int | None = Field(
+        None, ge=0, description="Max tokens per single request (None = unlimited)"
+    )
 
     tags: list[str] | None = Field(None, description="Tags for organization")
     metadata: dict[str, tp.Any] | None = Field(None, description="Additional custom metadata")
@@ -113,18 +116,18 @@ class UpdateApiKeyRequest(BaseModel):
     expires_in_days: int | None = Field(None, description="Days until expiration (None = never expires)")
 
     # Rate limits (None = unlimited)
-    requests_per_minute: int | None = Field(None, description="Max requests per minute (None = unlimited)")
-    requests_per_hour: int | None = Field(None, description="Max requests per hour (None = unlimited)")
-    requests_per_day: int | None = Field(None, description="Max requests per day (None = unlimited)")
-    tokens_per_minute: int | None = Field(None, description="Max tokens per minute (None = unlimited)")
-    tokens_per_hour: int | None = Field(None, description="Max tokens per hour (None = unlimited)")
-    tokens_per_day: int | None = Field(None, description="Max tokens per day (None = unlimited)")
+    requests_per_minute: int | None = Field(None, ge=0, description="Max requests per minute (None = unlimited)")
+    requests_per_hour: int | None = Field(None, ge=0, description="Max requests per hour (None = unlimited)")
+    requests_per_day: int | None = Field(None, ge=0, description="Max requests per day (None = unlimited)")
+    tokens_per_minute: int | None = Field(None, ge=0, description="Max tokens per minute (None = unlimited)")
+    tokens_per_hour: int | None = Field(None, ge=0, description="Max tokens per hour (None = unlimited)")
+    tokens_per_day: int | None = Field(None, ge=0, description="Max tokens per day (None = unlimited)")
 
     # Quotas (None = unlimited)
-    max_total_tokens: int | None = Field(None, description="Lifetime token limit (None = unlimited)")
-    max_total_requests: int | None = Field(None, description="Lifetime request limit (None = unlimited)")
-    monthly_token_limit: int | None = Field(None, description="Monthly token limit (None = unlimited)")
-    monthly_request_limit: int | None = Field(None, description="Monthly request limit (None = unlimited)")
+    max_total_tokens: int | None = Field(None, ge=0, description="Lifetime token limit (None = unlimited)")
+    max_total_requests: int | None = Field(None, ge=0, description="Lifetime request limit (None = unlimited)")
+    monthly_token_limit: int | None = Field(None, ge=0, description="Monthly token limit (None = unlimited)")
+    monthly_request_limit: int | None = Field(None, ge=0, description="Monthly request limit (None = unlimited)")
 
     # Permissions (None = unrestricted access)
     allowed_models: list[str] | None = Field(None, description="Allowed models (None = all models)")
@@ -133,10 +136,17 @@ class UpdateApiKeyRequest(BaseModel):
     blocked_ip_addresses: list[str] | None = Field(None, description="Blocked IPs (None = no blocks)")
     enable_streaming: bool | None = Field(None, description="Allow streaming requests")
     enable_function_calling: bool | None = Field(None, description="Allow function calling")
-    max_tokens_per_request: int | None = Field(None, description="Max tokens per request (None = unlimited)")
+    max_tokens_per_request: int | None = Field(None, ge=0, description="Max tokens per request (None = unlimited)")
 
     tags: list[str] | None = Field(None, description="Tags for organization")
     metadata: dict[str, tp.Any] | None = Field(None, description="Additional custom metadata")
+
+    @model_validator(mode="after")
+    def _reject_null_boolean_permissions(self) -> UpdateApiKeyRequest:
+        for field_name in ("enable_streaming", "enable_function_calling"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} must be a boolean, not null")
+        return self
 
 
 class AuthEndpointsMixin:
@@ -158,18 +168,9 @@ class AuthEndpointsMixin:
         # First, try to get API key from request state (if _authorize_request was already called)
         api_key = getattr(raw_request.state, "api_key", None)
 
-        # If not set in state, extract it manually
+        # If not set in state, read it from the headers (never the query string).
         if not api_key:
-            # Try Authorization header (Bearer token)
-            auth_header = raw_request.headers.get("Authorization")
-            if auth_header and auth_header.lower().startswith("bearer "):
-                api_key = auth_header.split(" ", 1)[1].strip()
-
-            if not api_key:
-                api_key = raw_request.headers.get("X-API-Key")
-
-            if not api_key:
-                api_key = raw_request.query_params.get("api_key")
+            api_key = api_key_from_headers(raw_request.headers)
 
         if not api_key:
             raise HTTPException(status_code=401, detail="API key required for this endpoint")
@@ -224,31 +225,34 @@ class AuthEndpointsMixin:
         """
         self._require_admin_role(raw_request)
 
-        rate_limits = RateLimitConfig(
-            requests_per_minute=request.requests_per_minute,
-            requests_per_hour=request.requests_per_hour,
-            requests_per_day=request.requests_per_day,
-            tokens_per_minute=request.tokens_per_minute,
-            tokens_per_hour=request.tokens_per_hour,
-            tokens_per_day=request.tokens_per_day,
-        )
+        try:
+            rate_limits = RateLimitConfig(
+                requests_per_minute=request.requests_per_minute,
+                requests_per_hour=request.requests_per_hour,
+                requests_per_day=request.requests_per_day,
+                tokens_per_minute=request.tokens_per_minute,
+                tokens_per_hour=request.tokens_per_hour,
+                tokens_per_day=request.tokens_per_day,
+            )
 
-        quota = QuotaConfig(
-            max_total_tokens=request.max_total_tokens,
-            max_total_requests=request.max_total_requests,
-            monthly_token_limit=request.monthly_token_limit,
-            monthly_request_limit=request.monthly_request_limit,
-        )
+            quota = QuotaConfig(
+                max_total_tokens=request.max_total_tokens,
+                max_total_requests=request.max_total_requests,
+                monthly_token_limit=request.monthly_token_limit,
+                monthly_request_limit=request.monthly_request_limit,
+            )
 
-        permissions = ApiKeyPermissions(
-            allowed_models=request.allowed_models,
-            allowed_endpoints=request.allowed_endpoints,
-            allowed_ip_addresses=request.allowed_ip_addresses,
-            blocked_ip_addresses=request.blocked_ip_addresses,
-            enable_streaming=request.enable_streaming,
-            enable_function_calling=request.enable_function_calling,
-            max_tokens_per_request=request.max_tokens_per_request,
-        )
+            permissions = ApiKeyPermissions(
+                allowed_models=request.allowed_models,
+                allowed_endpoints=request.allowed_endpoints,
+                allowed_ip_addresses=request.allowed_ip_addresses,
+                blocked_ip_addresses=request.blocked_ip_addresses,
+                enable_streaming=request.enable_streaming,
+                enable_function_calling=request.enable_function_calling,
+                max_tokens_per_request=request.max_tokens_per_request,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         admin_key = getattr(raw_request.state, "api_key", None)
         admin_metadata = self.auth_manager.validate_key(admin_key)
@@ -382,128 +386,134 @@ class AuthEndpointsMixin:
 
         provided_fields = set(request.model_fields_set)
 
-        rate_limits = None
-        rate_limit_fields = {
-            "requests_per_minute",
-            "requests_per_hour",
-            "requests_per_day",
-            "tokens_per_minute",
-            "tokens_per_hour",
-            "tokens_per_day",
-        }
-        if provided_fields.intersection(rate_limit_fields):
-            rate_limits = RateLimitConfig(
-                requests_per_minute=(
-                    request.requests_per_minute
-                    if "requests_per_minute" in provided_fields
-                    else existing.rate_limits.requests_per_minute
-                ),
-                requests_per_hour=(
-                    request.requests_per_hour
-                    if "requests_per_hour" in provided_fields
-                    else existing.rate_limits.requests_per_hour
-                ),
-                requests_per_day=(
-                    request.requests_per_day
-                    if "requests_per_day" in provided_fields
-                    else existing.rate_limits.requests_per_day
-                ),
-                tokens_per_minute=(
-                    request.tokens_per_minute
-                    if "tokens_per_minute" in provided_fields
-                    else existing.rate_limits.tokens_per_minute
-                ),
-                tokens_per_hour=(
-                    request.tokens_per_hour
-                    if "tokens_per_hour" in provided_fields
-                    else existing.rate_limits.tokens_per_hour
-                ),
-                tokens_per_day=(
-                    request.tokens_per_day
-                    if "tokens_per_day" in provided_fields
-                    else existing.rate_limits.tokens_per_day
-                ),
-            )
+        try:
+            rate_limits = None
+            rate_limit_fields = {
+                "requests_per_minute",
+                "requests_per_hour",
+                "requests_per_day",
+                "tokens_per_minute",
+                "tokens_per_hour",
+                "tokens_per_day",
+            }
+            if provided_fields.intersection(rate_limit_fields):
+                rate_limits = RateLimitConfig(
+                    requests_per_minute=(
+                        request.requests_per_minute
+                        if "requests_per_minute" in provided_fields
+                        else existing.rate_limits.requests_per_minute
+                    ),
+                    requests_per_hour=(
+                        request.requests_per_hour
+                        if "requests_per_hour" in provided_fields
+                        else existing.rate_limits.requests_per_hour
+                    ),
+                    requests_per_day=(
+                        request.requests_per_day
+                        if "requests_per_day" in provided_fields
+                        else existing.rate_limits.requests_per_day
+                    ),
+                    tokens_per_minute=(
+                        request.tokens_per_minute
+                        if "tokens_per_minute" in provided_fields
+                        else existing.rate_limits.tokens_per_minute
+                    ),
+                    tokens_per_hour=(
+                        request.tokens_per_hour
+                        if "tokens_per_hour" in provided_fields
+                        else existing.rate_limits.tokens_per_hour
+                    ),
+                    tokens_per_day=(
+                        request.tokens_per_day
+                        if "tokens_per_day" in provided_fields
+                        else existing.rate_limits.tokens_per_day
+                    ),
+                )
 
-        quota = None
-        quota_fields = {
-            "max_total_tokens",
-            "max_total_requests",
-            "monthly_token_limit",
-            "monthly_request_limit",
-        }
-        if provided_fields.intersection(quota_fields):
-            quota = QuotaConfig(
-                max_total_tokens=(
-                    request.max_total_tokens
-                    if "max_total_tokens" in provided_fields
-                    else existing.quota.max_total_tokens
-                ),
-                max_total_requests=(
-                    request.max_total_requests
-                    if "max_total_requests" in provided_fields
-                    else existing.quota.max_total_requests
-                ),
-                monthly_token_limit=(
-                    request.monthly_token_limit
-                    if "monthly_token_limit" in provided_fields
-                    else existing.quota.monthly_token_limit
-                ),
-                monthly_request_limit=(
-                    request.monthly_request_limit
-                    if "monthly_request_limit" in provided_fields
-                    else existing.quota.monthly_request_limit
-                ),
-            )
+            quota = None
+            quota_fields = {
+                "max_total_tokens",
+                "max_total_requests",
+                "monthly_token_limit",
+                "monthly_request_limit",
+            }
+            if provided_fields.intersection(quota_fields):
+                quota = QuotaConfig(
+                    max_total_tokens=(
+                        request.max_total_tokens
+                        if "max_total_tokens" in provided_fields
+                        else existing.quota.max_total_tokens
+                    ),
+                    max_total_requests=(
+                        request.max_total_requests
+                        if "max_total_requests" in provided_fields
+                        else existing.quota.max_total_requests
+                    ),
+                    monthly_token_limit=(
+                        request.monthly_token_limit
+                        if "monthly_token_limit" in provided_fields
+                        else existing.quota.monthly_token_limit
+                    ),
+                    monthly_request_limit=(
+                        request.monthly_request_limit
+                        if "monthly_request_limit" in provided_fields
+                        else existing.quota.monthly_request_limit
+                    ),
+                )
 
-        permissions = None
-        permission_fields = {
-            "allowed_models",
-            "allowed_endpoints",
-            "allowed_ip_addresses",
-            "blocked_ip_addresses",
-            "enable_streaming",
-            "enable_function_calling",
-            "max_tokens_per_request",
-        }
-        if provided_fields.intersection(permission_fields):
-            permissions = ApiKeyPermissions(
-                allowed_models=(
-                    request.allowed_models
-                    if "allowed_models" in provided_fields
-                    else existing.permissions.allowed_models
-                ),
-                allowed_endpoints=(
-                    request.allowed_endpoints
-                    if "allowed_endpoints" in provided_fields
-                    else existing.permissions.allowed_endpoints
-                ),
-                allowed_ip_addresses=(
-                    request.allowed_ip_addresses
-                    if "allowed_ip_addresses" in provided_fields
-                    else existing.permissions.allowed_ip_addresses
-                ),
-                blocked_ip_addresses=(
-                    request.blocked_ip_addresses
-                    if "blocked_ip_addresses" in provided_fields
-                    else existing.permissions.blocked_ip_addresses
-                ),
-                enable_streaming=(
-                    request.enable_streaming
-                    if "enable_streaming" in provided_fields
-                    else existing.permissions.enable_streaming
-                ),
-                enable_function_calling=(
-                    request.enable_function_calling
-                    if "enable_function_calling" in provided_fields
-                    else existing.permissions.enable_function_calling
-                ),
-                max_tokens_per_request=(
-                    request.max_tokens_per_request
-                    if "max_tokens_per_request" in provided_fields
-                    else existing.permissions.max_tokens_per_request
-                ),
-            )
+            permissions = None
+            permission_fields = {
+                "allowed_models",
+                "allowed_endpoints",
+                "allowed_ip_addresses",
+                "blocked_ip_addresses",
+                "enable_streaming",
+                "enable_function_calling",
+                "max_tokens_per_request",
+            }
+            if provided_fields.intersection(permission_fields):
+                for bool_field in ("enable_streaming", "enable_function_calling"):
+                    if bool_field in provided_fields and getattr(request, bool_field) is None:
+                        raise ValueError(f"{bool_field} must be a boolean, not null")
+                permissions = ApiKeyPermissions(
+                    allowed_models=(
+                        request.allowed_models
+                        if "allowed_models" in provided_fields
+                        else existing.permissions.allowed_models
+                    ),
+                    allowed_endpoints=(
+                        request.allowed_endpoints
+                        if "allowed_endpoints" in provided_fields
+                        else existing.permissions.allowed_endpoints
+                    ),
+                    allowed_ip_addresses=(
+                        request.allowed_ip_addresses
+                        if "allowed_ip_addresses" in provided_fields
+                        else existing.permissions.allowed_ip_addresses
+                    ),
+                    blocked_ip_addresses=(
+                        request.blocked_ip_addresses
+                        if "blocked_ip_addresses" in provided_fields
+                        else existing.permissions.blocked_ip_addresses
+                    ),
+                    enable_streaming=(
+                        request.enable_streaming
+                        if "enable_streaming" in provided_fields
+                        else existing.permissions.enable_streaming
+                    ),
+                    enable_function_calling=(
+                        request.enable_function_calling
+                        if "enable_function_calling" in provided_fields
+                        else existing.permissions.enable_function_calling
+                    ),
+                    max_tokens_per_request=(
+                        request.max_tokens_per_request
+                        if "max_tokens_per_request" in provided_fields
+                        else existing.permissions.max_tokens_per_request
+                    ),
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         admin_key = getattr(raw_request.state, "api_key", None)
         admin_metadata = self.auth_manager.validate_key(admin_key)

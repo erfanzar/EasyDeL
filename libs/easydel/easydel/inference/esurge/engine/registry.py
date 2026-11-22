@@ -51,10 +51,14 @@ class RequestRecord:
         decodable_tokens: Incrementally-filtered tokens for detokenization.
         reported_generated_count: Last generated-count reported to metrics.
         last_decoded_index: Index into decodable tokens of the last decode.
+        detokenizer_token_count: Tokens already submitted to native detokenization.
+        detokenized_text: Raw text reconstructed from bounded native deltas.
         start_time: ``perf_counter`` timestamp at admission.
         first_token_time: Seconds from admission to the first token, once known.
         last_decode_time: ``perf_counter`` timestamp of the last decode flush.
         decoder_visible_text: Client-visible accumulated text (stop-trimmed).
+        stop_scan_chars: Length of the text already searched for stop strings without a match.
+        stop_scan_tail: That text's last (longest stop - 1) characters, to detect a rewritten text.
         truncated: Whether the prompt was truncated at admission.
         tokens_dropped: Number of prompt tokens dropped by truncation.
         requested_new_tokens_original: ``max_tokens`` as requested.
@@ -75,10 +79,14 @@ class RequestRecord:
     decodable_tokens: list[int] = field(default_factory=list)
     reported_generated_count: int = 0
     last_decoded_index: int = 0
+    detokenizer_token_count: int = 0
+    detokenized_text: str = ""
     start_time: float = 0.0
     first_token_time: float | None = None
     last_decode_time: float = 0.0
     decoder_visible_text: str = ""
+    stop_scan_chars: int = 0
+    stop_scan_tail: str = ""
     truncated: bool = False
     tokens_dropped: int = 0
     requested_new_tokens_original: int | None = None
@@ -115,6 +123,8 @@ class RequestRegistry:
         self.request_lock = threading.RLock()
         self.output_lock = threading.RLock()
         self.output_event = threading.Event()
+        self._output_cond = threading.Condition(self.output_lock)
+        self._output_version: int = 0
         self.max_outputs = max_outputs
         self._output_leases: set[str] = set()
 
@@ -167,12 +177,66 @@ class RequestRegistry:
             self.records.pop(request_id, None)
             self.events.pop(request_id, None)
 
+    def rollback(self, request_id: str, child_request_ids: typing.Iterable[str] = ()) -> None:
+        """Undo registration of an admitted request and any child samples after enqueue failure."""
+        with self.request_lock, self.output_lock:
+            self.records.pop(request_id, None)
+            self.events.pop(request_id, None)
+            for child_id in child_request_ids:
+                self.records.pop(child_id, None)
+                self.events.pop(child_id, None)
+            self.outputs.pop(request_id, None)
+            self._output_leases.discard(request_id)
+            try:
+                self.finished_ids.remove(request_id)
+            except ValueError:
+                pass
+
+    def clear_all(self) -> None:
+        """Clear all request records, outputs, events, leases, and finished history atomically."""
+        with self.request_lock, self.output_lock:
+            events = list(self.events.values())
+            self.records.clear()
+            self.outputs.clear()
+            self.events.clear()
+            self.finished_ids.clear()
+            self._output_leases.clear()
+            self._output_version += 1
+            self._output_cond.notify_all()
+        for event in events:
+            event.set()
+        self.output_event.set()
+
+    def notify_output_change(self) -> None:
+        """Increment the output version counter and wake all batch/global output waiters."""
+        with self._output_cond:
+            self._output_version += 1
+            self._output_cond.notify_all()
+        self.output_event.set()
+
+    def output_version(self) -> int:
+        """Return the current monotonic output-change version."""
+        with self.output_lock:
+            return self._output_version
+
+    def wait_for_output_change(self, last_version: int, timeout: float) -> tuple[bool, int]:
+        """Block until the output version advances past ``last_version`` or ``timeout`` elapses.
+
+        Unlike ``output_event.wait()`` + ``clear()``, every concurrent waiter tracks its own
+        ``last_version`` cursor so wakeups are never stolen across threads.
+        """
+        with self._output_cond:
+            if self._output_version != last_version:
+                return True, self._output_version
+            self._output_cond.wait(timeout=timeout)
+            return self._output_version != last_version, self._output_version
+
     def signal(self, request_id: str) -> None:
         """Wake the request's waiter (if any) and the global output event."""
         event = self.events.get(request_id)
         if event is not None:
             event.set()
-        self.output_event.set()
+        self.notify_output_change()
 
     def signal_all(self) -> None:
         """Wake every registered waiter and the global output event."""
@@ -180,7 +244,7 @@ class RequestRegistry:
             events = list(self.events.values())
         for event in events:
             event.set()
-        self.output_event.set()
+        self.notify_output_change()
 
     def wait_any(self, timeout: float) -> bool:
         """Block until any request output changes (or the timeout elapses)."""

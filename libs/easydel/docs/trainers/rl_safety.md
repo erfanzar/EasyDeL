@@ -1,0 +1,182 @@
+# RL Safety: Off-Policy Contract, Unscorable Rewards, Async Admission
+
+Configuration knobs that keep online RL updates honest when rollouts come from eSurge, rewards can fail, or rollouts
+are generated asynchronously. Field names below are `GRPOConfig` fields (inherited by the GRPO family) unless stated
+otherwise.
+
+## Off-policy contract (`easydel/trainers/_shared/off_policy.py`)
+
+Per action token, with learner and behaviour (eSurge sampling) log-probs:
+
+```text
+lr_t = clip(logp_learner_t - logp_behavior_t, -20, 20)    # non-finite -> 0, counted
+k3_t = expm1(lr_t) - lr_t                                 # >= 0
+w_t  = exp(lr_t)
+K3_b = mean over the sequence's action tokens of k3_t
+```
+
+| field                                 | default | effect                                                                                               |
+|---------------------------------------|---------|------------------------------------------------------------------------------------------------------|
+| `off_policy_k3_threshold`             | `None`  | sequences with `K3_b` above it (or a non-finite log ratio, even when `None`) get zero loss; normalisers keep their token counts |
+| `off_policy_min_acceptance`           | `None`  | if `accepted_rows / eligible_rows` is below it, parameters and optimizer state are left unchanged (`off_policy/step_skipped = 1`); a batch without behaviour log-probs is skipped. Must be in `(0, 1]` |
+| `startup_behavior_k3_max`             | `None`  | first-step parity check on token-mean K3; a violation skips the first update and raises `RuntimeError` |
+| `startup_behavior_tail_fraction_max`  | `0.01`  | first-step bound on the fraction of tokens with `abs(lr_t) > 0.25`                                      |
+
+The first three must be positive when set and require `esurge_importance_sampling_correction=True` (otherwise
+`__post_init__` raises).
+
+Logged metrics (`N` = action tokens):
+
+| metric                           | formula                                              |
+|----------------------------------|------------------------------------------------------|
+| `off_policy/behavior_k3`         | `sum k3_t / N`                                       |
+| `off_policy/ess`                 | `(sum w_t)^2 / (N * sum w_t^2)` (`1` = on-policy)    |
+| `off_policy/chi2`                | `sum (w_t - 1)^2 / N`                                |
+| `off_policy/tail_fraction`       | `count(abs(lr_t) > 0.25) / N`                               |
+| `off_policy/accepted_fraction`   | `accepted_rows / eligible_rows` (`1` if none eligible) |
+| `off_policy/nonfinite_tokens`    | count of non-finite log ratios                       |
+| `off_policy/step_skipped`        | `1` when the update gate closed                      |
+
+Diagnostics are accumulated as additive sums, so gradient accumulation preserves every ratio.
+
+### Scheduled (MPMD) update gate
+
+Under a pipeline schedule (`mpmd_scheduler`), GRPO's scheduled loss adapter reduces the same sums across ranks on the
+host and sets the `update_gate` aux key: `accepted_fraction >= off_policy_min_acceptance` and, on the flagged first
+step, the parity bounds. Without behaviour log-probs the acceptance gate fails closed. The trainer applies stage-local
+gradients only when the gate is open; a missing or non-finite gate value closes it. Every rank computes the gate from
+the same host-replicated values.
+
+## Unscorable rewards
+
+A reward function returning `None` marks a sample unscorable (judge or sandbox failure).
+`discard_unscorable_groups`:
+
+| value            | behaviour                                                                                                                        |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `None` (default) | per-function opt-in: a `None` from a function whose `discard_unscorable` attribute is `True` drops the whole prompt group (zero advantages; its tokens and sequences leave every loss normaliser). A `None` from any other function becomes NaN and is skipped by the nan-aware reward statistics |
+| `True`           | a `None` from any function drops the group                                                                                       |
+| `False`          | never drop; every `None` uses the nan-aware aggregation                                                                          |
+
+`make_environment_reward_fn` sets `discard_unscorable = True`; see [RL environments](environments.md).
+
+With `gradient_accumulation_steps > 1`, a batch carrying `difficulty_weights` (dataset weights or discarded groups)
+normalises every microbatch by the full-batch weighted count, so a fully or mostly discarded microbatch does not
+dilute the gradient. Under a pipeline schedule (`mpmd_scheduler`) each pipeline and accumulation microbatch is
+weighted by its share of that count instead, which gives the same full-batch objective whenever the batch's total
+weighted count is at least `1` (always true with discarded groups and integer weights). If every weight is fractional
+and the total is below `1`, the non-pipelined step clamps the denominator to `1` while the pipelined step does not,
+so the two differ by that factor. Under `environment_factory`, a `reset` or `step` whose `info` sets `env_error` or
+`discard` reports a NaN environment reward (never the placeholder `0.0`), so the opted-in environment column drops
+the group.
+Dynamic sampling gives resampled groups weight `1`, never the zero weight of the discarded group they replace.
+
+## eSurge importance sampling
+
+`esurge_importance_sampling_correction` (default `True`) corrects the learner/rollout mismatch.
+`esurge_importance_sampling_mode` (default `"sequence_mask"`), with `cap` = `esurge_importance_sampling_cap`
+(default `3.0`) and `cap_low` = `esurge_importance_sampling_cap_low` (default `None` -> `1 / cap`):
+
+| mode                                     | effect                                                                                     |
+|------------------------------------------|--------------------------------------------------------------------------------------------|
+| `token_truncate`, `sequence_truncate`    | truncate the importance ratio at `cap`                                                     |
+| `token_mask`, `sequence_mask`            | mask tokens / sequences whose ratio exceeds `cap`                                          |
+| `token_icepop`, `sequence_icepop`        | double-sided band mask outside `[cap_low, cap]` (sequence variant extends it per sequence) |
+| `token_log_mask`, `sequence_log_mask`    | drop when `abs(log ratio) > log(cap)`, keep the rest with weight `1`; the sequence variant uses the summed log ratio; requires `cap > 1` |
+
+IcePop modes with `cap_low=None` require `cap >= 1`; an explicit `cap_low` must not exceed `cap`.
+
+## Loss and advantage variants
+
+- **GMPO** (`GMPOConfig`, `loss_type="gmpo"`, `epsilon = epsilon_high = 0.4`): the sequence ratio is the geometric
+  mean `exp(mean_t log clip(r_t))` of advantage-sign-aware clipped token ratios, computed in log space. Token-level IS
+  weights `w_t` fold into the mean: tokens with `w_t = 0` leave it, others add `stop_gradient(log w_t)`. A row
+  whose tokens all have `w_t = 0` gets sequence ratio `0` (zero loss).
+- **`scale_rewards`**: `"group"` (default) `A / (std_group(r) + eps)`, `"batch"` `A / (std_batch(r) + eps)`,
+  `"batch_advantage"` `(A - mean_batch(A)) / (std_batch(A) + eps)` over group-centred `A = r - baseline`, `"none"`.
+  `True` / `False` map to `"group"` / `"none"`.
+- **REINFORCE++** (`ReinforcePlusPlusConfig`) defaults to `scale_rewards="batch_advantage"` and `kl_estimator="k2"`.
+
+## Prefix-shared forward (`GRPOConfig.prefix_shared_forward`, default `False`)
+
+With the flag on, the policy loss forward runs each prompt once per group instead of once per completion. A capture
+pass records every layer's key/value states for the prompts. A fork pass then scores the `G` completions against the
+gathered prefix, with visibility from segment ids and causality from absolute positions.
+
+- **Supported:** dense full-attention models with `attn_mechanism` in `PREFIX_SHARED_ATTENTION_MECHANISMS`
+  (`easydel/caching/shared_prefix`): `vanilla`, `sdpa`, `flash_attn2` and `blocksparse`. All four match the
+  repeated-prompt forward on TPU for log-probs and every parameter update. `flash_attn2` was checked with fp32 matmul
+  precision pinned (XLA kernel at `HIGHEST`, or the Pallas kernel). At the default precision the XLA flash kernel uses
+  bf16 passes on TPU, about 6e-3 off for output and 9e-3 for gradients, with masking unchanged. `blocksparse` was
+  checked at 512-token prompts and completions, where the TPU kernel itself runs; shorter inputs use its fallback.
+- **Hybrid `qwen3_next`:** its gated-delta `linear_attention` layers use the recurrent views in
+  `easydel/caching/shared_prefix/recurrent.py`. The capture pass records each layer's end-of-prompt conv window and
+  recurrent state (left padding is zeroed before the projections, so it contributes nothing), and the fork pass starts
+  every completion row from its prompt's state. Prompt and completion lengths must both be at least 2. On TPU, with the
+  gated-delta rule pinned to the XLA kernel (`HIGHEST` matmuls), log-probs match the repeated-prompt forward to 4.8e-7
+  and every SGD parameter update to 1.2e-7 for `G` in {1, 2, 3}, dense and MoE MLPs, ragged left-padded prompts
+  (including one shorter than the conv kernel) and right-padded completions. The default TPU Pallas gated-delta kernel
+  runs its matmuls at `DEFAULT` precision (bf16 passes): there the two forwards differ by about 2.6e-4 in log-probs and
+  5.7e-4 in updates. That is below the kernel's own gap to the `HIGHEST` reference (4.0e-4 and 1.8e-3), and it is
+  rounding, not a state-handoff error: the fork pass restarts the chunked recurrence from the injected state, so its
+  chunks are aligned differently. At kernel level the split-vs-full gap is exactly 0 when the split falls on a chunk
+  boundary, and at most 9e-8 with the kernel's matmuls forced to `HIGHEST`. The XLA kernel's gradient with respect to
+  the injected state matches finite differences to 1e-5 relative. Tests bound the Pallas log-prob gap at 1e-3. Also
+  covered: `tp` 2 and 4 (captured conv and recurrent states stay sharded on `tp`; log-probs within 4.8e-7, updates
+  within 2.4e-7), both linear-attention projection variants (`linear_attention_separate_proj`,
+  `linear_attention_merged_split_proj`), and bf16 (shared vs repeated log-probs within 2.6e-3 and updates within
+  3.9e-3, about the size of the bf16-vs-fp32 gap of the repeated forward: 3.0e-3 and 4.6e-3).
+- **Rejected:** `completion_chunk_size`, `top_entropy_quantile < 1`, `mpmd_scheduler`, sliding-window layers, layer
+  types other than full attention (plus `linear_attention` for `qwen3_next` only, so KDA families such as
+  `kimi_linear` and `glm5_next` are rejected), single-token prompts or completions on hybrid models, quantized KV,
+  attention dropout, and other attention operations.
+- **Grouped fork attention (`vanilla`, `sdpa`):** the fork pass does not copy the prefix per completion. The queries
+  of all `G` completions of a prompt attend that prompt's `B`-row prefix in one matmul, and each completion attends its
+  own keys causally in 256-query blocks; blocks above the diagonal are skipped. One shared row maximum and denominator
+  make the merge an exact log-sum-exp combination, and prefix key/value gradients sum over the group inside the matmul.
+  `flash_attn2` and `blocksparse` still receive the concatenated `[P + C]` keys with a G-fold prefix copy. On TPU
+  (fp32, `HIGHEST`) log-probs match the repeated-prompt forward to 4.8e-7, the loss exactly, and every SGD update to
+  6e-8, including on `tp4` and `fsdp2×tp2` meshes.
+- **When it pays off:** measured on 4 TPU v5p chips, 697M-parameter dense Llama (hidden 2048, 12 layers, 16/8 heads),
+  `vanilla` attention, bf16, fsdp mesh; median step time and compiled temp memory:
+
+| P | C | G | prompts | off | copy path (previous) | grouped (vanilla) |
+|---|---|---|---|---|---|---|
+| 1024 | 256 | 8 | 8 | 0.316 s, 31.1 GiB | 0.143 s, 14.2 GiB | 0.119 s, 10.7 GiB |
+| 512 | 512 | 8 | 8 | 0.250 s, 22.4 GiB | 0.181 s, 18.4 GiB | 0.160 s, 15.0 GiB |
+| 256 | 1024 | 8 | 8 | 0.322 s, 32.5 GiB | 0.303 s, 38.2 GiB | 0.278 s, 29.6 GiB |
+| 512 | 2048 | 8 | 4 | 0.378 s, 51.3 GiB | 0.384 s, 59.2 GiB | 0.325 s, 44.2 GiB |
+| 512 | 1024 | 16 | 4 | 0.387 s, 42.9 GiB | 0.324 s, 43.0 GiB | 0.291 s, 35.1 GiB |
+
+  With grouped attention it was faster and used less temp memory than the default path in every measured shape,
+  including completions 4× longer than prompts. The copy path (still used by `flash_attn2` and `blocksparse`) pays
+  off only when prompts are at least as long as completions; with `C ≥ 4P` it was slower and used more memory than
+  the default path.
+
+## Async rollouts (`TrainingArguments`)
+
+| field                 | default | meaning                                                         |
+|-----------------------|---------|-----------------------------------------------------------------|
+| `async_mode`          | `False` | background rollout generation against a params-only snapshot; also enables eSurge async scheduling and overlap |
+| `max_inflight_tasks`  | `32`    | queued/in-flight rollout tasks                                  |
+| `max_staleness`       | `1`     | maximum lag, in rollout units (policy versions)                 |
+| `queue_maxsize`       | `0`     | `0` uses `max_inflight_tasks`                                    |
+| `weight_sync_steps`   | `1`     | rollouts between snapshot refreshes                             |
+| `request_timeout`, `first_rollout_timeout` | `120.0`, `3600.0` | seconds                                 |
+
+All bookkeeping runs in **rollout units**: one consumed rollout advances `state.step` by
+`_optimizer_steps_per_rollout()` (default `1`), and a step lag converts to a version lag by floor division.
+**Deadline admission**: a rollout anchored at version `v` must be consumed by `v + max_staleness`; a lookahead
+rollout is started only when every queued deadline stays feasible (`admission_is_feasible`), otherwise it is deferred.
+An over-stale rollout found at take time is regenerated. Counters: `async_rollout/admission_deferred`,
+`async_rollout/stale_dropped`.
+
+## PPO
+
+- **Async epochs**: `PPOTrainer._optimizer_steps_per_rollout()` returns `num_ppo_epochs`, so each rollout counts as
+  one version regardless of how many epochs replay it.
+- **Value pretraining** (`value_pretrain_steps`, default `0`; needs `vf_coef > 0`): while
+  `state.step < value_pretrain_steps` the loss is `vf_coef * vf_loss` on detached hidden states, and
+  `freeze_policy_during_value_pretrain` restores every non-value-head parameter and its optimizer moments to the
+  pre-step value (so weight decay and momentum do not move the policy). Counted in optimizer steps, so each PPO epoch
+  counts.

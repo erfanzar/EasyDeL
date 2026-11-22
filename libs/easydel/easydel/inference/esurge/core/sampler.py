@@ -176,6 +176,49 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     return jnp.where(is_greedy_row, greedy_tokens, sampled)
 
 
+def sample_top_p_rows(
+    logits: jax.Array,
+    temperatures: jax.Array,
+    top_ps: jax.Array,
+    sampling_seeds: jax.Array,
+    rng: jax.Array,
+    *,
+    unroll_search: bool = False,
+) -> jax.Array:
+    """Top-p + temperature sampling without runtime branches, for batches whose parameters the host has classified.
+
+    Computes the same token as :func:`sample_tokens` for every row with ``temperature > 0`` and ``top_p < 1`` in a batch
+    without top-k, min-p or linear penalties: top-p masking of the untempered probabilities (bisection threshold),
+    division by the temperature, and a Gumbel-max draw with ``fold_in(rng, seed)``. The reference reaches the same ops
+    through batch-flag ``lax.cond`` branches; here the caller has decided the branches, so the program is straight-line.
+    Rows outside that contract (greedy or padding rows) get an unspecified token the caller replaces.
+
+    Args:
+        logits: Logits ``[rows, vocab]`` after penalties.
+        temperatures: Temperatures ``[rows, 1]`` in the logits dtype; rows ``<= 0`` are scaled by 1 as in the reference.
+        top_ps: Top-p ``[rows]`` in the logits dtype.
+        sampling_seeds: Per-row fold-in seeds ``[rows]``.
+        rng: The engine key.
+        unroll_search: Unroll the 31-step threshold search into straight-line code (same result).
+
+    Returns:
+        int32 sampled ids ``[rows]``.
+    """
+    min_val = -1e10
+    if logits.dtype == jnp.bfloat16:
+        legi = jax.vmap(lambda row, p: apply_topp_mask_bf16(row[None, :], p, min_val, unroll_search)[0])(logits, top_ps)
+    else:
+        legi = jax.vmap(lambda row, p: apply_topp_mask(row[None, :], p, min_val)[0])(logits.astype(jnp.float32), top_ps)
+    legi = legi.astype(jnp.float32)
+    safe_temp = jnp.where(temperatures <= 0.0, 1.0, temperatures)
+    legi = legi / safe_temp
+
+    def sample_one(logits_i, seed_i):
+        return jax.random.categorical(jax.random.fold_in(rng, seed_i), logits_i).astype(jnp.int32)
+
+    return jax.vmap(sample_one)(legi, sampling_seeds.astype(jnp.int32))
+
+
 def build_history_token_counts(
     *,
     token_history: jax.Array,

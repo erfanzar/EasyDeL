@@ -47,16 +47,23 @@ Example:
 
 from __future__ import annotations
 
+import asyncio
+import hmac
+import inspect
 import json
 import os
 import time
 import typing as tp
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+from easydel.workers.esurge.auth.credentials import api_key_from_headers
 
 # The server scaffolding (status enum, metrics, endpoint/error models and the error-response helper) is shared with
 # the eSurge API server; it is re-exported here so ``easydel.inference.oai_proxies.<name>`` keeps working.
@@ -69,7 +76,72 @@ from .inference_engine_interface import (
     ServerStatus,
     create_error_response,
 )
-from .openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest
+from .openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest, ResponsesToolChoice
+
+_CHAT_SDK_PARAMS = frozenset(
+    {
+        "model",
+        "messages",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "stream",
+        "n",
+        "tools",
+        "tool_choice",
+        "functions",
+        "function_call",
+        "logit_bias",
+        "user",
+        "seed",
+        "response_format",
+        "stream_options",
+        "parallel_tool_calls",
+        "logprobs",
+        "top_logprobs",
+        "service_tier",
+        "store",
+        "metadata",
+        "reasoning_effort",
+        "modalities",
+        "audio",
+        "prediction",
+        "web_search_options",
+        "extra_headers",
+        "extra_query",
+        "timeout",
+    }
+)
+
+_COMPLETION_SDK_PARAMS = frozenset(
+    {
+        "model",
+        "prompt",
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "stream",
+        "n",
+        "logit_bias",
+        "user",
+        "seed",
+        "stream_options",
+        "logprobs",
+        "echo",
+        "best_of",
+        "suffix",
+        "extra_headers",
+        "extra_query",
+        "timeout",
+    }
+)
 
 # ``ResponsesRequest`` fields that the OpenAI SDK's ``responses.create`` accepts as keyword arguments. Everything else
 # (EasyDeL sampling extensions such as ``top_k``/``min_p``, chat-style ``messages``, legacy ``functions``, and any
@@ -120,6 +192,103 @@ def _backend_error_status(error: BaseException) -> int:
     return HTTPStatus.BAD_GATEWAY.value
 
 
+async def _close_upstream_stream(stream: tp.Any) -> None:
+    """Close an OpenAI SDK ``AsyncStream`` or async generator cleanly."""
+    close_fn = getattr(stream, "close", None)
+    if callable(close_fn):
+        try:
+            result = close_fn()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            pass
+        return
+    aclose_fn = getattr(stream, "aclose", None)
+    if callable(aclose_fn):
+        try:
+            await aclose_fn()
+        except Exception:
+            pass
+
+
+class _CloseOnce:
+    """Idempotent single-close guard for an upstream async stream."""
+
+    __slots__ = ("_closed", "_stream")
+
+    def __init__(self, stream: tp.Any) -> None:
+        self._stream = stream
+        self._closed = False
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await _close_upstream_stream(self._stream)
+
+
+class _ManagedStreamBody:
+    """Async iterator wrapper that guarantees shielded upstream stream closure even before first ``__anext__``."""
+
+    def __init__(self, body_iter: AsyncGenerator[bytes, None], upstream_stream: tp.Any) -> None:
+        self._body_iter = body_iter
+        self._upstream_closer = (
+            upstream_stream if isinstance(upstream_stream, _CloseOnce) else _CloseOnce(upstream_stream)
+        )
+        self._closed = False
+
+    def __aiter__(self) -> _ManagedStreamBody:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await self._body_iter.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Shield teardown against Starlette's task-group cancellation on client disconnect
+        # so the body generator and upstream httpx/OpenAI AsyncStream always close cleanly.
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._body_iter.aclose()
+            finally:
+                await self._upstream_closer.close()
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """StreamingResponse that always closes ``body_iterator`` on disconnect or send failure."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if callable(aclose):
+                with anyio.CancelScope(shield=True):
+                    await aclose()
+
+
+def _serialize_oai_value(value: tp.Any) -> tp.Any:
+    """Recursively convert nested Pydantic models into plain JSON-safe dicts without ``None`` fields."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, list):
+        return [_serialize_oai_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _serialize_oai_value(v) for k, v in value.items() if v is not None}
+    return value
+
+
 class InferenceApiRouter:
     """Enhanced FastAPI server acting as an OpenAI API proxy.
 
@@ -152,18 +321,28 @@ class InferenceApiRouter:
         base_url: str | None = None,
         organization: str | None = None,
         enable_function_calling: bool = True,
+        http_timeout: float = 30.0,
+        require_api_key: bool = False,
+        proxy_api_key: str | None = None,
         **kwargs,
     ) -> None:
         """Initialize the Inference API Router with EasyDeL compatibility.
 
         Args:
-            api_key: OpenAI API key for authentication. If not provided,
+            api_key: OpenAI API key for backend authentication. If not provided,
                 reads from OPENAI_API_KEY environment variable.
             base_url: Base URL for the backend API. If None, uses OpenAI's
                 default endpoint.
             organization: OpenAI organization ID for billing attribution.
             enable_function_calling: Whether to enable function calling
                 support and related endpoints. Defaults to True.
+            http_timeout: Total timeout in seconds for auxiliary backend HTTP
+                requests (``/metrics``, ``/v1/tools*``). Defaults to 30.0.
+            require_api_key: When ``True``, require incoming requests to present
+                a valid ``Authorization: Bearer`` or ``X-API-Key`` matching
+                ``proxy_api_key`` (or ``api_key``). Defaults to ``False``.
+            proxy_api_key: Optional client-facing API key when ``require_api_key=True``.
+                Defaults to ``api_key`` when omitted.
             **kwargs: Additional arguments passed to AsyncOpenAI client.
 
         Raises:
@@ -172,13 +351,23 @@ class InferenceApiRouter:
         import openai  # type:ignore
         from openai import AsyncOpenAI  # type:ignore
 
+        resolved_api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.client = AsyncOpenAI(
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            api_key=resolved_api_key,
             base_url=base_url,
             organization=organization,
             **kwargs,
         )
         self.openai_module = openai
+        self._api_key = resolved_api_key
+        self._http_timeout = max(0.1, float(http_timeout))
+        self._require_api_key = bool(require_api_key)
+        self._proxy_api_key = proxy_api_key or resolved_api_key
+        self._http_session: tp.Any | None = None
+        self._http_session_loop: asyncio.AbstractEventLoop | None = None
+        self._http_session_cls: tp.Any | None = None
+        self._http_session_lock: asyncio.Lock | None = None
+        self._http_session_lock_loop: asyncio.AbstractEventLoop | None = None
         self.enable_function_calling = enable_function_calling
         self.status = ServerStatus.STARTING
         self.metrics = ServerMetrics()
@@ -188,6 +377,7 @@ class InferenceApiRouter:
             title="EasyDeL Inference API Hub",
             description="High-performance inference server with OpenAI API compatibility",
             version="2.0.0",
+            lifespan=self._lifespan,
         )
 
         self._register_endpoints()
@@ -195,6 +385,181 @@ class InferenceApiRouter:
             self._add_function_calling_endpoints()
 
         self.status = ServerStatus.READY
+
+    @asynccontextmanager
+    async def _lifespan(self, app: FastAPI):
+        """Manage proxy HTTP/OpenAI client lifecycle cleanly across server startup and shutdown."""
+        self.status = ServerStatus.READY
+        try:
+            yield
+        finally:
+            self.status = ServerStatus.SHUTTING_DOWN
+            await self.aclose()
+
+    def _get_http_session_lock(self, loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+        """Return a per-event-loop lock serializing shared ``aiohttp.ClientSession`` lifecycle transitions."""
+        lock = getattr(self, "_http_session_lock", None)
+        lock_loop = getattr(self, "_http_session_lock_loop", None)
+        if lock is None or lock_loop is not loop:
+            lock = asyncio.Lock()
+            self._http_session_lock = lock
+            self._http_session_lock_loop = loop
+        return lock
+
+    async def aclose(self) -> None:
+        """Close the shared backend HTTP session and OpenAI SDK client."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        async def _close_http_session() -> None:
+            session = getattr(self, "_http_session", None)
+            self._http_session = None
+            self._http_session_loop = None
+            self._http_session_cls = None
+            if session is not None and not getattr(session, "closed", False):
+                close_fn = getattr(session, "close", None)
+                if callable(close_fn):
+                    try:
+                        result = close_fn()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        pass
+
+        if loop is not None:
+            async with self._get_http_session_lock(loop):
+                await _close_http_session()
+        else:
+            await _close_http_session()
+
+        client = getattr(self, "client", None)
+        if client is not None:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                try:
+                    result = close_fn()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+
+    def _presented_proxy_key(self, raw_request: Request | None) -> str | None:
+        req_headers = getattr(raw_request, "headers", None) if raw_request is not None else None
+        return api_key_from_headers(req_headers) if req_headers is not None else None
+
+    def _check_proxy_auth(self, raw_request: Request | None) -> None:
+        """Enforce proxy-level API key authentication when ``require_api_key=True``."""
+        if not getattr(self, "_require_api_key", False):
+            return
+        expected = getattr(self, "_proxy_api_key", None) or getattr(self, "_api_key", None)
+        presented = self._presented_proxy_key(raw_request)
+        if not expected or not presented or not hmac.compare_digest(presented, str(expected)):
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
+
+    def _backend_auth_headers(self, raw_request: Request | None = None) -> dict[str, str]:
+        """Build backend authorization headers from the proxy's configured upstream API key.
+
+        Client-presented proxy credentials (``proxy_api_key``) are never forwarded to the upstream backend.
+        """
+        del raw_request
+        api_key = getattr(self, "_api_key", None) or getattr(getattr(self, "client", None), "api_key", None)
+        if isinstance(api_key, str) and api_key.strip():
+            return {"Authorization": f"Bearer {api_key.strip()}"}
+        return {}
+
+    async def _get_or_create_http_session(
+        self,
+        client_session_cls: tp.Any,
+        client_timeout_cls: tp.Any,
+    ) -> tp.Any:
+        """Return a live shared ``aiohttp.ClientSession`` for the running loop, serializing init/replacement."""
+        loop = asyncio.get_running_loop()
+        session = getattr(self, "_http_session", None)
+        if (
+            session is not None
+            and not getattr(session, "closed", False)
+            and getattr(self, "_http_session_loop", None) is loop
+            and getattr(self, "_http_session_cls", None) is client_session_cls
+        ):
+            return session
+
+        lock = self._get_http_session_lock(loop)
+        async with lock:
+            session = getattr(self, "_http_session", None)
+            if (
+                session is not None
+                and not getattr(session, "closed", False)
+                and getattr(self, "_http_session_loop", None) is loop
+                and getattr(self, "_http_session_cls", None) is client_session_cls
+            ):
+                return session
+            old_session = session
+            self._http_session = None
+            self._http_session_loop = None
+            self._http_session_cls = None
+            if old_session is not None and not getattr(old_session, "closed", False):
+                close_fn = getattr(old_session, "close", None)
+                if callable(close_fn):
+                    try:
+                        res = close_fn()
+                        if inspect.isawaitable(res):
+                            await res
+                    except Exception:
+                        pass
+            timeout = client_timeout_cls(total=float(getattr(self, "_http_timeout", 30.0)))
+            new_session = client_session_cls(timeout=timeout)
+            self._http_session = new_session
+            self._http_session_loop = loop
+            self._http_session_cls = client_session_cls
+            return new_session
+
+    async def _request_backend_http(
+        self,
+        method: str,
+        url: str,
+        *,
+        raw_request: Request | None = None,
+        json_body: tp.Any = None,
+    ) -> tuple[int, tp.Any, bool]:
+        """Execute a timed backend HTTP request reusing a shared ``aiohttp.ClientSession`` when available."""
+        import aiohttp
+
+        headers = self._backend_auth_headers(raw_request)
+        client_session_cls = aiohttp.ClientSession
+        client_timeout_cls = getattr(aiohttp, "ClientTimeout", None)
+
+        async def _send_with_session(session: tp.Any) -> tuple[int, tp.Any, bool]:
+            req_fn = session.get if method == "GET" else session.post
+            req_kwargs: dict[str, tp.Any] = {}
+            if method != "GET":
+                req_kwargs["json"] = json_body
+            if headers:
+                try:
+                    sig_params = inspect.signature(req_fn).parameters
+                    if "headers" in sig_params or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+                    ):
+                        req_kwargs["headers"] = headers
+                except (TypeError, ValueError):
+                    req_kwargs["headers"] = headers
+
+            async with req_fn(url, **req_kwargs) as response:
+                status = int(response.status)
+                try:
+                    return status, await response.json(), True
+                except Exception:
+                    text_fn = getattr(response, "text", None)
+                    text = await text_fn() if callable(text_fn) else ""
+                    return status, text, False
+
+        if client_timeout_cls is not None:
+            session = await self._get_or_create_http_session(client_session_cls, client_timeout_cls)
+            return await _send_with_session(session)
+
+        async with client_session_cls() as session:
+            return await _send_with_session(session)
 
     @property
     def _endpoints(self) -> list[EndpointConfig]:
@@ -395,6 +760,58 @@ class InferenceApiRouter:
             params["extra_body"] = extra_body
         return params
 
+    @staticmethod
+    def _merge_extensions_and_extras(
+        params: dict[str, tp.Any],
+        request: ChatCompletionRequest | CompletionRequest,
+        sdk_params: frozenset[str],
+    ) -> None:
+        """Forward standard extra OpenAI SDK params directly and non-default EasyDeL extensions via ``extra_body``."""
+        extra_body: dict[str, tp.Any] = {}
+        existing_extra_body = params.get("extra_body")
+        if isinstance(existing_extra_body, dict):
+            extra_body.update(existing_extra_body)
+        req_extra_body = getattr(request, "extra_body", None)
+        if isinstance(req_extra_body, dict):
+            extra_body.update(_serialize_oai_value(req_extra_body))
+
+        rep_penalty = getattr(request, "repetition_penalty", None)
+        if rep_penalty is not None and rep_penalty != 1.0:
+            extra_body["repetition_penalty"] = rep_penalty
+
+        top_k = getattr(request, "top_k", None)
+        if top_k is not None and top_k != 0:
+            extra_body["top_k"] = top_k
+
+        min_p = getattr(request, "min_p", None)
+        if min_p is not None and min_p != 0.0:
+            extra_body["min_p"] = min_p
+
+        if bool(getattr(request, "ignore_eos", False)):
+            extra_body["ignore_eos"] = True
+
+        suppress_tokens = getattr(request, "suppress_tokens", None)
+        if suppress_tokens:
+            extra_body["suppress_tokens"] = list(suppress_tokens)
+
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
+        if chat_template_kwargs is not None:
+            extra_body["chat_template_kwargs"] = _serialize_oai_value(chat_template_kwargs)
+
+        model_extra = getattr(request, "model_extra", None)
+        if isinstance(model_extra, dict):
+            for key, value in model_extra.items():
+                if value is None or key in ("extra_body", "request_id"):
+                    continue
+                serialized = _serialize_oai_value(value)
+                if key in sdk_params:
+                    params[key] = serialized
+                else:
+                    extra_body[key] = serialized
+
+        if extra_body:
+            params["extra_body"] = extra_body
+
     def build_oai_params_from_request(
         self,
         request: CompletionRequest,
@@ -402,20 +819,15 @@ class InferenceApiRouter:
         """Build OpenAI parameters from a completion request.
 
         Converts a CompletionRequest object into a dictionary of parameters
-        suitable for the OpenAI API completions endpoint.
+        suitable for the OpenAI API completions endpoint. Non-default EasyDeL
+        extensions (``repetition_penalty``, ``top_k``, ``min_p``, ``ignore_eos``,
+        ``suppress_tokens``, etc.) are forwarded through ``extra_body``.
 
         Args:
             request: The completion request to convert.
 
         Returns:
             Dictionary of OpenAI API parameters ready for the completions endpoint.
-
-        Note:
-            ``repetition_penalty`` is an EasyDeL-specific parameter that the
-            OpenAI SDK does not accept as a direct keyword argument, so it is
-            forwarded through ``extra_body`` (the SDK's supported channel for
-            non-standard parameters), and only when it is set to a non-default
-            value (not ``None`` and not ``1.0``).
         """
         params: dict[str, tp.Any] = {
             "model": request.model,
@@ -429,7 +841,11 @@ class InferenceApiRouter:
             "stream": request.stream,
             "n": request.n,
         }
-        self._add_repetition_penalty(params, request.repetition_penalty)
+        if request.logit_bias is not None:
+            params["logit_bias"] = dict(request.logit_bias)
+        if request.user is not None:
+            params["user"] = request.user
+        self._merge_extensions_and_extras(params, request, _COMPLETION_SDK_PARAMS)
         return params
 
     def build_oai_params_from_chat_request(
@@ -439,8 +855,9 @@ class InferenceApiRouter:
         """Build OpenAI parameters from a chat completion request.
 
         Converts a ChatCompletionRequest object into a dictionary of parameters
-        suitable for the OpenAI API chat completions endpoint, including
-        function calling parameters if present.
+        suitable for the OpenAI API chat completions endpoint, dumping nested
+        Pydantic models with ``exclude_none=True`` and forwarding non-default
+        EasyDeL extensions through ``extra_body``.
 
         Args:
             request: The chat completion request to convert.
@@ -448,18 +865,10 @@ class InferenceApiRouter:
         Returns:
             Dictionary of OpenAI API parameters with optional tool/function
             definitions for the chat completions endpoint.
-
-            Note:
-                ``repetition_penalty`` is an EasyDeL-specific parameter that
-                the OpenAI SDK does not accept as a direct keyword argument,
-                so it is forwarded through ``extra_body`` (the SDK's
-                supported channel for non-standard parameters), and only
-                when it is set to a non-default value (not ``None`` and
-                not ``1.0``).
         """
         params: dict[str, tp.Any] = {
             "model": request.model,
-            "messages": [msg.model_dump() for msg in request.messages],
+            "messages": [msg.model_dump(exclude_none=True) for msg in request.messages],
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
             "top_p": request.top_p,
@@ -469,17 +878,35 @@ class InferenceApiRouter:
             "stream": request.stream,
             "n": request.n,
         }
-        self._add_repetition_penalty(params, request.repetition_penalty)
+        max_completion_tokens = getattr(request, "max_completion_tokens", None)
+        if max_completion_tokens is not None:
+            params["max_completion_tokens"] = max_completion_tokens
+        if request.logit_bias is not None:
+            params["logit_bias"] = dict(request.logit_bias)
+        if request.user is not None:
+            params["user"] = request.user
 
         if request.tools:
-            params["tools"] = [tool.model_dump() for tool in request.tools]
-        if request.tool_choice:
-            params["tool_choice"] = request.tool_choice
+            params["tools"] = [tool.model_dump(exclude_none=True) for tool in request.tools]
+        if request.tool_choice is not None:
+            if isinstance(request.tool_choice, ResponsesToolChoice):
+                params["tool_choice"] = {
+                    "type": request.tool_choice.type,
+                    "function": {"name": request.tool_choice.name},
+                }
+            elif hasattr(request.tool_choice, "model_dump"):
+                params["tool_choice"] = request.tool_choice.model_dump(exclude_none=True)
+            else:
+                params["tool_choice"] = request.tool_choice
         if request.functions:
-            params["functions"] = [func.model_dump() for func in request.functions]
-        if request.function_call:
-            params["function_call"] = request.function_call
+            params["functions"] = [func.model_dump(exclude_none=True) for func in request.functions]
+        if request.function_call is not None:
+            if hasattr(request.function_call, "model_dump"):
+                params["function_call"] = request.function_call.model_dump(exclude_none=True)
+            else:
+                params["function_call"] = request.function_call
 
+        self._merge_extensions_and_extras(params, request, _CHAT_SDK_PARAMS)
         return params
 
     def process_request_params(
@@ -547,6 +974,7 @@ class InferenceApiRouter:
         request_id = raw_request.headers.get("X-Request-ID")
 
         try:
+            self._check_proxy_auth(raw_request)
             self.metrics.total_requests += 1
             params = self.build_oai_params_from_responses_request(request)
             if not bool(params.get("stream", False)):
@@ -554,10 +982,14 @@ class InferenceApiRouter:
                 self.metrics.successful_requests += 1
                 return response
 
+            # Open the upstream stream before returning StreamingResponse so upstream
+            # 4xx/5xx APIError propagates as its real HTTP status rather than HTTP 200.
+            stream = await self.client.responses.create(**params)
+            closer = _CloseOnce(stream)
+
             async def stream_events() -> AsyncGenerator[bytes, None]:
                 """Stream Server-Sent Events from the backend."""
                 try:
-                    stream = await self.client.responses.create(**params)
                     async for event in stream:
                         event_type = getattr(event, "type", None) or getattr(event, "event", None)
                         if hasattr(event, "model_dump_json"):
@@ -573,9 +1005,12 @@ class InferenceApiRouter:
                     self.metrics.failed_requests += 1
                     error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
                     yield f"data: {error_response.body.decode()}\n\n".encode()
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        await closer.close()
 
-            return StreamingResponse(
-                stream_events(),
+            return _ManagedStreamingResponse(
+                _ManagedStreamBody(stream_events(), closer),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -594,7 +1029,7 @@ class InferenceApiRouter:
             self.metrics.failed_requests += 1
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
 
-    async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
+    async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request = None) -> tp.Any:
         """Handle chat completion requests with function calling support.
 
         Processes POST /v1/chat/completions requests, forwarding them to
@@ -604,6 +1039,7 @@ class InferenceApiRouter:
         Args:
             request: The chat completion request containing messages,
                 model selection, and generation parameters.
+            raw_request: Optional raw FastAPI request for auth and request ID headers.
 
         Returns:
             Chat completion response object or StreamingResponse for
@@ -612,9 +1048,12 @@ class InferenceApiRouter:
         Raises:
             HTTPException: If the backend API returns an error.
         """
-        request_id = getattr(request, "request_id", None)
+        request_id = getattr(request, "request_id", None) or (
+            raw_request.headers.get("X-Request-ID") if raw_request is not None else None
+        )
 
         try:
+            self._check_proxy_auth(raw_request)
             self.metrics.total_requests += 1
 
             openai_params = self.build_oai_params_from_chat_request(request)
@@ -629,8 +1068,13 @@ class InferenceApiRouter:
                 self.metrics.successful_requests += 1
                 return response
             else:
-                return StreamingResponse(
-                    self._stream_chat_completion(openai_params, metadata, request_id),
+                stream = await self.client.chat.completions.create(**openai_params)
+                closer = _CloseOnce(stream)
+                return _ManagedStreamingResponse(
+                    _ManagedStreamBody(
+                        self._stream_chat_completion(stream, metadata, request_id, _closer=closer),
+                        closer,
+                    ),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -642,20 +1086,29 @@ class InferenceApiRouter:
         except self.openai_module.APIError as e:
             self.metrics.failed_requests += 1
             raise HTTPException(status_code=_backend_error_status(e), detail=str(e)) from e
+        except HTTPException:
+            self.metrics.failed_requests += 1
+            raise
         except Exception as e:
             self.metrics.failed_requests += 1
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
 
     async def _stream_chat_completion(
-        self, params: dict, metadata: dict | None, request_id: str | None = None
+        self,
+        stream_or_params: tp.Any,
+        metadata: dict | None,
+        request_id: str | None = None,
+        *,
+        _closer: _CloseOnce | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Handle streaming chat completion responses.
 
         Streams Server-Sent Events (SSE) formatted responses from the backend
-        API to the client.
+        API to the client and always closes the upstream stream in ``finally``.
 
         Args:
-            params: OpenAI API parameters for the chat completion request.
+            stream_or_params: Already-opened upstream async stream, or a dict of
+                OpenAI API parameters for backward compatibility.
             metadata: Optional metadata to include at the start of the stream.
             request_id: Request identifier for tracking and logging.
 
@@ -663,8 +1116,16 @@ class InferenceApiRouter:
             SSE-formatted bytes containing response chunks, followed by
             a [DONE] marker at the end.
         """
+        stream: tp.Any = None
+        closer = _closer
         try:
-            stream = await self.client.chat.completions.create(**params)
+            stream = (
+                await self.client.chat.completions.create(**stream_or_params)
+                if isinstance(stream_or_params, dict)
+                else stream_or_params
+            )
+            if closer is None and stream is not None:
+                closer = _CloseOnce(stream)
             if metadata is not None:
                 yield self._format_metadata_sse(metadata)
 
@@ -678,8 +1139,12 @@ class InferenceApiRouter:
             self.metrics.failed_requests += 1
             error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
             yield f"data: {error_response.body.decode()}\n\n".encode()
+        finally:
+            if closer is not None:
+                with anyio.CancelScope(shield=True):
+                    await closer.close()
 
-    async def completions(self, request: CompletionRequest) -> tp.Any:
+    async def completions(self, request: CompletionRequest, raw_request: Request = None) -> tp.Any:
         """Handle text completion requests.
 
         Processes POST /v1/completions requests, forwarding them to
@@ -689,6 +1154,7 @@ class InferenceApiRouter:
         Args:
             request: The completion request containing prompt, model
                 selection, and generation parameters.
+            raw_request: Optional raw FastAPI request for auth and request ID headers.
 
         Returns:
             Completion response object or StreamingResponse for
@@ -697,9 +1163,12 @@ class InferenceApiRouter:
         Raises:
             HTTPException: If the backend API returns an error.
         """
-        request_id = getattr(request, "request_id", None)
+        request_id = getattr(request, "request_id", None) or (
+            raw_request.headers.get("X-Request-ID") if raw_request is not None else None
+        )
 
         try:
+            self._check_proxy_auth(raw_request)
             self.metrics.total_requests += 1
 
             openai_params = self.build_oai_params_from_request(request)
@@ -714,8 +1183,13 @@ class InferenceApiRouter:
                 self.metrics.successful_requests += 1
                 return response
             else:
-                return StreamingResponse(
-                    self._stream_completion(openai_params, metadata, request_id),
+                stream = await self.client.completions.create(**openai_params)
+                closer = _CloseOnce(stream)
+                return _ManagedStreamingResponse(
+                    _ManagedStreamBody(
+                        self._stream_completion(stream, metadata, request_id, _closer=closer),
+                        closer,
+                    ),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -727,20 +1201,29 @@ class InferenceApiRouter:
         except self.openai_module.APIError as e:
             self.metrics.failed_requests += 1
             raise HTTPException(status_code=_backend_error_status(e), detail=str(e)) from e
+        except HTTPException:
+            self.metrics.failed_requests += 1
+            raise
         except Exception as e:
             self.metrics.failed_requests += 1
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
 
     async def _stream_completion(
-        self, params: dict, metadata: dict | None, request_id: str | None = None
+        self,
+        stream_or_params: tp.Any,
+        metadata: dict | None,
+        request_id: str | None = None,
+        *,
+        _closer: _CloseOnce | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Handle streaming completion responses.
 
         Streams Server-Sent Events (SSE) formatted responses from the backend
-        API to the client.
+        API to the client and always closes the upstream stream in ``finally``.
 
         Args:
-            params: OpenAI API parameters for the completion request.
+            stream_or_params: Already-opened upstream async stream, or a dict of
+                OpenAI API parameters for backward compatibility.
             metadata: Optional metadata to include at the start of the stream.
             request_id: Request identifier for tracking and logging.
 
@@ -748,8 +1231,16 @@ class InferenceApiRouter:
             SSE-formatted bytes containing response chunks, followed by
             a [DONE] marker at the end.
         """
+        stream: tp.Any = None
+        closer = _closer
         try:
-            stream = await self.client.completions.create(**params)
+            stream = (
+                await self.client.completions.create(**stream_or_params)
+                if isinstance(stream_or_params, dict)
+                else stream_or_params
+            )
+            if closer is None and stream is not None:
+                closer = _CloseOnce(stream)
             if metadata is not None:
                 yield self._format_metadata_sse(metadata)
 
@@ -763,8 +1254,12 @@ class InferenceApiRouter:
             self.metrics.failed_requests += 1
             error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
             yield f"data: {error_response.body.decode()}\n\n".encode()
+        finally:
+            if closer is not None:
+                with anyio.CancelScope(shield=True):
+                    await closer.close()
 
-    async def health_check(self) -> JSONResponse:
+    async def health_check(self, raw_request: Request = None) -> JSONResponse:
         """Perform a comprehensive health check.
 
         Checks the backend API connectivity by listing models and returns
@@ -774,6 +1269,7 @@ class InferenceApiRouter:
             JSONResponse with health status, model count, backend URL,
             and request statistics. Returns 200 if healthy, 503 if unhealthy.
         """
+        self._check_proxy_auth(raw_request)
         try:
             # Try to list models to check if backend is responsive
             models = await self.client.models.list()
@@ -818,24 +1314,40 @@ class InferenceApiRouter:
         """
         return JSONResponse({"status": "alive"}, status_code=200)
 
-    async def readiness(self) -> JSONResponse:
+    async def readiness(self, raw_request: Request = None) -> JSONResponse:
         """Perform a readiness check.
 
-        Verifies the server can communicate with the backend API.
-        Used by load balancers to determine if the server should
-        receive traffic.
+        Verifies the server is ready to receive traffic. When ``require_api_key=True``,
+        unauthenticated probes only check local proxy readiness without triggering
+        upstream backend requests or exposing backend error details; authenticated
+        callers also probe upstream connectivity.
 
         Returns:
-            JSONResponse with status "ready" and HTTP 200 if backend
-            is responsive, otherwise status "not ready" with HTTP 503.
+            JSONResponse with status "ready" and HTTP 200 if ready,
+            otherwise status "not ready" with HTTP 503.
         """
+        authenticated = False
+        if getattr(self, "_require_api_key", False):
+            presented = self._presented_proxy_key(raw_request)
+            if presented is not None:
+                self._check_proxy_auth(raw_request)
+                authenticated = True
+            else:
+                if self.status == ServerStatus.READY:
+                    return JSONResponse({"status": "ready"}, status_code=200)
+                return JSONResponse({"status": "not ready"}, status_code=503)
+
+        if self.status != ServerStatus.READY:
+            return JSONResponse({"status": "not ready"}, status_code=503)
         try:
             await self.client.models.list()
             return JSONResponse({"status": "ready"}, status_code=200)
         except Exception as e:
-            return JSONResponse({"status": "not ready", "error": str(e)}, status_code=503)
+            if authenticated:
+                return JSONResponse({"status": "not ready", "error": str(e)}, status_code=503)
+            return JSONResponse({"status": "not ready"}, status_code=503)
 
-    async def get_metrics(self) -> JSONResponse:
+    async def get_metrics(self, raw_request: Request = None) -> JSONResponse:
         """Get server performance metrics.
 
         Returns detailed metrics about the server's operation including
@@ -847,18 +1359,20 @@ class InferenceApiRouter:
             request counts, token stats, and optionally backend_metrics
             if the backend supports the /metrics endpoint.
         """
+        self._check_proxy_auth(raw_request)
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         # If backend is an EasyDeL server, try to get its metrics
         backend_metrics = None
         if self.base_url:
             try:
-                import aiohttp
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self.server_root_url}/metrics") as response:
-                        if response.status == 200:
-                            backend_metrics = await response.json()
+                status, data, is_json = await self._request_backend_http(
+                    "GET",
+                    f"{self.server_root_url}/metrics",
+                    raw_request=raw_request,
+                )
+                if status == 200 and is_json:
+                    backend_metrics = data
             except Exception:
                 # Backend doesn't support metrics or is unavailable
                 pass
@@ -880,7 +1394,7 @@ class InferenceApiRouter:
 
         return JSONResponse(metrics_data, status_code=200)
 
-    async def list_models(self) -> JSONResponse:
+    async def list_models(self, raw_request: Request = None) -> JSONResponse:
         """List available models with metadata.
 
         Retrieves the list of models from the backend API and enriches
@@ -893,6 +1407,7 @@ class InferenceApiRouter:
         Raises:
             Returns error response if backend API call fails.
         """
+        self._check_proxy_auth(raw_request)
         try:
             response = await self.client.models.list()
             models_data = []
@@ -928,7 +1443,7 @@ class InferenceApiRouter:
         except Exception as e:
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
-    async def get_model(self, model_id: str) -> JSONResponse:
+    async def get_model(self, model_id: str, raw_request: Request = None) -> JSONResponse:
         """Get detailed information about a specific model.
 
         Retrieves metadata for a single model from the backend API.
@@ -944,6 +1459,7 @@ class InferenceApiRouter:
             Returns 404 error if model is not found.
             Returns 500 error for other backend failures.
         """
+        self._check_proxy_auth(raw_request)
         try:
             model = await self.client.models.retrieve(model_id)
 
@@ -971,7 +1487,7 @@ class InferenceApiRouter:
         except Exception as e:
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
-    async def list_tools(self) -> JSONResponse:
+    async def list_tools(self, raw_request: Request = None) -> JSONResponse:
         """List available tools/functions for each model.
 
         Returns information about available tools and functions that
@@ -982,6 +1498,7 @@ class InferenceApiRouter:
             is disabled, returns an empty tools list. If the backend
             supports the /v1/tools endpoint, proxies that response.
         """
+        self._check_proxy_auth(raw_request)
         if not self.enable_function_calling:
             return JSONResponse(
                 {
@@ -994,12 +1511,13 @@ class InferenceApiRouter:
         # If backend exposes tools, try to fetch them directly
         if self.base_url:
             try:
-                import aiohttp
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self.server_root_url}/v1/tools") as response:
-                        if response.status == 200:
-                            return JSONResponse(await response.json(), status_code=200)
+                status, data, is_json = await self._request_backend_http(
+                    "GET",
+                    f"{self.server_root_url}/v1/tools",
+                    raw_request=raw_request,
+                )
+                if status == 200 and is_json:
+                    return JSONResponse(data, status_code=200)
             except Exception:
                 # Backend doesn't support tools endpoint
                 pass
@@ -1026,24 +1544,38 @@ class InferenceApiRouter:
             JSONResponse with the tool execution result from the backend.
 
         Raises:
+            HTTPException: 401 when ``require_api_key=True`` and credentials are invalid.
             Returns 501 error if function calling is disabled.
+            Returns 400 error if request body is not valid JSON.
+            Returns 502 error if backend returns a non-JSON reply.
             Returns 500 error if tool execution fails.
             Returns 501 error if backend doesn't support tool execution.
         """
+        self._check_proxy_auth(request)
         if not self.enable_function_calling:
             return create_error_response(HTTPStatus.NOT_IMPLEMENTED, "Function calling is disabled")
 
         # If backend exposes tool execution, proxy the request
         if self.base_url:
             try:
-                import aiohttp
-
                 body = await request.json()
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(f"{self.server_root_url}/v1/tools/execute", json=body) as response:
-                        response_data = await response.json()
-                        return JSONResponse(response_data, status_code=response.status)
+            except Exception as e:
+                return create_error_response(HTTPStatus.BAD_REQUEST, f"Invalid JSON body: {e!s}")
+            try:
+                status, response_data, is_json = await self._request_backend_http(
+                    "POST",
+                    f"{self.server_root_url}/v1/tools/execute",
+                    raw_request=request,
+                    json_body=body,
+                )
+                if not is_json:
+                    try:
+                        http_status = HTTPStatus(status) if status >= 400 else HTTPStatus.BAD_GATEWAY
+                    except ValueError:
+                        http_status = HTTPStatus.BAD_GATEWAY
+                    detail = str(response_data).strip() or f"Backend returned non-JSON response (status {status})"
+                    return create_error_response(http_status, detail)
+                return JSONResponse(response_data, status_code=status)
             except Exception as e:
                 return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to execute tool: {e!s}")
 

@@ -42,15 +42,23 @@ class RunnerExecutionManager(ExecutionManager):
     """
 
     def execute_model(
-        self, num_tokens: int, padded_num_reqs: int, inputs: tp.Any, use_pipeline_runtime: bool = True
+        self,
+        num_tokens: int,
+        padded_num_reqs: int,
+        inputs: tp.Any,
+        use_pipeline_runtime: bool = True,
+        decode_only: bool = False,
     ) -> tp.Any:
         """Retain the actual model request bucket, including PP prefix compaction."""
-        output = super().execute_model(
+        kwargs: dict[str, tp.Any] = dict(
             num_tokens=num_tokens,
             padded_num_reqs=padded_num_reqs,
             inputs=inputs,
             use_pipeline_runtime=use_pipeline_runtime,
         )
+        if decode_only:
+            kwargs["decode_only"] = True
+        output = super().execute_model(**kwargs)
         self._last_model_request_bucket = int(padded_num_reqs)
         return output
 

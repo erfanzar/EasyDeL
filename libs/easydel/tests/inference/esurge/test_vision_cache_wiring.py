@@ -49,9 +49,7 @@ def test_actual_engine_constructor_shares_manager_cache_and_invalidation(monkeyp
     monkeypatch.setattr(
         esurge_engine,
         "WorkerManager",
-        lambda *args, **kwargs: SimpleNamespace(
-            start=lambda **kwargs: (None, None), tokenizer_endpoint=None, detokenizer_endpoint=None
-        ),
+        lambda *args, **kwargs: SimpleNamespace(start=lambda **kwargs: (None, None), tokenizer_endpoint=None),
     )
 
     def manager_factory(**kwargs):

@@ -207,9 +207,8 @@ esurge:
   strict_context: false
   truncate_mode: left  # left, right, middle
 
-  # External workers
+  # External tokenizer worker
   tokenizer_endpoint: null
-  detokenizer_endpoint: null
 ```
 
 ### Dataset Mixture Configuration (`mixture`)

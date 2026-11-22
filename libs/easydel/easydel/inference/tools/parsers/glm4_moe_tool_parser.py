@@ -51,6 +51,23 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
+def _has_open_marker_or_trailing_prefix(text: str, start_token: str, end_token: str) -> bool:
+    """Return True if *text* has an unclosed block or ends with a partial start marker."""
+    pos = 0
+    n = len(text)
+    start_len = len(start_token)
+    end_len = len(end_token)
+    while pos < n:
+        start_idx = text.find(start_token, pos)
+        if start_idx == -1:
+            return ToolParser._has_trailing_marker_prefix(text[pos:], (start_token,))
+        end_idx = text.find(end_token, start_idx + start_len)
+        if end_idx == -1:
+            return True
+        pos = end_idx + end_len
+    return False
+
+
 @ToolParserManager.register_module(["glm45", "glm-4.5"])  # pyright: ignore[reportUntypedClassDecorator]
 class Glm4MoeModelToolParser(ToolParser):
     """Tool parser for GLM-4 MoE (Mixture of Experts) models.
@@ -106,9 +123,10 @@ class Glm4MoeModelToolParser(ToolParser):
         self.tool_call_end_token = "</tool_call>"
 
         self.tool_calls_start_token = self.tool_call_start_token
+        self.tool_calls_end_token = self.tool_call_end_token
 
         self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
-        self.func_detail_regex = re.compile(r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL)
+        self.func_detail_regex = re.compile(r"<tool_call>([^\n]*)(?:\n(.*))?</tool_call>", re.DOTALL)
         self.func_arg_regex = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
@@ -116,6 +134,87 @@ class Glm4MoeModelToolParser(ToolParser):
         self.tool_call_start_token_id = self.vocab.get(self.tool_call_start_token)
         self.tool_call_end_token_id = self.vocab.get(self.tool_call_end_token)
         self._buffer = ""
+        self._streaming_initialized: bool = False
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether an open ``<tool_call>`` block or partial start marker is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return bool(self._buffer)
+        return _has_open_marker_or_trailing_prefix(
+            current_text,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+        )
+
+    def _iter_tool_call_blocks(self, text: str) -> list[str]:
+        """Linearly scan complete ``<tool_call>...</tool_call>`` block bodies."""
+        blocks: list[str] = []
+        start_tok = self.tool_call_start_token
+        end_tok = self.tool_call_end_token
+        start_len = len(start_tok)
+        end_len = len(end_tok)
+        pos = 0
+        n = len(text)
+        while pos < n:
+            start_idx = text.find(start_tok, pos)
+            if start_idx == -1:
+                break
+            body_start = start_idx + start_len
+            end_idx = text.find(end_tok, body_start)
+            if end_idx == -1:
+                break
+            blocks.append(text[body_start:end_idx])
+            pos = end_idx + end_len
+        return blocks
+
+    def _extract_func_detail(self, block_body: str) -> tuple[str, str]:
+        """Split a GLM-4 tool-call body into ``(function_name, args_section)``."""
+        nl_idx = block_body.find("\n")
+        if nl_idx == -1:
+            return block_body.strip(), ""
+        return block_body[:nl_idx].strip(), block_body[nl_idx + 1 :]
+
+    @staticmethod
+    def _extract_arg_pairs(tc_args: str) -> list[tuple[str, str]]:
+        """Linearly extract ``<arg_key>...</arg_key>\\s*<arg_value>...</arg_value>`` pairs."""
+        pairs: list[tuple[str, str]] = []
+        key_start_tok = "<arg_key>"
+        key_end_tok = "</arg_key>"
+        val_start_tok = "<arg_value>"
+        val_end_tok = "</arg_value>"
+        key_start_len = len(key_start_tok)
+        key_end_len = len(key_end_tok)
+        val_start_len = len(val_start_tok)
+        val_end_len = len(val_end_tok)
+        pos = 0
+        n = len(tc_args)
+        while pos < n:
+            k_start = tc_args.find(key_start_tok, pos)
+            if k_start == -1:
+                break
+            k_body_start = k_start + key_start_len
+            k_end = tc_args.find(key_end_tok, k_body_start)
+            if k_end == -1:
+                break
+            after_k = k_end + key_end_len
+            while after_k < n and tc_args[after_k].isspace():
+                after_k += 1
+            if not tc_args.startswith(val_start_tok, after_k):
+                pos = k_end + key_end_len
+                continue
+            v_body_start = after_k + val_start_len
+            v_end = tc_args.find(val_end_tok, v_body_start)
+            if v_end == -1:
+                break
+            pairs.append((tc_args[k_body_start:k_end], tc_args[v_body_start:v_end]))
+            pos = v_end + val_end_len
+        return pairs
 
     def extract_tool_calls(
         self,
@@ -164,10 +263,16 @@ class Glm4MoeModelToolParser(ToolParser):
                 return False
             for tool in tools:
                 if tool.function.name == tool_name:
-                    if tool.function.parameters is None:
+                    params = tool.function.parameters
+                    if not isinstance(params, dict):
                         return False
-                    arg_type = tool.function.parameters.get("properties", {}).get(arg_name, {}).get("type", None)
-                    return arg_type == "string"
+                    props = params.get("properties")
+                    if not isinstance(props, dict):
+                        return False
+                    prop = props.get(arg_name)
+                    if not isinstance(prop, dict):
+                        return False
+                    return prop.get("type") == "string"
             return False
 
         def _deserialize(value: str) -> Any:
@@ -192,15 +297,14 @@ class Glm4MoeModelToolParser(ToolParser):
                 pass
             return value
 
-        matched_tool_calls = self.func_call_regex.findall(model_output)
+        matched_tool_calls = self._iter_tool_call_blocks(model_output)
         try:
             tool_calls = []
-            for match in matched_tool_calls:
-                tc_detail = self.func_detail_regex.search(match)
-                tc_name = tc_detail.group(1).strip()
-                # GLM-4.7's detail regex makes the argument section optional, so group(2) can be None.
-                tc_args = tc_detail.group(2) or ""
-                pairs = self.func_arg_regex.findall(tc_args)
+            for block_body in matched_tool_calls:
+                tc_name, tc_args = self._extract_func_detail(block_body)
+                if not tc_name or self.tool_call_start_token in tc_name:
+                    continue
+                pairs = self._extract_arg_pairs(tc_args)
                 arg_dct = {}
                 for key, value in pairs:
                     arg_key = key.strip()
@@ -257,63 +361,96 @@ class Glm4MoeModelToolParser(ToolParser):
             text across streaming chunks. State is reset when a complete
             tool call is emitted.
         """
+        if not previous_text:
+            self._buffer = ""
+            self.current_tool_id = -1
+            self.current_tool_name_sent = False
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = []
+
+        self._streaming_initialized = True
         self._buffer += delta_text
         cur_text = self._buffer
-        start_idx = cur_text.find(self.tool_call_start_token)
-        if start_idx == -1:
-            # Withhold a trailing fragment that could be the start marker split
-            # across deltas instead of dropping it: if the marker completes on a
-            # later delta, a cleared buffer would lose the tool call entirely
-            # (for tokenizers that do not emit <tool_call> as one special token).
-            withheld = ""
-            max_check = min(len(self.tool_call_start_token) - 1, len(cur_text))
-            for size in range(max_check, 0, -1):
-                if cur_text.endswith(self.tool_call_start_token[:size]):
-                    withheld = cur_text[-size:]
-                    break
-            self._buffer = withheld
-            content = cur_text[: len(cur_text) - len(withheld)]
-            if self.current_tool_id > 0:
-                content = ""
-            return DeltaMessage(content=content)
-        end_idx = cur_text.find(self.tool_call_end_token)
-        if end_idx != -1:
+        content_parts: list[str] = []
+        emitted_tool_calls: list[DeltaToolCall] = []
+
+        while cur_text:
+            start_idx = cur_text.find(self.tool_call_start_token)
+            if start_idx == -1:
+                # Withhold a trailing fragment that could be the start marker split
+                # across deltas instead of dropping it: if the marker completes on a
+                # later delta, a cleared buffer would lose the tool call entirely
+                # (for tokenizers that do not emit <tool_call> as one special token).
+                withheld = ""
+                max_check = min(len(self.tool_call_start_token) - 1, len(cur_text))
+                for size in range(max_check, 0, -1):
+                    if cur_text.endswith(self.tool_call_start_token[:size]):
+                        withheld = cur_text[-size:]
+                        break
+                self._buffer = withheld
+                content = cur_text[: len(cur_text) - len(withheld)]
+                if content and self.current_tool_id <= 0:
+                    content_parts.append(content)
+                break
+
+            search_from = start_idx + len(self.tool_call_start_token)
+            end_idx = cur_text.find(self.tool_call_end_token, search_from)
+            if end_idx == -1:
+                if start_idx > 0 and self.current_tool_id <= 0:
+                    content_parts.append(cur_text[:start_idx])
+                self._buffer = cur_text[start_idx:]
+                break
+
+            block_end = end_idx + len(self.tool_call_end_token)
+            block_text = cur_text[start_idx:block_end]
+            extracted_tool_calls = self.extract_tool_calls(block_text, request)
+
+            if len(extracted_tool_calls.tool_calls) == 0:
+                if start_idx > 0 and self.current_tool_id <= 0:
+                    content_parts.append(cur_text[:start_idx])
+                cur_text = cur_text[block_end:]
+                self._buffer = cur_text
+                continue
+
+            if start_idx > 0 and self.current_tool_id <= 0:
+                content_parts.append(cur_text[:start_idx])
+
             if self.current_tool_id == -1:
                 self.current_tool_id = 0
                 self.prev_tool_call_arr = []
                 self.streamed_args_for_tool = []
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
 
-            extracted_tool_calls = self.extract_tool_calls(cur_text[: end_idx + len(self.tool_call_end_token)], request)
+            for tool_call in extracted_tool_calls.tool_calls:
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
 
-            if len(extracted_tool_calls.tool_calls) == 0:
-                return None
-            tool_call = extracted_tool_calls.tool_calls[0]
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": tool_call.function.name,
-                "arguments": json.loads(tool_call.function.arguments),
-            }
-            self.streamed_args_for_tool[self.current_tool_id] = tool_call.function.arguments
-            delta = DeltaMessage(
-                content=extracted_tool_calls.content,
-                tool_calls=[
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": tool_call.function.name,
+                    "arguments": json.loads(tool_call.function.arguments),
+                }
+                self.streamed_args_for_tool[self.current_tool_id] = tool_call.function.arguments
+                emitted_tool_calls.append(
                     DeltaToolCall(
                         index=self.current_tool_id,
                         id=tool_call.id,
                         type=tool_call.type,
-                        function=DeltaFunctionCall(name=tool_call.function.name, arguments=tool_call.function.arguments),
+                        function=DeltaFunctionCall(
+                            name=tool_call.function.name,
+                            arguments=tool_call.function.arguments,
+                        ),
                     )
-                ],
-            )
-            self.current_tool_id += 1
-            self._buffer = cur_text[end_idx + len(self.tool_call_end_token) :]
-            return delta
+                )
+                self.current_tool_id += 1
 
-        self._buffer = cur_text[start_idx:]
-        return DeltaMessage(content=cur_text[:start_idx])
+            cur_text = cur_text[block_end:]
+            self._buffer = cur_text
+
+        content_out = "".join(content_parts)
+        if emitted_tool_calls:
+            return DeltaMessage(content=content_out if content_out else None, tool_calls=emitted_tool_calls)
+        return DeltaMessage(content=content_out)
 
     def flush_streaming_content(self) -> str:
         """Release text withheld as a possible split start marker.

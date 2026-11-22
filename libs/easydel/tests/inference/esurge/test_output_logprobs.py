@@ -11,6 +11,7 @@ from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOu
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput, eSurge
 from easydel.inference.esurge.outputs import LogprobsLists
 from easydel.inference.sampling_params import SamplingParams
+from easydel.workers.esurge.pipeline import Detokenizer
 
 pytestmark = pytest.mark.cpu_ok
 
@@ -45,13 +46,9 @@ def pipeline_factory(monkeypatch):
         stop_matches = []
         pipeline = OutputPipeline(
             registry=registry,
-            detokenizer_client=SimpleNamespace(
-                decode=lambda request_id, tokens, **kwargs: SimpleNamespace(
-                    accumulated_text="".join(chr(t) for t in tokens),
-                    delta_text="".join(chr(t) for t in tokens),
-                    last_decoded_index=len(tokens),
-                ),
-                reset=lambda request_id: None,
+            detokenizer_client=Detokenizer(
+                SimpleNamespace(decode=lambda tokens, **kwargs: "".join(chr(token) for token in tokens)),
+                context_window=0,
             ),
             eos_token_ids=[0],
             decode_interval_tokens=interval,

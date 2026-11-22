@@ -97,12 +97,14 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
     # which cache-view indices own them. ``init_cache`` allocates exactly that set (r11 S09-1).
     indexer_num_layers: int | None = field(pytree_node=False, default=None)
     indexer_layer_indices: tuple[int, ...] | None = field(pytree_node=False, default=None)
+    num_draft_layers: int = field(pytree_node=False, default=0)
 
     @staticmethod
     def _compute_free_hbm(
         mesh: MeshLike,
         runtime_sharding_resolver: RuntimeShardingResolver,
         hbm_utilization: float,
+        largest_allocation_share: float = 1.0,
     ):
         """Compute free HBM budget available for MLA cache pages.
 
@@ -115,11 +117,15 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             runtime_sharding_resolver: Provides the data-parallel axis name.
             hbm_utilization: Fraction of total HBM to consider available
                 (0.0-1.0).
+            largest_allocation_share: Fraction of the pool held by its largest single array (see
+                :func:`~easydel.caching.ragged_page.cache.per_device_hbm_budget_bytes`).
 
         Returns:
             Total allocatable bytes across all devices on the page axis.
         """
-        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        budget = per_device_hbm_budget_bytes(
+            hbm_utilization, mode="free", mesh=mesh, largest_allocation_share=largest_allocation_share
+        )
         page_axis_size = mesh_axis_size(mesh, resolve_attention_data_parallel_axis(runtime_sharding_resolver))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
@@ -150,6 +156,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         indexer_dtype: jnp.dtype | None = None,
         indexer_num_layers: int | None = None,
         indexer_layer_indices: tp.Sequence[int] | None = None,
+        num_draft_layers: int = 0,
     ) -> "MLARaggedPagesCacheConfig":
         """Create an MLA ragged-page cache config from model hyperparameters.
 
@@ -236,11 +243,6 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if data_parallel_size > 1:
             logger.info(f"Scaling MLA KV page budget by data-parallel page axis: {data_parallel_size=}.")
 
-        free = cls._compute_free_hbm(
-            mesh=mesh,
-            runtime_sharding_resolver=runtime_sharding_resolver,
-            hbm_utilization=hbm_utilization,
-        )
         bytes_av = jnp.finfo(kvdtype).bits // 8
         kv_dim_padded = align_to_multiple(int(kv_lora_rank), HEAD_DIM_ALIGNMENT) + align_to_multiple(
             int(qk_rope_head_dim), HEAD_DIM_ALIGNMENT
@@ -282,7 +284,21 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if indexer_num_layers is None:
             indexer_num_layers = num_hidden_layers
         indexer_num_layers = max(0, min(int(indexer_num_layers), int(num_hidden_layers)))
-        page_bytes = num_hidden_layers * page_bytes_per_layer + indexer_num_layers * indexer_page_bytes
+        if int(num_draft_layers) < 0:
+            raise ValueError(f"num_draft_layers must be non-negative, got {num_draft_layers}.")
+        num_draft_layers = int(num_draft_layers)
+        page_bytes = (num_hidden_layers + num_draft_layers) * page_bytes_per_layer + (
+            indexer_num_layers + num_draft_layers
+        ) * indexer_page_bytes
+        # init_cache allocates one latent page array per layer and the indexer arrays per owner layer, so the
+        # largest single array holds at most this share of the pool.
+        largest_array_bytes = max(page_bytes_per_layer, indexer_page_bytes if indexer_num_layers else 0)
+        free = cls._compute_free_hbm(
+            mesh=mesh,
+            runtime_sharding_resolver=runtime_sharding_resolver,
+            hbm_utilization=hbm_utilization,
+            largest_allocation_share=largest_array_bytes / page_bytes,
+        )
         num_pages = int(free) // int(page_bytes)
         num_pages = cap_paged_cache_pages(
             num_pages,
@@ -317,6 +333,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             _indexer_dtype_str=DTYPE_TO_STRING_MAP[jnp.dtype(indexer_dtype).type],
             indexer_num_layers=int(indexer_num_layers) if indexer_key_dim > 0 else None,
             indexer_layer_indices=indexer_layer_indices if indexer_key_dim > 0 else None,
+            num_draft_layers=num_draft_layers,
         )
 
     @property
@@ -585,6 +602,34 @@ class MLARaggedPagesCacheView(RaggedPagesCacheView):
         if resolver is None:
             return x
         return resolver.shard(x, axes=[common_types.EMPTY] * x.ndim, mode=common_types.MODE_PREFILL)
+
+    def constrain_indexer_heads(self, x: jax.Array) -> jax.Array:
+        """Pin per-head indexer activations ``[T, heads, ...]`` to the head-sharded (tensor-parallel) layout.
+
+        The indexer's query and head-weight projections are column-parallel, so their outputs are sharded over the
+        head axis. Where the fused top-k splits its rows over every device, pinning that layout makes XLA reshard
+        the small activation (an all-to-all) instead of all-gathering the projection weights on every call.
+
+        Args:
+            x: Activation ``[T, heads, ...]``.
+
+        Returns:
+            ``x`` constrained to ``P(None, head_axes, None, ...)``; ``x`` unchanged without a resolver, on a
+            pipeline mesh, without a sharded head axis, or when the head count does not divide it.
+        """
+        resolver = getattr(self, "runtime_sharding_resolver", None)
+        if resolver is None or x.ndim < 2:
+            return x
+        mesh = getattr(resolver, "mesh", None)
+        if mesh is None or is_mpmd_mesh(mesh):
+            return x
+        heads = int(x.shape[1])
+        spec = resolver.resolve(axes=[common_types.HEAD], mode=common_types.MODE_PREFILL, shape=(heads,))
+        size = mesh_axis_size(mesh, normalize_axis_names(spec[0] if len(spec) > 0 else None))
+        if size <= 1 or heads % size:
+            return x
+        axes = [common_types.EMPTY, common_types.HEAD] + [common_types.EMPTY] * (x.ndim - 2)
+        return resolver.shard(x, axes=axes, mode=common_types.MODE_PREFILL)
 
     def flattened_kv_pages(self) -> jax.Array:
         """Materialize and return the KV page buffer as a concrete JAX array.

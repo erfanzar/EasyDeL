@@ -462,6 +462,11 @@ class HyV3MoE(BaseMoeModule):
                 norm_eps=1e-20,
             ),
         )
+        shared_expert = (
+            (lambda x: self.shared_experts(x).astype(jnp.float32))
+            if self.enable_moe_fp32_combine
+            else self.shared_experts
+        )
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -470,12 +475,8 @@ class HyV3MoE(BaseMoeModule):
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             hooks=hooks,
+            shared_expert=shared_expert,
         )
-        shared_output = self.shared_experts(hidden_states)
-        if self.enable_moe_fp32_combine:
-            out = (out.astype(jnp.float32) + shared_output.astype(jnp.float32)).astype(hidden_states.dtype)
-        else:
-            out = out + shared_output
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 

@@ -41,6 +41,8 @@ entry point and config dataclass.
 from functools import partial
 
 import jax
+import numpy as np
+from eformer.loggings import get_logger
 from ejkernel.modules import (
     multi_latent_ragged_page_attention,  # pyright: ignore[reportMissingTypeStubs]
     multi_latent_ragged_page_attention_v2,  # pyright: ignore[reportMissingTypeStubs]
@@ -51,6 +53,7 @@ from ejkernel.modules.operations.configs import (
     MultiLatentRaggedPageAttentionV2Config,
 )
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 from spectrax import common_types as ct
@@ -72,6 +75,22 @@ from ._paged_common import ENABLE_DP_LOCAL_PAGE_PATH, dp_page_axis, request_dist
 
 # Backward-compatible alias for callers importing the former adapter helper.
 _dp_page_axis = dp_page_axis
+
+logger = get_logger(__name__)
+
+# dsa_serving_ep_split: shortest per-shard token window run as compact per-window kernel calls; shorter windows use
+# one call over all rows with the other shards' rows skipped (every compact call pays the op's fixed metadata and
+# cache-write cost). Measured on v5p, one DSA layer at 16 query heads per chip, kv_lora_rank 512 (no rope part), page
+# size 128, 513 selected 4-token chunks per query, ep 4; ms per layer, single call vs compact calls: 8-token windows
+# 0.42 vs 0.52, 32-token windows 0.60 vs 0.64, 64-token windows 0.87 vs 0.80, 512-token windows 10.8 vs 7.0,
+# 8,192-token windows 224.6 vs 161.3.
+_EP_SPLIT_COMPACT_MIN_WINDOW = 64
+
+# dsa_serving_ep_split ``None`` (automatic): shortest per-shard token window worth splitting. GLM-5.3-Flash W8A8 at
+# ep 8 x tp 8 on v5p-128: 16-token decode steps (2-token windows) stepped in 14.74 ms split vs 14.38 ms unsplit (the
+# split's per-layer gathers cost more than the 7/8 of a tiny attention call they save), while 32-token decode steps
+# (4-token windows) and prefill were faster split. ``True`` still splits every window.
+_EP_SPLIT_MIN_WINDOW = 4
 
 
 def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwargs: dict):
@@ -108,6 +127,13 @@ def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwar
     sparse_kwargs = {k: v for k, v in common_call_kwargs.items() if k != "cfg"}
     dense_cfg = common_call_kwargs.get("cfg")
     sparse_kwargs["cfg"] = SparseMultiLatentRaggedPageAttentionConfig(
+        # TPU: 16 consecutive query tokens per program of ejkernel's Pallas query-block prefill kernel. Prefill
+        # buckets (>= 256 tokens) whose 16-token blocks each hold one sequence fetch the block's shared selected
+        # chunks once; other steps (decode, batches with a block spanning two sequences) keep the per-token kernel.
+        # Measured on v5p with 16 heads per chip (16 x 16 = 256 MXU rows per program), latent 512 + 128 rope pad,
+        # page 128, 4-token chunks, 513 selected chunks per token. The kernel switches itself off for head counts
+        # that are not power-of-two multiples of 16. Other backends keep the XLA default (8 rows per step).
+        num_queries_per_block=16 if jax.default_backend() == "tpu" else None,
         vmem_limit_bytes=getattr(dense_cfg, "vmem_limit_bytes", None),
         platform="auto",
     )
@@ -116,6 +142,324 @@ def _mla_kernel_call(dense_fn, ignore: dict, total_tokens: int, common_call_kwar
         return sparse_multi_latent_ragged_page_attention(*args, selected, chunk_size=chunk_size, **sparse_kwargs)
 
     return selected, sparse_kernel
+
+
+def resolve_dsa_serving_ep_split(
+    setting: bool | None,
+    *,
+    mesh,
+    partition_axis,
+    sparse: bool,
+    dp_local: bool,
+    page_axis,
+    query_specs: tuple[Ps, ...],
+    num_tokens: int | None = None,
+) -> tuple[str, ...]:
+    """Resolve ``dsa_serving_ep_split`` for one MLA ragged-pages call: the mesh axes its sparse queries split over.
+
+    The expert-parallel axis only replicates attention and the MLA pages are replicated over it, so each of its shards
+    can attend for a slice of the query tokens (:func:`_ep_split_sparse_attention`), with outputs and caches equal to
+    the unsplit call's. The split applies to sparse (DSA top-k) calls, which only the eSurge serving path makes (MLA
+    ragged-pages cache views), on an expert-parallel axis of more than one device, with the globally replicated page
+    path (KV pages not sharded over data parallelism) and a query sharding that does not already use that axis.
+
+    The setting is tri-state: ``None`` (automatic) splits wherever the split applies and each shard's window holds at
+    least ``_EP_SPLIT_MIN_WINDOW`` of the call's ``num_tokens`` query tokens, and keeps the unsplit call elsewhere
+    without a message; ``True`` does the same and warns once where it cannot apply; ``False`` never splits.
+    Training never reaches this function: it runs only for ragged-pages cache views.
+
+    Args:
+        setting: ``config.dsa_serving_ep_split`` (``None``, ``True`` or ``False``).
+        mesh: Device mesh of the call.
+        partition_axis: Partition axis naming the expert-parallel mesh axes.
+        sparse: Whether the call carries a DSA selection (dense MLA calls never split).
+        dp_local: Whether the data-parallel local page path runs this call.
+        page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
+        query_specs: Resolved partition specs of the two query tensors.
+        num_tokens: Query tokens of the call (static), or ``None`` to ignore the window rule.
+
+    Returns:
+        The expert-parallel mesh axis names to split over, or ``()`` for the unsplit call.
+    """
+    if (setting is not None and not setting) or not sparse:
+        return ()
+    names = normalize_axis_names(getattr(partition_axis, "expert_parallel_axis", None))
+    names = tuple(name for name in names if mesh_axis_size(mesh, name) > 1)
+    if not names:
+        return ()  # nothing to split over (ep = 1): the unsplit call is the split call
+    if (
+        setting is None
+        and num_tokens is not None
+        and -(-int(num_tokens) // mesh_axis_size(mesh, names)) < (_EP_SPLIT_MIN_WINDOW)
+    ):
+        return ()  # automatic rule: windows this small (decode steps) run faster unsplit
+    reasons = []
+    if dp_local:
+        reasons.append("the data-parallel local page path runs this call")
+    elif page_axis != ct.EMPTY:
+        reasons.append("the KV pages are sharded over the data-parallel axis")
+    used = {axis for spec in query_specs for entry in spec for axis in normalize_axis_names(entry)}
+    overlap = sorted(used.intersection(names))
+    if overlap:
+        reasons.append(f"the query sharding already uses {overlap}")
+    if reasons:
+        if setting:
+            logger.warning_once(
+                "dsa_serving_ep_split is inactive for this sparse MLA call because %s; every expert-parallel shard "
+                "attends for all query tokens.",
+                "; ".join(reasons),
+            )
+        return ()
+    return names
+
+
+def _serving() -> bool:
+    """Whether the call is traced inside ``set_inference_mode()``."""
+    from easydel.utils.inference_mode import is_inference_mode  # lazy: utils imports layers
+
+    return is_inference_mode()
+
+
+def ep_split_token_order(total: int, shards: int) -> np.ndarray:
+    """Token order of a balanced expert-parallel split: shard ``e`` holds windows ``e`` and ``2 * shards - 1 - e``.
+
+    The ``total`` tokens are cut into ``2 * shards`` equal windows; the returned ``[total]`` int32 indices list them
+    window by window in the order ``0, 2s-1, 1, 2s-2, ...``, so a contiguous split of the reordered tokens gives every
+    shard one early and one late window of a causal prefill step.
+    """
+    size = total // (2 * shards)
+    windows = [w for e in range(shards) for w in (e, 2 * shards - 1 - e)]
+    return np.concatenate([np.arange(w * size, (w + 1) * size, dtype=np.int32) for w in windows])
+
+
+def restore_ep_split_token_order(x: jax.Array, shards: int) -> jax.Array:
+    """Put ``x`` (tokens flattened over every axis but the last) back in token order after :func:`ep_split_token_order`."""
+    flat = x.reshape(-1, x.shape[-1])
+    inverse = np.argsort(ep_split_token_order(int(flat.shape[0]), shards)).astype(np.int32)
+    return jnp.take(flat, jnp.asarray(inverse), axis=0).reshape(x.shape)
+
+
+def _ep_split_sparse_attention(
+    kernel,
+    *,
+    mesh,
+    axis_names: tuple[str, ...],
+    specs: tuple[Ps, Ps, Ps, Ps, Ps],
+    queries_nope: jax.Array,
+    queries_pe: jax.Array,
+    keys_values: jax.Array,
+    keys_pe: jax.Array,
+    kv_pages: jax.Array,
+    context_lens: jax.Array,
+    pages_tables: jax.Array,
+    query_start_loc: jax.Array,
+    distribution: jax.Array,
+    selected: jax.Array,
+    balanced: bool = False,
+) -> tuple[jax.Array, jax.Array, int]:
+    """Sparse MLA attention with its query tokens split over the ``axis_names`` mesh axes.
+
+    ``T`` is padded to a multiple of the shard count ``n`` with tokens past ``query_start_loc[num_seqs]``, which the
+    kernel neither writes nor attends, and cut into ``n`` contiguous windows of ``T / n`` tokens; shard ``e`` attends
+    for window ``e``. Every shard runs the unchanged sparse op once per window on that window alone: the ragged
+    metadata clipped to the window (each sequence's query tokens inside it, its context length ending at its last
+    token inside it), the same page table. Each token thus gets exactly its sequence, position and selection
+    metadata of the unsplit call. The other shards' windows come first and only write their latent tokens into this
+    shard's cache replica (their attention output is unused, so XLA drops those kernel calls); the own window comes
+    last, after every token of the step is in the cache, and attends over a compact grid of ``T / n`` programs.
+    A grid that only skipped the other windows' rows would leave one of the two TensorCores of a v5p megacore chip,
+    which split the grid into contiguous halves, with all of the shard's work. Every replica receives each token
+    once (a packed cache word shared by two windows keeps the lanes the other window wrote, whichever call runs
+    first), so outputs and caches equal the unsplit call's bit for bit.
+
+    Windows shorter than ``_EP_SPLIT_COMPACT_MIN_WINDOW`` tokens (decode steps) instead make one call over all
+    ``T`` rows in which the other windows' rows have zero queries and an all ``-1`` selection (the kernel skips
+    them), and return the own window's rows: the per-window calls each pay the op's fixed metadata and cache-write
+    cost, which outweighs the smaller kernel grid there.
+
+    Args:
+        kernel: Sparse kernel from :func:`_mla_kernel_call`.
+        mesh: Device mesh.
+        axis_names: Mesh axes the query tokens are split over (the expert-parallel axis).
+        specs: Unsplit partition specs of ``(queries_nope, queries_pe, keys_values, keys_pe, kv_pages)``; the
+            queries' token entry is replaced by ``axis_names``, the others are used as given (token-replicated).
+        queries_nope: ``[T, H, L]`` absorbed queries.
+        queries_pe: ``[T, H, R]`` rope queries.
+        keys_values: ``[T, L]`` new latent tokens.
+        keys_pe: ``[T, R]`` new rope keys.
+        kv_pages: Paged MLA cache (replicated over ``axis_names``).
+        context_lens: ``[S]`` context lengths.
+        pages_tables: ``[S, pages_per_seq]`` page table.
+        query_start_loc: ``[S + 1]`` cumulative query counts.
+        distribution: ``[3]`` request distribution.
+        selected: ``[T, W]`` selected chunk ids.
+
+    Returns:
+        ``(outputs [T, H, L] sharded over axis_names on the token axis, updated kv_pages)``.
+    """
+    # Hold the queries in the unsplit call's layout up to the split; each shard then slices its rows locally.
+    # Unpinned, XLA propagates their token split back into the projections that produce them, which then partition,
+    # and round, differently from the unsplit program (v5p, one GLM-5.3 DSA layer call at ep 2 x tp 2: about 2/3 of
+    # the absorbed queries off by bf16 ulps and some top-k near-ties flipped; pinned, outputs and caches bitwise).
+    jax_mesh = getattr(mesh, "jax_mesh", mesh)
+    queries_nope = jax.lax.with_sharding_constraint(queries_nope, NamedSharding(jax_mesh, specs[0]))
+    queries_pe = jax.lax.with_sharding_constraint(queries_pe, NamedSharding(jax_mesh, specs[1]))
+    num_shards = mesh_axis_size(mesh, axis_names)
+    total = int(queries_nope.shape[0])
+    window = -(-total // num_shards)
+    padded = window * num_shards
+    # ``balanced`` (serving prefill): causal windows get longer contexts the later they are, so the shard of the last
+    # window does the most work and the others wait for it at the output gather. Cut into 2n windows instead, shard e
+    # attends windows e and 2n-1-e: the queries and selection are reordered (ep_split_token_order; a local take, they
+    # are replicated over the split axes) and the output stays in that order for the caller to restore.
+    chunks = 2 * num_shards
+    if not (balanced and total % chunks == 0 and total // chunks >= _EP_SPLIT_COMPACT_MIN_WINDOW):
+        chunks = 0
+    if chunks:
+        order = jnp.asarray(ep_split_token_order(total, num_shards))
+        queries_nope, queries_pe, selected = (jnp.take(x, order, axis=0) for x in (queries_nope, queries_pe, selected))
+    if padded != total:
+
+        def _pad(x, value=0):
+            return jnp.pad(x, [(0, padded - total)] + [(0, 0)] * (x.ndim - 1), constant_values=value)
+
+        queries_nope, queries_pe, keys_values, keys_pe = (
+            _pad(x) for x in (queries_nope, queries_pe, keys_values, keys_pe)
+        )
+        selected = _pad(selected, -1)
+
+    token_entry = axis_names[0] if len(axis_names) == 1 else tuple(axis_names)
+
+    def _split(spec, ndim: int) -> Ps:
+        entries = tuple(spec) + (None,) * (ndim - len(tuple(spec)))
+        return Ps(token_entry, *entries[1:])
+
+    q_nope_spec, q_pe_spec, keys_values_spec, keys_pe_spec, pages_spec = specs
+    q_nope_split = _split(q_nope_spec, queries_nope.ndim)
+    q_pe_split = _split(q_pe_spec, queries_pe.ndim)
+
+    @partial(
+        jax.shard_map,
+        mesh=mesh,
+        in_specs=(
+            q_nope_split,
+            q_pe_split,
+            keys_values_spec,
+            keys_pe_spec,
+            pages_spec,
+            Ps(),
+            Ps(),
+            Ps(),
+            Ps(),
+            Ps(token_entry, None),
+        ),
+        out_specs=(q_nope_split, pages_spec),
+        check_vma=False,
+    )
+    def _mapped_split(
+        local_queries_nope,
+        local_queries_pe,
+        all_keys_values,
+        all_keys_pe,
+        local_kv_pages,
+        full_context_lens,
+        full_pages_tables,
+        full_query_start_loc,
+        full_distribution,
+        local_selected,
+    ):
+        own = axis_index(axis_names)
+        block_tables = full_pages_tables.reshape(-1)
+        if window < _EP_SPLIT_COMPACT_MIN_WINDOW:
+            # Small (decode) windows: one call over all rows, the other shards' rows skipped (no attendable chunk).
+            start = own * jnp.int32(window)
+
+            def _widen(x, fill):
+                full = jnp.full((padded, *x.shape[1:]), fill, x.dtype)
+                return jax.lax.dynamic_update_slice_in_dim(full, x, start, axis=0)
+
+            output, local_kv_pages = kernel(
+                _widen(local_queries_nope, 0),
+                _widen(local_queries_pe, 0),
+                all_keys_values,
+                all_keys_pe,
+                local_kv_pages,
+                full_context_lens,
+                block_tables,
+                full_query_start_loc,
+                full_distribution,
+                selected=_widen(local_selected, -1),
+            )
+            return jax.lax.dynamic_slice_in_dim(output, start, window, axis=0), local_kv_pages
+
+        def window_call(index, window_queries_nope, window_queries_pe, window_selected, pages, size=window):
+            start = index * jnp.int32(size)
+            end = start + jnp.int32(size)
+            # Window-local ragged metadata: a token's sequence and position are unchanged (see the docstring).
+            window_query_start_loc = jnp.clip(full_query_start_loc, start, end) - start
+            # Sequences without tokens in the window are never read; clamping keeps their length non-negative.
+            window_context_lens = jnp.maximum(full_context_lens - jnp.maximum(full_query_start_loc[1:] - end, 0), 0)
+            return kernel(
+                window_queries_nope,
+                window_queries_pe,
+                jax.lax.dynamic_slice_in_dim(all_keys_values, start, size, axis=0),
+                jax.lax.dynamic_slice_in_dim(all_keys_pe, start, size, axis=0),
+                pages,
+                window_context_lens,
+                block_tables,
+                window_query_start_loc,
+                full_distribution,
+                selected=window_selected,
+            )
+
+        no_queries_nope = jnp.zeros_like(local_queries_nope)
+        no_queries_pe = jnp.zeros_like(local_queries_pe)
+        no_selection = jnp.full_like(local_selected, -1)
+        if chunks:
+            half = window // 2
+            last = jnp.int32(chunks - 1)
+            for step in range(1, num_shards):
+                # Cache write only: both windows of every other shard, before this shard's windows attend.
+                other = (own + step) % num_shards
+                for index in (other, last - other):
+                    _, local_kv_pages = window_call(
+                        index, no_queries_nope[:half], no_queries_pe[:half], no_selection[:half], local_kv_pages, half
+                    )
+            # The early window attends first; its call writes its tokens before the late window attends.
+            out_early, local_kv_pages = window_call(
+                own, local_queries_nope[:half], local_queries_pe[:half], local_selected[:half], local_kv_pages, half
+            )
+            out_late, local_kv_pages = window_call(
+                last - own,
+                local_queries_nope[half:],
+                local_queries_pe[half:],
+                local_selected[half:],
+                local_kv_pages,
+                half,
+            )
+            return jnp.concatenate([out_early, out_late], axis=0), local_kv_pages
+        for step in range(1, num_shards):
+            # Cache write only: the attention output of another shard's window is discarded.
+            _, local_kv_pages = window_call(
+                (own + step) % num_shards, no_queries_nope, no_queries_pe, no_selection, local_kv_pages
+            )
+        return window_call(own, local_queries_nope, local_queries_pe, local_selected, local_kv_pages)
+
+    output, kv_pages = _mapped_split(
+        queries_nope,
+        queries_pe,
+        keys_values,
+        keys_pe,
+        kv_pages,
+        context_lens,
+        pages_tables,
+        query_start_loc,
+        distribution,
+        selected,
+    )
+    if padded != total:
+        output = output[:total]
+    return output, kv_pages, chunks
 
 
 def _reshape_query_tensor(x, name: str):
@@ -303,6 +647,47 @@ class MultiLatentRaggedPageAttn(OperationImpl):
     def get_impl_name(cls) -> str | tuple[str]:
         """Return the registered operation name for this implementation."""
         return "multi_latent_ragged_page_attention_v1"
+
+    def _sparse_ep_split_axes(
+        self,
+        ignore: dict,
+        sparse_selected: jax.Array | None,
+        *,
+        dp_local: bool,
+        page_axis,
+        query_specs: tuple[Ps, ...],
+        num_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Mesh axes to split the sparse kernel's query tokens over, or ``()`` to keep the unsplit call.
+
+        The DSA layer passes its ``dsa_serving_ep_split`` setting as ``sparse_ep_split`` with its top-k selection (an
+        absent key is ``None``, the automatic rule); :func:`resolve_dsa_serving_ep_split` decides.
+
+        Args:
+            ignore: Extra forward kwargs; ``sparse_ep_split`` carries the setting.
+            sparse_selected: The DSA selection, ``None`` for dense MLA calls (never split).
+            dp_local: Whether the data-parallel local page path runs this call.
+            page_axis: Logical KV-page axis of the cache view (``EMPTY`` when replicated).
+            query_specs: Resolved partition specs of the two query tensors.
+            num_tokens: Query tokens of the call (the automatic rule keeps small per-shard windows unsplit).
+
+        Returns:
+            The expert-parallel mesh axis names to split over, or ``()``.
+        """
+        setting = ignore.get("sparse_ep_split")
+        if sparse_selected is None or (setting is not None and not setting):
+            # Dense MLA calls and an explicit ``False`` keep the unsplit call without reading the metadata.
+            return ()
+        return resolve_dsa_serving_ep_split(
+            setting,
+            mesh=self.metadata.mesh,
+            partition_axis=getattr(self.metadata, "partition_axis", None),
+            sparse=sparse_selected is not None,
+            dp_local=dp_local,
+            page_axis=page_axis,
+            query_specs=query_specs,
+            num_tokens=num_tokens,
+        )
 
     def forward_core(
         self,
@@ -515,6 +900,14 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         if sparse_selected is not None:
             extra_specs = (resolve(axes=[q_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=sparse_selected.shape),)
             extra_args = (sparse_selected,)
+        ep_split_axes = self._sparse_ep_split_axes(
+            ignore,
+            sparse_selected,
+            dp_local=can_use_dp_local,
+            page_axis=page_axis,
+            query_specs=(qaxes_nope, qaxes_pe),
+            num_tokens=int(queries_nope.shape[0]),
+        )
 
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
@@ -634,6 +1027,28 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 request_distribution,
                 *extra_args,
             )
+        elif ep_split_axes:
+            token_order = ignore.get("sparse_token_order")
+            output, kv_pages, chunks = _ep_split_sparse_attention(
+                _kernel,
+                mesh=self.metadata.mesh,
+                axis_names=ep_split_axes,
+                specs=(qaxes_nope, qaxes_pe, kv_values_axes, keys_pe_axes, kv_pages_spec_replicated),
+                queries_nope=queries_nope,
+                queries_pe=queries_pe,
+                keys_values=keys_values,
+                keys_pe=keys_pe,
+                kv_pages=kv_pages,
+                context_lens=cache_metadata.context_lens,
+                pages_tables=cache_metadata.pages_tables,
+                query_start_loc=cache_metadata.query_start_loc,
+                distribution=request_distribution,
+                selected=sparse_selected,
+                balanced=isinstance(token_order, dict) and _serving(),
+            )
+            if chunks:
+                # The caller restores token order after its output projection (restore_ep_split_token_order).
+                token_order["shards"] = chunks // 2
         else:
 
             @partial(

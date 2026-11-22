@@ -59,16 +59,16 @@ os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import jax
 import jax.numpy as jnp
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
 from easydel.inference.esurge.runners.spec import strategy as _strategy
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.inference.speculative import Qwen3_5MTPDrafter
 
 try:
+    from ._common import make_core_for_runner, served_request
     from ._common import make_tiny_qwen35 as make_tiny_model
 except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
     from _common import make_tiny_qwen35 as make_tiny_model
 
 _VOCAB = 256
@@ -204,7 +204,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows, replay=False, stat
 
         runner.executor_manager.execute = _det_execute
 
-        sch = Scheduler.from_runner(
+        sch = make_core_for_runner(
             runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -213,7 +213,7 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows, replay=False, stat
         )
         reqs = []
         for i in range(n):
-            r = EngineRequest(
+            r = served_request(
                 request_id=f"r-{i}",
                 prompt_token_ids=list(prompts[i]),
                 sampling_params=SamplingParams(max_tokens=14, temperature=0.0, ignore_eos=True),
@@ -224,19 +224,19 @@ def _run(model, *, n, k, disable_emit, prompts, project_rows, replay=False, stat
         for _ in range(4000):
             so = sch.schedule()
             out = runner.execute_model(so)
-            sch.update_from_output(so, out)
+            sch.commit(so, out)
             if state_trace is not None:
-                state_trace.append(
-                    {
-                        r.request_id: {
-                            "tokens": tuple(r.output_token_ids),
-                            "drafts": tuple(r.spec_token_ids),
-                            "computed": r.num_computed_tokens,
-                            "status": r.status,
-                        }
-                        for r in reqs
+                step_state = {}
+                for r in reqs:
+                    live = sch.request_state(r.request_id)
+                    status, computed, _num_tokens, drafts = live if live is not None else (r.finish_reason, -1, -1, [])
+                    step_state[r.request_id] = {
+                        "tokens": tuple(r.output_token_ids),
+                        "drafts": tuple(drafts),
+                        "computed": computed,
+                        "status": status,
                     }
-                )
+                state_trace.append(step_state)
             if all(r.is_finished() for r in reqs):
                 break
         else:

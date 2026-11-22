@@ -47,6 +47,7 @@ from ..training_utils import (
     constrain_batch_sharding,
     constrain_scheduled_batch,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
@@ -57,13 +58,20 @@ from ..training_utils import (
 logger = get_logger(__name__)
 
 
-def _dft_causal_lm_metrics(logits: jax.Array, labels: jax.Array, ignore_index: int = -100) -> LossMetrics:
+def _dft_causal_lm_metrics(
+    logits: jax.Array,
+    labels: jax.Array,
+    ignore_index: int = -100,
+    attention_mask: jax.Array | None = None,
+) -> LossMetrics:
     """Compute the DFT SFT loss from logits and causal-LM labels."""
     # DFT's detached probability weights and all reductions must retain fp32
     # precision even when the model emits bf16/fp16 activations.
     shift_logits = logits[:, :-1, :].astype(jnp.float32)
     shift_labels = labels[:, 1:]
     loss_mask = shift_labels != ignore_index
+    if attention_mask is not None and attention_mask.shape == labels.shape:
+        loss_mask = loss_mask & (attention_mask[:, 1:] != 0)
     safe_labels = jnp.where(loss_mask, shift_labels, 0)
     log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
     token_logps = jnp.take_along_axis(log_probs, safe_labels[..., None], axis=-1).squeeze(-1)
@@ -120,10 +128,20 @@ def base_step(
         )
         batch = constrain_batch_sharding(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
 
-    # CE/aux split: only needed when microbatches are averaged (see ``_split_ce_aux_objective``).
+    from easydel.trainers.dp_sharding import can_use_dp_spmd_vmap, dp_spmd_step_gradients
+
+    use_dp_spmd = is_training and can_use_dp_spmd_vmap(
+        state=state,
+        batch_size=_batch_size,
+        minibatch_size=minibatch_size,
+        partition_spec=partition_spec,
+        batch=batch,
+    )
+
+    # CE/aux split: needed whenever microbatches or DP slices are averaged (see ``_split_ce_aux_objective``).
     split_count = (
         _ce_aux_split_count({"loss_config": loss_config, "loss_type": loss_type, "state": state})
-        if is_training and gradient_accumulation_steps > 1
+        if is_training and (gradient_accumulation_steps > 1 or use_dp_spmd)
         else None
     )
 
@@ -165,7 +183,7 @@ def base_step(
                     tree = straight_through_emulator(tree)
             with jax.named_scope(scope_root + "/loss_fn/merge_state"):
                 module = state.merge(tree)
-                if not is_training:
+                if not is_training and getattr(module, "training", True):
                     module.eval()
             with jax.named_scope(scope_root + "/loss_fn/prepare_inputs"):
                 minibatch = dict(minibatch)
@@ -174,11 +192,13 @@ def base_step(
                 labels = call_batch.pop("labels", None)
             with jax.named_scope(scope_root + "/loss_fn/forward_and_loss"):
                 if loss_type == "dft":
+                    dft_labels = labels if labels is not None else call_batch.get("input_ids", minibatch.get("input_ids"))
                     outputs = module(**call_batch)
                     metrics = _dft_causal_lm_metrics(
                         outputs.logits,
-                        labels,
+                        dft_labels,
                         ignore_index=-100 if loss_config is None else loss_config.ignore_index,
+                        attention_mask=call_batch.get("attention_mask", minibatch.get("attention_mask")),
                     )
                     outputs = outputs.replace(loss=metrics.loss)
                 else:
@@ -201,22 +221,84 @@ def base_step(
         # Weight microbatches by valid-token count (same estimator as the scheduled MPMD
         # path) so a token-mean loss matches the full batch when microbatches hold
         # different numbers of valid tokens. ``None`` keeps the uniform average.
-        microbatch_weight_fn = (
-            _make_base_spmd_weight({"loss_config": loss_config, "loss_type": loss_type, "state": state, "batch": batch})
-            if gradient_accumulation_steps > 1
-            else None
+        weight_fn = _make_base_spmd_weight(
+            {"loss_config": loss_config, "loss_type": loss_type, "state": state, "batch": batch}
         )
+        microbatch_weight_fn = weight_fn if gradient_accumulation_steps > 1 else None
         if split_count is not None:
             # Added after the weight decision so the aux probe sees the original batch.
             batch = dict(batch)
             batch[_CE_TOKEN_SCALE_KEY] = _ce_token_scale_leaf(split_count, batch)
-        gradients, metrics = minibatch_call(
-            state=state,
-            batch=batch,
-            minibatch_size=minibatch_size,
-            grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
-            microbatch_weight_fn=microbatch_weight_fn,
-        )
+        dp_out = None
+        if use_dp_spmd:
+            from easydel.infra.sharding import strip_axis_from_spec
+
+            slice_ps = strip_axis_from_spec(partition_spec, "dp")
+            slice_minibatch_size = minibatch_size // int(
+                (state.model.mesh.jax_mesh if hasattr(state.model.mesh, "jax_mesh") else state.model.mesh).shape["dp"]
+            )
+
+            def _slice_base_grad(s_st, _extra, b_slice):
+                b_slice = constrain_batch_sharding(b_slice, slice_ps, mesh=s_st.model.mesh, ignore_mpmd=True)
+
+                def _slice_loss_fn(tree, mb):
+                    mb = dict(mb)
+                    ce_sc = mb.pop(_CE_TOKEN_SCALE_KEY, None)
+                    if straight_through_emulator is not None:
+                        tree = straight_through_emulator(tree)
+                    mod = s_st.merge(tree)
+                    call_b = mod.prepare_inputs_for_call(**mb)
+                    lbls = call_b.pop("labels", None)
+                    if loss_type == "dft":
+                        dft_lbls = lbls if lbls is not None else call_b.get("input_ids", mb.get("input_ids"))
+                        outs = mod(**call_b)
+                        mets = _dft_causal_lm_metrics(
+                            outs.logits,
+                            dft_lbls,
+                            ignore_index=-100 if loss_config is None else loss_config.ignore_index,
+                            attention_mask=call_b.get("attention_mask", mb.get("attention_mask")),
+                        )
+                        outs = outs.replace(loss=mets.loss)
+                    else:
+                        outs, mets = mod.compute_loss(labels=lbls, loss_config=loss_config, **call_b)
+                    lval = outs.loss
+                    if ce_sc is not None and split_count is not None:
+                        lval, mets = _split_ce_aux_objective(lval, mets, ce_sc, split_count, mb)
+                    return lval, mets
+
+                grads_s, mets_s = minibatch_call(
+                    state=s_st,
+                    batch=b_slice,
+                    minibatch_size=slice_minibatch_size,
+                    grad_fn=jax.value_and_grad(_slice_loss_fn, has_aux=True),
+                    microbatch_weight_fn=microbatch_weight_fn,
+                )
+                w_s = (
+                    jnp.ones((), jnp.float32)
+                    if weight_fn is None
+                    else jnp.asarray(weight_fn(s_st.graphstate, b_slice), jnp.float32).reshape(())
+                )
+                return grads_s, mets_s, w_s
+
+            dp_out = dp_spmd_step_gradients(
+                student_state=state,
+                batch=batch,
+                batch_size=_batch_size,
+                minibatch_size=minibatch_size,
+                partition_spec=partition_spec,
+                slice_grad_and_weight_fn=_slice_base_grad,
+                normalize_grads=True,
+            )
+        if dp_out is not None:
+            gradients, metrics, _ = dp_out
+        else:
+            gradients, metrics = minibatch_call(
+                state=state,
+                batch=batch,
+                minibatch_size=minibatch_size,
+                grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
+                microbatch_weight_fn=microbatch_weight_fn,
+            )
     with jax.named_scope(scope_root + "/update_state"):
         state = update_state_respectfully(
             state=state,
@@ -344,6 +426,7 @@ def _make_base_scheduled_loss(call):
     partition_spec = call.get("partition_spec")
     loss_type = call.get("loss_type", "nll")
     split_count = _ce_aux_split_count(call)
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
 
     def scheduled_loss(tree, batch):
         """Compute the base-trainer scheduled loss and auxiliary metrics.
@@ -360,7 +443,7 @@ def _make_base_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/base/scheduled_loss"):
             with jax.named_scope("easydel/trainer/base/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 batch = dict(batch)
                 ce_scale = batch.pop(_CE_TOKEN_SCALE_KEY, None)
                 batch = constrain_scheduled_batch(module, batch, partition_spec)
@@ -369,11 +452,13 @@ def _make_base_scheduled_loss(call):
                 labels = call_batch.pop("labels", None)
             with jax.named_scope("easydel/trainer/base/scheduled_loss/forward_and_loss"):
                 if loss_type == "dft":
+                    dft_labels = labels if labels is not None else call_batch.get("input_ids", batch.get("input_ids"))
                     outputs = module(**call_batch)
                     metrics = _dft_causal_lm_metrics(
                         outputs.logits,
-                        labels,
+                        dft_labels,
                         ignore_index=-100 if loss_config is None else loss_config.ignore_index,
+                        attention_mask=call_batch.get("attention_mask", batch.get("attention_mask")),
                     )
                     outputs = outputs.replace(loss=metrics.loss)
                 else:
@@ -419,7 +504,7 @@ def _base_scheduled_weight_semantics(loss_config, loss_type: str) -> str | None:
         the loss is not a token-mean and weighting must stay uniform.
     """
     if loss_type == "dft":
-        return "valid_only"
+        return "masked"
     if loss_config is None:
         return "masked"
     if getattr(loss_config, "mtp_only", False):

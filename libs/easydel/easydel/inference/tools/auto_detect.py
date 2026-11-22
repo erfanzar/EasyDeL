@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import typing as tp
 
+from ..reasoning.abstract_reasoning import shared_vocab
 from .abstract_tool import ToolParserManager, ToolParserName
 
 MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
@@ -75,6 +76,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "phimoe": "hermes",
     "phi3": "hermes",
     "phi": "hermes",
+    "glm5_next": "glm47",
     "glm_moe_dsa": "glm47",
     "glm4_moe_lite": "glm47",
     "glm4_moe": "glm47",
@@ -106,7 +108,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "command_r": "hermes",
     "kimi_k2": "kimi_k2",
     "kimi": "kimi_k2",
-    "gpt_oss": "hermes",
+    "gpt_oss": "openai",
     "smollm3": "hermes",
     "exaone4": "hermes",
     "exaone": "hermes",
@@ -157,6 +159,25 @@ _DEFAULT_PARSER: ToolParserName = "hermes"
 most widely adopted format (Qwen3, Nous, many finetunes)."""
 
 
+def _model_type_matches(mt: str, prefix: str) -> bool:
+    """Match ``prefix`` against ``mt`` at string-start or separator token boundaries."""
+    if mt == prefix:
+        return True
+    if mt.startswith(prefix):
+        nxt = mt[len(prefix)]
+        if prefix[-1].isdigit() or nxt in "_-./" or nxt.isdigit():
+            return True
+    idx = mt.find(prefix)
+    while idx != -1:
+        before_ok = idx == 0 or mt[idx - 1] in "_-./"
+        end = idx + len(prefix)
+        after_ok = end == len(mt) or mt[end] in "_-./" or mt[end].isdigit() or prefix[-1].isdigit()
+        if before_ok and after_ok:
+            return True
+        idx = mt.find(prefix, idx + 1)
+    return False
+
+
 def detect_tool_parser(
     *,
     parser_name: str | None = None,
@@ -184,7 +205,7 @@ def detect_tool_parser(
     if model_type is not None:
         mt = model_type.lower()
         for prefix in sorted(MODEL_TYPE_TO_TOOL_PARSER, key=len, reverse=True):
-            if mt.startswith(prefix) or prefix in mt:
+            if _model_type_matches(mt, prefix):
                 return MODEL_TYPE_TO_TOOL_PARSER[prefix]
 
     if tokenizer is not None:
@@ -194,7 +215,7 @@ def detect_tool_parser(
                 if hint in template:
                     return name
 
-        vocab = getattr(tokenizer, "get_vocab", lambda: {})()
+        vocab = shared_vocab(tokenizer)
         if isinstance(vocab, dict):
             for token, name in _VOCAB_HINTS:
                 if token in vocab:

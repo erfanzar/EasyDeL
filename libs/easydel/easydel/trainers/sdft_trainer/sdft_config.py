@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
+from easydel.utils.compiling_utils import hash_fn
 
 from ..self_distillation_policy_optimization import SDPOConfig
 
@@ -33,6 +34,8 @@ class SelfDistillationConfig(SDPOConfig):
     """
 
     trainer_prefix: str | None = field(default="SelfDistillation")
+
+    __hash__ = hash_fn
 
 
 @Registry.register("trainer-arguments", "sdft")
@@ -65,3 +68,5 @@ class SDFTConfig(SelfDistillationConfig):
             "{prompt}" not in self.teacher_prompt_template or "{privileged_context}" not in self.teacher_prompt_template
         ):
             raise ValueError("`teacher_prompt_template` must contain `{prompt}` and `{privileged_context}`.")
+
+    __hash__ = hash_fn

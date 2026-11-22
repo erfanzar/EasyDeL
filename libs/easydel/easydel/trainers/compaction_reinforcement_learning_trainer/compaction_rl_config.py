@@ -133,7 +133,7 @@ class CompactionRLConfig(OnlineActorCriticConfig):
         metadata={"help": "CompactionRL uses group size one."},
     )
     num_generations: int | None = field(
-        default=1,
+        default=None,
         metadata={"help": "Alias for group size; fixed to one."},
     )
     num_ppo_epochs: int = field(

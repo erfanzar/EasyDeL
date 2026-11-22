@@ -15,7 +15,7 @@
 """DSpark speculative decoding for DeepSeek-V4.1 in eSurge: greedy parity with plain decoding (computation test).
 
 A tiny fp32 / ``HIGHEST`` DeepSeek-V4.1 (shared compressed-window cache, ratio-2 and ratio-1 layers) is served through the
-real ``eSurgeRunner`` + ``Scheduler`` with and without a :class:`DeepseekV41DSparkDrafter`. Every run schedules two
+real ``eSurgeRunner`` + engine core with and without a :class:`DeepseekV41DSparkDrafter`. Every run schedules two
 requests of different prompt lengths and different ``max_tokens`` (so they finish at different steps), then a second wave
 that reuses the freed cache slots and drafter ring rows. Greedy outputs must be identical to the run without speculation.
 
@@ -44,13 +44,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import spectrax as spx
-from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import eSurgeRunner
-from easydel.inference.esurge.scheduler import Scheduler
 from easydel.inference.sampling_params import SamplingParams
 from easydel.modules.deepseek_v41 import DeepseekV41Config, DeepseekV41DSpark
 from easydel.modules.deepseek_v41.modeling_deepseek_v41_dspark import DeepseekV41DSparkDrafter
 from easydel.utils import set_inference_mode
+
+try:
+    from ._common import make_core_for_runner, served_request
+except ImportError:  # standalone `python test_x.py`
+    from _common import make_core_for_runner, served_request
 
 try:
     from tests.modules import _deepseek_v41_reference as ref
@@ -234,7 +237,7 @@ class _Harness:
             drafter=drafter,
         )
         self.runner.compile(max_num_batched_tokens=64)
-        self.scheduler = Scheduler.from_runner(
+        self.scheduler = make_core_for_runner(
             self.runner,
             max_num_batched_tokens=64,
             enable_prefix_caching=False,
@@ -245,7 +248,7 @@ class _Harness:
     def generate_greedy(self, specs: list[dict]) -> list[list[int]]:
         requests = []
         for spec in specs:
-            req = EngineRequest(
+            req = served_request(
                 request_id=spec["id"],
                 prompt_token_ids=list(spec["prompt_token_ids"]),
                 sampling_params=SamplingParams(max_tokens=int(spec["max_tokens"]), temperature=0.0, ignore_eos=True),
@@ -256,7 +259,7 @@ class _Harness:
         for _ in range(STEP_BUDGET):
             scheduler_output = self.scheduler.schedule()
             output = self.runner.execute_model(scheduler_output)
-            self.scheduler.update_from_output(scheduler_output, output)
+            self.scheduler.commit(scheduler_output, output)
             if all(r.is_finished() for r in requests):
                 break
         else:
