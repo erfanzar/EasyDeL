@@ -39,6 +39,7 @@ from eformer.loggings import get_logger
 from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
+from easydel.caching import HybridCache, KDACacheView, ParallelHybridCacheView, RecurrentCacheView
 from easydel.infra.sharding import replicate_on_array_mesh
 
 from ..async_types import DeviceInputTokenHandoff
@@ -49,6 +50,27 @@ if tp.TYPE_CHECKING:
     from ..execution_manager import ExecutionManager
 
 logger = get_logger("eSurge-PipelineMicrobatch")
+
+
+def _has_recurrent_views(kv_pages: tp.Any) -> bool:
+    """Return whether ``kv_pages`` is a HybridCache containing any per-slot recurrent views."""
+    if not isinstance(kv_pages, HybridCache):
+        return False
+    for view in getattr(kv_pages, "views", ()):
+        rec = None
+        if isinstance(view, RecurrentCacheView | KDACacheView):
+            rec = view
+        elif isinstance(view, ParallelHybridCacheView) and view.recurrent is not None:
+            rec = view.recurrent
+        if rec is None:
+            continue
+        if isinstance(rec, KDACacheView):
+            leaves = (rec.q_conv_state, rec.k_conv_state, rec.v_conv_state, rec.recurrent_state)
+        else:
+            leaves = (rec.conv_state, rec.recurrent_state)
+        if any(arr is not None for arr in leaves):
+            return True
+    return False
 
 
 class _PipelineMicrobatchScratchSlot(tp.TypedDict):
@@ -205,6 +227,11 @@ class PipelineMicrobatchExecutor:
         self._pipeline_microbatch_scratch_signature = None
         self._pipeline_logits_index_cache.clear()
         self._pipeline_handoff_scalar_cache.clear()
+
+    def close(self) -> None:
+        """Drop caches and break the back-reference to the owning ExecutionManager."""
+        self.clear_cache()
+        self._manager = None
 
     @staticmethod
     def _skip(reason: str, **ctx: tp.Any) -> None:
@@ -576,6 +603,10 @@ class PipelineMicrobatchExecutor:
         pipeline_runtime = self._manager._model_executor.pipeline_runtime
         if pipeline_plan is None or not pipeline_plan.is_enabled or pipeline_runtime is None:
             return self._skip("plan_disabled")
+        if _has_recurrent_views(getattr(self._manager, "kv_pages", None)):
+            return self._skip("recurrent_views")
+        if int(getattr(self._manager._model_executor, "full_hidden_state_max_tokens", 0) or 0) > 0:
+            return self._skip("full_hidden_state_required")
         if any(
             x is not None
             for x in (
@@ -883,10 +914,22 @@ class PipelineMicrobatchExecutor:
 
         start_lm_head = time.time()
         if positions_are_prefix:
-            lm_head_fn = self._manager._model_executor.get_pipeline_lm_head(
-                padded_num_reqs=padded_num_reqs,
-                part_rows=tuple(int(positions.shape[0]) for positions in original_positions),
-            )
+            part_rows = tuple(int(positions.shape[0]) for positions in original_positions)
+            part_token_shapes = tuple(int(part.shape[0]) for part in hidden_parts)
+            get_pp_lm_head = self._manager._model_executor.get_pipeline_lm_head
+            try:
+                lm_head_fn = get_pp_lm_head(
+                    padded_num_reqs=padded_num_reqs,
+                    part_rows=part_rows,
+                    part_token_shapes=part_token_shapes,
+                )
+            except TypeError as exc:
+                if "part_token_shapes" not in str(exc):
+                    raise
+                lm_head_fn = get_pp_lm_head(
+                    padded_num_reqs=padded_num_reqs,
+                    part_rows=part_rows,
+                )
             logits = lm_head_fn(
                 self._manager.graphstate, self._manager.graphother, tuple(hidden_parts), tuple(logits_index_parts)
             )
@@ -924,6 +967,9 @@ class PipelineMicrobatchExecutor:
         )
         self._manager.rng_key = rng_key_out
         self._manager._sampler_token_counts = token_counts_out
+        self._manager._last_model_request_bucket = int(padded_num_reqs)
+        self._manager.last_batch_metadata = metadata_batches[-1]
+        self._manager.last_spec_window_delta = None
         sampler_enqueue_took = time.time() - start_sampler
         exec_took = backbone_took + combine_took + lm_head_took + sampler_enqueue_took
 

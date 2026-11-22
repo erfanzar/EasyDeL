@@ -1980,19 +1980,15 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
                 - Output hidden states after MoE and shared expert processing
                 - Router logits for auxiliary loss computation
         """
-        routed_output, router_logits = self.moe_call(
+        output, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            shared_expert=self.gated_shared_expert_call(self.shared_expert, self.shared_expert_gate),
         )
-
-        shared_output = self.shared_expert(hidden_states)
-        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_states))
-
-        output = routed_output + shared_gate * shared_output
 
         return checkpoint_name(output, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 

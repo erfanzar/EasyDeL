@@ -150,7 +150,7 @@ def test_weight_semantics_gating():
     """Non-token-mean losses must keep the historical uniform weighting."""
     assert _base_scheduled_weight_semantics(LossConfig(), "nll") == "masked"
     assert _base_scheduled_weight_semantics(None, "nll") == "masked"
-    assert _base_scheduled_weight_semantics(LossConfig(), "dft") == "valid_only"
+    assert _base_scheduled_weight_semantics(LossConfig(), "dft") == "masked"
     assert _base_scheduled_weight_semantics(LossConfig(reduction="mean"), "nll") == "masked"
     assert _base_scheduled_weight_semantics(LossConfig(reduction="sum"), "nll") is None
     assert _base_scheduled_weight_semantics(LossConfig(divide_weight_sum=True), "nll") is None

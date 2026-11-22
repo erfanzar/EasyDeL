@@ -24,6 +24,7 @@ from easydel.trainers.rlvr_trainer import (
     ContainsVerifier,
     ExactMatchVerifier,
     JSONVerifier,
+    LengthPenaltyVerifier,
     MathVerifier,
     MultipleChoiceVerifier,
     ReasoningFormatVerifier,
@@ -141,6 +142,95 @@ def test_composite_weighted_sum():
     # default weights are 1.0 each
     comp2 = CompositeVerifier([contains, contains])
     assert comp2(completions=["answer"]) == [2.0]
+
+
+def test_math_verifier_comma_nested_boxed_last_match_and_none_gold():
+    v = MathVerifier()
+    # Bare comma in trailing prose must not match as a number.
+    assert v(completions=["total is 42. Yes, right."], batch={"answer": ["42"]}) == [1.0]
+    # Balanced nested braces in \boxed{\frac{1}{2}} and signed fractions.
+    assert v(
+        completions=[r"Therefore \boxed{\frac{1}{2}}", r"Result: \boxed{-\frac{3}{4}}"],
+        batch={"answer": ["0.5", r"\boxed{-\frac{3}{4}}"]},
+    ) == [1.0, 1.0]
+    # Last \boxed{...} wins over earlier intermediate boxes.
+    assert v(completions=[r"First \boxed{10}, wait actually \boxed{42}."], batch={"answer": ["42"]}) == [1.0]
+    # Empty/unparseable \boxed{} falls through to #### or numeric fallback.
+    assert v(
+        completions=[r"\boxed{} so #### 42", r"\boxed{invalid} hence 42"],
+        batch={"answer": ["42", "42"]},
+    ) == [1.0, 1.0]
+    # None gold answers stay None (not converted to "None") and score 0.0.
+    assert v._get_gold_answers({"answer": [None, "42"]}, 2) == [None, "42.0"]
+    assert v(completions=["42", "42"], batch={"answer": [None, "42"]}) == [0.0, 1.0]
+
+
+def test_multiple_choice_verifier_avoids_prose_false_positives_and_takes_last_match():
+    v = MultipleChoiceVerifier(answer_key="answer")
+    comps = [
+        "The answer can be derived: B",
+        "Answer: a simple equation gives B",
+        "The answer is correct, so D",
+        "First I thought the answer is A, actually the answer is C.",
+        r"Wait \boxed{A}, no \boxed{E}",
+        "the answer is b",
+    ]
+    golds = ["B", "B", "D", "C", "E", "B"]
+    assert v(completions=comps, batch={"answer": golds}) == [1.0] * len(comps)
+
+
+def test_length_penalty_verifier_configurable_max_length():
+    # Default must not hardcode max_length=5000 and zero out long targets.
+    v_long = LengthPenaltyVerifier(target_length=6000)
+    assert v_long(completions=["a" * 6000]) == [1.0]
+
+    # Explicit max_length caps completions above that bound to 0.0.
+    v_capped = LengthPenaltyVerifier(target_length=500, min_length=10, max_length=600)
+    assert v_capped(completions=["a" * 500, "a" * 600, "a" * 601]) == [1.0, 0.8, 0.0]
+
+
+def test_exact_match_verifier_handles_multi_group_extract_pattern():
+    v_alt = ExactMatchVerifier(answer_key="answer", extract_pattern=r"Answer:\s*(\w+)|Result:\s*(\w+)")
+    assert v_alt(
+        completions=["Reasoning... Answer: Paris", "Reasoning... Result: Berlin", "No match"],
+        batch={"answer": ["paris", "berlin", "rome"]},
+    ) == [1.0, 1.0, 0.0]
+
+    v_prefix = ExactMatchVerifier(answer_key="answer", extract_pattern=r"(Final\s+)?Answer:\s*(.+)")
+    assert v_prefix(completions=["Final Answer: 42"], batch={"answer": ["42"]}) == [1.0]
+
+
+def test_json_verifier_prefers_explicit_json_fence_over_earlier_non_json_fence():
+    v = JSONVerifier(required_keys=["name", "age"])
+    comp_with_python_first = (
+        "Helper code:\n"
+        "```python\n"
+        'd = {"not": "valid json"}\n'
+        "```\n"
+        "Final JSON:\n"
+        "```json\n"
+        '{"name": "alice", "age": 30}\n'
+        "```"
+    )
+    comp_with_plain_fence_first = '```\n{"other": 1}\n```\nThen:\n```json\n{"name": "bob", "age": 25}\n```'
+    assert v(completions=[comp_with_python_first, comp_with_plain_fence_first]) == [1.0, 1.0]
+
+
+def test_composite_verifier_guards_none_scores():
+    def partial_verifier(*, completions, **kwargs):
+        del completions, kwargs
+        return [1.0, None]
+
+    def always_verifier(*, completions, **kwargs):
+        del completions, kwargs
+        return [0.5, 0.8]
+
+    def none_verifier(*, completions, **kwargs):
+        del completions, kwargs
+        return None
+
+    comp = CompositeVerifier([partial_verifier, always_verifier, none_verifier], weights=[1.0, 0.5, 2.0])
+    assert comp(completions=["a", "b"]) == pytest.approx([1.25, 0.4])
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@ class GRPOConfig(TrainingArguments):
             periodically refreshed from a moving average of the
             policy.
         ref_model_mixup_alpha: Polyak mixing coefficient used when
-            syncing the reference (``new_ref = alpha * ref + (1 - alpha) * policy``).
+            syncing the reference (``new_ref = alpha * policy + (1 - alpha) * ref``).
         ref_model_sync_steps: Optimizer-step interval between
             reference syncs.
         num_iterations: Number of optimizer updates per generated

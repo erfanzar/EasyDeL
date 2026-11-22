@@ -167,11 +167,18 @@ class CompileOrchestrator:
         executables such as `(32 tokens, 256 requests)`.
         """
         feasible_pairs: list[tuple[int, int]] = []
+        min_req_padd = min((int(r) for r in reqs_padds), default=None)
         for num_tokens in num_tokens_paddings:
+            t = int(num_tokens)
+            matched = False
             for reqs_padd in reqs_padds:
-                if int(reqs_padd) > int(num_tokens):
+                r = int(reqs_padd)
+                if r > t:
                     continue
-                feasible_pairs.append((int(num_tokens), int(reqs_padd)))
+                feasible_pairs.append((t, r))
+                matched = True
+            if not matched and min_req_padd is not None:
+                feasible_pairs.append((t, min_req_padd))
         return feasible_pairs
 
     @staticmethod
@@ -287,8 +294,9 @@ class CompileOrchestrator:
         if self._manager.model.mesh.is_mpmd:
             model_tokens_to_compile = model_tokens
             reqs_to_compile = reqs_padds
+            model_executor = getattr(self._manager, "_model_executor", None)
 
-            if self._manager._model_executor.supports_pipeline_model_step:
+            if bool(getattr(model_executor, "supports_pipeline_model_step", False)):
                 pp_model_reqs_to_compile = reqs_to_compile
                 pp_model_pairs = [
                     (int(num_tokens), int(reqs_padd))
@@ -314,7 +322,7 @@ class CompileOrchestrator:
                     )
                 pp_model_progress.complete(f"All {len(pp_model_pairs)} fused PP model-step compilations completed")
             backbone_variants = [False]
-            if getattr(self._manager._model_executor, "pipeline_runtime", None) is not None:
+            if getattr(model_executor, "pipeline_runtime", None) is not None:
                 backbone_variants.append(True)
             backbone_total = len(model_tokens_to_compile) * len(backbone_variants)
             backbone_progress = ProgressLogger("eSurge-backbone", logger)

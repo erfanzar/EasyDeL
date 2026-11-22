@@ -135,6 +135,8 @@ class DelegatingParser:
     text, starting from a clean slate after the reasoning boundary.
     """
 
+    _MAX_SUPPRESSED_BUFFER_CHARS: int = 1024
+
     def __init__(
         self,
         reasoning_parser: ReasoningParser | None = None,
@@ -171,19 +173,32 @@ class DelegatingParser:
 
         # Parser-owned tool-start markers used to prescreen text before the
         # expensive streaming tool machinery runs (which re-tokenizes the full
-        # accumulated text every delta — O(n^2) per request). Prefer the
-        # machinery-specific hints so parsers that accept markerless bare-JSON
-        # payloads (llama3_json, xlam, ...) can include "{" / "[" without
-        # polluting is_buffering_protocol. Empty hints (e.g. custom parsers
-        # without marker attributes) fail OPEN: the machinery always runs,
-        # preserving the historical contract.
-        hints_fn = getattr(tool_parser, "get_tool_machinery_hints", None)
-        if not callable(hints_fn):
-            hints_fn = getattr(tool_parser, "get_streaming_buffer_hints", None)
+        # accumulated text every delta — O(n^2) per request). Keep machinery
+        # engagement hints (which may include bare "{" / "[" for markerless JSON
+        # or pythonic parsers) strictly separate from explicit protocol markers
+        # used to lock visible content in _process_tool_final, so ordinary prose
+        # containing "[" or "{" is never misclassified as tool protocol.
+        machinery_fn = getattr(tool_parser, "get_tool_machinery_hints", None)
+        if not callable(machinery_fn):
+            machinery_fn = getattr(tool_parser, "get_streaming_buffer_hints", None)
         try:
-            self._tool_marker_hints: tuple[str, ...] = tuple(hints_fn()) if callable(hints_fn) else ()
+            self._tool_machinery_hints: tuple[str, ...] = tuple(machinery_fn()) if callable(machinery_fn) else ()
         except Exception:
-            self._tool_marker_hints = ()
+            self._tool_machinery_hints = ()
+
+        bare_delimiters = frozenset({"[", "{", "(", "<"})
+        protocol_fn = getattr(tool_parser, "get_streaming_buffer_hints", None)
+        try:
+            raw_protocol_hints = tuple(protocol_fn()) if callable(protocol_fn) else ()
+        except Exception:
+            raw_protocol_hints = ()
+        self._tool_marker_hints: tuple[str, ...] = tuple(
+            hint for hint in raw_protocol_hints if isinstance(hint, str) and hint and hint not in bare_delimiters
+        )
+        self._parser_manages_prefix_buffering: bool = callable(getattr(tool_parser, "flush_streaming_content", None))
+        max_hint_len = max((len(hint) for hint in self._tool_marker_hints), default=0)
+        self._max_suppressed_buffer_chars: int = max(self._MAX_SUPPRESSED_BUFFER_CHARS, max_hint_len * 4)
+        self._suppressed_buffer_text: str = ""
         self._streamed_tool_call_state: dict[int, TrackedToolCallState] = {}
 
     def streamed_tool_call_id(self, index: int) -> str | None:
@@ -294,18 +309,8 @@ class DelegatingParser:
             missing_name = function_name if state is None or not state.function_name else None
             if state is None:
                 missing_arguments = function_arguments
-            elif function_arguments == state.function_arguments:
-                missing_arguments = ""
-            elif function_arguments.startswith(state.function_arguments):
-                missing_arguments = function_arguments[len(state.function_arguments) :]
-            elif self._arguments_payload_is_equivalent(function_arguments, state.function_arguments):
-                # The streamed deltas already carried the same payload in a
-                # different serialization (e.g. compact vs. default JSON
-                # separators). Re-sending the final text would make the
-                # concatenated argument stream invalid JSON.
-                missing_arguments = ""
             else:
-                missing_arguments = function_arguments
+                missing_arguments = self._resolve_missing_arguments(function_arguments, state.function_arguments)
 
             if not missing_name and not missing_arguments:
                 continue
@@ -323,6 +328,31 @@ class DelegatingParser:
             )
 
         return synthesized or None
+
+    @staticmethod
+    def _resolve_missing_arguments(final_args: str, streamed: str) -> str:
+        """Return only a valid completing suffix for ``streamed``, never double-JSON."""
+        if not streamed:
+            return final_args
+        if final_args == streamed:
+            return ""
+        if final_args.startswith(streamed):
+            return final_args[len(streamed) :]
+        try:
+            final_payload = json.loads(final_args)
+        except Exception:
+            return ""
+        try:
+            if json.loads(streamed) == final_payload:
+                return ""
+        except Exception:
+            pass
+        for ensure_ascii in (False, True):
+            for separators in ((", ", ": "), (",", ":")):
+                candidate = json.dumps(final_payload, ensure_ascii=ensure_ascii, separators=separators)
+                if candidate.startswith(streamed):
+                    return candidate[len(streamed) :]
+        return ""
 
     @staticmethod
     def _arguments_payload_is_equivalent(first: str, second: str) -> bool:
@@ -392,7 +422,7 @@ class DelegatingParser:
         # ParsePhase could stick in BUFFERING).
         if self._tool_machinery_latched:
             return True
-        hints = self._tool_marker_hints
+        hints = self._tool_machinery_hints
         if not hints:
             return True
         if not content_text:
@@ -516,8 +546,11 @@ class DelegatingParser:
                 result.accumulated_content = content_for_tools
 
                 old_reasoning = self._accumulated_reasoning
-                if reasoning and len(reasoning) > len(old_reasoning):
-                    result.delta_reasoning = reasoning[len(old_reasoning) :]
+                if reasoning and reasoning != old_reasoning:
+                    if reasoning.startswith(old_reasoning):
+                        result.delta_reasoning = reasoning[len(old_reasoning) :]
+                    elif not old_reasoning:
+                        result.delta_reasoning = reasoning
 
                 old_content = self._raw_content_text
                 if content_for_tools:
@@ -682,8 +715,10 @@ class DelegatingParser:
                 if reasoning is not None and reasoning != self._accumulated_reasoning:
                     old_reasoning = self._accumulated_reasoning
                     result.accumulated_reasoning = reasoning
-                    if len(reasoning) > len(old_reasoning):
+                    if reasoning.startswith(old_reasoning):
                         result.delta_reasoning = reasoning[len(old_reasoning) :]
+                    elif not old_reasoning:
+                        result.delta_reasoning = reasoning
 
                 if content is not None:
                     old_content = self._raw_content_text
@@ -767,19 +802,6 @@ class DelegatingParser:
         previous_visible_content = self._accumulated_content
 
         try:
-            if (
-                self._tool_previous_text
-                and self._tool_previous_token_ids
-                and content_text.startswith(self._tool_previous_text)
-            ):
-                tool_current_token_ids = self._tokenize_for_tool_view_append(
-                    self._tool_previous_text,
-                    self._tool_previous_token_ids,
-                    content_text[len(self._tool_previous_text) :],
-                )
-            else:
-                tool_current_token_ids = self._tokenize_for_tool_view(content_text)
-            tool_delta_token_ids = self._tokenize_for_tool_view(content_delta) if content_delta else []
             if self._tool_previous_text and not self._tool_previous_token_ids:
                 # The machinery gate keeps previous_text synced while
                 # bypassing but (deliberately) skips per-delta retokenization;
@@ -787,6 +809,29 @@ class DelegatingParser:
                 # that inspect previous_token_ids (e.g. ernie45's
                 # all-newlines check) see a consistent triple.
                 self._tool_previous_token_ids = self._tokenize_for_tool_view(self._tool_previous_text)
+            if (
+                self._tool_previous_text
+                and self._tool_previous_token_ids
+                and content_text.startswith(self._tool_previous_text)
+            ):
+                tool_current_token_ids, common_prefix_len = self._tokenize_for_tool_view_append_with_cut(
+                    self._tool_previous_text,
+                    self._tool_previous_token_ids,
+                    content_text[len(self._tool_previous_text) :],
+                )
+            else:
+                tool_current_token_ids = self._tokenize_for_tool_view(content_text)
+                common_prefix_len = 0
+            # Compute delta_token_ids as the diverged suffix of tool_current_token_ids
+            # relative to previous_token_ids so special tokens merged across chunk
+            # boundaries are never lost by standalone delta tokenization.
+            max_common = min(len(self._tool_previous_token_ids), len(tool_current_token_ids))
+            while (
+                common_prefix_len < max_common
+                and self._tool_previous_token_ids[common_prefix_len] == tool_current_token_ids[common_prefix_len]
+            ):
+                common_prefix_len += 1
+            tool_delta_token_ids = list(tool_current_token_ids[common_prefix_len:])
 
             delta_msg = self.tool_parser.extract_tool_calls_streaming(
                 previous_text=self._tool_previous_text,
@@ -810,17 +855,46 @@ class DelegatingParser:
             if tool_calls:
                 result.delta_tool_calls = tool_calls
                 self._merge_streamed_tool_call_state(result.delta_tool_calls)
+                self._suppressed_buffer_text = ""
                 if tools_enabled:
                     self.phase = ParsePhase.TOOL_CALL
 
             # Preserve extracted ordinary prefixes alongside tool calls or a
-            # buffered suffix. A raw pass-through delta is not disambiguated,
-            # however: legacy parsers return it while a marker is still forming.
+            # buffered suffix. Parsers exposing ``flush_streaming_content``
+            # manage partial-marker withholding internally, so any emitted
+            # content is already disambiguated visible prose and must not be
+            # re-buffered here. Legacy parsers without internal buffering may
+            # echo raw pass-through deltas while a marker is still forming; cap
+            # that fallback buffer so a stuck ``is_buffering_protocol`` cannot
+            # grow unboundedly or permanently lose visible prose.
             visible_content = getattr(delta_msg, "content", None)
-            if buffering and not tool_calls and not self._streamed_tool_call_state and visible_content == content_delta:
-                visible_content = None
+            if (
+                not self._parser_manages_prefix_buffering
+                and buffering
+                and not tool_calls
+                and not self._streamed_tool_call_state
+                and visible_content == content_delta
+            ):
+                if content_delta:
+                    if len(self._suppressed_buffer_text) + len(content_delta) <= self._max_suppressed_buffer_chars:
+                        self._suppressed_buffer_text += content_delta
+                        visible_content = None
+                    else:
+                        visible_content = f"{self._suppressed_buffer_text}{content_delta}"
+                        self._suppressed_buffer_text = ""
+                else:
+                    visible_content = None
             if visible_content is not None:
                 visible_delta = visible_content if isinstance(visible_content, str) else str(visible_content)
+                if (
+                    self._suppressed_buffer_text
+                    and not buffering
+                    and not tool_calls
+                    and not self._streamed_tool_call_state
+                ):
+                    if visible_delta == content_delta:
+                        visible_delta = f"{self._suppressed_buffer_text}{visible_delta}"
+                    self._suppressed_buffer_text = ""
                 result.accumulated_content = f"{previous_visible_content}{visible_delta}"
                 result.delta_content = visible_delta
                 if not tool_calls:
@@ -835,8 +909,11 @@ class DelegatingParser:
                 result.accumulated_content = previous_visible_content
                 result.delta_content = ""
             else:
+                self._suppressed_buffer_text = ""
                 result.accumulated_content = content_text
-                result.delta_content = content_delta
+                result.delta_content = self._compute_visible_content_delta(
+                    content_text, previous_visible_content, content_delta
+                )
 
             self._tool_previous_text = content_text
             self._tool_previous_token_ids = tool_current_token_ids
@@ -858,7 +935,6 @@ class DelegatingParser:
             content_for_tools: Final visible content fed to the tool parser.
         """
         tool_request = self._get_tool_request()
-        tools_enabled = self._is_tools_enabled()
         original_visible_content = self._accumulated_content
         previous_visible_content = original_visible_content
         # The terminal engine update is not necessarily passed through process_delta.
@@ -869,7 +945,10 @@ class DelegatingParser:
             previous_visible_content = result.accumulated_content
         flush = getattr(self.tool_parser, "flush_streaming_content", None)
         if callable(flush):
-            previous_visible_content += flush() or ""
+            flushed_text = flush() or ""
+            if flushed_text:
+                previous_visible_content += flushed_text
+                result.accumulated_content = previous_visible_content
         protocol_recognized = (
             self.phase == ParsePhase.TOOL_CALL
             or bool(self._streamed_tool_call_state)
@@ -909,7 +988,7 @@ class DelegatingParser:
             elif protocol_recognized:
                 result.accumulated_content = previous_visible_content
                 result.delta_content = ""
-            elif tools_enabled:
+            else:
                 visible = extracted.content if extracted.content is not None else content_for_tools
                 result.accumulated_content = visible
                 result.delta_content = self._compute_visible_content_delta(
@@ -921,7 +1000,66 @@ class DelegatingParser:
                 "Tool batch extraction failed; passing content through",
                 exc_info=True,
             )
+        self._suppressed_buffer_text = ""
         result.delta_content = self._compute_visible_content_delta(result.accumulated_content, original_visible_content)
+
+    def _tokenize_for_tool_view_append_with_cut(
+        self,
+        previous_text: str,
+        previous_token_ids: list[int],
+        delta_text: str,
+    ) -> tuple[list[int], int]:
+        """Append a delta via bounded suffix re-tokenization, returning ``(ids, preserved_prefix_len)``."""
+        tokenizer = getattr(self.tool_parser, "model_tokenizer", None)
+        decode = getattr(tokenizer, "decode", None)
+        if not previous_text or not previous_token_ids or not callable(decode):
+            return self._tokenize_for_tool_view(previous_text + delta_text), 0
+        n_prev = len(previous_token_ids)
+        if n_prev <= 32:
+            return self._tokenize_for_tool_view(previous_text + delta_text), 0
+
+        min_cut = max(0, n_prev - 96)
+        start_cut = n_prev - 32
+        ws_search_floor = max(min_cut, start_cut - 8)
+        fallback_cut: tuple[int, str] | None = None
+        for cut in range(start_cut, min_cut - 1, -1):
+            suffix_ids = previous_token_ids[cut:]
+            try:
+                try:
+                    suffix_text = decode(suffix_ids, skip_special_tokens=False)
+                except TypeError:
+                    suffix_text = decode(suffix_ids)
+            except Exception:
+                return self._tokenize_for_tool_view(previous_text + delta_text), 0
+            if not suffix_text or "\ufffd" in suffix_text or not previous_text.endswith(suffix_text):
+                continue
+            prefix_len = len(previous_text) - len(suffix_text)
+            if cut > 0 and prefix_len > 0:
+                starts_with_ws = suffix_text[0].isspace()
+                preceded_by_ws = previous_text[prefix_len - 1].isspace()
+                if starts_with_ws:
+                    suffix_token_ids = self._tokenize_for_tool_view(suffix_text + delta_text)
+                    return [*previous_token_ids[:cut], *suffix_token_ids], cut
+                if preceded_by_ws:
+                    if self._tokenize_for_tool_view(suffix_text) != list(suffix_ids):
+                        continue
+                    suffix_token_ids = self._tokenize_for_tool_view(suffix_text + delta_text)
+                    return [*previous_token_ids[:cut], *suffix_token_ids], cut
+                # Non-whitespace boundary (compact JSON, base64, URLs, CJK):
+                # accept a round-trip-verified cutpoint so whitespace-free text
+                # stays O(1) per delta instead of falling back to O(N).
+                if fallback_cut is None and self._tokenize_for_tool_view(suffix_text) == list(suffix_ids):
+                    fallback_cut = (cut, suffix_text)
+                if fallback_cut is not None and cut <= ws_search_floor:
+                    break
+                continue
+            suffix_token_ids = self._tokenize_for_tool_view(suffix_text + delta_text)
+            return [*previous_token_ids[:cut], *suffix_token_ids], cut
+        if fallback_cut is not None:
+            cut, suffix_text = fallback_cut
+            suffix_token_ids = self._tokenize_for_tool_view(suffix_text + delta_text)
+            return [*previous_token_ids[:cut], *suffix_token_ids], cut
+        return self._tokenize_for_tool_view(previous_text + delta_text), 0
 
     def _tokenize_for_tool_view_append(
         self,
@@ -929,28 +1067,15 @@ class DelegatingParser:
         previous_token_ids: list[int],
         delta_text: str,
     ) -> list[int]:
-        """Append a delta using only a bounded suffix re-tokenization.
+        """Append a delta using only a safe bounded suffix re-tokenization.
 
-        The previous full tokenization is retained except for the last 32
-        tokens. Those are decoded, concatenated with the delta and re-encoded
-        so merges at the chunk boundary are handled without re-reading the
-        entire output. If the tokenizer cannot decode the suffix, the safe
-        fallback is a full re-tokenization.
+        Selects a suffix cut near the last 32 tokens that round-trips cleanly
+        through ``decode`` -> ``encode`` without splitting UTF-8 codepoints
+        (``\\ufffd``) or SentencePiece word boundaries. Falls back to full
+        re-tokenization when no clean boundary is found within the window.
         """
-        tokenizer = getattr(self.tool_parser, "model_tokenizer", None)
-        decode = getattr(tokenizer, "decode", None)
-        if not previous_text or not previous_token_ids or not callable(decode):
-            return self._tokenize_for_tool_view(previous_text + delta_text)
-        suffix_ids = previous_token_ids[-32:]
-        try:
-            try:
-                suffix_text = decode(suffix_ids, skip_special_tokens=False)
-            except TypeError:
-                suffix_text = decode(suffix_ids)
-        except Exception:
-            return self._tokenize_for_tool_view(previous_text + delta_text)
-        suffix_token_ids = self._tokenize_for_tool_view(suffix_text + delta_text)
-        return [*previous_token_ids[:-32], *suffix_token_ids]
+        ids, _cut = self._tokenize_for_tool_view_append_with_cut(previous_text, previous_token_ids, delta_text)
+        return ids
 
     def _tokenize_for_tool_view(self, text: str) -> list[int]:
         """Tokenize text for the tool parser's independent view.

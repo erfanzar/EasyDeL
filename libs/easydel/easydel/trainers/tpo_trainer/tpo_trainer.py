@@ -30,6 +30,7 @@ from ..model_loading import reject_string_model_id
 from ..training_utils import (
     compile_trainer_auxiliary,
     compile_trainer_step,
+    resolve_straight_through_emulator,
 )
 from ._fn import tpo_concatenated_forward, tpo_evaluation_step, tpo_training_step
 from .tpo_config import TPOConfig
@@ -97,10 +98,14 @@ class TPOTrainer(DPOTrainer):
         # so the triple-preference collators must be reachable through the collate hooks (below) rather than
         # being assigned after construction. A user-supplied collator takes precedence over the defaults.
         self._tpo_user_data_collator = data_collator
+        # TPO is reference-free (its "reference" branch is a dataset completion, not a separate
+        # reference model). Pass ``reference_model=None`` so DPOTrainer.__init__ skips deep-copying
+        # an unused reference state in HBM.
+        del reference_model
         super().__init__(
             arguments=arguments,
             model=model,
-            reference_model=reference_model,
+            reference_model=None,
             processing_class=processing_class,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
@@ -167,6 +172,16 @@ class TPOTrainer(DPOTrainer):
         self.input_data_collator_tfds = self._build_triple_collator(DataCollatorForTriplePreferenceTFDS)
         return self.input_data_collator_tfds
 
+    def _build_preprocess_transform(self) -> TPOPreprocessTransform:
+        """Construct a :class:`TPOPreprocessTransform` from the trainer's config."""
+        return TPOPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_prompt_length=self.arguments.max_prompt_length,
+            max_completion_length=self.arguments.max_completion_length,
+            tools=getattr(self.arguments, "tools", None),
+            label_pad_token_id=self.arguments.label_pad_token_id,
+        )
+
     def _get_preprocess_transform(self) -> TPOPreprocessTransform | None:
         """Return TPO preprocessing unless the source is already tokenized.
 
@@ -176,23 +191,25 @@ class TPOTrainer(DPOTrainer):
         """
         if self._is_pretokenized():
             return None
-        return TPOPreprocessTransform(
-            tokenizer=self.processing_class,
-            max_prompt_length=self.arguments.max_prompt_length,
-            max_completion_length=self.arguments.max_completion_length,
-            tools=getattr(self.arguments, "tools", None),
-            label_pad_token_id=self.arguments.label_pad_token_id,
-        )
+        return self._build_preprocess_transform()
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Compile TPO train/eval functions and auxiliary concatenated forward.
 
         The auxiliary forward is compiled for the model mesh and reused by both
         train and eval steps. Static arguments capture TPO loss parameters,
-        sharding specs, gradient accumulation, and MPMD scheduling choices.
+        sharding specs, gradient accumulation, QAT straight-through emulation,
+        and MPMD scheduling choices.
         """
         mesh = self.model.mesh
         empty_sharding = replicated_named_sharding(mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
         partial_concatenated_forward = partial(
             tpo_concatenated_forward,
             is_encoder_decoder=self.arguments.is_encoder_decoder,
@@ -208,7 +225,7 @@ class TPOTrainer(DPOTrainer):
         jited_concatenated_forward = compile_trainer_auxiliary(
             partial_concatenated_forward,
             mesh=mesh,
-            out_shardings=(empty_sharding,),
+            out_shardings=empty_sharding,
             static_argnames=(
                 "is_encoder_decoder",
                 "label_pad_token_id",
@@ -218,6 +235,8 @@ class TPOTrainer(DPOTrainer):
                 "aux_loss_enabled",
                 "loss_type",
                 "tpo_alpha",
+                "logprob_vocab_chunk_size",
+                "vocab_shard_stage",
             ),
         )
         self._train_shared_fn_static_args = (
@@ -231,6 +250,7 @@ class TPOTrainer(DPOTrainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
         )
         self._eval_shared_fn_static_args = (
             partial_concatenated_forward,
@@ -241,30 +261,34 @@ class TPOTrainer(DPOTrainer):
             self.arguments.tpo_l_gamma,
             self.arguments.step_partition_spec,
         )
+        train_static_argnums = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+        eval_static_argnums = (2, 3, 4, 5, 6, 7, 8)
         sharded_training_step_function = compile_trainer_step(
             tpo_training_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
-            static_argnums=(2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+            static_argnums=train_static_argnums,
             mesh=mesh,
             schedule=self.arguments.mpmd_scheduler,
             arguments=self.arguments,
         )
         sharded_evaluation_step_function = compile_trainer_step(
             tpo_evaluation_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
-            static_argnums=(2, 3, 4, 5, 6, 7, 8),
+            static_argnums=eval_static_argnums,
             mesh=mesh,
             schedule=self.arguments.mpmd_scheduler,
             arguments=self.arguments,
         )
-        sharded_training_step_function.static_argnums_ = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
-        sharded_evaluation_step_function.static_argnums_ = (2, 3, 4, 5, 6, 7, 8)
+        sharded_training_step_function.static_argnums_ = train_static_argnums
+        sharded_evaluation_step_function.static_argnums_ = eval_static_argnums
 
         self.arguments.ensure_checkpoint_path()
         self.concatenated_forward = jited_concatenated_forward
+        self._extra_forward_flops_per_token = 0.0
+        self._extra_backward_flops_per_token = 0.0
         return TrainerConfigureFunctionOutput(
             sharded_training_step_function=sharded_training_step_function,
             sharded_evaluation_step_function=sharded_evaluation_step_function,

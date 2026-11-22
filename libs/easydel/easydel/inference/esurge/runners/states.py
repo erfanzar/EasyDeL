@@ -165,39 +165,61 @@ class CachedRequestState:
             bool: True if the request contains pixel values, video data,
                 or cached multimodal features.
         """
-        return self.pixel_values is not None or self.pixel_values_videos is not None or len(self.mm_features) > 0
+        return self.pixel_values is not None or self.pixel_values_videos is not None or bool(self.mm_features)
 
     @property
     def vision_processed(self) -> bool:
         """Check if vision data has been processed (prefill complete).
 
         Returns:
-            bool: True if vision embeddings have been computed and raw
-                vision data has been cleared.
+            bool: True if vision embeddings have been computed for the
+                current prefill pass.
         """
         return self._vision_processed
 
-    def clear_vision_data(self) -> None:
-        """Clear raw vision data after prefill to free memory.
+    def clear_vision_data(
+        self,
+        *,
+        skip_feature_ids: set[int] | None = None,
+        detach_features: bool = False,
+    ) -> None:
+        """Clear raw vision data to free memory.
 
         Removes pixel values and grid shapes from the request state to
-        reduce memory usage after vision embeddings have been computed.
-        The mm_features list with cached embeddings is preserved to
-        support multi-turn conversations.
+        reduce memory usage after vision embeddings have been safely
+        cached or when the request finishes. The mm_features list with
+        cached embeddings is preserved to support preemption resume and
+        multi-turn conversations unless ``detach_features=True`` (used on
+        terminal request cleanup to drop references without mutating any
+        potentially shared feature instances in place).
+
+        Args:
+            skip_feature_ids: Optional set of ``id(feature)`` handles still
+                referenced by other live requests (e.g. ``n > 1`` siblings
+                sharing zero-copy features) whose raw pixel buffers must not
+                be mutated.
+            detach_features: When ``True``, detach ``self.mm_features = []``
+                instead of calling ``feat.clear_pixel_values()`` in place.
 
         Side Effects:
             - Sets pixel_values, image_grid_thw, pixel_values_videos,
               and video_grid_thw to None.
-            - Calls clear_pixel_values() on each feature in mm_features.
+            - Either clears ``mm_features`` (when ``detach_features=True``)
+              or calls ``clear_pixel_values()`` on each non-skipped feature.
             - Sets _vision_processed to True.
         """
         self.pixel_values = None
         self.image_grid_thw = None
         self.pixel_values_videos = None
         self.video_grid_thw = None
-        for feat in self.mm_features:
-            if hasattr(feat, "clear_pixel_values"):
-                feat.clear_pixel_values()
+        if detach_features:
+            self.mm_features = []
+        else:
+            for feat in self.mm_features or ():
+                if skip_feature_ids is not None and id(feat) in skip_feature_ids:
+                    continue
+                if hasattr(feat, "clear_pixel_values"):
+                    feat.clear_pixel_values()
         self._vision_processed = True
 
     def get_token_id(self, idx: int) -> int:

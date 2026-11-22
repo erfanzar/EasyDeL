@@ -151,7 +151,10 @@ class DeepseekV41DSparkStage(spx.Module):
         )
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc.coefficients(hidden_streams)
         mlp_input = self.post_attention_layernorm(manifold_collapse(attn_pre, hidden_streams))
-        mlp_output, _ = self.mlp(mlp_input)
+        mlp_output, _ = self.mlp(
+            mlp_input,
+            post_write_gate=self.ffn_hc.fused_post_write_gate(hidden_streams, ffn_post, ffn_comb),
+        )
         mlp_output = checkpoint_name(mlp_output, "mlp_output")
         hidden_streams = manifold_residual_write(
             hidden_streams, mlp_output, ffn_post, ffn_comb, precision=self.precision

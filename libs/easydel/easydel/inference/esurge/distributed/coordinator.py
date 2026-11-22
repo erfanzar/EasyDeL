@@ -32,6 +32,7 @@ for correctness.
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import typing
 from dataclasses import dataclass
@@ -173,11 +174,35 @@ def _jax_distributed_state():
     return global_state
 
 
+def format_tcp_endpoint(host: str, port: int) -> str:
+    """Format a ZeroMQ ``tcp://`` endpoint, bracketing IPv6 literals."""
+    bare = str(host).strip()
+    if bare.startswith("[") and bare.endswith("]"):
+        bare = bare[1:-1]
+    if ":" in bare:
+        return f"tcp://[{bare}]:{int(port)}"
+    return f"tcp://{bare}:{int(port)}"
+
+
 def _split_host_port(address: str) -> tuple[str, int | None]:
-    """Split ``host:port`` (an IPv6 host may be bracketed); the port is ``None`` when absent or not numeric."""
-    host, sep, port = str(address).rpartition(":")
+    """Split ``host:port`` (IPv6 hosts may be bracketed or bare); port is ``None`` when absent or not numeric."""
+    raw = str(address).strip()
+    if raw.startswith("["):
+        host, sep, rest = raw[1:].partition("]")
+        if sep:
+            if rest.startswith(":") and rest[1:].isdigit():
+                return host, int(rest[1:])
+            return host, None
+    try:
+        ipaddress.ip_address(raw)
+        return raw, None
+    except ValueError:
+        pass
+    if raw.count(":") > 1:
+        return raw, None
+    host, sep, port = raw.rpartition(":")
     if not sep or not port.isdigit():
-        return str(address).strip("[]"), None
+        return raw.strip("[]"), None
     return host.strip("[]"), int(port)
 
 
@@ -218,19 +243,24 @@ def _advertised_leader_addr(bind_host: str, configured: str | None) -> str | Non
     reach the JAX coordinator (reachable by every process of the same JAX world), then the hostname's address.
     """
     if configured:
-        return str(configured)
+        return str(configured).strip("[]")
     if str(bind_host) not in _WILDCARD_BIND_HOSTS:
-        return str(bind_host)
+        return str(bind_host).strip("[]")
+    family = socket.AF_INET6 if str(bind_host) in {"::", "[::]"} else socket.AF_INET
     state = _jax_distributed_state()
     coordinator = getattr(state, "coordinator_address", None) if state is not None else None
     if coordinator:
         # Advertise an address of the family the control socket listens on: the default wildcard bind is IPv4, and
         # a hostname coordinator on a dual-stack host can also resolve to IPv6.
-        family = socket.AF_INET6 if str(bind_host) in {"::", "[::]"} else socket.AF_INET
         addr = _local_ip_towards(*_split_host_port(coordinator), family=family)
         if addr:
             return addr
     try:
+        if family == socket.AF_INET6:
+            infos = socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET6, type=socket.SOCK_STREAM)
+            if infos:
+                return str(infos[0][4][0])
+            return None
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return None

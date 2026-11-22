@@ -55,6 +55,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import weakref
 
 from .metrics import MetricsCollector, get_metrics_collector
 
@@ -159,63 +160,84 @@ class PrometheusMetrics:
             raise ImportError("prometheus_client not available. Install with: pip install prometheus-client")
 
         self.prefix = prefix
+        # Track every collector incrementally so a mid-init registration error
+        # unregisters already-created collectors from the global REGISTRY.
+        self._collectors: list = []
 
-        self.requests_total = Counter(f"{prefix}requests_total", "Total number of requests", ["status"])
+        def _track(collector):
+            self._collectors.append(collector)
+            return collector
 
-        self.request_duration = Histogram(
-            f"{prefix}request_duration_seconds",
-            "Request duration in seconds",
-            buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
-        )
+        try:
+            self.requests_total = _track(Counter(f"{prefix}requests_total", "Total number of requests", ["status"]))
 
-        self.time_to_first_token = Histogram(
-            f"{prefix}time_to_first_token_seconds",
-            "Time to first token in seconds",
-            buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
-        )
+            self.request_duration = _track(
+                Histogram(
+                    f"{prefix}request_duration_seconds",
+                    "Request duration in seconds",
+                    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+                )
+            )
 
-        self.tokens_generated_total = Counter(f"{prefix}tokens_generated_total", "Total number of tokens generated")
+            self.time_to_first_token = _track(
+                Histogram(
+                    f"{prefix}time_to_first_token_seconds",
+                    "Time to first token in seconds",
+                    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+                )
+            )
 
-        self.tokens_per_second = Gauge(f"{prefix}tokens_per_second", "Current tokens per second throughput")
+            self.tokens_generated_total = _track(
+                Counter(f"{prefix}tokens_generated_total", "Total number of tokens generated")
+            )
 
-        self.waiting_requests = Gauge(f"{prefix}waiting_requests", "Number of requests waiting to be scheduled")
+            self.tokens_per_second = _track(
+                Gauge(f"{prefix}tokens_per_second", "Current tokens per second throughput")
+            )
 
-        self.running_requests = Gauge(f"{prefix}running_requests", "Number of currently running requests")
+            self.waiting_requests = _track(
+                Gauge(f"{prefix}waiting_requests", "Number of requests waiting to be scheduled")
+            )
 
-        self.scheduled_tokens = Gauge(f"{prefix}scheduled_tokens", "Number of tokens scheduled in current batch")
+            self.running_requests = _track(Gauge(f"{prefix}running_requests", "Number of currently running requests"))
 
-        self.preempted_requests_total = Counter(
-            f"{prefix}preempted_requests_total", "Total number of preempted requests"
-        )
+            self.scheduled_tokens = _track(
+                Gauge(f"{prefix}scheduled_tokens", "Number of tokens scheduled in current batch")
+            )
 
-        self.schedule_duration = Histogram(
-            f"{prefix}schedule_duration_seconds",
-            "Scheduler operation duration in seconds",
-            buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1],
-        )
+            self.preempted_requests_total = _track(
+                Counter(f"{prefix}preempted_requests_total", "Total number of preempted requests")
+            )
 
-        self.model_execution_duration = Histogram(
-            f"{prefix}model_execution_duration_seconds",
-            "Model execution duration in seconds",
-            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
-        )
+            self.schedule_duration = _track(
+                Histogram(
+                    f"{prefix}schedule_duration_seconds",
+                    "Scheduler operation duration in seconds",
+                    buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1],
+                )
+            )
 
-        self.batch_size = Gauge(f"{prefix}batch_size", "Current batch size")
+            self.model_execution_duration = _track(
+                Histogram(
+                    f"{prefix}model_execution_duration_seconds",
+                    "Model execution duration in seconds",
+                    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
+                )
+            )
 
-        self.cache_pages_total = Gauge(f"{prefix}cache_pages_total", "Total number of cache pages")
+            self.batch_size = _track(Gauge(f"{prefix}batch_size", "Current batch size"))
 
-        self.cache_pages_used = Gauge(f"{prefix}cache_pages_used", "Number of used cache pages")
+            self.cache_pages_total = _track(Gauge(f"{prefix}cache_pages_total", "Total number of cache pages"))
 
-        self.cache_hit_rate = Gauge(f"{prefix}cache_hit_rate", "Cache hit rate (0-1)")
+            self.cache_pages_used = _track(Gauge(f"{prefix}cache_pages_used", "Number of used cache pages"))
 
-        self.system_info = Info(f"{prefix}system_info", "System information")
-        self.system_info.info(self._collect_system_info())
+            self.cache_hit_rate = _track(Gauge(f"{prefix}cache_hit_rate", "Cache hit rate (0-1)"))
 
-        # Every collector registered in the default registry, so ``close`` can
-        # release the metric names and a later instance can register them again.
-        self._collectors = [
-            value for value in vars(self).values() if isinstance(value, (Counter, Gauge, Histogram, Info))
-        ]
+            self.system_info = _track(Info(f"{prefix}system_info", "System information"))
+            self.system_info.info(self._collect_system_info())
+        except BaseException:
+            self.close()
+            raise
 
         # Monotonic cursor: total requests seen so far (completed + failed).
         # Used to process only new completions from the deque without
@@ -798,8 +820,62 @@ _console_monitor: RichConsoleMonitor | None = None
 _monitoring_lock = threading.RLock()
 # Each successful start acquires one idempotent lease per owner. ``None`` is
 # the legacy process-wide owner; stack shutdown must not release that lease.
-_monitoring_server_owners: dict[int | None, object | None] = {}
-_console_monitor_owners: dict[int | None, object | None] = {}
+# Non-None owners are tracked via weakref.finalize so abandoned engines are
+# never pinned in module globals and automatically release their leases on GC.
+_monitoring_server_owners: dict[int | None, tuple[object, weakref.finalize | None] | None] = {}
+_console_monitor_owners: dict[int | None, tuple[object, weakref.finalize | None] | None] = {}
+
+
+def _detach_owner_lease(entry: tuple[object, weakref.finalize | None] | None) -> None:
+    if entry is not None and entry[1] is not None:
+        entry[1].detach()
+
+
+def _release_gc_owner_lease(owner_key: int, token: object, service: str) -> None:
+    """Release an owner's lease automatically when the owner object is garbage-collected."""
+    global _monitoring_server, _console_monitor
+
+    with _monitoring_lock:
+        if service == "server":
+            entry = _monitoring_server_owners.get(owner_key)
+            if entry is None or entry[0] is not token:
+                return
+            _monitoring_server_owners.pop(owner_key, None)
+            if not _monitoring_server_owners and _monitoring_server is not None:
+                _monitoring_server.stop()
+                _monitoring_server = None
+        elif service == "console":
+            entry = _console_monitor_owners.get(owner_key)
+            if entry is None or entry[0] is not token:
+                return
+            _console_monitor_owners.pop(owner_key, None)
+            if not _console_monitor_owners and _console_monitor is not None:
+                _console_monitor.stop()
+                _console_monitor = None
+
+
+def _acquire_owner_lease(
+    owners: dict[int | None, tuple[object, weakref.finalize | None] | None],
+    owner: object | None,
+    service: str,
+) -> None:
+    """Record an idempotent owner lease without holding a strong reference to ``owner``."""
+    if owner is None:
+        owners[None] = None
+        return
+    owner_key = id(owner)
+    existing = owners.get(owner_key)
+    if existing is not None:
+        _tok, existing_fin = existing
+        if existing_fin is None or existing_fin.alive:
+            return
+    token = object()
+    try:
+        fin = weakref.finalize(owner, _release_gc_owner_lease, owner_key, token, service)
+        fin.atexit = False
+    except TypeError:
+        fin = None
+    owners[owner_key] = (token, fin)
 
 
 def start_monitoring_server(
@@ -844,7 +920,7 @@ def start_monitoring_server(
             _monitoring_server = server
         else:
             _monitoring_server.start()
-        _monitoring_server_owners[None if owner is None else id(owner)] = owner
+        _acquire_owner_lease(_monitoring_server_owners, owner, "server")
         return _monitoring_server
 
 
@@ -876,7 +952,7 @@ def start_console_monitor(refresh_rate: float = 1.0, *, owner: object | None = N
             _console_monitor = monitor
         else:
             _console_monitor.start()
-        _console_monitor_owners[None if owner is None else id(owner)] = owner
+        _acquire_owner_lease(_console_monitor_owners, owner, "console")
         return _console_monitor
 
 
@@ -904,11 +980,15 @@ def stop_monitoring(*, owner: object | None = None) -> None:
         stop_server = owner is None or owner_key in _monitoring_server_owners
         stop_console = owner is None or owner_key in _console_monitor_owners
         if owner is None:
+            for entry in _monitoring_server_owners.values():
+                _detach_owner_lease(entry)
+            for entry in _console_monitor_owners.values():
+                _detach_owner_lease(entry)
             _monitoring_server_owners.clear()
             _console_monitor_owners.clear()
         else:
-            _monitoring_server_owners.pop(owner_key, None)
-            _console_monitor_owners.pop(owner_key, None)
+            _detach_owner_lease(_monitoring_server_owners.pop(owner_key, None))
+            _detach_owner_lease(_console_monitor_owners.pop(owner_key, None))
 
         if stop_server and not _monitoring_server_owners and _monitoring_server is not None:
             _monitoring_server.stop()

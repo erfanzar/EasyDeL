@@ -387,6 +387,74 @@ class BatchMetadataPreparer:
         if async_preparer is not None:
             async_preparer.host_payloads_replicated = enabled
 
+    def invalidate_page_table_cache(self) -> None:
+        """Drop cached device page-table state on this preparer and any retained children."""
+        self._cached_pages_tables_dev = None
+        self._cached_page_table_version = None
+        self._cached_rows_to_copy = None
+        for _, child in getattr(self, "_cache_group_preparers", {}).values():
+            child.invalidate_page_table_cache()
+        async_preparer = getattr(self, "_async_group_preparer", None)
+        if async_preparer is not None:
+            async_preparer.invalidate_page_table_cache()
+
+    def clear_device_caches(self) -> None:
+        """Drop all cached device arrays and pending transfers on this preparer and any retained children."""
+        self._cached_pages_tables_dev = None
+        self._cached_page_table_version = None
+        self._cached_rows_to_copy = None
+        zero_cache = getattr(self, "_zero_dev_cache", None)
+        if zero_cache is not None:
+            zero_cache.clear()
+        payload_cache = getattr(self, "_payload_put_cache", None)
+        if payload_cache is not None:
+            payload_cache.clear()
+        self._pending_transfer = None
+        self._pending_transfer_metadata = None
+        if hasattr(self, "_pending_group_result"):
+            self._pending_group_result = None
+        for _, child in getattr(self, "_cache_group_preparers", {}).values():
+            if hasattr(child, "clear_device_caches"):
+                child.clear_device_caches()
+            else:
+                child.invalidate_page_table_cache()
+        async_preparer = getattr(self, "_async_group_preparer", None)
+        if async_preparer is not None:
+            if hasattr(async_preparer, "clear_device_caches"):
+                async_preparer.clear_device_caches()
+            else:
+                async_preparer.invalidate_page_table_cache()
+
+    def _broadcast_host_payload(self, host_payload: tuple) -> tuple:
+        """Broadcast only non-device entries of ``host_payload`` from process 0.
+
+        Already-device leaves (such as ``_cached_pages_tables_dev``) were already
+        synchronized across processes when cached; passing them to
+        ``broadcast_one_to_all`` forces an unnecessary D2H + collective + H2D
+        round-trip every step.
+        """
+        from jax.experimental import multihost_utils
+
+        host_indices = [idx for idx, value in enumerate(host_payload) if not isinstance(value, jax.Array)]
+        if not host_indices:
+            return host_payload
+        if len(host_indices) == len(host_payload):
+            return multihost_utils.broadcast_one_to_all(host_payload)
+        broadcast_values = multihost_utils.broadcast_one_to_all(tuple(host_payload[idx] for idx in host_indices))
+        merged = list(host_payload)
+        for idx, value in zip(host_indices, broadcast_values, strict=True):
+            merged[idx] = value
+        return tuple(merged)
+
+    def _put_extra_host_payload(self, payload: tp.Any) -> tp.Any:
+        """Broadcast (when needed on replicated drivers) and place optional host payload via ``put_host_payload``."""
+        replicated = getattr(self, "host_payloads_replicated", None)
+        if host_payload_broadcast_needed(replicated):
+            from jax.experimental import multihost_utils
+
+            payload = multihost_utils.broadcast_one_to_all(payload)
+        return put_host_payload(payload, self._empty_sharding, host_payloads_replicated=replicated)
+
     def _get_zero_dev(self, *, namespace: str, shape: tuple[int, ...], dtype: np.dtype) -> jax.Array:
         """Get or create a cached zero-filled device array.
 
@@ -405,7 +473,11 @@ class BatchMetadataPreparer:
         key = (str(namespace), tuple(int(x) for x in shape), str(np.dtype(dtype)))
         cached = self._zero_dev_cache.get(key)
         if cached is None:
-            cached = jax.device_put(np.zeros(shape, dtype=dtype), self._empty_sharding)
+            cached = put_host_payload(
+                np.zeros(shape, dtype=dtype),
+                self._empty_sharding,
+                host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
+            )
             self._zero_dev_cache[key] = cached
         return cached
 
@@ -445,7 +517,10 @@ class BatchMetadataPreparer:
                 cache_entry = (key, shape, dtype)
                 pending_cache_keys[idx] = cache_entry
             put_indices.append(idx)
-            put_values.append(value)
+            # Snapshot reused host scratch arrays before async device_put so an
+            # overlapped next step cannot mutate backing memory while PJRT/CPU
+            # transfer or execution still reads it.
+            put_values.append(arr.copy() if isinstance(value, np.ndarray) else value)
             put_shardings.append(
                 self._input_sharding if self._uses_spmd_dp() and idx in (0, 1) else self._empty_sharding
             )
@@ -738,7 +813,7 @@ class BatchMetadataPreparer:
             if group.num_computed_tokens_cpu is not None and group.num_computed_tokens_cpu.shape != (row_count,):
                 raise ValueError("Cache group computed progress must align with the compact token window rows")
             cached = self._cache_group_preparers.get(index)
-            if cached is None or cached[0] != identity:
+            if cached is None:
                 child = BatchMetadataPreparer(
                     metadata=config,
                     empty_sharding=self._empty_sharding,
@@ -754,7 +829,10 @@ class BatchMetadataPreparer:
                 )
                 self._cache_group_preparers[index] = (identity, child)
             else:
-                child = cached[1]
+                prev_identity, child = cached
+                if prev_identity != identity:
+                    child.invalidate_page_table_cache()
+                    self._cache_group_preparers[index] = (identity, child)
             group_kwargs = dict(kwargs, page_table_cpu=group.page_table_cpu, page_table_version=group.page_table_version)
             if group.num_computed_tokens_cpu is not None:
                 group_kwargs["num_computed_tokens_cpu"] = group.num_computed_tokens_cpu
@@ -935,9 +1013,7 @@ class BatchMetadataPreparer:
         # replicated sharding. Skipped under the ZMQ step-replication plane,
         # where payloads are identical by construction (see host_sync).
         if host_payload_broadcast_needed(self.host_payloads_replicated):
-            from jax.experimental import multihost_utils
-
-            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
+            host_payload = self._broadcast_host_payload(host_payload)
 
         device_payload = self._device_put_host_payload(host_payload)
 
@@ -998,7 +1074,7 @@ class BatchMetadataPreparer:
         prefill_embeds_mask_dev = None
         extra_put_start = time.time()
         if mrope_position_ids_cpu is not None:
-            mrope_position_ids_dev = jax.device_put(mrope_position_ids_cpu, self._empty_sharding)
+            mrope_position_ids_dev = self._put_extra_host_payload(mrope_position_ids_cpu)
 
         # Prefill embedding overrides are rare outside of multimodal prompt regions.
         # Keep device buffers stable, but only transfer when the mask selects any rows.
@@ -1009,8 +1085,9 @@ class BatchMetadataPreparer:
                     namespace="prefill_embeds_mask", arr=prefill_embeds_mask_cpu
                 )
                 if bool(prefill_embeds_mask_cpu.any()):
-                    prefill_embeds_dev = jax.device_put(prefill_embeds_cpu, self._empty_sharding)
-                    prefill_embeds_mask_dev = jax.device_put(prefill_embeds_mask_cpu, self._empty_sharding)
+                    prefill_embeds_dev, prefill_embeds_mask_dev = self._put_extra_host_payload(
+                        (prefill_embeds_cpu, prefill_embeds_mask_cpu)
+                    )
             else:
                 prefill_embeds_mask_dev = self._get_zero_dev(
                     namespace="prefill_embeds_mask",
@@ -1023,34 +1100,32 @@ class BatchMetadataPreparer:
         if visual_pos_masks_cpu is not None:
             visual_pos_masks_dev = self._get_zero_dev_like(namespace="visual_pos_masks", arr=visual_pos_masks_cpu)
             if bool(visual_pos_masks_cpu.any()):
-                visual_pos_masks_dev = jax.device_put(visual_pos_masks_cpu, self._empty_sharding)
+                visual_pos_masks_dev = self._put_extra_host_payload(visual_pos_masks_cpu)
         if deepstack_visual_embeds_cpu is not None:
             deepstack_visual_embeds_dev = tuple(
                 self._get_zero_dev_like(namespace=f"deepstack_visual_embeds:{idx}", arr=arr)
                 for idx, arr in enumerate(deepstack_visual_embeds_cpu)
             )
             if visual_pos_masks_cpu is not None and bool(visual_pos_masks_cpu.any()):
-                deepstack_visual_embeds_dev = tuple(
-                    jax.device_put(arr, self._empty_sharding) for arr in deepstack_visual_embeds_cpu
-                )
+                deepstack_visual_embeds_dev = self._put_extra_host_payload(tuple(deepstack_visual_embeds_cpu))
 
         pixel_values_dev = None
         image_grid_thw_dev = None
         pixel_values_videos_dev = None
         video_grid_thw_dev = None
         if pixel_values is not None:
-            pixel_values_dev = jax.device_put(pixel_values, self._empty_sharding)
+            pixel_values_dev = self._put_extra_host_payload(pixel_values)
         if image_grid_thw is not None:
-            image_grid_thw_dev = jax.device_put(image_grid_thw, self._empty_sharding)
+            image_grid_thw_dev = self._put_extra_host_payload(image_grid_thw)
         if pixel_values_videos is not None:
-            pixel_values_videos_dev = jax.device_put(pixel_values_videos, self._empty_sharding)
+            pixel_values_videos_dev = self._put_extra_host_payload(pixel_values_videos)
         if video_grid_thw is not None:
-            video_grid_thw_dev = jax.device_put(video_grid_thw, self._empty_sharding)
+            video_grid_thw_dev = self._put_extra_host_payload(video_grid_thw)
         model_side_inputs_dev = None
         if model_side_inputs_cpu:
-            model_side_inputs_dev = {
-                name: jax.device_put(value, self._empty_sharding) for name, value in model_side_inputs_cpu.items()
-            }
+            side_names = tuple(model_side_inputs_cpu.keys())
+            side_values = self._put_extra_host_payload(tuple(model_side_inputs_cpu.values()))
+            model_side_inputs_dev = dict(zip(side_names, side_values, strict=True))
         extra_put_took = time.time() - extra_put_start
 
         # Expose a timing breakdown to the execution manager (for perf logs).
@@ -1388,9 +1463,7 @@ class BatchMetadataPreparer:
 
         device_put_start = time.time()
         if host_payload_broadcast_needed(self.host_payloads_replicated):
-            from jax.experimental import multihost_utils
-
-            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
+            host_payload = self._broadcast_host_payload(host_payload)
         self._pending_transfer = self._device_put_host_payload(host_payload)
         device_put_took = time.time() - device_put_start
         self._pending_transfer_metadata = {
@@ -1629,11 +1702,7 @@ class BatchMetadataPreparer:
             raise ValueError("Speculative window handoff does not serve rank-major SPMD DP batches.")
         sources = handoff.sources
         if not isinstance(sources, jax.Array):
-            sources = put_host_payload(
-                np.asarray(sources, dtype=np.int32),
-                self._empty_sharding,
-                host_payloads_replicated=self.host_payloads_replicated,
-            )
+            sources = self._put_extra_host_payload(np.asarray(sources, dtype=np.int32))
         # The verify program may run on another placement (the drafter's mesh); move its outputs device-to-device
         # onto the step's input placement (no copy when it already matches, never a host read).
         last_token, accepted, drafts = (

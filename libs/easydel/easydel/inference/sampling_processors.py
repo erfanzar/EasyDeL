@@ -25,6 +25,29 @@ import numpy as np
 _MASKED_LOGIT = -1e10
 
 
+def _masked_logit_value(dtype: jnp.dtype) -> jax.Array:
+    """Return a finite masked-logit floor representable in ``dtype``.
+
+    ``-1e10`` overflows ``float16`` (min ``-65504.0``) to ``-inf``, which can
+    produce ``NaN`` softmax outputs on fully masked rows. Clamping to
+    ``finfo(dtype).min`` keeps ``float32``/``bfloat16`` at ``-1e10`` and keeps
+    ``float16`` finite.
+    """
+    resolved = jnp.dtype(dtype)
+    if jnp.issubdtype(resolved, jnp.floating):
+        value = max(_MASKED_LOGIT, float(jnp.finfo(resolved).min))
+    else:
+        value = _MASKED_LOGIT
+    return jnp.asarray(value, dtype=resolved)
+
+
+def _align_constraint_to_logits(arr: jax.Array, logits: jax.Array) -> jax.Array:
+    """Broadcast 2D ``(batch, vocab)`` constraints across 3D ``(batch, k, vocab)`` logits."""
+    if logits.ndim == 3 and arr.ndim == 2 and arr.shape[0] == logits.shape[0] and arr.shape[1] == logits.shape[2]:
+        return arr[:, None, :]
+    return arr
+
+
 @dataclasses.dataclass(frozen=True)
 class SamplingConstraints:
     """One step's per-request logit bias, allow-lists and banned next tokens, as sparse ``(row, token)`` entries.
@@ -134,7 +157,17 @@ def apply_sparse_sampling_constraints(
     Adds the bias entries, masks every token a restricted row does not allow, then masks the banned entries, in the
     order of :func:`apply_sampling_constraints`. Entries whose row or token is out of range are dropped.
     """
-    masked = jnp.asarray(_MASKED_LOGIT, dtype=logits.dtype)
+    num_rows, vocab_size = int(logits.shape[0]), int(logits.shape[1])
+    # JAX ``mode="drop"`` wraps negative indices in ``[-dim, -1]`` onto tail
+    # elements instead of dropping them; map negative indices out-of-bounds first.
+    bias_rows = jnp.where(bias_rows >= 0, bias_rows, num_rows)
+    bias_tokens = jnp.where(bias_tokens >= 0, bias_tokens, vocab_size)
+    allowed_rows = jnp.where(allowed_rows >= 0, allowed_rows, num_rows)
+    allowed_tokens = jnp.where(allowed_tokens >= 0, allowed_tokens, vocab_size)
+    banned_rows = jnp.where(banned_rows >= 0, banned_rows, num_rows)
+    banned_tokens = jnp.where(banned_tokens >= 0, banned_tokens, vocab_size)
+
+    masked = _masked_logit_value(logits.dtype)
     logits = logits.at[bias_rows, bias_tokens].add(bias_values.astype(logits.dtype), mode="drop")
     allowed = jnp.zeros(logits.shape, dtype=jnp.bool_).at[allowed_rows, allowed_tokens].set(True, mode="drop")
     logits = jnp.where(restricted[:, None] & ~allowed, masked, logits)
@@ -150,13 +183,18 @@ def apply_sampling_constraints(
     """Apply per-request logit bias, allowed-token and bad-token masks given as dense arrays.
 
     ``allowed_token_ids_mask`` uses ``True`` for allowed tokens and ``bad_words_token_ids`` uses ``True`` for banned
-    tokens. ``None`` leaves the corresponding constraint disabled. The masks use ``-1e10`` rather than NaN so greedy
-    and sampled paths have finite logits for every row.
+    tokens. ``None`` leaves the corresponding constraint disabled. The masks use a dtype-safe finite floor (``-1e10``
+    for float32/bfloat16, ``-65504.0`` for float16) rather than NaN or ``-inf`` so greedy and sampled paths have finite
+    logits for every row.
     """
+    masked = _masked_logit_value(logits.dtype)
     if logit_bias is not None:
-        logits = logits + logit_bias.astype(logits.dtype)
+        bias = _align_constraint_to_logits(jnp.asarray(logit_bias), logits).astype(logits.dtype)
+        logits = logits + bias
     if allowed_token_ids_mask is not None:
-        logits = jnp.where(allowed_token_ids_mask, logits, _MASKED_LOGIT)
+        allow_mask = _align_constraint_to_logits(jnp.asarray(allowed_token_ids_mask, dtype=jnp.bool_), logits)
+        logits = jnp.where(allow_mask, logits, masked)
     if bad_words_token_ids is not None:
-        logits = jnp.where(bad_words_token_ids, _MASKED_LOGIT, logits)
+        bad_mask = _align_constraint_to_logits(jnp.asarray(bad_words_token_ids, dtype=jnp.bool_), logits)
+        logits = jnp.where(bad_mask, masked, logits)
     return logits

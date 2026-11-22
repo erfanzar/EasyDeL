@@ -42,6 +42,123 @@ DP_AXIS = "dp"
 _HOST_KEY = "easydel/esurge/serving/replica_host/{port}/{process}"
 
 
+def _parse_accelerator_type(value: str | None) -> tuple[str, int | None] | None:
+    """Parse a ``TPU_ACCELERATOR_TYPE`` string like ``'v5litepod-16'`` into ``(prefix, total_cores)``."""
+    if not value:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    prefix, sep, count = raw.rpartition("-")
+    if sep and prefix and count.isdigit():
+        return prefix, int(count)
+    return raw, None
+
+
+def _generation_from_prefix(prefix: str) -> tuple[str, int] | None:
+    """Return ``(generation_family, physical_cores_per_chip)`` for an accelerator-type prefix."""
+    norm = prefix.strip().lower().replace("_", "-")
+    for token, family, cores in (
+        ("v6e", "v6e", 1),
+        ("ct6e", "v6e", 1),
+        ("trillium", "v6e", 1),
+        ("v5litepod", "v5e", 1),
+        ("v5lite", "v5e", 1),
+        ("v5e", "v5e", 1),
+        ("ct5e", "v5e", 1),
+        ("ct5lp", "v5e", 1),
+        ("v5p", "v5p", 2),
+        ("ct5p", "v5p", 2),
+        ("v4i", "v4i", 1),
+        ("v4lite", "v4i", 1),
+        ("v4", "v4", 2),
+        ("ct4", "v4", 2),
+        ("v3", "v3", 2),
+        ("v2", "v2", 2),
+        ("tpu7x", "tpu7x", 2),
+        ("v7x", "tpu7x", 2),
+        ("tpu7", "tpu7", 2),
+        ("v7", "tpu7", 2),
+    ):
+        if norm == token or norm.startswith(f"{token}-"):
+            return family, cores
+    return None
+
+
+def _spec_from_device_kind(device_kind: str | None) -> tuple[str, str, int] | None:
+    """Map a JAX ``device.device_kind`` string to ``(accelerator_prefix, family, cores_per_chip)``."""
+    if not device_kind:
+        return None
+    norm = " ".join(str(device_kind).strip().lower().split())
+    if not norm:
+        return None
+    if "v6e" in norm or "v6 lite" in norm or "trillium" in norm:
+        return "v6e", "v6e", 1
+    if "v5 lite" in norm or "v5e" in norm or "v5lite" in norm:
+        return "v5litepod", "v5e", 1
+    if "v5p" in norm or norm == "tpu v5":
+        return "v5p", "v5p", 2
+    if "v4 lite" in norm or "v4i" in norm:
+        return "v4i", "v4i", 1
+    if "v4" in norm:
+        return "v4", "v4", 2
+    if "v3" in norm:
+        return "v3", "v3", 2
+    if "v2" in norm:
+        return "v2", "v2", 2
+    if "7x" in norm:
+        return "tpu7x", "tpu7x", 2
+    if "tpu7" in norm or "tpu 7" in norm:
+        return "tpu7", "tpu7", 2
+    return None
+
+
+def _infer_accelerator_spec(
+    all_devices: tp.Sequence[tp.Any],
+    local_devices: tp.Sequence[tp.Any],
+    slice_extent: tp.Sequence[int],
+    chips_per_host: tp.Sequence[int],
+    env: tp.Mapping[str, str] | None = None,
+) -> tuple[str, int]:
+    """Derive ``(accelerator_prefix, cores_per_chip)`` from live devices and inherited ``TPU_ACCELERATOR_TYPE``."""
+    slice_chips = max(1, int(np.prod(slice_extent)))
+    host_chips = max(1, int(np.prod(chips_per_host)))
+    devices_per_chip = max(1, len(local_devices) // host_chips) if local_devices else 1
+
+    device_kind: str | None = None
+    for device in (*local_devices, *all_devices):
+        kind = getattr(device, "device_kind", None)
+        if isinstance(kind, str) and kind.strip():
+            device_kind = kind
+            break
+
+    source_env = os.environ if env is None else env
+    env_parsed = _parse_accelerator_type(source_env.get("TPU_ACCELERATOR_TYPE"))
+    dev_spec = _spec_from_device_kind(device_kind)
+
+    if dev_spec is not None:
+        dev_prefix, dev_family, dev_cores = dev_spec
+        if env_parsed is not None:
+            env_prefix, env_total = env_parsed
+            env_gen = _generation_from_prefix(env_prefix)
+            if env_gen is not None and env_gen[0] == dev_family:
+                if env_total is not None and env_total > 0 and env_total % slice_chips == 0:
+                    return env_prefix, max(1, env_total // slice_chips)
+                return env_prefix, max(dev_cores, devices_per_chip)
+        return dev_prefix, max(dev_cores, devices_per_chip)
+
+    if env_parsed is not None:
+        env_prefix, env_total = env_parsed
+        if env_total is not None and env_total > 0 and env_total % slice_chips == 0:
+            return env_prefix, max(1, env_total // slice_chips)
+        env_gen = _generation_from_prefix(env_prefix)
+        if env_gen is not None:
+            return env_prefix, max(env_gen[1], devices_per_chip)
+        return env_prefix, devices_per_chip
+
+    return "v5p", max(2, devices_per_chip)
+
+
 @dataclasses.dataclass(frozen=True)
 class BoxLayout:
     """A replica's devices as a contiguous box of the slice's chip torus.
@@ -51,12 +168,18 @@ class BoxLayout:
         extent: Chips per dimension of the box.
         slice_extent: Chips per dimension of the whole slice (a box dimension spanning it keeps its wraparound).
         chips_per_host: Chips per dimension of one host.
+        accelerator_prefix: TPU accelerator-type prefix (e.g. ``"v5p"``, ``"v4"``, ``"v5litepod"``, ``"v6e"``).
+            When omitted, derived from ``TPU_ACCELERATOR_TYPE`` in the environment.
+        cores_per_chip: Physical TensorCores per chip counted in ``TPU_ACCELERATOR_TYPE`` (2 for v2/v3/v4/v5p,
+            1 for v5e/v5litepod/v6e).
     """
 
     origin: tuple[int, int, int]
     extent: tuple[int, int, int]
     slice_extent: tuple[int, int, int]
     chips_per_host: tuple[int, int, int]
+    accelerator_prefix: str | None = None
+    cores_per_chip: int | None = None
 
     @property
     def host_bounds(self) -> tuple[int, int, int]:
@@ -67,14 +190,24 @@ class BoxLayout:
         x, y, z = ((int(chip[i]) - self.origin[i]) // self.chips_per_host[i] for i in range(3))
         return (z, y, x)
 
-    def libtpu_env(self, hostnames: tp.Sequence[str], rank: int) -> dict[str, str]:
+    def libtpu_env(
+        self,
+        hostnames: tp.Sequence[str],
+        rank: int,
+        *,
+        env: tp.Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         """The libtpu environment that makes this box its own TPU slice, for the worker at ``rank``."""
         chips = int(np.prod(self.extent))
+        if self.accelerator_prefix is not None and self.cores_per_chip is not None:
+            prefix, cores_per_chip = self.accelerator_prefix, int(self.cores_per_chip)
+        else:
+            prefix, cores_per_chip = _infer_accelerator_spec((), (), self.slice_extent, self.chips_per_host, env=env)
         return {
             "TPU_WORKER_HOSTNAMES": ",".join(hostnames),
             "TPU_WORKER_ID": str(int(rank)),
             "TPU_SKIP_MDS_QUERY": "1",
-            "TPU_ACCELERATOR_TYPE": f"v5p-{2 * chips}",
+            "TPU_ACCELERATOR_TYPE": f"{prefix}-{cores_per_chip * chips}",
             "TPU_TOPOLOGY": "x".join(str(v) for v in self.extent),
             "TPU_TOPOLOGY_WRAP": ",".join(
                 "true" if e == s else "false" for e, s in zip(self.extent, self.slice_extent, strict=True)
@@ -93,9 +226,12 @@ class ReplicaPlan:
         rank: This process's index in the replica world.
         num_processes: Processes in the replica world.
         coordinator: ``host:port`` of the replica world's JAX coordination service (its rank 0).
-        leaders: Address of every replica's leader, by replica index.
+        leaders: Address of every replica's planned rank 0 (its JAX coordinator), by replica index.
         token_fd: Inherited pipe holding the shared request-plane token (never on the command line).
         role: ``"engine"`` for a replica process, ``"front"`` for the process serving the OpenAI endpoint.
+        hosts: Every replica's host addresses in plan order, by replica index. libtpu numbers a replica world's
+            processes by its own host order, which need not match the plan's, so the engine leader
+            (``jax.process_index() == 0``) can be any of these hosts; the front finds it by asking each.
     """
 
     index: int
@@ -105,6 +241,9 @@ class ReplicaPlan:
     leaders: tuple[str, ...]
     token_fd: int = -1
     role: str = "engine"
+    hosts: tuple[tuple[str, ...], ...] = ()
+    front_index: int = 0
+    front_socket_dir: str = ""
 
     @property
     def count(self) -> int:
@@ -117,8 +256,12 @@ class ReplicaPlan:
 
     @property
     def spawns_front(self) -> bool:
-        """Whether this process starts the front (replica 0's leader, once its engine is up)."""
-        return self.role == "engine" and self.index == 0 and self.rank == 0
+        """Whether this process is in the replica whose engine leader starts the front (replica 0).
+
+        Only the process that turns out to lead replica 0's engine starts it; which process that is is known only
+        inside the replica world (``jax.process_index() == 0``), not from :attr:`rank`.
+        """
+        return self.role == "engine" and self.index == 0
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -127,6 +270,7 @@ class ReplicaPlan:
     def from_json(cls, text: str) -> ReplicaPlan:
         data = json.loads(text)
         data["leaders"] = tuple(data["leaders"])
+        data["hosts"] = tuple(tuple(h) for h in data.get("hosts", ()))
         return cls(**data)
 
     def read_token(self) -> str:
@@ -163,15 +307,28 @@ def box_layout(box: tp.Sequence[tp.Any], all_devices: tp.Sequence[tp.Any], local
     coords = np.asarray([tuple(d.coords)[:3] for d in box])
     origin = coords.min(axis=0)
     extent = coords.max(axis=0) - origin + 1
-    if int(np.prod(extent)) != len(box) or len({tuple(c) for c in coords}) != len(box):
+    unique_coords = {tuple(int(v) for v in c) for c in coords}
+    local = np.asarray([tuple(d.coords)[:3] for d in local_devices])
+    local_unique = {tuple(int(v) for v in c) for c in local}
+    if not local_unique or len(local_devices) % len(local_unique) != 0:
+        return None
+    devices_per_chip = len(local_devices) // len(local_unique)
+    if int(np.prod(extent)) != len(unique_coords) or len(box) != len(unique_coords) * devices_per_chip:
         return None
     full = np.asarray([tuple(d.coords)[:3] for d in all_devices]).max(axis=0) + 1
-    local = np.asarray([tuple(d.coords)[:3] for d in local_devices])
     per_host = local.max(axis=0) - local.min(axis=0) + 1
     if np.any(extent % per_host) or np.any(origin % per_host):
         return None
     as_tuple = lambda a: tuple(int(v) for v in a)  # noqa: E731
-    return BoxLayout(as_tuple(origin), as_tuple(extent), as_tuple(full), as_tuple(per_host))
+    prefix, cores_per_chip = _infer_accelerator_spec(all_devices, local_devices, full, per_host)
+    return BoxLayout(
+        as_tuple(origin),
+        as_tuple(extent),
+        as_tuple(full),
+        as_tuple(per_host),
+        accelerator_prefix=prefix,
+        cores_per_chip=cores_per_chip,
+    )
 
 
 def plan_replicas(
@@ -232,12 +389,14 @@ def plan_replicas(
     order = orders[mine]
     rank = next(i for i, (_, _, p) in enumerate(order) if p == me)
     hostnames = [addr for _, addr, _ in order]
+    coord_host = f"[{hostnames[0]}]" if ":" in hostnames[0] and not hostnames[0].startswith("[") else hostnames[0]
     plan = ReplicaPlan(
         index=mine,
         rank=rank,
         num_processes=len(order),
-        coordinator=f"{hostnames[0]}:{int(port)}",
+        coordinator=f"{coord_host}:{int(port)}",
         leaders=tuple(o[0][1] for o in orders),
+        hosts=tuple(tuple(addr for _, addr, _ in o) for o in orders),
     )
     return plan, layout.libtpu_env(hostnames, rank)
 
@@ -265,7 +424,7 @@ def reexec_into_replica(plan: ReplicaPlan, env: tp.Mapping[str, str], token: str
     os.execve(sys.executable, argv, child_env)
 
 
-def spawn_front(plan: ReplicaPlan, token: str) -> subprocess.Popen:
+def spawn_front(plan: ReplicaPlan, token: str, index: int = 0) -> subprocess.Popen:
     """Start the front: the same command, as a host-only process serving the OpenAI endpoint over every replica.
 
     The front runs JAX on the host CPU with no distributed world, so HTTP handling, routing and per-request
@@ -281,7 +440,7 @@ def spawn_front(plan: ReplicaPlan, token: str) -> subprocess.Popen:
         The front's process.
     """
     read_fd = _token_pipe(token)
-    front = dataclasses.replace(plan, role="front", token_fd=read_fd)
+    front = dataclasses.replace(plan, role="front", token_fd=read_fd, front_index=int(index))
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "ENABLE_DISTRIBUTED_INIT": "0"}
     sys.stdout.flush()
     sys.stderr.flush()

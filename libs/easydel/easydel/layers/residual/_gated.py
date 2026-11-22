@@ -72,7 +72,7 @@ def expand_streams(
 
 def inject_streams(
     hyper_input: Float[Array, "batch seq hc*hidden"],
-    sublayer_output: Float[Array, "batch seq hidden"],
+    sublayer_output: Float[Array, "batch seq hidden"] | Float[Array, "batch seq hc hidden"],
     injection_weights: Float[Array, "batch seq hc"],
 ) -> Float[Array, "batch seq hc*hidden"]:
     """Write a sub-layer output back onto the residual streams.
@@ -80,12 +80,17 @@ def inject_streams(
     Args:
         hyper_input: The streams as returned by :class:`GatedResidual` (the
             *unnormalized* input), ``[batch, seq, hc * hidden]``.
-        sublayer_output: Sub-layer output ``[batch, seq, hidden]``.
+        sublayer_output: Sub-layer output ``[batch, seq, hidden]``, or an
+            already-expanded ``sublayer_output * injection_weights`` tensor
+            ``[batch, seq, hc, hidden]`` from a sublayer that fused the write
+            gate into its backward pass.
         injection_weights: Per-branch scalar gates ``[batch, seq, hc]``.
 
     Returns:
         Updated streams: ``hyper_input + flatten(w_i * sublayer_output)``.
     """
+    if sublayer_output.ndim == hyper_input.ndim + 1:
+        return hyper_input + sublayer_output.astype(hyper_input.dtype).reshape(hyper_input.shape)
     injection = sublayer_output[..., None, :] * injection_weights[..., None]
     return hyper_input + injection.reshape(hyper_input.shape)
 
@@ -223,3 +228,24 @@ class GatedResidual(spx.Module):
             return mixed_input
         injection_weights = 2.0 * jax.nn.sigmoid(self.block_inject_weight(normed) / hc)
         return mixed_input, hyper_input, injection_weights
+
+    def fused_post_write_gate(
+        self,
+        hyper_input: Float[Array, "batch seq hc*hidden"],
+        injection_weights: Float[Array, "batch seq hc"],
+        *,
+        mesh: object | None = None,
+    ) -> Float[Array, "batch seq hc"] | None:
+        """Return ``injection_weights`` when a sublayer may fuse ``output * injection_weights``, else ``None``.
+
+        Sublayers such as :meth:`~easydel.layers.BaseMoeModule.moe_call` can fold the scalar-gated stream
+        expansion into their chunked custom-VJP backward so outer layer remat does not replay the sublayer
+        forward solely for ``d_injection``. Returns ``None`` on an MPMD pipeline mesh (``pp > 1``).
+        """
+        if mesh is not None:
+            from easydel.infra.sharding import is_mpmd_mesh
+
+            raw_mesh = getattr(mesh, "mesh", mesh)
+            if is_mpmd_mesh(raw_mesh):
+                return None
+        return injection_weights.astype(hyper_input.dtype)

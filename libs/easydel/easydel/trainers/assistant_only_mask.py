@@ -76,14 +76,28 @@ class AssistantSpanIds:
 
     Attributes:
         header_ids: Ids of the assistant header (the text right before assistant content).
-        end_id: Id that closes an assistant turn (included in the span).
+        end_id: First id of the terminator that closes an assistant turn.
         newline_family: Alternate ids accepted at the header's final position when the header ends
-            with a newline that BPE may fuse with newline-leading content.
+            with a standalone newline token that BPE may fuse with newline-leading content.
+        end_ids: Full token-id sequence that closes an assistant turn (included in the span).
+            Defaults to ``(end_id,)`` when omitted.
+        structure_ids: Additional single-token role/turn markers (e.g. user/system opening tokens
+            on templates with distinct per-role markers like Phi-3 or DeepSeek) that identify chat
+            structure even when no assistant turn or terminator is present.
+        structure_sequences: Additional multi-token role/turn opening sequences used for chat
+            structure detection when the user/system opening prefix is not a single special token.
     """
 
     header_ids: tuple[int, ...]
     end_id: int
     newline_family: tuple[int, ...] = ()
+    end_ids: tuple[int, ...] = ()
+    structure_ids: tuple[int, ...] = ()
+    structure_sequences: tuple[tuple[int, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.end_ids:
+            object.__setattr__(self, "end_ids", (int(self.end_id),))
 
 
 def _encode(tokenizer: tp.Any, text: str) -> list[int]:
@@ -99,6 +113,74 @@ def _encode(tokenizer: tp.Any, text: str) -> list[int]:
                 continue
             raise
     raise RuntimeError("tokenizer encode kept hitting the borrow race") from last_exc
+
+
+def _extract_role_prefix_text(tokenizer: tp.Any, rendered: str, sentinel: str) -> str:
+    """Return the role-opening prefix before ``sentinel`` with any leading BOS token stripped."""
+    pos = rendered.find(sentinel)
+    if pos <= 0:
+        return ""
+    prefix = rendered[:pos]
+    bos = getattr(tokenizer, "bos_token", None)
+    if isinstance(bos, str) and bos and prefix.startswith(bos):
+        prefix = prefix[len(bos) :]
+    return prefix
+
+
+def _derive_template_structure_markers(
+    tokenizer: tp.Any,
+    *,
+    without_user_rendered: str | None = None,
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    """Derive user/system role-opening token ids/sequences from the tokenizer chat template."""
+    if not getattr(tokenizer, "chat_template", None):
+        return (), ()
+    prefixes: list[str] = []
+    if isinstance(without_user_rendered, str):
+        p = _extract_role_prefix_text(tokenizer, without_user_rendered, _HEADER_SENTINEL_USER)
+        if p.strip():
+            prefixes.append(p)
+    else:
+        try:
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": _HEADER_SENTINEL_USER}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            if isinstance(rendered, str):
+                p = _extract_role_prefix_text(tokenizer, rendered, _HEADER_SENTINEL_USER)
+                if p.strip():
+                    prefixes.append(p)
+        except Exception:
+            pass
+    try:
+        sys_rendered = tokenizer.apply_chat_template(
+            [{"role": "system", "content": _HEADER_SENTINEL_USER}],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        if isinstance(sys_rendered, str):
+            p = _extract_role_prefix_text(tokenizer, sys_rendered, _HEADER_SENTINEL_USER)
+            if p.strip() and p not in prefixes:
+                prefixes.append(p)
+    except Exception:
+        pass
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", ()) or ())
+    single_ids: set[int] = set()
+    sequences: list[tuple[int, ...]] = []
+    for prefix in prefixes:
+        try:
+            toks = tuple(_encode(tokenizer, prefix))
+        except Exception:
+            continue
+        if not toks:
+            continue
+        if len(toks) == 1 or toks[0] in special_ids:
+            single_ids.add(int(toks[0]))
+        elif toks not in sequences:
+            sequences.append(toks)
+    return tuple(sorted(single_ids)), tuple(sequences)
 
 
 def _template_header_and_end(tokenizer: tp.Any) -> tuple[str, str]:
@@ -148,7 +230,7 @@ def derive_assistant_span_ids(
         end_text: Explicit assistant terminator text; ``None`` derives it from the chat template.
 
     Returns:
-        AssistantSpanIds: Header ids, terminator id and newline family.
+        AssistantSpanIds: Header ids, terminator id, newline family, and role-opening structure ids.
 
     Raises:
         RuntimeError: When the signature cannot be derived. A requested mask must never silently
@@ -176,58 +258,110 @@ def derive_assistant_span_ids(
             f"assistant-span markers encode to nothing (header={header_text!r}, end={end_text!r}); set "
             "`assistant_header_text` / `assistant_end_text` explicitly."
         )
+    end_ids = tuple(int(t) for t in end)
     family: set[int] = set()
     if header_text.endswith("\n"):
-        for repeat in range(1, 9):
-            try:
-                toks = _encode(tokenizer, "\n" * repeat)
-            except Exception:
-                break
-            if toks:
-                family.add(int(toks[0]))
-    return AssistantSpanIds(header_ids=header, end_id=int(end[0]), newline_family=tuple(sorted(family)))
+        nl_toks = _encode(tokenizer, "\n")
+        base_toks = tuple(_encode(tokenizer, header_text[:-1])) if len(header_text) > 1 else ()
+        if len(nl_toks) == 1 and header == (*base_toks, int(nl_toks[0])):
+            for repeat in range(1, 9):
+                try:
+                    toks = _encode(tokenizer, "\n" * repeat)
+                except Exception:
+                    break
+                if toks:
+                    family.add(int(toks[0]))
+    structure_ids, structure_sequences = _derive_template_structure_markers(tokenizer)
+    return AssistantSpanIds(
+        header_ids=header,
+        end_id=end_ids[0],
+        newline_family=tuple(sorted(family)),
+        end_ids=end_ids,
+        structure_ids=structure_ids,
+        structure_sequences=structure_sequences,
+    )
+
+
+def _find_subsequence_starts(seg: np.ndarray, pattern: tuple[int, ...]) -> np.ndarray:
+    """Return sorted start indices where ``pattern`` occurs in 1-D array ``seg``."""
+    plen = len(pattern)
+    if plen == 0 or seg.shape[0] < plen:
+        return np.empty(0, dtype=np.int64)
+    if plen == 1:
+        return np.flatnonzero(seg == pattern[0])
+    n = seg.shape[0] - plen + 1
+    hit = np.ones(n, dtype=bool)
+    for offset, tok in enumerate(pattern):
+        hit &= seg[offset : n + offset] == tok
+    return np.flatnonzero(hit)
 
 
 def assistant_mask_from_token_ids(
     input_ids: np.ndarray,
     span_ids: AssistantSpanIds,
     segment_ids: np.ndarray | None = None,
+    *,
+    fallback_to_full_on_plain_text: bool = True,
+    strict_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build a ``[batch, seq]`` assistant-span mask by scanning token ids.
 
-    A span starts right after each assistant header and runs through the next terminator id
+    A span starts right after each assistant header and runs through the next terminator sequence
     (inclusive); a span cut by its row/segment edge runs to that edge. Rules apply per contiguous
-    segment when ``segment_ids`` is given, so spans never cross document boundaries:
+    non-negative segment when ``segment_ids`` is given (``segment_ids < 0`` padding stays zero), so
+    spans never cross document boundaries:
 
-    * a segment with no role-marker structure (neither the header's first id nor the terminator) is
-      plain text and is fully supervised;
-    * a segment with structure but no complete header (e.g. a truncated window that lost its
-      header) fails safe to all zeros;
-    * when the header ends with a newline, a fused newline id at that position is accepted and the
-      span starts AT the fused token (it carries content).
+    * a segment with no role-marker structure (neither the header's first id, nor user/system
+      ``structure_ids``/``structure_sequences``, nor the terminator) is plain text and is fully
+      supervised unless ``fallback_to_full_on_plain_text=False`` or ``strict_mask`` is set on that
+      segment (in which case it fails safe to zeros);
+    * a segment with structure but no complete header (e.g. a user-only or truncated window that
+      lost its assistant header) fails safe to all zeros;
+    * when the header ends with a standalone newline token, a fused newline id at that position is
+      accepted and the span starts AT the fused token (it carries content).
 
     Args:
         input_ids: ``[batch, seq]`` token ids.
         span_ids: The span signature.
         segment_ids: Optional ``[batch, seq]`` packed-document ids.
+        fallback_to_full_on_plain_text: Whether marker-free segments fall back to full supervision.
+        strict_mask: Optional boolean ``[batch, seq]`` mask; segments where any token has
+            ``strict_mask == True`` fail safe to zeros instead of falling back to full supervision.
 
     Returns:
         np.ndarray: ``int32[batch, seq]`` mask.
     """
     ids = np.asarray(input_ids)
     bsz, seqlen = ids.shape
+    mask = np.zeros((bsz, seqlen), dtype=np.int32)
+    if seqlen == 0:
+        return mask
     header = span_ids.header_ids
     k = len(header)
     prefix, last_id = header[:-1], header[-1]
     last_ok = np.asarray(sorted(set(span_ids.newline_family) | {last_id}))
     structure_id = header[0]
-    end_id = span_ids.end_id
-    mask = np.zeros((bsz, seqlen), dtype=np.int32)
+    structure_ids_arr = np.asarray(span_ids.structure_ids, dtype=np.int64) if span_ids.structure_ids else np.empty(0)
+    structure_sequences = span_ids.structure_sequences
+    end_ids = span_ids.end_ids or (span_ids.end_id,)
+    end_len = len(end_ids)
+    strict_arr = None if strict_mask is None else np.asarray(strict_mask, dtype=bool)
 
     def _scan(row: int, lo: int, hi: int) -> None:
         seg = ids[row, lo:hi]
-        if not bool((seg == structure_id).any() or (seg == end_id).any()):
-            mask[row, lo:hi] = 1
+        ends = _find_subsequence_starts(seg, end_ids)
+        has_structure = (
+            bool((seg == structure_id).any())
+            or ends.size > 0
+            or (structure_ids_arr.size > 0 and bool(np.isin(seg, structure_ids_arr).any()))
+            or any(_find_subsequence_starts(seg, seq).size > 0 for seq in structure_sequences)
+        )
+        if not has_structure:
+            seg_strict = (not fallback_to_full_on_plain_text) or (
+                strict_arr is not None and bool(strict_arr[row, lo:hi].any())
+            )
+            if not seg_strict:
+                mask[row, lo:hi] = 1
             return
         n = hi - lo
         m = len(prefix)
@@ -241,10 +375,9 @@ def assistant_mask_from_token_ids(
                 starts.append(int(p) + k if seg[p + m] == last_id else int(p) + m)
         if not starts:
             return
-        ends = np.flatnonzero(seg == end_id)
         for s in starts:
             j = np.searchsorted(ends, s)
-            stop = ends[j] if j < len(ends) else n - 1
+            stop = int(ends[j]) + end_len - 1 if j < len(ends) else n - 1
             mask[row, lo + s : lo + stop + 1] = 1
 
     for row in range(bsz):
@@ -255,7 +388,8 @@ def assistant_mask_from_token_ids(
         bounds = np.flatnonzero(np.diff(seg_row)) + 1
         lo = 0
         for hi in [*bounds.tolist(), seqlen]:
-            _scan(row, int(lo), int(hi))
+            if lo < hi and int(seg_row[lo]) >= 0:
+                _scan(row, int(lo), int(hi))
             lo = hi
     return mask
 
@@ -370,53 +504,136 @@ def zero_supervision_stats(
     """
     ids = np.asarray(input_ids)
     cm = np.asarray(completion_mask)
-    docs: list[tuple[np.ndarray, np.ndarray, int]] = []
+    limit = max(int(sample_limit), 0)
+    n_zero = with_header = without_header = 0
+    per_dataset: dict[int, tuple[int, int]] = {}
+    samples: list[tuple[int, tuple[int, ...], bool]] = []
+
     if segment_ids is not None:
         seg = np.asarray(segment_ids)
-        for w in range(seg.shape[0]):
-            valid = seg[w] >= 0
-            for s in np.unique(seg[w][valid]):
-                sel = seg[w] == s
-                d_id = -1
-                if dataset_ids_per_token is not None:
-                    vals = np.asarray(dataset_ids_per_token)[w][sel]
-                    d_id = int(vals[0]) if vals.size else -1
-                docs.append((ids[w][sel], cm[w][sel], d_id))
-    else:
-        attn = np.ones_like(ids) if attention_mask is None else np.asarray(attention_mask)
-        for r in range(ids.shape[0]):
-            sel = attn[r] > 0
-            if not sel.any():
-                continue
-            d_id = int(np.asarray(dataset_ids_per_row).reshape(-1)[r]) if dataset_ids_per_row is not None else -1
-            docs.append((ids[r][sel], cm[r][sel], d_id))
-
-    n_zero = with_header = without_header = 0
-    per_dataset: dict[int, list[int]] = {}
-    samples: list[tuple[int, tuple[int, ...], bool]] = []
-    for tokens, doc_mask, d_id in docs:
-        bucket = per_dataset.setdefault(d_id, [0, 0])
-        bucket[0] += 1
-        if int(np.asarray(doc_mask).sum()) != 0:
-            continue
-        n_zero += 1
-        bucket[1] += 1
-        has_header = _contains_subsequence(tokens, header_ids)
-        if has_header:
-            with_header += 1
+        w_idx, t_idx = np.nonzero(seg >= 0)
+        if w_idx.size == 0:
+            return ZeroSupervisionStats(
+                n_docs=0,
+                n_zero=0,
+                n_zero_with_header=0,
+                n_zero_without_header=0,
+                per_dataset={},
+                dataset_names=dataset_names,
+                samples=(),
+            )
+        s_val = seg[w_idx, t_idx].astype(np.int64)
+        stride = int(s_val.max()) + 1
+        keys = w_idx.astype(np.int64) * stride + s_val
+        if keys.size > 1 and not bool(np.all(keys[1:] >= keys[:-1])):
+            order = np.argsort(keys, kind="mergesort")
+            keys = keys[order]
+            w_idx = w_idx[order]
+            t_idx = t_idx[order]
+        changes = np.flatnonzero(keys[1:] != keys[:-1]) + 1
+        starts = np.concatenate((np.zeros(1, dtype=np.int64), changes))
+        ends = np.concatenate((changes, np.array([keys.size], dtype=np.int64)))
+        n_docs = int(starts.size)
+        cm_valid = cm[w_idx, t_idx].astype(np.int64, copy=False)
+        doc_sums = np.add.reduceat(cm_valid, starts)
+        is_zero = doc_sums == 0
+        if dataset_ids_per_token is not None:
+            ds_flat = np.asarray(dataset_ids_per_token)[w_idx[starts], t_idx[starts]].astype(np.int64)
         else:
-            without_header += 1
-        if len(samples) < max(int(sample_limit), 0):
-            samples.append((d_id, tuple(int(t) for t in tokens), has_header))
+            ds_flat = np.full(n_docs, -1, dtype=np.int64)
+
+        zero_indices = np.flatnonzero(is_zero)
+        n_zero = int(zero_indices.size)
+        for doc_idx in zero_indices.tolist():
+            lo = int(starts[doc_idx])
+            hi = int(ends[doc_idx])
+            tokens = ids[w_idx[lo:hi], t_idx[lo:hi]]
+            has_header = _contains_subsequence(tokens, header_ids)
+            if has_header:
+                with_header += 1
+            else:
+                without_header += 1
+            if len(samples) < limit:
+                samples.append((int(ds_flat[doc_idx]), tuple(int(t) for t in tokens), has_header))
+    else:
+        attn = np.ones_like(ids, dtype=bool) if attention_mask is None else (np.asarray(attention_mask) > 0)
+        valid_rows = np.flatnonzero(attn.any(axis=-1))
+        n_docs = int(valid_rows.size)
+        if n_docs == 0:
+            return ZeroSupervisionStats(
+                n_docs=0,
+                n_zero=0,
+                n_zero_with_header=0,
+                n_zero_without_header=0,
+                per_dataset={},
+                dataset_names=dataset_names,
+                samples=(),
+            )
+        row_sums = np.where(attn[valid_rows], cm[valid_rows], 0).sum(axis=-1)
+        is_zero = row_sums == 0
+        if dataset_ids_per_row is not None:
+            ds_flat = np.asarray(dataset_ids_per_row).reshape(-1)[valid_rows].astype(np.int64)
+        else:
+            ds_flat = np.full(n_docs, -1, dtype=np.int64)
+
+        zero_indices = np.flatnonzero(is_zero)
+        n_zero = int(zero_indices.size)
+        for pos in zero_indices.tolist():
+            r = int(valid_rows[pos])
+            tokens = ids[r][attn[r]]
+            has_header = _contains_subsequence(tokens, header_ids)
+            if has_header:
+                with_header += 1
+            else:
+                without_header += 1
+            if len(samples) < limit:
+                samples.append((int(ds_flat[pos]), tuple(int(t) for t in tokens), has_header))
+
+    uniq_ds, ds_counts = np.unique(ds_flat, return_counts=True)
+    zero_counts_map: dict[int, int] = {}
+    if n_zero:
+        z_ds, z_counts = np.unique(ds_flat[is_zero], return_counts=True)
+        zero_counts_map = {int(k): int(v) for k, v in zip(z_ds.tolist(), z_counts.tolist(), strict=True)}
+    per_dataset = {
+        int(k): (int(n), zero_counts_map.get(int(k), 0))
+        for k, n in zip(uniq_ds.tolist(), ds_counts.tolist(), strict=True)
+    }
+
     return ZeroSupervisionStats(
-        n_docs=len(docs),
+        n_docs=n_docs,
         n_zero=n_zero,
         n_zero_with_header=with_header,
         n_zero_without_header=without_header,
-        per_dataset={key: (v[0], v[1]) for key, v in per_dataset.items()},
+        per_dataset=per_dataset,
         dataset_names=dataset_names,
         samples=tuple(samples),
     )
+
+
+def _packed_doc_boundary_mask(
+    segment_ids: np.ndarray | None,
+    attention: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Return boolean mask of non-leading packed segment starts (and post-PAD starts).
+
+    In shifted causal LM loss (``logits[:, t]`` predicts ``labels[:, t + 1]``), the
+    first token of a non-leading packed document (or any active token preceded by a
+    PAD token) must keep ``labels == -100`` so the previous document or PAD separator
+    never predicts across boundaries.
+    """
+    if segment_ids is None:
+        return None
+    seg = np.asarray(segment_ids)
+    if seg.ndim < 2 or seg.shape[-1] == 0:
+        return np.zeros_like(seg, dtype=bool)
+    valid = seg >= 0
+    boundary = np.zeros_like(valid, dtype=bool)
+    if seg.shape[-1] > 1:
+        boundary[:, 1:] = valid[:, 1:] & (seg[:, 1:] != seg[:, :-1])
+        if attention is not None and attention.shape == seg.shape:
+            attn = np.asarray(attention) != 0
+            boundary[:, 1:] |= valid[:, 1:] & attn[:, 1:] & (~attn[:, :-1])
+    return boundary
 
 
 def _segment_aware_label_mask(
@@ -426,10 +643,12 @@ def _segment_aware_label_mask(
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Mask source 2: supervision-bearing ``-100`` labels.
 
-    Returns ``(mask, pending_rows, pending_tokens)``. A row (or packed document) WITHOUT any ``-100``
-    label carries no supervision information; its positions are reported as pending so a later
-    source (the span scan) or the full-sequence fallback can claim them. Under packing the rule runs
-    per document, so one ``-100``-labelled document cannot zero its window neighbours.
+    Returns ``(mask, pending_rows, pending_tokens)``. A row (or packed document) WITHOUT any
+    supervision-bearing ``-100`` label (excluding lone packed cross-document boundary ``-100``s at
+    non-leading segment starts) carries no prompt-masking information; its positions are reported
+    as pending so a later source (the span scan) or the full-sequence fallback can claim them.
+    Under packing the rule runs per document, so one ``-100``-labelled document cannot zero its
+    window neighbours.
     """
     neg = labels == -100
     if attention is not None:
@@ -443,14 +662,17 @@ def _segment_aware_label_mask(
             mask = mask * attention
         pending = None if bool(row_has.all()) else ~row_has
         return mask, pending, None
-    if not bool(neg.any()):
-        return None, None, None
     seg = np.asarray(segment_ids)
     valid = seg >= 0
-    window = np.arange(seg.shape[0])[:, None]
-    stride = int(seg.max()) + 2
-    group = window * stride + np.where(valid, seg + 1, 0)
-    has_any = np.bincount(group[neg].ravel(), minlength=int(group.max()) + 1) > 0
+    neg = neg & valid
+    boundary = _packed_doc_boundary_mask(seg, attention)
+    supervision_neg = neg & (~boundary) if boundary is not None else neg
+    if not bool(supervision_neg.any()):
+        return None, None, None
+    window = np.arange(seg.shape[0], dtype=np.int64)[:, None]
+    stride = max(int(seg[valid].max()) + 2, 2)
+    group = window * stride + np.where(valid, seg.astype(np.int64) + 1, 0)
+    has_any = np.bincount(group[supervision_neg].ravel(), minlength=int(group.max()) + 1) > 0
     has_tok = has_any[group] & valid
     mask = np.where(has_tok, (labels != -100).astype(np.int32), 0)
     if attention is not None:
@@ -528,14 +750,29 @@ class AssistantOnlyMaskMixin:
 
         global_flag = bool(self._ao_arg("assistant_only_loss", False))
         per_dataset = ao is not None and bool((ao != -1).any())
-        if not per_dataset:
+        needs_global_mask = (
+            global_flag
+            and "input_ids" in batch
+            and batch.get("completion_mask") is None
+            and batch.get("assistant_masks") is None
+        )
+        if not per_dataset and not needs_global_mask:
             batch = normalize_completion_masks_and_labels(
                 batch, assistant_mask_fallback_on_empty=self._assistant_mask_fallback_on_empty
             )
+            if global_flag and "labels" in batch and "completion_mask" in batch:
+                labels = np.asarray(batch["labels"]).copy()
+                if not np.issubdtype(labels.dtype, np.signedinteger):
+                    labels = labels.astype(np.int32)
+                labels[np.asarray(batch["completion_mask"]) == 0] = -100
+                batch["labels"] = labels
             carriers_present = any(c is not None for c in (row_ao, tok_ao, row_ds, tok_ds))
             if carriers_present and "completion_mask" in batch:
                 self._run_zero_supervision_census(batch, infos, tok_ds=tok_ds, row_ds=row_ds, enforce=False)
             return batch
+
+        if ao is None:
+            ao = np.full(np.asarray(batch["input_ids"]).shape, -1, dtype=np.int32)
 
         if "assistant_masks" in batch:
             if "completion_mask" not in batch or (
@@ -560,6 +797,8 @@ class AssistantOnlyMaskMixin:
         segment_ids = None if segment_ids is None else np.asarray(segment_ids)
         input_ids = None if "input_ids" not in batch else np.asarray(batch["input_ids"])
         ones = attention if attention is not None else (None if input_ids is None else np.ones_like(input_ids))
+        if ones is not None and segment_ids is not None:
+            ones = ones * (segment_ids >= 0).astype(np.int32)
 
         base = None
         pending_rows = pending_tok = None
@@ -567,18 +806,35 @@ class AssistantOnlyMaskMixin:
             base = np.asarray(batch["completion_mask"]).astype(np.int32)
             if attention is not None:
                 base = base * attention
+            if segment_ids is not None:
+                base = base * (segment_ids >= 0).astype(np.int32)
         elif "labels" in batch:
             base, pending_rows, pending_tok = _segment_aware_label_mask(
                 np.asarray(batch["labels"]), attention, segment_ids
             )
 
-        need_scan = input_ids is not None and (
-            bool((ao == 1).any())
-            or (global_flag and (base is None or pending_rows is not None or pending_tok is not None))
-        )
+        wants_masked = (ao == 1) | ((ao == -1) & bool(global_flag))
+        if segment_ids is not None:
+            wants_masked = wants_masked & (segment_ids >= 0)
+        if attention is not None:
+            wants_masked = wants_masked & (attention != 0)
+        if base is None:
+            needs_positions = wants_masked
+        elif pending_rows is not None:
+            needs_positions = wants_masked & pending_rows[:, None]
+        elif pending_tok is not None:
+            needs_positions = wants_masked & pending_tok
+        else:
+            needs_positions = None
+        need_scan = input_ids is not None and needs_positions is not None and bool(needs_positions.any())
         scan = None
         if need_scan:
-            scan = assistant_mask_from_token_ids(input_ids, self._assistant_span_ids(), segment_ids=segment_ids)
+            scan = assistant_mask_from_token_ids(
+                input_ids,
+                self._assistant_span_ids(),
+                segment_ids=segment_ids,
+                strict_mask=(ao == 1),
+            )
             if attention is not None:
                 scan = scan * attention
 
@@ -611,10 +867,29 @@ class AssistantOnlyMaskMixin:
         cm = cm.astype(np.int32, copy=False)
         if attention is not None:
             cm = cm * attention
+        if segment_ids is not None:
+            cm = cm * (segment_ids >= 0).astype(np.int32)
         batch["completion_mask"] = cm
-        if "labels" not in batch and input_ids is not None:
+        boundary = _packed_doc_boundary_mask(segment_ids, attention)
+        if "labels" in batch:
+            labels = np.asarray(batch["labels"]).copy()
+            if not np.issubdtype(labels.dtype, np.signedinteger):
+                labels = labels.astype(np.int32)
+            if input_ids is not None:
+                restore = (ao == 0) & (cm == 1) & (labels == -100)
+                if boundary is not None:
+                    restore = restore & (~boundary)
+                if bool(restore.any()):
+                    labels = np.where(restore, input_ids.astype(labels.dtype, copy=False), labels)
+            labels[cm == 0] = -100
+            if boundary is not None:
+                labels[boundary] = -100
+            batch["labels"] = labels
+        elif input_ids is not None:
             labels = input_ids.astype(np.int32, copy=True)
             labels[cm == 0] = -100
+            if boundary is not None:
+                labels[boundary] = -100
             batch["labels"] = labels
 
     def _run_zero_supervision_census(

@@ -162,6 +162,8 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
 
         if isinstance(model, str):
             reject_string_model_id(model, role="policy model")
+        if model is None:
+            raise ValueError("`model` must be provided to `SFTTrainer`.")
         if not isinstance(model, EasyDeLState):
             model = model.to_state(trainable_selector=arguments.trainable_selector)
 
@@ -179,7 +181,21 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
         """Apply token overrides through the shared helper (compatibility API)."""
         apply_tokenizer_overrides(tokenizer, eos_token=eos_token, pad_token=pad_token)
 
-    def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
+    def _should_pack_split(self, *, is_eval: bool) -> bool:
+        """Return whether sequence packing is active for the train or eval split."""
+        train_packing = bool(
+            getattr(self.arguments, "packing", False)
+            or getattr(self.arguments, "sequence_packing", False)
+            or getattr(self.arguments, "padding_free", False)
+        )
+        if not is_eval:
+            return train_packing
+        eval_packing = getattr(self.arguments, "eval_packing", None)
+        if eval_packing is None:
+            return train_packing
+        return bool(eval_packing)
+
+    def _get_preprocess_transform(self, *, is_eval: bool = False) -> SFTPreprocessTransform | None:
         """Build the lazy SFT preprocessing transform for the data source.
 
         Returns a transform that handles:
@@ -195,6 +211,12 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
         the legacy ``completion_only_loss`` setting, with the latter
         taking precedence when explicitly set.
 
+        Args:
+            is_eval: Whether the transform is being built for the evaluation
+                split. Controls padding when ``packing=True`` and
+                ``eval_packing=False`` so unpacked eval rows are padded to
+                ``max_length``.
+
         Returns:
             SFTPreprocessTransform | None: The configured preprocessing
             transform, or ``None`` when the dataset is already
@@ -209,17 +231,14 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
             return None
 
         mask_prompt = resolve_mask_prompt(self.arguments)
+        pack_split = self._should_pack_split(is_eval=is_eval)
 
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
             max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
             mask_prompt=mask_prompt,
-            padding=(
-                False
-                if getattr(self.arguments, "packing", False) or getattr(self.arguments, "padding_free", False)
-                else "max_length"
-            ),
+            padding=False if pack_split else "max_length",
             truncation_mode=self.arguments.truncation_mode,
             pad_to_multiple_of=self.arguments.pad_to_multiple_of,
             formatting_func=self._formatting_func,
@@ -231,31 +250,45 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
         apply_chat_template_path(tokenizer, chat_template_path)
 
     def _apply_preprocess_transforms(self) -> None:
-        """Run the base preprocessor and optionally wrap the source in a packer.
+        """Preprocess train/eval independently and honor per-split packing settings.
 
-        After the standard tokenisation transform attached by the base
-        :class:`Trainer` runs, this override preserves the legacy SFT
-        ``packing=True`` knob. The shared ``sequence_packing=True`` flag
-        is handled by the base implementation so other offline
-        single-stream trainers use the same wrapper.
+        Honors ``eval_packing=False`` even when ``sequence_packing=True`` or
+        ``packing=True`` is enabled, and ensures unpacked evaluation splits
+        receive ``padding="max_length"`` during tokenization instead of being
+        left ragged.
 
         Side effects:
             Replaces ``self._train_source`` (and, when configured,
-            ``self._eval_source``) with packed views in place.
+            ``self._eval_source``) with tokenized / packed views in place.
         """
-        super()._apply_preprocess_transforms()
+        self._dataset_preprocess_workers()
+        for attr, is_eval in (("_train_source", False), ("_eval_source", True)):
+            source = getattr(self, attr)
+            if source is not None:
+                prev_train_source = self._train_source
+                try:
+                    self._train_source = source
+                    transform = self._get_preprocess_transform(is_eval=is_eval)
+                finally:
+                    self._train_source = prev_train_source
+                if transform is not None:
+                    setattr(self, attr, self._preprocess_source(source, transform))
 
-        if getattr(self.arguments, "sequence_packing", False) or not getattr(self.arguments, "packing", False):
-            return
+        train_pack = self._should_pack_split(is_eval=False)
+        eval_pack = self._should_pack_split(is_eval=True)
+        if train_pack or eval_pack:
+            self._apply_sequence_packing_to_sources(
+                train_enabled=train_pack,
+                eval_enabled=eval_pack,
+            )
 
-        eval_packing = getattr(self.arguments, "eval_packing", None)
-        if eval_packing is None:
-            eval_packing = self.arguments.packing
-
-        self._apply_sequence_packing_to_sources(
-            train_enabled=True,
-            eval_enabled=bool(eval_packing),
-        )
+    def _configure_eval_config_override(self):
+        """Freeze evaluation mode into the eval graphdef outside the readonly JIT."""
+        super()._configure_eval_config_override()
+        eval_state = self._eval_state_for_compiled_step(self.model_state)
+        module = eval_state.model
+        module.eval()
+        self._eval_graphdef, _, _ = module.split_module(trainable_selector=self.arguments.trainable_selector)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Compile SFT train/eval steps with the active sharding and QAT config."""
@@ -267,6 +300,9 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
             tensor_straight_through=self.arguments.tensor_straight_through,
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
+        self._straight_through_emulator = straight_through_emulator
+        train_static_argnums = (2, 3, 4, 5, 6, 7)
+        self._bucket_static_argnums = train_static_argnums
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
             self.scheduler,
@@ -277,7 +313,7 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
         )
         sharded_training_step_function = compile_trainer_step(
             training_step,
-            static_argnums=(2, 3, 4, 5, 6, 7),
+            static_argnums=train_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
@@ -294,7 +330,7 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
         sharded_evaluation_step_function = compile_trainer_step(
             evaluation_step,
             static_argnums=(2, 3, 4),
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             schedule=self.arguments.mpmd_scheduler,
             arguments=self.arguments,
@@ -309,6 +345,11 @@ class SFTTrainer(AssistantOnlyMaskMixin, Trainer):
             mesh=self.model.mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
+        """Preserve SFT's ``straight_through_emulator`` and ``loss_type`` under buckets."""
+        extra, static = super()._resolve_bucket_step_args(i)
+        return extra, (*static, self.arguments.loss_type)
 
     def _preprocess_batch_input(
         self,

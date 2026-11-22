@@ -150,6 +150,89 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return float(ordered[rank - 1])
 
 
+def summarize_requests(
+    finished: list[RequestMetrics], window_seconds: float = 300.0, recent_limit: int = 20
+) -> dict[str, Any]:
+    """Aggregate finished requests over a recent time window (see :meth:`MetricsCollector.model_summary`)."""
+    cutoff = time.time() - float(window_seconds)
+    rows = [req for req in finished if float(req.end_time or 0.0) >= cutoff]
+    ok = [req for req in rows if not req.error]
+    prompt_tokens = sum(int(req.prompt_tokens) for req in ok)
+    completion_tokens = sum(int(req.generated_tokens) for req in ok)
+    cache_read = sum(int(req.cache_read_tokens) for req in ok)
+    uncached = sum(req.uncached_input_tokens for req in ok)
+    cache_hits = sum(1 for req in ok if req.cache_read_tokens > 0)
+    ttfts = [float(req.time_to_first_token) for req in ok if req.time_to_first_token is not None]
+    latencies = [float(req.total_latency) for req in ok if req.total_latency is not None]
+
+    prefill_time = sum(float(req.time_to_first_token) for req in ok if req.time_to_first_token)
+    prefill_tokens = sum(req.uncached_input_tokens for req in ok if req.time_to_first_token)
+    decode_time = 0.0
+    decode_tokens = 0
+    for req in ok:
+        if req.time_to_first_token is None or req.total_latency is None or req.generated_tokens <= 1:
+            continue
+        span = float(req.total_latency) - float(req.time_to_first_token)
+        if span > 0:
+            decode_time += span
+            decode_tokens += int(req.generated_tokens) - 1
+    output_tps = None
+    if ok:
+        span = max(float(req.end_time) for req in ok) - min(float(req.start_time) for req in ok)
+        output_tps = completion_tokens / span if span > 0 else None
+
+    recent = []
+    for req in sorted(finished, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
+        decode_span = (
+            float(req.total_latency) - float(req.time_to_first_token)
+            if req.total_latency is not None and req.time_to_first_token is not None
+            else 0.0
+        )
+        recent.append(
+            {
+                "request_id": req.request_id,
+                "end_time": req.end_time,
+                "finish_reason": req.finish_reason,
+                "error": req.error,
+                "prompt_tokens": int(req.prompt_tokens),
+                "completion_tokens": int(req.generated_tokens),
+                "ttft_s": req.time_to_first_token,
+                "latency_s": req.total_latency,
+                "decode_tps": (
+                    (int(req.generated_tokens) - 1) / decode_span
+                    if decode_span > 0 and req.generated_tokens > 1
+                    else None
+                ),
+                "cache_hit": req.cache_read_tokens > 0,
+                "cache_read_tokens": int(req.cache_read_tokens),
+                "uncached_input_tokens": req.uncached_input_tokens,
+            }
+        )
+
+    return {
+        "window_seconds": float(window_seconds),
+        "aggregate": {
+            "completed": len(ok),
+            "failed": len(rows) - len(ok),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cache_hits": cache_hits,
+            "cache_hit_rate": cache_hits / len(ok) if ok else None,
+            "cache_read_tokens": cache_read,
+            "uncached_input_tokens": uncached,
+            "token_cache_hit_rate": cache_read / prompt_tokens if prompt_tokens else None,
+            "ttft_p50_s": _percentile(ttfts, 0.50),
+            "ttft_p99_s": _percentile(ttfts, 0.99),
+            "latency_p50_s": _percentile(latencies, 0.50),
+            "latency_p99_s": _percentile(latencies, 0.99),
+            "prefill_tps": prefill_tokens / prefill_time if prefill_time > 0 else None,
+            "decode_tps": decode_tokens / decode_time if decode_time > 0 else None,
+            "output_tps": output_tps,
+        },
+        "recent_requests": recent,
+    }
+
+
 @dataclass
 class SchedulerMetrics:
     """Metrics for scheduler operations.
@@ -363,11 +446,34 @@ class MetricsCollector:
         self.last_log_time = time.time()
 
         self.logger = logging.getLogger("eSurge.metrics")
+        self._file_handler: logging.FileHandler | None = None
         if log_file:
             handler = logging.FileHandler(log_file)
             handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+            self._file_handler = handler
+
+    def close(self) -> None:
+        """Detach and close any FileHandler owned by this collector."""
+        handler = getattr(self, "_file_handler", None)
+        if handler is not None:
+            try:
+                self.logger.removeHandler(handler)
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+            self._file_handler = None
+
+    def cancel_request(self, request_id: str) -> None:
+        """Remove an admitted request whose enqueue failed without counting it as completed or failed."""
+        with self._lock:
+            removed = self.request_metrics.pop(request_id, None)
+            if removed is not None and self.counters["total_requests"] > 0:
+                self.counters["total_requests"] -= 1
 
     def start_request(self, request_id: str, prompt_tokens: int = 0, model_name: str | None = None) -> None:
         """Start tracking metrics for a new request.
@@ -691,18 +797,20 @@ class MetricsCollector:
         if not recent_requests:
             return SystemMetrics(timestamp=current_time)
 
-        total_completed = len(recent_requests)
-        total_failed = len([req for req in recent_requests if req.error])
-        total_tokens = sum(req.generated_tokens for req in recent_requests)
+        failed_requests = [req for req in recent_requests if req.error]
+        succeeded_requests = [req for req in recent_requests if not req.error]
+        total_completed = len(succeeded_requests)
+        total_failed = len(failed_requests)
+        total_tokens = sum(req.generated_tokens for req in succeeded_requests)
 
-        latencies = [req.total_latency for req in recent_requests if req.total_latency]
-        ttfts = [req.time_to_first_token for req in recent_requests if req.time_to_first_token]
-        throughputs = [req.tokens_per_second for req in recent_requests if req.tokens_per_second > 0]
+        latencies = [req.total_latency for req in succeeded_requests if req.total_latency]
+        ttfts = [req.time_to_first_token for req in succeeded_requests if req.time_to_first_token]
+        throughputs = [req.tokens_per_second for req in succeeded_requests if req.tokens_per_second > 0]
 
         avg_latency = fmean(latencies) if latencies else 0.0
         avg_ttft = fmean(ttfts) if ttfts else 0.0
         avg_throughput = fmean(throughputs) if throughputs else 0.0
-        requests_per_second = total_completed / window_seconds
+        requests_per_second = total_completed / window_seconds if window_seconds > 0 else 0.0
 
         return SystemMetrics(
             timestamp=current_time,
@@ -740,87 +848,23 @@ class MetricsCollector:
         Returns:
             JSON-serializable dict with ``window_seconds``, ``aggregate`` and ``recent_requests``.
         """
-        cutoff = time.time() - float(window_seconds)
+        return summarize_requests(self.finished_requests(model_name), window_seconds, recent_limit)
+
+    def finished_requests(self, model_name: str | None) -> list[RequestMetrics]:
+        """Completed requests of one model (``None`` selects untagged requests), oldest first."""
         with self._lock:
-            finished = [
-                req for req in self.completed_requests if req.model_name == model_name and req.end_time is not None
-            ]
-        rows = [req for req in finished if float(req.end_time or 0.0) >= cutoff]
-        ok = [req for req in rows if not req.error]
-        prompt_tokens = sum(int(req.prompt_tokens) for req in ok)
-        completion_tokens = sum(int(req.generated_tokens) for req in ok)
-        cache_read = sum(int(req.cache_read_tokens) for req in ok)
-        uncached = sum(req.uncached_input_tokens for req in ok)
-        cache_hits = sum(1 for req in ok if req.cache_read_tokens > 0)
-        ttfts = [float(req.time_to_first_token) for req in ok if req.time_to_first_token is not None]
-        latencies = [float(req.total_latency) for req in ok if req.total_latency is not None]
+            return [req for req in self.completed_requests if req.model_name == model_name and req.end_time is not None]
 
-        prefill_time = sum(float(req.time_to_first_token) for req in ok if req.time_to_first_token)
-        prefill_tokens = sum(req.uncached_input_tokens for req in ok if req.time_to_first_token)
-        decode_time = 0.0
-        decode_tokens = 0
-        for req in ok:
-            if req.time_to_first_token is None or req.total_latency is None or req.generated_tokens <= 1:
-                continue
-            span = float(req.total_latency) - float(req.time_to_first_token)
-            if span > 0:
-                decode_time += span
-                decode_tokens += int(req.generated_tokens) - 1
-        output_tps = None
-        if ok:
-            span = max(float(req.end_time) for req in ok) - min(float(req.start_time) for req in ok)
-            output_tps = completion_tokens / span if span > 0 else None
+    def request_rows(self, model_name: str | None, window_seconds: float = 300.0, recent_limit: int = 20) -> list[dict]:
+        """The rows :func:`summarize_requests` needs to reproduce :meth:`model_summary` elsewhere.
 
-        recent = []
-        for req in sorted(finished, key=lambda r: float(r.end_time or 0.0), reverse=True)[: max(0, int(recent_limit))]:
-            decode_span = (
-                float(req.total_latency) - float(req.time_to_first_token)
-                if req.total_latency is not None and req.time_to_first_token is not None
-                else 0.0
-            )
-            recent.append(
-                {
-                    "request_id": req.request_id,
-                    "end_time": req.end_time,
-                    "finish_reason": req.finish_reason,
-                    "error": req.error,
-                    "prompt_tokens": int(req.prompt_tokens),
-                    "completion_tokens": int(req.generated_tokens),
-                    "ttft_s": req.time_to_first_token,
-                    "latency_s": req.total_latency,
-                    "decode_tps": (
-                        (int(req.generated_tokens) - 1) / decode_span
-                        if decode_span > 0 and req.generated_tokens > 1
-                        else None
-                    ),
-                    "cache_hit": req.cache_read_tokens > 0,
-                    "cache_read_tokens": int(req.cache_read_tokens),
-                    "uncached_input_tokens": req.uncached_input_tokens,
-                }
-            )
-
-        return {
-            "window_seconds": float(window_seconds),
-            "aggregate": {
-                "completed": len(ok),
-                "failed": len(rows) - len(ok),
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "cache_hits": cache_hits,
-                "cache_hit_rate": cache_hits / len(ok) if ok else None,
-                "cache_read_tokens": cache_read,
-                "uncached_input_tokens": uncached,
-                "token_cache_hit_rate": cache_read / prompt_tokens if prompt_tokens else None,
-                "ttft_p50_s": _percentile(ttfts, 0.50),
-                "ttft_p99_s": _percentile(ttfts, 0.99),
-                "latency_p50_s": _percentile(latencies, 0.50),
-                "latency_p99_s": _percentile(latencies, 0.99),
-                "prefill_tps": prefill_tokens / prefill_time if prefill_time > 0 else None,
-                "decode_tps": decode_tokens / decode_time if decode_time > 0 else None,
-                "output_tps": output_tps,
-            },
-            "recent_requests": recent,
-        }
+        Every request finished inside the window plus the ``recent_limit`` newest, as plain dicts. Summarizing the
+        union of several processes' rows gives exactly the summary one process would report for all their requests.
+        """
+        finished = self.finished_requests(model_name)
+        cutoff = time.time() - float(window_seconds)
+        newest = set(map(id, sorted(finished, key=lambda r: float(r.end_time or 0.0))[-max(0, int(recent_limit)) :]))
+        return [asdict(req) for req in finished if float(req.end_time or 0.0) >= cutoff or id(req) in newest]
 
     def log_summary(self, force: bool = False) -> None:
         """Log a summary of current metrics.
@@ -960,6 +1004,8 @@ def initialize_metrics(
         ... )
     """
     global _global_metrics_collector
+    if _global_metrics_collector is not None:
+        _global_metrics_collector.close()
     _global_metrics_collector = MetricsCollector(
         log_file=log_file,
         log_interval=log_interval,

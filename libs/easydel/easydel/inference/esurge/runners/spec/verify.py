@@ -39,7 +39,7 @@ import numpy as np
 
 from easydel.inference.sampling_processors import apply_sampling_constraints
 
-from ...core.binary_search import apply_topk_mask, apply_topp_mask
+from ...core.binary_search import apply_topk_mask, apply_topk_mask_bf16, apply_topp_mask, apply_topp_mask_bf16
 
 ROW_LIVE = 0
 """1 when the row emits tokens this step (its scheduled tokens reach the end of its known tokens)."""
@@ -94,9 +94,14 @@ def filter_logits(
     Returns:
         Filtered float32 logits of the same shape.
     """
-    x = logits.astype(jnp.float32)
-    x = jax.lax.cond(top_k > 0, lambda v: apply_topk_mask(v, top_k.astype(jnp.int32), _MASKED), lambda v: v, x)
-    x = jax.lax.cond(top_p < 1.0, lambda v: apply_topp_mask(v, top_p.astype(jnp.float32), _MASKED), lambda v: v, x)
+    use_bf16 = logits.dtype == jnp.bfloat16
+    x = logits if use_bf16 else logits.astype(jnp.float32)
+    topk_mask = apply_topk_mask_bf16 if use_bf16 else apply_topk_mask
+    topp_mask = apply_topp_mask_bf16 if use_bf16 else apply_topp_mask
+    top_p_val = top_p.astype(jnp.bfloat16 if use_bf16 else jnp.float32)
+    x = jax.lax.cond(top_k > 0, lambda v: topk_mask(v, top_k.astype(jnp.int32), _MASKED), lambda v: v, x)
+    x = jax.lax.cond(top_p < 1.0, lambda v: topp_mask(v, top_p_val, _MASKED), lambda v: v, x)
+    x = x.astype(jnp.float32)
     x = jax.lax.cond(temperature > 0.0, lambda v: v / temperature.astype(jnp.float32), lambda v: v, x)
 
     def _min_p(v: jax.Array) -> jax.Array:
@@ -196,7 +201,25 @@ def resolve_rows(
     live = rows[:, ROW_LIVE] > 0
     greedy = rows[:, ROW_GREEDY] > 0
     if k > 0 and logits is not None:
-        logits = apply_sampling_constraints(logits, logit_bias, allowed_token_ids_mask, bad_words_token_ids)
+        if logits.ndim == 3:
+            _bias = None if logit_bias is None else (logit_bias[:, None, :] if logit_bias.ndim == 2 else logit_bias)
+            _allow = (
+                None
+                if allowed_token_ids_mask is None
+                else (
+                    allowed_token_ids_mask[:, None, :]
+                    if allowed_token_ids_mask.ndim == 2
+                    else allowed_token_ids_mask
+                )
+            )
+            _bad = (
+                None
+                if bad_words_token_ids is None
+                else (bad_words_token_ids[:, None, :] if bad_words_token_ids.ndim == 2 else bad_words_token_ids)
+            )
+            logits = apply_sampling_constraints(logits, _bias, _allow, _bad)
+        else:
+            logits = apply_sampling_constraints(logits, logit_bias, allowed_token_ids_mask, bad_words_token_ids)
         logits = logits.astype(jnp.float32)
         vocab = int(logits.shape[-1])
         argmax = jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -259,28 +282,70 @@ def pack_rows(
     """
     k = int(num_draft_tokens)
     p = int(emitted.shape[0])
+    emitted_i32 = emitted.astype(jnp.int32)
+    emitted_cols = int(emitted_i32.shape[1])
+    if emitted_cols < k + 1:
+        emitted_i32 = jnp.concatenate([emitted_i32, jnp.full((p, k + 1 - emitted_cols), -1, jnp.int32)], axis=1)
+    elif emitted_cols > k + 1:
+        emitted_i32 = emitted_i32[:, : k + 1]
     if drafts is None:
-        drafts = jnp.full((p, k), -1, jnp.int32)
-    elif int(drafts.shape[1]) < k:
-        drafts = jnp.concatenate([drafts, jnp.full((p, k - int(drafts.shape[1])), -1, jnp.int32)], axis=1)
-    packed = jnp.concatenate([emitted, accepted[:, None], drafts.astype(jnp.int32)], axis=1).astype(jnp.int32)
+        drafts_i32 = jnp.full((p, k), -1, jnp.int32)
+    else:
+        drafts_i32 = drafts.astype(jnp.int32)
+        draft_cols = int(drafts_i32.shape[1])
+        if draft_cols < k:
+            drafts_i32 = jnp.concatenate([drafts_i32, jnp.full((p, k - draft_cols), -1, jnp.int32)], axis=1)
+        elif draft_cols > k:
+            drafts_i32 = drafts_i32[:, :k]
+    packed = jnp.concatenate([emitted_i32, accepted[:, None].astype(jnp.int32), drafts_i32], axis=1).astype(jnp.int32)
     seq = jnp.where(rows[:, ROW_SEQ] >= 0, rows[:, ROW_SEQ], int(num_rows))
     return jnp.full((int(num_rows), 2 * k + 2), -1, jnp.int32).at[seq].set(packed, mode="drop")
 
 
-@functools.partial(jax.jit, static_argnames=("num_rows",))
+@functools.partial(jax.jit, static_argnames=("num_rows", "num_draft_tokens"))
 def pack_pooled_drafts(
     seed_tokens: jax.Array,
     drafts: jax.Array,
     output_rows: jax.Array,
     *,
     num_rows: int,
+    num_draft_tokens: int | None = None,
 ) -> jax.Array:
     """Pack a pooled first draft as ``spec_out``: the previous token in emit[0], accepted=-1, then drafts."""
-    k = int(drafts.shape[1])
+    k_in = int(drafts.shape[1])
+    k = k_in if num_draft_tokens is None else int(num_draft_tokens)
+    drafts_i32 = drafts.astype(jnp.int32)
+    if k_in < k:
+        drafts_i32 = jnp.concatenate([drafts_i32, jnp.full((int(drafts_i32.shape[0]), k - k_in), -1, jnp.int32)], axis=1)
+    elif k_in > k:
+        drafts_i32 = drafts_i32[:, :k]
+    safe_rows = jnp.where(output_rows >= 0, output_rows, int(num_rows))
     packed = jnp.full((int(num_rows), 2 * k + 2), -1, jnp.int32)
-    packed = packed.at[output_rows, 0].set(seed_tokens.astype(jnp.int32))
-    return packed.at[output_rows, k + 2 :].set(drafts.astype(jnp.int32))
+    packed = packed.at[safe_rows, 0].set(seed_tokens.astype(jnp.int32), mode="drop")
+    return packed.at[safe_rows, k + 2 :].set(drafts_i32, mode="drop")
+
+
+@functools.partial(jax.jit, static_argnames=("num_draft_tokens",))
+def widen_spec_out(spec_out: jax.Array, *, num_draft_tokens: int) -> jax.Array:
+    """Align a packed ``[num_rows, 2*k_in + 2]`` result to ``[num_rows, 2*K + 2]`` by right-padding with ``-1``."""
+    k = int(num_draft_tokens)
+    spec_i32 = spec_out.astype(jnp.int32)
+    width = int(spec_i32.shape[1])
+    target_width = 2 * k + 2
+    if width == target_width:
+        return spec_i32
+    k_in = max(0, (width - 2) // 2)
+    n_rows = int(spec_i32.shape[0])
+    emitted = spec_i32[:, : k_in + 1]
+    accepted = spec_i32[:, k_in + 1 : k_in + 2]
+    drafts = spec_i32[:, k_in + 2 : 2 * k_in + 2]
+    if k_in < k:
+        emitted = jnp.concatenate([emitted, jnp.full((n_rows, k - k_in), -1, jnp.int32)], axis=1)
+        drafts = jnp.concatenate([drafts, jnp.full((n_rows, k - k_in), -1, jnp.int32)], axis=1)
+    elif k_in > k:
+        emitted = emitted[:, : k + 1]
+        drafts = drafts[:, :k]
+    return jnp.concatenate([emitted, accepted, drafts], axis=1)
 
 
 def split_packed(packed: np.ndarray, num_draft_tokens: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -309,4 +374,5 @@ __all__ = (
     "pack_rows",
     "resolve_rows",
     "split_packed",
+    "widen_spec_out",
 )

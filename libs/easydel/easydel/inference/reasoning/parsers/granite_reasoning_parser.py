@@ -123,32 +123,14 @@ class GraniteReasoningParser(ReasoningParser):
         return list(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
-        """Split the model output into reasoning and content via the compiled regex.
-
-        Args:
-            model_output: Full decoded text produced by the model.
-            request: Optional inference request; unused, kept for interface
-                parity with sibling parsers.
-
-        Returns:
-            Tuple ``(reasoning, content)`` extracted from the regex
-            capture groups. When the regex does not match (no
-            thought/response sandwich found), returns
-            ``(None, model_output)`` so the whole text is treated as
-            visible content. Either element may be ``None`` when the
-            captured group was empty after stripping.
-        """
-        match = self._regex.search(model_output)
-        if not match:
-            if self._find_earliest(model_output, self._thought_starters) is not None:
-                # An unfinished thought section still belongs to reasoning, including a
-                # terminal prefix that can no longer become a response delimiter.
-                reasoning, content = self._split_stream(model_output, final=True)
-                return reasoning or None, content or None
+        """Split the model output into reasoning and content using the shared delimiter splitter."""
+        del request
+        has_thought = self._find_earliest(model_output, self._thought_starters) is not None
+        has_response = self._find_earliest(model_output, self._response_starters) is not None
+        if not has_thought and not has_response:
             return None, model_output
-        reasoning = match.group(1).strip()
-        content = match.group(2).strip()
-        return reasoning or None, content or None
+        reasoning, content = self._split_stream(model_output, final=True)
+        return reasoning.strip() or None, content.strip() or None
 
     def extract_reasoning_streaming(
         self,

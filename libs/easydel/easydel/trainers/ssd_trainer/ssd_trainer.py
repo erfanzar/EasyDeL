@@ -126,7 +126,7 @@ class SSDTrainer(GRPOTrainer):
         )
         sharded_evaluation_step_function = compile_trainer_step(
             ssd_step,
-            in_shardings=(self.state_shardings, empty_sharding),
+            in_shardings=(self.eval_state_shardings, empty_sharding),
             out_shardings=empty_sharding,
             static_argnums=static_argnums,
             mesh=mesh,
@@ -205,6 +205,8 @@ class SSDTrainer(GRPOTrainer):
             prompt_mask = results.prompt_mask
             completion_ids = results.completion_ids
             completion_mask = self._make_attn_mask(completion_ids)
+            if results.completion_mask is not None:
+                completion_mask = completion_mask * results.completion_mask.astype(completion_mask.dtype)
             texts = self._coerce_generation_texts(results.text, fallback=results.raw_text)
             if not texts:
                 completion_ids_array = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
@@ -218,6 +220,10 @@ class SSDTrainer(GRPOTrainer):
                     attention_mask=completion_mask_array,
                 )
             completion_mask = self._filter_ssd_completion_mask(completion_ids, completion_mask, texts)
+            prompt_ids = self._all_gather(prompt_ids)
+            prompt_mask = self._all_gather(prompt_mask)
+            completion_ids = self._all_gather(completion_ids)
+            completion_mask = self._all_gather(completion_mask)
 
         preprocessing_time = preprocessing_time_fn()
         completion_lengths = jnp.sum(completion_mask, axis=-1)

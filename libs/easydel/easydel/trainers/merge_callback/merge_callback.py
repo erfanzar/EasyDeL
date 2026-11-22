@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
+
 from ._fn import _as_graphstate, merge_pytrees
 from .merge_config import MergeConfig
 
@@ -113,7 +115,9 @@ class MergeModelCallback:
         if not callable(merge):
             raise TypeError("Publishing raw pytrees requires `publish_fn`; otherwise pass an EasyDeLState.")
         model = merge(tree=self.last_merged_state)
-        model.push_to_hub(repo_id=repo_id, **kwargs.get("hub_kwargs", {}))
+        if jax.process_index() == 0:
+            hub_kwargs = kwargs.get("hub_kwargs") or {}
+            model.push_to_hub(repo_id=repo_id, **hub_kwargs)
 
     def on_save(self, *args: tp.Any, **kwargs: tp.Any) -> None:
         """Handle a checkpoint-save callback event.
@@ -135,13 +139,15 @@ class MergeModelCallback:
             policy_state = kwargs.get("policy_state")
             if policy_state is None:
                 policy_state = kwargs.get("state")
-            target_state = kwargs.get("target_state", self.target_state)
+            target_state = kwargs.get("target_state")
+            if target_state is None:
+                target_state = self.target_state
             if policy_state is not None and target_state is not None:
                 self._merge_and_publish(
                     policy_state,
                     target_state,
                     hub_model_id=kwargs.get("hub_model_id"),
-                    hub_kwargs=kwargs.get("hub_kwargs", {}),
+                    hub_kwargs=kwargs.get("hub_kwargs") or {},
                 )
         del args
 
@@ -159,12 +165,14 @@ class MergeModelCallback:
             policy_state = kwargs.get("policy_state")
             if policy_state is None:
                 policy_state = kwargs.get("state")
-            target_state = kwargs.get("target_state", self.target_state)
+            target_state = kwargs.get("target_state")
+            if target_state is None:
+                target_state = self.target_state
             if policy_state is not None and target_state is not None:
                 self._merge_and_publish(
                     policy_state,
                     target_state,
                     hub_model_id=kwargs.get("hub_model_id"),
-                    hub_kwargs=kwargs.get("hub_kwargs", {}),
+                    hub_kwargs=kwargs.get("hub_kwargs") or {},
                 )
         del args

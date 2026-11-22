@@ -198,33 +198,84 @@ def _resolve_attr(obj: tp.Any, path: str) -> tp.Any:
     return obj
 
 
-def _forward_accepts(model: tp.Any, name: str) -> bool:
-    """Whether any forward-ish entry point of ``model`` names parameter ``name``.
+def _entry_point_fn(holder: tp.Any) -> tp.Any:
+    """Return the callable defining ``holder``'s real forward signature.
 
-    Families accept precomputed features on the base model's ``forward`` /
-    ``compute_embedding`` rather than on the task head, and several accept it only via
-    ``**kwargs`` pass-through, so the source of the merge site is the reliable signal.
+    SpectraX modules wrap ``forward`` behind a generic ``__call__(*args, **kwargs)``,
+    so ``forward`` is authoritative whenever it exists unless ``__call__`` itself
+    declares explicit non-variadic parameters.
     """
-    targets = []
-    for holder in (model, getattr(model, "base_model", None)):
-        if holder is None:
-            continue
-        for attr in ("forward", "compute_embedding", "__call__"):
-            fn = getattr(holder, attr, None)
-            if fn is not None:
-                targets.append(fn)
-
-    for fn in targets:
+    forward_fn = getattr(holder, "forward", None)
+    if callable(holder):
         try:
-            params = inspect.signature(fn).parameters
+            call_params = inspect.signature(holder).parameters.values()
+            if any(
+                param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for param in call_params
+            ):
+                return holder
         except (TypeError, ValueError):
-            continue
-        if name in params and params[name].kind not in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        ):
-            return True
-    return False
+            pass
+    return forward_fn if forward_fn is not None else (holder if callable(holder) else None)
+
+
+def _signature_has_explicit_kwarg(fn: tp.Any, name: str) -> bool:
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    param = params.get(name)
+    return param is not None and param.kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.VAR_POSITIONAL,
+        inspect.Parameter.VAR_KEYWORD,
+    )
+
+
+def _signature_accepts_kwarg(fn: tp.Any, name: str) -> bool:
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    param = params.get(name)
+    if param is not None and param.kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.VAR_POSITIONAL,
+        inspect.Parameter.VAR_KEYWORD,
+    ):
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _forward_accepts(model: tp.Any, name: str) -> bool:
+    """Whether ``model``'s forward entry point actually accepts precomputed feature ``name``.
+
+    Inspects only ``forward`` / ``__call__`` (never ``compute_embedding``): models like
+    Mistral3, Gemma3, and Llava accept ``image_features`` only on ``compute_embedding``
+    while their ``forward`` hardcodes ``image_features = None`` and forwards ``**lm_kwargs``
+    directly to the language model.
+    """
+    top_fn = _entry_point_fn(model)
+    if _signature_has_explicit_kwarg(top_fn, name):
+        return True
+    top_forward = getattr(model, "forward", None)
+    if top_forward is not top_fn and _signature_has_explicit_kwarg(top_forward, name):
+        return True
+
+    if not _signature_accepts_kwarg(top_fn, name):
+        return False
+    base_model = getattr(model, "base_model", None)
+    if base_model is None or base_model is model:
+        return False
+    base_fn = _entry_point_fn(base_model)
+    if _signature_has_explicit_kwarg(base_fn, name):
+        return True
+    base_forward = getattr(base_model, "forward", None)
+    return base_forward is not base_fn and _signature_has_explicit_kwarg(base_forward, name)
 
 
 def resolve_encoder_binding(model: tp.Any) -> EncoderBinding | None:
@@ -282,27 +333,46 @@ class PixelLayout(StrEnum):
     ROW_MAJOR = "row_major"
 
 
-def resolve_pixel_layout(batch: tp.Mapping[str, tp.Any], presence_key: str | None = None) -> PixelLayout:
-    """Classify a batch's pixel layout.
+def _resolve_layout_and_presence(
+    batch: tp.Mapping[str, tp.Any],
+    presence_key: str | None = None,
+) -> tuple[PixelLayout, np.ndarray | None]:
+    """Classify pixel layout and return any already-probed host presence mask in one sync."""
+    if grid_describes_rows(batch):
+        return PixelLayout.IMAGE_MAJOR, None
 
-    ``ROW_MAJOR`` is claimed only on positive evidence -- an explicit presence mask, or a
-    leading dimension equal to the batch size *and* at least one all-zero row. A dense
-    all-vision batch whose image count happens to equal the batch size is correctly left
-    as ``IMAGE_MAJOR``, since packing it would be a no-op either way.
-    """
     if presence_key is not None and presence_key in batch:
-        return PixelLayout.ROW_MAJOR
+        return PixelLayout.ROW_MAJOR, vision_row_presence(batch, presence_key)
 
     pixels = batch.get(PIXEL_KEY)
     sequences = batch.get("input_ids")
     if pixels is None or sequences is None or getattr(pixels, "ndim", 0) < 2:
-        return PixelLayout.IMAGE_MAJOR
+        return PixelLayout.IMAGE_MAJOR, None
     if pixels.shape[0] != sequences.shape[0]:
-        return PixelLayout.IMAGE_MAJOR
+        return PixelLayout.IMAGE_MAJOR, None
 
-    reduce_axes = tuple(range(1, pixels.ndim))
-    has_content = np.asarray(jax.device_get(jnp.any(pixels != 0, axis=reduce_axes)))
-    return PixelLayout.ROW_MAJOR if not has_content.all() else PixelLayout.IMAGE_MAJOR
+    has_content = vision_row_presence(batch, None)
+    if has_content is None:
+        return PixelLayout.IMAGE_MAJOR, None
+    if not has_content.all():
+        return PixelLayout.ROW_MAJOR, has_content
+    return PixelLayout.IMAGE_MAJOR, None
+
+
+def resolve_pixel_layout(batch: tp.Mapping[str, tp.Any], presence_key: str | None = None) -> PixelLayout:
+    """Classify a batch's pixel layout.
+
+    ``ROW_MAJOR`` is claimed only on positive evidence -- an explicit presence mask, or a
+    leading dimension equal to the batch size *and* at least one all-zero row. Grid-described
+    patch batches are always ``IMAGE_MAJOR`` because patch rows must never be dropped as
+    text-only sequences. A dense all-vision batch whose image count happens to equal the
+    batch size is left as ``IMAGE_MAJOR``, since packing it would be a no-op either way.
+    """
+    layout, _ = _resolve_layout_and_presence(batch, presence_key)
+    return layout
+
+
+_DEFAULT_RESOLVE_PIXEL_LAYOUT = resolve_pixel_layout
 
 
 def grid_describes_rows(batch: tp.Mapping[str, tp.Any]) -> bool:
@@ -383,6 +453,8 @@ def select_vision_rows(
     batch: tp.Mapping[str, tp.Any],
     config: ProcessEncoderConfig,
     layout: PixelLayout | None = None,
+    *,
+    _presence: np.ndarray | None = None,
 ) -> VisionSelection | None:
     """Choose which pixel rows to encode and the bucketed count to encode them at.
 
@@ -398,14 +470,21 @@ def select_vision_rows(
     if pixels is None or getattr(pixels, "ndim", 0) < 2:
         return None
 
+    presence = _presence
     if layout is None:
-        layout = resolve_pixel_layout(batch, config.presence_key)
+        if resolve_pixel_layout is _DEFAULT_RESOLVE_PIXEL_LAYOUT:
+            layout, probed = _resolve_layout_and_presence(batch, config.presence_key)
+            if presence is None:
+                presence = probed
+        else:
+            layout = resolve_pixel_layout(batch, config.presence_key)
 
     total_rows = int(pixels.shape[0])
     if layout is PixelLayout.IMAGE_MAJOR:
         indices = np.arange(total_rows)
     else:
-        presence = vision_row_presence(batch, config.presence_key)
+        if presence is None:
+            presence = vision_row_presence(batch, config.presence_key)
         if presence is None:
             return None
         indices = np.flatnonzero(presence)
@@ -434,6 +513,9 @@ def select_vision_rows(
         ceiling = total_rows if layout is PixelLayout.ROW_MAJOR else _NO_ROW_CEILING
         padded = bucket_row_count(int(indices.size), config.row_bucket_multiple, ceiling)
     return VisionSelection(indices=indices, padded_rows=padded, total_rows=total_rows, layout=layout)
+
+
+_DEFAULT_SELECT_VISION_ROWS = select_vision_rows
 
 
 def pack_vision_inputs(
@@ -526,19 +608,35 @@ class EncoderProcessor:
     immediately before the compiled train step.
     """
 
-    def __init__(self, model: tp.Any, config: ProcessEncoderConfig, binding: EncoderBinding | None = None):
-        """Bind a processor to a model.
+    def __init__(self, model: tp.Any | None, config: ProcessEncoderConfig, binding: EncoderBinding | None = None):
+        """Bind a processor to a model or pre-resolved binding.
 
         Args:
-            model: The VLM whose tower should be lifted out of the step.
+            model: The VLM whose tower should be lifted out of the step, or ``None``
+                when ``binding`` is pre-resolved and live ``model`` is supplied per
+                :meth:`process` call (avoids pinning Step-0 weights in HBM).
             config: Behaviour knobs.
             binding: Pre-resolved binding; discovered from ``model`` when omitted.
         """
         self.config = config
-        self.binding = binding if binding is not None else resolve_encoder_binding(model)
+        self.binding = binding if binding is not None else (resolve_encoder_binding(model) if model is not None else None)
         self._model = model
         self._warned_unsupported = False
-        self._feature_rows_target: int | None = None
+        self._feature_rows_targets: dict[int | None, int] = {}
+
+    @property
+    def _feature_rows_target(self) -> int | None:
+        """High-water feature-row target for the unbucketed (``None``) key, or overall max."""
+        if None in self._feature_rows_targets:
+            return self._feature_rows_targets[None]
+        return max(self._feature_rows_targets.values(), default=None)
+
+    @_feature_rows_target.setter
+    def _feature_rows_target(self, value: int | None) -> None:
+        if value is None:
+            self._feature_rows_targets.clear()
+        else:
+            self._feature_rows_targets[None] = int(value)
 
     @property
     def supported(self) -> bool:
@@ -585,8 +683,16 @@ class EncoderProcessor:
         config = self.config
         if not config.enabled or not isinstance(batch, dict):
             return batch
+
+        def _without_presence(src: dict[str, tp.Any]) -> dict[str, tp.Any]:
+            if config.presence_key is not None and config.presence_key in src:
+                cleaned = dict(src)
+                cleaned.pop(config.presence_key, None)
+                return cleaned
+            return src
+
         if not config.applies_to_bucket(bucket_index):
-            return batch
+            return _without_presence(batch)
         if not self.supported:
             if config.require_support is False and not self._warned_unsupported:
                 logger.warning(
@@ -594,16 +700,39 @@ class EncoderProcessor:
                     "keyword; falling back to the in-model vision path."
                 )
                 self._warned_unsupported = True
+            return _without_presence(batch)
+
+        presence: np.ndarray | None = None
+        if resolve_pixel_layout is _DEFAULT_RESOLVE_PIXEL_LAYOUT:
+            layout, presence = _resolve_layout_and_presence(batch, config.presence_key)
+        else:
+            layout = resolve_pixel_layout(batch, config.presence_key)
+
+        if layout is PixelLayout.ROW_MAJOR and presence is not None and not bool(presence.any()):
+            # Zero-image ROW_MAJOR batch: strip dummy zero pixel_values, companion keys, and presence_key
+            # so the model takes the clean text-only path instead of encoding dummy images.
+            if PIXEL_KEY in batch or (config.presence_key is not None and config.presence_key in batch):
+                processed = dict(batch)
+                processed.pop(PIXEL_KEY, None)
+                for key in VISION_COMPANION_KEYS:
+                    processed.pop(key, None)
+                if config.presence_key is not None:
+                    processed.pop(config.presence_key, None)
+                return processed
             return batch
 
-        layout = resolve_pixel_layout(batch, config.presence_key)
-        selection = select_vision_rows(batch, config, layout=layout)
+        if select_vision_rows is _DEFAULT_SELECT_VISION_ROWS:
+            selection = select_vision_rows(batch, config, layout=layout, _presence=presence)
+        else:
+            selection = select_vision_rows(batch, config, layout=layout)
         if selection is None:
-            return batch
+            return _without_presence(batch)
 
         binding = self.binding
         assert binding is not None
         model = model if model is not None else self._model
+        if model is None:
+            raise ValueError("EncoderProcessor.process requires a live `model` when constructed with `model=None`.")
 
         packed = pack_vision_inputs(batch, selection)
         raw_features = self._encode(model, packed)
@@ -612,21 +741,40 @@ class EncoderProcessor:
             # Structured outputs need all auxiliary residuals at the merge site.
             # Already-flat padded outputs have lost image boundaries. Neither can
             # be interpreted as a flat feature buffer without guessing or loss.
-            return batch
+            return _without_presence(batch)
         features = flatten_features(raw_features)
 
         # Cross-check the encoder-derived feature count against the merge site's
-        # placeholder tokens.
+        # placeholder tokens. Reduce to a single scalar on device when input_ids is
+        # a JAX array so we never copy the full [B, S] token buffer to host.
         merge_feature = getattr(model, "_multimodal_merge_feature", None)
         if merge_feature is None:
             merge_feature = getattr(getattr(model, "base_model", None), "_multimodal_merge_feature", None)
         image_token_id = getattr(merge_feature, "image_token_id", None)
         input_ids = batch.get("input_ids")
         if binding.feature_valid_length_kwarg is not None and (image_token_id is None or input_ids is None):
-            return batch
+            return _without_presence(batch)
         if image_token_id is not None and input_ids is not None:
-            host_ids = np.asarray(jax.device_get(input_ids))
-            placeholder_count = int(np.count_nonzero(np.isin(host_ids, image_token_id)))
+            if isinstance(input_ids, jax.Array):
+                if isinstance(image_token_id, (list, tuple, set, frozenset, np.ndarray, jax.Array)):
+                    token_ids_arr = jnp.asarray(
+                        list(image_token_id) if isinstance(image_token_id, (set, frozenset)) else image_token_id
+                    )
+                    match = jnp.isin(input_ids, token_ids_arr)
+                else:
+                    match = input_ids == int(image_token_id)
+                placeholder_count = int(jax.device_get(jnp.sum(match, dtype=jnp.int32)))
+            else:
+                host_ids = np.asarray(input_ids)
+                if isinstance(image_token_id, (list, tuple, set, frozenset, np.ndarray, jax.Array)):
+                    host_targets = (
+                        list(image_token_id)
+                        if isinstance(image_token_id, (set, frozenset))
+                        else np.asarray(image_token_id)
+                    )
+                    placeholder_count = int(np.count_nonzero(np.isin(host_ids, host_targets)))
+                else:
+                    placeholder_count = int(np.count_nonzero(host_ids == int(image_token_id)))
             if placeholder_count != valid_length:
                 raise ValueError(
                     f"process_encoder: Expected {placeholder_count} image placeholder tokens "
@@ -638,15 +786,19 @@ class EncoderProcessor:
 
         processed = dict(batch)
         if binding.feature_valid_length_kwarg is not None:
-            self._feature_rows_target = max(self._feature_rows_target or 0, features.shape[0])
-            features = pad_features_to_constant(features, self._feature_rows_target)
+            target = max(self._feature_rows_targets.get(bucket_index, 0), features.shape[0])
+            self._feature_rows_targets[bucket_index] = target
+            features = pad_features_to_constant(features, target)
             processed[binding.feature_valid_length_kwarg] = jnp.asarray(valid_length, dtype=jnp.int32)
         else:
             features = features[:valid_length]
         processed[binding.feature_kwarg] = features
-        # Drop the pixels so the family's `if features is None and pixel_values is not
-        # None` guard takes the precomputed branch and the tower does not run twice.
+        # Drop the pixels and presence mask so the family's `if features is None and
+        # pixel_values is not None` guard takes the precomputed branch and the presence
+        # carrier never leaks into the model forward.
         processed.pop(PIXEL_KEY, None)
+        if config.presence_key is not None:
+            processed.pop(config.presence_key, None)
         return processed
 
 

@@ -714,23 +714,24 @@ def create_kv_cache_specs_from_config(
         ]
 
     groups: dict[tuple[AttnMaskType, int | None, int | None, int, int], list[int]] = defaultdict(list)
+    linear_layers: list[int] = []
     for layer_idx, detail in mask_details.items():
+        mask_type = detail.mask_type
+        # Linear-attention layers keep no token KV pages of their own; per
+        # ``AttnMaskType.from_hf`` (and the enum docstring) they merge into an
+        # existing full-attention group so differing full-attention geometry
+        # (e.g. ``global_head_dim``) never creates a duplicate FullAttentionSpec.
+        if mask_type == AttnMaskType.LINEAR:
+            linear_layers.append(int(layer_idx))
+            continue
         layer_num_kv_heads, layer_head_size = _resolve_layer_attention_geometry(
             config=config,
             layer_idx=int(layer_idx),
             default_num_kv_heads=num_kv_heads,
             default_head_size=head_size,
         )
-        # Linear-attention layers keep no token KV pages of their own; per
-        # ``AttnMaskType.from_hf`` (and the enum docstring) they group with
-        # full-attention layers for scheduler compatibility. Normalized
-        # BEFORE grouping so geometry-equal LINEAR and FULL layers merge
-        # into one cache group instead of inflating page demand.
-        mask_type = detail.mask_type
         detail_size = detail.size
         detail_chunks = detail.chunks
-        if mask_type == AttnMaskType.LINEAR:
-            mask_type = AttnMaskType.FULL
         # Keep chunked layers in the conservative full-history allocation
         # group. Chunk masking is independent of page retention; activating
         # eviction is not necessary for correct chunked-attention outputs.
@@ -749,9 +750,17 @@ def create_kv_cache_specs_from_config(
             )
         ].append(int(layer_idx))
 
+    if linear_layers:
+        existing_full_key = next((key for key in groups if key[0] == AttnMaskType.FULL), None)
+        if existing_full_key is not None:
+            groups[existing_full_key].extend(linear_layers)
+            groups[existing_full_key].sort()
+        else:
+            groups[(AttnMaskType.FULL, None, None, int(num_kv_heads), int(head_size))].extend(sorted(linear_layers))
+
     specs: list[CacheGroupSpec] = []
 
-    for (mask_type, sliding_window, chunk_size, group_num_kv_heads, group_head_size), layer_indices in groups.items():
+    for (mask_type, sliding_window, _chunk_size, group_num_kv_heads, group_head_size), layer_indices in groups.items():
         layer_names = [f"layer.{idx}" for idx in layer_indices]
 
         if mask_type == AttnMaskType.FULL:
@@ -779,22 +788,6 @@ def create_kv_cache_specs_from_config(
                         dtype=dtype,
                         use_mla=False,  # MLA is not supported for sliding window
                         sliding_window=sliding_window,
-                    ),
-                    layer_names=layer_names,
-                )
-            )
-        elif mask_type == AttnMaskType.CHUNK:
-            if chunk_size is None:
-                raise ValueError(f"Chunk size is required for chunked attention layers: {layer_names}")
-            specs.append(
-                CacheGroupSpec(
-                    kv_cache_spec=ChunkedLocalAttentionSpec(
-                        page_size=page_size,
-                        num_kv_heads=group_num_kv_heads,
-                        head_size=group_head_size,
-                        dtype=dtype,
-                        use_mla=use_mla,
-                        attention_chunk_size=chunk_size,
                     ),
                     layer_names=layer_names,
                 )

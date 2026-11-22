@@ -107,13 +107,21 @@ def cache_group_rows(kv_cache_groups: list[CacheGroupSpec]) -> np.ndarray:
 class _Step:
     """A schedule the loop will commit: the core's plan, its runner view, and the entries' handles and ids."""
 
-    __slots__ = ("handles", "plan", "rids", "so")
+    __slots__ = ("empty_rids", "handles", "plan", "rids", "so")
 
-    def __init__(self, so: SchedulerOutput, plan: typing.Any, handles: list[int], rids: list[str]) -> None:
+    def __init__(
+        self,
+        so: SchedulerOutput,
+        plan: typing.Any,
+        handles: list[int],
+        rids: list[str],
+        empty_rids: list[str] | None = None,
+    ) -> None:
         self.so = so
         self.plan = plan
         self.handles = handles
         self.rids = rids
+        self.empty_rids = list(empty_rids) if empty_rids else []
 
 
 class EngineCoreDriver:
@@ -466,20 +474,43 @@ class EngineCoreDriver:
         """Finish live requests in order (``FINISH_STOP`` for a stop string, ``FINISH_ABORT``); returns those freed."""
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
+        ordered_unique: list[str] = []
+        seen: set[str] = set()
         handles: list[int] = []
+        removed_empty: set[str] = set()
+        empty_set = set(self._empty)
         for rid in request_ids:
+            if rid in seen:
+                continue
+            seen.add(rid)
+            ordered_unique.append(rid)
+            if rid in empty_set:
+                removed_empty.add(rid)
+                continue
             h = self._handles.get(rid)
-            if h is not None and h not in handles:
+            if h is not None:
                 handles.append(h)
-        if not handles:
-            return []
-        live = self._core.finish(np.asarray(handles, np.int64), int(reason)).tolist()
-        out = []
-        for h in live:
-            rid = self._names[h]
-            self._drop_live(rid, h)
-            out.append(rid)
-        return out
+        if removed_empty:
+            self._empty = [rid for rid in self._empty if rid not in removed_empty]
+            if self.include_finished_set:
+                self._empty_freed.extend(rid for rid in ordered_unique if rid in removed_empty)
+        freed_set = set(removed_empty)
+        if handles:
+            live = self._core.finish(np.asarray(handles, np.int64), int(reason)).tolist()
+            for h in live:
+                rid = self._names[h]
+                rec = self._records.get(h)
+                if rec is not None:
+                    rec.pixel_values = None
+                    rec.image_grid_thw = None
+                    rec.pixel_values_videos = None
+                    rec.video_grid_thw = None
+                    rec.mm_features = []
+                    rec.images = None
+                    rec.token_types = None
+                self._drop_live(rid, h)
+                freed_set.add(rid)
+        return [rid for rid in ordered_unique if rid in freed_set]
 
     # ------------------------------------------------------------------------------------------------ registry
     def _drop_live(self, rid: str, h: int) -> None:
@@ -694,6 +725,17 @@ class EngineCoreDriver:
                             mm_features=rec.mm_features,
                         )
                     )
+                    # Hand off heavy multimodal payloads exclusively to the runner's
+                    # CachedRequestState; _KIND_NEW fires at most once per handle
+                    # (preemption resumes via _KIND_RESUMED), so retaining raw pixels
+                    # here would defeat post-prefill host-RAM release.
+                    rec.pixel_values = None
+                    rec.image_grid_thw = None
+                    rec.pixel_values_videos = None
+                    rec.video_grid_thw = None
+                    rec.mm_features = []
+                    rec.images = None
+                    rec.token_types = None
                     continue
                 if kinds[i] == _KIND_RESUMED:
                     resumed.append((i, page_ids))
@@ -720,12 +762,14 @@ class EngineCoreDriver:
             self._drop_live(rid, h)
         for h in plan.finished.tolist():
             self._reported(h)
+        step_empty: list[str] = []
         if self._empty:
             for rid in self._empty:
                 logger.warning("Dropping request %s: zero schedulable prompt tokens (empty prompt).", rid)
             finished.update(self._empty)
+            step_empty = list(self._empty)
             if self.include_finished_set:
-                self._empty_freed.extend(self._empty)
+                self._empty_freed.extend(step_empty)
             self._empty = []
         preempted = {names[h] for h in plan.preempted.tolist()}
         if self._kv_versions:
@@ -773,7 +817,7 @@ class EngineCoreDriver:
             async_safe=bool(plan.flags & _PLAN_ASYNC_SAFE),
         )
         if n or zero_schedule_needs_update(so):
-            self._steps[id(so)] = _Step(so, plan, handles, rids)
+            self._steps[id(so)] = _Step(so, plan, handles, rids, step_empty)
         collector = get_metrics_collector()
         if collector:
             collector.record_scheduler_metrics(
@@ -877,13 +921,14 @@ class EngineCoreDriver:
                         accepted[i] = int(count)
                 offsets.append(len(flat))
                 draft_offsets.append(len(new_drafts))
+            has_drafts = spec is not None or spec_drafts is not None
             events = self._core.commit(
                 step.plan,
                 sampled_tokens=np.asarray(flat, np.int32),
                 sampled_offsets=np.asarray(offsets, np.int32),
                 accepted=accepted,
-                new_drafts=None if spec is None else np.asarray(new_drafts, np.int32),
-                new_draft_offsets=None if spec is None else np.asarray(draft_offsets, np.int32),
+                new_drafts=np.asarray(new_drafts, np.int32) if has_drafts else None,
+                new_draft_offsets=np.asarray(draft_offsets, np.int32) if has_drafts else None,
                 present=present,
             )
         else:
@@ -920,6 +965,14 @@ class EngineCoreDriver:
             )
             if code:
                 self._drop_live(rid, h)
+        for rid in step.empty_rids:
+            outputs.append(
+                EngineCoreOutput(
+                    request_id=rid,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ABORT,
+                )
+            )
         timestamp = time.perf_counter()
         result: dict[int, EngineCoreOutputs] = {}
         if outputs:
@@ -947,8 +1000,19 @@ class EngineCoreDriver:
         self._core.check()
 
     def shutdown(self) -> None:
-        """Close the core; later calls raise :attr:`closed_error`."""
-        self._core.shutdown()
+        """Close the core and drop all retained host bookkeeping; later calls raise :attr:`closed_error`."""
+        try:
+            self._core.shutdown()
+        finally:
+            self._handles.clear()
+            self._records.clear()
+            self._names.clear()
+            self._reports_due.clear()
+            self._steps.clear()
+            self._empty.clear()
+            self._empty_freed.clear()
+            self._kv_versions.clear()
+            self.image_expander = None
 
 
 __all__ = ("FINISH_ABORT", "FINISH_LENGTH", "FINISH_STOP", "EngineCoreDriver", "cache_group_rows")

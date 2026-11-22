@@ -57,6 +57,7 @@ from ..utils import (
     find_common_suffix,
     is_complete_json,
     partial_json_loads,
+    stable_json_stream_prefix,
 )
 
 
@@ -93,7 +94,10 @@ def stream_json_calls(calls: list[dict], previous: list[dict], sent: list[str], 
                 # Numeric tokens may still grow into exponents (1 -> 1e-2),
                 # changing their serialization rather than simply appending.
                 if not isinstance(args, str):
-                    stable = re.sub(r"(?<=[ :\[,])[-+0-9.eE]+$", "", stable)
+                    stable = re.sub(r"(?<=[ :\[,])(?:[-+0-9.eE]+|Infinity|NaN)$", "", stable)
+                # Withhold a trailing unmatched high surrogate (split \ud83d + \ude00 escape pair).
+                if stable and "\ud800" <= stable[-1] <= "\udbff":
+                    stable = stable[:-1]
             else:
                 stable = ""
             if stable.startswith(sent[index]):
@@ -120,4 +124,6 @@ __all__ = [
     "find_common_suffix",
     "is_complete_json",
     "partial_json_loads",
+    "stable_json_stream_prefix",
+    "stream_json_calls",
 ]

@@ -259,6 +259,140 @@ def replay_case(case: dict, tokens: np.ndarray, make_manager, running_status=Non
     assert [m._core.free_order(), m._core.refs()] == case["final"], name
 
 
+_LEGACY_HYBRID_SLIDING_EAGLE_CASES: dict[int, tuple[str, int]] = {
+    # Captured from the former Python CacheManager (commit f7856e6b18f0), whose HybridCacheCoordinator
+    # double-subtracted the EAGLE reserve page on 2-type (Full, Sliding) layouts (once in Full, once in Sliding).
+    # surgecore now reserves a single page; these cases verify exact bitwise parity up to the first EAGLE hit,
+    # the exact +1 page single-reserve delta at that hit, and full KV invariants across the entire op stream.
+    13: ("13_full_sw8_p1_c_e", 18),
+    14: ("14_sw8_full_p16_c_e", 15),
+    21: ("21_full_full_sw64_p1_c_e_mm", 36),
+}
+
+
+def replay_corrected_hybrid_sliding_eagle_case(
+    case: dict,
+    tokens: np.ndarray,
+    make_manager,
+    first_hit_step: int,
+    running_status=None,
+) -> None:
+    """Replay a legacy (Full, Sliding) + eagle golden case with single-page EAGLE invariant checks."""
+    name = case["name"]
+    assert case["init_error"] is None and case["caching"] and case["eagle"], name
+    kinds = {g[0] for g in case["groups"]}
+    assert kinds == {0, 1}, (name, kinds)
+    ps = int(case["groups"][0][1])
+    m = make_manager(case["groups"], case["num_pages"], case["max_model_len"], case["caching"], case["eagle"])
+    reqs = [
+        FakeRequest(f"r{i}", tokens[q["off"] : q["off"] + q["len"]].tolist(), q["extra"], q["plog"], running_status)
+        for i, q in enumerate(case["requests"])
+    ]
+    hits: dict[int, object] = {}
+    key_classes: dict[int, int] = {}
+
+    def call(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs), None
+        except Exception as exc:
+            return None, type(exc).__name__
+
+    for step, op in enumerate(case["ops"]):
+        kind, i, a = op["o"], op["r"], op["a"]
+        r = reqs[i] if i is not None else None
+        where = (name, step, kind, i, a)
+        if kind == "append":
+            r.all_token_ids.append(a["t"])
+            continue
+        before_probe = None
+        if kind == "probe":
+            before_probe = (
+                m.page_pool.get_num_free_pages(),
+                m.num_cached_pages,
+                m._core.free_order(),
+                m._core.refs(),
+            )
+            res, err = call(m.probe_num_computed_tokens, r)
+            got = err or int(res)
+        elif kind == "keys":
+            res, err = call(m.request_page_hashes, r)
+            got = err or [key_classes.setdefault(int(k), len(key_classes)) for k in res]
+        elif kind == "lookup":
+            res, err = call(
+                m.get_computed_pages, r, dp_shard_hint=a["h"], data_parallel_size=a["d"], max_cache_hit_tokens=a["mx"]
+            )
+            hits[i] = None if err else res[0]
+            got = err or [_ids(res[0]), int(res[1])]
+        elif kind == "needed":
+            hit = hits.get(i) if a["hit"] else None
+            res, err = call(m.get_num_pages_needed, r, a["n"], hit, max_chunk_tokens=a["mc"])
+            got = err or int(res)
+        elif kind == "alloc":
+            r.num_computed_tokens = a["c"]
+            hit = hits.get(i) if a.get("hit") else None
+            res, err = call(m.allocate_slots, r, a["n"], a["nc"], hit, a["la"], a["h"], a["d"])
+            got = err or (None if res is None else _ids(res))
+            if err is None and res is not None:
+                r.num_computed_tokens = a["c"] + a["nc"] + a["n"]
+        elif kind == "publish":
+            _, got = call(m.cache_pages, r, a["n"])
+        elif kind == "common":
+            res, err = call(m.get_num_common_prefix_pages, r, a["k"])
+            got = err or [int(x) for x in res]
+        elif kind == "preempt":
+            _, got = call(m.free, r)
+            r.num_computed_tokens = 0
+        elif kind == "finish":
+            _, err = call(m.free, r)
+            _, err2 = call(m.free_page_hashes, r)
+            r.num_computed_tokens = 0
+            got = err or err2
+        elif kind == "reset":
+            res, err = call(m.reset_prefix_cache)
+            got = err or bool(res)
+        else:
+            raise AssertionError(f"unknown golden op {kind}")
+
+        if step < first_hit_step:
+            assert got == op["res"], (*where, got, op["res"])
+            state = [int(m.page_pool.get_num_free_pages()), int(m.num_cached_pages)]
+            assert state == op["st"], (*where, state, op["st"])
+            if "ids" in op:
+                assert [list(g) for g in m.get_page_ids(r.request_id)] == op["ids"], where
+            if "q" in op:
+                assert _crc(m._core) == op["q"], where
+        elif step == first_hit_step:
+            if kind == "lookup":
+                assert not isinstance(got, str), (*where, got)
+                assert got[1] == op["res"][1] + ps, (*where, got[1], op["res"][1], ps)
+                assert all(len(g) == got[1] // ps for g in got[0]), (*where, got)
+            else:
+                assert kind == "probe" and isinstance(got, int), (*where, got)
+                assert got == op["res"] + ps, (*where, got, op["res"], ps)
+        else:
+            if kind == "probe" and isinstance(got, int):
+                after_probe = (
+                    m.page_pool.get_num_free_pages(),
+                    m.num_cached_pages,
+                    m._core.free_order(),
+                    m._core.refs(),
+                )
+                assert after_probe == before_probe, where
+                assert got >= 0 and got % ps == 0, (*where, got)
+                if got > 0:
+                    assert got <= (r.num_tokens - 1) - ps, (*where, got, r.num_tokens, ps)
+            elif kind == "lookup" and not isinstance(got, str):
+                hit_pages, hit_tokens = got
+                assert hit_tokens >= 0 and hit_tokens % ps == 0, (*where, got)
+                assert all(len(g) == hit_tokens // ps for g in hit_pages), (*where, got)
+                if hit_tokens > 0:
+                    max_len = r.num_tokens - 1 if a["mx"] is None else min(r.num_tokens - 1, a["mx"])
+                    assert hit_tokens <= max_len - ps, (*where, hit_tokens, max_len, ps)
+
+        assert m.page_pool.get_num_free_pages() + sum(1 for x in m._core.refs() if x) == case["num_pages"] - 1, where
+        m._core.check()
+
+
 def test_fixture_header_names_source_and_commit():
     assert _HEADER == {"commit": "f7856e6b18f0", "source": "easydel.inference.esurge.core.manager"}
     assert len(_BODY["cases"]) == 45 and len(_BODY["snapshots"]) == 24
@@ -266,7 +400,90 @@ def test_fixture_header_names_source_and_commit():
 
 @pytest.mark.parametrize("index", range(45))
 def test_kv_core_matches_python_goldens(index):
-    replay_case(_BODY["cases"][index], _TOKENS, KvDriver)
+    case = _BODY["cases"][index]
+    if index in _LEGACY_HYBRID_SLIDING_EAGLE_CASES:
+        expected_name, first_hit_step = _LEGACY_HYBRID_SLIDING_EAGLE_CASES[index]
+        assert case["name"] == expected_name
+        replay_corrected_hybrid_sliding_eagle_case(case, _TOKENS, KvDriver, first_hit_step)
+        return
+    replay_case(case, _TOKENS, KvDriver)
+
+
+def test_hybrid_full_sliding_eagle_reserves_only_one_page():
+    for groups, full_idx, sw_idx in [
+        ([(0, 4, 0, 0), (1, 4, 4, 1)], 0, 1),
+        ([(1, 4, 4, 0), (0, 4, 0, 1)], 1, 0),
+    ]:
+        core = KvCore(num_pages=32, groups=groups, max_model_len=64, caching=True, eagle=True)
+        toks = list(range(1, 10))
+        donor = core.open(0)
+        hits, n_hit = core.lookup(donor, toks, False, len(toks) - 1)
+        assert n_hit == 0 and hits == [[], []]
+        assert core.allocate(donor, 0, len(toks), 0, hits, 0) is not None
+        assert core.publish(donor, 8) is None
+        core.free(donor)
+
+        # 2 cached pages (8 tokens) with EAGLE reserving 1 page must hit 4 tokens (1 page), never 0.
+        assert core.probe(None, toks, 0, len(toks) - 1) == 4
+        slot = core.open(0)
+        pages, hit_tokens = core.lookup(slot, toks, False, len(toks) - 1)
+        assert hit_tokens == 4
+        assert len(pages[full_idx]) == 1 and pages[full_idx][0] != 0
+        assert len(pages[sw_idx]) == 1 and pages[sw_idx][0] != 0
+        core.check()
+
+    # Window=8, page_size=4, 4 cached pages (16 tokens): EAGLE reserves 1 page -> 12 tokens with null prefix on page 0.
+    core = KvCore(num_pages=32, groups=[(0, 4, 0, 0), (1, 4, 8, 1)], max_model_len=64, caching=True, eagle=True)
+    toks17 = list(range(100, 117))
+    donor = core.open(0)
+    hits, _ = core.lookup(donor, toks17, False, len(toks17) - 1)
+    assert core.allocate(donor, 0, len(toks17), 0, hits, 0) is not None
+    assert core.publish(donor, 16) is None
+    core.free(donor)
+
+    assert core.probe(None, toks17, 0, len(toks17) - 1) == 12
+    slot = core.open(0)
+    pages, hit_tokens = core.lookup(slot, toks17, False, len(toks17) - 1)
+    assert hit_tokens == 12
+    assert len(pages[0]) == 3 and all(p != 0 for p in pages[0])
+    assert len(pages[1]) == 3 and pages[1][0] == 0 and pages[1][1] != 0 and pages[1][2] != 0
+    core.check()
+
+
+def test_hybrid_full_chunked_eagle_reserves_once_at_chunk_boundary():
+    for groups, full_idx, ch_idx in [
+        ([(0, 4, 0, 0), (2, 4, 8, 1)], 0, 1),
+        ([(2, 4, 8, 0), (0, 4, 0, 1)], 1, 0),
+    ]:
+        # Pool size=8 (7 usable pages): donor allocates 3 pages in full (3) + 1 page in chunked after dropping chunk 0
+        # behind boundary 8, then an evictor claims the freed chunk-0 pages so chunked has only page 2 cached (pages 0,1
+        # are evicted in chunked while full still holds pages 0,1,2).
+        core = KvCore(num_pages=10, groups=groups, max_model_len=64, caching=True, eagle=True)
+        toks = list(range(50, 63))
+        donor = core.open(0)
+        hits, _ = core.lookup(donor, toks, False, len(toks) - 1)
+        assert core.allocate(donor, 0, 8, 0, hits, 0) is not None
+        assert core.publish(donor, 8) is None
+        # Advancing past chunk boundary 8 releases chunk-0 pages in the chunked group into the free list.
+        assert core.allocate(donor, 8, 4, 0, None, 0) is not None
+        assert core.publish(donor, 12) is None
+        # Evict the unreferenced chunk-0 pages from the chunked group while donor keeps full pages 0,1,2 pinned.
+        evictor = core.open(1)
+        ev_toks = list(range(200, 213))
+        ev_hits, _ = core.lookup(evictor, ev_toks, False, len(ev_toks) - 1)
+        assert core.allocate(evictor, 0, 8, 0, ev_hits, 0) is not None
+        core.free(evictor)
+        core.free(donor)
+
+        # Full still has 3 pages (12 tokens) -> EAGLE drops 1 page to chunk boundary 8 -> chunked hits [0, 0] (8 tokens)
+        # without subtracting a second page into the evicted chunk 0.
+        assert core.probe(None, toks, 0, len(toks) - 1) == 8
+        slot = core.open(0)
+        pages, hit_tokens = core.lookup(slot, toks, False, len(toks) - 1)
+        assert hit_tokens == 8
+        assert len(pages[full_idx]) == 2 and all(p != 0 for p in pages[full_idx])
+        assert pages[ch_idx] == [0, 0]
+        core.check()
 
 
 @pytest.mark.parametrize("index", range(24))

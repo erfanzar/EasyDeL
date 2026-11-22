@@ -116,8 +116,7 @@ impl HitSearch {
                 let mut hit_full = find_full(pool, keys, max_len, fps, full, range, eagle);
                 let len = hit_full[0].len() as i64 * fps;
                 let og = groups[other[0] as usize];
-                let other_eagle = eagle && !matches!(og.kind, Kind::Chunked(_));
-                let hit_other = og.find(pool, keys, len, other, range, other_eagle)?;
+                let hit_other = og.find(pool, keys, len, other, range, false)?;
                 let len = hit_other[0].len() as i64 * og.page_size;
                 if len % fps != 0 {
                     return Err(KvError::Runtime(format!(
@@ -216,5 +215,112 @@ mod tests {
             HitSearch::select(&[full, sw(24)], false).unwrap(),
             HitSearch::NoCache
         ));
+    }
+
+    #[test]
+    fn hybrid_full_sliding_eagle_reserves_only_one_page() {
+        use super::super::pool::NULL_PAGE;
+
+        let full = Group {
+            kind: Kind::Full,
+            page_size: 4,
+            type_index: 0,
+        };
+        let sw4 = Group {
+            kind: Kind::Sliding(4),
+            page_size: 4,
+            type_index: 1,
+        };
+        // 2 published pages (8 tokens) with window=4, page_size=4: EAGLE reserves 1 page -> 4 tokens (1 page), not 0.
+        for groups in [vec![full, sw4], vec![sw4, full]] {
+            let search = HitSearch::select(&groups, true).unwrap();
+            assert!(matches!(search, HitSearch::Hybrid { .. }));
+            let mut pool = PagePool::new(16, true).unwrap();
+            let keys: Vec<PageKey> = (1..=2).collect();
+            let mut owned = Vec::new();
+            for gid in 0..2u32 {
+                let pages = pool.get_new(2, None).unwrap();
+                for (&p, &k) in pages.iter().zip(&keys) {
+                    pool.publish(p, k, gid).unwrap();
+                }
+                owned.push(pages);
+            }
+            let (hit, len) = search.find(&groups, &pool, &keys, 8, None, true).unwrap();
+            assert_eq!(len, 4);
+            assert_eq!(hit[0], vec![owned[0][0]]);
+            assert_eq!(hit[1], vec![owned[1][0]]);
+        }
+
+        // 4 published pages (16 tokens) with window=8, page_size=4: EAGLE reserves 1 page -> 12 tokens (3 pages),
+        // with the sliding group dropping page 0 behind the window (NULL_PAGE).
+        let sw8 = Group {
+            kind: Kind::Sliding(8),
+            page_size: 4,
+            type_index: 1,
+        };
+        let groups = vec![full, sw8];
+        let search = HitSearch::select(&groups, true).unwrap();
+        let mut pool = PagePool::new(32, true).unwrap();
+        let keys: Vec<PageKey> = (10..=13).collect();
+        let full_pages = pool.get_new(4, None).unwrap();
+        let sw_pages = pool.get_new(4, None).unwrap();
+        for (&p, &k) in full_pages.iter().zip(&keys) {
+            pool.publish(p, k, 0).unwrap();
+        }
+        for (&p, &k) in sw_pages.iter().zip(&keys) {
+            pool.publish(p, k, 1).unwrap();
+        }
+        let (hit, len) = search.find(&groups, &pool, &keys, 16, None, true).unwrap();
+        assert_eq!(len, 12);
+        assert_eq!(hit[0], full_pages[..3].to_vec());
+        assert_eq!(hit[1], vec![NULL_PAGE, sw_pages[1], sw_pages[2]]);
+
+        // If sliding only retains pages 2 and 3 (pages 0 and 1 missing), dropping page 3 for EAGLE leaves page 1
+        // uncovered for window=8 at len=12, so the hit must be 0.
+        let mut pool2 = PagePool::new(32, true).unwrap();
+        let full_pages2 = pool2.get_new(4, None).unwrap();
+        let sw_pages2 = pool2.get_new(2, None).unwrap();
+        for (&p, &k) in full_pages2.iter().zip(&keys) {
+            pool2.publish(p, k, 0).unwrap();
+        }
+        pool2.publish(sw_pages2[0], keys[2], 1).unwrap();
+        pool2.publish(sw_pages2[1], keys[3], 1).unwrap();
+        let (hit2, len2) = search.find(&groups, &pool2, &keys, 16, None, true).unwrap();
+        assert_eq!(len2, 0);
+        assert!(hit2[0].is_empty() && hit2[1].is_empty());
+    }
+
+    #[test]
+    fn hybrid_full_chunked_eagle_reserves_once_at_chunk_boundary() {
+        use super::super::pool::NULL_PAGE;
+
+        let full = Group {
+            kind: Kind::Full,
+            page_size: 4,
+            type_index: 0,
+        };
+        let ch = Group {
+            kind: Kind::Chunked(8),
+            page_size: 4,
+            type_index: 1,
+        };
+        let keys: Vec<PageKey> = (20..=22).collect();
+
+        // Full has 3 cached pages (12 tokens); chunked has no cached pages in chunk 0 or page 2 (chunk 0 was dropped
+        // behind chunk boundary 8). EAGLE drops 1 page from full (12 -> 8) and chunked hits chunk boundary 8 with
+        // NULL pages without subtracting another page into the uncached previous chunk.
+        for (groups, full_idx, ch_idx) in [(vec![full, ch], 0usize, 1usize), (vec![ch, full], 1usize, 0usize)] {
+            let search = HitSearch::select(&groups, true).unwrap();
+            assert!(matches!(search, HitSearch::Hybrid { .. }));
+            let mut pool = PagePool::new(16, true).unwrap();
+            let full_pages = pool.get_new(3, None).unwrap();
+            for (&p, &k) in full_pages.iter().zip(&keys) {
+                pool.publish(p, k, full_idx as u32).unwrap();
+            }
+            let (hit, len) = search.find(&groups, &pool, &keys, 12, None, true).unwrap();
+            assert_eq!(len, 8);
+            assert_eq!(hit[full_idx], full_pages[..2].to_vec());
+            assert_eq!(hit[ch_idx], vec![NULL_PAGE, NULL_PAGE]);
+        }
     }
 }

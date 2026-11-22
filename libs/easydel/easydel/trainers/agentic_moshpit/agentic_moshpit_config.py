@@ -21,6 +21,7 @@ and agentic reward computation.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from easydel.utils import Registry
@@ -160,6 +161,47 @@ class AgenticMoshPitConfig(GRPOConfig):
         },
     )
 
+    def validate_agentic_knobs(self) -> None:
+        """Validate Agentic MoshPit bounds and reject unsupported inherited GRPO knobs.
+
+        Called both from ``__post_init__`` and from ``AgenticMoshPitTrainer.__init__``
+        so post-construction config mutations are also caught before training starts.
+        """
+        for field_name in ("max_steps", "group_size", "num_env_groups"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"`{field_name}` must be a positive integer; got {value!r}.")
+
+        gamma = self.step_reward_gamma
+        if isinstance(gamma, bool) or not isinstance(gamma, int | float) or not math.isfinite(gamma) or not (0.0 <= gamma <= 1.0):
+            raise ValueError(f"`step_reward_gamma` must be a finite float in [0.0, 1.0]; got {gamma!r}.")
+
+        if self.num_iterations > 1:
+            raise ValueError(
+                f"AgenticMoshPit does not support `num_iterations > 1` (got {self.num_iterations}); "
+                "agentic rollouts perform one on-policy update per collected batch."
+            )
+        if self.steps_per_generation is not None and self.steps_per_generation > 1:
+            raise ValueError(
+                f"AgenticMoshPit does not support `steps_per_generation > 1` (got {self.steps_per_generation})."
+            )
+        if self.mask_truncated_completions:
+            raise ValueError(
+                "AgenticMoshPit does not support `mask_truncated_completions=True`; "
+                "multi-turn episodes track truncation per episode rather than single-turn EOS."
+            )
+        if self.off_policy_mask_threshold is not None:
+            raise ValueError(
+                "AgenticMoshPit does not support `off_policy_mask_threshold`; "
+                f"got {self.off_policy_mask_threshold!r}."
+            )
+        divergence_type = getattr(self, "divergence_type", None)
+        if self.loss_type == "dppo" and divergence_type in {"topk_tv", "topk_kl"}:
+            raise ValueError(
+                f"AgenticMoshPit does not support DPPO top-k divergence ({divergence_type!r}); "
+                "multi-turn rollouts do not emit top-k sampling log-prob tensors."
+            )
+
     def __post_init__(
         self,
         max_sequence_length: int | None,
@@ -170,8 +212,8 @@ class AgenticMoshPitConfig(GRPOConfig):
         Aligns ``num_generations`` and ``num_return_sequences`` with the
         configured ``group_size`` when they were left at their defaults,
         delegates to the GRPO base for shared validation, then validates
-        ``reward_mode`` and ``advantage_estimator`` against the supported
-        choices.
+        bounds, ``reward_mode``, ``advantage_estimator``, and unsupported
+        inherited GRPO knobs.
 
         Args:
             max_sequence_length: Forwarded to the GRPO ``__post_init__``
@@ -180,9 +222,12 @@ class AgenticMoshPitConfig(GRPOConfig):
                 for legacy alias handling.
 
         Raises:
-            ValueError: If ``reward_mode`` or ``advantage_estimator`` is
-                not one of the supported values.
+            ValueError: If any Agentic MoshPit bound, mode, estimator, or
+                unsupported GRPO knob is invalid.
         """
+        if isinstance(self.group_size, bool) or not isinstance(self.group_size, int) or self.group_size <= 0:
+            raise ValueError(f"`group_size` must be a positive integer; got {self.group_size!r}.")
+
         if self.num_generations is None and self.num_return_sequences == 4:
             self.num_return_sequences = self.group_size
             self.num_generations = self.group_size
@@ -206,5 +251,7 @@ class AgenticMoshPitConfig(GRPOConfig):
                 "step": "step_reinforce",
                 "gigpo": "gigpo",
             }[self.reward_mode]
+
+        self.validate_agentic_knobs()
 
     __hash__ = hash_fn

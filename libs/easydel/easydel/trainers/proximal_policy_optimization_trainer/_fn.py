@@ -42,6 +42,10 @@ from easydel.trainers._logprob_utils import (
     resolve_lmhead_chunksize,
 )
 
+from .._shared.policy_losses import (
+    _MAX_SAFE_LOG_RATIO,
+    _MIN_SAFE_LOG_RATIO,
+)
 from ..training_utils import (
     make_assertions_and_get_sizes,
     minibatch_call,
@@ -214,11 +218,17 @@ def clipped_policy_loss(
         of tokens whose clipped branch was selected.
     """
     upper = cliprange if cliprange_high is None else cliprange_high
-    ratio = jnp.exp(new_logps - old_logps)
-    unclipped = -advantages * ratio
-    clipped_branch = -advantages * jnp.clip(ratio, 1.0 - cliprange, 1.0 + upper)
-    per_token_loss = jnp.maximum(unclipped, clipped_branch)
-    return per_token_loss, ratio, (clipped_branch > unclipped).astype(jnp.float32)
+    log_ratio = (new_logps - old_logps).astype(jnp.float32)
+    safe_log_ratio = jnp.clip(log_ratio, _MIN_SAFE_LOG_RATIO, _MAX_SAFE_LOG_RATIO)
+    ratio = jnp.exp(safe_log_ratio)
+    low = 1.0 - cliprange
+    high = 1.0 + upper
+    use_clipped = ((advantages > 0.0) & (ratio > high)) | ((advantages < 0.0) & (ratio < low))
+    safe_unclipped_ratio = jnp.where(~use_clipped, ratio, 1.0)
+    unclipped = -advantages * safe_unclipped_ratio
+    clipped_branch = -advantages * jnp.where(advantages > 0.0, high, low)
+    per_token_loss = jnp.where(use_clipped, clipped_branch, unclipped)
+    return per_token_loss, ratio, use_clipped.astype(jnp.float32)
 
 
 def compute_per_token_logps(logits: jax.Array, input_ids: jax.Array, prompt_length: int) -> jax.Array:
@@ -535,10 +545,11 @@ def ppo_step(
     """
     normalizer_accumulation_steps = int(gradient_accumulation_steps) if is_training else 1
     scope_root = "easydel/trainer/ppo/" + ("train_step" if is_training else "eval_step")
+    effective_accum_steps = max(int(gradient_accumulation_steps), 1) if is_training else 1
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=effective_accum_steps,
             batch_partition_spec=partition_spec,
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
@@ -567,11 +578,12 @@ def ppo_step(
             input_ids = minibatch["input_ids"]
             attention_mask = minibatch["attention_mask"]
             completion_mask = minibatch["completion_mask"].astype(jnp.float32)
+            mask_bool = completion_mask > 0.0
 
-            old_logps = minibatch["old_logps"]
-            old_values = minibatch["old_values"]
-            advantages = jax.lax.stop_gradient(minibatch["advantages"])
-            returns = jax.lax.stop_gradient(minibatch["returns"])
+            old_logps = jax.lax.stop_gradient(minibatch["old_logps"].astype(jnp.float32))
+            old_values = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["old_values"].astype(jnp.float32), 0.0))
+            advantages = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["advantages"].astype(jnp.float32), 0.0))
+            returns = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["returns"].astype(jnp.float32), 0.0))
             in_value_pretrain = jnp.asarray(state.step) < value_pretrain_steps if value_pretrain_steps > 0 else None
 
             with jax.named_scope(scope_root + "/loss_fn/policy_forward"):
@@ -585,30 +597,34 @@ def ppo_step(
                 )
 
             with jax.named_scope(scope_root + "/loss_fn/policy_loss"):
-                log_ratio = new_logps - old_logps
+                safe_new_logps = jnp.where(mask_bool, new_logps.astype(jnp.float32), 0.0)
+                safe_old_logps = jnp.where(mask_bool, old_logps, 0.0)
+                safe_log_ratio = safe_new_logps - safe_old_logps
                 per_token_pg_loss, ratio, pg_clipped = clipped_policy_loss(
-                    new_logps,
-                    old_logps,
+                    safe_new_logps,
+                    safe_old_logps,
                     advantages,
                     cliprange=cliprange,
                     cliprange_high=cliprange_high,
                 )
+                safe_ratio = jnp.where(mask_bool, ratio, 0.0)
                 pg_denominator = _token_normalizer(
                     completion_mask,
                     minibatch.get("num_items_in_batch"),
                     token_level_loss=token_level_loss,
                     gradient_accumulation_steps=normalizer_accumulation_steps,
                 )
-                pg_loss = jnp.sum(per_token_pg_loss * completion_mask) / pg_denominator
+                pg_loss = jnp.sum(jnp.where(mask_bool, per_token_pg_loss, 0.0)) / pg_denominator
 
             with jax.named_scope(scope_root + "/loss_fn/value_loss"):
-                values_clipped = old_values + jnp.clip(new_values - old_values, -cliprange_value, cliprange_value)
-                vf_losses1 = jnp.square(new_values - returns)
+                safe_new_values = jnp.where(mask_bool, new_values.astype(jnp.float32), 0.0)
+                values_clipped = old_values + jnp.clip(safe_new_values - old_values, -cliprange_value, cliprange_value)
+                vf_losses1 = jnp.square(safe_new_values - returns)
                 vf_losses2 = jnp.square(values_clipped - returns)
                 vf_loss = 0.5 * _masked_mean(jnp.maximum(vf_losses1, vf_losses2), completion_mask)
 
             with jax.named_scope(scope_root + "/loss_fn/entropy_and_combine"):
-                entropy = _masked_mean(entropies, completion_mask)
+                entropy = _masked_mean(jnp.where(mask_bool, entropies.astype(jnp.float32), 0.0), completion_mask)
                 loss = pg_loss + vf_coef * vf_loss - entropy_coef * entropy
                 positive_nll = jnp.zeros((), dtype=jnp.float32)
                 if positive_nll_coef > 0.0:
@@ -619,13 +635,13 @@ def ppo_step(
                         token_level_loss=token_level_loss,
                         gradient_accumulation_steps=normalizer_accumulation_steps,
                     )
-                    positive_nll = -jnp.sum(new_logps * positive_tokens) / nll_denominator
+                    positive_nll = -jnp.sum(safe_new_logps * positive_tokens) / nll_denominator
                     loss = loss + positive_nll_coef * positive_nll
                 if in_value_pretrain is not None:
                     loss = jnp.where(in_value_pretrain, vf_coef * vf_loss, loss)
 
             with jax.named_scope(scope_root + "/loss_fn/diagnostics"):
-                approx_kl = 0.5 * _masked_mean(jnp.square(log_ratio), completion_mask)
+                approx_kl = 0.5 * _masked_mean(jnp.square(safe_log_ratio), completion_mask)
                 pg_clipfrac = _masked_mean(pg_clipped, completion_mask)
                 vf_clipfrac = _masked_mean(((vf_losses2 > vf_losses1).astype(jnp.float32)), completion_mask)
 
@@ -636,7 +652,7 @@ def ppo_step(
                     "approx_kl": approx_kl,
                     "pg_clipfrac": pg_clipfrac,
                     "vf_clipfrac": vf_clipfrac,
-                    "ratio_mean": _masked_mean(ratio, completion_mask),
+                    "ratio_mean": _masked_mean(safe_ratio, completion_mask),
                     "advantages_mean": _masked_mean(advantages, completion_mask),
                     "returns_mean": _masked_mean(returns, completion_mask),
                 }

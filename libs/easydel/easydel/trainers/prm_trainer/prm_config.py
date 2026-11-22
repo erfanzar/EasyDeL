@@ -39,5 +39,34 @@ class PRMConfig(RewardConfig):
     step_separator: str = field(default="\n")
     train_on_last_step_only: bool = field(default=False)
     dataset_num_proc: int | None = field(default=None)
+    center_rewards_coefficient: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Inherited from RewardConfig for schema compatibility only; unused by PRMTrainer "
+                "(token-classification loss) and must remain None."
+            )
+        },
+    )
+
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
+        if self.center_rewards_coefficient is not None:
+            raise ValueError(
+                "`center_rewards_coefficient` is not supported by EasyDeL PRMTrainer "
+                "(which trains with token-classification cross-entropy); leave it as None."
+            )
+        if self.max_completion_length is not None and (
+            isinstance(self.max_completion_length, bool) or self.max_completion_length <= 0
+        ):
+            raise ValueError("`max_completion_length` must be a positive integer when set.")
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__(
+                max_sequence_length=max_sequence_length,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

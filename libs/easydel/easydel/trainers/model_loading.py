@@ -78,10 +78,9 @@ def disable_state_dropout(state: EasyDeLState | None) -> EasyDeLState | None:
         return None
     module = state.model
     module.eval()
-    try:
-        graphdef, _ = spx.export(module)
-    except TypeError:
+    if not isinstance(module, spx.Module):
         return state
+    graphdef, _ = spx.export(module)
     return state.replace(graphdef=graphdef)
 
 

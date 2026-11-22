@@ -24,6 +24,7 @@ from __future__ import annotations
 import typing as tp
 from copy import deepcopy
 
+import jax
 import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
@@ -37,6 +38,7 @@ from easydel.utils.helpers import capture_time
 from .._shared import drop_optimizer_state
 from ..async_rollout_mixin import AsyncRolloutMixin
 from ..metrics import _host_mean_float
+from ..model_loading import disable_state_dropout, reject_string_model_id
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..trainer import Trainer
 from .seq_kd_config import SeqKDConfig
@@ -166,13 +168,32 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
 
         self.arguments = arguments
 
+        if isinstance(student_model, str):
+            reject_string_model_id(student_model, role="student model")
+        if student_model is None:
+            raise ValueError("`student_model` must be provided for SeqKDTrainer.")
+        if isinstance(teacher_model, str):
+            reject_string_model_id(teacher_model, role="teacher model")
+
         if not isinstance(student_model, EasyDeLState):
             student_model = student_model.to_state(trainable_selector=arguments.trainable_selector)
+        if getattr(arguments, "disable_dropout", False):
+            student_model = disable_state_dropout(student_model)
 
-        if teacher_model is not None and not isinstance(teacher_model, EasyDeLState):
-            teacher_model = teacher_model.to_state(trainable_selector=arguments.trainable_selector)
+        if teacher_model is not None:
+            if not isinstance(teacher_model, EasyDeLState):
+                teacher_model.eval()
+                teacher_model = teacher_model.to_state()
+            teacher_model = disable_state_dropout(teacher_model)
 
-        self.teacher_state = drop_optimizer_state(teacher_model)
+        self.teacher_state = (
+            None
+            if teacher_model is None
+            else self._share_esurge_cache_scope_if_compatible(
+                drop_optimizer_state(teacher_model),
+                primary_state=student_model,
+            )
+        )
         self.teacher_fn = teacher_fn
         self.processing_class = processing_class
 
@@ -189,6 +210,11 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
             data_collator=None,
             processing_class=processing_class,
         )
+        if self.teacher_state is not None:
+            self.teacher_state = self._share_esurge_cache_scope_if_compatible(
+                self.teacher_state,
+                primary_state=self.model_state,
+            )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
         """Build the lazy prompt-only preprocessing transform for SeqKD.
@@ -276,6 +302,61 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
             pad_token_id=self.padding_value,
         )
 
+    def _encode_teacher_fn_completions(
+        self,
+        completion_texts: list[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Right-pad ``teacher_fn`` completion strings and append EOS when room permits."""
+        max_completion_length = int(self.arguments.max_completion_length)
+        call_kwargs: dict[str, tp.Any] = {
+            "padding": "max_length",
+            "padding_side": "right",
+            "max_length": max_completion_length,
+            "truncation": True,
+            "return_tensors": "np",
+            "add_special_tokens": False,
+        }
+        try:
+            encoded = self.processing_class(completion_texts, **call_kwargs)
+        except TypeError:
+            call_kwargs.pop("padding_side", None)
+            tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+            had_padding_side = hasattr(tokenizer, "padding_side")
+            previous_padding_side = getattr(tokenizer, "padding_side", None)
+            if had_padding_side:
+                tokenizer.padding_side = "right"
+            try:
+                encoded = self.processing_class(completion_texts, **call_kwargs)
+            finally:
+                if had_padding_side:
+                    tokenizer.padding_side = previous_padding_side
+
+        completion_ids = np.array(encoded["input_ids"], copy=True)
+        completion_mask = np.array(encoded["attention_mask"], copy=True)
+
+        raw_eos = getattr(self, "_eos_token_id", None)
+        if raw_eos is None:
+            tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+            raw_eos = getattr(tokenizer, "eos_token_id", None)
+        if raw_eos is not None:
+            if isinstance(raw_eos, (list, tuple)):
+                eos_ids = [int(tok) for tok in raw_eos if tok is not None]
+            elif isinstance(raw_eos, np.ndarray):
+                eos_ids = [int(tok) for tok in raw_eos.reshape(-1).tolist()]
+            else:
+                eos_ids = [int(raw_eos)]
+            if eos_ids:
+                primary_eos = eos_ids[0]
+                eos_set = set(eos_ids)
+                seq_width = int(completion_ids.shape[1])
+                for row_idx in range(int(completion_ids.shape[0])):
+                    active_len = int(completion_mask[row_idx].sum())
+                    already_has_eos = active_len > 0 and int(completion_ids[row_idx, active_len - 1]) in eos_set
+                    if not already_has_eos and active_len < seq_width:
+                        completion_ids[row_idx, active_len] = primary_eos
+                        completion_mask[row_idx, active_len] = 1
+        return completion_ids, completion_mask
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
@@ -318,7 +399,7 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
 
             if self.teacher_fn is not None:
                 with capture_time() as generation_time_fn:
-                    host_prompt_ids = np.asarray(prompt_ids)
+                    host_prompt_ids = np.asarray(jax.device_get(prompt_ids))
                     prompt_texts = self.processing_class.batch_decode(
                         host_prompt_ids,
                         skip_special_tokens=True,
@@ -340,17 +421,10 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
                             f"{len(prompt_texts)} prompts with generation_factor={generation_factor}, "
                             f"but got {len(completion_texts)}."
                         )
-                    encoded = self.processing_class(
-                        completion_texts,
-                        padding="max_length",
-                        max_length=self.arguments.max_completion_length,
-                        truncation=True,
-                        return_tensors="np",
-                        add_special_tokens=False,
-                    )
+                    completion_ids_np, completion_mask_np = self._encode_teacher_fn_completions(completion_texts)
                     generated_completions_text = completion_texts
-                    completion_ids = jnp.array(encoded["input_ids"])
-                    completion_mask = jnp.array(encoded["attention_mask"])
+                    completion_ids = jnp.asarray(completion_ids_np)
+                    completion_mask = jnp.asarray(completion_mask_np)
                 generation_time = generation_time_fn()
             else:
                 with capture_time() as generation_time_fn:
@@ -369,6 +443,8 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
                 generation_time = generation_time_fn()
 
                 completion_mask = self._make_attn_mask(completion_ids)
+                if results.completion_mask is not None:
+                    completion_mask = completion_mask * results.completion_mask.astype(completion_mask.dtype)
 
             # Handle generation factor (num_generations_per_prompt > 1)
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
@@ -379,17 +455,16 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
             input_ids_full = jnp.concatenate([expanded_prompt_ids, completion_ids], axis=1)
             attention_mask_full = jnp.concatenate([expanded_prompt_mask, completion_mask], axis=1)
 
-            # Build labels: same as input_ids, but mask prompt tokens with -100
-            # ForCausalLMLoss shifts internally, so labels[i] = input_ids[i] is correct.
-            prompt_len = expanded_prompt_ids.shape[1]
-            labels = np.array(input_ids_full)
-            labels[:, :prompt_len] = -100
-            labels[np.array(attention_mask_full) == 0] = -100
+            # Build labels on-device without a D2H/H2D round-trip: mask prompt and pad
+            # positions with -100. ForCausalLMLoss shifts internally.
+            prompt_labels = jnp.full_like(expanded_prompt_ids, -100)
+            completion_labels = jnp.where(completion_mask.astype(bool), completion_ids, -100)
+            labels = jnp.concatenate([prompt_labels, completion_labels], axis=1)
 
             # Gather to replicated sharding
             input_ids_full = self._all_gather(input_ids_full)
             attention_mask_full = self._all_gather(attention_mask_full)
-            labels = self._all_gather(jnp.asarray(labels))
+            labels = self._all_gather(labels)
 
         preprocessing_time = preprocessing_time_fn()
 
@@ -398,16 +473,17 @@ class SeqKDTrainer(AsyncRolloutMixin, Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
-        self._log_training_generations_to_wandb(
-            state=state,
-            prompts=expanded_prompt_ids,
-            prompt_mask=expanded_prompt_mask,
-            completions=generated_completions_text,
-            completion_ids=completion_ids,
-            completion_mask=completion_mask,
-            generation_time=generation_time,
-            source="teacher",
-        )
+        if is_train:
+            self._log_training_generations_to_wandb(
+                state=state,
+                prompts=expanded_prompt_ids,
+                prompt_mask=expanded_prompt_mask,
+                completions=generated_completions_text,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                generation_time=generation_time,
+                source="teacher",
+            )
 
         return (
             {

@@ -686,3 +686,160 @@ def test_compaction_config_requires_strict_budget_and_resume_placeholder():
         CompactionRLConfig(resume_template="missing placeholder")
     with pytest.raises(ValueError, match="global_token_normalization"):
         CompactionRLConfig(global_token_normalization=False)
+
+
+def test_normalize_provider_batch_recomputes_all_nan_collated_behavior_logps():
+    trajectory = OnlineRLTrajectory(
+        input_ids=np.asarray([10, 11, 12, 13], dtype=np.int32),
+        attention_mask=np.ones(4, dtype=np.bool_),
+        action_mask=np.asarray([0, 0, 1, 1], dtype=np.bool_),
+        rewards=np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        behavior_logps=None,
+    )
+    # Pre-collated dict has all-NaN behavior_logps / target_behavior_logps.
+    collated = OnlineRLTrajectoryCollator(max_length=4, pad_token_id=0)([trajectory])
+    assert np.all(np.isnan(collated["behavior_logps"]))
+    assert np.all(np.isnan(collated["target_behavior_logps"]))
+
+    trainer = OnlineActorCriticTrainer.__new__(OnlineActorCriticTrainer)
+    trainer.arguments = SimpleNamespace(rollout_logprob_source="recompute", kl_coef=0.0)
+    trainer._prepare_target_batch = lambda batch: batch
+    recomputed = []
+
+    def fake_score(gs, go, ids, mask):
+        recomputed.append(int(gs))
+        return jnp.full((ids.shape[0], ids.shape[1] - 1), -0.75, dtype=jnp.float32)
+
+    trainer.compute_actor_logps_full = fake_score
+    normalized = trainer._normalize_provider_batch(
+        collated,
+        scoring_state=SimpleNamespace(graphstate=jnp.asarray(4), graphother=None),
+    )
+    assert recomputed == [4]
+    np.testing.assert_allclose(np.asarray(normalized["behavior_logps"]), [[0.0, -0.75, -0.75]])
+
+    # Under rollout_logprob_source="engine", all-NaN behavior_logps must still fail.
+    trainer.arguments.rollout_logprob_source = "engine"
+    with pytest.raises(ValueError, match="rollout_logprob_source='engine'"):
+        trainer._normalize_provider_batch(
+            collated,
+            scoring_state=SimpleNamespace(graphstate=jnp.asarray(4), graphother=None),
+        )
+
+    # Partial NaN corruption (one finite, one NaN) must still fail under "recompute".
+    trainer.arguments.rollout_logprob_source = "recompute"
+    corrupted = dict(collated)
+    corrupted["target_behavior_logps"] = np.asarray([[np.nan, -0.5, np.nan]], dtype=np.float32)
+    with pytest.raises(ValueError, match="must be finite"):
+        trainer._normalize_provider_batch(
+            corrupted,
+            scoring_state=SimpleNamespace(graphstate=jnp.asarray(4), graphother=None),
+        )
+
+
+def test_normalize_provider_batch_k3_kl_clamps_extreme_log_ratio():
+    trainer = OnlineActorCriticTrainer.__new__(OnlineActorCriticTrainer)
+    trainer.arguments = SimpleNamespace(
+        rollout_logprob_source="engine",
+        kl_coef=0.1,
+        kl_estimator="k3",
+    )
+    trainer._prepare_target_batch = lambda batch: batch
+    normalized = trainer._normalize_provider_batch(
+        {
+            "input_ids": np.asarray([[1, 2, 3, 4]], dtype=np.int32),
+            "attention_mask": np.ones((1, 4), dtype=np.int32),
+            "target_action_mask": np.asarray([[0, 1, 1]], dtype=np.int32),
+            "target_rewards": np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+            "target_behavior_logps": np.asarray([[0.0, -100.0, -0.5]], dtype=np.float32),
+            "reference_logps": np.asarray([[100.0, 0.0, -0.4]], dtype=np.float32),
+        },
+        scoring_state=SimpleNamespace(step=jnp.asarray(0)),
+    )
+    assert np.all(np.isfinite(np.asarray(normalized["rewards"])))
+
+
+def test_configs_preserve_num_return_sequences_and_validate_kl_estimator():
+    from easydel.trainers.proximal_policy_optimization_trainer import PPOConfig
+
+    ppo_n = PPOConfig(num_return_sequences=4)
+    assert ppo_n.num_return_sequences == 4
+    assert ppo_n.num_generations == 4
+
+    ppo_g = PPOConfig(num_generations=3)
+    assert ppo_g.num_return_sequences == 3
+    assert ppo_g.num_generations == 3
+
+    with pytest.raises(ValueError, match="aliases"):
+        PPOConfig(num_return_sequences=4, num_generations=2)
+
+    with pytest.raises(ValueError, match="single-rollout"):
+        SAOConfig(num_return_sequences=4)
+
+    with pytest.raises(ValueError, match="group size one"):
+        CompactionRLConfig(num_return_sequences=4)
+
+    assert PPOConfig(kl_estimator="k1").kl_estimator == "k1"
+    assert PPOConfig(kl_estimator="k3").kl_estimator == "k3"
+    with pytest.raises(ValueError, match="kl_estimator"):
+        PPOConfig(kl_estimator="k2")  # type: ignore[arg-type]
+
+
+def test_normalize_provider_batch_handles_multimodal_processor_pad_token_id():
+    trajectory = OnlineRLTrajectory(
+        input_ids=np.asarray([10, 11, 12], dtype=np.int32),
+        attention_mask=np.ones(3, dtype=np.bool_),
+        action_mask=np.asarray([0, 1, 1], dtype=np.bool_),
+        rewards=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        behavior_logps=np.asarray([0.0, -0.2, -0.3], dtype=np.float32),
+    )
+    trainer = OnlineActorCriticTrainer.__new__(OnlineActorCriticTrainer)
+    trainer.arguments = SimpleNamespace(
+        max_length=5,
+        rollout_logprob_source="engine",
+        kl_coef=0.0,
+    )
+    # Multimodal processor exposes pad_token_id only on `.tokenizer`, not top-level.
+    trainer.processing_class = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
+    trainer._prepare_target_batch = lambda batch: batch
+
+    normalized = trainer._normalize_provider_batch(
+        [trajectory],
+        scoring_state=SimpleNamespace(step=jnp.asarray(0)),
+    )
+    np.testing.assert_array_equal(np.asarray(normalized["input_ids"]), [[10, 11, 12, 7, 7]])
+
+
+def test_save_state_syncs_global_devices_on_multihost(tmp_path, monkeypatch):
+    from jax.experimental import multihost_utils
+
+    syncs: list[str] = []
+    monkeypatch.setattr("easydel.trainers._online_rl.trainer.jax.process_count", lambda: 2)
+    monkeypatch.setattr("easydel.trainers._online_rl.trainer.jax.process_index", lambda: 0)
+    monkeypatch.setattr(multihost_utils, "sync_global_devices", lambda name: syncs.append(name))
+
+    trainer = OnlineActorCriticTrainer.__new__(OnlineActorCriticTrainer)
+    trainer.actor_algorithm = "sao"
+    trainer.arguments = SimpleNamespace(save_optimizer_state=False)
+    trainer.critic_state = SimpleNamespace(
+        step=jnp.asarray(9),
+        model=SimpleNamespace(param_dtype=jnp.float32),
+        save_state=lambda **kwargs: None,
+    )
+    actor_state = SimpleNamespace(step=jnp.asarray(4))
+    monkeypatch.setattr(
+        PPOTrainer,
+        "_save_state",
+        lambda self, state, save_directory, *args, **kwargs: str(save_directory),
+    )
+
+    trainer._save_state(actor_state, str(tmp_path))
+    assert syncs == [
+        "easydel.online_rl.save_state.after_manifest_init",
+        "easydel.online_rl.save_state.before_manifest_complete",
+        "easydel.online_rl.save_state.after_manifest_complete",
+    ]
+    manifest = json.loads((tmp_path / "online_rl_checkpoint.json").read_text())
+    assert manifest["complete"] is True
+    assert manifest["actor_step"] == 4
+    assert manifest["critic_step"] == 9

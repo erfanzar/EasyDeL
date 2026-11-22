@@ -2347,21 +2347,12 @@ class Qwen3NextSparseMoeBlock(BaseMoeModule):
             gate_up_kernel=self.experts.gate_up_proj.kernel_view(),
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
+            shared_expert=self.gated_shared_expert_call(
+                self.shared_expert,
+                self.shared_expert_gate,
+                fp32_combine=self.dtype in lowfloats,
+            ),
         )
-
-        stage_mesh = resolve_stage_mesh(self.config.mesh, arr=hidden_states)
-        with spx.use_mesh(stage_mesh):
-            shared_out = self.shared_expert(hidden_states)
-            gate_input = self.shared_expert_gate(hidden_states)
-        needs_upcast = self.dtype in lowfloats
-        if needs_upcast:
-            gate = jax.nn.sigmoid(gate_input.astype(jnp.float32))
-            shared_out = shared_out.astype(jnp.float32) * gate
-            out = (out.astype(jnp.float32) + shared_out).astype(self.dtype)
-        else:
-            gate = jax.nn.sigmoid(gate_input)
-            shared_out = shared_out * gate
-            out = out + shared_out
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 

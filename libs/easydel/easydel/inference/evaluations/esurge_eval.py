@@ -246,7 +246,12 @@ def _strip_empty_reasoning_scaffold(
 
     stripped_prompt = rendered_prompt
     for pattern in scaffold_patterns:
-        stripped_prompt = re.sub(pattern, "", stripped_prompt, count=1)
+        # Strip only the trailing (last) empty reasoning scaffold so earlier few-shot
+        # assistant turns in multi-shot prompts remain untouched.
+        matches = list(re.finditer(pattern, stripped_prompt))
+        if matches:
+            last_match = matches[-1]
+            stripped_prompt = stripped_prompt[: last_match.start()] + stripped_prompt[last_match.end() :]
     return stripped_prompt
 
 
@@ -355,7 +360,13 @@ def _coerce_sampling_params_template(
     from easydel.inference.sampling_params import SamplingParams
 
     if isinstance(sampling_params, SamplingParams):
-        explicit_fields = frozenset(field.name for field in dataclass_fields(SamplingParams) if field.init)
+        default_max_tokens = SamplingParams().max_tokens
+        explicit_fields = frozenset(
+            field.name
+            for field in dataclass_fields(SamplingParams)
+            if field.init
+            and not (field.name == "max_tokens" and sampling_params.max_tokens == default_max_tokens)
+        )
         return sampling_params.clone(), explicit_fields
     if isinstance(sampling_params, collections.abc.Mapping):
         valid_fields = {field.name for field in dataclass_fields(SamplingParams) if field.init}
@@ -599,6 +610,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         sampling_params: SamplingParams | collections.abc.Mapping[str, Any] | None = None,
         normalize_math_answers: bool = True,
         math_answer_task_hints: tuple[str, ...] | list[str] | None = None,
+        add_bos_token: bool = False,
     ):
         """Initialize the eSurgeLMEvalAdapter.
 
@@ -652,7 +664,12 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         self.tokenizer.padding_side = "left"
 
         if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            eos_id = getattr(self.tokenizer, "eos_token_id", None)
+            if isinstance(eos_id, (list, tuple)):
+                eos_id = eos_id[0] if eos_id else None
+            self.tokenizer.pad_token_id = int(eos_id) if eos_id is not None else None
+
+        self.add_bos_token = bool(add_bos_token)
 
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
@@ -738,12 +755,20 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             attn_mechanism = attn_mechanism.value
         attn_mechanism = str(attn_mechanism).lower() if attn_mechanism is not None else ""
 
-        if attn_mechanism in {
+        decode_attn_mechanism = getattr(text_config, "decode_attn_mechanism", None)
+        if hasattr(decode_attn_mechanism, "value"):
+            decode_attn_mechanism = decode_attn_mechanism.value
+        decode_attn_mechanism = str(decode_attn_mechanism).lower() if decode_attn_mechanism is not None else ""
+
+        paged_mechanisms = {
             "ragged_page_attention_v2",
             "ragged_page_attention_v3",
             "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
             "paged_flash_attention",
-        }:
+            "unified_attention",
+        }
+        if attn_mechanism in paged_mechanisms or decode_attn_mechanism in paged_mechanisms:
             try:
                 compat_graphdef = self.model.new_graphdef(
                     recursive_update=True,
@@ -942,18 +967,21 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             prompt_text = prompts[i]
             try:
                 prompt_token_ids = [int(tok) for tok in self.tok_encode(prompt_text)]
-                prompt_token_ids, request_max_tokens = maybe_truncate(
+                truncated_token_ids, request_max_tokens = maybe_truncate(
                     prompt_token_ids,
                     max_gen_toks=int(request_max_tokens),
                     max_model_len=self.max_length,
                     side=self.truncation_side,
                     verbose=False,
                 )
-                prompt_text = self.tok_decode(
-                    prompt_token_ids,
-                    skip_special_tokens=False,
-                    spaces_between_special_tokens=False,
-                )
+                # Only re-decode when truncation actually shortened/modified the prompt so
+                # non-lossless tokenizers keep the exact rendered prompt intact.
+                if len(truncated_token_ids) != len(prompt_token_ids) or truncated_token_ids != prompt_token_ids:
+                    prompt_text = self.tok_decode(
+                        truncated_token_ids,
+                        skip_special_tokens=False,
+                        spaces_between_special_tokens=False,
+                    )
             except Exception as trunc_exc:
                 logger.debug("Prompt truncation failed, using original: %s", trunc_exc)
                 prompt_text = prompts[i]
@@ -975,6 +1003,15 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 sampling_kwargs["max_tokens"] = int(request_max_tokens)
                 sampling_kwargs["n"] = 1
                 sampling_kwargs["stop"] = _merge_stop_lists(sampling_kwargs.get("stop"), request_stops)
+                if not allow_per_request_sampling_overrides:
+                    # Preserve deterministic/explicit overrides from callers like ``greedy_until``.
+                    sampling_kwargs["temperature"] = float(
+                        self.temperature if request_temperature is None else request_temperature
+                    )
+                    sampling_kwargs["top_p"] = float(self.top_p if request_top_p is None else request_top_p)
+                    if sampling_kwargs["temperature"] <= 0.0:
+                        sampling_kwargs["top_k"] = 0
+                        sampling_kwargs["min_p"] = 0.0
             else:
                 sampling_kwargs = {
                     "max_tokens": int(request_max_tokens),
@@ -1054,8 +1091,8 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
     def _parse_instances(instances) -> tuple[list[str], list[dict[str, Any]]]:
         """Extract prompts and generation kwargs from lm-eval Instance objects.
 
-        Handles both modern Instance objects (with `.arguments`) and legacy
-        ``(context, gen_kwargs)`` tuples.
+        Handles lm-eval 0.4+ Instance objects (`.args` or `.arguments`) as well
+        as legacy ``(context, gen_kwargs)`` tuples.
 
         Args:
             instances: List of Instance objects or tuples.
@@ -1063,26 +1100,15 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         Returns:
             Tuple of (prompts, generation_kwargs).
         """
-        if instances and not hasattr(instances[0], "arguments") and isinstance(instances[0], tuple):
-            prompts: list[str] = []
-            generation_kwargs: list[dict[str, Any]] = []
-            for request in instances:
-                prompt = str(request[0]) if request else ""
-                config = request[1] if len(request) > 1 else None
-                if isinstance(config, dict):
-                    gen_kwargs = dict(config)
-                elif isinstance(config, (list, tuple)):
-                    gen_kwargs = {"until": list(config)}
-                else:
-                    gen_kwargs = {}
-                prompts.append(prompt)
-                generation_kwargs.append(gen_kwargs)
-            return prompts, generation_kwargs
-
         prompts: list[str] = []
         generation_kwargs: list[dict[str, Any]] = []
         for instance in instances:
-            arguments = instance.arguments if hasattr(instance, "arguments") else instance
+            if hasattr(instance, "args"):
+                arguments = instance.args
+            elif hasattr(instance, "arguments"):
+                arguments = instance.arguments
+            else:
+                arguments = instance
             prompt = str(arguments[0]) if arguments else ""
             config = arguments[1] if len(arguments) > 1 else None
             if isinstance(config, dict):
@@ -1118,7 +1144,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             normalized.append(generation)
         return normalized
 
-    def generate_until(self, instances):
+    def generate_until(self, instances, disable_tqdm: bool = False):
         """Generate text until a specified set of stop sequences is reached.
 
         This method is part of the lm-evaluation-harness LM interface.
@@ -1128,10 +1154,13 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 Each instance is expected to contain the prompt as the first
                 argument and an optional dictionary as the second argument
                 with an 'until' key containing a list of stop sequences.
+            disable_tqdm: Ignored progress-bar toggle accepted for lm-eval 0.4+
+                compatibility.
 
         Returns:
             List of generated strings, one for each instance.
         """
+        del disable_tqdm
         prompts, generation_kwargs = self._parse_instances(instances)
         generations = self._generate(prompts, generation_kwargs=generation_kwargs)
         return self._maybe_normalize_math(generations, instances)
@@ -1141,9 +1170,12 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         """Get the end-of-text token ID.
 
         Returns:
-            int: The EOS token ID from the tokenizer.
+            int | None: Normalized scalar EOS token ID from the tokenizer.
         """
-        return self.tokenizer.eos_token_id
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos_id, (list, tuple)):
+            eos_id = eos_id[0] if eos_id else None
+        return int(eos_id) if eos_id is not None else None
 
     @property
     def max_length(self):
@@ -1234,14 +1266,31 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 self._chat_template_sig_resolved = True
             signature = self._chat_template_signature
 
+            added_enable_thinking_via_varkw = False
             if signature is not None:
+                has_var_keyword = any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+                )
                 if "continue_final_message" in signature.parameters:
                     template_kwargs["continue_final_message"] = not add_generation_prompt
                 if "enable_thinking" in signature.parameters:
                     template_kwargs["enable_thinking"] = self.enable_thinking
+                elif has_var_keyword:
+                    template_kwargs["enable_thinking"] = self.enable_thinking
+                    added_enable_thinking_via_varkw = True
             template_kwargs.update(self.chat_template_args)
             try:
                 rendered = template_fn(messages, **template_kwargs)
+            except TypeError as type_exc:
+                if (
+                    added_enable_thinking_via_varkw
+                    and "enable_thinking" not in self.chat_template_args
+                    and "enable_thinking" in str(type_exc)
+                ):
+                    template_kwargs.pop("enable_thinking", None)
+                    rendered = template_fn(messages, **template_kwargs)
+                else:
+                    raise
             except Exception as template_exc:
                 if any(message.get("role") == "system" for message in (messages or [])):
                     logger.debug("Chat template failed with system message, retrying without: %s", template_exc)
@@ -1363,6 +1412,14 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         whole_enc = [int(t) for t in self.tok_encode(context + continuation)]
         context_enc = [int(t) for t in self.tok_encode(context)]
         continuation_enc = whole_enc[len(context_enc) :]
+        if self.add_bos_token:
+            bos_id = getattr(self.tokenizer, "bos_token_id", None)
+            if isinstance(bos_id, (list, tuple)):
+                bos_id = bos_id[0] if bos_id else None
+            if bos_id is not None:
+                bos_int = int(bos_id)
+                if not context_enc or context_enc[0] != bos_int:
+                    context_enc = [bos_int, *context_enc]
         return context_enc, continuation_enc
 
     def _loglikelihood_token_ids(
@@ -1476,6 +1533,11 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         if max_len < 1:
             return results
 
+        # Bucket sequence lengths to powers of two (capped at max_length) so
+        # ``@spx.jit`` does not recompile for every distinct batch length.
+        bucket_len = max(16, 1 << (max_len - 1).bit_length())
+        padded_len = max(max_len, min(int(self.max_length), bucket_len))
+
         input_rows: list[jax.Array] = []
         target_rows: list[jax.Array] = []
         mask_rows: list[jax.Array] = []
@@ -1483,7 +1545,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             ids_arr = jnp.asarray(ids, dtype=jnp.int32)
             targets_arr = jnp.asarray(t_ids, dtype=jnp.int32)
             valid_len = ids_arr.shape[0]
-            pad_len = max_len - valid_len
+            pad_len = padded_len - valid_len
 
             input_rows.append(jnp.pad(ids_arr, (0, pad_len), constant_values=pad_id))
             target_rows.append(jnp.pad(targets_arr, (0, pad_len), constant_values=pad_id))
@@ -1517,7 +1579,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
 
         greedy_ids = jnp.argmax(logits, axis=-1)
 
-        positions = jnp.arange(max_len)[None, :]
+        positions = jnp.arange(padded_len)[None, :]
         start = (jnp.asarray(context_lens_scored) - 1)[:, None]
         end = (jnp.asarray(context_lens_scored) - 1 + jnp.asarray(cont_lens_scored))[:, None]
         score_mask = (positions >= start) & (positions < end) & attention_mask_jax
@@ -1614,7 +1676,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
 
         return results
 
-    def loglikelihood_rolling(self, instances):
+    def loglikelihood_rolling(self, instances, disable_tqdm: bool = False):
         """Calculate log-likelihood of token sequences in a rolling fashion.
 
         This method is part of the lm-evaluation-harness LM interface.
@@ -1625,18 +1687,23 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             instances: List of Instance objects from lm-evaluation-harness.
                 Instances contain either the raw string or a pre-tokenized
                 sequence.
+            disable_tqdm: Ignored progress-bar toggle accepted for lm-eval 0.4+
+                compatibility.
 
         Returns:
             List of rolling log-likelihoods (floats), one per instance.
         """
+        del disable_tqdm
         per_request_windows: list[tuple[int, list[int], list[int]]] = []
 
-        prefix = self.eot_token_id
+        prefix = self.prefix_token_id
         max_seq_len = int(self.max_length)
         context_len = 1  # matches lm-eval default for rolling perplexity
 
         for req_idx, instance in enumerate(instances):
-            if hasattr(instance, "arguments"):
+            if hasattr(instance, "args"):
+                arguments = instance.args
+            elif hasattr(instance, "arguments"):
                 arguments = instance.arguments
             else:
                 arguments = instance
@@ -1679,7 +1746,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
 
         return totals
 
-    def greedy_until(self, requests):
+    def greedy_until(self, requests, disable_tqdm: bool = False):
         """Generate completions using greedy decoding until stop sequences.
 
         This method is part of the lm-evaluation-harness LM interface.
@@ -1688,10 +1755,13 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         Args:
             requests: List of (context, stopping_sequences) tuples or
                 Instance objects from lm-evaluation-harness.
+            disable_tqdm: Ignored progress-bar toggle accepted for lm-eval 0.4+
+                compatibility.
 
         Returns:
             List of generated completion strings.
         """
+        del disable_tqdm
         prompts, generation_kwargs = self._parse_instances(requests)
         generations = self._generate(
             prompts,

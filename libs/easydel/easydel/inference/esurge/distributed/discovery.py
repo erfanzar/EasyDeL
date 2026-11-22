@@ -88,17 +88,27 @@ def _host_sort_key(host: str) -> tuple[int, str]:
         return (1, host)
 
 
-def resolve_service_hosts(service_name: str, world_size: int | None = None) -> DiscoveryResult:
+def resolve_service_hosts(
+    service_name: str,
+    world_size: int | None = None,
+    *,
+    family: int = socket.AF_UNSPEC,
+) -> DiscoveryResult:
     """Resolve a DNS service name into a sorted, de-duplicated host list.
 
     Uses :func:`socket.getaddrinfo` to look up *service_name* and collects
-    unique IP addresses from the results.  The addresses are sorted via
-    :func:`_host_sort_key` to produce a deterministic ordering across hosts.
+    unique IP addresses from the results.  When *family* is
+    :data:`socket.AF_UNSPEC` and DNS returns both IPv4 and IPv6 records
+    (dual-stack pods), only one address family is kept so each pod is counted
+    once rather than twice (IPv4 is preferred unless *world_size* matches only
+    the IPv6 set).  The addresses are sorted via :func:`_host_sort_key` to
+    produce a deterministic ordering across hosts.
 
     Args:
         service_name: DNS name to resolve (e.g. a Kubernetes headless service).
         world_size: If provided, the number of resolved hosts must match this
             value exactly; otherwise a :class:`ValueError` is raised.
+        family: Optional socket address family filter (default ``AF_UNSPEC``).
 
     Returns:
         A :class:`DiscoveryResult` containing the sorted host list.
@@ -112,21 +122,46 @@ def resolve_service_hosts(service_name: str, world_size: int | None = None) -> D
         raise ValueError("`distributed_service_name` must be a non-empty DNS name.")
 
     try:
-        entries = socket.getaddrinfo(str(service_name), None, type=socket.SOCK_STREAM)
+        entries = socket.getaddrinfo(str(service_name), None, family=family, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise ValueError(f"Failed to resolve distributed service '{service_name}': {exc}") from exc
 
-    hosts: list[str] = []
-    seen: set[str] = set()
+    v4_hosts: list[str] = []
+    v6_hosts: list[str] = []
+    other_hosts: list[str] = []
+    seen_v4: set[str] = set()
+    seen_v6: set[str] = set()
+    seen_other: set[str] = set()
     for entry in entries:
+        entry_family = entry[0]
         sockaddr = entry[4]
         if not sockaddr:
             continue
         host = sockaddr[0]
-        if host in seen:
-            continue
-        seen.add(host)
-        hosts.append(host)
+        if entry_family == socket.AF_INET:
+            if host not in seen_v4:
+                seen_v4.add(host)
+                v4_hosts.append(host)
+        elif entry_family == socket.AF_INET6:
+            if host not in seen_v6:
+                seen_v6.add(host)
+                v6_hosts.append(host)
+        else:
+            if host not in seen_other:
+                seen_other.add(host)
+                other_hosts.append(host)
+
+    if family == socket.AF_INET:
+        hosts = v4_hosts
+    elif family == socket.AF_INET6:
+        hosts = v6_hosts
+    elif v4_hosts and v6_hosts:
+        if world_size is not None and len(v4_hosts) != int(world_size) and len(v6_hosts) == int(world_size):
+            hosts = v6_hosts
+        else:
+            hosts = v4_hosts
+    else:
+        hosts = v4_hosts or v6_hosts or other_hosts
 
     hosts.sort(key=_host_sort_key)
 

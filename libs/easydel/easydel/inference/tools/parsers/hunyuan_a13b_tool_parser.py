@@ -48,9 +48,22 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import consume_space, stable_json_stream_prefix
+from ..utils import consume_space, partial_json_loads, stable_json_stream_prefix
 
 logger = get_logger(__name__)
+
+_THINK_START = "<think>"
+_THINK_END = "</think>"
+
+
+def _trailing_prefix_len(text: str, start: int, marker: str) -> int:
+    """Return length of the longest proper prefix of *marker* at the end of ``text[start:]``."""
+    avail = len(text) - start
+    max_len = min(len(marker) - 1, avail)
+    for size in range(max_len, 0, -1):
+        if text.endswith(marker[:size]):
+            return size
+    return 0
 
 
 @ToolParserManager.register_module("hunyuan_a13b")  # pyright: ignore[reportUntypedClassDecorator]
@@ -121,12 +134,89 @@ class HunyuanA13BToolParser(ToolParser):
         )
 
         self.bot_string = "<tool_calls>"
+        self.eot_string = "</tool_calls>"
 
         self.streaming_state: dict[str, Any] = {
             "current_tool_index": -1,
             "tool_ids": [],
             "sent_tools": [],
         }
+        self._emitted_content_pos: int | None = None
+        self._pending_tail_start: int | None = None
+        self._last_current_text: str = ""
+        self._streaming_initialized: bool = False
+        self._in_open_block: bool = False
+        self._scan_pos: int = 0
+        self._in_think: bool = False
+        self._closed_emitted_idx: int = 0
+        self._closed_complete_calls: list[dict] = []
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Report whether a ``<tool_calls>`` block outside ``<think>`` or a partial prefix is buffered."""
+        del delta_text
+        if self._streaming_initialized:
+            return self._in_open_block or self._pending_tail_start is not None
+
+        pos = 0
+        n = len(current_text)
+        think_start_len = len(_THINK_START)
+        think_end_len = len(_THINK_END)
+        bot_len = len(self.bot_string)
+        eot_len = len(self.eot_string)
+        while pos < n:
+            t_idx = current_text.find(_THINK_START, pos)
+            b_idx = current_text.find(self.bot_string, pos)
+            if t_idx != -1 and (b_idx == -1 or t_idx < b_idx):
+                t_end = current_text.find(_THINK_END, t_idx + think_start_len)
+                if t_end == -1:
+                    return False
+                pos = t_end + think_end_len
+                continue
+            if b_idx == -1:
+                return self._has_trailing_marker_prefix(current_text[pos:], (self.bot_string,))
+            e_idx = current_text.find(self.eot_string, b_idx + bot_len)
+            if e_idx == -1:
+                return True
+            pos = e_idx + eot_len
+        return False
+
+    def _reset_streaming_state(self, emitted_pos: int = 0) -> None:
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.streamed_args = []
+        self.streamed_args_for_tool = []
+        self.prev_tool_call_arr = []
+        self.prev_tool_calls = []
+        self.current_tools_sent = []
+        self.streaming_state = {
+            "current_tool_index": -1,
+            "tool_ids": [],
+            "sent_tools": [],
+        }
+        self._emitted_content_pos = emitted_pos
+        self._pending_tail_start = None
+        self._last_current_text = ""
+        self._streaming_initialized = False
+        self._in_open_block = False
+        self._scan_pos = 0
+        self._in_think = False
+        self._closed_emitted_idx = 0
+        self._closed_complete_calls = []
+
+    def flush_streaming_content(self) -> str | None:
+        """Flush any trailing partial ``<tool_calls>`` prefix withheld at EOS."""
+        flushed: str | None = None
+        if self._pending_tail_start is not None and self._pending_tail_start < len(self._last_current_text):
+            flushed = self._last_current_text[self._pending_tail_start :] or None
+            self._emitted_content_pos = len(self._last_current_text)
+            self._pending_tail_start = None
+        self._last_current_text = ""
+        return flushed
 
     def preprocess_model_output(self, model_output: str) -> tuple[str | None, str | None]:
         """Preprocess model output to extract tool calls content.
@@ -153,20 +243,64 @@ class HunyuanA13BToolParser(ToolParser):
             >>> content
             'Hello'
         """
-        for match in self.answer_tool_calls_pattern.finditer(model_output):
-            start, end = match.span()
-            think_regions = [
-                (m.start(), m.end()) for m in re.finditer(r"<think>(.*?)</think>", model_output, flags=re.DOTALL)
-            ]
-            in_think = any(start > t_start and end < t_end for t_start, t_end in think_regions)
-            if not in_think:
-                content = model_output[:start]
-                tool_calls_content = match.group(1).strip()
-                try:
-                    json.loads(tool_calls_content)
-                    return content, tool_calls_content
-                except Exception:
-                    continue
+        dec = json.JSONDecoder()
+        merged_calls: list[Any] = []
+        first_valid_start: int | None = None
+        first_raw_payload: str | None = None
+        first_non_list_block: tuple[int, str] | None = None
+        valid_block_count = 0
+
+        pos = 0
+        n = len(model_output)
+        think_start_len = len(_THINK_START)
+        think_end_len = len(_THINK_END)
+        while pos < n:
+            think_idx = model_output.find(_THINK_START, pos)
+            start = model_output.find(self.bot_string, pos)
+            if think_idx != -1 and (start == -1 or think_idx < start):
+                think_end = model_output.find(_THINK_END, think_idx + think_start_len)
+                if think_end == -1:
+                    break
+                pos = think_end + think_end_len
+                continue
+
+            if start == -1:
+                break
+
+            payload_start = consume_space(start + len(self.bot_string), model_output)
+            if payload_start >= n:
+                break
+            try:
+                parsed, end_pos = dec.raw_decode(model_output, payload_start)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                pos = start + len(self.bot_string)
+                continue
+
+            after_json = consume_space(end_pos, model_output)
+            if not model_output.startswith(self.eot_string, after_json):
+                pos = end_pos
+                continue
+
+            pos = after_json + len(self.eot_string)
+            raw_payload = model_output[payload_start:end_pos].strip()
+            if isinstance(parsed, list):
+                if first_valid_start is None:
+                    first_valid_start = start
+                    first_raw_payload = raw_payload
+                valid_block_count += 1
+                merged_calls.extend(parsed)
+            elif first_non_list_block is None:
+                # Preserve non-list payloads as fallback when no valid list block follows.
+                first_non_list_block = (start, raw_payload)
+
+        if first_valid_start is not None:
+            content = model_output[:first_valid_start]
+            if valid_block_count == 1 and first_raw_payload is not None:
+                return content, first_raw_payload
+            return content, json.dumps(merged_calls, ensure_ascii=False)
+        if first_non_list_block is not None:
+            nl_start, nl_payload = first_non_list_block
+            return model_output[:nl_start], nl_payload
         return model_output, None
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
@@ -206,32 +340,43 @@ class HunyuanA13BToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=False,
                     tool_calls=[],
-                    content=content or model_output,
+                    content=model_output,
                 )
 
             tool_calls: list[ToolCall] = []
 
             for _, call in enumerate(tool_calls_data):
-                if not isinstance(call, dict) or "name" not in call or "arguments" not in call:
+                if (
+                    not isinstance(call, dict)
+                    or not isinstance(call.get("name"), str)
+                    or not call.get("name")
+                    or "arguments" not in call
+                ):
                     continue
 
+                raw_args = call["arguments"]
                 tool_call = ToolCall(
                     id=f"call_{uuid4()}",
                     type="function",
                     function=FunctionCall(
                         name=call["name"],
-                        arguments=(
-                            json.dumps(call["arguments"]) if isinstance(call["arguments"], dict) else call["arguments"]
-                        ),
+                        arguments=raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False),
                     ),
                 )
                 tool_calls.append(tool_call)
+
+            if not tool_calls:
+                return ExtractedToolCallInformation(
+                    tools_called=False,
+                    tool_calls=[],
+                    content=model_output,
+                )
 
             if not content or len(content.strip()) == 0:
                 content = None
 
             return ExtractedToolCallInformation(
-                tools_called=len(tool_calls) > 0,
+                tools_called=True,
                 tool_calls=tool_calls,
                 content=content,
             )
@@ -270,69 +415,239 @@ class HunyuanA13BToolParser(ToolParser):
                 - None if waiting for more tokens to complete parsing.
         """
 
-        start_idx = consume_space(0, current_text)
-        if current_text[start_idx:].startswith(self.bot_string):
-            start_idx = consume_space(start_idx + len(self.bot_string), current_text)
-        if not current_text or start_idx >= len(current_text) or current_text[start_idx] != "[":
-            return DeltaMessage(content=delta_text)
+        if not previous_text:
+            self._reset_streaming_state(0)
+        elif self._emitted_content_pos is None:
+            self._reset_streaming_state(len(previous_text))
+        elif self._scan_pos > len(current_text):
+            self._reset_streaming_state(0)
 
-        self._try_parse_json_tools(current_text[start_idx:])
+        self._streaming_initialized = True
+        self._last_current_text = current_text
+        self._pending_tail_start = None
+        self._in_open_block = False
 
-        # Split only at top-level array boundaries. Nested argument properties
-        # (including "name") and delimiters inside JSON strings are payload.
-        regions = []
-        depth = 0
-        in_string = False
-        escaped = False
-        region_start = None
-        for position in range(start_idx + 1, len(current_text)):
-            char = current_text[position]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-            elif char in "{[":
-                if depth == 0:
-                    region_start = position
-                depth += 1
-            elif char in "}]":
-                if depth == 0:
+        dec = json.JSONDecoder()
+        pos = self._scan_pos
+        in_think = self._in_think
+        n = len(current_text)
+        think_start_len = len(_THINK_START)
+        think_end_len = len(_THINK_END)
+        visible_parts: list[tuple[int, int]] = []
+        # list of (call_dict, safe_call_dict, call_complete, block_closed)
+        all_calls: list[tuple[dict, dict, bool, bool]] = []
+        new_closed_complete_calls: list[dict] = []
+        open_complete_calls: list[dict] = []
+
+        while pos < n:
+            if in_think:
+                t_end = current_text.find(_THINK_END, pos)
+                if t_end == -1:
+                    visible_parts.append((pos, n))
+                    hold_t = _trailing_prefix_len(current_text, pos, _THINK_END)
+                    pos = n - hold_t
                     break
-                depth -= 1
-                if depth == 0 and region_start is not None:
-                    regions.append(current_text[region_start : position + 1])
-                    region_start = None
-        if region_start is not None:
-            regions.append(current_text[region_start:])
+                close_end = t_end + think_end_len
+                visible_parts.append((pos, close_end))
+                pos = close_end
+                in_think = False
+                continue
 
-        name_matches = []
-        for region in regions:
+            t_idx = current_text.find(_THINK_START, pos)
+            sec_start = current_text.find(self.bot_string, pos)
+            if t_idx != -1 and (sec_start == -1 or t_idx < sec_start):
+                t_body = t_idx + think_start_len
+                visible_parts.append((pos, t_body))
+                pos = t_body
+                in_think = True
+                continue
+
+            if sec_start == -1:
+                hold_bot = _trailing_prefix_len(current_text, pos, self.bot_string)
+                hold_think = _trailing_prefix_len(current_text, pos, _THINK_START)
+                safe_end = n - hold_bot
+                if safe_end > pos:
+                    visible_parts.append((pos, safe_end))
+                if hold_bot > 0:
+                    self._pending_tail_start = safe_end
+                pos = n - max(hold_bot, hold_think)
+                break
+
+            if sec_start > pos:
+                visible_parts.append((pos, sec_start))
+
+            payload_start = consume_space(sec_start + len(self.bot_string), current_text)
+            if payload_start >= n:
+                self._in_open_block = True
+                pos = sec_start
+                break
+
+            parsed: object = None
+            end_pos = -1
             try:
-                # An unfinished name must not be announced as a complete name.
-                call = partial_json_parser.loads(region, Allow.ALL & ~Allow.STR)
-            except (ValueError, partial_json_parser.MalformedJSON):
-                call = {}
-            name_matches.append(call if isinstance(call, dict) else {})
-        tool_count = len(regions)
-        self._ensure_state_arrays(tool_count)
-        deltas = []
-        for current_idx, region in enumerate(regions):
-            name_delta = self._handle_tool_name_streaming(current_idx, tool_count, name_matches)
-            args_delta = self._handle_tool_args_streaming(region, current_idx, tool_count)
-            if name_delta and args_delta:
-                name_delta.tool_calls[0].function.arguments = args_delta.tool_calls[0].function.arguments
-                deltas.extend(name_delta.tool_calls)
-            elif name_delta:
-                deltas.extend(name_delta.tool_calls or [])
-            elif args_delta:
-                deltas.extend(args_delta.tool_calls or [])
-        return DeltaMessage(tool_calls=deltas) if deltas else None
+                parsed, end_pos = dec.raw_decode(current_text, payload_start)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                parsed = None
+
+            if parsed is not None:
+                after_json = consume_space(end_pos, current_text)
+                if current_text.startswith(self.eot_string, after_json):
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict):
+                                all_calls.append((item, item, True, True))
+                                new_closed_complete_calls.append(item)
+                    pos = after_json + len(self.eot_string)
+                    continue
+                if after_json == n or self.eot_string.startswith(current_text[after_json:]):
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict):
+                                all_calls.append((item, item, True, False))
+                                open_complete_calls.append(item)
+                    self._in_open_block = True
+                    pos = sec_start
+                    break
+                eot_idx = current_text.find(self.eot_string, end_pos)
+                if eot_idx != -1:
+                    pos = eot_idx + len(self.eot_string)
+                    continue
+                self._in_open_block = True
+                pos = sec_start
+                break
+
+            slice_text = current_text[payload_start:]
+            try:
+                part_all, _ = partial_json_loads(slice_text, Allow.ALL)
+            except (
+                partial_json_parser.core.exceptions.MalformedJSON,
+                ValueError,
+                AssertionError,
+                RecursionError,
+            ):
+                eot_idx = current_text.find(self.eot_string, payload_start)
+                if eot_idx != -1:
+                    pos = eot_idx + len(self.eot_string)
+                    continue
+                self._in_open_block = True
+                pos = sec_start
+                break
+
+            if isinstance(part_all, list):
+                try:
+                    part_safe, _ = partial_json_loads(slice_text, Allow.ALL & ~Allow.STR)
+                    if not isinstance(part_safe, list):
+                        part_safe = []
+                except (
+                    partial_json_parser.core.exceptions.MalformedJSON,
+                    ValueError,
+                    AssertionError,
+                    RecursionError,
+                ):
+                    part_safe = []
+
+                for i, item in enumerate(part_all):
+                    if not isinstance(item, dict):
+                        continue
+                    safe_item = part_safe[i] if i < len(part_safe) and isinstance(part_safe[i], dict) else {}
+                    all_calls.append((item, safe_item, i < len(part_all) - 1, False))
+            self._in_open_block = True
+            pos = sec_start
+            break
+
+        if new_closed_complete_calls:
+            self._closed_complete_calls.extend(new_closed_complete_calls)
+        combined_complete = (
+            [*self._closed_complete_calls, *open_complete_calls]
+            if open_complete_calls
+            else self._closed_complete_calls
+        )
+        if combined_complete:
+            self.prev_tool_call_arr = list(combined_complete)
+            self.prev_tool_calls = list(combined_complete)
+
+        content_chunks: list[str] = []
+        emitted_pos = self._emitted_content_pos or 0
+        for seg_start, seg_end in visible_parts:
+            if seg_end > emitted_pos:
+                content_chunks.append(current_text[max(seg_start, emitted_pos) : seg_end])
+                emitted_pos = seg_end
+        self._emitted_content_pos = emitted_pos
+        content_out = "".join(content_chunks)
+
+        deltas: list[DeltaToolCall] = []
+        emitted_idx = self._closed_emitted_idx
+        next_closed_emitted_idx = self._closed_emitted_idx
+
+        for call, safe_call, call_complete, block_closed in all_calls:
+            already_sent = emitted_idx < len(self.current_tools_sent) and self.current_tools_sent[emitted_idx]
+            if already_sent or call_complete:
+                tool_name = call.get("name")
+            else:
+                tool_name = safe_call.get("name")
+
+            if not isinstance(tool_name, str) or not tool_name or "arguments" not in call:
+                continue
+
+            idx = emitted_idx
+            emitted_idx += 1
+            if block_closed:
+                next_closed_emitted_idx = emitted_idx
+            self._ensure_state_arrays(idx + 1)
+            while len(self.streamed_args) <= idx:
+                self.streamed_args.append("")
+            while len(self.streamed_args_for_tool) <= idx:
+                self.streamed_args_for_tool.append("")
+
+            first = not self.current_tools_sent[idx]
+            if first:
+                tool_id = f"call_{idx}_{uuid4()}"
+                self.streaming_state["tool_ids"][idx] = tool_id
+                self.streaming_state["sent_tools"][idx]["sent_name"] = True
+                self.streaming_state["current_tool_index"] = idx
+                self.current_tools_sent[idx] = True
+                self.current_tool_id = idx
+                self.current_tool_name_sent = True
+
+            args_diff = ""
+            if "arguments" in call and call["arguments"] is not None:
+                arguments = call["arguments"]
+                args_text = json.dumps(arguments, ensure_ascii=False) if not isinstance(arguments, str) else arguments
+                safe_args = args_text if call_complete else stable_json_stream_prefix(args_text)
+                state = self.streaming_state["sent_tools"][idx]
+                sent_args = state["sent_arguments"]
+                if safe_args.startswith(sent_args):
+                    args_diff = safe_args[len(sent_args) :]
+                    if args_diff:
+                        state["sent_arguments_prefix"] = True
+                        state["sent_arguments"] = safe_args
+                        self.streamed_args[idx] = safe_args
+                        self.streamed_args_for_tool[idx] = safe_args
+
+            if first or args_diff:
+                deltas.append(
+                    DeltaToolCall(
+                        index=idx,
+                        type="function" if first else None,
+                        id=self.streaming_state["tool_ids"][idx] if first else None,
+                        function=DeltaFunctionCall(
+                            name=tool_name if first else None,
+                            arguments=args_diff if args_diff else None,
+                        ).model_dump(exclude_none=True),
+                    )
+                )
+
+        self._scan_pos = pos
+        self._in_think = in_think
+        self._closed_emitted_idx = next_closed_emitted_idx
+
+        if content_out and deltas:
+            return DeltaMessage(content=content_out, tool_calls=deltas)
+        if deltas:
+            return DeltaMessage(tool_calls=deltas)
+        if content_out:
+            return DeltaMessage(content=content_out)
+        return None
 
     def _try_parse_json_tools(self, current_text: str):
         """Attempt to parse the current text as a JSON array of tools.
@@ -349,7 +664,7 @@ class HunyuanA13BToolParser(ToolParser):
             if isinstance(parsed_tools, list):
                 self.prev_tool_call_arr = parsed_tools
                 self.prev_tool_calls = parsed_tools
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             pass
 
     def _ensure_state_arrays(self, tool_count: int):
@@ -435,10 +750,16 @@ class HunyuanA13BToolParser(ToolParser):
         try:
             call = json.loads(current_text)
             complete = True
-        except ValueError:
+        except (ValueError, RecursionError):
             try:
                 call = partial_json_parser.loads(current_text, Allow.ALL)
-            except (ValueError, partial_json_parser.MalformedJSON):
+            except (
+                ValueError,
+                partial_json_parser.MalformedJSON,
+                AssertionError,
+                IndexError,
+                RecursionError,
+            ):
                 return None
         if not isinstance(call, dict) or "arguments" not in call:
             return None

@@ -79,7 +79,7 @@ class GOLDTrainer(DistillationTrainer):
             raise ValueError("Pass either `model` or `student_model`, not both.")
         resolved_student = self._resolve_student_model(student_model if student_model is not None else model)
         resolved_teacher = teacher_model
-        if resolved_teacher is None:
+        if resolved_teacher is None and not bool(getattr(arguments, "teacher_from_cache", False)):
             # Prepare the owned, eval-mode teacher BEFORE DistillationTrainer
             # constructs teacher shardings and eval_config_overrides variants.
             # Use the same default teacher layout as module inputs to the

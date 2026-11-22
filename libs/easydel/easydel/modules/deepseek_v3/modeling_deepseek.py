@@ -555,9 +555,8 @@ class DeepseekV3MoE(BaseMoeModule):
             wd_kernel=self.experts.down_proj.kernel_view(),
             act_fn=self.experts.act_fn,
             hooks=self.moe_hooks.replace(select_hook=select_hook),
+            shared_expert=self.shared_experts if self.config.n_shared_experts is not None else None,
         )
-        if self.config.n_shared_experts is not None:
-            out = out + self.shared_experts(hidden_states)
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 

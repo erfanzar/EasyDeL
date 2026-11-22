@@ -35,9 +35,11 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 from ..group_relative_policy_optimization._fn import get_per_token_logps
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     constrain_scheduled_batch,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
@@ -53,6 +55,7 @@ def _compute_policy_logps(
     completion_ids: jax.Array,
     completion_mask: jax.Array,
     logprob_vocab_chunk_size: int | None,
+    vocab_shard_stage: int | None = None,
 ) -> jax.Array:
     """Compute policy log probabilities for completion tokens.
 
@@ -72,6 +75,7 @@ def _compute_policy_logps(
             ``[batch, completion_len]``.
         logprob_vocab_chunk_size: Vocab-axis chunk size for the
             chunked log-prob computation. ``None`` disables chunking.
+        vocab_shard_stage: Optional MPMD terminal pipeline stage rank.
 
     Returns:
         Per-token log probabilities of shape ``[batch, completion_len]``.
@@ -86,6 +90,7 @@ def _compute_policy_logps(
         attention_mask,
         prompt_length,
         logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+        vocab_shard_stage=vocab_shard_stage,
     )
 
 
@@ -199,13 +204,17 @@ def nash_md_step(
                 ref_token_logps = ref_token_logps * mask
 
             with jax.named_scope(scope_root + "/loss_fn/compute_nash_md_loss"):
+                step_beta = minibatch["beta"][0].astype(jnp.float32) if "beta" in minibatch else beta
                 policy_logps = policy_token_logps.sum(axis=1)
                 log_ratio = policy_token_logps - ref_token_logps
                 kl_vector = log_ratio.sum(axis=1)
-                kl_loss = (jax.lax.stop_gradient(log_ratio) * policy_token_logps).sum(axis=1)
+                # Causal reward-to-go KL gradient: pair each token t with sum_{s >= t} log_ratio_s
+                # so earlier tokens receive gradients from downstream trajectory KL terms (s > t).
+                future_kl = jnp.cumsum(log_ratio[:, ::-1], axis=1)[:, ::-1]
+                kl_loss = (jax.lax.stop_gradient(future_kl) * policy_token_logps).sum(axis=1)
 
                 score = (probabilities - 0.5) * policy_logps
-                loss_vector = beta * kl_loss - score
+                loss_vector = step_beta * kl_loss - score
                 loss = loss_vector.mean()
 
             metrics = LossMetrics(
@@ -247,8 +256,25 @@ def nash_md_step(
     return metrics
 
 
+def _nash_md_beta_cache_token(call) -> tp.Hashable:
+    """Return a stable cache token for ``beta`` without recompiling on array identity."""
+    if isinstance(call.batch, tp.Mapping) and "beta" in call.batch:
+        return "batch_leaf"
+    beta_val = call.get("beta")
+    if isinstance(beta_val, (int, float)):
+        return float(beta_val)
+    try:
+        return float(jax.device_get(beta_val))
+    except Exception:
+        return id(beta_val)
+
+
 def _nash_md_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     """Build a cache key for the Nash-MD scheduled-loss compilation.
+
+    When ``beta`` is carried inside ``batch["beta"]`` it stays dynamic and does
+    not enter the specialization key; otherwise concrete scalar ``beta`` values
+    are hashed by Python float value rather than JAX array object identity.
 
     Args:
         call: The current :class:`ScheduledStepCall`.
@@ -257,11 +283,12 @@ def _nash_md_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         A tuple covering ``beta``, the logprob vocab chunk size, the
         partition spec, and the quantization emulator identity.
     """
-    return scheduled_loss_cache_key(
+    base_key = scheduled_loss_cache_key(
         call,
-        value_fields=("beta", "logprob_vocab_chunk_size", "partition_spec"),
+        value_fields=("logprob_vocab_chunk_size", "partition_spec"),
         object_fields=("straight_through_emulator",),
     )
+    return (*base_key, _nash_md_beta_cache_token(call))
 
 
 def _make_nash_md_scheduled_loss(call):
@@ -274,9 +301,11 @@ def _make_nash_md_scheduled_loss(call):
         A closure ``loss_fn(tree, batch) -> scalar`` ready for
         :func:`spx.sxvalue_and_grad`.
     """
-    beta = jnp.asarray(call.get("beta"), dtype=jnp.float32)
+    beta_fallback = jnp.asarray(call.get("beta"), dtype=jnp.float32)
     logprob_vocab_chunk_size = call.get("logprob_vocab_chunk_size")
     partition_spec = call.get("partition_spec")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the scalar Nash-MD loss inside the SpectraX scheduled VJP.
@@ -291,8 +320,9 @@ def _make_nash_md_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/nash_md/scheduled_loss"):
             with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 batch = constrain_scheduled_batch(module, batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, schedule)
             completion_mask = batch["completion_mask"]
             with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/policy_logps"):
                 policy_token_logps = _compute_policy_logps(
@@ -302,16 +332,19 @@ def _make_nash_md_scheduled_loss(call):
                     batch["completion_ids"],
                     completion_mask,
                     logprob_vocab_chunk_size,
+                    vocab_shard_stage=_terminal_rank,
                 )
                 mask = completion_mask.astype(policy_token_logps.dtype)
                 policy_token_logps = policy_token_logps * mask
                 ref_token_logps = jax.lax.stop_gradient(batch["ref_token_logps"]) * mask
             with jax.named_scope("easydel/trainer/nash_md/scheduled_loss/compute_nash_md_loss"):
+                step_beta = batch["beta"][0].astype(jnp.float32) if "beta" in batch else beta_fallback
                 policy_logps = policy_token_logps.sum(axis=1)
                 log_ratio = policy_token_logps - ref_token_logps
-                kl_loss = (jax.lax.stop_gradient(log_ratio) * policy_token_logps).sum(axis=1)
+                future_kl = jnp.cumsum(log_ratio[:, ::-1], axis=1)[:, ::-1]
+                kl_loss = (jax.lax.stop_gradient(future_kl) * policy_token_logps).sum(axis=1)
                 score = (batch["probabilities"] - 0.5) * policy_logps
-                return (beta * kl_loss - score).mean()
+                return (step_beta * kl_loss - score).mean()
 
     return scheduled_loss
 

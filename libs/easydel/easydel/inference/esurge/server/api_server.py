@@ -68,14 +68,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
+import math
 import threading
 import time
 import traceback
 import typing as tp
 import uuid
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterator, Sequence
 from http import HTTPStatus
 
 import anyio
@@ -634,6 +636,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         requested_tokens: int = 0,
         stream: bool = False,
         uses_tools: bool = False,
+        reconcile_immediately: bool | None = None,
     ) -> str | None:
         """Authorize request using enhanced auth system with RBAC and rate limiting.
 
@@ -644,6 +647,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             requested_tokens: Number of tokens requested.
             stream: Whether streaming permission is required.
             uses_tools: Whether function-calling permission is required.
+            reconcile_immediately: Explicitly control whether to immediately
+                reconcile a zero-token reservation (e.g. for metadata routes
+                such as ``GET /v1/models/{model_id}`` that also pass ``model``).
+                When ``None``, defaults to ``model is None`` for backward
+                compatibility.
 
         Returns:
             Validated API key string if successful, None if auth not required.
@@ -687,7 +695,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 raw_request.state.api_key_metadata = metadata
                 raw_request.state.auth_reservation_id = reservation_id
                 raw_request.state.auth_reservation_completed = False
-                if model is None:
+                should_reconcile = (model is None) if reconcile_immediately is None else bool(reconcile_immediately)
+                if should_reconcile:
                     # Non-generation routes have no deferred token usage to reconcile.
                     self._record_api_key_usage(raw_request, 0, 0)
                 return candidate
@@ -707,6 +716,167 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         if require_key:
             raise HTTPException(status_code=401, detail="Missing or invalid API key")
         return None
+
+    def _authorize_endpoint(
+        self,
+        raw_request: Request,
+        *,
+        endpoint: str,
+        model: str | None = None,
+        requested_tokens: int = 0,
+        stream: bool = False,
+        uses_tools: bool = False,
+        reconcile_immediately: bool | None = None,
+    ) -> str | None:
+        """Invoke ``_authorize_request`` while supporting legacy single-arg test overrides."""
+        authorize = self._authorize_request
+        kwargs: dict[str, tp.Any] = {
+            "endpoint": endpoint,
+            "model": model,
+            "requested_tokens": requested_tokens,
+            "stream": stream,
+            "uses_tools": uses_tools,
+            "reconcile_immediately": reconcile_immediately,
+        }
+        if getattr(authorize, "__func__", None) is eSurgeApiServer._authorize_request:
+            return authorize(raw_request, **kwargs)
+        try:
+            params = inspect.signature(authorize).parameters
+        except (TypeError, ValueError):
+            return authorize(raw_request, **kwargs)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_var_kw:
+            return authorize(raw_request, **kwargs)
+        accepted = {k: v for k, v in kwargs.items() if k in params}
+        return authorize(raw_request, **accepted)
+
+    def _request_auth_metadata(self, raw_request: Request | None) -> tp.Any | None:
+        """Return the validated ``ApiKeyMetadata`` attached to ``raw_request.state``, if any."""
+        state = getattr(raw_request, "state", None)
+        return getattr(state, "api_key_metadata", None) if state is not None else None
+
+    def _is_privileged_metrics_caller(self, raw_request: Request | None) -> bool:
+        """Whether ``raw_request`` may view admin ``auth_stats`` and cross-tenant ``recent_requests``.
+
+        When authentication is inactive (dev/unauthenticated mode), full metrics remain visible.
+        When authentication is active, only ``ApiKeyRole.ADMIN`` callers receive admin/cross-tenant
+        details on ``/metrics``.
+        """
+        if not self._auth_system_enabled():
+            return True
+        metadata = self._request_auth_metadata(raw_request)
+        if metadata is None:
+            return False
+        role = getattr(metadata, "role", None)
+        return role == ApiKeyRole.ADMIN or getattr(role, "value", None) == ApiKeyRole.ADMIN.value
+
+    def _allowed_models_for_request(self, raw_request: Request | None) -> set[str] | None:
+        """Return the caller's permitted model set from ``metadata.permissions.allowed_models``, or ``None``."""
+        if not self._auth_system_enabled():
+            return None
+        metadata = self._request_auth_metadata(raw_request)
+        if metadata is None:
+            return None
+        permissions = getattr(metadata, "permissions", None)
+        allowed = getattr(permissions, "allowed_models", None) if permissions is not None else None
+        if allowed is None:
+            return None
+        return set(allowed)
+
+    @staticmethod
+    def _response_store_owner_id(raw_request: Request | None) -> str | None:
+        """Return a stable tenant owner identifier for ``/v1/responses`` persistence isolation."""
+        state = getattr(raw_request, "state", None)
+        if state is None:
+            return None
+        metadata = getattr(state, "api_key_metadata", None)
+        key_id = getattr(metadata, "key_id", None)
+        if isinstance(key_id, str) and key_id:
+            return key_id
+        api_key = getattr(state, "api_key", None)
+        if isinstance(api_key, str) and api_key:
+            return f"keyhash:{hashlib.sha256(api_key.encode('utf-8')).hexdigest()}"
+        return None
+
+    @staticmethod
+    def _scoped_conversation_store_key(conversation_id: str, owner_key_id: str | None) -> str:
+        """Namespace client-chosen conversation IDs by authenticated tenant owner."""
+        if owner_key_id is not None:
+            return f"owner:{owner_key_id}:{conversation_id}"
+        return f"anon:{conversation_id}"
+
+    @staticmethod
+    def _resolved_tool_call_visible_text(
+        completion: tp.Any | None,
+        output: tp.Any | None = None,
+    ) -> str | None:
+        """Return parser-separated assistant text accompanying tool calls, or ``None``.
+
+        ``OutputPipeline`` populates ``completion.raw_text`` / ``output.raw_accumulated_text``
+        whenever it separates parsed visible content from raw tool-call protocol markup.
+        When that separation occurred and visible assistant text remains, preserve it so
+        non-streaming responses match streaming parity; otherwise return ``None``.
+        """
+        text = ""
+        raw_text = None
+        if completion is not None:
+            text = getattr(completion, "text", "") or ""
+            raw_text = getattr(completion, "raw_text", None)
+        if not text and output is not None:
+            text = getattr(output, "accumulated_text", "") or ""
+        if raw_text is None and output is not None:
+            raw_accum = getattr(output, "raw_accumulated_text", None)
+            if raw_accum:
+                raw_text = raw_accum
+        if raw_text is not None and text:
+            return text
+        return None
+
+    async def _run_in_thread_with_cancel_abort(
+        self,
+        fn: tp.Callable[[], tp.Any],
+        *,
+        abort_fn: tp.Callable[[], None],
+        on_cancelled_result: tp.Callable[[tp.Any], None] | None = None,
+    ) -> tp.Any:
+        """Execute blocking engine work in the thread pool and hold resources until abort unwinds."""
+        executor = getattr(self, "thread_pool", None)
+        cf_future = None
+        if executor is not None:
+            cf_future = executor.submit(fn)
+            pending: asyncio.Future[tp.Any] = asyncio.wrap_future(cf_future)
+        else:
+            loop = asyncio.get_running_loop()
+            pending = loop.run_in_executor(None, fn)
+
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            if cf_future is not None and cf_future.cancel():
+                raise
+            abort_fn()
+            with anyio.CancelScope(shield=True):
+                while not pending.done():
+                    try:
+                        await asyncio.shield(pending)
+                        break
+                    except asyncio.CancelledError:
+                        if pending.cancelled():
+                            break
+                        continue
+                    except Exception:
+                        break
+            if pending.done() and not pending.cancelled():
+                try:
+                    result = pending.result()
+                except Exception:
+                    result = None
+                if result is not None and on_cancelled_result is not None:
+                    try:
+                        on_cancelled_result(result)
+                    except Exception:
+                        logger.debug("Failed to reconcile usage after cancellation", exc_info=True)
+            raise
 
     @staticmethod
     def _request_uses_tools(request: tp.Any) -> bool:
@@ -970,8 +1140,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             }
         ]
 
-    def _create_tools_response(self) -> dict[str, tp.Any]:
-        """Describe tool-calling capabilities as reported by each eSurge engine.
+    def _create_tools_response(self, *, allowed_models: set[str] | None = None) -> dict[str, tp.Any]:
+        """Describe tool-calling capabilities as reported by each permitted eSurge engine.
+
+        Args:
+            allowed_models: Optional model allowlist; ``None`` includes all loaded models.
 
         Returns:
             Dictionary keyed by model name with each entry containing
@@ -981,6 +1154,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
         tools_by_model: dict[str, dict[str, tp.Any]] = {}
         for model_name, adapter in self.adapters.items():
+            if allowed_models is not None and model_name not in allowed_models:
+                continue
             tool_parser = self._get_engine_tool_parser(adapter.esurge) if self.enable_function_calling else None
             tools_by_model[model_name] = {
                 "tools": self._example_tool_definitions(),
@@ -1036,7 +1211,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             The method modifies the request object in-place when inferring
             a value, and sets `_auto_max_tokens` flag for downstream processing.
         """
-        max_tokens_raw = getattr(request, "max_tokens", None)
+        max_tokens_raw = getattr(request, "max_completion_tokens", None)
+        if max_tokens_raw is None:
+            max_tokens_raw = getattr(request, "max_tokens", None)
         inferred_value: int | None = None
 
         def _mark_auto(value: int) -> int:
@@ -1147,7 +1324,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         *,
         raw_request: Request,
         esurge: eSurge,
-        request_id: str,
+        request_id: str | Sequence[str],
         endpoint: str,
         model: str | None,
         done_event: asyncio.Event,
@@ -1156,12 +1333,14 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         """Abort non-stream engine work when the HTTP client disconnects.
 
         Polls the request's disconnect state and, when set, asks the engine
-        to abort. The loop exits once ``done_event`` is set by the caller.
+        to abort every request ID associated with the call. The loop exits once
+        ``done_event`` is set by the caller.
 
         Args:
             raw_request: FastAPI request whose disconnect state is polled.
             esurge: eSurge engine to abort against.
-            request_id: Engine-side request identifier to abort.
+            request_id: Engine-side request identifier (or sequence of identifiers)
+                to abort.
             endpoint: Endpoint path used only for log context.
             model: Model name used only for log context.
             done_event: Event the caller sets when the request finished and
@@ -1169,6 +1348,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             poll_interval_s: Seconds between disconnect probes.
         """
 
+        target_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         disconnect_logged = False
 
         while not done_event.is_set():
@@ -1196,14 +1376,15 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     )
                     disconnect_logged = True
 
-                try:
-                    esurge.abort_request(request_id)
-                except Exception:
-                    logger.debug(
-                        "Failed to abort non-stream request %s after disconnect",
-                        request_id,
-                        exc_info=True,
-                    )
+                for target_id in target_ids:
+                    try:
+                        esurge.abort_request(target_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to abort non-stream request %s after disconnect",
+                            target_id,
+                            exc_info=True,
+                        )
 
             await asyncio.sleep(poll_interval_s)
 
@@ -1558,7 +1739,9 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         Returns:
             SamplingParams configured for eSurge generation.
         """
-        raw_max_tokens = getattr(request, "max_tokens", None)
+        raw_max_tokens = getattr(request, "max_completion_tokens", None)
+        if raw_max_tokens is None:
+            raw_max_tokens = getattr(request, "max_tokens", None)
         max_tokens: int | None
         auto_max_tokens_requested = bool(getattr(request, "_auto_max_tokens", False))
         if raw_max_tokens is None or auto_max_tokens_requested:
@@ -1566,18 +1749,21 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         else:
             try:
                 max_tokens = int(raw_max_tokens)
-            except (TypeError, ValueError):
-                logger.debug("Unable to parse max_tokens=%s; defaulting to auto.", raw_max_tokens)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid max_tokens value: {raw_max_tokens!r}") from exc
+            if max_tokens < 0:
                 max_tokens = None
-            else:
-                if max_tokens < 0:
-                    max_tokens = None
+
         raw_temperature: float | None = request.temperature
         if raw_temperature is None:
             temperature_f = 1.0
         else:
             temperature_f = float(raw_temperature)
-        temperature = max(0.0, min(temperature_f, 2.0))
+        if not math.isfinite(temperature_f):
+            raise ValueError(f"temperature must be finite, got {raw_temperature!r}")
+        if temperature_f < 0.0 or temperature_f > 2.0:
+            raise ValueError(f"temperature must be in [0.0, 2.0], got {temperature_f}")
+        temperature = temperature_f
 
         raw_top_k = getattr(request, "top_k", None)
         if raw_top_k is None:
@@ -1585,7 +1771,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         else:
             top_k = int(raw_top_k)
         if top_k < 0:
-            top_k = 0
+            raise ValueError(f"top_k must be >= 0, got {top_k}")
 
         def _coerce_optional_bool(value: tp.Any, default: bool) -> bool:
             if value is None:
@@ -1600,17 +1786,40 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     return False
             return bool(value)
 
+        presence_penalty = float(0.0 if request.presence_penalty is None else request.presence_penalty)
+        frequency_penalty = float(0.0 if request.frequency_penalty is None else request.frequency_penalty)
+        raw_rep = getattr(request, "repetition_penalty", 1.0)
+        repetition_penalty = float(1.0 if raw_rep is None else raw_rep)
+        top_p = float(1.0 if request.top_p is None else request.top_p)
+        raw_min_p = getattr(request, "min_p", 0.0)
+        min_p = float(0.0 if raw_min_p is None else raw_min_p)
+        n = int(1 if request.n is None else request.n)
+
+        for field_name, field_val in (
+            ("presence_penalty", presence_penalty),
+            ("frequency_penalty", frequency_penalty),
+            ("repetition_penalty", repetition_penalty),
+            ("top_p", top_p),
+            ("min_p", min_p),
+        ):
+            if not math.isfinite(field_val):
+                raise ValueError(f"{field_name} must be finite, got {field_val!r}")
+        if not -2.0 <= frequency_penalty <= 2.0:
+            raise ValueError(f"frequency_penalty must be in [-2, 2], got {frequency_penalty}.")
+        if not 0.0 <= min_p <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {min_p}.")
+
         return SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
-            presence_penalty=float(request.presence_penalty or 0.0),
-            frequency_penalty=float(request.frequency_penalty or 0.0),
-            repetition_penalty=float(getattr(request, "repetition_penalty", 1.0)),
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
             top_k=top_k,
-            top_p=float(request.top_p or 1.0),
-            min_p=float(getattr(request, "min_p", 0.0)),
-            n=int(request.n or 1),
-            stop=request.stop,
+            top_p=top_p,
+            min_p=min_p,
+            n=n,
+            stop=request.stop or [],
             ignore_eos=_coerce_optional_bool(getattr(request, "ignore_eos", None), False),
             skip_special_tokens=_coerce_optional_bool(getattr(request, "skip_special_tokens", None), False),
             spaces_between_special_tokens=_coerce_optional_bool(
@@ -1648,18 +1857,24 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 request = refined_request
 
         try:
-            adapter = self._get_adapter(request.model)
-            esurge = adapter.esurge
+            adapters = getattr(self, "adapters", None)
+            peek_adapter = adapters.get(request.model) if isinstance(adapters, dict) else None
+            peek_esurge = peek_adapter.esurge if peek_adapter is not None else None
 
-            max_tokens = self._ensure_request_max_tokens(request, esurge)
-            self._authorize_request(
+            max_tokens = self._ensure_request_max_tokens(request, peek_esurge)
+            n_samples = max(1, int(request.n or 1))
+            self._authorize_endpoint(
                 raw_request,
                 endpoint="/v1/chat/completions",
                 model=request.model,
-                requested_tokens=max_tokens,
+                requested_tokens=max_tokens * n_samples,
                 stream=bool(request.stream),
                 uses_tools=self._request_uses_tools(request),
+                reconcile_immediately=False,
             )
+
+            adapter = self._get_adapter(request.model)
+            esurge = adapter.esurge
 
             if not request.messages:
                 raise HTTPException(400, "Messages cannot be empty")
@@ -1897,25 +2112,36 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 previous_response_id = previous_response_id.strip() or None
 
             conversation_id = self._normalize_conversation_id(request.conversation)
+
+            model = request.model.strip() if isinstance(request.model, str) else ""
+            adapters = getattr(self, "adapters", None)
+            peek_adapter = adapters.get(model) if (model and isinstance(adapters, dict)) else None
+            peek_esurge = peek_adapter.esurge if peek_adapter is not None else None
+
+            try:
+                requested_tokens, max_tokens = self._parse_responses_max_tokens(request, peek_esurge)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+            n_samples = max(1, int(request.n or 1))
+            self._authorize_endpoint(
+                raw_request,
+                endpoint="/v1/responses",
+                model=model or None,
+                requested_tokens=requested_tokens * n_samples,
+                stream=bool(request.stream),
+                uses_tools=self._request_uses_tools(request),
+                reconcile_immediately=False,
+            )
+
             if previous_response_id and conversation_id:
                 raise HTTPException(status_code=400, detail="Cannot use both 'previous_response_id' and 'conversation'")
 
-            model = request.model
-            if not isinstance(model, str) or not model.strip():
+            if not model:
                 raise HTTPException(400, "Field 'model' is required")
 
             adapter = self._get_adapter(model)
             esurge = adapter.esurge
-
-            requested_tokens, max_tokens = self._parse_responses_max_tokens(request, esurge)
-            self._authorize_request(
-                raw_request,
-                endpoint="/v1/responses",
-                model=model,
-                requested_tokens=requested_tokens,
-                stream=bool(request.stream),
-                uses_tools=self._request_uses_tools(request),
-            )
 
             input_messages = [
                 message if isinstance(message, ChatMessage) else ChatMessage.model_validate(message)
@@ -1930,6 +2156,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             else:
                 instructions = instructions.strip()
 
+            owner_key_id = self._response_store_owner_id(raw_request)
+            conversation_store_key = (
+                self._scoped_conversation_store_key(conversation_id, owner_key_id) if conversation_id else None
+            )
+
             history_messages: list[ChatMessage] = []
             if previous_response_id:
                 if not self._enable_response_store:
@@ -1939,14 +2170,18 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 prev = await self._response_store_get_response(previous_response_id)
                 if prev is None:
                     raise HTTPException(status_code=400, detail=f"Unknown previous_response_id '{previous_response_id}'")
+                if prev.get("owner_key_id") != owner_key_id:
+                    raise HTTPException(
+                        status_code=403, detail=f"Access denied to previous_response_id '{previous_response_id}'"
+                    )
                 history_messages = [
                     ChatMessage.model_validate(message)
                     for message in tp.cast(list[dict[str, tp.Any]], prev.get("conversation", []))
                 ]
-            elif conversation_id:
+            elif conversation_id and conversation_store_key is not None:
                 if not self._enable_response_store:
                     raise HTTPException(status_code=400, detail="conversation requires enable_response_store=True")
-                conversation_history = (await self._response_store_get_conversation(conversation_id)) or []
+                conversation_history = (await self._response_store_get_conversation(conversation_store_key)) or []
                 history_messages = [ChatMessage.model_validate(message) for message in conversation_history]
 
             # `full_messages` is the persisted conversation state for this response (excludes `instructions`).
@@ -1958,11 +2193,24 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 engine_messages.insert(0, ChatMessage(role="system", content=instructions))
 
             engine_messages_payload = [message.model_dump(exclude_none=True) for message in engine_messages]
-            self._reject_local_media_references(engine_messages_payload)
+            processor = getattr(esurge, "tokenizer", None)
+            if isinstance(processor, ProcessorMixin) and getattr(self, "oai_like_processor", False):
+                from easydel.utils.prompt_utils import convert_to_openai_format
+
+                engine_messages_payload = tp.cast(
+                    list[dict[str, tp.Any]], convert_to_openai_format(engine_messages_payload)
+                )
+            if self._messages_have_multimodal_content(engine_messages_payload):
+                self._reject_local_media_references(engine_messages_payload)
+            else:
+                engine_messages_payload = self._prepare_text_messages_for_chat(engine_messages_payload)
 
             raw_tools, tools_for_template = self._extract_responses_tools(request)
 
-            sampling_params = self._create_sampling_params_from_responses(request, max_tokens)
+            try:
+                sampling_params = self._create_sampling_params_from_responses(request, max_tokens)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             sampling_params = self._apply_extra_stops_to_sampling_params(sampling_params)
             stream = bool(request.stream)
             reasoning_summary_requested = self._responses_reasoning_summary_requested(request)
@@ -1991,7 +2239,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     raw_request=raw_request,
                     stream=False,
                 ):
-                    loop = asyncio.get_running_loop()
                     disconnect_done = asyncio.Event()
                     disconnect_task = asyncio.create_task(
                         self._abort_non_stream_request_on_disconnect(
@@ -2010,22 +2257,31 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             esurge.chat(
                                 messages=engine_messages_payload,
                                 tools=tools_for_template,
+                                tool_choice=request.tool_choice,
                                 sampling_params=sampling_params,
                                 request_id=response_id,
                                 stream=False,
                             ),
                         )
 
+                    def _reconcile_cancelled_response(partial_output: RequestOutput) -> None:
+                        p_tokens = self._prompt_token_count_from_output(partial_output)
+                        c_tokens = int(getattr(partial_output, "num_generated_tokens", 0) or 0)
+                        if p_tokens > 0 or c_tokens > 0:
+                            self.metrics.total_tokens_generated += c_tokens
+                            self._record_api_key_usage(raw_request, p_tokens, c_tokens)
+
                     try:
-                        output = await loop.run_in_executor(self.thread_pool, _run_chat)
-                    except asyncio.CancelledError:
-                        self._abort_request_after_handler_cancel(
-                            esurge=esurge,
-                            request_id=response_id,
-                            endpoint="/v1/responses",
-                            model=model,
+                        output = await self._run_in_thread_with_cancel_abort(
+                            _run_chat,
+                            abort_fn=lambda: self._abort_request_after_handler_cancel(
+                                esurge=esurge,
+                                request_id=response_id,
+                                endpoint="/v1/responses",
+                                model=model,
+                            ),
+                            on_cancelled_result=_reconcile_cancelled_response,
                         )
-                        raise
                     except ValueError as e:
                         raise HTTPException(status_code=400, detail=str(e)) from e
                     finally:
@@ -2047,8 +2303,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 )
 
                 if tool_calls_payload:
-                    # Prefer canonical function_call items over raw protocol text.
-                    response_text = ""
+                    response_text = self._resolved_tool_call_visible_text(primary_output, output) or ""
 
                 output_items = self._build_responses_output_items(
                     output_text=response_text,
@@ -2080,6 +2335,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         response_id,
                         {
                             "id": response_id,
+                            "owner_key_id": owner_key_id,
                             "model": model,
                             "created_at": response_obj.created_at,
                             "previous_response_id": previous_response_id,
@@ -2088,10 +2344,18 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             "response": response_obj.model_dump(exclude_none=False),
                         },
                     )
-                    if conversation_id:
-                        await self._response_store_put_conversation(conversation_id, conversation_after)
+                    if conversation_id and conversation_store_key is not None:
+                        await self._response_store_put_conversation(conversation_store_key, conversation_after)
 
                 return response_obj.model_dump(exclude_none=False)
+
+            self._check_generation_slot_capacity(
+                endpoint="/v1/responses",
+                request_id=response_id,
+                model=model,
+                raw_request=raw_request,
+                stream=True,
+            )
 
             created_at = int(time.time())
 
@@ -2107,6 +2371,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 ):
                     disconnected = False
                     final_obj: ResponsesResponse | None = None
+                    persisted_response = False
+                    accounted_completion = False
                     queue = self._start_observed_stream_task(
                         lambda: tp.cast(
                             Iterator[StreamEventFrame],
@@ -2115,6 +2381,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                                 model=model,
                                 messages=engine_messages_payload,
                                 tools=tools_for_template,
+                                tool_choice=request.tool_choice,
                                 sampling_params=sampling_params,
                                 request_id=response_id,
                                 include_reasoning_summary=reasoning_summary_requested,
@@ -2151,12 +2418,38 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                             frame_payload = frame.payload
                             if frame_event == "response.completed" and isinstance(frame_payload, ResponseCompletedEvent):
                                 final_obj = frame_payload.response
+                                # Persist response/conversation state and finalize accounting BEFORE
+                                # yielding ``response.completed`` so clients that immediately close or
+                                # send a follow-up with ``previous_response_id`` never observe a race.
+                                if store_response and self._enable_response_store and not persisted_response:
+                                    output_items = list(tp.cast(list[ResponsesOutputItem], final_obj.output))
+                                    assistant_turn = self._responses_assistant_message_from_output_items(output_items)
+                                    conversation_after = self._conversation_from_messages(full_messages, assistant_turn)
+                                    await self._response_store_put_response(
+                                        response_id,
+                                        {
+                                            "id": response_id,
+                                            "owner_key_id": owner_key_id,
+                                            "model": model,
+                                            "created_at": final_obj.created_at,
+                                            "previous_response_id": previous_response_id,
+                                            "conversation_id": conversation_id,
+                                            "conversation": conversation_after,
+                                            "response": final_obj.model_dump(exclude_none=False),
+                                        },
+                                    )
+                                    if conversation_id and conversation_store_key is not None:
+                                        await self._response_store_put_conversation(
+                                            conversation_store_key, conversation_after
+                                        )
+                                    persisted_response = True
                                 usage = final_obj.usage
-                                self._record_api_key_usage(
-                                    raw_request,
-                                    int(usage.input_tokens if usage is not None else 0),
-                                    int(usage.output_tokens if usage is not None else 0),
-                                )
+                                prompt_tokens = int(usage.input_tokens if usage is not None else 0)
+                                completion_tokens = int(usage.output_tokens if usage is not None else 0)
+                                if not accounted_completion:
+                                    self.metrics.total_tokens_generated += completion_tokens
+                                    self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+                                    accounted_completion = True
 
                             yield self._sse_event(frame_event, frame_payload)
 
@@ -2165,31 +2458,6 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
                         if final_obj is None:
                             raise RuntimeError("Streaming finished without response.completed")
-
-                        if store_response and self._enable_response_store:
-                            output_items = list(tp.cast(list[ResponsesOutputItem], final_obj.output))
-                            assistant_turn = self._responses_assistant_message_from_output_items(output_items)
-                            conversation_after = self._conversation_from_messages(full_messages, assistant_turn)
-                            await self._response_store_put_response(
-                                response_id,
-                                {
-                                    "id": response_id,
-                                    "model": model,
-                                    "created_at": final_obj.created_at,
-                                    "previous_response_id": previous_response_id,
-                                    "conversation_id": conversation_id,
-                                    "conversation": conversation_after,
-                                    "response": final_obj.model_dump(exclude_none=False),
-                                },
-                            )
-                            if conversation_id:
-                                await self._response_store_put_conversation(conversation_id, conversation_after)
-
-                        usage = final_obj.usage
-                        prompt_tokens = int(usage.input_tokens if usage is not None else 0)
-                        completion_tokens = int(usage.output_tokens if usage is not None else 0)
-                        self.metrics.total_tokens_generated += completion_tokens
-                        self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
 
                     except Exception as e:
                         self._mark_stream_failure()
@@ -2310,7 +2578,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             if completion.tool_calls:
                 message = ChatMessage(
                     role="assistant",
-                    content=None,
+                    content=self._resolved_tool_call_visible_text(completion, output if idx == 0 else None),
                     tool_calls=completion.tool_calls,
                     reasoning_content=completion.reasoning_content,
                 )
@@ -2383,8 +2651,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             raw_request=raw_request,
             stream=False,
         ):
-            sampling_params = self._prepare_sampling_params(request, esurge)
-            loop = asyncio.get_running_loop()
+            try:
+                sampling_params = self._prepare_sampling_params(request, esurge)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             disconnect_done = asyncio.Event()
             disconnect_task = asyncio.create_task(
                 self._abort_non_stream_request_on_disconnect(
@@ -2411,16 +2681,24 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     ),
                 )
 
+            def _reconcile_cancelled_chat(partial_output: RequestOutput) -> None:
+                p_tokens = self._prompt_token_count_from_output(partial_output)
+                c_tokens = int(getattr(partial_output, "num_generated_tokens", 0) or 0)
+                if p_tokens > 0 or c_tokens > 0:
+                    self.metrics.total_tokens_generated += c_tokens
+                    self._record_api_key_usage(raw_request, p_tokens, c_tokens)
+
             try:
-                output = await loop.run_in_executor(self.thread_pool, _run_chat)
-            except asyncio.CancelledError:
-                self._abort_request_after_handler_cancel(
-                    esurge=esurge,
-                    request_id=request_id,
-                    endpoint="/v1/chat/completions",
-                    model=request.model,
+                output = await self._run_in_thread_with_cancel_abort(
+                    _run_chat,
+                    abort_fn=lambda: self._abort_request_after_handler_cancel(
+                        esurge=esurge,
+                        request_id=request_id,
+                        endpoint="/v1/chat/completions",
+                        model=request.model,
+                    ),
+                    on_cancelled_result=_reconcile_cancelled_chat,
                 )
-                raise
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             finally:
@@ -2458,7 +2736,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             cache and connection headers, plus ``X-Request-ID``.
         """
 
-        sampling_params = self._prepare_sampling_params(request, esurge)
+        try:
+            sampling_params = self._prepare_sampling_params(request, esurge)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         tools = self.extract_tools(request=request)
         # Refuse overload before the SSE response starts: a 503 raised inside the
         # body iterator reaches the client as an empty, aborted stream instead.
@@ -2607,21 +2888,28 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         request_id = str(uuid.uuid4())
 
         try:
-            adapter = self._get_adapter(request.model)
-            esurge = adapter.esurge
+            prompt = request.prompt
+            prompts = [prompt] if isinstance(prompt, str) else list(prompt)
 
-            max_tokens = self._ensure_request_max_tokens(request, esurge)
-            self._authorize_request(
+            adapters = getattr(self, "adapters", None)
+            peek_adapter = adapters.get(request.model) if isinstance(adapters, dict) else None
+            peek_esurge = peek_adapter.esurge if peek_adapter is not None else None
+
+            max_tokens = self._ensure_request_max_tokens(request, peek_esurge)
+            batch_size = max(1, len(prompts))
+            n_samples = max(1, int(request.n or 1))
+            self._authorize_endpoint(
                 raw_request,
                 endpoint="/v1/completions",
                 model=request.model,
-                requested_tokens=max_tokens,
+                requested_tokens=max_tokens * batch_size * n_samples,
                 stream=bool(request.stream),
                 uses_tools=self._request_uses_tools(request),
+                reconcile_immediately=False,
             )
 
-            prompt = request.prompt
-            prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+            adapter = self._get_adapter(request.model)
+            esurge = adapter.esurge
 
             if not prompts or any(not p for p in prompts):
                 raise HTTPException(400, "Prompt cannot be empty")
@@ -2681,34 +2969,41 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             asyncio.CancelledError: Re-raised after aborting the engine
                 request when the handler itself is cancelled.
         """
-        async with self._acquire_generation_slot(
-            endpoint="/v1/completions",
-            request_id=request_id,
-            model=request.model,
-            raw_request=raw_request,
-            stream=False,
-        ):
-            multi_prompt = not isinstance(prompt, str)
-            prompts = list(prompt) if multi_prompt else [prompt]
+        multi_prompt = not isinstance(prompt, str)
+        prompts = list(prompt) if multi_prompt else [prompt]
+        slot_kwargs: dict[str, tp.Any] = {
+            "endpoint": "/v1/completions",
+            "request_id": request_id,
+            "model": request.model,
+            "raw_request": raw_request,
+            "stream": False,
+        }
+        if len(prompts) > 1:
+            slot_kwargs["count"] = len(prompts)
+
+        async with self._acquire_generation_slot(**slot_kwargs):
             # ``generate`` needs one id per prompt when batching; a single prompt keeps the caller's id unchanged.
             request_ids = [f"{request_id}-{i}" for i in range(len(prompts))] if multi_prompt else [request_id]
-            prompt_tokens = sum(len(esurge.tokenizer(p)["input_ids"]) for p in prompts)
-            sampling_params = self._prepare_sampling_params(request, esurge)
+            try:
+                sampling_params = self._prepare_sampling_params(request, esurge)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             loop = asyncio.get_running_loop()
+            prompt_tokens = await loop.run_in_executor(
+                getattr(self, "thread_pool", None),
+                lambda: sum(len(esurge.tokenizer(p)["input_ids"]) for p in prompts),
+            )
             disconnect_done = asyncio.Event()
-            disconnect_tasks = [
-                asyncio.create_task(
-                    self._abort_non_stream_request_on_disconnect(
-                        raw_request=raw_request,
-                        esurge=esurge,
-                        request_id=rid,
-                        endpoint="/v1/completions",
-                        model=request.model,
-                        done_event=disconnect_done,
-                    )
+            disconnect_task = asyncio.create_task(
+                self._abort_non_stream_request_on_disconnect(
+                    raw_request=raw_request,
+                    esurge=esurge,
+                    request_id=request_ids if multi_prompt else request_ids[0],
+                    endpoint="/v1/completions",
+                    model=request.model,
+                    done_event=disconnect_done,
                 )
-                for rid in request_ids
-            ]
+            )
 
             def _run_generate() -> list[RequestOutput]:
                 return esurge.generate(
@@ -2718,9 +3013,7 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                     use_tqdm=False,
                 )
 
-            try:
-                outputs = await loop.run_in_executor(self.thread_pool, _run_generate)
-            except asyncio.CancelledError:
+            def _abort_batch() -> None:
                 for rid in request_ids:
                     self._abort_request_after_handler_cancel(
                         esurge=esurge,
@@ -2728,14 +3021,28 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                         endpoint="/v1/completions",
                         model=request.model,
                     )
-                raise
+
+            def _reconcile_cancelled_completion(partial_outputs: list[RequestOutput]) -> None:
+                if not partial_outputs:
+                    return
+                c_tokens = sum(int(getattr(o, "num_generated_tokens", 0) or 0) for o in partial_outputs)
+                if c_tokens > 0 or prompt_tokens > 0:
+                    self.metrics.total_tokens_generated += c_tokens
+                    self._record_api_key_usage(raw_request, prompt_tokens, c_tokens)
+
+            try:
+                outputs = await self._run_in_thread_with_cancel_abort(
+                    _run_generate,
+                    abort_fn=_abort_batch,
+                    on_cancelled_result=_reconcile_cancelled_completion,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             finally:
                 disconnect_done.set()
-                for disconnect_task in disconnect_tasks:
-                    disconnect_task.cancel()
-                for disconnect_task in disconnect_tasks:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await disconnect_task
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
 
             if not outputs:
                 raise RuntimeError("Generation failed to produce output")
@@ -2798,6 +3105,18 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             An SSE response covering all prompt completions.
         """
 
+        try:
+            self._prepare_sampling_params(request, esurge)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        self._check_generation_slot_capacity(
+            endpoint="/v1/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=True,
+        )
+
         async def generate_stream():
             stream_id = f"cmpl-{uuid.uuid4().hex}"
             created_at = int(time.time())
@@ -2813,9 +3132,19 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             for prompt_index, prompt in enumerate(prompts):
                 if await raw_request.is_disconnected():
                     return
-                response = await self._handle_completion_streaming(
-                    request, esurge, prompt, f"{request_id}-{prompt_index}", raw_request, record_usage=False
-                )
+                try:
+                    response = await self._handle_completion_streaming(
+                        request, esurge, prompt, f"{request_id}-{prompt_index}", raw_request, record_usage=False
+                    )
+                except HTTPException as exc:
+                    self._mark_stream_failure()
+                    try:
+                        status_code = HTTPStatus(exc.status_code)
+                    except ValueError:
+                        status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                    error_response = create_error_response(status_code, str(exc.detail), request_id)
+                    yield f"data: {error_response.body.decode()}\n\n"
+                    return
                 iterator = response.body_iterator
                 next_choice_offset = choice_offset
                 completed = False
@@ -2908,7 +3237,10 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             usual cache/connection headers and ``X-Request-ID``.
         """
 
-        sampling_params = self._prepare_sampling_params(request, esurge)
+        try:
+            sampling_params = self._prepare_sampling_params(request, esurge)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         # Same pre-flight check as chat.
         self._check_generation_slot_capacity(
             endpoint="/v1/completions",
@@ -2931,7 +3263,11 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
                 raw_request=raw_request,
                 stream=True,
             ):
-                prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
+                loop = asyncio.get_running_loop()
+                prompt_tokens = await loop.run_in_executor(
+                    getattr(self, "thread_pool", None),
+                    lambda: len(esurge.tokenizer(prompt)["input_ids"]),
+                )
                 previous_texts: dict[int, str] = {}
                 stream_id = f"cmpl-{uuid.uuid4().hex}"
                 created_at = int(time.time())
@@ -3095,13 +3431,16 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
 
             Status code 200 if READY, 503 otherwise.
         """
-        self._authorize_request(raw_request)
+        self._authorize_endpoint(raw_request, endpoint="/health", reconcile_immediately=True)
+        allowed_models = self._allowed_models_for_request(raw_request)
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         model_health_info = {}
         total_pending_requests = 0
         total_running_requests = 0
         for name, adapter in self.adapters.items():
+            if allowed_models is not None and name not in allowed_models:
+                continue
             pending_requests = int(getattr(adapter.esurge, "num_pending_requests", 0) or 0)
             running_requests = int(getattr(adapter.esurge, "num_running_requests", 0) or 0)
             total_pending_requests += pending_requests
@@ -3141,7 +3480,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         status_code = 200 if self.status == ServerStatus.READY else 503
         return JSONResponse(health_status, status_code=status_code)
 
-    def _engine_metrics_snapshot(self) -> dict[str, tp.Any]:
+    def _engine_metrics_snapshot(
+        self,
+        *,
+        allowed_models: set[str] | None = None,
+        include_recent_requests: bool = True,
+    ) -> dict[str, tp.Any]:
         """Per-model windowed metrics from the engine's :class:`MetricsCollector`.
 
         The collector owns the accounting (cache reads, TTFT, decode rate, percentiles); this method only adds
@@ -3150,11 +3494,15 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         collector = get_metrics_collector()
         snapshots: dict[str, tp.Any] = {}
         for model_name, engine in self.esurge_map.items():
+            if allowed_models is not None and model_name not in allowed_models:
+                continue
             summary = (
                 collector.model_summary(getattr(engine, "esurge_name", model_name), window_seconds=_METRICS_WINDOW_S)
                 if collector is not None
                 else {"window_seconds": _METRICS_WINDOW_S, "aggregate": {}, "recent_requests": []}
             )
+            if not include_recent_requests:
+                summary = {k: v for k, v in summary.items() if k != "recent_requests"}
             snapshot_stats_fn = getattr(engine, "prefix_snapshot_stats", None)
             snapshots[model_name] = {
                 "running_requests": int(getattr(engine, "num_running_requests", 0) or 0),
@@ -3176,30 +3524,45 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             raw_request: Raw FastAPI request for endpoint-scoped auth.
 
         Returns:
-            JSONResponse with comprehensive server metrics including
-            request counts, token statistics, throughput, status, and the
-            embedded ``auth_stats`` block reported by the auth manager.
+            JSONResponse with server metrics including request counts, token
+            statistics, throughput, status, and (for ``ADMIN`` keys or when
+            auth is disabled) ``auth_stats`` and per-request ``recent_requests``.
         """
-        self._authorize_request(raw_request, endpoint="/v1/metrics")
-        self.metrics.uptime_seconds = time.time() - self.metrics.start_time
-
-        auth_stats = self.auth_manager.get_statistics()
-
+        self._authorize_endpoint(raw_request, endpoint="/metrics", reconcile_immediately=True)
         return JSONResponse(
-            {
-                "uptime_seconds": self.metrics.uptime_seconds,
-                "total_requests": self.metrics.total_requests,
-                "successful_requests": self.metrics.successful_requests,
-                "failed_requests": self.metrics.failed_requests,
-                "total_tokens_generated": self.metrics.total_tokens_generated,
-                "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
-                "active_requests": len(self._active_requests),
-                "models_loaded": len(self.adapters),
-                "status": self.status.value,
-                "auth_stats": auth_stats,
-                "engine_metrics": self._engine_metrics_snapshot(),
-            }
+            self.metrics_payload(
+                include_admin_details=self._is_privileged_metrics_caller(raw_request),
+                allowed_models=self._allowed_models_for_request(raw_request),
+            )
         )
+
+    def metrics_payload(
+        self,
+        *,
+        include_admin_details: bool = True,
+        allowed_models: set[str] | None = None,
+    ) -> dict[str, tp.Any]:
+        """The ``/metrics`` body, without an authorization check (callers must have authorized already)."""
+        self.metrics.uptime_seconds = time.time() - self.metrics.start_time
+        engine_metrics = self._engine_metrics_snapshot(
+            allowed_models=allowed_models,
+            include_recent_requests=include_admin_details,
+        )
+        payload: dict[str, tp.Any] = {
+            "uptime_seconds": self.metrics.uptime_seconds,
+            "total_requests": self.metrics.total_requests,
+            "successful_requests": self.metrics.successful_requests,
+            "failed_requests": self.metrics.failed_requests,
+            "total_tokens_generated": self.metrics.total_tokens_generated,
+            "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
+            "active_requests": len(self._active_requests),
+            "models_loaded": len(engine_metrics) if allowed_models is not None else len(self.adapters),
+            "status": self.status.value,
+            "engine_metrics": engine_metrics,
+        }
+        if include_admin_details:
+            payload["auth_stats"] = self.auth_manager.get_statistics()
+        return payload
 
     async def list_models(self, raw_request: Request) -> JSONResponse:
         """List available models.
@@ -3212,9 +3575,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         Returns:
             JSONResponse with list of available models and their metadata.
         """
-        self._authorize_request(raw_request)
+        self._authorize_endpoint(raw_request, endpoint="/v1/models", reconcile_immediately=True)
+        allowed_models = self._allowed_models_for_request(raw_request)
         models_data = []
         for model_id, adapter in self.adapters.items():
+            if allowed_models is not None and model_id not in allowed_models:
+                continue
             model_info = adapter.get_model_info()
             models_data.append(
                 {
@@ -3252,7 +3618,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         Raises:
             HTTPException: If model not found (404).
         """
-        self._authorize_request(raw_request)
+        self._authorize_endpoint(
+            raw_request,
+            endpoint=f"/v1/models/{model_id}",
+            model=model_id,
+            reconcile_immediately=True,
+        )
         adapter = self._get_adapter(model_id)
         model_info = adapter.get_model_info()
 
@@ -3281,8 +3652,8 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
         Returns:
             JSONResponse with tool definitions per model.
         """
-        self._authorize_request(raw_request)
-        return JSONResponse(self._create_tools_response())
+        self._authorize_endpoint(raw_request, endpoint="/v1/tools", reconcile_immediately=True)
+        return JSONResponse(self._create_tools_response(allowed_models=self._allowed_models_for_request(raw_request)))
 
     async def execute_tool(self, raw_request: Request) -> JSONResponse:
         """Execute a tool/function call.
@@ -3301,7 +3672,12 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             This is intentionally a placeholder; production deployments
             should bind this endpoint to a real tool executor.
         """
-        self._authorize_request(raw_request)
+        self._authorize_endpoint(
+            raw_request,
+            endpoint="/v1/tools/execute",
+            uses_tools=True,
+            reconcile_immediately=True,
+        )
         return self._create_tool_execution_placeholder_response()
 
     @property

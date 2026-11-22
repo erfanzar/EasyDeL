@@ -39,6 +39,7 @@ import inspect
 import time
 import typing as tp
 import warnings
+import weakref
 
 import jax
 import numpy as np
@@ -57,6 +58,7 @@ from easydel.utils.helpers import check_bool_flag, get_logger
 logger = get_logger("EasyDeL-ScheduledTrainerStep")
 
 if tp.TYPE_CHECKING:
+    from easydel.infra.base_module import EasyDeLBaseModule
     from easydel.infra.etils import MpMdSchedulers
 
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
@@ -351,7 +353,43 @@ PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS = frozenset(
 _ScheduledLossFn = tp.Callable[[tp.Any, collections.abc.Mapping[str, jax.Array]], jax.Array]
 _ScheduledValueAndGradFn = tp.Callable[[tp.Any, dict], tuple[jax.Array, tp.Any, tp.Any]]
 _SCHEDULED_LOSS_ADAPTERS: dict[tuple[str, str], ScheduledLossAdapter] = {}
-_SCHEDULED_AUXILIARY_CACHE: dict[tuple[tp.Any, ...], tp.Callable[..., tp.Any]] = {}
+_SCHEDULED_AUXILIARY_CACHE_MAXSIZE = 32
+
+
+class _BoundedScheduledAuxCache(collections.abc.MutableMapping):
+    """Bounded LRU cache for scheduled auxiliary forwards with identity verification.
+
+    Prevents unbounded module-level retention of compiled ``spx.jit`` executables
+    and rejects false cache hits from Python ``id()`` reuse.
+    """
+
+    def __init__(self, maxsize: int = _SCHEDULED_AUXILIARY_CACHE_MAXSIZE) -> None:
+        self._maxsize = max(int(maxsize), 1)
+        self._entries: collections.OrderedDict[tp.Any, tp.Any] = collections.OrderedDict()
+
+    def __getitem__(self, key: tp.Any) -> tp.Any:
+        value = self._entries[key]
+        self._entries.move_to_end(key)
+        return value
+
+    def __setitem__(self, key: tp.Any, value: tp.Any) -> None:
+        if key in self._entries:
+            self._entries.move_to_end(key)
+        self._entries[key] = value
+        while len(self._entries) > self._maxsize:
+            self._entries.popitem(last=False)
+
+    def __delitem__(self, key: tp.Any) -> None:
+        del self._entries[key]
+
+    def __iter__(self) -> collections.abc.Iterator[tp.Any]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+_SCHEDULED_AUXILIARY_CACHE: collections.abc.MutableMapping[tp.Any, tp.Any] = _BoundedScheduledAuxCache()
 _SCHEDULED_AUX_PIPELINE_EXECUTOR: dict[bool, tp.Any] = {}
 
 SCHEDULED_UPDATE_GATE_KEY = "update_gate"
@@ -630,6 +668,7 @@ class _ScheduledValueAndGradCompiler:
     schedule: tp.Any
     batch_argnums: int | tp.Sequence[int] | None
     adapter: ScheduledLossAdapter
+    jit_kwargs: dict[str, tp.Any] = dataclasses.field(default_factory=dict)
     cached_key: tuple[tp.Any, ...] | None = None
     cached_value_and_grad: _ScheduledValueAndGradFn | None = None
     cached_microbatch_weight_fn: tp.Callable[..., tp.Any] | None = None
@@ -639,8 +678,8 @@ class _ScheduledValueAndGradCompiler:
 
         On a cache miss, builds a fresh ``spx.jit``-compiled loss with the
         configured schedule and wraps it in :func:`spx.sxvalue_and_grad`.
-        Subsequent calls with the same adapter cache key reuse the existing
-        compiled callable.
+        Subsequent calls with the same adapter cache key and multimodal
+        ``position_ids`` layout reuse the existing compiled callable.
 
         Args:
             call: The current scheduled step call context.
@@ -649,7 +688,20 @@ class _ScheduledValueAndGradCompiler:
             A function ``(tree, batch) -> (loss, gradients)`` ready to be
             applied by the trainer.
         """
-        key = self.adapter.make_cache_key(call)
+        # The generic pipeline runtime splits leading batch axes. Transport
+        # multimodal (3, B, S) positions as (B, 3, S), then restore the model's
+        # public layout inside the scheduled loss / weight closures. This also
+        # disambiguates B == 3 without teaching SpectraX model-specific keys.
+        batch_size = _infer_batch_size(call.batch)
+        position_paths = frozenset(
+            path
+            for path, leaf in tu.tree_flatten_with_path(call.batch)[0]
+            if path
+            and isinstance(path[-1], tu.DictKey)
+            and (path[-1].key == "position_ids" or str(path[-1].key).endswith("_position_ids"))
+            and infer_prompt_batch_axis(leaf, batch_size, key=path[-1].key) == 1
+        )
+        key = (self.adapter.make_cache_key(call), position_paths)
         if self.cached_value_and_grad is not None and self.cached_key == key:
             return self.cached_value_and_grad
 
@@ -657,20 +709,6 @@ class _ScheduledValueAndGradCompiler:
         weight_fn = None
         if self.adapter.make_microbatch_weight is not None:
             weight_fn = self.adapter.make_microbatch_weight(call)
-
-        # The generic pipeline runtime splits leading batch axes. Transport
-        # multimodal (3, B, S) positions as (B, 3, S), then restore the model's
-        # public layout inside the scheduled loss / weight closures. This also
-        # disambiguates B == 3 without teaching SpectraX model-specific keys.
-        batch_size = _infer_batch_size(call.batch)
-        position_paths = {
-            path
-            for path, leaf in tu.tree_flatten_with_path(call.batch)[0]
-            if path
-            and isinstance(path[-1], tu.DictKey)
-            and path[-1].key == "position_ids"
-            and infer_prompt_batch_axis(leaf, batch_size, key="position_ids") == 1
-        }
 
         def position_layout(batch, *, restore=False):
             if not position_paths:
@@ -693,6 +731,7 @@ class _ScheduledValueAndGradCompiler:
             schedule=self.schedule,
             static_argnums=(),
             batch_argnums=self.batch_argnums,
+            **self.jit_kwargs,
         )
         has_aux = self.adapter.resolve_has_aux(call)
         scheduled_value_and_grad = spx.sxvalue_and_grad(
@@ -957,6 +996,129 @@ def sync_module_physical_stage_config(module: tp.Any) -> tp.Iterator[None]:
             config.pipeline_virtual_stages = old_value
 
 
+def make_scheduled_state_shell(call: ScheduledStepCall) -> tp.Any:
+    """Return a weightless state shell derived from ``call.state``.
+
+    Replaces live device-resident leaves (``graphstate``, ``opt_state``, ``step``)
+    and ``tx`` on ``call.state`` so cached scheduled-loss closures can call
+    ``state_shell.replace(graphstate=tree)`` without pinning Step-0 parameters,
+    optimizer buffers, or the full :class:`ScheduledStepCall` in HBM.
+
+    Args:
+        call: Live :class:`ScheduledStepCall` for the step being compiled.
+
+    Returns:
+        A lightweight state shell retaining only static graph metadata
+        (``graphdef``, ``graphother``, ``apply_fn``, ``esurge_cache_scope_key``).
+    """
+    state = call.state
+    replace_fn = getattr(state, "replace", None)
+    if callable(replace_fn):
+        overrides: dict[str, tp.Any] = {}
+        if hasattr(state, "step"):
+            overrides["step"] = 0
+        if hasattr(state, "graphstate"):
+            overrides["graphstate"] = None
+        if hasattr(state, "opt_state"):
+            overrides["opt_state"] = None
+        if hasattr(state, "tx"):
+            overrides["tx"] = None
+        if overrides:
+            try:
+                return replace_fn(**overrides)
+            except TypeError:
+                for key in ("graphstate", "opt_state", "step", "tx"):
+                    if key in overrides:
+                        try:
+                            state = state.replace(**{key: overrides[key]})
+                        except TypeError:
+                            pass
+                return state
+    return state
+
+
+def make_scheduled_module_binder(
+    call: ScheduledStepCall,
+    *,
+    straight_through_field: str = "straight_through_emulator",
+    binder_fn: tp.Callable[..., tp.Any] | None = None,
+) -> tp.Callable[[tp.Any], tp.Any]:
+    """Create a parameter-tree binder closure that never pins ``call`` or live HBM state.
+
+    Captures only the static ``(graphdef, graphother, schedule, straight_through_emulator)``
+    metadata needed to materialize a module from a traced parameter ``tree`` inside a
+    cached MPMD scheduled-loss closure. Unlike calling :func:`bind_scheduled_module`
+    directly with ``call`` inside ``scheduled_loss``, the returned binder holds zero
+    references to ``call``, ``call.state``, ``call.state.graphstate``,
+    ``call.state.opt_state``, or ``call.batch``.
+
+    Args:
+        call: Live :class:`ScheduledStepCall` for the step being compiled.
+        straight_through_field: Name of the bound argument supplying an optional
+            straight-through quantization emulator callable.
+        binder_fn: Optional module-level ``bind_scheduled_module`` reference from
+            the caller's module. When left as ``None`` or equal to
+            :func:`bind_scheduled_module`, the fast zero-pinning path is used.
+            When monkeypatched in tests to a custom callable, delegates to
+            ``binder_fn`` with a weightless :class:`ScheduledStepCall` shell.
+
+    Returns:
+        Callable ``(tree) -> module`` that merges ``tree`` and syncs the
+        module's pipeline-stage schedule config.
+    """
+    schedule = getattr(call, "schedule", None)
+    straight_through = call.get(straight_through_field) if hasattr(call, "get") else None
+
+    if binder_fn is not None and binder_fn is not bind_scheduled_module:
+        raw_state = getattr(call, "state", None)
+        state_shell = make_scheduled_state_shell(call) if raw_state is not None else None
+        detached_bound = {straight_through_field: straight_through} if straight_through is not None else {}
+        call_shell = ScheduledStepCall(
+            step_fn=getattr(call, "step_fn", None),
+            state=state_shell,
+            batch={},
+            args=(),
+            kwargs={},
+            bound_arguments=detached_bound,
+            schedule=schedule,
+        )
+
+        def _bind_override(tree: tp.Any) -> tp.Any:
+            return binder_fn(call_shell, tree)
+
+        return _bind_override
+
+    state = call.state
+    if isinstance(state, EasyDeLState) and type(state).merge is EasyDeLState.merge:
+        graphdef = state.graphdef
+        graphother = state.graphother
+
+        def _bind_module(tree: tp.Any) -> tp.Any:
+            if straight_through is not None:
+                tree = straight_through(tree)
+            other = jax.tree_util.tree_map(
+                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                graphother,
+            )
+            full_state = tree.merge(other, copy=False)
+            module = tp.cast("EasyDeLBaseModule", spx.bind(graphdef, full_state))
+            sync_module_schedule_config(module, schedule)
+            return module
+
+        return _bind_module
+
+    state_shell = make_scheduled_state_shell(call)
+
+    def _bind_shell(tree: tp.Any) -> tp.Any:
+        if straight_through is not None:
+            tree = straight_through(tree)
+        module = state_shell.merge(tree)
+        sync_module_schedule_config(module, schedule)
+        return module
+
+    return _bind_shell
+
+
 def bind_scheduled_module(
     call: ScheduledStepCall,
     tree: tp.Any,
@@ -969,6 +1131,11 @@ def bind_scheduled_module(
     applying an optional straight-through quantization emulator and
     synchronising the resulting module's pipeline-stage configuration
     with the active MPMD schedule so subsequent stage markers match.
+
+    Note:
+        Scheduled-loss adapters whose returned closures are cached across steps
+        should build a binder once outside ``scheduled_loss`` via
+        :func:`make_scheduled_module_binder` rather than closing over ``call``.
 
     Args:
         call: Live :class:`ScheduledStepCall` for this scheduled step.
@@ -1039,34 +1206,110 @@ def _aux_slice_tree_leading_axis(value: tp.Any, start: int, size: int, full: int
 
 
 def _aux_concat_microbatch_outputs(microbatch_outputs: list[tp.Any], chunk: int) -> tp.Any:
-    """Concatenate per-microbatch output trees along axis 0 for leaves of leading size ``chunk``.
+    """Reassemble per-microbatch output trees using key-aware batch-axis resolution.
 
-    Each microbatch already produced a ``(chunk, ...)`` shard living on its stage submesh; the
-    concatenation stitches them back into a ``(microbatches * chunk, ...)`` array that stays sharded
-    over the same submesh (axis-0 inputs are sharded over the data axis, so the concat output is too).
-    Leaves whose leading axis is not ``chunk`` (scalars, metadata) are passed through from the first
-    microbatch unchanged.
+    Batch-aligned leaves (including rank-3 ``(3, chunk, S)`` multimodal
+    ``position_ids`` along axis 1) are concatenated along their batch axis.
+    Shared non-batch keys are returned from the first microbatch unchanged, and
+    0-d floating scalar outputs are averaged across microbatches instead of
+    dropping microbatches ``1..M-1``.
     """
 
-    def _concat(*leaves: tp.Any) -> tp.Any:
-        """Concatenate aligned pytree leaves along axis 0 when they carry the chunk dim.
-
-        Args:
-            *leaves: One leaf from each microbatch's output tree at the same
-                pytree position.
-
-        Returns:
-            ``jnp.concatenate(leaves, axis=0)`` for leaves whose leading
-            axis equals ``chunk``; otherwise ``leaves[0]`` (treated as a
-            shared scalar/metadata leaf).
-        """
+    def _concat(path, *leaves: tp.Any) -> tp.Any:
         first = leaves[0]
         shape = getattr(first, "shape", None)
-        if shape is None or len(shape) == 0 or int(shape[0]) != chunk:
+        if shape is None:
             return first
-        return jnp.concatenate(leaves, axis=0)
+        if len(shape) == 0:
+            dtype = getattr(first, "dtype", None)
+            if dtype is not None and jnp.issubdtype(dtype, jnp.inexact):
+                return (sum(jnp.asarray(leaf, jnp.float32) for leaf in leaves) / float(len(leaves))).astype(dtype)
+            return first
+        key = next((entry.key for entry in reversed(path) if isinstance(entry, tu.DictKey)), None)
+        if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
+            return first
+        axis = infer_prompt_batch_axis(first, chunk, key=key)
+        if axis is None:
+            return first
+        return jnp.concatenate(leaves, axis=axis)
 
-    return tu.tree_map(_concat, *microbatch_outputs)
+    return tu.tree_map_with_path(_concat, *microbatch_outputs)
+
+
+def _evict_scheduled_aux_cache_entry(
+    cache_ref: weakref.ReferenceType[collections.abc.MutableMapping[tp.Any, tp.Any]],
+    key: tp.Any,
+) -> None:
+    """Remove ``key`` from a scheduled-auxiliary cache once its mesh or callable is GC'd."""
+    cache = cache_ref()
+    if cache is not None:
+        cache.pop(key, None)
+
+
+def _try_weakref(obj: tp.Any) -> tuple[bool, tp.Any]:
+    """Return ``(True, weakref.ref(obj))`` when ``obj`` is weakrefable, else ``(False, obj)``."""
+    try:
+        return True, weakref.ref(obj)
+    except TypeError:
+        return False, obj
+
+
+def _resolve_scheduled_aux_cache(
+    fn: tp.Callable[..., tp.Any],
+    mesh: MeshLike,
+    microbatches: int,
+    batch_argnums_t: tuple[int, ...],
+    use_workers: bool,
+) -> tuple[collections.abc.MutableMapping[tp.Any, tp.Any], tp.Any, tp.Any, bool]:
+    """Select the cache mapping, lookup key, callable identity target, and verification mode.
+
+    Prefers a bounded per-callable LRU stored on ``fn`` (or on ``fn.__self__`` for
+    bound methods) so trainer-owned closures and ``functools.partial`` callables
+    are garbage-collected with their trainer instead of being pinned in module-level
+    globals when ``mesh`` is immutable (``jax.sharding.Mesh``, ``SpxMesh``, ``MpMdMesh``).
+    """
+    if not isinstance(_SCHEDULED_AUXILIARY_CACHE, _BoundedScheduledAuxCache):
+        key = (id(fn), id(mesh), microbatches, batch_argnums_t, use_workers)
+        return _SCHEDULED_AUXILIARY_CACHE, key, fn, False
+
+    fn_cache = getattr(fn, "_easydel_scheduled_aux_cache", None)
+    if not isinstance(fn_cache, _BoundedScheduledAuxCache):
+        try:
+            fn_cache = _BoundedScheduledAuxCache()
+            fn._easydel_scheduled_aux_cache = fn_cache
+        except (AttributeError, TypeError):
+            fn_cache = None
+    if fn_cache is not None:
+        key = (None, id(mesh), microbatches, batch_argnums_t, use_workers)
+        return fn_cache, key, fn, True
+
+    bound_self = getattr(fn, "__self__", None)
+    bound_func = getattr(fn, "__func__", None)
+    if bound_self is not None and bound_func is not None:
+        owner_cache = getattr(bound_self, "_easydel_scheduled_aux_cache", None)
+        if not isinstance(owner_cache, _BoundedScheduledAuxCache):
+            try:
+                owner_cache = _BoundedScheduledAuxCache()
+                bound_self._easydel_scheduled_aux_cache = owner_cache
+            except (AttributeError, TypeError):
+                owner_cache = None
+        if owner_cache is not None:
+            key = (id(bound_func), id(mesh), microbatches, batch_argnums_t, use_workers)
+            return owner_cache, key, bound_func, True
+
+    mesh_cache = getattr(mesh, "_easydel_scheduled_aux_cache", None)
+    if not isinstance(mesh_cache, _BoundedScheduledAuxCache):
+        try:
+            mesh_cache = _BoundedScheduledAuxCache()
+            mesh._easydel_scheduled_aux_cache = mesh_cache
+        except (AttributeError, TypeError):
+            mesh_cache = None
+    if mesh_cache is not None:
+        key = (id(fn), id(mesh), microbatches, batch_argnums_t, use_workers)
+        return mesh_cache, key, fn, True
+
+    key = (id(fn), id(mesh), microbatches, batch_argnums_t, use_workers)
+    return _SCHEDULED_AUXILIARY_CACHE, key, fn, True
 
 
 def cached_scheduled_auxiliary(
@@ -1110,15 +1353,47 @@ def cached_scheduled_auxiliary(
         batch_argnums_t = tuple(int(i) for i in batch_argnums)
     microbatches = max(1, int(microbatches))
 
-    key = (id(fn), id(mesh), microbatches, batch_argnums_t, use_workers)
-    cached = _SCHEDULED_AUXILIARY_CACHE.get(key)
+    cache_store, key, fn_target, verified_entries = _resolve_scheduled_aux_cache(
+        fn,
+        mesh,
+        microbatches,
+        batch_argnums_t,
+        use_workers,
+    )
+
+    cached = cache_store.get(key)
     if cached is not None:
-        return cached
+        if verified_entries and isinstance(cached, tuple) and len(cached) == 5:
+            fn_is_weak, fn_holder, mesh_is_weak, mesh_holder, cached_callable = cached
+            cached_fn = fn_holder() if fn_is_weak else fn_holder
+            cached_mesh = mesh_holder() if mesh_is_weak else mesh_holder
+            if cached_fn is fn_target and cached_mesh is mesh:
+                return cached_callable
+            cache_store.pop(key, None)
+        elif not verified_entries:
+            return cached
+
+    def _store_cached(result: tp.Callable[..., tp.Any]) -> tp.Callable[..., tp.Any]:
+        if verified_entries:
+            fn_is_weak, fn_holder = _try_weakref(fn_target)
+            mesh_is_weak, mesh_holder = _try_weakref(mesh)
+            cache_store[key] = (fn_is_weak, fn_holder, mesh_is_weak, mesh_holder, result)
+            try:
+                cache_ref = weakref.ref(cache_store)
+            except TypeError:
+                cache_ref = None
+            if cache_ref is not None:
+                if mesh_is_weak:
+                    weakref.finalize(mesh, _evict_scheduled_aux_cache_entry, cache_ref, key)
+                if cache_store is _SCHEDULED_AUXILIARY_CACHE and fn_is_weak:
+                    weakref.finalize(fn_target, _evict_scheduled_aux_cache_entry, cache_ref, key)
+        else:
+            cache_store[key] = result
+        return result
 
     compiled = spx.jit(fn, mesh=mesh)
     if microbatches <= 1 or not batch_argnums_t:
-        _SCHEDULED_AUXILIARY_CACHE[key] = compiled
-        return compiled
+        return _store_cached(compiled)
 
     @functools.wraps(fn)
     def _microbatched(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
@@ -1225,8 +1500,7 @@ def cached_scheduled_auxiliary(
                 pass
         return _aux_concat_microbatch_outputs(microbatch_outputs, chunk)
 
-    _SCHEDULED_AUXILIARY_CACHE[key] = _microbatched
-    return _microbatched
+    return _store_cached(_microbatched)
 
 
 def stop_gradient_tree(value: tp.Any) -> tp.Any:
@@ -1541,7 +1815,13 @@ def infer_prompt_batch_axis(
     if shape is None or len(shape) == 0:
         return None
 
-    if key == "position_ids" and len(shape) >= 3 and shape[0] == 3 and shape[1] == prompt_batch_size:
+    if (
+        isinstance(key, str)
+        and (key == "position_ids" or key.endswith("_position_ids"))
+        and len(shape) >= 3
+        and shape[0] == 3
+        and shape[1] == prompt_batch_size
+    ):
         return 1
     if shape[0] == prompt_batch_size:
         return 0
@@ -1920,12 +2200,17 @@ def _leaf_batch_partition_spec(
     shape: tuple[int, ...],
     partition_spec: PartitionSpec,
     axis_sizes: dict[str, int],
+    *,
+    key: str | None = None,
 ) -> PartitionSpec:
     """Pick a rank-aware placement of a trainer (batch, seq, ...) spec for one leaf shape.
 
     Tries the spec anchored at dim 0; if the batch axes do not divide dim 0,
     tries dim 1 with a leading ``None`` (covers ``(K, batch, seq)`` leaves like
-    multimodal rope position ids). Entries whose mesh ways do not divide the
+    multimodal rope position ids). For rank-3 ``(3, B, S)`` ``position_ids``
+    leaves, always anchors at dim 1 so pure-``sp`` (``batch_ways == 1``) or
+    ``batch_ways == 3`` meshes never shard the 3 coordinate channels or shard
+    the batch axis by ``"sp"``. Entries whose mesh ways do not divide the
     target dim are dropped to ``None`` instead of degrading the whole leaf.
     Returns a fully-replicated spec only when nothing fits.
     """
@@ -1960,6 +2245,16 @@ def _leaf_batch_partition_spec(
             return None
         return PartitionSpec(*placed)
 
+    is_mrope_positions = (
+        isinstance(key, str)
+        and (key == "position_ids" or key.endswith("_position_ids"))
+        and len(shape) == 3
+        and int(shape[0]) == 3
+    )
+    if is_mrope_positions:
+        spec = _fit(1)
+        return spec if spec is not None else PartitionSpec()
+
     if batch_ways and int(shape[0]) % batch_ways == 0:
         spec = _fit(0)
         if spec is not None:
@@ -1990,15 +2285,15 @@ def constrain_batch_sharding(
     A trainer's ``batch_partition_spec`` (e.g. ``P(("dp","fsdp"), "sp")``)
     describes a ``(batch, sequence)`` layout, but collated batches also carry
     leaves it does not fit: rank-1 row tables from packed-embed collation,
-    rank-3 ``(K, batch, seq)`` position ids, scalars. Constraining the whole
-    tree with one spec makes the sharding fallback silently replicate those
-    leaves on every device (a ``(3, B, S)`` position-id tensor lands fully
-    replicated on all devices instead of batch-sharded). This helper places
-    the spec per leaf via :func:`_leaf_batch_partition_spec` so batch axes
-    land on the dimension they actually divide.
+    rank-3 ``(K, batch, seq)`` position ids, scalars, and nested containers
+    such as ``deepstack_visual_embeds``. Constraining the whole tree with one
+    spec makes the sharding fallback silently replicate those leaves on every
+    device. This helper places the spec per leaf via
+    :func:`_leaf_batch_partition_spec` so batch axes land on the dimension they
+    actually divide.
 
     Args:
-        batch: Batch pytree (typically a flat dict of arrays).
+        batch: Batch pytree (typically a dict of arrays or nested containers).
         partition_spec: Trainer batch partition spec; ``None`` is a no-op.
         mesh: Mesh whose axis sizes decide divisibility.
         ignore_mpmd: Forwarded to ``spx.with_sharding_constraint``.
@@ -2010,16 +2305,15 @@ def constrain_batch_sharding(
         return batch
     axis_sizes = {str(name): int(size) for name, size in dict(getattr(mesh, "shape", {}) or {}).items()}
 
-    def _constrain(leaf: tp.Any) -> tp.Any:
+    def _constrain(path: tuple[tp.Any, ...], leaf: tp.Any) -> tp.Any:
         shape = getattr(leaf, "shape", None)
         if shape is None:
             return leaf
-        spec = _leaf_batch_partition_spec(tuple(int(d) for d in shape), partition_spec, axis_sizes)
+        key = next((entry.key for entry in reversed(path) if isinstance(entry, tu.DictKey)), None)
+        spec = _leaf_batch_partition_spec(tuple(int(d) for d in shape), partition_spec, axis_sizes, key=key)
         return spx.with_sharding_constraint(leaf, spec, mesh=mesh, ignore_mpmd=ignore_mpmd)
 
-    if isinstance(batch, dict):
-        return {key: _constrain(value) for key, value in batch.items()}
-    return jax.tree_util.tree_map(_constrain, batch)
+    return tu.tree_map_with_path(_constrain, batch)
 
 
 def make_assertions_and_get_sizes(
@@ -2110,6 +2404,11 @@ def compile_trainer_step(
         schedule = None
     scheduled_adapter = get_scheduled_loss_adapter(fn) if schedule is not None else None
     if scheduled_adapter is not None:
+        scheduled_jit_kwargs = dict(jit_kwargs)
+        if arguments is not None:
+            _compiler_options = getattr(arguments, "xla_compiler_options", None)
+            if _compiler_options:
+                scheduled_jit_kwargs.setdefault("compiler_options", dict(_compiler_options))
         return _compile_scheduled_training_step(
             step_fn=fn,
             mesh=mesh,
@@ -2117,6 +2416,7 @@ def compile_trainer_step(
             batch_argnums=(1,) if batch_argnums is None else batch_argnums,
             static_argnums=static_argnums,
             adapter=scheduled_adapter,
+            jit_kwargs=scheduled_jit_kwargs,
         )
     # SpectraX's schedule= path is a scalar-loss custom-VJP runtime. Whole
     # EasyDeL trainer steps usually return (state, metrics) or metrics, and
@@ -2486,45 +2786,91 @@ def _run_scheduled_value_and_grad(
     if num_accum_steps == 1:
         return value_and_grad(graphstate, batch)
 
-    scales = [jnp.asarray(1.0 / num_accum_steps, dtype=jnp.float32)] * num_accum_steps
+    scales_f = [1.0 / float(num_accum_steps)] * num_accum_steps
     if microbatch_weight_fn is not None:
-        # Retain only scalar weights, not all sliced (possibly large teacher /
-        # vision feature) batches for the entire accumulation window.
-        weights = [
-            jnp.asarray(
-                microbatch_weight_fn(
-                    graphstate,
-                    _slice_batch_for_scheduled_step(batch, batch_size, index * minibatch_size, minibatch_size),
-                ),
-                jnp.float32,
+        # Convert scalar weights to host Python floats (after host replication on
+        # multi-host MPMD) so multiplying stage-local gradient leaves never mixes
+        # committed single-device arrays across disjoint per-stage submeshes.
+        weights_f = [
+            float(
+                jax.device_get(
+                    _mpmd_host_replicate_scalar(
+                        jnp.asarray(
+                            microbatch_weight_fn(
+                                graphstate,
+                                _slice_batch_for_scheduled_step(batch, batch_size, index * minibatch_size, minibatch_size),
+                            ),
+                            jnp.float32,
+                        )
+                    )
+                )
             )
             for index in range(num_accum_steps)
         ]
-        total = sum(weights)
-        safe_total = jnp.where(total > 0, total, jnp.float32(1.0))
-        scales = [jnp.where(total > 0, weight / safe_total, scales[0]) for weight in weights]
+        total = sum(w for w in weights_f if w > 0.0)
+        if total > 0.0:
+            scales_f = [w / total if w > 0.0 else 0.0 for w in weights_f]
+        else:
+            scales_f = [0.0] * num_accum_steps
+
+    def _scale_leaf_fp32(x: tp.Any, scale_val: float) -> tp.Any:
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.inexact):
+            return arr.astype(jnp.float32) * scale_val
+        return arr * scale_val
+
+    def _restore_dtype(acc: tp.Any, template: tp.Any) -> tp.Any:
+        dt = getattr(template, "dtype", None)
+        if dt is not None and jnp.issubdtype(dt, jnp.inexact):
+            return acc.astype(dt)
+        return acc
+
+    def _zero_like_safe(template: tp.Any) -> tp.Any:
+        arr = jnp.asarray(template)
+        return jnp.where(False, arr, jnp.zeros((), dtype=arr.dtype))
 
     loss_acc = None
     grad_acc = None
     aux_acc = None
     weight_sum = None
-    for index, scale in enumerate(scales):
+    template_loss = None
+    template_grads = None
+    template_aux = None
+    for index, scale_val in enumerate(scales_f):
         minibatch = _slice_batch_for_scheduled_step(batch, batch_size, index * minibatch_size, minibatch_size)
         loss_i, gradients_i, aux_i = value_and_grad(graphstate, minibatch)
-        loss_i = loss_i * scale
-        gradients_i = jax.tree_util.tree_map(lambda x, scale=scale: x * scale, gradients_i)
-        loss_acc = loss_i if loss_acc is None else loss_acc + loss_i
-        grad_acc = gradients_i if grad_acc is None else jax.tree_util.tree_map(jnp.add, grad_acc, gradients_i)
+        if template_loss is None:
+            template_loss = loss_i
+            template_grads = gradients_i
+            template_aux = aux_i
+        if aux_i is not None and aux_i.get("weight_sum") is not None:
+            count = jnp.asarray(aux_i["weight_sum"], jnp.float32)
+            weight_sum = count if weight_sum is None else weight_sum + count
+        if scale_val <= 0.0:
+            # Skip zero-weight chunks before multiplying so NaN/Inf on empty chunks
+            # cannot poison the accumulated loss, gradients, or auxiliary metrics.
+            continue
+        scaled_loss = _scale_leaf_fp32(loss_i, scale_val)
+        scaled_grads = jax.tree_util.tree_map(lambda x, s=scale_val: _scale_leaf_fp32(x, s), gradients_i)
+        loss_acc = scaled_loss if loss_acc is None else loss_acc + scaled_loss
+        grad_acc = scaled_grads if grad_acc is None else jax.tree_util.tree_map(jnp.add, grad_acc, scaled_grads)
         if aux_i is not None:
-            if aux_i.get("weight_sum") is not None:
-                count = jnp.asarray(aux_i["weight_sum"], jnp.float32)
-                weight_sum = count if weight_sum is None else weight_sum + count
-            aux_i = jax.tree_util.tree_map(lambda x, scale=scale: x * scale, aux_i)
-            aux_acc = aux_i if aux_acc is None else jax.tree_util.tree_map(jnp.add, aux_acc, aux_i)
+            scaled_aux = jax.tree_util.tree_map(lambda x, s=scale_val: _scale_leaf_fp32(x, s), aux_i)
+            aux_acc = scaled_aux if aux_acc is None else jax.tree_util.tree_map(jnp.add, aux_acc, scaled_aux)
 
-    if loss_acc is None or grad_acc is None:
+    if template_loss is None or template_grads is None:
         raise ValueError("Gradient accumulation produced no minibatches.")
-    if weight_sum is not None:
+    if loss_acc is None or grad_acc is None:
+        loss_acc = _zero_like_safe(template_loss)
+        grad_acc = jax.tree_util.tree_map(_zero_like_safe, template_grads)
+        if template_aux is not None:
+            aux_acc = jax.tree_util.tree_map(_zero_like_safe, template_aux)
+    else:
+        loss_acc = _restore_dtype(loss_acc, template_loss)
+        grad_acc = jax.tree_util.tree_map(_restore_dtype, grad_acc, template_grads)
+        if aux_acc is not None and template_aux is not None:
+            aux_acc = jax.tree_util.tree_map(_restore_dtype, aux_acc, template_aux)
+    if weight_sum is not None and aux_acc is not None:
         aux_acc = {**aux_acc, "weight_sum": weight_sum}
     return loss_acc, grad_acc, aux_acc
 
@@ -2537,6 +2883,7 @@ def _compile_scheduled_training_step(
     batch_argnums: int | tp.Sequence[int] | None,
     static_argnums: int | tp.Sequence[int] | None,
     adapter: ScheduledLossAdapter,
+    jit_kwargs: dict[str, tp.Any] | None = None,
 ) -> tp.Callable[..., tp.Any]:
     """Build the scheduled-VJP version of a registered trainer step.
 
@@ -2572,6 +2919,7 @@ def _compile_scheduled_training_step(
         schedule=schedule,
         batch_argnums=batch_argnums,
         adapter=adapter,
+        jit_kwargs=dict(jit_kwargs or {}),
     )
 
     def scheduled_training_step(
@@ -2951,7 +3299,11 @@ def accumulate_microbatch(
     else:
         weight = jnp.asarray(microbatch_weight_fn(graphstate, minibatch), jnp.float32).reshape(())
     (_, step_metrics), step_grads = grad_fn(graphstate, minibatch)
-    grads = jax.tree_util.tree_map(lambda a, g: a + g.astype(jnp.float32) * weight, accumulator["grads"], step_grads)
+    grads = jax.tree_util.tree_map(
+        lambda a, g: a + jnp.where(weight > 0, g.astype(jnp.float32) * weight, jnp.float32(0.0)),
+        accumulator["grads"],
+        step_grads,
+    )
     new_acc = {"grads": grads, "weight": accumulator["weight"] + weight, "count": accumulator["count"] + 1}
     return new_acc, step_metrics, weight
 
@@ -2968,11 +3320,15 @@ def fold_microbatch_metrics(acc_metrics: tp.Any, step_metrics: tp.Any, weight: j
         The updated fold.
     """
     weight = jnp.asarray(weight, jnp.float32)
+
+    def _weighted_metric(s: tp.Any) -> jax.Array:
+        return jnp.where(weight > 0, jnp.asarray(s, jnp.float32) * weight, jnp.float32(0.0))
+
     if acc_metrics is None:
-        out = jax.tree_util.tree_map(lambda s: jnp.asarray(s, jnp.float32) * weight, step_metrics)
+        out = jax.tree_util.tree_map(_weighted_metric, step_metrics)
         prev_weight_sum = jnp.zeros((), jnp.float32)
     else:
-        out = jax.tree_util.tree_map(lambda a, s: a + jnp.asarray(s, jnp.float32) * weight, acc_metrics, step_metrics)
+        out = jax.tree_util.tree_map(lambda a, s: a + _weighted_metric(s), acc_metrics, step_metrics)
         prev_weight_sum = getattr(acc_metrics, "weight_sum", None)
     if isinstance(step_metrics, LossMetrics) and step_metrics.weight_sum is not None:
         out = out.replace(weight_sum=prev_weight_sum + jnp.asarray(step_metrics.weight_sum, jnp.float32))
@@ -3070,9 +3426,18 @@ def minibatch_call(
             shape_minibatch,
         )
 
+        def _fp32_zeros(x):
+            """Zero accumulator in fp32 for floating/inexact leaves to prevent low-precision swamping."""
+            dtype = jnp.float32 if jnp.issubdtype(x.dtype, jnp.inexact) else x.dtype
+            return jnp.zeros(x.shape, dtype)
+
+        def _metric_zeros(x):
+            """Zero accumulator in fp32 so weighted or uniform means never truncate."""
+            return jnp.zeros(x.shape, jnp.float32)
+
         init_acc = {
-            "grads": jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shape),
-            "metrics": jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape),
+            "grads": jax.tree_util.tree_map(_fp32_zeros, grads_shape),
+            "metrics": jax.tree_util.tree_map(_metric_zeros, metrics_shape),
         }
         # LossMetrics.weight_sum is an additive token counter, not an intensive
         # metric. Keep a separate accumulator so neither mean reduction can
@@ -3086,12 +3451,14 @@ def minibatch_call(
         if microbatch_weight_fn is None:
 
             def accumulate_gradients(acc, start_index):
-                """Accumulate gradients and metrics for each minibatch."""
+                """Accumulate gradients (in fp32) and metrics for each minibatch."""
                 minibatch = slice_minibatch(batch, start_index)
                 (_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
                 new_acc = {
-                    "grads": jax.tree_util.tree_map(jnp.add, acc["grads"], step_grads),
-                    "metrics": jax.tree_util.tree_map(jnp.add, acc["metrics"], step_aux),
+                    "grads": jax.tree_util.tree_map(lambda a, g: a + g.astype(a.dtype), acc["grads"], step_grads),
+                    "metrics": jax.tree_util.tree_map(
+                        lambda a, m: a + jnp.asarray(m, jnp.float32), acc["metrics"], step_aux
+                    ),
                 }
                 if has_weight_sum:
                     new_acc["weight_sum"] = acc["weight_sum"] + jnp.asarray(step_aux.weight_sum, jnp.float32)
@@ -3103,41 +3470,52 @@ def minibatch_call(
                 start_indices,
                 length=num_accum_steps,
             )
-            gradients = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["grads"])
-            metrics = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["metrics"])
+            gradients = jax.tree_util.tree_map(
+                lambda x, s: (x / num_accum_steps).astype(s.dtype), final_acc["grads"], grads_shape
+            )
+            metrics = jax.tree_util.tree_map(
+                lambda x, s: (
+                    (x / num_accum_steps).astype(s.dtype)
+                    if jnp.issubdtype(s.dtype, jnp.inexact)
+                    else (x / num_accum_steps)
+                ),
+                final_acc["metrics"],
+                metrics_shape,
+            )
         else:
             # Normalized per-microbatch weights w_i / sum(w), computed up front so the scan
-            # accumulates the final weighted mean directly (scale factors stay in [0, 1]).
+            # accumulates the final weighted mean in fp32. Zero-weight microbatches are
+            # gated before multiplication so NaN/Inf on empty chunks cannot poison the step,
+            # and all-zero batches return zeros (matching execution-mode ``finalize_accumulation``).
             raw_weights = jax.lax.map(
                 lambda s: jnp.asarray(
                     microbatch_weight_fn(state.graphstate, slice_minibatch(batch, s)), jnp.float32
                 ).reshape(()),
                 start_indices,
             )
-            total_weight = jnp.sum(raw_weights)
+            total_weight = jnp.sum(jnp.where(raw_weights > 0, raw_weights, jnp.float32(0.0)))
             safe_total = jnp.where(total_weight > 0, total_weight, jnp.float32(1.0))
-            scales = jnp.where(total_weight > 0, raw_weights / safe_total, jnp.float32(1.0 / num_accum_steps))
+            scales = jnp.where(
+                total_weight > 0,
+                jnp.where(raw_weights > 0, raw_weights / safe_total, jnp.float32(0.0)),
+                jnp.float32(0.0),
+            )
 
-            def _scale(x, w):
-                """Scale one leaf by ``w`` (computed in float32, cast back to the leaf dtype)."""
-                return (x * w).astype(x.dtype)
-
-            def _float_zeros(x):
-                """Zero accumulator; non-float leaves accumulate in float32 so weighting cannot truncate."""
-                dtype = x.dtype if jnp.issubdtype(x.dtype, jnp.inexact) else jnp.float32
-                return jnp.zeros(x.shape, dtype)
-
-            init_acc["metrics"] = jax.tree_util.tree_map(_float_zeros, metrics_shape)
+            def _weighted_add(a, x, w):
+                x_cast = jnp.asarray(x, a.dtype)
+                return a + jnp.where(w > 0, x_cast * w.astype(a.dtype), jnp.zeros((), a.dtype))
 
             def accumulate_weighted(acc, xs):
-                """Accumulate ``scale_i * (grads_i, metrics_i)`` for one minibatch."""
+                """Accumulate ``scale_i * (grads_i, metrics_i)`` in fp32 for one minibatch."""
                 start_index, scale = xs
                 minibatch = slice_minibatch(batch, start_index)
                 (_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
                 new_acc = {
-                    "grads": jax.tree_util.tree_map(lambda a, g: a + _scale(g, scale), acc["grads"], step_grads),
+                    "grads": jax.tree_util.tree_map(
+                        lambda a, g: _weighted_add(a, g, scale), acc["grads"], step_grads
+                    ),
                     "metrics": jax.tree_util.tree_map(
-                        lambda a, m: a + (m * scale).astype(a.dtype), acc["metrics"], step_aux
+                        lambda a, m: _weighted_add(a, m, scale), acc["metrics"], step_aux
                     ),
                 }
                 if has_weight_sum:
@@ -3150,8 +3528,12 @@ def minibatch_call(
                 (start_indices, scales),
                 length=num_accum_steps,
             )
-            gradients = final_acc["grads"]
-            metrics = final_acc["metrics"]
+            gradients = jax.tree_util.tree_map(lambda g, s: g.astype(s.dtype), final_acc["grads"], grads_shape)
+            metrics = jax.tree_util.tree_map(
+                lambda m, s: m.astype(s.dtype) if jnp.issubdtype(s.dtype, jnp.inexact) else m,
+                final_acc["metrics"],
+                metrics_shape,
+            )
 
         if has_weight_sum:
             metrics = metrics.replace(weight_sum=final_acc["weight_sum"])

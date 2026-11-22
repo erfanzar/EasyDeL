@@ -75,6 +75,15 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
+def _selector_matching_graphstate(reference_graphstate: tp.Any) -> tp.Any:
+    """Return a SpectraX selector predicate matching ``reference_graphstate``'s exact leaves."""
+    paths_fn = getattr(reference_graphstate, "paths", None)
+    if not callable(paths_fn):
+        return None
+    selected = frozenset(paths_fn())
+    return lambda variable, path: (getattr(variable, "kind", None), path) in selected
+
 AUTO_LOGITS_CHUNK_SIZE = 4096
 """Largest ``logits_chunk_size`` the trainer sets on a tensor-parallel mesh when the config leaves it ``None``.
 
@@ -238,6 +247,7 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
                 teacher_model = disable_state_dropout(teacher_model)
 
         self.teacher_state = None if teacher_model is None else drop_optimizer_state(teacher_model)
+        self._configure_distillation_model_configs(student_state=student_model, teacher_state=self.teacher_state)
         self._teacher_cache_reader = None
         if teacher_cached:
             from easydel.data.teacher_cache import TeacherCacheReader
@@ -295,6 +305,78 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
             raise ValueError("`teacher_model` must be provided for distillation.")
         return teacher_model
 
+    def _configure_distillation_model_configs(
+        self,
+        *,
+        student_state: EasyDeLState | None = None,
+        teacher_state: EasyDeLState | None = None,
+    ) -> None:
+        """Apply distillation config mutations before bucket/eval graphdef deep-copies.
+
+        Freezes ``mtp_loss_coef`` when ``mtp_distillation=False`` and enables TP>1
+        auto ``logits_chunk_size`` / ``lmhead_chunksize`` defaults so bucket and
+        ``eval_config_overrides`` graphdefs inherit the exact same config as the
+        primary compiled step. Safe to invoke idempotently from both ``__init__``
+        and ``configure_functions``.
+        """
+        student_model = getattr(student_state, "model", None) if student_state is not None else getattr(self, "model", None)
+        if student_model is None:
+            return
+        t_state = self.teacher_state if teacher_state is None else teacher_state
+        mesh = getattr(student_model, "mesh", None)
+        student_cfg = getattr(student_model, "config", None)
+
+        if not bool(self.arguments.mtp_distillation) and student_cfg is not None:
+            _froze_mtp = False
+            for _cfg in (student_cfg, getattr(student_cfg, "text_config", None)):
+                if _cfg is not None and float(getattr(_cfg, "mtp_loss_coef", 0.0) or 0.0) > 0.0:
+                    _cfg.mtp_loss_coef = 0.0
+                    _froze_mtp = True
+            if _froze_mtp:
+                logger.debug(
+                    "`mtp_distillation=False` -> froze the student MTP head (mtp_loss_coef=0); "
+                    "no MTP loss is trained or distilled."
+                )
+
+        try:
+            _tp_size = int(mesh.shape["tp"]) if (mesh is not None and "tp" in getattr(mesh, "axis_names", ())) else 1
+        except Exception:
+            _tp_size = 1
+        if _tp_size > 1:
+            _adv_vocab = (
+                self.arguments.beta is not None
+                or self.arguments.cakld_gamma is not None
+                or int(self.arguments.loss_top_k or 0) > 0
+                or bool(self.arguments.loss_add_tail)
+            )
+            _seq_len = int(getattr(self.arguments, "max_length", None) or 0)
+            if (
+                self.arguments.logits_chunk_size is None
+                and _seq_len > 0
+                and not bool(self.arguments.mtp_distillation)
+                and not _adv_vocab
+            ):
+                self.arguments.logits_chunk_size = auto_logits_chunk_size(_seq_len)
+                logger.info(
+                    "Auto-enabled column-parallel distillation KL (logits_chunk_size=%d) on a TP=%d mesh.",
+                    self.arguments.logits_chunk_size,
+                    _tp_size,
+                )
+            if student_cfg is not None and getattr(student_cfg, "lmhead_chunksize", None) is None:
+                _lh = min(_seq_len, 2048) if _seq_len > 0 else 2048
+                try:
+                    student_cfg.lmhead_chunksize = _lh
+                    _t_model = getattr(t_state, "model", None)
+                    if _t_model is not None and getattr(_t_model.config, "lmhead_chunksize", None) is None:
+                        _t_model.config.lmhead_chunksize = _lh
+                    logger.debug(
+                        "Auto-enabled chunked+checkpointed LM-head/MTP projection (lmhead_chunksize=%d) on a TP=%d mesh.",
+                        _lh,
+                        _tp_size,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not auto-set lmhead_chunksize: %s", exc)
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Build the JIT-compiled distillation training/evaluation step functions.
 
@@ -334,72 +416,7 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
             gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
         )
         mesh = self.model.mesh
-
-        # Master MTP switch. A checkpoint that ships an MTP head keeps training it via the student's
-        # self-supervised MTP cross-entropy, which the model folds into ``outputs.aux_loss`` (gated by
-        # ``mtp_loss_coef``) and the step adds unconditionally -- independent of the trainer's MTP-KD term.
-        # So when MTP distillation is OFF, freeze the head (``mtp_loss_coef=0``) so ``mtp_distillation=False``
-        # means *no* MTP loss at all. (``mtp_distillation=True`` leaves ``mtp_loss_coef`` untouched; pair it
-        # with ``mtp_kd_weight=0`` if you want the self-supervised MTP CE WITHOUT the soft-KD term.) The MoE
-        # router aux loss is added separately and is unaffected. ``text_config`` covers the VLM student,
-        # whose MTP head lives on the inner text model.
-        if not bool(self.arguments.mtp_distillation):
-            _froze_mtp = False
-            for _cfg in (self.model.config, getattr(self.model.config, "text_config", None)):
-                if _cfg is not None and float(getattr(_cfg, "mtp_loss_coef", 0.0) or 0.0) > 0.0:
-                    _cfg.mtp_loss_coef = 0.0
-                    _froze_mtp = True
-            if _froze_mtp:
-                logger.debug(
-                    "`mtp_distillation=False` -> froze the student MTP head (mtp_loss_coef=0); "
-                    "no MTP loss is trained or distilled."
-                )
-
-        # Zero-config large-vocab fit on a tensor-parallel mesh: enable the memory-safe LM-head paths
-        # automatically (explicit user values are always preserved). On TP>1 the row-parallel LM head
-        # otherwise materializes full ``[B, S, V]`` logits -- the distillation-KL and MTP-aux OOM:
-        #   * ``logits_chunk_size`` -> chunks of at most ``AUTO_LOGITS_CHUNK_SIZE`` tokens through the
-        #     COLUMN-PARALLEL projection so the distillation KL never all-reduces the full vocabulary;
-        #   * ``lmhead_chunksize``  -> chunk + ``jax.checkpoint`` the LM-head / MTP-aux projection so the
-        #     vocab-sized logits are recomputed in the backward instead of held as residuals.
-        try:
-            _tp_size = int(mesh.shape["tp"]) if (mesh is not None and "tp" in getattr(mesh, "axis_names", ())) else 1
-        except Exception:
-            _tp_size = 1
-        if _tp_size > 1:
-            _adv_vocab = (
-                self.arguments.beta is not None
-                or self.arguments.cakld_gamma is not None
-                or int(self.arguments.loss_top_k or 0) > 0
-                or bool(self.arguments.loss_add_tail)
-            )
-            _seq_len = int(getattr(self.arguments, "max_length", None) or 0)
-            if (
-                self.arguments.logits_chunk_size is None
-                and _seq_len > 0
-                and not bool(self.arguments.mtp_distillation)
-                and not _adv_vocab
-            ):
-                self.arguments.logits_chunk_size = auto_logits_chunk_size(_seq_len)
-                logger.info(
-                    "Auto-enabled column-parallel distillation KL (logits_chunk_size=%d) on a TP=%d mesh.",
-                    self.arguments.logits_chunk_size,
-                    _tp_size,
-                )
-            if getattr(self.model.config, "lmhead_chunksize", None) is None:
-                _lh = min(_seq_len, 2048) if _seq_len > 0 else 2048
-                try:
-                    self.model.config.lmhead_chunksize = _lh
-                    _t_model = getattr(self.teacher_state, "model", None)
-                    if _t_model is not None and getattr(_t_model.config, "lmhead_chunksize", None) is None:
-                        _t_model.config.lmhead_chunksize = _lh
-                    logger.debug(
-                        "Auto-enabled chunked+checkpointed LM-head/MTP projection (lmhead_chunksize=%d) on a TP=%d mesh.",
-                        _lh,
-                        _tp_size,
-                    )
-                except Exception as exc:
-                    logger.warning("Could not auto-set lmhead_chunksize: %s", exc)
+        self._configure_distillation_model_configs()
 
         empty_sharding = replicated_named_sharding(mesh)
 
@@ -739,12 +756,18 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
         Raises:
             ValueError: When the batch carries no dataset attribution or a supervised token has no group.
         """
-        input_ids = np.asarray(batch.get("input_ids", batch.get("inputs_embeds")))
+        raw_ids = batch.get("input_ids")
+        if raw_ids is None:
+            raw_ids = batch.get("inputs_embeds")
+        input_ids = np.asarray(raw_ids)
         if token_ids is not None:
             dataset_ids = np.asarray(token_ids)
         elif row_ids is not None:
             rows = np.asarray(row_ids).reshape(-1).astype(np.int64)
             dataset_ids = np.repeat(rows[:, None], int(input_ids.shape[1]), axis=1)
+        elif not is_train:
+            # Evaluation splits are commonly single unattributed datasets; skip group weighting cleanly.
+            return batch
         else:
             raise ValueError(
                 "`loss_group_weights` is set but the batch carries no dataset attribution (per-token "
@@ -874,13 +897,14 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
         """
         super()._configure_eval_config_override()
         self._eval_teacher_state = None
-        if self._eval_graphdef is None or self.teacher_state is None:
+        overrides = getattr(self.arguments, "eval_config_overrides", None)
+        if self._eval_graphdef is None or not overrides or self.teacher_state is None:
             return
         teacher_graphdef = self._build_config_override_graphdef(
             model=self.teacher_state.model,
-            overrides=self.arguments.eval_config_overrides,
+            overrides=overrides,
             reference_graphstate=self.teacher_state.graphstate,
-            trainable_selector=None,
+            trainable_selector=_selector_matching_graphstate(self.teacher_state.graphstate),
             label="eval_config_overrides (teacher)",
             eval_mode=True,
         )
@@ -890,6 +914,34 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
     # Without these overrides, buckets compiled the BASE Trainer's
     # `training_step` (plain LM loss) — a bucketed distillation run would
     # silently train without the teacher.
+
+    def _configure_buckets(self):
+        """Extend bucket setup with per-bucket teacher graphdefs when overrides are active."""
+        super()._configure_buckets()
+        self._bucket_teacher_states: list[EasyDeLState | None] = []
+        if not getattr(self, "_buckets", None) or self.teacher_state is None:
+            return
+        teacher_selector = _selector_matching_graphstate(self.teacher_state.graphstate)
+        for idx, bucket in enumerate(self._buckets):
+            bucket_cfg = getattr(bucket, "config", None)
+            if isinstance(bucket_cfg, dict) and bucket_cfg:
+                teacher_gdef = self._build_config_override_graphdef(
+                    model=self.teacher_state.model,
+                    overrides=bucket_cfg,
+                    reference_graphstate=self.teacher_state.graphstate,
+                    trainable_selector=teacher_selector,
+                    label=f"bucket[{idx}].config (teacher)",
+                    eval_mode=True,
+                )
+                self._bucket_teacher_states.append(self.teacher_state.replace(graphdef=teacher_gdef))
+            else:
+                self._bucket_teacher_states.append(self.teacher_state)
+
+    def _bucket_teacher_state(self, i: int) -> EasyDeLState | None:
+        bucket_teachers = getattr(self, "_bucket_teacher_states", None)
+        if bucket_teachers and i < len(bucket_teachers):
+            return bucket_teachers[i]
+        return self.teacher_state
 
     def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
         """Per-bucket ``(extra, static)`` args for the compiled distillation step.
@@ -908,13 +960,17 @@ class DistillationTrainer(AssistantOnlyMaskMixin, Trainer):
             static[2] = bucket.step_partition_spec
         if bucket.gradient_accumulation_steps is not None:
             static[3] = bucket.gradient_accumulation_steps
-        return (self.teacher_state,), tuple(static)
+        return (self._bucket_teacher_state(i),), tuple(static)
 
     def _bucket_step_compile_kwargs(self, i: int) -> dict:
         """Extend the base compile kwargs with the teacher-state input sharding."""
         kwargs = super()._bucket_step_compile_kwargs(i)
         state_shardings, empty_sharding = kwargs["in_shardings"]
-        kwargs["in_shardings"] = (state_shardings, empty_sharding, self._teacher_in_shardings())
+        kwargs["in_shardings"] = (
+            state_shardings,
+            empty_sharding,
+            self._teacher_in_shardings(self._bucket_teacher_state(i)),
+        )
         return kwargs
 
     def _compile_one_bucket_step(self, i: int):

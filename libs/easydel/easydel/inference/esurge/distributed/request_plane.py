@@ -177,6 +177,7 @@ class _CoalesceEntry:
         "log",
         "scheduled_parent",
         "scheduler_finished",
+        "seen_identities",
         "subscribers",
         "suffixes",
     )
@@ -187,6 +188,7 @@ class _CoalesceEntry:
         self.suffixes = suffixes
         self.local_direct = local_direct
         self.subscribers: dict[tuple[bytes | None, str], bool] = {}
+        self.seen_identities: set[bytes | None] = set()
         self.log: dict[str, list[EngineCoreOutput]] = {suffix: [] for suffix in suffixes}
         self.finished_suffixes: set[str] = set()
         self.scheduler_finished: set[str] = set()
@@ -264,6 +266,7 @@ class OwnerRequestPlane:
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._out_seq = 0
+        self._peer_out_seq: dict[bytes, int] = {}
         self._lock = threading.RLock()
 
         # non-coalescable remote requests
@@ -297,6 +300,8 @@ class OwnerRequestPlane:
         }
 
         coordinator.set_plane_handler(self.handle_inbound)
+        if hasattr(coordinator, "set_client_evict_handler"):
+            coordinator.set_client_evict_handler(self.handle_client_evicted)
 
     def ensure_started(self) -> None:
         """Start the ingest thread (idempotent; safe across engine restarts)."""
@@ -333,11 +338,18 @@ class OwnerRequestPlane:
             self._by_counter.clear()
             self._scheduled_children.clear()
             self._subscriber_children.clear()
+            self._local_coalesce_counter = itertools.count(1)
+            self._peer_out_seq.clear()
+            self._out_seq = 0
             self.needs_tee = False
 
     def handle_inbound(self, identity: bytes, message: wire.WireMessage, payload: bytes | None) -> None:
         """Coordinator IO-thread handoff for plane wire messages."""
         self._queue.put(("wire", identity, message, payload))
+
+    def handle_client_evicted(self, identity: bytes) -> None:
+        """Coordinator IO-thread handoff when a silent or replaced client is evicted."""
+        self._queue.put(("client_evicted", identity, None, None))
 
     def tee_outputs(self, engine_outputs) -> None:
         """Engine-loop handoff: fan this step's outputs back to subscribers.
@@ -374,61 +386,83 @@ class OwnerRequestPlane:
 
         to_schedule: list[AdmissionRecord] = []
         created_entries: list[_CoalesceEntry] = []
+        attached_entries: list[tuple[_CoalesceEntry, str, bool]] = []
+        pending_replays: list[tuple[list[EngineCoreOutput], set[str] | None]] = []
         with self._lock:
-            for parent_id, requests in _group_by_parent(scheduler_requests):
-                if not _is_coalescable_id(parent_id):
-                    to_schedule.extend(requests)
-                    continue
-                counter = next(self._local_coalesce_counter)
-                content_hash = compute_admission_key(
-                    requests[0].prompt_token_ids, requests[0].sampling_params, len(requests)
+            try:
+                for parent_id, requests in _group_by_parent(scheduler_requests):
+                    if not _is_coalescable_id(parent_id):
+                        to_schedule.extend(requests)
+                        continue
+                    counter = next(self._local_coalesce_counter)
+                    content_hash = compute_admission_key(
+                        requests[0].prompt_token_ids, requests[0].sampling_params, len(requests)
+                    )
+                    entry = self._lookup_entry(counter, content_hash, origin="owner-local")
+                    if entry is None:
+                        suffixes = [request.request_id[len(parent_id) :] for request in requests]
+                        entry = self._create_entry((counter, content_hash), parent_id, suffixes, local_direct=True)
+                        self._attach(entry, _LOCAL, parent_id, direct=True)
+                        for request in requests:
+                            self._scheduled_children[request.request_id] = (
+                                entry,
+                                request.request_id[len(parent_id) :],
+                            )
+                        to_schedule.extend(requests)
+                        created_entries.append(entry)
+                        self.stats["scheduled_groups"] += 1
+                    else:
+                        was_seen = _LOCAL in entry.seen_identities
+                        self._attach(entry, _LOCAL, parent_id, direct=False)
+                        attached_entries.append((entry, parent_id, was_seen))
+                        outputs, finished = entry.build_replay(parent_id)
+                        if outputs or finished:
+                            pending_replays.append((outputs, finished))
+                            self.stats["replayed_attaches"] += 1
+                        self.stats["coalesced_attaches"] += 1
+            except BaseException:
+                for entry in created_entries:
+                    self._retire_entry(entry)
+                for entry, parent_id, was_seen in attached_entries:
+                    self._detach(entry, _LOCAL, parent_id)
+                    if not was_seen:
+                        entry.seen_identities.discard(_LOCAL)
+                raise
+            # Submitted while holding the lock: a concurrent tee
+            # fanning newer tokens to this subscriber serializes
+            # behind the attach, so the pipeline sees the catch-up
+            # replay strictly before any later delta.
+            for outputs, finished in pending_replays:
+                self._submit_local_outputs(
+                    {
+                        0: EngineCoreOutputs(
+                            outputs=outputs,
+                            timestamp=time.perf_counter(),
+                            finished_requests=finished,
+                        )
+                    }
                 )
-                entry = self._lookup_entry(counter, content_hash, origin="owner-local")
-                if entry is None:
-                    suffixes = [request.request_id[len(parent_id) :] for request in requests]
-                    entry = self._create_entry((counter, content_hash), parent_id, suffixes, local_direct=True)
-                    self._attach(entry, _LOCAL, parent_id, direct=True)
-                    for request in requests:
-                        self._scheduled_children[request.request_id] = (
-                            entry,
-                            request.request_id[len(parent_id) :],
-                        )
-                    to_schedule.extend(requests)
-                    created_entries.append(entry)
-                    self.stats["scheduled_groups"] += 1
-                else:
-                    self._attach(entry, _LOCAL, parent_id, direct=False)
-                    outputs, finished = entry.build_replay(parent_id)
-                    # Submitted while holding the lock: a concurrent tee
-                    # fanning newer tokens to this subscriber serializes
-                    # behind the attach, so the pipeline sees the catch-up
-                    # replay strictly before any later delta.
-                    if outputs or finished:
-                        self._submit_local_outputs(
-                            {
-                                0: EngineCoreOutputs(
-                                    outputs=outputs,
-                                    timestamp=time.perf_counter(),
-                                    finished_requests=finished,
-                                )
-                            }
-                        )
-                        self.stats["replayed_attaches"] += 1
-                    self.stats["coalesced_attaches"] += 1
         if to_schedule:
             try:
                 self._scheduler_submit(to_schedule)
-            except Exception:
+            except BaseException:
                 with self._lock:
                     for entry in created_entries:
                         self._retire_entry(entry)
+                    for entry, parent_id, was_seen in attached_entries:
+                        self._detach(entry, _LOCAL, parent_id)
+                        if not was_seen:
+                            entry.seen_identities.discard(_LOCAL)
                 raise
 
     def translate_local_stop_hits(self, stop_string_finishes: dict[str, str]) -> dict[str, str]:
         """Map owner-local sample ids onto scheduled ids where a group renamed them.
 
         ``local_direct`` groups and untracked requests pass through
-        unchanged (their scheduler ids are the local ids).
+        unchanged (their scheduler ids are the local ids). For coalesced
+        groups, also schedules finish propagation on the ingest queue so
+        coalesce entries and remote subscribers retire cleanly even when
+        ``include_finished_set=False``.
 
         Args:
             stop_string_finishes: ``{sample_request_id: matched_stop}`` from
@@ -437,6 +471,7 @@ class OwnerRequestPlane:
         Returns:
             The same hits keyed by scheduler-resolvable ids.
         """
+        coalesced_finished: list[str] = []
         with self._lock:
             if not self._subscriber_children:
                 return stop_string_finishes
@@ -445,47 +480,126 @@ class OwnerRequestPlane:
                 mapped = self._subscriber_children.get((_LOCAL, request_id))
                 if mapped is not None:
                     entry, suffix, _parent = mapped
-                    translated[entry.scheduled_parent + suffix] = stop_string
+                    scheduled_id = entry.scheduled_parent + suffix
+                    translated[scheduled_id] = stop_string
+                    coalesced_finished.append(scheduled_id)
                 else:
                     translated[request_id] = stop_string
-            return translated
+        if coalesced_finished:
+            self._enqueue_coalesced_finished(_LOCAL, coalesced_finished)
+        return translated
+
+    def _enqueue_coalesced_finished(self, source_identity: bytes | None, scheduled_ids: list[str]) -> None:
+        """Schedule coalesced suffix finish propagation strictly after prior queued outputs."""
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            self._queue.put(("coalesced_finished", source_identity, list(scheduled_ids), None))
+        else:
+            self._handle_coalesced_finished(source_identity, scheduled_ids)
+
+    def _abort_coalesced_locked(self, identity: bytes | None, request_id: str) -> tuple[list[str], list[str]]:
+        """Detach one subscriber (or sample) from its coalesced group.
+
+        Caller must hold ``self._lock``. Handles both parent-level aborts
+        (all ``n`` children of the subscriber) and per-sample child aborts,
+        removing the subscriber from ``entry.subscribers`` as soon as its last
+        sample child disappears, retiring the whole group once no subscribers
+        remain, and aborting any individual scheduled suffix no remaining
+        subscriber still wants.
+
+        Returns:
+            ``(scheduled_aborts, local_direct_finished)`` where
+            ``scheduled_aborts`` are scheduled ids that the plane must abort on
+            the engine, and ``local_direct_finished`` are ``local_direct``
+            scheduled child ids whose rows the engine's local abort is already
+            killing directly and whose finish must be propagated to remaining
+            subscribers.
+        """
+        matched_keys = [
+            key
+            for key, (_entry, _suffix, parent_id) in self._subscriber_children.items()
+            if key[0] == identity and (key[1] == request_id or parent_id == request_id)
+        ]
+        if not matched_keys:
+            return [], []
+
+        by_entry: dict[int, tuple[_CoalesceEntry, str, list[str]]] = {}
+        for key in matched_keys:
+            mapped = self._subscriber_children.get(key)
+            if mapped is None:
+                continue
+            entry, suffix, parent_id = mapped
+            eid = id(entry)
+            if eid not in by_entry:
+                by_entry[eid] = (entry, parent_id, [suffix])
+            else:
+                by_entry[eid][2].append(suffix)
+
+        scheduled_aborts: list[str] = []
+        local_direct_finished: list[str] = []
+        for entry, parent_id, popped_suffixes in by_entry.values():
+            for suffix in popped_suffixes:
+                self._subscriber_children.pop((identity, parent_id + suffix), None)
+            has_remaining_for_subscriber = any(
+                (identity, parent_id + suffix) in self._subscriber_children for suffix in entry.suffixes
+            )
+            if not has_remaining_for_subscriber:
+                entry.subscribers.pop((identity, parent_id), None)
+
+            if identity is _LOCAL and entry.local_direct:
+                # The engine's local abort kills the scheduled rows directly
+                # (avoid recursive self._abort_request calls), so we detach
+                # _LOCAL here and either retire the unshared group or propagate
+                # finish signals to surviving subscribers.
+                if not entry.subscribers:
+                    if not entry.all_finished or len(entry.seen_identities) >= self._world_size:
+                        self._retire_entry(entry)
+                    continue
+                for suffix in popped_suffixes:
+                    if suffix not in entry.finished_suffixes and suffix not in entry.scheduler_finished:
+                        local_direct_finished.append(entry.scheduled_parent + suffix)
+                continue
+
+            if not entry.subscribers and not entry.all_finished:
+                # Last subscriber gone: tear the whole group down.
+                scheduled_aborts.append(entry.scheduled_parent)
+                self._retire_entry(entry)
+                continue
+            for suffix in popped_suffixes:
+                if (
+                    suffix not in entry.finished_suffixes
+                    and suffix not in entry.scheduler_finished
+                    and not any(
+                        value[0] is entry and value[1] == suffix for value in self._subscriber_children.values()
+                    )
+                ):
+                    # Subscribers remain, but none still wants this sample:
+                    # abort only its scheduled row so the survivors stream on.
+                    entry.scheduler_finished.add(suffix)
+                    if entry.all_finished and entry.finished_at is None:
+                        entry.finished_at = time.monotonic()
+                    scheduled_aborts.append(entry.scheduled_parent + suffix)
+        return scheduled_aborts, local_direct_finished
 
     def notify_local_abort(self, request_id: str) -> None:
         """Owner-local abort hook: detach the local subscriber from its group.
 
         For a ``local_direct`` group the scheduled rows are the caller's own
-        ids and the engine's normal abort tears them down (remote
-        subscribers observe the abort via scheduler-finish signals on the
-        tee). For a renamed (remote-first) group this detaches the local
-        subscriber only and aborts the scheduled rows when it was the last
-        one.
+        ids and the engine's normal abort tears them down; this detaches the
+        local subscriber, retires unshared entries immediately, and propagates
+        finish signals to any attached remote subscribers even when
+        ``include_finished_set=False``. For a renamed (remote-first) group
+        this detaches the local subscriber (or sample child) and aborts
+        orphaned scheduled rows.
 
         Args:
             request_id: Owner-local parent (or sample child) id.
         """
-        scheduled_abort: str | None = None
         with self._lock:
-            keys = [key for key in self._subscriber_children if key[0] is _LOCAL]
-            for key in keys:
-                mapped = self._subscriber_children.get(key)
-                if mapped is None:
-                    continue
-                entry, _suffix, parent_id = mapped
-                if key[1] != request_id and parent_id != request_id:
-                    continue
-                if entry.local_direct:
-                    # The engine abort will kill the scheduled rows itself;
-                    # scheduler-finish signals propagate to remote subscribers.
-                    continue
-                self._subscriber_children.pop(key, None)
-                # A sample-level abort keeps the subscriber attached for its
-                # remaining samples; a parent-level (or n=1) abort detaches it.
-                if parent_id == request_id or key[1] == parent_id:
-                    entry.subscribers.pop((_LOCAL, parent_id), None)
-                if not entry.subscribers and not entry.all_finished:
-                    scheduled_abort = entry.scheduled_parent
-                    self._retire_entry(entry)
-        if scheduled_abort is not None:
+            scheduled_aborts, local_direct_finished = self._abort_coalesced_locked(_LOCAL, request_id)
+        if local_direct_finished:
+            self._enqueue_coalesced_finished(_LOCAL, local_direct_finished)
+        for scheduled_abort in scheduled_aborts:
             self._abort_request(scheduled_abort)
 
     def _loop(self) -> None:
@@ -508,6 +622,10 @@ class OwnerRequestPlane:
                     self._dispatch_wire(identity, message, payload)
                 elif kind == "outputs":
                     self._fan_out(message)
+                elif kind == "client_evicted":
+                    self._handle_client_evicted(identity)
+                elif kind == "coalesced_finished":
+                    self._handle_coalesced_finished(identity, message)
             except Exception:
                 logger.exception("Request-plane ingest failed on %r", item[0] if isinstance(item, tuple) else item)
             finally:
@@ -545,6 +663,7 @@ class OwnerRequestPlane:
 
     def _attach(self, entry: _CoalesceEntry, identity: bytes | None, parent_id: str, *, direct: bool) -> None:
         entry.subscribers[(identity, parent_id)] = direct
+        entry.seen_identities.add(identity)
         for suffix in entry.suffixes:
             self._subscriber_children[(identity, parent_id + suffix)] = (entry, suffix, parent_id)
 
@@ -575,7 +694,7 @@ class OwnerRequestPlane:
             for entry in list(self._entries.values()):
                 if entry.finished_at is None:
                     continue
-                fully_attached = len(entry.subscribers) >= self._world_size
+                fully_attached = len(entry.seen_identities) >= self._world_size
                 if fully_attached or now - entry.finished_at > self._retention_s:
                     self._retire_entry(entry)
 
@@ -586,6 +705,10 @@ class OwnerRequestPlane:
                 raise RequestPlaneError("Admit carried no request payload")
             requests: list[AdmissionRecord] = wire.decode_payload(payload)
             origin_parent = admit.request_id
+            if admit.n_samples <= 0 or not requests:
+                raise RequestPlaneError(
+                    f"Admit for {origin_parent!r} must include at least one sample (n_samples={admit.n_samples})"
+                )
             if admit.n_samples != len(requests):
                 raise RequestPlaneError(
                     f"Admit for {origin_parent!r} declared n_samples={admit.n_samples} "
@@ -712,49 +835,8 @@ class OwnerRequestPlane:
                 self._retire(owner_id)
                 scheduled_aborts.append(owner_id)
             else:
-                # Coalescable abort. Subscriber children are keyed by
-                # ``parent + suffix``, so a bare parent id never matches a
-                # ``get`` on the raw id (``AUTO`` vs ``AUTO-0``). Mirror
-                # ``notify_local_abort``: the wire id is either a subscriber
-                # parent id (``AbortReq`` contract: aborts every ``n>1``
-                # child) or a subscriber sample-child id (aborts one sample).
-                request_id = message.request_id
-                matched_keys = [
-                    key
-                    for key, (_entry, _suffix, parent_id) in self._subscriber_children.items()
-                    if key[0] == identity and (key[1] == request_id or parent_id == request_id)
-                ]
-                for key in matched_keys:
-                    mapped = self._subscriber_children.get(key)
-                    if mapped is None:
-                        continue  # already retired while handling a sibling suffix
-                    entry, suffix, parent_id = mapped
-                    self._subscriber_children.pop(key, None)
-                    # A parent-level (or n=1) abort detaches the subscriber
-                    # entirely; a sample-level abort keeps it attached for its
-                    # remaining samples.
-                    if parent_id == request_id or key[1] == parent_id:
-                        entry.subscribers.pop((identity, parent_id), None)
-                    if not entry.subscribers and not entry.all_finished:
-                        # Last subscriber gone: tear the whole group down.
-                        scheduled_aborts.append(entry.scheduled_parent)
-                        self._retire_entry(entry)
-                    elif (
-                        suffix not in entry.finished_suffixes
-                        and suffix not in entry.scheduler_finished
-                        and not any(
-                            value[0] is entry and value[1] == suffix for value in self._subscriber_children.values()
-                        )
-                    ):
-                        # Subscribers remain, but none still wants this sample:
-                        # abort only its scheduled row so the survivors stream
-                        # on (the AbortReq contract is "a child id aborts one
-                        # sample"). Mark it finished so the group retires once
-                        # the rest terminate.
-                        entry.scheduler_finished.add(suffix)
-                        if entry.all_finished and entry.finished_at is None:
-                            entry.finished_at = time.monotonic()
-                        scheduled_aborts.append(entry.scheduled_parent + suffix)
+                aborts, _ = self._abort_coalesced_locked(identity, message.request_id)
+                scheduled_aborts.extend(aborts)
         for scheduled_abort in scheduled_aborts:
             try:
                 self._abort_request(scheduled_abort)
@@ -763,18 +845,115 @@ class OwnerRequestPlane:
 
     def _handle_stop_hit(self, identity: bytes, message: wire.StopHit) -> None:
         mapped: dict[str, str] = {}
+        coalesced_finished: list[str] = []
         with self._lock:
             for origin_id, stop_string in message.hits.items():
                 owner_id = self._origin_to_owner.get((identity, origin_id))
                 if owner_id is not None:
                     mapped[owner_id] = stop_string
+                    # Non-coalescable: the origin already finished this sample locally,
+                    # so retire owner-side routing state immediately regardless of
+                    # include_finished_set.
+                    self._retire(owner_id)
                     continue
                 subscribed = self._subscriber_children.get((identity, origin_id))
                 if subscribed is not None:
                     entry, suffix, _parent = subscribed
-                    mapped[entry.scheduled_parent + suffix] = stop_string
+                    scheduled_id = entry.scheduled_parent + suffix
+                    mapped[scheduled_id] = stop_string
+                    coalesced_finished.append(scheduled_id)
         if mapped:
             self._apply_stop_strings(mapped)
+        if coalesced_finished:
+            self._handle_coalesced_finished(identity, coalesced_finished)
+
+    def _handle_client_evicted(self, identity: bytes) -> None:
+        """Clean up routing state, sequence tracking, and orphaned requests for a dead client."""
+        scheduled_aborts: list[str] = []
+        with self._lock:
+            self._peer_out_seq.pop(identity, None)
+            orphan_parents = [
+                owner_parent
+                for owner_parent, (ident, _origin_parent) in list(self._parents.items())
+                if ident == identity
+            ]
+            for owner_parent in orphan_parents:
+                for child_id in list(self._children.get(owner_parent, ())):
+                    self._retire(child_id)
+                self._retire(owner_parent)
+                scheduled_aborts.append(owner_parent)
+            for owner_id, (ident, _origin_id) in list(self._owner_to_origin.items()):
+                if ident == identity:
+                    self._retire(owner_id)
+                    scheduled_aborts.append(owner_id)
+            coalesced_parents = {
+                parent_id
+                for (ident, _child_id), (_entry, _suffix, parent_id) in list(self._subscriber_children.items())
+                if ident == identity
+            }
+            for parent_id in coalesced_parents:
+                aborts, _ = self._abort_coalesced_locked(identity, parent_id)
+                scheduled_aborts.extend(aborts)
+        for scheduled_abort in scheduled_aborts:
+            try:
+                self._abort_request(scheduled_abort)
+            except Exception:
+                logger.exception("Request plane: client-eviction abort failed for %r", scheduled_abort)
+
+    def _handle_coalesced_finished(self, source_identity: bytes | None, scheduled_ids: list[str]) -> None:
+        """Mark coalesced suffixes scheduler-finished and notify surviving non-direct subscribers."""
+        if not scheduled_ids:
+            return
+        per_origin: dict[bytes, tuple[list[EngineCoreOutput], set[str]]] = {}
+        local_finished: set[str] = set()
+        retire_candidates: list[_CoalesceEntry] = []
+        with self._lock:
+            for scheduled_id in scheduled_ids:
+                coalesced = self._scheduled_children.get(scheduled_id)
+                if coalesced is None:
+                    continue
+                entry, suffix = coalesced
+                if suffix in entry.finished_suffixes or suffix in entry.scheduler_finished:
+                    continue
+                entry.scheduler_finished.add(suffix)
+                if entry.all_finished and entry.finished_at is None:
+                    entry.finished_at = time.monotonic()
+                for (identity, parent_id), direct in entry.subscribers.items():
+                    if direct or identity == source_identity:
+                        continue
+                    subscriber_id = parent_id + suffix
+                    if (identity, subscriber_id) not in self._subscriber_children:
+                        continue
+                    if identity is _LOCAL:
+                        local_finished.add(subscriber_id)
+                    else:
+                        _outputs, finished = per_origin.setdefault(identity, ([], set()))
+                        finished.add(subscriber_id)
+                if entry.all_finished and len(entry.seen_identities) >= self._world_size:
+                    retire_candidates.append(entry)
+            if local_finished:
+                self._submit_local_outputs(
+                    {
+                        0: EngineCoreOutputs(
+                            outputs=[],
+                            timestamp=time.perf_counter(),
+                            finished_requests=local_finished,
+                        )
+                    }
+                )
+            for entry in retire_candidates:
+                self._retire_entry(entry)
+
+        for identity, (outputs, finished) in per_origin.items():
+            with self._lock:
+                self._out_seq += 1
+                seq = self._peer_out_seq.get(identity, 0) + 1
+                self._peer_out_seq[identity] = seq
+            self._coordinator.send_to_peer(
+                identity,
+                wire.OutputUpdate(seq=seq),
+                wire.encode_payload((outputs, finished or None)),
+            )
 
     def _retire(self, owner_id: str) -> None:
         """Retire one owner child id; retire the group when its last child drains."""
@@ -823,10 +1002,13 @@ class OwnerRequestPlane:
                 )
 
         for identity, (outputs, finished) in per_origin.items():
-            self._out_seq += 1
+            with self._lock:
+                self._out_seq += 1
+                seq = self._peer_out_seq.get(identity, 0) + 1
+                self._peer_out_seq[identity] = seq
             self._coordinator.send_to_peer(
                 identity,
-                wire.OutputUpdate(seq=self._out_seq),
+                wire.OutputUpdate(seq=seq),
                 wire.encode_payload((outputs, finished or None)),
             )
 
@@ -859,6 +1041,8 @@ class OwnerRequestPlane:
             if direct:
                 continue  # local_direct caller renders straight from its registry
             subscriber_id = parent_id + suffix
+            if (identity, subscriber_id) not in self._subscriber_children:
+                continue  # this subscriber already aborted this sample
             if identity is _LOCAL:
                 local_outputs.append(_rename_output(engine_output, subscriber_id))
             else:
@@ -883,6 +1067,8 @@ class OwnerRequestPlane:
         if coalesced is None:
             return
         entry, suffix = coalesced
+        if suffix in entry.finished_suffixes or suffix in entry.scheduler_finished:
+            return
         entry.scheduler_finished.add(suffix)
         if entry.all_finished and entry.finished_at is None:
             entry.finished_at = time.monotonic()
@@ -890,6 +1076,8 @@ class OwnerRequestPlane:
             if direct:
                 continue
             subscriber_id = parent_id + suffix
+            if (identity, subscriber_id) not in self._subscriber_children:
+                continue  # this subscriber already aborted this sample
             if identity is _LOCAL:
                 local_finished.add(subscriber_id)
             else:
@@ -952,8 +1140,23 @@ class OriginRequestPlane:
         # Origin parent id -> live child count (drives id retirement).
         self._live_children: dict[str, int] = {}
         self._child_to_parent: dict[str, str] = {}
+        self._last_output_seq = 0
+        self.seq_gaps = 0
 
         coordinator.set_plane_handler(self._handle_inbound)
+
+    def reset(self) -> None:
+        """Reset origin-side counters and tracking maps (e.g. across weight hot-swaps)."""
+        self.fail_pending("request plane reset")
+        with self._lock:
+            self._counter = itertools.count(1)
+            self._coalesce_counter = itertools.count(1)
+            self._pending.clear()
+            self._remote_ids.clear()
+            self._live_children.clear()
+            self._child_to_parent.clear()
+            self._last_output_seq = 0
+            self.seq_gaps = 0
 
     def submit_remote(self, scheduler_requests: list[AdmissionRecord]) -> None:
         """Forward admission-built requests to the owner and await its acks.
@@ -1100,6 +1303,7 @@ class OriginRequestPlane:
             remote = {rid: s for rid, s in stop_string_finishes.items() if rid in self._remote_ids}
         if remote:
             self._coordinator.send_to_leader(wire.StopHit(hits=remote))
+            self._retire_origin_ids(remote.keys())
         return {rid: s for rid, s in stop_string_finishes.items() if rid not in remote}
 
     def fail_pending(self, reason: str) -> None:
@@ -1121,24 +1325,43 @@ class OriginRequestPlane:
             if slot is None:
                 # Timed-out/rolled-back admissions were already cancelled.
                 return
-            if message.ok and payload is not None:
-                # Coalesced catch-up replay: apply before releasing the
-                # admitting caller so it never observes a pre-replay gap.
-                outputs, finished = wire.decode_payload(payload)
-                self._track_finishes(outputs, finished)
-                self._submit_outputs(
-                    {
-                        0: EngineCoreOutputs(
-                            outputs=outputs,
-                            timestamp=time.perf_counter(),
-                            finished_requests=finished,
-                        )
-                    }
+            try:
+                if message.ok and payload is not None:
+                    # Coalesced catch-up replay: apply before releasing the
+                    # admitting caller so it never observes a pre-replay gap.
+                    outputs, finished = wire.decode_payload(payload)
+                    self._track_finishes(outputs, finished)
+                    self._submit_outputs(
+                        {
+                            0: EngineCoreOutputs(
+                                outputs=outputs,
+                                timestamp=time.perf_counter(),
+                                finished_requests=finished,
+                            )
+                        }
+                    )
+                slot.ack = message
+            except Exception as exc:
+                logger.exception("Request plane: failed to apply AdmitAck payload for %r", message.request_id)
+                slot.ack = wire.AdmitAck(
+                    request_id=message.request_id,
+                    ok=False,
+                    error=f"failed to decode/apply AdmitAck replay payload: {exc}",
                 )
-            slot.ack = message
-            slot.event.set()
+            finally:
+                slot.event.set()
             return
         if isinstance(message, wire.OutputUpdate):
+            if message.seq > 0:
+                with self._lock:
+                    if self._last_output_seq > 0 and message.seq != self._last_output_seq + 1:
+                        self.seq_gaps += 1
+                        logger.error(
+                            "Request plane: OutputUpdate seq gap detected (expected %d, got %d)",
+                            self._last_output_seq + 1,
+                            message.seq,
+                        )
+                    self._last_output_seq = message.seq
             if payload is None:
                 return
             outputs, finished = wire.decode_payload(payload)
@@ -1154,15 +1377,10 @@ class OriginRequestPlane:
             return
         logger.warning("Request plane: origin ignoring unexpected %s", type(message).__name__)
 
-    def _track_finishes(self, outputs: list[EngineCoreOutput], finished: set[str] | None) -> None:
-        """Retire origin-side ids as their terminal deltas arrive."""
-        done_ids = [out.request_id for out in outputs if out.finish_reason is not None]
-        if finished:
-            done_ids.extend(finished)
-        if not done_ids:
-            return
+    def _retire_origin_ids(self, request_ids: typing.Iterable[str]) -> None:
+        """Retire finished origin-side sample/parent ids from local tracking structures."""
         with self._lock:
-            for request_id in done_ids:
+            for request_id in request_ids:
                 if request_id not in self._remote_ids:
                     continue
                 self._remote_ids.discard(request_id)
@@ -1175,6 +1393,15 @@ class OriginRequestPlane:
                         self._remote_ids.discard(parent_id)
                     else:
                         self._live_children[parent_id] = live
+
+    def _track_finishes(self, outputs: list[EngineCoreOutput], finished: set[str] | None) -> None:
+        """Retire origin-side ids as their terminal deltas arrive."""
+        done_ids = [out.request_id for out in outputs if out.finish_reason is not None]
+        if finished:
+            done_ids.extend(finished)
+        if not done_ids:
+            return
+        self._retire_origin_ids(done_ids)
 
 
 def create_request_plane(

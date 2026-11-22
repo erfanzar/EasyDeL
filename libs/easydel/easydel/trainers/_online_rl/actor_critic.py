@@ -37,13 +37,20 @@ from .._logprob_utils import (
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
 )
-from .._shared.policy_losses import clipped_ppo_policy_loss, sao_policy_loss
+from .._shared.policy_losses import (
+    _MAX_SAFE_LOG_RATIO,
+    _MIN_SAFE_LOG_RATIO,
+    clipped_ppo_policy_loss,
+    sao_policy_loss,
+)
 from ..training_utils import (
     ScheduledLossAdapter,
     make_assertions_and_get_sizes,
+    make_scheduled_state_shell,
     minibatch_call,
     register_scheduled_loss_adapter,
     scheduled_loss_cache_key,
+    sync_module_schedule_config,
     update_metrics,
     update_state_respectfully,
 )
@@ -244,10 +251,7 @@ def _token_normalizer(
     global_count = minibatch.get("num_items_in_batch")
     if global_count is None:
         return jnp.maximum(local_count, 1.0)
-    return jnp.maximum(
-        global_count.astype(jnp.float32) / max(int(gradient_accumulation_steps), 1),
-        1.0,
-    )
+    return jnp.maximum(global_count.astype(jnp.float32), 1.0) / max(int(gradient_accumulation_steps), 1)
 
 
 def _masked_mean(value: jax.Array, mask: jax.Array) -> jax.Array:
@@ -280,10 +284,11 @@ def actor_step(
     critic regression is handled by :func:`critic_step`.
     """
     scope_root = f"easydel/trainer/{algorithm}/actor/" + ("train_step" if is_training else "eval_step")
+    effective_accum_steps = max(int(gradient_accumulation_steps), 1) if is_training else 1
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=effective_accum_steps,
             batch_partition_spec=partition_spec,
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
@@ -294,6 +299,7 @@ def actor_step(
             tree = straight_through_emulator(tree)
         module = state.merge(tree)
         action_mask = minibatch["action_mask"].astype(jnp.float32)
+        mask_bool = action_mask > 0.0
         behavior_logps = jax.lax.stop_gradient(minibatch["behavior_logps"].astype(jnp.float32))
         advantages = jax.lax.stop_gradient(minibatch["advantages"].astype(jnp.float32))
         current_logps, entropies = score_actor_tokens(
@@ -303,14 +309,20 @@ def actor_step(
             logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             return_entropy=entropy_coef > 0,
         )
-        log_ratio = current_logps - behavior_logps
-        ratio = jnp.exp(log_ratio)
+        log_ratio = (current_logps - behavior_logps).astype(jnp.float32)
+        safe_log_ratio = jnp.where(mask_bool, log_ratio, 0.0)
+        ratio = jnp.where(
+            mask_bool,
+            jnp.exp(jnp.clip(safe_log_ratio, _MIN_SAFE_LOG_RATIO, _MAX_SAFE_LOG_RATIO)),
+            0.0,
+        )
+        safe_advantages = jnp.where(mask_bool, advantages, 0.0)
 
         local_count = jnp.sum(action_mask)
         normalizer = _token_normalizer(
             minibatch,
             local_count,
-            gradient_accumulation_steps,
+            effective_accum_steps,
             use_global_normalizer,
         )
         if algorithm == "sao":
@@ -324,7 +336,7 @@ def actor_step(
                 normalizer=normalizer,
                 return_keep_mask=True,
             )
-            clip_fraction = 1.0 - _masked_mean(keep, action_mask)
+            clip_fraction = _masked_mean(1.0 - keep, action_mask)
         elif algorithm == "ppo":
             policy_loss, clip_fraction = clipped_ppo_policy_loss(
                 current_logps,
@@ -342,19 +354,20 @@ def actor_step(
         if entropies is None:
             entropy = jnp.asarray(0.0, dtype=jnp.float32)
         else:
-            entropy = jnp.sum(entropies * action_mask) / normalizer
+            entropy = jnp.sum(jnp.where(mask_bool, entropies.astype(jnp.float32), 0.0)) / normalizer
         loss = policy_loss - entropy_coef * entropy
-        approx_kl = 0.5 * _masked_mean(jnp.square(log_ratio), action_mask)
+        approx_kl = 0.5 * _masked_mean(jnp.square(safe_log_ratio), action_mask)
         metrics = LossMetrics(
             loss=loss,
             accuracy=jnp.asarray(1.0, dtype=jnp.float32),
+            weight_sum=local_count,
             other_metrics={
                 "actor/policy_loss": policy_loss,
                 "actor/entropy": entropy,
                 "actor/approx_kl": approx_kl,
                 "actor/clip_fraction": clip_fraction,
                 "actor/ratio_mean": _masked_mean(ratio, action_mask),
-                "actor/advantage_mean": _masked_mean(advantages, action_mask),
+                "actor/advantage_mean": _masked_mean(safe_advantages, action_mask),
                 "actor/action_tokens": local_count,
                 "actor/dis_keep_fraction": _masked_mean(keep, action_mask),
             },
@@ -371,6 +384,10 @@ def actor_step(
         minibatch_size=minibatch_size,
         grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
     )
+    if metrics.other_metrics is not None and metrics.weight_sum is not None:
+        other_metrics = dict(metrics.other_metrics)
+        other_metrics["actor/action_tokens"] = metrics.weight_sum
+        metrics = metrics.replace(other_metrics=other_metrics)
     state = update_state_respectfully(
         state=state,
         gradients=gradients,
@@ -398,10 +415,11 @@ def critic_step(
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Run one independently optimized critic regression update."""
     scope_root = "easydel/trainer/online_rl/critic/" + ("train_step" if is_training else "eval_step")
+    effective_accum_steps = max(int(gradient_accumulation_steps), 1) if is_training else 1
     with jax.named_scope(scope_root + "/prepare_batch"):
         _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
             batch=batch,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=effective_accum_steps,
             batch_partition_spec=partition_spec,
         )
         batch = with_sharding_constraint(batch, partition_spec, mesh=state.model.mesh, ignore_mpmd=True)
@@ -410,12 +428,17 @@ def critic_step(
         """Compute clipped value regression for one accumulation microbatch."""
         module = state.merge(tree)
         action_mask = minibatch["action_mask"].astype(jnp.float32)
-        old_values = jax.lax.stop_gradient(minibatch["old_values"].astype(jnp.float32))
-        returns = jax.lax.stop_gradient(minibatch["critic_returns"].astype(jnp.float32))
-        values = score_critic_values(
-            module,
-            minibatch["input_ids"],
-            minibatch["attention_mask"],
+        mask_bool = action_mask > 0.0
+        old_values = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["old_values"].astype(jnp.float32), 0.0))
+        returns = jax.lax.stop_gradient(jnp.where(mask_bool, minibatch["critic_returns"].astype(jnp.float32), 0.0))
+        values = jnp.where(
+            mask_bool,
+            score_critic_values(
+                module,
+                minibatch["input_ids"],
+                minibatch["attention_mask"],
+            ),
+            0.0,
         )
         clipped_values = old_values + jnp.clip(values - old_values, -cliprange_value, cliprange_value)
         losses = jnp.square(values - returns)
@@ -425,7 +448,7 @@ def critic_step(
         normalizer = _token_normalizer(
             minibatch,
             local_count,
-            gradient_accumulation_steps,
+            effective_accum_steps,
             use_global_normalizer,
         )
         value_loss = jnp.sum(per_token_loss * action_mask) / normalizer
@@ -438,6 +461,7 @@ def critic_step(
         metrics = LossMetrics(
             loss=value_loss,
             accuracy=jnp.asarray(1.0, dtype=jnp.float32),
+            weight_sum=local_count,
             other_metrics={
                 "critic/value_loss": value_loss,
                 "critic/value_mean": value_mean,
@@ -459,6 +483,10 @@ def critic_step(
         minibatch_size=minibatch_size,
         grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
     )
+    if metrics.other_metrics is not None and metrics.weight_sum is not None:
+        other_metrics = dict(metrics.other_metrics)
+        other_metrics["critic/action_tokens"] = metrics.weight_sum
+        metrics = metrics.replace(other_metrics=other_metrics)
     state = update_state_respectfully(
         state=state,
         gradients=gradients,
@@ -473,6 +501,34 @@ def critic_step(
     return state, metrics
 
 
+_SCHEDULED_GLOBAL_TOKEN_SCALE_KEY = "__easydel_online_rl_global_token_scale__"
+
+
+def _prepare_online_rl_scheduled_batch(call) -> dict[str, tp.Any]:
+    """Attach a scalar scale reconciling local action-token weight with ``num_items_in_batch``."""
+    batch = dict(call.batch)
+    batch.pop(_SCHEDULED_GLOBAL_TOKEN_SCALE_KEY, None)
+    if call.get("use_global_normalizer", True):
+        num_items = batch.get("num_items_in_batch")
+        if num_items is not None:
+            local_total = jnp.sum(batch["action_mask"].astype(jnp.float32))
+            denom = jnp.maximum(jnp.asarray(num_items, dtype=jnp.float32), 1.0)
+            batch[_SCHEDULED_GLOBAL_TOKEN_SCALE_KEY] = local_total / denom
+    return batch
+
+
+def _make_online_rl_scheduled_weight(call):
+    """Build the per-microbatch valid action-token weight for scheduled MPMD steps."""
+    if not call.get("use_global_normalizer", True):
+        return None
+
+    def scheduled_weight(tree, batch):
+        del tree
+        return jnp.sum(batch["action_mask"].astype(jnp.float32))
+
+    return scheduled_weight
+
+
 def _actor_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
     """Build the MPMD scheduled-loss cache key for the actor step."""
     return scheduled_loss_cache_key(
@@ -485,7 +541,6 @@ def _actor_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
             "entropy_coef",
             "logprob_vocab_chunk_size",
             "partition_spec",
-            "gradient_accumulation_steps",
             "use_global_normalizer",
         ),
         object_fields=("loss_config", "learning_rate_fn", "straight_through_emulator"),
@@ -503,17 +558,22 @@ def _make_actor_scheduled_loss(call):
     loss_config = call.get("loss_config")
     learning_rate_fn = call.get("learning_rate_fn")
     partition_spec = call.get("partition_spec")
-    gradient_accumulation_steps = call.get("gradient_accumulation_steps")
     use_global_normalizer = call.get("use_global_normalizer")
     straight_through_emulator = call.get("straight_through_emulator")
+    schedule = getattr(call, "schedule", None)
+    if schedule is not None:
+        sync_module_schedule_config(call.state.model, schedule)
+    state_shell = make_scheduled_state_shell(call)
 
     def scheduled_loss(tree, batch):
         """Evaluate the policy-only scalar loss on one scheduled microbatch."""
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
+        scale = batch.get(_SCHEDULED_GLOBAL_TOKEN_SCALE_KEY)
+        eval_batch = {k: v for k, v in batch.items() if k != _SCHEDULED_GLOBAL_TOKEN_SCALE_KEY}
         metrics = actor_step(
-            call.state.replace(graphstate=tree),
-            batch,
+            state_shell.replace(graphstate=tree),
+            eval_batch,
             algorithm,
             dis_epsilon_low,
             dis_epsilon_high,
@@ -523,12 +583,15 @@ def _make_actor_scheduled_loss(call):
             loss_config=loss_config,
             learning_rate_fn=learning_rate_fn,
             partition_spec=partition_spec,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            use_global_normalizer=use_global_normalizer,
+            gradient_accumulation_steps=1,
+            use_global_normalizer=False,
             is_training=False,
             straight_through_emulator=None,
         )
-        return tp.cast(LossMetrics, metrics).loss
+        loss = tp.cast(LossMetrics, metrics).loss
+        if use_global_normalizer and scale is not None:
+            loss = loss * scale
+        return loss
 
     return scheduled_loss
 
@@ -540,7 +603,6 @@ def _critic_scheduled_loss_cache_key(call) -> tuple[tp.Any, ...]:
         value_fields=(
             "cliprange_value",
             "partition_spec",
-            "gradient_accumulation_steps",
             "use_global_normalizer",
         ),
         object_fields=("loss_config", "learning_rate_fn"),
@@ -553,23 +615,31 @@ def _make_critic_scheduled_loss(call):
     loss_config = call.get("loss_config")
     learning_rate_fn = call.get("learning_rate_fn")
     partition_spec = call.get("partition_spec")
-    gradient_accumulation_steps = call.get("gradient_accumulation_steps")
     use_global_normalizer = call.get("use_global_normalizer")
+    schedule = getattr(call, "schedule", None)
+    if schedule is not None:
+        sync_module_schedule_config(call.state.model, schedule)
+    state_shell = make_scheduled_state_shell(call)
 
     def scheduled_loss(tree, batch):
         """Evaluate the critic-only scalar loss on one scheduled microbatch."""
+        scale = batch.get(_SCHEDULED_GLOBAL_TOKEN_SCALE_KEY)
+        eval_batch = {k: v for k, v in batch.items() if k != _SCHEDULED_GLOBAL_TOKEN_SCALE_KEY}
         metrics = critic_step(
-            call.state.replace(graphstate=tree),
-            batch,
+            state_shell.replace(graphstate=tree),
+            eval_batch,
             cliprange_value,
             loss_config=loss_config,
             learning_rate_fn=learning_rate_fn,
             partition_spec=partition_spec,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            use_global_normalizer=use_global_normalizer,
+            gradient_accumulation_steps=1,
+            use_global_normalizer=False,
             is_training=False,
         )
-        return tp.cast(LossMetrics, metrics).loss
+        loss = tp.cast(LossMetrics, metrics).loss
+        if use_global_normalizer and scale is not None:
+            loss = loss * scale
+        return loss
 
     return scheduled_loss
 
@@ -580,6 +650,8 @@ register_scheduled_loss_adapter(
         name="online_rl_actor",
         make_loss=_make_actor_scheduled_loss,
         make_cache_key=_actor_scheduled_loss_cache_key,
+        prepare_batch=_prepare_online_rl_scheduled_batch,
+        make_microbatch_weight=_make_online_rl_scheduled_weight,
     ),
 )
 register_scheduled_loss_adapter(
@@ -588,6 +660,8 @@ register_scheduled_loss_adapter(
         name="online_rl_critic",
         make_loss=_make_critic_scheduled_loss,
         make_cache_key=_critic_scheduled_loss_cache_key,
+        prepare_batch=_prepare_online_rl_scheduled_batch,
+        make_microbatch_weight=_make_online_rl_scheduled_weight,
     ),
 )
 

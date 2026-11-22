@@ -91,7 +91,9 @@ def test_engine_kwargs_without_call_shape_leaves_length_unset_and_sizes_pool():
     assert "max_model_len" not in kwargs
     assert kwargs["tokenizer"] == "tok"
     assert kwargs["max_num_seqs"] == 6
-    assert kwargs["max_cache_tokens"] == 64 * 2 * 3
+    # Page-rounded (default page_size=128) and margin-adjusted (0.92): 6 seqs * 1 page = 6 pages,
+    # ceil(6 / 0.92) = 7 pages (int(7 * 0.92) = 6 >= 6) => 7 * 128 = 896 tokens.
+    assert kwargs["max_cache_tokens"] == 7 * 128
     assert kwargs["max_num_batched_tokens"] == 64
 
 

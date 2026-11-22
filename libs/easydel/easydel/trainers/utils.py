@@ -24,9 +24,11 @@ This module provides essential utilities for training, including:
 """
 
 import collections.abc
+import inspect
 import logging
 import os
 import random
+import threading
 import typing as tp
 import warnings
 from contextlib import contextmanager
@@ -258,7 +260,7 @@ def create_constant_length_dataset(
             stacklevel=1,
         )
 
-    concat_token_id = processing_class.eos_token_id if processing_class.eos_token_id else eos_token_id
+    concat_token_id = processing_class.eos_token_id if processing_class.eos_token_id is not None else eos_token_id
     max_buffer_size = seq_length * chars_per_token * num_of_sequences
 
     # Input validation and formatting function setup
@@ -270,13 +272,26 @@ def create_constant_length_dataset(
         )
 
     if formatting_func is not None:
-        if formatting_func.__code__.co_argcount > 1:
-            warnings.warn(
-                "The passed formatting_func has more than one argument. Usually that "
-                "function should have a single argument `example` which corresponds "
-                "to the dictionary returned by each element of the dataset. Make sure you know what you are doing.",
-                stacklevel=1,
+        try:
+            sig = inspect.signature(formatting_func)
+            positional_params = [
+                param
+                for param in sig.parameters.values()
+                if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            required_params = [param for param in positional_params if param.default is inspect.Parameter.empty]
+            has_var_positional = any(
+                param.kind is inspect.Parameter.VAR_POSITIONAL for param in sig.parameters.values()
             )
+            if len(required_params) > 1 or (len(positional_params) > 1 and not has_var_positional):
+                warnings.warn(
+                    "The passed formatting_func has more than one argument. Usually that "
+                    "function should have a single argument `example` which corresponds "
+                    "to the dictionary returned by each element of the dataset. Make sure you know what you are doing.",
+                    stacklevel=1,
+                )
+        except (TypeError, ValueError):
+            pass
     elif dataset_text_field is not None:
         formatting_func = lambda x: x[dataset_text_field]  # noqa
     else:
@@ -296,6 +311,8 @@ def create_constant_length_dataset(
         iterator = iter(dataset)
         more_examples = True
         epoch_has_examples = False
+        epoch_reset_occurred = False
+        tokens_since_last_reset = 0
         pending_token_ids = []
         pending_attention_masks = []
 
@@ -319,6 +336,7 @@ def create_constant_length_dataset(
                             return
                         iterator = iter(dataset)
                         epoch_has_examples = False
+                        epoch_reset_occurred = True
                         warnings.warn(
                             "The dataset reached end and the iterator is reset to the start.",
                             stacklevel=1,
@@ -344,12 +362,21 @@ def create_constant_length_dataset(
             # Concatenate all tokens and attention masks
             all_token_ids = pending_token_ids
             all_attention_masks = pending_attention_masks
+            new_tokens = 0
             for tokenized_input, attention_mask in zip(tokenized_inputs, attention_masks, strict=False):
                 if append_concat_token:
                     tokenized_input = [*tokenized_input, concat_token_id]
                     attention_mask = [*attention_mask, 1]
                 all_token_ids.extend(tokenized_input)
                 all_attention_masks.extend(attention_mask)
+                new_tokens += len(tokenized_input)
+
+            tokens_since_last_reset += new_tokens
+            if epoch_reset_occurred:
+                if tokens_since_last_reset == 0:
+                    return
+                tokens_since_last_reset = 0
+                epoch_reset_occurred = False
 
             examples = []
             examples_attention_masks = []
@@ -409,7 +436,11 @@ def _collate_batch(
     if are_tensors_same_length and (pad_to_multiple_of is None or length_of_first % pad_to_multiple_of == 0):
         return jnp.stack(examples, axis=0)
 
-    if processing_class._pad_token is None:
+    pad_token = getattr(processing_class, "pad_token", None)
+    if pad_token is None:
+        pad_token = getattr(processing_class, "_pad_token", None)
+    pad_token_id = getattr(processing_class, "pad_token_id", None)
+    if (pad_token is None and pad_token_id is None) or pad_token_id is None:
         raise ValueError(
             "You are attempting to pad samples but the processing_class you are using"
             f" ({processing_class.__class__.__name__}) does not have a pad token."
@@ -420,14 +451,18 @@ def _collate_batch(
         max_length = ((max_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
     result = jnp.full(
         shape=(len(examples), max_length),
-        fill_value=processing_class.pad_token_id,
+        fill_value=pad_token_id,
         dtype=examples[0].dtype,
     )
+    padding_side = getattr(processing_class, "padding_side", "right")
     for i, example in enumerate(examples):
-        if processing_class.padding_side == "right":
-            result = result.at[i, : example.shape[0]].set(example)
+        n = example.shape[0]
+        if n == 0:
+            continue
+        if padding_side == "right":
+            result = result.at[i, :n].set(example)
         else:
-            result = result.at[i, -example.shape[0] :].set(example)
+            result = result.at[i, max_length - n :].set(example)
     return result
 
 
@@ -725,11 +760,17 @@ class DataCollatorForCompletionOnlyLM:
             left_pad = getattr(self.processing_class, "padding_side", "right") == "left"
             for row, ids in enumerate(input_ids):
                 n = len(ids)
+                if n == 0:
+                    continue
                 token_mask = np.asarray(examples[row].get("attention_mask", [1] * n), dtype=bool)
                 start = seq_len - n if left_pad else 0
                 valid[row, start : start + n] = token_mask
             labels_np = np.where(valid, inputs_np, self.ignore_index)
-            return {"input_ids": jnp.asarray(inputs_np), "labels": jnp.asarray(labels_np)}
+            return {
+                "input_ids": jnp.asarray(inputs_np),
+                "attention_mask": jnp.asarray(valid.astype(np.int32)),
+                "labels": jnp.asarray(labels_np),
+            }
 
         mask_labels = []
         for e in examples:
@@ -748,13 +789,22 @@ class DataCollatorForCompletionOnlyLM:
             mask_labels.append(self._whole_word_mask(ref_tokens))
         # Masks must be padded with zeros, not with the tokenizer's pad token ID.
         batch_mask = np.zeros(batch_input.shape, dtype=bool)
+        attention_mask = np.zeros(batch_input.shape, dtype=np.int32)
         left_pad = getattr(self.processing_class, "padding_side", "right") == "left"
         for row, mask in enumerate(mask_labels):
-            start = batch_mask.shape[1] - len(mask) if left_pad else 0
-            token_mask = np.asarray(examples[row].get("attention_mask", [1] * len(mask)), dtype=bool)
-            batch_mask[row, start : start + len(mask)] = np.asarray(mask, dtype=bool) & token_mask
+            n = len(mask)
+            if n == 0:
+                continue
+            start = batch_mask.shape[1] - n if left_pad else 0
+            token_mask = np.asarray(examples[row].get("attention_mask", [1] * n), dtype=bool)
+            attention_mask[row, start : start + n] = token_mask.astype(np.int32)
+            batch_mask[row, start : start + n] = np.asarray(mask, dtype=bool) & token_mask
         inputs, labels = self.jax_mask_tokens(batch_input, mask_labels=batch_mask)
-        return {"input_ids": jnp.asarray(inputs), "labels": jnp.asarray(labels)}
+        return {
+            "input_ids": jnp.asarray(inputs),
+            "attention_mask": jnp.asarray(attention_mask),
+            "labels": jnp.asarray(labels),
+        }
 
     def __call__(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
         """Collate examples and mask labels so loss is only on completions.
@@ -768,7 +818,7 @@ class DataCollatorForCompletionOnlyLM:
                 a dict containing ``input_ids``.
 
         Returns:
-            dict with ``input_ids`` and ``labels`` as JAX arrays.
+            dict with ``input_ids``, ``attention_mask``, and ``labels`` as JAX arrays.
         """
         # JAX arrays are immutable: edit the labels on writable NumPy copies and convert back at the end.
         batch = {key: np.array(value) for key, value in self.jax_call(examples).items()}
@@ -777,16 +827,21 @@ class DataCollatorForCompletionOnlyLM:
         left_pad = getattr(self.processing_class, "padding_side", "right") == "left"
         for row, example in enumerate(examples):
             ids = example["input_ids"] if isinstance(example, collections.abc.Mapping) else example
-            start = template_ids.shape[1] - len(ids) if left_pad else 0
-            template_ids[row, start : start + len(ids)] = ids
+            n = len(ids)
+            if n == 0:
+                continue
+            start = template_ids.shape[1] - n if left_pad else 0
+            template_ids[row, start : start + n] = ids
 
+        resp_len = len(self.response_token_ids)
         if self.instruction_template is None:
             for i in range(len(examples)):
                 response_token_ids_start_idx = None
 
-                for idx in np.where(template_ids[i] == self.response_token_ids[0])[0]:
-                    if self.response_token_ids == template_ids[i][idx : idx + len(self.response_token_ids)].tolist():
-                        response_token_ids_start_idx = idx
+                if resp_len > 0:
+                    for idx in np.where(template_ids[i] == self.response_token_ids[0])[0]:
+                        if self.response_token_ids == template_ids[i][idx : idx + resp_len].tolist():
+                            response_token_ids_start_idx = idx
 
                 if response_token_ids_start_idx is None:
                     warnings.warn(
@@ -798,22 +853,28 @@ class DataCollatorForCompletionOnlyLM:
                     )
                     batch["labels"][i, :] = self.ignore_index
                 else:
-                    response_token_ids_end_idx = response_token_ids_start_idx + len(self.response_token_ids)
+                    response_token_ids_end_idx = response_token_ids_start_idx + resp_len
                     batch["labels"][i, :response_token_ids_end_idx] = self.ignore_index
 
         else:
+            human_token_ids = self.instruction_token_ids
+            if human_token_ids is None:
+                raise RuntimeError("instruction_token_ids must not be None when using instruction_template")
+            inst_len = len(human_token_ids)
+
             for i in range(len(examples)):
-                response_token_ids_idxs = []
-                human_token_ids_idxs = []
+                row_tokens = template_ids[i].tolist()
+                seq_len = len(row_tokens)
 
-                for assistant_idx in np.where(template_ids[i] == self.response_token_ids[0])[0]:
-                    if (
-                        self.response_token_ids
-                        == template_ids[i][assistant_idx : assistant_idx + len(self.response_token_ids)].tolist()
-                    ):
-                        response_token_ids_idxs.append(assistant_idx + len(self.response_token_ids))
+                has_response = resp_len > 0 and any(
+                    row_tokens[idx : idx + resp_len] == self.response_token_ids
+                    for idx in range(seq_len - resp_len + 1)
+                )
+                has_instruction = inst_len > 0 and any(
+                    row_tokens[idx : idx + inst_len] == human_token_ids for idx in range(seq_len - inst_len + 1)
+                )
 
-                if len(response_token_ids_idxs) == 0:
+                if not has_response:
                     warnings.warn(
                         f"Could not find response key `{self.response_template}` in the "
                         f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
@@ -822,15 +883,9 @@ class DataCollatorForCompletionOnlyLM:
                         stacklevel=1,
                     )
                     batch["labels"][i, :] = self.ignore_index
+                    continue
 
-                human_token_ids = self.instruction_token_ids
-                if human_token_ids is None:
-                    raise RuntimeError("instruction_token_ids must not be None when using instruction_template")
-                for human_idx in np.where(template_ids[i] == human_token_ids[0])[0]:
-                    if human_token_ids == template_ids[i][human_idx : human_idx + len(human_token_ids)].tolist():
-                        human_token_ids_idxs.append(human_idx)
-
-                if len(human_token_ids_idxs) == 0:
+                if not has_instruction:
                     warnings.warn(
                         f"Could not find instruction key `{self.instruction_template}` in the "
                         f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
@@ -839,22 +894,27 @@ class DataCollatorForCompletionOnlyLM:
                         stacklevel=1,
                     )
                     batch["labels"][i, :] = self.ignore_index
+                    continue
 
-                if (
-                    len(human_token_ids_idxs) > 0
-                    and len(response_token_ids_idxs) > 0
-                    and human_token_ids_idxs[0] > response_token_ids_idxs[0]
-                ):
-                    human_token_ids_idxs = [0, *human_token_ids_idxs]
-
-                for idx, (start, end) in enumerate(zip(human_token_ids_idxs, response_token_ids_idxs, strict=False)):
-                    if idx != 0:
-                        batch["labels"][i, start:end] = self.ignore_index
+                # Linear state-machine marker scan so extra/quoted markers do not misalign turns.
+                in_response = False
+                pos = 0
+                while pos < seq_len:
+                    if not in_response:
+                        if pos + resp_len <= seq_len and row_tokens[pos : pos + resp_len] == self.response_token_ids:
+                            batch["labels"][i, pos : pos + resp_len] = self.ignore_index
+                            pos += resp_len
+                            in_response = True
+                        else:
+                            batch["labels"][i, pos] = self.ignore_index
+                            pos += 1
                     else:
-                        batch["labels"][i, :end] = self.ignore_index
-
-                if len(response_token_ids_idxs) < len(human_token_ids_idxs):
-                    batch["labels"][i, human_token_ids_idxs[-1] :] = self.ignore_index
+                        if pos + inst_len <= seq_len and row_tokens[pos : pos + inst_len] == human_token_ids:
+                            batch["labels"][i, pos : pos + inst_len] = self.ignore_index
+                            pos += inst_len
+                            in_response = False
+                        else:
+                            pos += 1
 
         batch = {key: jnp.asarray(value) for key, value in batch.items()}
         if isinstance(examples[0], collections.abc.Mapping):
@@ -934,13 +994,18 @@ class RewardDataCollatorWithPaddingTFDS:
         if pad_token_id is None:
             pad_token_id = 0
 
-        if self.padding == "max_length":
-            target_len = self.max_length
-        elif self.padding:
+        padding = self.padding.value if hasattr(self.padding, "value") else self.padding
+        if padding not in (True, False, "max_length", "longest", "do_not_pad"):
+            raise ValueError(f"Unsupported padding strategy: {self.padding!r}")
+
+        disable_padding = padding is False or padding == "do_not_pad"
+        if disable_padding:
             target_len = None
+        elif padding == "max_length":
+            target_len = self._resolve_target_length(self.max_length)
         else:
+            # padding is True or "longest": determine from batch below (capped by max_length if set).
             target_len = None
-        target_len = self._resolve_target_length(target_len)
 
         def _pad_right(arr: jnp.ndarray, pad_value: int) -> jnp.ndarray:
             """Pad or truncate an array to ``target_len`` on the right side.
@@ -957,7 +1022,7 @@ class RewardDataCollatorWithPaddingTFDS:
                 return arr
             if arr.shape[-1] > target_len:
                 if self.truncation_mode == "keep_end":
-                    arr = arr[..., -target_len:]
+                    arr = arr[..., arr.shape[-1] - target_len :]
                 else:
                     arr = arr[..., :target_len]
             if arr.shape[-1] < target_len:
@@ -970,9 +1035,11 @@ class RewardDataCollatorWithPaddingTFDS:
         rejected_ids = [_pad_right(jnp.asarray(f["input_ids_rejected"]), pad_token_id) for f in features]
         rejected_mask = [_pad_right(jnp.asarray(f["attention_mask_rejected"]), 0) for f in features]
 
-        if target_len is None:
-            target_len = max(x.shape[-1] for x in chosen_ids + rejected_ids)
-            target_len = self._resolve_target_length(target_len)
+        if not disable_padding and target_len is None:
+            longest = max(x.shape[-1] for x in chosen_ids + rejected_ids)
+            if self.max_length is not None:
+                longest = min(longest, self.max_length)
+            target_len = self._resolve_target_length(longest)
             chosen_ids = [_pad_right(x, pad_token_id) for x in chosen_ids]
             chosen_mask = [_pad_right(x, 0) for x in chosen_mask]
             rejected_ids = [_pad_right(x, pad_token_id) for x in rejected_ids]
@@ -1000,7 +1067,7 @@ class RewardDataCollatorWithPaddingGrain:
 
     Attributes:
         tokenizer: The tokenizer/processor for encoding text.
-        padding: Padding strategy - 'max_length', True, or False.
+        padding: Padding strategy - 'max_length', 'longest', 'do_not_pad', True, or False.
         max_length: Maximum sequence length for padding.
         truncation_mode: How to truncate sequences ('keep_end' or 'keep_start').
 
@@ -1015,12 +1082,29 @@ class RewardDataCollatorWithPaddingGrain:
     truncation_mode: str = "keep_end"
     pad_to_multiple_of: int | None = None
 
-    def _resolve_target_length(self) -> int | None:
-        """Return the Grain reward-collator target length after rounding."""
-        target_len = self.max_length if self.padding else None
+    def _round_target_length(self, target_len: int | None) -> int | None:
+        """Round a target length up to ``pad_to_multiple_of`` when set."""
         if target_len is not None and self.pad_to_multiple_of is not None and target_len % self.pad_to_multiple_of != 0:
             target_len = ((target_len // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
         return target_len
+
+    def _resolve_target_length(self, longest: int | None = None) -> int | None:
+        """Return the Grain reward-collator target length after rounding."""
+        padding = self.padding.value if hasattr(self.padding, "value") else self.padding
+        if padding not in (True, False, "max_length", "longest", "do_not_pad"):
+            raise ValueError(f"Unsupported padding strategy: {self.padding!r}")
+        if padding is False or padding == "do_not_pad":
+            return None
+        if padding == "max_length":
+            target_len = self.max_length if self.max_length is not None else longest
+        else:
+            # padding is True or "longest"
+            target_len = longest
+            if target_len is not None and self.max_length is not None:
+                target_len = min(target_len, self.max_length)
+            elif target_len is None:
+                target_len = self.max_length
+        return self._round_target_length(target_len)
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
         """Collate chosen/rejected pairs for Grain-based reward modeling.
@@ -1057,24 +1141,30 @@ class RewardDataCollatorWithPaddingGrain:
             pad_token_id = getattr(getattr(self.tokenizer, "tokenizer", None), "pad_token_id", None)
         if pad_token_id is None:
             pad_token_id = 0
-        target_len = self._resolve_target_length()
+
+        raw_chosen_ids = np.asarray(features["input_ids_chosen"])
+        raw_chosen_mask = np.asarray(features["attention_mask_chosen"])
+        raw_rejected_ids = np.asarray(features["input_ids_rejected"])
+        raw_rejected_mask = np.asarray(features["attention_mask_rejected"])
+        longest = max(raw_chosen_ids.shape[-1], raw_rejected_ids.shape[-1])
+        target_len = self._resolve_target_length(longest=longest)
 
         def _pad_right(arr: np.ndarray, pad_value: int) -> np.ndarray:
-            """Pad or truncate a NumPy array to ``max_length`` on the right side.
+            """Pad or truncate a NumPy array to ``target_len`` on the right side.
 
             Args:
                 arr: Input NumPy array to pad or truncate.
                 pad_value: Value used for padding.
 
             Returns:
-                Array with its last dimension matching ``max_length``, or
+                Array with its last dimension matching ``target_len``, or
                 unchanged if padding is disabled.
             """
             if target_len is None:
                 return arr
             if arr.shape[-1] > target_len:
                 if self.truncation_mode == "keep_end":
-                    arr = arr[..., -target_len:]
+                    arr = arr[..., arr.shape[-1] - target_len :]
                 else:
                     arr = arr[..., :target_len]
             if arr.shape[-1] < target_len:
@@ -1082,10 +1172,10 @@ class RewardDataCollatorWithPaddingGrain:
                 arr = np.pad(arr, [(0, 0)] * (arr.ndim - 1) + [(0, pad_amount)], constant_values=pad_value)
             return arr
 
-        chosen_ids = _pad_right(np.asarray(features["input_ids_chosen"]), pad_token_id).astype(np.int32)
-        chosen_mask = _pad_right(np.asarray(features["attention_mask_chosen"]), 0).astype(np.int32)
-        rejected_ids = _pad_right(np.asarray(features["input_ids_rejected"]), pad_token_id).astype(np.int32)
-        rejected_mask = _pad_right(np.asarray(features["attention_mask_rejected"]), 0).astype(np.int32)
+        chosen_ids = _pad_right(raw_chosen_ids, pad_token_id).astype(np.int32)
+        chosen_mask = _pad_right(raw_chosen_mask, 0).astype(np.int32)
+        rejected_ids = _pad_right(raw_rejected_ids, pad_token_id).astype(np.int32)
+        rejected_mask = _pad_right(raw_rejected_mask, 0).astype(np.int32)
 
         batch: dict[str, tp.Any] = {
             "input_ids_chosen": chosen_ids,
@@ -1097,6 +1187,51 @@ class RewardDataCollatorWithPaddingGrain:
             batch["margin"] = np.asarray(features["margin"], dtype=np.float32)
         _attach_tools_sidechannel(batch, features)
         return batch
+
+
+def _collate_vision_tensors_jax(arrays: list[jnp.ndarray], pad_value: float | int = 0.0) -> jnp.ndarray:
+    """Collate vision tensors independently of text prompt lengths.
+
+    Stacks tensors when all examples share the same shape, or pads spatial axes
+    to the batch maximum shape without ever truncating/padding to text length.
+    """
+    if all(arr.shape == arrays[0].shape for arr in arrays):
+        return jnp.stack(arrays, axis=0)
+    ndim = arrays[0].ndim
+    if not all(arr.ndim == ndim for arr in arrays):
+        raise ValueError(f"Cannot collate vision tensors with mismatched ranks: {[arr.shape for arr in arrays]}")
+    max_shape = tuple(max(arr.shape[dim] for arr in arrays) for dim in range(ndim))
+    padded = []
+    for arr in arrays:
+        pad_width = [(0, max_shape[dim] - arr.shape[dim]) for dim in range(ndim)]
+        if any(after > 0 for _, after in pad_width):
+            arr = jnp.pad(arr, pad_width, mode="constant", constant_values=pad_value)
+        padded.append(arr)
+    return jnp.stack(padded, axis=0)
+
+
+def _strip_matching_prompt_prefix_np(
+    valid_ids: np.ndarray,
+    feature: dict[str, tp.Any],
+    *,
+    is_encoder_decoder: bool | None,
+) -> np.ndarray:
+    """Strip an explicit prompt-token prefix from ``valid_ids`` when present."""
+    if is_encoder_decoder or "prompt_input_ids" not in feature:
+        return valid_ids
+    prompt_ids = np.asarray(feature["prompt_input_ids"])
+    prompt_mask = feature.get("prompt_attention_mask")
+    if prompt_mask is not None:
+        prompt_valid = prompt_ids[np.asarray(prompt_mask, dtype=bool)]
+    else:
+        prompt_valid = prompt_ids
+    if (
+        prompt_valid.size > 0
+        and valid_ids.size >= prompt_valid.size
+        and np.array_equal(valid_ids[: prompt_valid.size], prompt_valid)
+    ):
+        return valid_ids[prompt_valid.size :]
+    return valid_ids
 
 
 @auto_pytree
@@ -1169,28 +1304,30 @@ class DataCollatorForPreferenceTFDS:
         Returns:
             Tuple of (completion_input_ids, completion_attention_mask).
         """
-        input_ids = jnp.asarray(feature[f"{prefix}_input_ids"])
+        input_ids_np = np.asarray(feature[f"{prefix}_input_ids"])
         attention_mask = feature.get(f"{prefix}_attention_mask")
         if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
+            attention_mask_np = np.ones_like(input_ids_np)
         else:
-            attention_mask = jnp.asarray(attention_mask)
+            attention_mask_np = np.asarray(attention_mask)
 
         labels = feature.get(f"{prefix}_labels")
         if labels is not None:
-            labels = jnp.asarray(labels)
-            completion_tokens = labels != self.label_pad_token_id
-            input_ids = input_ids[completion_tokens]
-            attention_mask = attention_mask[completion_tokens]
-        elif input_ids.shape[-1] > self.max_completion_length and "prompt_attention_mask" in feature:
-            prompt_length = int(np.asarray(feature["prompt_attention_mask"]).sum())
-            input_ids = input_ids[prompt_length:]
-            attention_mask = attention_mask[prompt_length:]
+            labels_np = np.asarray(labels)
+            completion_tokens = labels_np != self.label_pad_token_id
+            input_ids_np = input_ids_np[completion_tokens]
+            attention_mask_np = attention_mask_np[completion_tokens]
+            valid_ids = input_ids_np[attention_mask_np.astype(bool)]
+        else:
+            valid_ids = input_ids_np[attention_mask_np.astype(bool)]
+            valid_ids = _strip_matching_prompt_prefix_np(
+                valid_ids,
+                feature,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
 
-        valid_tokens = attention_mask.astype(bool)
-        input_ids = input_ids[valid_tokens]
-        attention_mask = attention_mask[valid_tokens]
-        return input_ids, jnp.ones_like(input_ids, dtype=attention_mask.dtype)
+        out_ids = jnp.asarray(valid_ids)
+        return out_ids, jnp.ones_like(out_ids, dtype=jnp.asarray(attention_mask_np).dtype)
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
         """Collate a batch of preference examples for DPO training.
@@ -1270,11 +1407,16 @@ class DataCollatorForPreferenceTFDS:
             "rejected_attention_mask": pad(rejected_attention_mask, completion_pad_length, padding_value=0),
         }
         if pixel_values is not None:
-            output["pixel_values"] = pad(pixel_values, prompt_pad_length, padding_value=0.0)
+            output["pixel_values"] = _collate_vision_tensors_jax(pixel_values, pad_value=0.0)
         if pixel_attention_mask is not None:
-            output["pixel_attention_mask"] = pad(pixel_attention_mask, prompt_pad_length, padding_value=0)
+            output["pixel_attention_mask"] = _collate_vision_tensors_jax(pixel_attention_mask, pad_value=0)
         if "image_sizes" in features[0]:
             output["image_sizes"] = jnp.array([feature["image_sizes"] for feature in features])
+        if "image_grid_thw" in features[0]:
+            output["image_grid_thw"] = _collate_vision_tensors_jax(
+                [jnp.array(feature["image_grid_thw"]) for feature in features],
+                pad_value=0,
+            )
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
@@ -1364,15 +1506,16 @@ class DataCollatorForPreferenceGrain:
             completion_tokens = labels != self.label_pad_token_id
             input_ids = input_ids[completion_tokens]
             attention_mask = attention_mask[completion_tokens]
-        elif input_ids.shape[-1] > self.max_completion_length and "prompt_attention_mask" in features:
-            prompt_length = int(np.asarray(features["prompt_attention_mask"]).sum())
-            input_ids = input_ids[prompt_length:]
-            attention_mask = attention_mask[prompt_length:]
+            valid_ids = input_ids[attention_mask.astype(bool)]
+        else:
+            valid_ids = input_ids[attention_mask.astype(bool)]
+            valid_ids = _strip_matching_prompt_prefix_np(
+                valid_ids,
+                features,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
 
-        valid_tokens = attention_mask.astype(bool)
-        input_ids = input_ids[valid_tokens]
-        attention_mask = attention_mask[valid_tokens]
-        return input_ids, np.ones_like(input_ids, dtype=attention_mask.dtype)
+        return valid_ids, np.ones_like(valid_ids, dtype=attention_mask.dtype)
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
         """Collate preference data for Grain-based DPO training.
@@ -1451,11 +1594,13 @@ class DataCollatorForPreferenceGrain:
         }
 
         if pixel_values is not None:
-            output["pixel_values"] = pad_single(pixel_values, prompt_pad_length, padding_value=0.0)
+            output["pixel_values"] = pixel_values
         if pixel_attention_mask is not None:
-            output["pixel_attention_mask"] = pad_single(pixel_attention_mask, prompt_pad_length, padding_value=0)
+            output["pixel_attention_mask"] = pixel_attention_mask
         if "image_sizes" in features.keys():
             output["image_sizes"] = np.array(features["image_sizes"])
+        if "image_grid_thw" in features.keys():
+            output["image_grid_thw"] = np.array(features["image_grid_thw"])
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
@@ -1556,10 +1701,17 @@ class BCODataCollatorTFDS(_BCODataCollatorMixin):
         batch: dict[str, jnp.ndarray] = {}
         batch["prompt_input_ids"] = self._pad_prompt(prompt_input_ids, self.pad_token_id)
         batch["prompt_attention_mask"] = self._pad_prompt(prompt_attention_mask, 0)
-        # completion_input_ids contains full sequence (prompt + completion), pad to max_length
-        batch["completion_input_ids"] = self._pad_full_sequence(completion_input_ids, self.pad_token_id)
-        batch["completion_attention_mask"] = self._pad_full_sequence(completion_attention_mask, 0)
-        batch["completion_labels"] = self._pad_full_sequence(completion_labels, self.label_pad_token_id)
+        # Encoder-decoder completions hold targets only (max_completion_length);
+        # decoder-only completions hold full prompt+completion sequences (max_length).
+        pad_completion = self._pad_completion if self.is_encoder_decoder else self._pad_full_sequence
+        batch["completion_input_ids"] = pad_completion(completion_input_ids, self.pad_token_id)
+        batch["completion_attention_mask"] = pad_completion(completion_attention_mask, 0)
+        batch["completion_labels"] = pad_completion(completion_labels, self.label_pad_token_id)
+        if "completion_decoder_input_ids" in features[0]:
+            completion_decoder_input_ids = [
+                np.asarray(f["completion_decoder_input_ids"], dtype=np.int32) for f in features
+            ]
+            batch["completion_decoder_input_ids"] = pad_completion(completion_decoder_input_ids, self.pad_token_id)
         batch["label"] = jnp.asarray(labels, dtype=jnp.bool_)
 
         if "embedding_input_ids" in features[0]:
@@ -1612,27 +1764,50 @@ class BCODataCollatorGrain(_BCODataCollatorMixin):
             padding_value=0,
             padding_side="left",
         )
-        # completion_input_ids contains full sequence (prompt + completion), pad to max_length
+        completion_target_len = self.max_completion_length if self.is_encoder_decoder else self.max_length
         batch["completion_input_ids"] = pad_single(
             completion_input_ids,
-            self.max_length,
+            completion_target_len,
             padding_value=self.pad_token_id,
         )
         batch["completion_attention_mask"] = pad_single(
             completion_attention_mask,
-            self.max_length,
+            completion_target_len,
             padding_value=0,
         )
         batch["completion_labels"] = pad_single(
             completion_labels,
-            self.max_length,
+            completion_target_len,
             padding_value=self.label_pad_token_id,
         )
+        if "completion_decoder_input_ids" in feature:
+            completion_decoder_input_ids = np.asarray(feature["completion_decoder_input_ids"], dtype=np.int32)
+            batch["completion_decoder_input_ids"] = pad_single(
+                completion_decoder_input_ids,
+                completion_target_len,
+                padding_value=self.pad_token_id,
+            )
         batch["label"] = np.asarray(feature["label"], dtype=np.bool_)
 
         if "embedding_input_ids" in feature:
-            batch["embedding_input_ids"] = np.asarray(feature["embedding_input_ids"], dtype=np.int32)
-            batch["embedding_attention_mask"] = np.asarray(feature["embedding_attention_mask"], dtype=np.int32)
+            embedding_input_ids = np.asarray(feature["embedding_input_ids"], dtype=np.int32)
+            embedding_attention_mask = feature.get("embedding_attention_mask")
+            if embedding_attention_mask is None:
+                embedding_attention_mask = np.ones_like(embedding_input_ids, dtype=np.int32)
+            else:
+                embedding_attention_mask = np.asarray(embedding_attention_mask, dtype=np.int32)
+            batch["embedding_input_ids"] = pad_single(
+                embedding_input_ids,
+                self.max_prompt_length,
+                padding_value=self.pad_token_id,
+                padding_side="right",
+            )
+            batch["embedding_attention_mask"] = pad_single(
+                embedding_attention_mask,
+                self.max_prompt_length,
+                padding_value=0,
+                padding_side="right",
+            )
         if "reference_logps" in feature:
             batch["reference_logps"] = np.asarray(feature["reference_logps"], dtype=np.float32)
 
@@ -1702,17 +1877,12 @@ class GRPODataCollatorTFDS:
                 continue
             if key in FLATTENABLE_MULTIMODAL_KEYS:
                 normalized_arrays = [_normalize_flattenable_multimodal_array(key, array) for array in arrays]
-                if all(array.shape == normalized_arrays[0].shape for array in normalized_arrays):
-                    if normalized_arrays[0].ndim >= 1 and normalized_arrays[0].shape[0] == 1:
-                        batch[key] = jnp.asarray(np.concatenate(normalized_arrays, axis=0))
-                    else:
-                        batch[key] = jnp.asarray(np.stack(normalized_arrays, axis=0))
-                    continue
-                try:
+                if all(array.ndim >= 1 for array in normalized_arrays) and all(
+                    array.shape[1:] == normalized_arrays[0].shape[1:] for array in normalized_arrays
+                ):
                     batch[key] = jnp.asarray(np.concatenate(normalized_arrays, axis=0))
                     continue
-                except Exception:
-                    arrays = normalized_arrays
+                arrays = normalized_arrays
             arrays = [
                 _maybe_left_pad_prompt_aligned_array(
                     key,
@@ -1780,6 +1950,10 @@ def _pad_single_along_axis(
 ) -> np.ndarray:
     """Pad a single array along the requested sequence axis."""
 
+    if padding_side not in ("left", "right"):
+        raise ValueError("padding_side must be 'left' or 'right'")
+    if max_length < 0:
+        raise ValueError("max_length must be nonnegative")
     axis = axis if axis >= 0 else tensor.ndim + axis
     current_length = tensor.shape[axis]
     if current_length == max_length:
@@ -1789,15 +1963,13 @@ def _pad_single_along_axis(
     pad_amount = max(max_length - current_length, 0)
     if padding_side == "left":
         pad_width[axis] = (pad_amount, 0)
-    elif padding_side == "right":
-        pad_width[axis] = (0, pad_amount)
     else:
-        raise ValueError("padding_side must be 'left' or 'right'")
+        pad_width[axis] = (0, pad_amount)
 
     padded = np.pad(tensor, pad_width, mode="constant", constant_values=padding_value)
     index = [slice(None)] * padded.ndim
     if padding_side == "left":
-        index[axis] = slice(-max_length, None)
+        index[axis] = slice(padded.shape[axis] - max_length, None)
     else:
         index[axis] = slice(0, max_length)
     return padded[tuple(index)]
@@ -1856,7 +2028,14 @@ def _prompt_aligned_padding_value(
 ) -> int | float:
     """Choose a model-consistent padding value for prompt-aligned auxiliary tensors."""
 
-    if key in {"position_ids", "cache_position", "decoder_position_ids", "token_type_ids", "mm_token_type_ids"}:
+    if key in {
+        "position_ids",
+        "cache_position",
+        "decoder_position_ids",
+        "token_type_ids",
+        "mm_token_type_ids",
+        "pixel_attention_mask",
+    }:
         return np.array(0, dtype=array.dtype).item()
     if jnp.issubdtype(array.dtype, jnp.floating):
         return np.array(0.0, dtype=array.dtype).item()
@@ -1940,6 +2119,17 @@ class GRPODataCollatorGrain:
         return batch
 
 
+def _first_element_equals(seq: tp.Any, target: int) -> bool:
+    """Return True when a possibly nested sequence has a first scalar equal to ``target``."""
+    cur = seq
+    while isinstance(cur, (list, tuple)):
+        if not cur:
+            return False
+        cur = cur[0]
+    arr = np.asarray(cur)
+    return arr.size > 0 and int(arr.reshape(-1)[0]) == target
+
+
 @auto_pytree
 class DPODataCollatorWithPaddingTFDS:
     """Advanced data collator for DPO training with TFDS.
@@ -1983,24 +2173,33 @@ class DPODataCollatorWithPaddingTFDS:
             Handles different padding strategies for prompts (left) vs completions (right).
             Supports encoder-decoder architectures with special handling.
         """
+        if not features:
+            return {}
         camax_length = self.max_completion_length + self.max_prompt_length
         padded_batch = {}
+        feature_keys = set(features[0].keys())
         for k in features[0].keys():
             if k.endswith(("_input_ids", "_attention_mask", "_labels", "_pixel_values")):
-                match k.split("_")[0]:
-                    case "rejected":
-                        max_length = self.max_completion_length
-                    case "chosen":
-                        max_length = self.max_completion_length
+                prefix = k.split("_")[0]
+                match prefix:
+                    case "rejected" | "chosen":
+                        if self.is_encoder_decoder:
+                            max_length = self.max_completion_length
+                        elif f"{prefix}_input_ids" in feature_keys:
+                            max_length = camax_length
+                        else:
+                            has_masked_prompt = _first_element_equals(features[0][k], self.label_pad_token_id)
+                            max_length = camax_length if has_masked_prompt else self.max_completion_length
                     case "prompt":
                         max_length = self.max_prompt_length
                     case _:
                         max_length = camax_length
 
                 if self.is_encoder_decoder:
-                    to_pad = [jnp.array(ex[k], dtype="i4") for ex in features]
+                    dtype = jnp.float32 if k.endswith("_pixel_values") else jnp.int32
+                    to_pad = [jnp.array(ex[k], dtype=dtype) for ex in features]
 
-                    if (k.startswith("prompt")) and (k.endswith("input_ids")):
+                    if k.endswith("_input_ids"):
                         if self.pad_token_id is None:
                             raise ValueError(
                                 "Padding is enabled, but the tokenizer is not configured with a padding token."
@@ -2009,9 +2208,9 @@ class DPODataCollatorWithPaddingTFDS:
                                 " before calling the trainer."
                             )
                         padding_value = self.pad_token_id
-                    elif k.endswith("_attention_mask"):
+                    elif k.endswith("_attention_mask") or k.endswith("_pixel_values"):
                         padding_value = 0
-                    elif k.startswith(("chosen", "rejected", "completion")) or ("decoder" in k):
+                    elif k.endswith("_labels") or k.startswith(("chosen", "rejected", "completion")) or ("decoder" in k):
                         padding_value = self.label_pad_token_id
                     else:
                         raise ValueError(f"Unexpected key in batch '{k}'")
@@ -2061,13 +2260,24 @@ class DPODataCollatorWithPaddingTFDS:
             elif k.endswith("_logps"):
                 padded_batch[k] = jnp.array([ex[k] for ex in features])
             else:
-                padded_batch[k] = [ex[k] for ex in features]
+                raw_vals = [ex[k] for ex in features]
+                if k != "tools" and all(
+                    isinstance(v, bool | np.bool_ | np.generic | np.ndarray | jax.Array)
+                    and (not hasattr(v, "dtype") or is_numeric_dtype(v.dtype))
+                    for v in raw_vals
+                ):
+                    try:
+                        padded_batch[k] = jnp.asarray(raw_vals)
+                    except Exception:
+                        padded_batch[k] = raw_vals
+                else:
+                    padded_batch[k] = raw_vals
             if self.output_arrays_only:
                 if k == "tools":
                     continue
                 val = padded_batch.get(k)
                 if hasattr(val, "dtype"):
-                    if val.dtype not in [jnp.float64, jnp.float32, jnp.float16, jnp.int32, jnp.int16, jnp.int8]:
+                    if not is_numeric_dtype(val.dtype):
                         padded_batch.pop(k)
                 else:
                     padded_batch.pop(k)
@@ -2115,13 +2325,19 @@ class DPODataCollatorWithPaddingGrain:
         """
         camax_length = self.max_completion_length + self.max_prompt_length
         padded_batch = {}
+        feature_keys = set(features.keys())
         for k in features.keys():
             if k.endswith(("_input_ids", "_attention_mask", "_labels", "_pixel_values")):
-                match k.split("_")[0]:
-                    case "rejected":
-                        max_length = self.max_completion_length
-                    case "chosen":
-                        max_length = self.max_completion_length
+                prefix = k.split("_")[0]
+                match prefix:
+                    case "rejected" | "chosen":
+                        if self.is_encoder_decoder:
+                            max_length = self.max_completion_length
+                        elif f"{prefix}_input_ids" in feature_keys:
+                            max_length = camax_length
+                        else:
+                            has_masked_prompt = _first_element_equals(features[k], self.label_pad_token_id)
+                            max_length = camax_length if has_masked_prompt else self.max_completion_length
                     case "prompt":
                         max_length = self.max_prompt_length
                     case _:
@@ -2130,15 +2346,16 @@ class DPODataCollatorWithPaddingGrain:
                 if self.is_encoder_decoder:
                     # Grain maps individual examples before Batch. A 1-D column
                     # is one sequence, not a batch containing one row per token.
+                    dtype = np.float32 if k.endswith("_pixel_values") else np.int32
                     values = list(features[k])
                     single_example = not values or np.ndim(values[0]) == 0
                     to_pad = (
-                        [np.asarray(values, dtype=np.int32)]
+                        [np.asarray(values, dtype=dtype)]
                         if single_example
-                        else [np.asarray(row, dtype=np.int32) for row in values]
+                        else [np.asarray(row, dtype=dtype) for row in values]
                     )
 
-                    if (k.startswith("prompt")) and (k.endswith("input_ids")):
+                    if k.endswith("_input_ids"):
                         if self.pad_token_id is None:
                             raise ValueError(
                                 "Padding is enabled, but the tokenizer is not configured with a padding token."
@@ -2147,9 +2364,9 @@ class DPODataCollatorWithPaddingGrain:
                                 " before calling the trainer."
                             )
                         padding_value = self.pad_token_id
-                    elif k.endswith("_attention_mask"):
+                    elif k.endswith("_attention_mask") or k.endswith("_pixel_values"):
                         padding_value = 0
-                    elif k.startswith(("chosen", "rejected", "completion")) or ("decoder" in k):
+                    elif k.endswith("_labels") or k.startswith(("chosen", "rejected", "completion")) or ("decoder" in k):
                         padding_value = self.label_pad_token_id
                     else:
                         raise ValueError(f"Unexpected key in batch '{k}'")
@@ -2199,13 +2416,17 @@ class DPODataCollatorWithPaddingGrain:
             elif k.endswith("_logps"):
                 padded_batch[k] = np.array(features[k])
             else:
-                padded_batch[k] = features[k]
+                val = features[k]
+                if k != "tools" and isinstance(val, bool | np.bool_):
+                    padded_batch[k] = np.asarray(val, dtype=np.bool_)
+                else:
+                    padded_batch[k] = val
             if self.output_arrays_only:
                 if k == "tools":
                     continue
                 val = padded_batch.get(k)
                 if hasattr(val, "dtype"):
-                    if val.dtype not in [np.float64, np.float32, np.float16, np.int32, np.int16, np.int8]:
+                    if not is_numeric_dtype(val.dtype):
                         padded_batch.pop(k)
                 else:
                     padded_batch.pop(k)
@@ -2275,6 +2496,45 @@ class HFDataSource(pygrain.RandomAccessDataSource):
             for shard_rank in self.dataset_shards
         ]
         self.data_iters = []
+        self._init_lock = threading.Lock()
+        self._shard_locks = [threading.Lock() for _ in range(self.num_threads)]
+        self._thread_to_worker: dict[int, int] = {}
+        self._next_worker_slot: int = 0
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_init_lock", None)
+        state.pop("_shard_locks", None)
+        state.pop("_thread_to_worker", None)
+        state["data_iters"] = []
+        state["_next_worker_slot"] = 0
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._init_lock = threading.Lock()
+        self._shard_locks = [threading.Lock() for _ in range(self.num_threads)]
+        self._thread_to_worker = {}
+        self._next_worker_slot = 0
+
+    def _resolve_worker_idx(self) -> int:
+        if self.num_threads <= 1:
+            return 0
+        thread = current_thread()
+        parts = thread.name.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return int(parts[1]) % self.num_threads
+        tid = thread.ident if thread.ident is not None else id(thread)
+        worker_idx = self._thread_to_worker.get(tid)
+        if worker_idx is not None:
+            return worker_idx
+        with self._init_lock:
+            worker_idx = self._thread_to_worker.get(tid)
+            if worker_idx is None:
+                worker_idx = self._next_worker_slot % self.num_threads
+                self._next_worker_slot += 1
+                self._thread_to_worker[tid] = worker_idx
+            return worker_idx
 
     def __len__(self):
         """Return a large number as IterableDatasets don't have fixed length.
@@ -2302,26 +2562,25 @@ class HFDataSource(pygrain.RandomAccessDataSource):
 
         Note:
             Determines which dataset shard to use based on the current thread ID.
-            Lazily initializes iterators on first access.
+            Lazily initializes iterators under a lock on first access.
         """
         if not self.data_iters:
-            self.data_iters = [iter(ds) for ds in self.datasets]
-        thread_id_str = current_thread().name.split("_")[-1]
-        if not thread_id_str.isdigit():
-            worker_idx = 0
-        else:
-            worker_idx = int(thread_id_str) % self.num_threads
-        try:
-            return next(self.data_iters[worker_idx])
-        except StopIteration as e:
-            if os.getenv("HFDATASOURCE_NONSTOP", "1") != "1":
-                raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
-            self.data_iters[worker_idx] = iter(self.datasets[worker_idx])
-            logger.info("reseting data-iters index to rebatch point.")
+            with self._init_lock:
+                if not self.data_iters:
+                    self.data_iters = [iter(ds) for ds in self.datasets]
+        worker_idx = self._resolve_worker_idx()
+        with self._shard_locks[worker_idx]:
             try:
                 return next(self.data_iters[worker_idx])
-            except StopIteration as empty:
-                raise IndexError(f"Dataset shard for worker {worker_idx} is empty.") from empty
+            except StopIteration as e:
+                if os.getenv("HFDATASOURCE_NONSTOP", "1") != "1":
+                    raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
+                self.data_iters[worker_idx] = iter(self.datasets[worker_idx])
+                logger.info("reseting data-iters index to rebatch point.")
+                try:
+                    return next(self.data_iters[worker_idx])
+                except StopIteration as empty:
+                    raise IndexError(f"Dataset shard for worker {worker_idx} is empty.") from empty
 
 
 @dataclass
@@ -2374,30 +2633,44 @@ class ToNumpy(pygrain.MapTransform):
 def shift_and_pad(mask, *tensors):
     """Shift tensors to align with the first non-zero mask position.
 
-    Rolls each tensor so that the first '1' in the mask appears at position 0.
-    Useful for aligning sequences that have different starting positions.
+    Rolls each tensor along its sequence axis (axis 1 in the batched tensor,
+    i.e. axis 0 of each row) so that the first non-zero entry in the mask
+    appears at position 0. Rows that are all zeros are left unchanged. Supports
+    both mutable NumPy arrays and immutable JAX arrays, as well as ``>= 3D``
+    tensors without flattening trailing dimensions.
 
     Args:
         mask: Binary mask array indicating valid positions.
         *tensors: Additional tensors to shift along with the mask.
 
     Returns:
-        tuple: Shifted mask and tensors (if provided), or just mask if no tensors.
-
-    Note:
-        Modifies inputs in-place. Each row is shifted independently based on
-        its first non-zero mask position.
+        Shifted mask and tensors (if provided), or just mask if no tensors.
     """
-    for i in range(mask.shape[0]):
-        first_one_idx = np.nonzero(mask[i])[0][0].item()
-        mask[i] = np.roll(mask[i], shift=-first_one_idx)
-        for tensor in tensors:
-            tensor[i] = np.roll(tensor[i], shift=-first_one_idx)
+    mask_is_jax = isinstance(mask, jax.Array)
+    mask_np = np.asarray(jax.device_get(mask)) if mask_is_jax else mask
+    out_mask = mask
+    out_tensors = list(tensors)
 
-    if not tensors:
-        return mask
-    else:
-        return mask, *tensors
+    for i in range(mask_np.shape[0]):
+        nonzero = np.nonzero(mask_np[i])[0]
+        if nonzero.size == 0:
+            continue
+        first_one_idx = int(nonzero[0].item())
+        if first_one_idx == 0:
+            continue
+        if mask_is_jax:
+            out_mask = out_mask.at[i].set(jnp.roll(out_mask[i], shift=-first_one_idx, axis=0))
+        else:
+            out_mask[i] = np.roll(out_mask[i], shift=-first_one_idx, axis=0)
+        for t_idx, tensor in enumerate(out_tensors):
+            if isinstance(tensor, jax.Array):
+                out_tensors[t_idx] = tensor.at[i].set(jnp.roll(tensor[i], shift=-first_one_idx, axis=0))
+            else:
+                tensor[i] = np.roll(tensor[i], shift=-first_one_idx, axis=0)
+
+    if not out_tensors:
+        return out_mask
+    return (out_mask, *out_tensors)
 
 
 def pad(
@@ -2473,25 +2746,26 @@ def pad_single(
         If tensor is already longer than max_length, it will be truncated
         from the appropriate side based on padding_side.
     """
-    current_length = tensor.shape[-1]
-
+    if padding_side not in ("left", "right"):
+        raise ValueError("padding_side must be 'left' or 'right'")
     if max_length is None:
         return tensor
+    if max_length < 0:
+        raise ValueError("max_length must be nonnegative")
+
+    current_length = tensor.shape[-1]
 
     if current_length >= max_length:
         if padding_side == "left":
-            return tensor[..., -max_length:]
-        else:
-            return tensor[..., :max_length]
+            return tensor[..., current_length - max_length :]
+        return tensor[..., :max_length]
 
     pad_amount = max_length - current_length
 
     if padding_side == "left":
         pad_config = [(0, 0)] * (tensor.ndim - 1) + [(pad_amount, 0)]
-    elif padding_side == "right":
-        pad_config = [(0, 0)] * (tensor.ndim - 1) + [(0, pad_amount)]
     else:
-        raise ValueError("padding_side must be 'left' or 'right'")
+        pad_config = [(0, 0)] * (tensor.ndim - 1) + [(0, pad_amount)]
 
     return np.pad(tensor, pad_config, mode="constant", constant_values=padding_value)
 
@@ -2571,7 +2845,7 @@ def pad_to_length(
         return jax.numpy.concatenate(
             [
                 tensor,
-                pad_value * jax.numpy.ones(pad_size, dtype=tensor.dtype),
+                jax.numpy.full(pad_size, pad_value, dtype=tensor.dtype),
             ],
             axis=axis,
         )
@@ -2670,12 +2944,15 @@ def conversations_formatting_function(
             list of conversation lists) or a single formatted string for
             the unbatched case.
         """
-        if isinstance(examples[messages_field][0], list):
+        messages = examples[messages_field]
+        if not messages:
+            return []
+        if isinstance(messages[0], list):
             output_texts = []
-            for i in range(len(examples[messages_field])):
+            for i in range(len(messages)):
                 output_texts.append(
                     processing_class.apply_chat_template(
-                        examples[messages_field][i],
+                        messages[i],
                         tokenize=False,
                         tools=tools,
                     )
@@ -2683,7 +2960,7 @@ def conversations_formatting_function(
             return output_texts
         else:
             return processing_class.apply_chat_template(
-                examples[messages_field],
+                messages,
                 tokenize=False,
                 tools=tools,
             )
@@ -2850,7 +3127,7 @@ def add_bos_token_if_needed(
 
 
 def add_eos_token_if_needed(
-    eos_token_id: int,
+    eos_token_id: int | None,
     chosen_tokens: dict[str, list[int]],
     rejected_tokens: dict[str, list[int]],
 ):
@@ -2860,7 +3137,7 @@ def add_eos_token_if_needed(
     for proper sequence termination.
 
     Args:
-        eos_token_id: EOS token ID to add.
+        eos_token_id: EOS token ID to add, or None if no EOS token is configured.
         chosen_tokens: Chosen response token dictionary.
         rejected_tokens: Rejected response token dictionary.
 
@@ -2871,6 +3148,8 @@ def add_eos_token_if_needed(
         Only adds EOS if it's not already present at the end.
         Updates both input_ids and attention_mask.
     """
+    if eos_token_id is None:
+        return chosen_tokens, rejected_tokens
     if len(chosen_tokens["input_ids"]) == 0 or eos_token_id != chosen_tokens["input_ids"][-1]:
         chosen_tokens["input_ids"].append(eos_token_id)
         chosen_tokens["attention_mask"].append(1)
@@ -2935,15 +3214,17 @@ def truncate_right(input_ids, stop_token_id, pad_token_id):
 class EmbeddingDataCollatorTFDS:
     """Data collator for contrastive embedding training with TFDS backends.
 
-    Stacks tokenized query/positive/negative tensors from individual
-    examples into batched JAX arrays. Expects examples to already be
+    Pads/truncates and stacks tokenized query/positive/negative tensors from
+    individual examples into batched JAX arrays. Expects examples to already be
     tokenized with ``query_input_ids``, ``query_attention_mask``,
     ``positive_input_ids``, ``positive_attention_mask``, and optionally
     ``negative_input_ids``, ``negative_attention_mask`` keys.
 
     Args:
-        pad_token_id: Token ID used for padding. Defaults to 0.
-        max_length: Maximum sequence length. Defaults to 512.
+        pad_token_id: Token ID used for padding ``*_input_ids``. Defaults to 0.
+        max_length: Optional maximum sequence length. When set, sequences are
+            right-padded or right-truncated to ``max_length``; when ``None``,
+            variable-length batches are right-padded to the batch maximum.
         has_negatives: Whether the dataset includes hard negative columns.
 
     Example:
@@ -2954,14 +3235,14 @@ class EmbeddingDataCollatorTFDS:
     """
 
     pad_token_id: int = 0
-    max_length: int = 512
+    max_length: int | None = None
     has_negatives: bool = False
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
-        """Stack per-example query/positive (and optionally negative) tensors.
+        """Pad, truncate, and stack per-example query/positive (and optional negative) tensors.
 
         Args:
-            features: List of pre-tokenized example dicts.  Each example is
+            features: List of pre-tokenized example dicts. Each example is
                 expected to contain ``query_input_ids``,
                 ``query_attention_mask``, ``positive_input_ids``,
                 ``positive_attention_mask`` and -- when
@@ -2971,6 +3252,8 @@ class EmbeddingDataCollatorTFDS:
         Returns:
             A dict mapping each present field to a stacked JAX array.
         """
+        if not features:
+            return {}
         keys = [
             "query_input_ids",
             "query_attention_mask",
@@ -2983,7 +3266,9 @@ class EmbeddingDataCollatorTFDS:
         batch: dict[str, jnp.ndarray] = {}
         for key in keys:
             if key in features[0]:
-                batch[key] = jnp.array([f[key] for f in features])
+                arrays = [jnp.asarray(f[key], dtype=jnp.int32) for f in features]
+                pad_val = 0 if key.endswith("_attention_mask") else self.pad_token_id
+                batch[key] = pad(arrays, self.max_length, padding_value=pad_val, padding_side="right")
         return batch
 
 
@@ -2996,11 +3281,11 @@ class EmbeddingDataCollatorGrain:
     """
 
     pad_token_id: int = 0
-    max_length: int = 512
+    max_length: int | None = None
     has_negatives: bool = False
 
     def __call__(self, features: dict[str, tp.Any] | list[dict[str, tp.Any]]) -> dict[str, np.ndarray | jnp.ndarray]:
-        """Convert token columns without adding a batch dimension to one example.
+        """Pad/truncate token columns without adding a batch dimension to one example.
 
         Args:
             features: A tokenized example dict, or a legacy list of examples.
@@ -3025,4 +3310,10 @@ class EmbeddingDataCollatorGrain:
         ]
         if self.has_negatives:
             keys.extend(["negative_input_ids", "negative_attention_mask"])
-        return {key: np.asarray(features[key], dtype=np.int32) for key in keys if key in features}
+        batch: dict[str, np.ndarray] = {}
+        for key in keys:
+            if key in features:
+                arr = np.asarray(features[key], dtype=np.int32)
+                pad_val = 0 if key.endswith("_attention_mask") else self.pad_token_id
+                batch[key] = pad_single(arr, self.max_length, padding_value=pad_val, padding_side="right")
+        return batch

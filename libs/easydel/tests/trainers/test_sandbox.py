@@ -160,31 +160,58 @@ def test_default_cpu_budget_clears_a_fractional_wall_clock():
 
 @pytest.mark.parametrize("network", [False, True])
 def test_nsjail_network_flag_matches_policy(monkeypatch, network):
-    """nsjail isolates the network by default; --disable_clone_newnet shares the host's."""
+    """nsjail isolates the network by default and passes mounts, cwd, env, rlimits, and realpath."""
     import easydel.trainers._shared.sandbox as sandbox_mod
 
     monkeypatch.setattr(sandbox_mod.shutil, "which", lambda name: "/usr/bin/nsjail" if name == "nsjail" else None)
-    box = Sandbox(timeout=2.0, memory_mb=512, network=network, use_jail="required")
+    monkeypatch.setattr(sandbox_mod, "_probe_jail", lambda kind, prefix: (True, ""))
+    box = Sandbox(timeout=2.0, memory_mb=512, file_size_mb=32, max_procs=48, network=network, use_jail="required")
     assert box._jail[0] == "/usr/bin/nsjail"
-    assert box._jail[-1] == "--"
+    assert box._jail_kind == "nsjail"
     assert ("--disable_clone_newnet" in box._jail) is network
+    # nsjail mounts runtime paths read-only and configures a bounded /tmp tmpfs.
+    ro_mounts = [box._jail[i + 1] for i, arg in enumerate(box._jail) if arg == "-R"]
+    assert "/usr" in ro_mounts
+    assert "--mount" in box._jail
+    assert f"none:/tmp:tmpfs:size={32 * 1024 * 1024}" in box._jail
     # nsjail resets rlimits, so the caps travel as flags and no preexec_fn is used.
     assert box._jail[box._jail.index("--rlimit_cpu") + 1] == "3"
     assert box._jail[box._jail.index("--rlimit_as") + 1] == "512"
+    assert box._jail[box._jail.index("--rlimit_fsize") + 1] == "32"
+    assert box._jail[box._jail.index("--rlimit_nproc") + 1] == "48"
     assert box._jail_owns_limits is True
+
+    # Per-run command includes writable bind, --cwd, -E env vars, --, and realpath(argv[0]).
+    cmd = box._build_command(
+        [sys.executable, "-I", "/tmp/work/script.py"],
+        tmp="/tmp/work",
+        env={"HOME": "/tmp/work", "PATH": "/usr/bin:/bin"},
+        ro_binds=["/tmp/ro"],
+    )
+    assert "-R" in cmd and "/tmp/ro" in cmd
+    assert "-B" in cmd and "/tmp/work:/tmp/work" in cmd
+    assert cmd[cmd.index("--cwd") + 1] == "/tmp/work"
+    assert "-E" in cmd and "HOME=/tmp/work" in cmd and "PATH=/usr/bin:/bin" in cmd
+    sep = cmd.index("--")
+    assert cmd[sep + 1] == os.path.realpath(sys.executable)
+    assert cmd[sep + 2 :] == ["-I", "/tmp/work/script.py"]
 
 
 @pytest.mark.parametrize("network", [False, True])
 def test_bwrap_isolates_host_paths_and_pids_and_keeps_rlimits(monkeypatch, network):
-    """Required bwrap exposes runtime mounts, not host root/home/repo or PIDs."""
+    """Required bwrap exposes runtime mounts, bounded tmpfs, not host root/home/repo or PIDs."""
     import easydel.trainers._shared.sandbox as sandbox_mod
 
     monkeypatch.setattr(sandbox_mod.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
-    box = Sandbox(timeout=2.0, network=network, use_jail="required")
+    monkeypatch.setattr(sandbox_mod, "_probe_jail", lambda kind, prefix: (True, ""))
+    box = Sandbox(timeout=2.0, file_size_mb=32, network=network, use_jail="required")
     assert ("--unshare-net" in box._jail) is not network
     for flag in ("--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent"):
         assert flag in box._jail
     assert box._jail[box._jail.index("--cap-drop") + 1] == "ALL"
+    size_idx = box._jail.index("--size")
+    assert box._jail[size_idx + 1] == str(32 * 1024 * 1024)
+    assert box._jail[size_idx + 2 : size_idx + 4] == ["--tmpfs", "/tmp"]
     sources = [box._jail[i + 1] for i, arg in enumerate(box._jail) if arg == "--ro-bind"]
     allowed = {"/usr", "/bin", "/sbin", "/lib", "/lib64", os.path.realpath(sys.base_prefix)}
     if network:
@@ -202,12 +229,15 @@ def test_required_bwrap_hides_host_sentinel_and_pids(tmp_path, network):
     """Exercise real namespace isolation when bubblewrap is usable on the host."""
     if not shutil.which("bwrap"):
         pytest.skip("bubblewrap is not installed")
-    box = Sandbox(timeout=10.0, network=network, use_jail="required")
+    try:
+        box = Sandbox(timeout=10.0, network=network, use_jail="bwrap")
+    except RuntimeError as exc:
+        if any(
+            reason in str(exc) for reason in ("Operation not permitted", "No permissions to create", "Permission denied")
+        ):
+            pytest.skip(f"bubblewrap cannot create namespaces here: {exc}")
+        raise
     probe = box.run_python("print('ready')")
-    if not probe.ok and any(
-        reason in probe.stderr for reason in ("Operation not permitted", "No permissions to create", "Permission denied")
-    ):
-        pytest.skip(f"bubblewrap cannot create namespaces here: {probe.stderr.strip()}")
     assert probe.ok, probe.stderr
     sentinel = tmp_path / "host-secret"
     sentinel.write_text("not for generated code")
@@ -275,11 +305,148 @@ def test_run_bash():
 def test_code_verifier_uses_sandbox():
     from easydel.trainers.rlvr_trainer import CodeVerifier
 
-    v = CodeVerifier(timeout=10.0)
+    v = CodeVerifier(timeout=10.0, use_jail="off")
     good = "```python\ndef add(a, b):\n    return a + b\n```"
     bad = "```python\ndef add(a, b):\n    return a - b\n```"
     batch = {"tests": ["assert add(2, 3) == 5", "assert add(2, 3) == 5"]}
     assert v(completions=[good, bad], batch=batch) == [1.0, 0.0]
+
+
+def test_code_verifier_defeats_sys_exit_and_os_exit_reward_hacking():
+    """Generated code calling sys.exit(0) or os._exit(0) must never score 1.0."""
+    from easydel.trainers.rlvr_trainer import CodeVerifier
+
+    v = CodeVerifier(timeout=10.0, use_jail="off")
+    exploits = [
+        "```python\nimport sys\nsys.exit(0)\n```",
+        "```python\nimport os\nos._exit(0)\n```",
+        "```python\ndef add(a, b):\n    import sys\n    sys.exit(0)\n```",
+        "```python\ndef add(a, b):\n    import os\n    os._exit(0)\n```",
+        "```python\nimport os\nassert '_ED_SENTINEL_TOKEN' not in os.environ\nassert '_ED_SENTINEL_FILE' not in os.environ\nimport sys\nsys.exit(0)\n```",
+    ]
+    batch = {"tests": ["assert add(2, 3) == 5"] * len(exploits)}
+    assert v(completions=exploits, batch=batch) == [0.0] * len(exploits)
+
+
+def test_code_verifier_and_sandbox_handle_over_128kib_payloads():
+    """Scripts exceeding Linux MAX_ARG_STRLEN (128 KiB) execute via temp file, not -c argv."""
+    from easydel.trainers.rlvr_trainer import CodeVerifier
+
+    padding = ("# " + "x" * 100 + "\n") * 2000  # > 200 KiB
+    assert len(padding.encode("utf-8")) > 150_000
+
+    res = Sandbox(timeout=10.0, use_jail="off").run_python(f"{padding}\nprint('large-ok')")
+    assert res.ok, res.stderr
+    assert res.stdout.strip() == "large-ok"
+
+    v = CodeVerifier(timeout=10.0, use_jail="off")
+    completion = f"```python\n{padding}\ndef add(a, b):\n    return a + b\n```"
+    assert v(completions=[completion], batch={"tests": ["assert add(20, 22) == 42"]}) == [1.0]
+
+
+def test_sandbox_and_code_verifier_validate_use_jail_and_warn_on_auto_fallback(monkeypatch):
+    """Unknown use_jail values raise ValueError; auto warns on unjailed fallback; explicit modes fail."""
+    import warnings
+
+    import easydel.trainers._shared.sandbox as sandbox_mod
+    from easydel.trainers.rlvr_trainer import CodeVerifier
+
+    for bad_mode in ("requried", "none", "true", "", "docker"):
+        with pytest.raises(ValueError, match="Invalid use_jail"):
+            Sandbox(use_jail=bad_mode)
+        with pytest.raises(ValueError, match="Invalid use_jail"):
+            CodeVerifier(use_jail=bad_mode)
+
+    monkeypatch.setattr(sandbox_mod.shutil, "which", lambda _name: None)
+
+    with pytest.warns(RuntimeWarning, match="unjailed host subprocess"):
+        box = Sandbox(timeout=2.0, use_jail="auto")
+    assert box._jail is None
+
+    with pytest.warns(RuntimeWarning, match="unjailed host subprocess"):
+        verifier = CodeVerifier(timeout=2.0, use_jail="auto")
+    assert verifier._sandbox._jail is None
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Sandbox(timeout=2.0, use_jail="off")
+        CodeVerifier(timeout=2.0, use_jail="off")
+    assert caught == []
+
+    for required_mode in ("required", "bwrap", "nsjail"):
+        with pytest.raises(RuntimeError, match="required but unavailable"):
+            Sandbox(timeout=2.0, use_jail=required_mode)
+        with pytest.raises(RuntimeError, match="required but unavailable"):
+            CodeVerifier(timeout=2.0, use_jail=required_mode)
+
+
+def test_sandbox_probes_and_caches_unusable_bwrap_falling_back_cleanly(monkeypatch, tmp_path):
+    """An installed bwrap blocked by AppArmor/userns is probed once (cached) and falls back under auto."""
+    import easydel.trainers._shared.sandbox as sandbox_mod
+
+    counter_file = tmp_path / "probe_count.txt"
+    fake_bwrap = tmp_path / "bwrap"
+    fake_bwrap.write_text(
+        f"#!/bin/sh\necho x >> {str(counter_file)!r}\necho 'bwrap: No permissions to create new namespace' >&2\nexit 1\n"
+    )
+    fake_bwrap.chmod(0o755)
+
+    monkeypatch.setattr(sandbox_mod.shutil, "which", lambda name: str(fake_bwrap) if name == "bwrap" else None)
+    sandbox_mod._JAIL_PROBE_CACHE.clear()
+
+    with pytest.warns(RuntimeWarning, match="bwrap probe failed"):
+        box1 = Sandbox(timeout=5.0, use_jail="auto")
+    assert box1._jail is None
+    assert box1.run_python("print(2 + 2)").stdout.strip() == "4"
+
+    # Second Sandbox reuses the cached probe result without re-running fake_bwrap.
+    with pytest.warns(RuntimeWarning, match="bwrap probe failed"):
+        box2 = Sandbox(timeout=5.0, use_jail="auto")
+    assert box2._jail is None
+    assert len(counter_file.read_text().splitlines()) == 1
+
+    with pytest.raises(RuntimeError, match="bwrap probe failed"):
+        Sandbox(timeout=5.0, use_jail="required")
+
+
+def test_sandbox_recognizes_128_plus_sigxcpu_as_timeout():
+    """Jailed/shell-wrapped children killed by SIGXCPU often report exit code 128 + SIGXCPU."""
+    code = "import os, signal; os._exit(128 + int(signal.SIGXCPU))"
+    res = Sandbox(timeout=10.0, use_jail="off").run_python(code)
+    assert res.returncode == 128 + signal.SIGXCPU
+    assert res.timed_out is True
+    assert res.ok is False
+
+
+def test_sandbox_write_stdin_broken_pipe_does_not_leak_thread_exception():
+    """Closing stdin after an early-exiting child must not raise an uncaught BrokenPipeError."""
+    thread_errors: list[threading.ExceptHookArgs] = []
+    previous_hook = threading.excepthook
+    threading.excepthook = thread_errors.append
+    try:
+        big_stdin = "x" * (1024 * 1024)
+        res = Sandbox(timeout=10.0, use_jail="off").run_python("pass", stdin=big_stdin)
+    finally:
+        threading.excepthook = previous_hook
+    assert res.ok is True
+    assert thread_errors == []
+
+
+def test_sandbox_enforces_rlimit_fsize_and_avoids_post_fork_import():
+    """RLIMIT_FSIZE bounds child disk writes and preexec_fn never imports resource post-fork."""
+    import inspect
+
+    box = Sandbox(timeout=10.0, file_size_mb=1, use_jail="off")
+    limits_fn = box._limits()
+    assert limits_fn is not None
+    assert "import resource" not in inspect.getsource(limits_fn)
+
+    small_res = box.run_python("open('ok.bin', 'wb').write(b'a' * 1024); print('ok')")
+    assert small_res.ok, small_res.stderr
+    assert small_res.stdout.strip() == "ok"
+
+    huge_res = box.run_python("open('boom.bin', 'wb').write(b'a' * (4 * 1024 * 1024))")
+    assert huge_res.ok is False
 
 
 if __name__ == "__main__":

@@ -119,9 +119,30 @@ def chunk_iter_with_batch(
         - Chunks at the end of audio: right stride may be 0 if the chunk
           extends beyond the audio length
     """
-    inputs_len = audio_array.shape[0]
+    if batch_size is None or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+    if chunk_length <= 0:
+        raise ValueError(f"chunk_length must be positive, got {chunk_length!r}")
+    if stride_left < 0 or stride_right < 0:
+        raise ValueError(f"stride_left and stride_right must be non-negative, got ({stride_left!r}, {stride_right!r})")
+
     step = chunk_length - stride_left - stride_right
-    all_chunk_start_idx = np.arange(0, inputs_len, step)
+    if step <= 0:
+        raise ValueError(f"step (chunk_length - stride_left - stride_right) must be > 0, got {step}")
+
+    inputs_len = audio_array.shape[0]
+    if inputs_len == 0:
+        return
+
+    chunk_starts: list[int] = []
+    start = 0
+    while start < inputs_len:
+        chunk_starts.append(start)
+        if start + chunk_length >= inputs_len:
+            break
+        start += step
+
+    all_chunk_start_idx = np.asarray(chunk_starts, dtype=np.int64)
     num_samples = len(all_chunk_start_idx)
     num_batches = math.ceil(num_samples / batch_size)
     batch_idx = np.array_split(np.arange(num_samples), num_batches)
@@ -141,21 +162,12 @@ def chunk_iter_with_batch(
 
         yield {
             "stride": [
-                (chunk_l, _stride_l, _stride_r)
-                for chunk_l, _stride_l, _stride_r in zip(
-                    [chunk.shape[0] for chunk in chunks],
-                    np.where(chunk_start_idx == 0, 0, stride_left),
-                    np.where(
-                        np.where(
-                            stride_right > 0,
-                            chunk_end_idx > inputs_len,
-                            chunk_end_idx >= inputs_len,
-                        ),
-                        0,
-                        stride_right,
-                    ),
-                    strict=False,
+                (
+                    int(chunk.shape[0]),
+                    0 if int(chunk_start) == 0 else stride_left,
+                    0 if int(chunk_end) >= inputs_len else stride_right,
                 )
+                for chunk, chunk_start, chunk_end in zip(chunks, chunk_start_idx, chunk_end_idx, strict=False)
             ],
             **processed,
         }
@@ -164,6 +176,7 @@ def chunk_iter_with_batch(
 def process_audio_input(
     audio_input: str | bytes | np.ndarray | dict[str, np.ndarray | int],
     feature_extractor,
+    timeout: float = 30.0,
 ):
     """Process various audio input formats into a normalized numpy array.
 
@@ -253,7 +266,9 @@ def process_audio_input(
 
     if isinstance(audio_input, str):
         if audio_input.startswith("http://") or audio_input.startswith("https://"):
-            audio_input = requests.get(audio_input).content
+            response = requests.get(audio_input, timeout=timeout)
+            response.raise_for_status()
+            audio_input = response.content
         else:
             with open(audio_input, "rb") as f:
                 audio_input = f.read()
@@ -299,12 +314,18 @@ def process_audio_input(
         raise ValueError("We expect a single channel audio input for AutomaticSpeechRecognitionPipeline")
 
     if stride is not None:
-        if stride[0] + stride[1] > audio_input.shape[0]:
+        if len(stride) != 2:
+            raise ValueError(f"Expected stride to be a 2-tuple (left, right), got {stride!r}")
+        stride_left = round(stride[0] * ratio)
+        stride_right = round(stride[1] * ratio)
+        if stride_left < 0 or stride_right < 0:
+            raise ValueError("Stride values must be non-negative")
+        if stride_left + stride_right > audio_input.shape[0]:
             raise ValueError("Stride is too large for input")
         stride = (
             audio_input.shape[0],
-            round(stride[0] * ratio),
-            round(stride[1] * ratio),
+            stride_left,
+            stride_right,
         )
 
     return audio_input, stride

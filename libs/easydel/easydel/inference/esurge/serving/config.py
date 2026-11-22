@@ -29,6 +29,7 @@ The literal ``internal`` for a bind address means this VM's primary internal (VP
 from __future__ import annotations
 
 import dataclasses
+import math
 import typing as tp
 from collections.abc import Mapping
 from pathlib import Path
@@ -64,6 +65,15 @@ def _port(value: tp.Any, what: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
         raise ServingConfigError(f"{what} must be an integer port in 1..65535, got {value!r}")
     return value
+
+
+def _positive_finite_float(value: tp.Any, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ServingConfigError(f"{what} must be a positive number, got {value!r}")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ServingConfigError(f"{what} must be finite and positive, got {value!r}")
+    return parsed
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,6 +159,10 @@ class ServerSpec:
         profiler_port: When set, the leader starts a JAX profiler server on this port (off by default). Capture
             from the leader host with ``python -m jax.collect_profile <port> <duration_ms>``; keep the port off
             any public firewall rule, it is unauthenticated.
+        dashboard: Start ``esurge-dashboard`` next to the endpoint (on by default; ``false`` turns it off). The
+            process serving the endpoint keeps it running and restarts it when it exits; with dp replicas it is
+            replica 0's leader, and the dashboard reads ``/metrics`` merged over every front.
+        dashboard_port: Port the dashboard listens on, on the same address as the endpoint.
     """
 
     host: str = INTERNAL_ADDRESS
@@ -158,13 +172,33 @@ class ServerSpec:
     log_level: str = "info"
     max_concurrent_generations: int | None = None
     profiler_port: int | None = None
+    dashboard: bool = True
+    dashboard_port: int = 9090
 
     def __post_init__(self) -> None:
         _port(self.port, "`server.port`")
+        if not isinstance(self.dashboard, bool):
+            raise ServingConfigError(f"`server.dashboard` must be true or false, got {self.dashboard!r}")
+        _port(self.dashboard_port, "`server.dashboard_port`")
+        if self.dashboard and self.dashboard_port in {self.port, self.profiler_port}:
+            raise ServingConfigError(
+                "`server.dashboard_port` must differ from `server.port` and `server.profiler_port` "
+                "(or set `server.dashboard: false`)"
+            )
         if self.profiler_port is not None:
             _port(self.profiler_port, "`server.profiler_port`")
             if self.profiler_port == self.port:
                 raise ServingConfigError("`server.profiler_port` must differ from `server.port`")
+        if self.max_concurrent_generations is not None:
+            if (
+                isinstance(self.max_concurrent_generations, bool)
+                or not isinstance(self.max_concurrent_generations, int)
+                or self.max_concurrent_generations <= 0
+            ):
+                raise ServingConfigError(
+                    "`server.max_concurrent_generations` must be a positive integer, "
+                    f"got {self.max_concurrent_generations!r}"
+                )
         if not self.api_key_file:
             raise ServingConfigError("`server.api_key_file` is required: the server never runs without a key")
 
@@ -194,8 +228,12 @@ class CoordinationSpec:
 
     def __post_init__(self) -> None:
         _port(self.control_port, "`coordination.control_port`")
-        if float(self.heartbeat_timeout_s) <= 0 or float(self.token_timeout_s) <= 0:
-            raise ServingConfigError("`coordination` timeouts must be positive")
+        if self.control_port > 65533:
+            raise ServingConfigError(
+                "`coordination.control_port` must be <= 65533 (ports +1 and +2 are reserved for replica coordination)"
+            )
+        _positive_finite_float(self.heartbeat_timeout_s, "`coordination.heartbeat_timeout_s`")
+        _positive_finite_float(self.token_timeout_s, "`coordination.token_timeout_s`")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -221,6 +259,23 @@ class ServingConfig:
     _TOP_LEVEL: tp.ClassVar[frozenset[str]] = frozenset(
         {"model", "esurge", "server", "coordination", "compilation_cache_dir"}
     )
+
+    def __post_init__(self) -> None:
+        control = self.coordination.control_port
+        reserved = {control, control + 1}
+        if self.server.port in reserved:
+            raise ServingConfigError(
+                "`server.port` must differ from `coordination.control_port` and the port after it"
+            )
+        if self.server.profiler_port is not None and self.server.profiler_port in reserved:
+            raise ServingConfigError(
+                "`server.profiler_port` must differ from `coordination.control_port` and the port after it"
+            )
+        if self.server.dashboard and self.server.dashboard_port in reserved:
+            raise ServingConfigError(
+                "`server.dashboard_port` must differ from `coordination.control_port` and the port after it "
+                "(or set `server.dashboard: false`)"
+            )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, tp.Any]) -> ServingConfig:

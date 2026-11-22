@@ -181,6 +181,11 @@ class EmbeddingConfig(TrainingArguments):
             "max",
         }:
             raise ValueError("`pooling_strategy` must be one of 'last', 'first', 'mean', 'weighted_mean', or 'max'.")
+        if self.matryoshka_dims is not None:
+            if len(self.matryoshka_dims) == 0:
+                raise ValueError("`matryoshka_dims` must be non-empty when set.")
+            if any(isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 for dim in self.matryoshka_dims):
+                raise ValueError("`matryoshka_dims` must contain only positive integers.")
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
                 max_sequence_length=max_sequence_length,

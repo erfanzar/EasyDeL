@@ -52,6 +52,7 @@ if typing.TYPE_CHECKING:
     from .registry import RequestRegistry
 
 _STOP_SENTINEL = None
+_MAX_TOOL_CALL_DELTA_HISTORY = 4096
 
 
 def _cache_usage_metrics(num_prompt_tokens: int, cached_tokens: int, prefix_cache_page_size: int) -> dict:
@@ -333,6 +334,13 @@ class OutputPipeline:
                 return
         if self._thread is thread:
             self._thread = None
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the worker thread and break engine callback references."""
+        self.stop(timeout=timeout)
+        self._on_stop_strings = None
+        self._on_activity = None
+        self._on_fatal = None
 
     def _loop(self) -> None:
         """Drain bundles in FIFO order until the sentinel or a fatal error."""
@@ -631,16 +639,19 @@ class OutputPipeline:
                 scan_from = 0
                 scanned = rd.stop_scan_chars
                 overlap = max(len(stop) for stop in stop_sequences) - 1
+                # Keep at least a 1-character tail guard so 1-char stop strings (overlap == 0)
+                # still detect rewrites instead of comparing "" == "".
+                tail_guard = max(1, overlap)
                 if (
                     not finished
                     and 0 < scanned <= len(accumulated_text)
-                    and accumulated_text[max(0, scanned - overlap) : scanned] == rd.stop_scan_tail
+                    and accumulated_text[max(0, scanned - tail_guard) : scanned] == rd.stop_scan_tail
                 ):
                     scan_from = max(0, scanned - overlap)
                 matched = self._find_first_stop_string(accumulated_text[scan_from:], stop_sequences)
                 if matched is None:
                     rd.stop_scan_chars = len(accumulated_text)
-                    rd.stop_scan_tail = accumulated_text[max(0, len(accumulated_text) - overlap) :]
+                    rd.stop_scan_tail = accumulated_text[max(0, len(accumulated_text) - tail_guard) :]
                 if matched is not None:
                     stop_index, stop_reason = matched
                     stop_index += scan_from
@@ -751,7 +762,7 @@ class OutputPipeline:
             visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
                 rd,
                 accumulated_text=parsed["accumulated_content"],
-                fallback_delta=parsed["delta_content"] or delta_text,
+                fallback_delta=parsed["delta_content"] or "",
                 finished=finished,
             )
             rd.decoder_visible_text = visible_text
@@ -1176,6 +1187,7 @@ class OutputPipeline:
         raw_accumulated: str,
         raw_delta: str,
         visible_delta: str = "",
+        step_tool_deltas: list | None = None,
     ) -> tuple[bool, bool]:
         """Write parser output back into ``CompletionOutput`` / ``RequestOutput``.
 
@@ -1231,6 +1243,15 @@ class OutputPipeline:
             ro.delta_text = effective_delta or ""
             ro.delta_reasoning_content = parsed["delta_reasoning"]
             ro.reasoning_content = parsed["accumulated_reasoning"] or None
+            if parsed["delta_tool_calls"]:
+                if step_tool_deltas is not None:
+                    step_tool_deltas.extend(parsed["delta_tool_calls"])
+                history = getattr(ro, "tool_call_delta_history", None)
+                if history is not None:
+                    history.extend(parsed["delta_tool_calls"])
+                    overflow = len(history) - _MAX_TOOL_CALL_DELTA_HISTORY
+                    if overflow > 0:
+                        del history[:overflow]
             ro.delta_tool_calls = parsed["delta_tool_calls"]
             if parsed["tool_calls"]:
                 ro.tool_calls = parsed["tool_calls"]
@@ -1297,6 +1318,7 @@ class OutputPipeline:
         metrics_collector,
         now: float,
         decode_results: dict[tuple[str, bool], DetokenizerResult] | None = None,
+        step_tool_deltas: list | None = None,
     ) -> tuple[bool, bool]:
         """Run the terminal-step pipeline for a finishing request/sample.
 
@@ -1358,12 +1380,15 @@ class OutputPipeline:
             decode_results=decode_results,
         )
 
-        if stop_hit and stop_reason:
-            stop_string_finishes[request_id] = stop_reason
+        if stop_hit:
+            if stop_reason:
+                stop_string_finishes[request_id] = stop_reason
+            if comp.finish_reason != "abort":
+                comp.finish_reason = "stop"
 
         self._materialize_completion(rd, comp)
         if parsed is not None:
-            if parsed["tool_calls"]:
+            if parsed["tool_calls"] and not (force_finished or stop_hit):
                 comp.finish_reason = "tool_calls"
             text_changed, structured_changed = self._update_outputs(
                 comp,
@@ -1372,6 +1397,7 @@ class OutputPipeline:
                 parsed,
                 raw_accumulated,
                 raw_delta,
+                step_tool_deltas=step_tool_deltas,
             )
 
         elapsed = now - rd.start_time
@@ -1463,6 +1489,7 @@ class OutputPipeline:
                     structured_changed = False
                     force_finished = False
                     new_tokens = engine_output.new_token_ids
+                    step_tool_deltas: list | None = [] if sample_index == 0 else None
 
                     if new_tokens:
                         comp = ro.outputs[sample_index]
@@ -1514,6 +1541,7 @@ class OutputPipeline:
                                 parsed,
                                 raw_accumulated,
                                 raw_delta,
+                                step_tool_deltas=step_tool_deltas,
                             )
 
                         self._update_metrics(rd, ro, now, num_generated)
@@ -1533,9 +1561,17 @@ class OutputPipeline:
                             metrics_collector,
                             now,
                             decode_results=decode_results,
+                            step_tool_deltas=step_tool_deltas,
                         )
                         text_changed = text_changed or tc
                         structured_changed = structured_changed or sc
+
+                    if step_tool_deltas:
+                        # Preserve all tool-call deltas emitted during this step (including when
+                        # _decode_and_parse(finished=False) and _finalize_request(finished=True)
+                        # both run inside the same _output_lock critical section).
+                        ro.delta_tool_calls = list(step_tool_deltas)
+                        structured_changed = True
 
                     ro.update_seq += 1
                     if text_changed or structured_changed or engine_output.finished or force_finished:
@@ -1553,4 +1589,7 @@ class OutputPipeline:
         if stop_string_finishes:
             self._on_stop_strings(stop_string_finishes)
 
-        self._output_event.set()
+        if hasattr(self._registry, "notify_output_change"):
+            self._registry.notify_output_change()
+        else:
+            self._output_event.set()

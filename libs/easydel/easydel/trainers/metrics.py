@@ -237,13 +237,14 @@ class StepMetrics:
         epoch_value = float(epoch) if epoch_progress is None else float(epoch) + float(epoch_progress)
         logged_extras = {key: _host_metric_value(value) for key, value in extras.items()}
 
+        step_key = f"{mode}_step" if mode is not None else "step"
         basic_metrics = {
             "epoch": epoch_value,
             "epoch_index": int(epoch),
-            "learning_rate": float(np.array(learning_rate).item()),
+            "learning_rate": _host_scalar_float(learning_rate),
             "loss": loss_value,
             "perplexity": _host_perplexity(loss_value),
-            f"{mode}_step": int(current_step),
+            step_key: int(current_step),
             "visited_tokens": visited_tokens,
             "z_loss": z_loss_value,
             **logged_extras,
@@ -331,13 +332,20 @@ class StepMetrics:
                 "mean_accuracy",
             }:
                 return "ignore"
-        performance_prefix = "performance/eval/" if mode == "eval" else "performance/"
-        if metric_name.startswith(performance_prefix):
-            bare_metric_name = metric_name.removeprefix(performance_prefix)
-            if bare_metric_name == "total_time":
-                return "ignore"
-            if bare_metric_name in {"total_flops", "total_tokens"}:
-                return "sum"
+        if mode == "eval":
+            performance_prefixes = ("performance/eval/",)
+        elif mode == "train":
+            performance_prefixes = ("performance/",)
+        else:
+            performance_prefixes = ("performance/step/", "performance/")
+        for performance_prefix in performance_prefixes:
+            if metric_name.startswith(performance_prefix):
+                bare_metric_name = metric_name.removeprefix(performance_prefix)
+                if bare_metric_name == "total_time":
+                    return "ignore"
+                if bare_metric_name in {"total_flops", "total_tokens"}:
+                    return "sum"
+                break
         return "mean"
 
     def accumulate_summary_metric(
@@ -443,37 +451,55 @@ class StepMetrics:
         Note:
             Only computed when log_grad_norms is True and not in performance mode.
         """
-        detailed_metrics = {}
-        getattr_in = lambda x: x if not hasattr(x, "value") else x.value  # noqa
-        if self.arguments.log_grad_norms:
-            if metrics.max_grad_norm is not None:
-                detailed_metrics.update({"train/max_grad_norm": getattr_in(metrics.max_grad_norm).tolist()})
+        detailed_metrics: dict[str, tp.Any] = {}
+        if not getattr(self.arguments, "log_grad_norms", False):
+            return detailed_metrics
 
-            if metrics.mean_grad_norm is not None:
-                detailed_metrics.update({"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist()})
+        def _unwrap(value: tp.Any) -> tp.Any:
+            return value.value if hasattr(value, "value") else value
 
-            # Add per-layer gradient norms. ``grad_norms`` may be a plain
-            # nested dict (legacy path) or a ``spx.State`` (current path);
-            # the latter exposes ``.flatten()`` which returns a flat
-            # ``{"collection/path": leaf}`` mapping ready to format.
-            if metrics.grad_norms is not None:
-                if hasattr(metrics.grad_norms, "flatten") and not isinstance(metrics.grad_norms, dict):
-                    flat_grad_norms = metrics.grad_norms.flatten()
-                    detailed_metrics.update(
-                        {
-                            f"grad_norm/{layer_name}": getattr_in(grad_norm).tolist()
-                            for layer_name, grad_norm in flat_grad_norms.items()
-                            if getattr_in(grad_norm) is not None
-                        }
-                    )
-                else:
-                    detailed_metrics.update(
-                        {
-                            f"grad_norm/{'.'.join([str(s) for s in layer_name])}": getattr_in(grad_norm).tolist()
-                            for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
-                            if getattr_in(grad_norm) is not None
-                        }
-                    )
+        def _coerce_norm(value: tp.Any) -> tp.Any:
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                return float(value)
+            arr = np.asarray(value)
+            if arr.ndim == 0 or arr.size == 1:
+                return float(arr.reshape(()).item())
+            return arr.tolist()
+
+        pending: dict[str, tp.Any] = {}
+        if metrics.max_grad_norm is not None:
+            max_norm = _unwrap(metrics.max_grad_norm)
+            if max_norm is not None:
+                pending["max_grad_norm"] = max_norm
+
+        if metrics.mean_grad_norm is not None:
+            mean_norm = _unwrap(metrics.mean_grad_norm)
+            if mean_norm is not None:
+                pending["mean_grad_norm"] = mean_norm
+
+        # Add per-layer gradient norms. ``grad_norms`` may be a plain
+        # nested dict (legacy path) or a ``spx.State`` (current path);
+        # the latter exposes ``.flatten()`` which returns a flat
+        # ``{"collection/path": leaf}`` mapping ready to format.
+        if metrics.grad_norms is not None:
+            if hasattr(metrics.grad_norms, "flatten") and not isinstance(metrics.grad_norms, dict):
+                flat_grad_norms = metrics.grad_norms.flatten()
+                for layer_name, grad_norm in flat_grad_norms.items():
+                    value = _unwrap(grad_norm)
+                    if value is not None:
+                        pending[f"grad_norm/{layer_name}"] = value
+            else:
+                for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items():
+                    value = _unwrap(grad_norm)
+                    if value is not None:
+                        pending[f"grad_norm/{'.'.join([str(s) for s in layer_name])}"] = value
+
+        if not pending:
+            return detailed_metrics
+
+        host_values = jax.device_get(pending)
+        for key, value in host_values.items():
+            detailed_metrics[key] = _coerce_norm(value)
 
         return detailed_metrics
 
@@ -522,15 +548,19 @@ class MetricsTracker:
         self.loss_count += 1
         mean_loss = self.loss_sum / max(self.loss_count, 1)
 
-        mean_accuracy = None
         if accuracy is not None:
             accuracy_value = _host_scalar_float(accuracy)
             if np.isfinite(accuracy_value):
                 self.accuracy_sum = accuracy_value if self.accuracy_sum is None else self.accuracy_sum + accuracy_value
                 self.accuracy_count += 1
-                mean_accuracy = self.accuracy_sum / max(self.accuracy_count, 1)
 
-        return float(mean_loss), None if mean_accuracy is None else float(mean_accuracy)
+        mean_accuracy = (
+            None
+            if self.accuracy_sum is None or self.accuracy_count == 0
+            else float(self.accuracy_sum / self.accuracy_count)
+        )
+
+        return float(mean_loss), mean_accuracy
 
     def reset(self, step):
         """Reset tracked metrics.
@@ -844,7 +874,7 @@ class RichProgressBar(BaseProgressBar):
         self._postfix = {}
 
     def close(self) -> None:
-        """Remove the Rich task from the progress display.
+        """Remove the Rich task and stop the refresh display when no tasks remain.
 
         Silently ignores ``KeyError`` if the task is already gone.
         """
@@ -852,6 +882,13 @@ class RichProgressBar(BaseProgressBar):
             self.progress.remove_task(self.task_id)
         except KeyError:
             pass
+        if not getattr(self.progress, "tasks", None):
+            stop = getattr(self.progress, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    pass
 
 
 @auto_pytree
@@ -904,18 +941,16 @@ class MetricsHistogram:
         Returns:
             Tuple of (bin_counts, bin_edges)
         """
-        arr = arr.astype(jnp.float32)
-        bin_edges = jnp.histogram_bin_edges(arr, 64)
-        left_edges = bin_edges[:-1, None]
-        right_edges = bin_edges[1:, None]
-        index = ((arr >= left_edges) & (arr < right_edges)).astype(jnp.int32)
-        out = index.sum(axis=1, dtype=jnp.int32)
-        out = jax.lax.cond(
-            out.size >= 1,
-            lambda o: o.at[-1].add(jnp.sum(arr == bin_edges[-1], dtype=jnp.int32)),
-            lambda o: o,
-            out,
-        )
+        num_bins = 64
+        arr = arr.reshape(-1).astype(jnp.float32)
+        bin_edges = jnp.histogram_bin_edges(arr, num_bins)
+        if arr.size == 0:
+            return jnp.zeros((num_bins,), dtype=jnp.int32), bin_edges
+        bin_idx = jnp.searchsorted(bin_edges, arr, side="right") - 1
+        bin_idx = jnp.where(arr == bin_edges[-1], num_bins - 1, bin_idx)
+        in_range = (arr >= bin_edges[0]) & (arr <= bin_edges[-1])
+        bin_idx = jnp.where(in_range, jnp.clip(bin_idx, 0, num_bins - 1), num_bins)
+        out = jnp.bincount(bin_idx, length=num_bins).astype(jnp.int32)
         return out, bin_edges
 
     @classmethod
@@ -958,8 +993,11 @@ class MetricsHistogram:
         return self.sum / self.size
 
     @property
-    def variance(self) -> jax.Array:
+    def variance(self) -> jax.Array | np.ndarray:
         """Calculate variance of the original array.
+
+        Clamped at 0 so floating-point cancellation in ``E[x^2] - E[x]^2`` on
+        constant or low-variance tensors never yields negative variance.
 
         Returns:
             Variance value
@@ -967,16 +1005,25 @@ class MetricsHistogram:
         mean = self.mean
         mean_of_squares = self.sum_squares / self.size
         variance = mean_of_squares - (mean**2)
-        return variance
+        if isinstance(variance, np.ndarray | np.generic | float | int):
+            return np.maximum(variance, 0.0)
+        return jnp.maximum(variance, 0.0)
 
     @property
-    def std(self) -> jax.Array:
+    def std(self) -> jax.Array | np.ndarray:
         """Calculate standard deviation of the original array.
+
+        Computes on host via ``np.sqrt`` when backed by NumPy/host scalars so
+        hosted histograms do not trigger per-parameter JAX H2D/D2H round-trips,
+        while preserving ``jnp.sqrt`` for JAX arrays and tracers.
 
         Returns:
             Standard deviation value
         """
-        return jnp.sqrt(self.variance).reshape(-1)
+        variance = self.variance
+        if isinstance(variance, np.ndarray | np.generic | float | int):
+            return np.asarray(np.sqrt(variance)).reshape(-1)
+        return jnp.sqrt(variance).reshape(-1)
 
 
 def _device_set_key(value: tp.Any) -> tuple[tuple[str, int, int], ...]:

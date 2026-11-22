@@ -319,6 +319,24 @@ class ToolChoiceOption(OpenAIBaseModel):
     function: ToolChoiceFunction
 
 
+class ResponsesToolChoice(OpenAIBaseModel):
+    """Flat Responses function selector, with a compatibility view for chat consumers."""
+
+    type: tp.Literal["function"] = "function"
+    name: str
+
+    @property
+    def function(self) -> ToolChoiceFunction:
+        """Return the nested selector used at chat-template boundaries."""
+        return ToolChoiceFunction(name=self.name)
+
+
+def _validate_greedy_sample_count(temperature: float | None, n: int | None) -> None:
+    """Reject ``n > 1`` when greedy sampling (``temperature < 1e-5``) is selected."""
+    if temperature is not None and temperature < 1e-5 and n is not None and n > 1:
+        raise ValueError(f"n must be 1 for greedy sampling (temperature={temperature}), got n={n}.")
+
+
 class ConversationReference(OpenAIBaseModel):
     """Typed conversation reference for Responses API continuation.
 
@@ -378,25 +396,31 @@ class ChatCompletionRequest(OpenAIBaseModel):
     model: str
     messages: list[ChatMessage]
     max_tokens: TokenLimit = Field(default=None, ge=1)
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    repetition_penalty: float = 1.0
-    temperature: float | None = 0.7
-    top_p: float = 0.95
-    top_k: int = 0
-    min_p: float = 0.0
+    max_completion_tokens: TokenLimit = Field(default=None, ge=1)
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    repetition_penalty: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    temperature: float | None = Field(default=0.7, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float = Field(default=0.95, gt=0.0, le=1.0, allow_inf_nan=False)
+    top_k: int = Field(default=0, ge=0)
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
     suppress_tokens: list[int] = Field(default_factory=list)
     functions: list[FunctionDefinition] | None = None
     function_call: str | FunctionCallSelection | None = None
     tools: list[ToolDefinition] | None = None
-    tool_choice: str | ToolChoiceOption | None = None
-    n: int | None = 1
+    tool_choice: str | ToolChoiceOption | ResponsesToolChoice | None = None
+    n: int | None = Field(default=1, ge=1)
     stream: bool | None = False
     stop: str | list[str] | None = None
     logit_bias: dict[str, float] | None = None  # Ignored by EasyDeL
     user: str | None = None  # Ignored by EasyDeL
     chat_template_kwargs: dict[str, int | float | str | bool] | None = None
     ignore_eos: bool = False  # vLLM-compatible extension: generate until max_tokens or a stop string
+
+    @model_validator(mode="after")
+    def _validate_sampling_combinations(self) -> "ChatCompletionRequest":
+        _validate_greedy_sample_count(self.temperature, self.n)
+        return self
 
 
 class ChatCompletionResponseChoice(OpenAIBaseModel):
@@ -495,20 +519,25 @@ class CompletionRequest(OpenAIBaseModel):
     model: str
     prompt: str | list[str]
     max_tokens: TokenLimit = Field(default=None, ge=1)
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    repetition_penalty: float = 1.0
-    temperature: float | None = 0.7
-    top_p: float = 0.95
-    top_k: int = 0
-    min_p: float = 0.0
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    repetition_penalty: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    temperature: float | None = Field(default=0.7, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float = Field(default=0.95, gt=0.0, le=1.0, allow_inf_nan=False)
+    top_k: int = Field(default=0, ge=0)
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
     suppress_tokens: list[int] = Field(default_factory=list)
-    n: int | None = 1
+    n: int | None = Field(default=1, ge=1)
     stream: bool | None = False
     stop: str | list[str] | None = None
     logit_bias: dict[str, float] | None = None
     user: str | None = None
     ignore_eos: bool = False  # vLLM-compatible extension: generate until max_tokens or a stop string
+
+    @model_validator(mode="after")
+    def _validate_sampling_combinations(self) -> "CompletionRequest":
+        _validate_greedy_sample_count(self.temperature, self.n)
+        return self
 
 
 class ResponsesToolDefinition(FunctionDefinition):
@@ -521,18 +550,6 @@ class ResponsesToolDefinition(FunctionDefinition):
     def function(self) -> FunctionDefinition:
         """Expose a chat-compatible function view without changing Responses serialization."""
         return FunctionDefinition.model_validate(self.model_dump(exclude={"type"}, exclude_none=True))
-
-
-class ResponsesToolChoice(OpenAIBaseModel):
-    """Flat Responses function selector, with a compatibility view for chat consumers."""
-
-    type: tp.Literal["function"] = "function"
-    name: str
-
-    @property
-    def function(self) -> ToolChoiceFunction:
-        """Return the nested selector used at chat-template boundaries."""
-        return ToolChoiceFunction(name=self.name)
 
 
 class ResponsesRequest(OpenAIBaseModel):
@@ -584,15 +601,15 @@ class ResponsesRequest(OpenAIBaseModel):
     max_output_tokens: TokenLimit = Field(default=None, ge=1)
     max_tokens: TokenLimit = Field(default=None, ge=1)
     max_completion_tokens: TokenLimit = Field(default=None, ge=1)
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    min_p: float | None = None
-    presence_penalty: float | None = None
-    frequency_penalty: float | None = None
-    repetition_penalty: float | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0, allow_inf_nan=False)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0, allow_inf_nan=False)
+    repetition_penalty: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     stop: str | list[str] | None = None
-    n: int | None = None
+    n: int | None = Field(default=None, ge=1)
 
     tools: list[ResponsesToolDefinition | ToolDefinition] | None = None
     functions: list[FunctionDefinition] | None = None
@@ -604,6 +621,11 @@ class ResponsesRequest(OpenAIBaseModel):
     truncation: str | None = None
     include: list[str] | None = None
     metadata: dict[str, tp.Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_sampling_combinations(self) -> "ResponsesRequest":
+        _validate_greedy_sample_count(self.temperature, self.n)
+        return self
 
 
 class CompletionLogprobs(OpenAIBaseModel):

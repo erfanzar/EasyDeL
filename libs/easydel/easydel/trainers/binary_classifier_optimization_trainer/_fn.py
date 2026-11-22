@@ -24,6 +24,7 @@ parameter, and the scheduled-VJP loss adapter used under MPMD pipelining.
 from __future__ import annotations
 
 import collections.abc
+import math
 import typing as tp
 
 import jax
@@ -40,6 +41,7 @@ from easydel.trainers._logprob_utils import (
     compute_sequence_scores_from_hidden_states,
     compute_token_logps_and_entropies_chunked,
     resolve_lmhead_chunksize,
+    sum_logits_vocab_chunked,
 )
 from easydel.trainers._shared import apply_paired_truncation, gather_multimodal_kwargs
 
@@ -50,6 +52,7 @@ from ..training_utils import (
     constrain_scheduled_batch,
     filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     prepare_scheduled_reference_outputs,
     register_scheduled_loss_adapter,
@@ -95,17 +98,25 @@ class RunningMoments:
 
         Used when only the batch sum / sum of squares / count are available on
         host (for example after a jitted step reduced the per-example rewards).
+        Non-finite inputs or non-positive counts are ignored so a single NaN/Inf
+        step cannot poison the running BCO threshold.
 
         Args:
             batch_mean: Mean of the new values.
             batch_var: Population variance of the new values.
-            batch_count: Number of new values. Non-positive counts are ignored.
+            batch_count: Number of new values. Non-positive or non-finite counts are ignored.
         """
-        if not batch_count > 0:
-            return
         batch_mean = float(batch_mean)
-        batch_var = max(float(batch_var), 0.0)
+        batch_var = float(batch_var)
         batch_count = float(batch_count)
+        if not (
+            math.isfinite(batch_mean)
+            and math.isfinite(batch_var)
+            and math.isfinite(batch_count)
+            and batch_count > 0.0
+        ):
+            return
+        batch_var = max(batch_var, 0.0)
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
@@ -114,8 +125,12 @@ class RunningMoments:
         old_sum = self.var * self.count + delta * delta * self.count * batch_count / tot_count
         tot_sum = old_sum + new_sum
 
-        self.mean += delta * batch_count / tot_count
-        self.var = tot_sum / tot_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        new_var = tot_sum / tot_count
+        if not (math.isfinite(new_mean) and math.isfinite(new_var) and math.isfinite(tot_count)):
+            return
+        self.mean = new_mean
+        self.var = new_var
         self.count = tot_count
 
     def as_dict(self) -> dict[str, float]:
@@ -132,9 +147,12 @@ class RunningMoments:
         Args:
             data: Dictionary with mean, var, and count.
         """
-        self.mean = float(data.get("mean", 0.0))
-        self.var = float(data.get("var", 1.0))
-        self.count = float(data.get("count", 1e-24))
+        mean = float(data.get("mean", 0.0))
+        var = float(data.get("var", 1.0))
+        count = float(data.get("count", 1e-24))
+        self.mean = mean if math.isfinite(mean) else 0.0
+        self.var = max(var, 0.0) if math.isfinite(var) else 1.0
+        self.count = count if (math.isfinite(count) and count > 0.0) else 1e-24
 
 
 def concatenated_forward(
@@ -198,9 +216,8 @@ def concatenated_forward(
 
     Returns:
         Dict with ``completion_logps`` (``[batch]`` summed log-probs),
-        ``completion_logits`` (raw logits or ``None`` under headless
-        scoring), ``mean_completion_logits`` (scalar mean for
-        diagnostics), and optionally ``aux_loss``.
+        ``mean_completion_logits`` (scalar mean for diagnostics), and
+        optionally ``aux_loss``.
     """
 
     prompt_input_ids = batch["prompt_input_ids"]
@@ -235,7 +252,11 @@ def concatenated_forward(
         )
         completion_logps = jnp.where(loss_mask, gathered_logps, 0.0).sum(axis=1)
         token_logit_sums = jnp.sum(
-            jnp.where(loss_mask, logits.astype(jnp.float32).sum(axis=-1), 0.0),
+            jnp.where(
+                loss_mask,
+                sum_logits_vocab_chunked(logits, chunk_size=logprob_vocab_chunk_size),
+                0.0,
+            ),
             axis=1,
         )
         token_counts = jnp.sum(loss_mask.astype(jnp.float32), axis=1)
@@ -292,7 +313,11 @@ def concatenated_forward(
             )
             completion_logps = jnp.where(loss_mask, gathered_logps, 0.0).sum(axis=1)
             token_logit_sums = jnp.sum(
-                jnp.where(loss_mask, logits_shifted.astype(jnp.float32).sum(axis=-1), 0.0),
+                jnp.where(
+                    loss_mask,
+                    sum_logits_vocab_chunked(logits_shifted, chunk_size=logprob_vocab_chunk_size),
+                    0.0,
+                ),
                 axis=1,
             )
             token_counts = jnp.sum(loss_mask.astype(jnp.float32), axis=1)
@@ -301,12 +326,12 @@ def concatenated_forward(
 
     output = {
         "completion_logps": completion_logps,
-        "completion_logits": logits,
         "mean_completion_logits": mean_logits,
     }
 
-    if aux_loss_enabled and hasattr(outputs, "aux_loss"):
-        output["aux_loss"] = outputs.aux_loss
+    aux_loss = getattr(outputs, "aux_loss", None)
+    if aux_loss_enabled and aux_loss is not None:
+        output["aux_loss"] = aux_loss
     return tp.cast(dict[str, jax.Array], output)
 
 
@@ -560,21 +585,25 @@ def training_step(
                     losses = losses + policy_outputs["aux_loss"]
 
             with jax.named_scope(scope_root + "/loss_fn/build_metrics"):
+                chosen_count_safe = jnp.maximum(chosen_valid.sum(), 1.0)
+                rejected_count_safe = jnp.maximum(rejected_valid.sum(), 1.0)
+                chosen_reward_mean = chosen_rewards_masked.sum() / chosen_count_safe
+                rejected_reward_mean = rejected_rewards_masked.sum() / rejected_count_safe
                 metrics = LossMetrics(
                     loss=losses,
-                    chosen_rewards=chosen_rewards_masked,
-                    rejected_rewards=rejected_rewards_masked,
+                    chosen_rewards=chosen_reward_mean,
+                    rejected_rewards=rejected_reward_mean,
                     other_metrics={
                         "delta": running_delta,
                         "logps/chosen": (completion_logps * chosen_mask.astype(completion_logps.dtype)).sum()
-                        / jnp.maximum(chosen_valid.sum(), 1.0),
+                        / chosen_count_safe,
                         "logps/rejected": (completion_logps * rejected_mask.astype(completion_logps.dtype)).sum()
-                        / jnp.maximum(rejected_valid.sum(), 1.0),
+                        / rejected_count_safe,
                         "logits/mean": policy_outputs["mean_completion_logits"],
                         "count/chosen": chosen_valid.sum(),
                         "count/rejected": rejected_valid.sum(),
-                        "loss/chosen": chosen_losses.sum() / jnp.maximum(chosen_valid.sum(), 1.0),
-                        "loss/rejected": rejected_losses.sum() / jnp.maximum(rejected_valid.sum(), 1.0),
+                        "loss/chosen": chosen_losses.sum() / chosen_count_safe,
+                        "loss/rejected": rejected_losses.sum() / rejected_count_safe,
                         # Reward moments consumed host-side by ``RunningMoments`` (BCO delta).
                         # Every row is either chosen or rejected, so these cover the whole batch;
                         # gradient accumulation scales all three alike, so ratios stay exact.
@@ -674,7 +703,8 @@ def _make_bco_scheduled_loss(call):
     concatenated_forward_fn = call.get("concatenated_forward_fn")
     beta = call.get("beta")
     partition_spec = call.get("partition_spec")
-    straight_through_emulator = call.get("straight_through_emulator")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
     # The pipeline averages auxiliary metrics over its own microbatches. Report
     # moments at accumulation-minibatch scale, independent of pipeline chunking,
     # so the host hook uses the same count correction as the ordinary step.
@@ -706,11 +736,9 @@ def _make_bco_scheduled_loss(call):
             with jax.named_scope("easydel/trainer/bco/scheduled_loss/bind_module"):
                 call_batch = dict(batch)
                 call_batch.pop("running_mean", None)
-                if straight_through_emulator is not None:
-                    tree = straight_through_emulator(tree)
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 call_batch = constrain_scheduled_batch(module, call_batch, partition_spec)
-                _terminal_rank = _scheduled_terminal_stage_rank(module, call.schedule)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, schedule)
 
             with jax.named_scope("easydel/trainer/bco/scheduled_loss/policy_forward"):
                 policy_outputs = concatenated_forward_fn(module, call_batch, vocab_shard_stage=_terminal_rank)
@@ -853,23 +881,22 @@ def evaluation_step(
             udm_weights=rejected_weights,
         )
 
+    chosen_count_safe = jnp.maximum(chosen_valid.sum(), 1.0)
+    rejected_count_safe = jnp.maximum(rejected_valid.sum(), 1.0)
     metrics = LossMetrics(
         loss=losses,
-        chosen_rewards=chosen_rewards,
-        rejected_rewards=rejected_rewards,
+        chosen_rewards=chosen_rewards.sum() / chosen_count_safe,
+        rejected_rewards=rejected_rewards.sum() / rejected_count_safe,
         other_metrics={
             "delta": running_delta,
-            "logps/chosen": (completion_logps * chosen_mask.astype(completion_logps.dtype)).sum()
-            / jnp.maximum(chosen_valid.sum(), 1.0),
+            "logps/chosen": (completion_logps * chosen_mask.astype(completion_logps.dtype)).sum() / chosen_count_safe,
             "logps/rejected": (completion_logps * rejected_mask.astype(completion_logps.dtype)).sum()
-            / jnp.maximum(rejected_valid.sum(), 1.0),
+            / rejected_count_safe,
             "logits/mean": policy_outputs["mean_completion_logits"],
             "count/chosen": chosen_valid.sum(),
             "count/rejected": rejected_valid.sum(),
-            "loss/chosen": chosen_losses.sum() / jnp.maximum(chosen_valid.sum(), 1.0),
-            "loss/rejected": rejected_losses.sum() / jnp.maximum(rejected_valid.sum(), 1.0),
-            "mask/chosen": chosen_valid,
-            "mask/rejected": rejected_valid,
+            "loss/chosen": chosen_losses.sum() / chosen_count_safe,
+            "loss/rejected": rejected_losses.sum() / rejected_count_safe,
         },
     )
     return metrics

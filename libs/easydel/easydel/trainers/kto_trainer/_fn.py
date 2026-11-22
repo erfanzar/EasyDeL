@@ -35,10 +35,13 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
     ScheduledLossAdapter,
+    _scheduled_terminal_stage_rank,
     bind_scheduled_module,
     cached_scheduled_auxiliary,
     constrain_scheduled_batch,
+    filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
+    make_scheduled_module_binder,
     minibatch_call,
     prepare_scheduled_reference_outputs,
     register_scheduled_loss_adapter,
@@ -52,17 +55,36 @@ from ..training_utils import (
 KTO_LOSS_TYPES = ("kto", "apo_zero_unpaired")
 
 
-def _build_kl_batch(batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
-    """Create mismatched prompt/completion batch for KL estimation.
+def _build_kl_batch(
+    batch: dict[str, jax.Array],
+    *,
+    is_encoder_decoder: bool = False,
+    label_pad_token_id: int = -100,
+    padding_value: int = 0,
+    truncation_mode: str = "keep_end",
+) -> dict[str, jax.Array]:
+    """Create a genuinely mismatched ``(prompt_i, completion_{(i-1)%B})`` batch for KL estimation.
 
-    Rolls completion sequences by one position to create mismatched pairs,
-    enabling estimation of KL divergence between policy and reference.
+    For encoder-decoder models (or batches without ``completion_labels``), prompts and
+    completions already live in separate tensors so rolling ``completion_*`` by ``shift=1``
+    along axis 0 pairs ``prompt_i`` with ``completion_{(i-1)%B}``.
+
+    For decoder-only models where ``completion_input_ids`` packs ``prompt_i + completion_i``
+    and ``completion_labels`` masks prompt tokens with ``label_pad_token_id``, this helper
+    separates each row's prompt and completion spans, rolls only the completion spans across
+    the batch, and reassembles ``[prompt_i, completion_{(i-1)%B}]`` with matching attention
+    masks and labels (preserving static ``[B, L]`` shapes under JIT).
 
     Args:
         batch: Original batch with prompts and completions.
+        is_encoder_decoder: Whether the model is encoder-decoder.
+        label_pad_token_id: Label sentinel masking prompt and pad positions.
+        padding_value: Token ID used to pad unused trailing positions.
+        truncation_mode: ``"keep_end"`` (default) or ``"keep_start"`` when a
+            mismatched ``prompt_i + completion_{(i-1)%B}`` pair exceeds ``L``.
 
     Returns:
-        Batch with rolled completions for KL computation.
+        Batch with mismatched prompt/completion pairs for KL computation.
     """
 
     kl_batch: dict[str, jax.Array] = {
@@ -74,25 +96,78 @@ def _build_kl_batch(batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
         if key in batch:
             kl_batch[key] = batch[key]
 
-    def _rolled(name: str):
-        """Insert a 1-position rolled copy of ``batch[name]`` into ``kl_batch``.
+    if is_encoder_decoder or "completion_labels" not in batch:
+        for field in (
+            "completion_input_ids",
+            "completion_attention_mask",
+            "completion_labels",
+            "completion_decoder_input_ids",
+        ):
+            if field in batch:
+                kl_batch[field] = jnp.roll(batch[field], shift=1, axis=0)
+        return kl_batch
 
-        Used to build the KL-estimation batch by pairing each prompt
-        with the *next* example's completion.
+    full_ids = batch["completion_input_ids"]
+    full_mask = batch["completion_attention_mask"]
+    full_labels = batch["completion_labels"]
+    seq_len = full_ids.shape[1]
 
-        Args:
-            name: Batch column name to roll into the KL batch.
-        """
-        if name in batch:
-            kl_batch[name] = jnp.roll(batch[name], shift=1, axis=0)
+    valid_mask = full_mask != 0
+    comp_mask = valid_mask & (full_labels != label_pad_token_id)
+    prompt_mask = valid_mask & (~comp_mask)
 
-    for field in (
-        "completion_input_ids",
-        "completion_attention_mask",
-        "completion_labels",
-        "completion_decoder_input_ids",
-    ):
-        _rolled(field)
+    # Compact prompt tokens and completion tokens to index 0 within each row in
+    # original relative order (pure JAX, static shape [B, L]).
+    prompt_order = jnp.argsort(~prompt_mask, axis=1, stable=True)
+    prompt_ids_compact = jnp.take_along_axis(full_ids, prompt_order, axis=1)
+    prompt_len = jnp.sum(prompt_mask, axis=1, dtype=jnp.int32)
+
+    comp_order = jnp.argsort(~comp_mask, axis=1, stable=True)
+    comp_ids_compact = jnp.take_along_axis(full_ids, comp_order, axis=1)
+    comp_labels_compact = jnp.take_along_axis(full_labels, comp_order, axis=1)
+    comp_len = jnp.sum(comp_mask, axis=1, dtype=jnp.int32)
+
+    # Roll only the completion spans across the batch so row i pairs prompt_i with completion_{(i-1)%B}.
+    rolled_comp_ids = jnp.roll(comp_ids_compact, shift=1, axis=0)
+    rolled_comp_labels = jnp.roll(comp_labels_compact, shift=1, axis=0)
+    rolled_comp_len = jnp.roll(comp_len, shift=1, axis=0)
+
+    if truncation_mode == "keep_start":
+        eff_prompt_len = jnp.minimum(prompt_len, seq_len)
+        eff_comp_len = jnp.minimum(rolled_comp_len, seq_len - eff_prompt_len)
+        prompt_offset = jnp.zeros_like(prompt_len)
+        comp_offset = jnp.zeros_like(rolled_comp_len)
+    else:
+        overflow = jnp.maximum(prompt_len + rolled_comp_len - seq_len, 0)
+        eff_prompt_len = jnp.maximum(prompt_len - overflow, 0)
+        prompt_offset = prompt_len - eff_prompt_len
+        eff_comp_len = jnp.minimum(rolled_comp_len, seq_len - eff_prompt_len)
+        comp_offset = rolled_comp_len - eff_comp_len
+
+    pos = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+    in_prompt = pos < eff_prompt_len[:, None]
+    in_comp = (pos >= eff_prompt_len[:, None]) & (pos < (eff_prompt_len + eff_comp_len)[:, None])
+
+    max_idx = max(seq_len - 1, 0)
+    p_idx = jnp.clip(pos + prompt_offset[:, None], 0, max_idx)
+    c_idx = jnp.clip(pos - eff_prompt_len[:, None] + comp_offset[:, None], 0, max_idx)
+
+    gathered_prompt_ids = jnp.take_along_axis(prompt_ids_compact, p_idx, axis=1)
+    gathered_comp_ids = jnp.take_along_axis(rolled_comp_ids, c_idx, axis=1)
+    gathered_comp_labels = jnp.take_along_axis(rolled_comp_labels, c_idx, axis=1)
+
+    pad_val = jnp.asarray(padding_value, dtype=full_ids.dtype)
+    label_pad_val = jnp.asarray(label_pad_token_id, dtype=full_labels.dtype)
+
+    kl_batch["completion_input_ids"] = jnp.where(
+        in_prompt,
+        gathered_prompt_ids,
+        jnp.where(in_comp, gathered_comp_ids, pad_val),
+    )
+    kl_batch["completion_attention_mask"] = (in_prompt | in_comp).astype(full_mask.dtype)
+    kl_batch["completion_labels"] = jnp.where(in_comp, gathered_comp_labels, label_pad_val)
+    if "completion_decoder_input_ids" in batch:
+        kl_batch["completion_decoder_input_ids"] = jnp.roll(batch["completion_decoder_input_ids"], shift=1, axis=0)
 
     return kl_batch
 
@@ -108,6 +183,7 @@ def kto_objective(
     loss_type: str,
     policy_kl_logps: jax.Array | None = None,
     reference_kl_logps: jax.Array | None = None,
+    kl: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Compute the KTO (or APO-zero-unpaired) loss and per-example implicit rewards.
 
@@ -174,7 +250,9 @@ def kto_objective(
 
     logratios = policy_logps - reference_logps
 
-    if policy_kl_logps is not None and reference_kl_logps is not None:
+    if kl is not None:
+        kl = jnp.asarray(kl, dtype=dtype).reshape(())
+    elif policy_kl_logps is not None and reference_kl_logps is not None:
         kl = jnp.maximum(jnp.mean(policy_kl_logps - reference_kl_logps), 0.0)
     else:
         kl = jnp.zeros((), dtype=dtype)
@@ -229,6 +307,10 @@ def training_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
+    is_encoder_decoder: bool = False,
+    label_pad_token_id: int = -100,
+    padding_value: int = 0,
+    truncation_mode: str = "keep_end",
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Run one KTO training step (forward, loss, backward, optimizer update).
 
@@ -303,50 +385,65 @@ def training_step(
             ref_out = forward_fn(reference_state.model, batch)
             batch["reference_logps"] = jax.lax.stop_gradient(ref_out["completion_logps"])
 
+        full_kl: jax.Array | None = None
         if calculate_kl:
             # Both the reference AND policy KL anchors must be built from the same
-            # full-batch rolled pairing (prompt_i with completion_{i-1}). The
-            # reference is precomputed here and sliced per-microbatch by
-            # minibatch_call. The policy KL is stop-gradient (it never needs a
-            # gradient), so it is likewise precomputed here on the full batch at
-            # the current policy params instead of being re-rolled inside
-            # _loss_fn -- re-rolling within a microbatch (`_build_kl_batch(minibatch)`)
-            # pairs prompt_i with a DIFFERENT completion than the reference,
-            # corrupting the KL anchor `z` whenever gradient_accumulation_steps > 1.
-            # This mirrors the MPMD scheduled path (_prepare_kto_scheduled_batch).
+            # full-batch rolled pairing (prompt_i with completion_{i-1}). Reducing
+            # kl = max(mean(policy_kl - ref_kl), 0) ONCE on the full batch before
+            # microbatching avoids upward Jensen bias under gradient accumulation.
             kl_batch = None
-            if "_reference_kl_logps" not in batch:
+            reference_kl_logps = batch.get("_reference_kl_logps")
+            if reference_kl_logps is None:
                 # Dataset-level KL caches were paired before training shuffle;
                 # only runtime anchors share the current policy's rolled pairs.
-                kl_batch = _build_kl_batch(batch)
+                kl_batch = _build_kl_batch(
+                    batch,
+                    is_encoder_decoder=is_encoder_decoder,
+                    label_pad_token_id=label_pad_token_id,
+                    padding_value=padding_value,
+                    truncation_mode=truncation_mode,
+                )
                 ref_kl_out = forward_fn(reference_state.model, kl_batch)
-                reference_kl_logps = ref_kl_out["completion_logps"]
-                batch["_reference_kl_logps"] = jax.lax.stop_gradient(reference_kl_logps)
-            if "_policy_kl_logps" not in batch:
+                reference_kl_logps = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
+            else:
+                reference_kl_logps = jax.lax.stop_gradient(reference_kl_logps)
+
+            policy_kl_logps = batch.get("_policy_kl_logps")
+            if policy_kl_logps is None:
                 policy_kl_logps = batch.get("policy_KL_logps")
                 if policy_kl_logps is None:
                     if kl_batch is None:
-                        kl_batch = _build_kl_batch(batch)
+                        kl_batch = _build_kl_batch(
+                            batch,
+                            is_encoder_decoder=is_encoder_decoder,
+                            label_pad_token_id=label_pad_token_id,
+                            padding_value=padding_value,
+                            truncation_mode=truncation_mode,
+                        )
                     policy_kl_out = forward_fn(state.model, kl_batch)
                     policy_kl_logps = policy_kl_out["completion_logps"]
-                batch["_policy_kl_logps"] = jax.lax.stop_gradient(policy_kl_logps)
+                policy_kl_logps = jax.lax.stop_gradient(policy_kl_logps)
+            else:
+                policy_kl_logps = jax.lax.stop_gradient(policy_kl_logps)
+
+            full_kl = jax.lax.stop_gradient(jnp.maximum(jnp.mean(policy_kl_logps - reference_kl_logps), 0.0))
 
     def _loss_fn(tree: spx.State, minibatch: dict[str, jax.Array]):
         """Compute the KTO loss for one minibatch.
 
-        Runs the policy concatenated forward, optionally builds the KL
-        batch (rolled completions) for both policy and reference,
-        evaluates :func:`kto_objective`, and folds in any auxiliary
-        loss the policy reports.
+        Runs the policy concatenated forward, evaluates :func:`kto_objective`
+        against the full-batch KL anchor ``full_kl``, and folds in any
+        auxiliary loss the policy reports.
 
         Args:
             tree: Policy graphstate to differentiate against.
             minibatch: One minibatch slice with ``label`` and the
-                precomputed reference (and optional KL) log-probs.
+                precomputed reference log-probs.
 
         Returns:
-            ``(loss, metrics)`` with chosen / rejected rewards and the
-            KL diagnostic recorded under ``other_metrics["kl"]``.
+            ``(loss, metrics)`` with class-normalized chosen / rejected
+            rewards and the KL diagnostic recorded under
+            ``other_metrics["kl"]``.
         """
         with jax.named_scope(scope_root + "/loss_fn"):
             if straight_through_emulator is not None:
@@ -360,16 +457,6 @@ def training_step(
 
             reference_logps = jax.lax.stop_gradient(minibatch["reference_logps"])
 
-            if calculate_kl:
-                # Both KL anchors were precomputed on the full batch (same rolled
-                # pairing) and sliced per-microbatch by minibatch_call. Re-rolling
-                # here with `_build_kl_batch(minibatch)` would mis-pair the policy
-                # completions vs the reference under gradient accumulation.
-                policy_kl_logps = jax.lax.stop_gradient(minibatch["_policy_kl_logps"])
-                reference_kl_logps = jax.lax.stop_gradient(minibatch["_reference_kl_logps"])
-            else:
-                policy_kl_logps = reference_kl_logps = None
-
             with jax.named_scope(scope_root + "/loss_fn/compute_kto_loss"):
                 loss, chosen_rewards, rejected_rewards, kl = kto_objective(
                     policy_logps,
@@ -379,18 +466,21 @@ def training_step(
                     desirable_weight=desirable_weight,
                     undesirable_weight=undesirable_weight,
                     loss_type=loss_type,
-                    policy_kl_logps=policy_kl_logps,
-                    reference_kl_logps=reference_kl_logps,
+                    kl=full_kl,
                 )
 
-                if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
-                    loss = loss + aux_loss_coef * policy_out["aux_loss"]
+                aux_loss = policy_out.get("aux_loss")
+                if aux_loss_coef > 0.0 and aux_loss is not None:
+                    loss = loss + aux_loss_coef * aux_loss
 
             with jax.named_scope(scope_root + "/loss_fn/build_metrics"):
+                labels_bool = minibatch["label"].astype(bool)
+                chosen_count = jnp.maximum(labels_bool.astype(chosen_rewards.dtype).sum(), 1.0)
+                rejected_count = jnp.maximum((~labels_bool).astype(rejected_rewards.dtype).sum(), 1.0)
                 metrics = LossMetrics(
                     loss=loss,
-                    chosen_rewards=chosen_rewards,
-                    rejected_rewards=rejected_rewards,
+                    chosen_rewards=chosen_rewards.sum() / chosen_count,
+                    rejected_rewards=rejected_rewards.sum() / rejected_count,
                     other_metrics={"kl": kl},
                 )
             return metrics.loss, metrics
@@ -456,6 +546,10 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
     if "_policy_kl_logps" in batch and "_reference_kl_logps" not in batch and "reference_KL_logps" in batch:
         batch["_reference_kl_logps"] = batch["reference_KL_logps"]
     if "_reference_kl_logps" in batch and "_policy_kl_logps" in batch:
+        if isinstance(batch["_policy_kl_logps"], jax.Array) and isinstance(batch["_reference_kl_logps"], jax.Array):
+            batch["_kl"] = jax.lax.stop_gradient(
+                jnp.maximum(jnp.mean(batch["_policy_kl_logps"] - batch["_reference_kl_logps"]), 0.0)
+            )
         return batch
 
     reference_state = call.get("reference_state")
@@ -463,7 +557,13 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
     if reference_state is None or forward_fn is None:
         raise RuntimeError("KTO scheduled MPMD KL requires reference_state and forward_fn.")
 
-    kl_batch = _build_kl_batch(batch)
+    kl_batch = _build_kl_batch(
+        batch,
+        is_encoder_decoder=bool(call.get("is_encoder_decoder", False)),
+        label_pad_token_id=int(call.get("label_pad_token_id", -100)),
+        padding_value=int(call.get("padding_value", 0)),
+        truncation_mode=str(call.get("truncation_mode", "keep_end")),
+    )
     partition_spec = call.get("partition_spec")
 
     _kl_microbatches = getattr(call.schedule, "microbatches", 1)
@@ -487,6 +587,10 @@ def _prepare_kto_scheduled_batch(call) -> dict[str, tp.Any]:
             )
             policy_out = stop_gradient_tree(policy_forward(policy_model, policy_kl_batch))
         batch["_policy_kl_logps"] = policy_out["completion_logps"]
+    if isinstance(batch["_policy_kl_logps"], jax.Array) and isinstance(batch["_reference_kl_logps"], jax.Array):
+        batch["_kl"] = jax.lax.stop_gradient(
+            jnp.maximum(jnp.mean(batch["_policy_kl_logps"] - batch["_reference_kl_logps"]), 0.0)
+        )
     return batch
 
 
@@ -535,6 +639,8 @@ def _make_kto_scheduled_loss(call):
     calculate_kl = bool(call.get("calculate_kl", False))
     aux_loss_coef = float(call.get("aux_loss_coef", 0.0))
     partition_spec = call.get("partition_spec")
+    bind_module = make_scheduled_module_binder(call, binder_fn=bind_scheduled_module)
+    schedule = call.schedule
 
     def scheduled_loss(tree: spx.State, batch: dict[str, tp.Any]):
         """Compute the scalar KTO loss inside the SpectraX scheduled VJP.
@@ -550,18 +656,27 @@ def _make_kto_scheduled_loss(call):
         """
         with jax.named_scope("easydel/trainer/kto/scheduled_loss"):
             with jax.named_scope("easydel/trainer/kto/scheduled_loss/bind_module"):
-                module = bind_scheduled_module(call, tree)
+                module = bind_module(tree)
                 call_batch = constrain_scheduled_batch(module, batch, partition_spec)
+                _terminal_rank = _scheduled_terminal_stage_rank(module, schedule)
             with jax.named_scope("easydel/trainer/kto/scheduled_loss/policy_forward"):
-                policy_out = forward_fn(module, call_batch)
+                forward_kwargs = {"vocab_shard_stage": _terminal_rank} if _terminal_rank is not None else {}
+                if forward_kwargs:
+                    forward_kwargs = filter_kwargs_for_callable(forward_fn, forward_kwargs)
+                policy_out = forward_fn(module, call_batch, **forward_kwargs)
                 policy_logps = policy_out["completion_logps"]
                 reference_logps = jax.lax.stop_gradient(call_batch["reference_logps"])
 
             if calculate_kl:
-                policy_kl_logps = jax.lax.stop_gradient(call_batch["_policy_kl_logps"])
-                reference_kl_logps = jax.lax.stop_gradient(call_batch["_reference_kl_logps"])
+                kl_override = call_batch.get("_kl")
+                if kl_override is not None:
+                    policy_kl_logps = reference_kl_logps = None
+                    kl_override = jax.lax.stop_gradient(kl_override)
+                else:
+                    policy_kl_logps = jax.lax.stop_gradient(call_batch["_policy_kl_logps"])
+                    reference_kl_logps = jax.lax.stop_gradient(call_batch["_reference_kl_logps"])
             else:
-                policy_kl_logps = reference_kl_logps = None
+                kl_override = policy_kl_logps = reference_kl_logps = None
 
             with jax.named_scope("easydel/trainer/kto/scheduled_loss/compute_kto_loss"):
                 loss, *_ = kto_objective(
@@ -574,10 +689,12 @@ def _make_kto_scheduled_loss(call):
                     loss_type=loss_type,
                     policy_kl_logps=policy_kl_logps,
                     reference_kl_logps=reference_kl_logps,
+                    kl=kl_override,
                 )
 
-                if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
-                    loss = loss + aux_loss_coef * policy_out["aux_loss"]
+                aux_loss = policy_out.get("aux_loss")
+                if aux_loss_coef > 0.0 and aux_loss is not None:
+                    loss = loss + aux_loss_coef * aux_loss
             return loss
 
     return scheduled_loss
@@ -606,6 +723,10 @@ def evaluation_step(
     calculate_kl: bool,
     aux_loss_coef: float,
     partition_spec: PartitionSpec | None = None,
+    is_encoder_decoder: bool = False,
+    label_pad_token_id: int = -100,
+    padding_value: int = 0,
+    truncation_mode: str = "keep_end",
 ) -> LossMetrics:
     """Run one KTO evaluation step (forward only, no parameter update).
 
@@ -659,7 +780,13 @@ def evaluation_step(
 
     if calculate_kl:
         with jax.named_scope(eval_scope + "/kl_forward"):
-            kl_batch = _build_kl_batch(batch)
+            kl_batch = _build_kl_batch(
+                batch,
+                is_encoder_decoder=is_encoder_decoder,
+                label_pad_token_id=label_pad_token_id,
+                padding_value=padding_value,
+                truncation_mode=truncation_mode,
+            )
             policy_kl_logps = forward_fn(state.model, kl_batch)["completion_logps"]
             reference_kl_logps = forward_fn(reference_state.model, kl_batch)["completion_logps"]
     else:
@@ -678,12 +805,16 @@ def evaluation_step(
             reference_kl_logps=reference_kl_logps,
         )
 
-        if aux_loss_coef > 0.0 and "aux_loss" in policy_out:
-            loss = loss + aux_loss_coef * policy_out["aux_loss"]
+        aux_loss = policy_out.get("aux_loss")
+        if aux_loss_coef > 0.0 and aux_loss is not None:
+            loss = loss + aux_loss_coef * aux_loss
 
+    labels_bool = batch["label"].astype(bool)
+    chosen_count = jnp.maximum(labels_bool.astype(chosen_rewards.dtype).sum(), 1.0)
+    rejected_count = jnp.maximum((~labels_bool).astype(rejected_rewards.dtype).sum(), 1.0)
     return LossMetrics(
         loss=loss,
-        chosen_rewards=chosen_rewards,
-        rejected_rewards=rejected_rewards,
+        chosen_rewards=chosen_rewards.sum() / chosen_count,
+        rejected_rewards=rejected_rewards.sum() / rejected_count,
         other_metrics={"kl": kl},
     )

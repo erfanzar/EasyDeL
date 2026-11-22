@@ -379,3 +379,156 @@ def test_polyak_reference_update_allocates_fresh_arrays():
     for policy_leaf, replaced_leaf in zip(_array_leaves(state.graphstate), _array_leaves(replaced), strict=True):
         assert replaced_leaf is not policy_leaf
         assert jnp.array_equal(replaced_leaf, policy_leaf)
+
+
+def test_value_head_propagates_esurge_cache_scope_key_and_reuses_cached_engine(monkeypatch):
+    from easydel.infra.mixins import generation as gen_mod
+    from easydel.modules.llama.llama_configuration import LlamaConfig
+    from easydel.modules.llama.modeling_llama import LlamaForCausalLM
+    from easydel.trainers.proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
+
+    config = LlamaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        max_position_embeddings=16,
+        sharding_axis_dims=(1, 1, 1, 1, 1, 1),
+    )
+    base_model = LlamaForCausalLM(config=config, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
+    wrapped = CausalLMWithValueHead(base_model, rngs=spx.Rngs(1))
+    state = wrapped.to_state(trainable_selector="parameters")
+    scope_key = state.esurge_cache_scope_key
+
+    # Track engines keyed by the real EasyGenerationMixin._esurge_cache_scope() path.
+    fake_cache: dict[str, SimpleNamespace] = {}
+    monkeypatch.setattr(gen_mod, "_ESURGE_MAP_CACHE", fake_cache)
+
+    created_engines = []
+    paused_engines = []
+    resumed_engines = []
+    refreshed_models = []
+
+    def fake_get_esurge(self, *args, **kwargs):
+        cache_key = f"{self._esurge_cache_scope()}-cfg"
+        if cache_key not in fake_cache:
+            eng = SimpleNamespace(
+                cache_key=cache_key,
+                paused=False,
+                silent_mode=True,
+                pause=lambda: paused_engines.append(cache_key),
+                resume=lambda: resumed_engines.append(cache_key),
+                update_model_weights=lambda model, **kw: refreshed_models.append(type(model)),
+                num_running_requests=0,
+                num_pending_requests=0,
+            )
+            fake_cache[cache_key] = eng
+            created_engines.append(cache_key)
+        return fake_cache[cache_key]
+
+    monkeypatch.setattr(LlamaForCausalLM, "get_esurge", fake_get_esurge)
+
+    # Simulate two consecutive PPO rollout steps reconstructing state.model fresh each time.
+    m1 = state.model
+    eng1 = m1.get_esurge()
+    assert m1.model._esurge_cache_scope() == scope_key
+
+    m2 = state.model
+    assert m2 is not m1
+    assert m2.model is not m1.model
+    eng2 = m2.get_esurge()
+    assert eng2 is eng1, "CausalLMWithValueHead must reuse the cached eSurge engine across state.model reconstructions"
+    assert len(created_engines) == 1
+
+    # release_generation_runtime calls state.model.pause_esurge(); it must match the same scope.
+    m3 = state.model
+    listed = m3.list_esurge_engines()
+    assert len(listed) == 1
+    assert listed[0]["cache_key"] == f"{scope_key}-cfg"
+    m3.pause_esurge()
+    assert paused_engines == [f"{scope_key}-cfg"]
+    m3.resume_esurge()
+    assert resumed_engines == [f"{scope_key}-cfg"]
+    assert refreshed_models == [LlamaForCausalLM]
+
+    # A snapshot with a distinct cache scope key must propagate that distinct key onto self.model.
+    custom_state = state.replace(esurge_cache_scope_key="ppo-custom-scope")
+    m_custom = custom_state.model
+    eng_custom = m_custom.get_esurge()
+    assert eng_custom is not eng1
+    assert eng_custom.cache_key == "ppo-custom-scope-cfg"
+    assert m_custom.model._esurge_cache_scope() == "ppo-custom-scope"
+    assert custom_state.model._esurge_cache_scope() == "ppo-custom-scope"
+
+
+def test_ppo_compute_refmodel_logps_headless_fallback_to_hidden_states(monkeypatch):
+    import easydel as ed
+    from easydel.modules.llama.llama_configuration import LlamaConfig
+    from easydel.modules.llama.modeling_llama import LlamaForCausalLM
+    from easydel.trainers.proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
+    from easydel.trainers.trainer.trainer import Trainer
+
+    monkeypatch.setattr(Trainer, "__init__", lambda self, **kwargs: None)
+    config = LlamaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        max_position_embeddings=16,
+        sharding_axis_dims=(1, 1, 1, 1, 1, 1),
+        lmhead_chunksize=2,
+    )
+    actor = LlamaForCausalLM(config=config, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
+    wrapped = CausalLMWithValueHead(actor, rngs=spx.Rngs(1))
+    policy_state = wrapped.to_state(trainable_selector="parameters")
+
+    args = ed.PPOConfig(
+        max_training_steps=1,
+        max_prompt_length=2,
+        max_completion_length=2,
+        kl_coef=0.05,
+        gradient_accumulation_steps=2,
+    )
+    trainer = ed.PPOTrainer(
+        arguments=args,
+        model=policy_state,
+        reward_funcs=lambda **_: [0.0],
+        processing_class=SimpleNamespace(pad_token_id=0, eos_token_id=1),
+    )
+    trainer._model = policy_state.model
+    trainer.model_state = policy_state
+    trainer.state_shardings = policy_state.shardings
+    trainer.scheduler = None
+    trainer._runtime_trace = lambda *a, **kw: None
+    trainer.arguments.ensure_checkpoint_path = lambda: None
+    trainer.arguments.get_streaming_checkpointer = lambda: None
+
+    # Patch CausalLMWithValueHead.forward to return last_hidden_state=None and hidden_states=(..., final_h)
+    # when apply_lm_head=False, asserting output_hidden_states=True was passed!
+    observed_kwargs = []
+    orig_forward = CausalLMWithValueHead.forward
+
+    def headless_hidden_only_forward(self, *f_args, **f_kwargs):
+        observed_kwargs.append(dict(f_kwargs))
+        out = orig_forward(self, *f_args, **f_kwargs)
+        if f_kwargs.get("apply_lm_head") is False:
+            assert f_kwargs.get("output_hidden_states") is True
+            h = out.last_hidden_state if out.last_hidden_state is not None else out.hidden_states[-1]
+            return SimpleNamespace(logits=None, last_hidden_state=None, hidden_states=(h,))
+        return out
+
+    monkeypatch.setattr(CausalLMWithValueHead, "forward", headless_hidden_only_forward)
+    trainer.configure_functions()
+    # Verify eval static args use gradient_accumulation_steps=1 (index 9).
+    assert trainer._eval_shared_fn_static_args[9] == 1
+
+    ids = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
+    mask = jnp.ones((1, 4), dtype=jnp.int32)
+    logps = trainer.compute_refmodel_logps(trainer.ref_state.graphstate, trainer.ref_state.graphother, ids, mask)
+    assert logps.shape == (1, 2)
+    assert jnp.all(jnp.isfinite(logps))
+    assert any(kw.get("apply_lm_head") is False and kw.get("output_hidden_states") is True for kw in observed_kwargs)

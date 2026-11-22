@@ -104,6 +104,13 @@ span), and the 20 most recent requests.
 
 ## Dashboard
 
+`serving serve` starts the dashboard by itself: the process serving the endpoint keeps `esurge-dashboard` running on
+`server.dashboard_port` (default `9090`, same address as the endpoint) and restarts it when it exits. It uses
+`esurge-dashboard` from `PATH`, else `libs/esurge-dashboard/target/release/`, else builds it there with cargo.
+`server.dashboard: false` turns it off. With dp replicas, replica 0's leader runs it, and every front answers
+`/metrics` for the whole deployment (it merges the fronts' counters and recomputes the windowed aggregate over all
+their requests), so the dashboard sees every request. To run it by hand:
+
 ```bash
 cd libs/esurge-dashboard && cargo build --release
 target/release/esurge-dashboard --upstream http://<leader-internal-ip>:8000 --listen <internal-ip>:9090

@@ -80,6 +80,55 @@ def compute_admission_key(
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
+def _derive_child_seed(base_seed: int, sample_idx: int) -> int:
+    """Derive a distinct, deterministic int64 child seed for ``n > 1`` parallel sampling."""
+    if sample_idx == 0:
+        return int(base_seed)
+    digest = hashlib.blake2b(f"{int(base_seed)}:{int(sample_idx)}".encode(), digest_size=8).digest()
+    derived = int.from_bytes(digest, "little") & ((1 << 63) - 1)
+    if derived == int(base_seed):
+        derived = (derived + 1) & ((1 << 63) - 1)
+    return derived
+
+
+class _ToolAdjustProxy:
+    """Adapter exposing ``tools``/``tool_choice`` from a chat request while routing mutations to ``SamplingParams``."""
+
+    def __init__(self, sampling_params: SamplingParams, tool_request: Any | None) -> None:
+        object.__setattr__(self, "_sampling_params", sampling_params)
+        object.__setattr__(self, "_tool_request", tool_request)
+
+    @property
+    def tools(self) -> Any:
+        return getattr(self._tool_request, "tools", None)
+
+    @property
+    def tool_choice(self) -> Any:
+        return getattr(self._tool_request, "tool_choice", None)
+
+    def __getattr__(self, name: str) -> Any:
+        sampling_params = object.__getattribute__(self, "_sampling_params")
+        if hasattr(sampling_params, name):
+            return getattr(sampling_params, name)
+        tool_request = object.__getattribute__(self, "_tool_request")
+        if tool_request is not None and hasattr(tool_request, name):
+            return getattr(tool_request, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_sampling_params"), name, value)
+
+
+def _apply_tool_parser_adjust_request(tool_parser: Any | None, sampling_params: SamplingParams, tool_request: Any | None) -> None:
+    """Invoke ``tool_parser.adjust_request(...)`` so special tool delimiters are preserved on ``sampling_params``."""
+    if tool_parser is None or not hasattr(tool_parser, "adjust_request"):
+        return
+    try:
+        tool_parser.adjust_request(_ToolAdjustProxy(sampling_params, tool_request))
+    except Exception:
+        logger.debug("Failed to apply tool parser adjust_request hook", exc_info=True)
+
+
 def clone_sampling_params(sampling_params: SamplingParams) -> SamplingParams:
     """Create a deep copy of sampling parameters.
 
@@ -263,6 +312,14 @@ class RequestAdmission:
 
         self._request_counter = 0
         self._counter_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Break engine callback references so closed engines do not retain reference cycles."""
+        self._callback_engine = None
+        self._scheduler_submit = None
+        self._sampling_params_callback = None
+        self._on_activity = None
+        self._info = None
 
     def generate_request_id(self) -> str:
         """Allocate a fresh request id under the counter lock.
@@ -503,6 +560,47 @@ class RequestAdmission:
         except Exception:
             logger.debug("Failed to configure reasoning parser prompt context", exc_info=True)
 
+    def rollback_request(self, request_id: str, child_request_ids: Sequence[str] = ()) -> None:
+        """Roll back registry and metrics entries for a request whose admission failed."""
+        self._registry.rollback(request_id, child_request_ids)
+        metrics_collector = get_metrics_collector()
+        if metrics_collector is not None:
+            if hasattr(metrics_collector, "cancel_request"):
+                metrics_collector.cancel_request(request_id)
+            elif hasattr(metrics_collector, "request_metrics"):
+                lock = getattr(metrics_collector, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        metrics_collector.request_metrics.pop(request_id, None)
+                else:
+                    metrics_collector.request_metrics.pop(request_id, None)
+
+    def _build_parsers_for_sample(
+        self,
+        *,
+        sample_request_id: str,
+        sampling_params: SamplingParams,
+        prompt_text: str,
+        prompt_token_ids: Sequence[int],
+        tool_parser_request: Any | None,
+    ) -> DelegatingParser:
+        """Instantiate per-sample reasoning/tool parsers and run each ``adjust_request`` hook once."""
+        _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
+        if _rp is not None:
+            _rp.adjust_request(sampling_params)
+        self._configure_reasoning_parser_for_prompt(
+            reasoning_parser=_rp,
+            prompt_text=prompt_text,
+            prompt_token_ids=prompt_token_ids,
+        )
+        _tp = build_tool_parser_or_none(self._tool_parser_class, self.tokenizer, context=f"request {sample_request_id}")
+        _apply_tool_parser_adjust_request(_tp, sampling_params, tool_parser_request)
+        return DelegatingParser(
+            reasoning_parser=_rp,
+            tool_parser=_tp,
+            tool_request=tool_parser_request,
+        )
+
     def add_request(
         self,
         request_id: str,
@@ -517,6 +615,8 @@ class RequestAdmission:
         pixel_values_videos: Any | None = None,
         video_grid_thw: Any | None = None,
         mm_features: list | None = None,
+        *,
+        track_tool_call_delta_history: bool = True,
     ) -> list[AdmissionRecord] | None:
         """Add a new request to the scheduler queue with intelligent context management.
 
@@ -740,41 +840,6 @@ class RequestAdmission:
                 logger.warn("Failed to decode truncated prompt; keeping original prompt text.")
 
         start_ts = time.perf_counter()
-        ev = threading.Event()
-
-        with self._request_lock:
-            self._request_events[request_id] = ev
-            self._active_requests[request_id] = RequestRecord(
-                prompt=prompt_for_engine,
-                prompt_token_ids=token_ids,
-                sampling_params=sampling_params,
-                start_time=start_ts,
-                last_decode_time=start_ts,
-                truncated=truncated,
-                tokens_dropped=tokens_dropped,
-                requested_new_tokens_original=original_requested_new,
-                requested_new_tokens_final=requested_new,
-                reserve_tokens=self.reserve_tokens,
-                max_model_len=max_model_len,
-            )
-            _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
-            if _rp is not None:
-                _rp.adjust_request(sampling_params)
-            self._configure_reasoning_parser_for_prompt(
-                reasoning_parser=_rp,
-                prompt_text=prompt_for_engine,
-                prompt_token_ids=token_ids,
-            )
-            _tp = build_tool_parser_or_none(self._tool_parser_class, self.tokenizer, context=f"request {request_id}")
-            self._active_requests[request_id].delegating_parser = DelegatingParser(
-                reasoning_parser=_rp,
-                tool_parser=_tp,
-                tool_request=tool_parser_request,
-            )
-
-        metrics_collector = get_metrics_collector()
-        if metrics_collector:
-            metrics_collector.start_request(request_id, len(token_ids), model_name=self._model_name)
 
         # Execution ids are authoritative: decoding and re-tokenizing can lose
         # processor-expanded placeholders or undo context truncation.
@@ -786,28 +851,6 @@ class RequestAdmission:
 
         # Handle n > 1 sampling: create one AdmissionRecord per sample
         n_samples = getattr(sampling_params, "n", 1) or 1
-
-        completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
-
-        output = RequestOutput(
-            request_id=request_id,
-            prompt=prompt_for_engine,
-            prompt_token_ids=prompt_token_segments,
-            outputs=completion_outputs,
-            finished=False,
-            accumulated_text="",
-            delta_text="",
-            raw_accumulated_text="",
-            raw_delta_text="",
-            tokens_per_second=0.0,
-            num_generated_tokens=0,
-            time_spent_generating=0.0,
-            first_token_time=None,
-            processing_time=0.0,
-            update_seq=0,
-            delta_seq=0,
-        )
-        self._registry.register(request_id, self._registry.get_record(request_id), output)
 
         eos_token_ids = [int(tid) for tid in (self._eos_ids or []) if tid is not None]
 
@@ -831,96 +874,151 @@ class RequestAdmission:
                     sampling_params.stop_token_ids.append(eos_id)
                     all_stop_ids.add(eos_id)
 
-        mm_features_cache_key_only = None
-        if mm_features and n_samples > 1:
-            mm_features_cache_key_only = []
-            for feat in mm_features:
-                try:
-                    mm_features_cache_key_only.append(
-                        type(feat)(
-                            mm_hash=getattr(feat, "mm_hash", ""),
-                            modality=getattr(feat, "modality", "image"),
-                            pixel_values=None,
-                            grid_thw=None,
-                        )
-                    )
-                except Exception:
-                    # Worst-case fallback: keep the original feature object.
-                    # This preserves correctness at the cost of extra memory.
-                    mm_features_cache_key_only.append(feat)
+        completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
 
-        scheduler_requests: list[AdmissionRecord] = []
-        for sample_idx in range(n_samples):
+        output = RequestOutput(
+            request_id=request_id,
+            prompt=prompt_for_engine,
+            prompt_token_ids=prompt_token_segments,
+            outputs=completion_outputs,
+            finished=False,
+            accumulated_text="",
+            delta_text="",
+            raw_accumulated_text="",
+            raw_delta_text="",
+            tokens_per_second=0.0,
+            num_generated_tokens=0,
+            time_spent_generating=0.0,
+            first_token_time=None,
+            processing_time=0.0,
+            update_seq=0,
+            delta_seq=0,
+            tool_call_delta_history=[] if track_tool_call_delta_history else None,
+        )
+
+        # Snapshot base SamplingParams before any per-sample parser adjust_request mutation so n > 1
+        # children each receive an isolated clone adjusted exactly once with a distinct child seed.
+        base_seed = getattr(sampling_params, "seed", None)
+        base_template_sp = self._clone_sampling_params(sampling_params) if n_samples > 1 else sampling_params
+
+        created_child_ids: list[str] = []
+        metrics_started = False
+        try:
+            parent_record = RequestRecord(
+                prompt=prompt_for_engine,
+                prompt_token_ids=token_ids,
+                sampling_params=sampling_params,
+                start_time=start_ts,
+                last_decode_time=start_ts,
+                truncated=truncated,
+                tokens_dropped=tokens_dropped,
+                requested_new_tokens_original=original_requested_new,
+                requested_new_tokens_final=requested_new,
+                reserve_tokens=self.reserve_tokens,
+                max_model_len=max_model_len,
+            )
             if n_samples == 1:
-                child_request_id = request_id
-                parent_id = None
-            else:
-                child_request_id = f"{request_id}-{sample_idx}"
-                parent_id = request_id
+                parent_record.delegating_parser = self._build_parsers_for_sample(
+                    sample_request_id=request_id,
+                    sampling_params=sampling_params,
+                    prompt_text=prompt_for_engine,
+                    prompt_token_ids=token_ids,
+                    tool_parser_request=tool_parser_request,
+                )
 
-                # Create tracking entries for child requests
-                # IMPORTANT: Create a fresh dict for each sample to avoid sharing mutable objects
-                with self._request_lock:
-                    self._request_events[child_request_id] = self._request_events[request_id]
-                    self._active_requests[child_request_id] = RequestRecord(
-                        prompt=prompt_for_engine,
-                        prompt_token_ids=token_ids,
-                        sampling_params=sampling_params,
-                        start_time=start_ts,
-                        last_decode_time=start_ts,
-                        truncated=truncated,
-                        tokens_dropped=tokens_dropped,
-                        requested_new_tokens_original=original_requested_new,
-                        requested_new_tokens_final=requested_new,
-                        reserve_tokens=self.reserve_tokens,
-                        max_model_len=max_model_len,
-                        sample_index=sample_idx,
-                        parent_request_id=request_id,
-                    )
-                    _rp2 = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
-                    if _rp2 is not None:
-                        _rp2.adjust_request(sampling_params)
-                    self._configure_reasoning_parser_for_prompt(
-                        reasoning_parser=_rp2,
+            self._registry.register(request_id, parent_record, output)
+
+            metrics_collector = get_metrics_collector()
+            if metrics_collector:
+                metrics_collector.start_request(request_id, len(token_ids), model_name=self._model_name)
+                metrics_started = True
+
+            scheduler_requests: list[AdmissionRecord] = []
+            for sample_idx in range(n_samples):
+                if n_samples == 1:
+                    child_request_id = request_id
+                    parent_id = None
+                    child_sp = sampling_params
+                else:
+                    child_request_id = f"{request_id}-{sample_idx}"
+                    parent_id = request_id
+                    created_child_ids.append(child_request_id)
+                    child_sp = self._clone_sampling_params(base_template_sp)
+                    if base_seed is not None:
+                        child_sp.seed = _derive_child_seed(int(base_seed), sample_idx)
+
+                    child_parser = self._build_parsers_for_sample(
+                        sample_request_id=child_request_id,
+                        sampling_params=child_sp,
                         prompt_text=prompt_for_engine,
                         prompt_token_ids=token_ids,
+                        tool_parser_request=tool_parser_request,
                     )
-                    _tp2 = build_tool_parser_or_none(
-                        self._tool_parser_class, self.tokenizer, context=f"request {child_request_id}"
-                    )
-                    self._active_requests[child_request_id].delegating_parser = DelegatingParser(
-                        reasoning_parser=_rp2,
-                        tool_parser=_tp2,
-                        tool_request=tool_parser_request,
-                    )
+                    if sample_idx == 0:
+                        # Mirror the first child's adjusted params onto the parent record for inspection.
+                        parent_record.sampling_params = child_sp
+                        parent_record.delegating_parser = child_parser
 
-            # In multi-host mode, use a deterministic arrival_time so all
-            # hosts agree on preemption/priority ordering.
-            _arrival = float(self._request_counter) if jax.process_count() > 1 else None
-            scheduler_requests.append(
-                AdmissionRecord(
-                    request_id=child_request_id,
-                    prompt_token_ids=token_ids,
-                    sampling_params=sampling_params,
-                    eos_token_id=primary_eos_token_id,
-                    parent_request_id=parent_id,
-                    sample_index=sample_idx,
-                    arrival_time=_arrival,
-                    # Vision-language model data (only for first sample to save memory)
-                    pixel_values=pixel_values if sample_idx == 0 else None,
-                    image_grid_thw=image_grid_thw if sample_idx == 0 else None,
-                    pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
-                    video_grid_thw=video_grid_thw if sample_idx == 0 else None,
-                    # Keep multimodal cache keys for all samples so n>1 can share
-                    # KV-prefix pages via prefix caching without duplicating pixel buffers.
-                    mm_features=mm_features if sample_idx == 0 else mm_features_cache_key_only,
+                    # Create tracking entries for child requests
+                    with self._request_lock:
+                        self._request_events[child_request_id] = self._request_events[request_id]
+                        self._active_requests[child_request_id] = RequestRecord(
+                            prompt=prompt_for_engine,
+                            prompt_token_ids=token_ids,
+                            sampling_params=child_sp,
+                            start_time=start_ts,
+                            last_decode_time=start_ts,
+                            truncated=truncated,
+                            tokens_dropped=tokens_dropped,
+                            requested_new_tokens_original=original_requested_new,
+                            requested_new_tokens_final=requested_new,
+                            reserve_tokens=self.reserve_tokens,
+                            max_model_len=max_model_len,
+                            delegating_parser=child_parser,
+                            sample_index=sample_idx,
+                            parent_request_id=request_id,
+                        )
+
+                # In multi-host mode, advance the lock-protected monotonic arrival stamp so all
+                # hosts agree on FCFS/priority tie-breaking (even with explicit request IDs).
+                _arrival = self.next_arrival_stamp() if jax.process_count() > 1 else None
+                # Give each n > 1 sibling shallow-copied MultiModalFeature containers so read-only
+                # array views are shared zero-copy while per-request lifecycle mutations (e.g.
+                # clearing raw pixels after prefill/finish) can never corrupt waiting siblings.
+                sibling_mm_features = (
+                    [copy.copy(feat) for feat in mm_features]
+                    if (mm_features and n_samples > 1)
+                    else mm_features
                 )
-            )
+                scheduler_requests.append(
+                    AdmissionRecord(
+                        request_id=child_request_id,
+                        prompt_token_ids=token_ids,
+                        sampling_params=child_sp,
+                        eos_token_id=primary_eos_token_id,
+                        parent_request_id=parent_id,
+                        sample_index=sample_idx,
+                        arrival_time=_arrival,
+                        # Share zero-copy vision-language inputs across all n siblings so sample_idx >= 1
+                        # never crashes VLM prefill; VisionEncoderCache deduplicates vision encoding.
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        pixel_values_videos=pixel_values_videos,
+                        video_grid_thw=video_grid_thw,
+                        mm_features=sibling_mm_features,
+                    )
+                )
 
-        if defer_scheduler_enqueue:
-            return scheduler_requests
+            if defer_scheduler_enqueue:
+                return scheduler_requests
 
-        self._scheduler_submit(scheduler_requests)
+            self._scheduler_submit(scheduler_requests)
+        except BaseException:
+            if metrics_started:
+                self.rollback_request(request_id, created_child_ids)
+            else:
+                self._registry.rollback(request_id, created_child_ids)
+            raise
 
         self._info(
             f"Queued request {request_id}: prompt_len={prompt_len}, "

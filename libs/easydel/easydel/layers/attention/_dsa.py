@@ -68,6 +68,7 @@ from easydel.layers.indexer import (
     compact_valid_layout,
     pool_bitmap_tail_error,
     resolve_dsa_pool_kernel,
+    segment_pool_layout,
     use_sparse_training_attention,
 )
 from easydel.operations.kernels import DsaGatherAttn, DsaPoolSparseAttn
@@ -431,6 +432,30 @@ class DeepSeekSparseAttention(UnifiedAttention):
             return None
         return PartitionSpec(spec[0], tokens[0] if len(tokens) == 1 else tokens, spec[2])
 
+    def _resolved_pool_kernel(self) -> str:
+        """``dsa_pool_kernel`` with ``None`` resolved for this layer (see :func:`resolve_dsa_pool_kernel`)."""
+        return resolve_dsa_pool_kernel(
+            self.config.dsa_pool_kernel,
+            self.indexer.config.kpool_size,
+            latent_dim=self.kv_lora_rank,
+            latent_dtype=self.attention_performer.metadata.runtime_dtype,
+        )
+
+    def _pool_takes_packed_documents(self, mask_info: MaskInfo) -> bool:
+        """Packed documents run on the pool path when they come as explicit segment ids and the gather kernel runs.
+
+        The documents are laid out on a pool-aligned key grid (:func:`segment_pool_layout`) that is longer than the
+        sequence; the gather kernel reads any key grid length, the bitmap kernel assumes keys == queries. Segment ids
+        derived from an arbitrary pairwise mask are not taken: the pairwise structure need not be block-diagonal.
+        """
+        if getattr(mask_info, "_q_segment_ids", None) is None:
+            return False
+        if getattr(mask_info, "_kv_segment_ids", None) is not None and (
+            mask_info._kv_segment_ids.shape != mask_info._q_segment_ids.shape
+        ):
+            return False
+        return self._resolved_pool_kernel() == "gather"
+
     def _use_dsa_pool_training(
         self,
         *,
@@ -463,10 +488,10 @@ class DeepSeekSparseAttention(UnifiedAttention):
         reasons = []
         if cache_view is not None:
             reasons.append("a cache is attached")
-        if not mask_info.padding_only:
+        if not mask_info.padding_only and not self._pool_takes_packed_documents(mask_info):
             reasons.append(
-                "the mask carries packed documents or a custom pairwise mask (MaskInfo.padding_only is False; "
-                "the pool path supports per-row padding only)"
+                "the mask carries packed documents without explicit segment ids, or a custom pairwise mask, or "
+                "the bitmap pool kernel is selected (packed documents need explicit segment ids and the gather kernel)"
             )
         if shared_indexer:
             reasons.append("the layer reuses a shared indexer selection")
@@ -511,6 +536,7 @@ class DeepSeekSparseAttention(UnifiedAttention):
         query_states: Array,
         compressed_kv: Array,
         q_mask: Array | None,
+        segments: Array | None = None,
     ) -> SparseAttentionLayerOutput:
         """No-cache DSA forward without ``O(seq^2)`` tensors.
 
@@ -539,14 +565,12 @@ class DeepSeekSparseAttention(UnifiedAttention):
                 (:func:`~easydel.layers.indexer.pool_bitmap_tail_error`).
         """
         kpool = self.indexer.config.kpool_size
-        pool_kernel = resolve_dsa_pool_kernel(
-            self.config.dsa_pool_kernel,
-            kpool,
-            latent_dim=self.kv_lora_rank,
-            latent_dtype=self.attention_performer.metadata.runtime_dtype,
-        )
-        if pool_kernel == "gather":
-            return self._forward_dsa_pool_gather(hidden_states, q_resid, query_states, compressed_kv, q_mask)
+        if self._resolved_pool_kernel() == "gather":
+            return self._forward_dsa_pool_gather(
+                hidden_states, q_resid, query_states, compressed_kv, q_mask, segments=segments
+            )
+        if segments is not None:
+            raise ValueError("packed documents on the DSA pool path need dsa_pool_kernel='gather'.")
         tail_error = pool_bitmap_tail_error(kpool, self.indexer.config.select_tail)
         if tail_error is not None:
             raise ValueError(tail_error)
@@ -595,6 +619,7 @@ class DeepSeekSparseAttention(UnifiedAttention):
         query_states: Array,
         compressed_kv: Array,
         q_mask: Array | None,
+        segments: Array | None = None,
     ) -> SparseAttentionLayerOutput:
         """``dsa_pool_kernel="gather"`` variant of :meth:`_forward_dsa_pool_training`.
 
@@ -626,16 +651,25 @@ class DeepSeekSparseAttention(UnifiedAttention):
         # Split the indexer's per-chunk score rows like the attention's queries; the activation layout replicates
         # them over the tensor axes, so every tensor-parallel device would repeat the whole selection.
         row_split = ScoreRowSplit(mesh=layout.mesh, rows=layout.query_row_entries) if split else None
-        key_layout = None if q_mask is None else compact_valid_layout(q_mask)
         kpool = self.indexer.config.kpool_size
+        seg_layout = None
+        key_layout = None
+        if segments is not None:
+            # Packed documents: every document starts a pool on the key grid, so neither a selected pool nor the tail
+            # crosses a document boundary, and the indexer only offers a query pools of its own document.
+            seg_layout = segment_pool_layout(segments, kpool)
+            key_layout = seg_layout
+        elif q_mask is not None:
+            key_layout = compact_valid_layout(q_mask)
         pool_ids, _ = self.indexer.select_pools_chunked(
             hidden_states,
             q_resid,
-            q_mask,
+            None if seg_layout is not None else q_mask,
             query_chunk_size=int(self.config.dsa_pool_query_chunk),
             as_indices=True,
             row_split=row_split,
-            layout=key_layout,
+            layout=None if seg_layout is not None else key_layout,
+            segment_layout=seg_layout,
         )
         if key_layout is None:
             positions = jnp.broadcast_to(jnp.arange(q_len, dtype=jnp.int32)[None, :], (bsz, q_len))
@@ -744,12 +778,19 @@ class DeepSeekSparseAttention(UnifiedAttention):
             return_topk_indices=return_topk_indices,
             mode=mode,
         ):
+            segments = None
+            if not mask_info.padding_only:
+                segments = mask_info._q_segment_ids
+                if segments.ndim == 3:
+                    segments = segments[:, 0]
+                segments = segments[:, :q_len].astype(jnp.int32)
             return self._forward_dsa_pool_training(
                 hidden_states,
                 q_resid,
                 q_nope.transpose(0, 2, 1, 3),
                 compressed_kv,
                 mask_info.q_attention_mask[:, :q_len].astype(jnp.bool_),
+                segments=segments,
             )
 
         if attention_view is None:

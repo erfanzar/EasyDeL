@@ -29,6 +29,8 @@ SnapshotT = tp.TypeVar("SnapshotT")
 PayloadT = tp.TypeVar("PayloadT")
 ResultT = tp.TypeVar("ResultT")
 
+_CLOSE_SENTINEL = object()
+
 
 def _immutable_metadata(metadata: tp.Mapping[str, tp.Any] | None) -> tp.Mapping[str, tp.Any]:
     """Return a shallow immutable metadata mapping."""
@@ -282,9 +284,6 @@ class _SubmissionRecord(tp.Generic[ResultT]):
     settled: bool = False
 
 
-_CLOSED_SENTINEL = -1
-
-
 class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
     """Run bounded rollout work and consume it in completion order.
 
@@ -347,11 +346,15 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         )
         self._max_outstanding = max_outstanding
         self._capacity = threading.BoundedSemaphore(max_outstanding)
-        self._completion_ids: queue.Queue[int] = queue.Queue()
+        # Backpressure is enforced by `_capacity`; keep `_completion_ids` unbounded so
+        # close() can always enqueue wakeup sentinels without blocking or raising queue.Full.
+        self._completion_ids: queue.Queue[int | object] = queue.Queue()
         self._records: dict[int, _SubmissionRecord[ResultT]] = {}
         self._lock = threading.Lock()
         self._next_submission_id = 0
+        self._waiters = 0
         self._closed = False
+        self._closed_event = threading.Event()
         self._credits_in_use = 0
         self._max_staleness = max_staleness
         self._groups_per_update = int(groups_per_update)
@@ -441,8 +444,10 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
     def _on_future_done(self, submission_id: int) -> None:
         """Publish a completion unless the record was already settled by ``close``."""
 
+        if self._closed_event.is_set():
+            return
         with self._lock:
-            if submission_id in self._records:
+            if not self._closed and submission_id in self._records:
                 self._completion_ids.put_nowait(submission_id)
 
     def submit(
@@ -557,22 +562,36 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         with self._lock:
             if not self._records:
                 raise RuntimeError("no outstanding rollouts")
+            if self._closed:
+                raise RuntimeError("rollout coordinator is closed")
+            self._waiters += 1
 
-        while True:
-            try:
-                submission_id = (
-                    self._completion_ids.get() if timeout is None else self._completion_ids.get(timeout=timeout)
-                )
-            except queue.Empty as exc:
-                raise TimeoutError("timed out waiting for an asynchronous rollout") from exc
-            if submission_id == _CLOSED_SENTINEL:
-                # Keep waking any other blocked consumer.
-                self._completion_ids.put_nowait(_CLOSED_SENTINEL)
-                raise RuntimeError("rollout coordinator was closed while waiting")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while True:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    submission_id = (
+                        self._completion_ids.get()
+                        if remaining is None
+                        else self._completion_ids.get(timeout=remaining)
+                    )
+                except queue.Empty as exc:
+                    raise TimeoutError("timed out waiting for an asynchronous rollout") from exc
+                if submission_id is _CLOSE_SENTINEL:
+                    # Keep waking any other blocked consumer.
+                    self._completion_ids.put_nowait(_CLOSE_SENTINEL)
+                    raise RuntimeError("rollout coordinator was closed while waiting for completion")
+                with self._lock:
+                    closed = self._closed
+                    record = self._settle_locked(tp.cast(int, submission_id))
+                if record is not None:
+                    break
+                if closed:
+                    raise RuntimeError("rollout coordinator was closed while waiting for completion")
+        finally:
             with self._lock:
-                record = self._settle_locked(submission_id)
-            if record is not None:
-                break
+                self._waiters -= 1
 
         if record.future.cancelled():
             raise AsyncRolloutCancelled(
@@ -615,9 +634,9 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
         submission_id = ticket if isinstance(ticket, int) else ticket.submission_id
         with self._lock:
             record = self._records.get(submission_id)
-            if record is None:
-                return False
-            future = record.future
+            future = None if record is None else record.future
+        if future is None:
+            return False
         return future.cancel()
 
     def cancel_pending(self) -> int:
@@ -652,19 +671,23 @@ class BoundedAsyncRolloutCoordinator(tp.Generic[SnapshotT, PayloadT, ResultT]):
             if self._closed:
                 return
             self._closed = True
+            self._closed_event.set()
             futures = [record.future for record in self._records.values()]
-        self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
-        if on_idle is not None:
-            after_futures(futures, on_idle)
-        with self._lock:
             for submission_id in tuple(self._records):
                 self._settle_locked(submission_id)
+            waiters = self._waiters
             while True:
                 try:
                     self._completion_ids.get_nowait()
                 except queue.Empty:
                     break
-            self._completion_ids.put_nowait(_CLOSED_SENTINEL)
+            # Enqueue wakeup sentinels so any concurrent blocked next_completed(timeout=None)
+            # wakes up and exits cleanly instead of hanging forever.
+            for _ in range(max(waiters, 1)):
+                self._completion_ids.put_nowait(_CLOSE_SENTINEL)
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
+        if on_idle is not None:
+            after_futures(futures, on_idle)
 
     def __enter__(self) -> BoundedAsyncRolloutCoordinator[SnapshotT, PayloadT, ResultT]:
         """Return this coordinator as a context manager."""

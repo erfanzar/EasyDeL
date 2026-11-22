@@ -298,8 +298,8 @@ def test_gfpo_shared_rollout_preserves_rloo_reuse_and_log_alignment(correction_e
         reward_clip_range=None,
     )
     trainer.group_filter_func = lambda ids, rewards, mask: ids[:, 0].astype(jnp.float32)
-    trainer.steps_per_generation = 2
-    trainer.num_iterations = 1
+    trainer.steps_per_generation = 1
+    trainer.num_iterations = 2
     trainer.ref_state = None
     trainer.train_is_conversational = False
     trainer.eval_is_conversational = False

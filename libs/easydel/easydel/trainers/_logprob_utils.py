@@ -104,8 +104,9 @@ def resolve_lmhead_chunksize(model: tp.Any) -> int | None:
     projection_model = resolve_lmhead_projection_module(model)
     if projection_model is None:
         return None
-    config_holder = model if hasattr(model, "config") else projection_model
-    chunk_size = config_holder.config.lmhead_chunksize
+    chunk_size = getattr(getattr(model, "config", None), "lmhead_chunksize", None)
+    if chunk_size is None and projection_model is not model:
+        chunk_size = getattr(getattr(projection_model, "config", None), "lmhead_chunksize", None)
     if chunk_size is None:
         return None
     chunk_size = int(chunk_size)
@@ -179,7 +180,8 @@ def compute_token_logps_and_entropies_chunked(
         if not return_entropy:
             return token_log_probs, None
         probs = jnp.exp(log_probs)
-        entropies = -jnp.sum(probs * log_probs, axis=-1)
+        safe_log_probs = jnp.where(probs > 0, log_probs, 0.0)
+        entropies = -jnp.sum(probs * safe_log_probs, axis=-1)
         return token_log_probs, entropies
     chunk_size = int(chunk_size)
     num_full_chunks = vocab_size // chunk_size
@@ -253,50 +255,97 @@ def compute_token_logps_and_entropies_chunked(
     if tail:
         exp_sum = _sum_step(num_full_chunks * chunk_size, tail, exp_sum)
 
-    log_z = jnp.log(exp_sum) + logit_max
+    log_exp_sum = jnp.log(exp_sum)
+    log_z = log_exp_sum + logit_max
     target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1).astype(jnp.float32)
     token_log_probs = jnp.squeeze(target_logits, axis=-1) - log_z
 
     if not return_entropy:
         return token_log_probs, None
 
-    def _entropy_step(start: int, size: int, expected_logits: Array) -> Array:
-        """Update the running ``E_p[logit]`` with one vocab chunk.
+    def _entropy_step(start: int, size: int, running_entropy: Array) -> Array:
+        """Update the running Shannon entropy with one vocab chunk.
+
+        Computes shift-invariant log-probabilities ``(chunk - logit_max) - log(exp_sum)``
+        and masks zero-probability (e.g. ``-inf``) logits before multiplication so
+        both forward values and gradients remain finite.
 
         Args:
             start: Vocabulary start index.
             size: Number of vocab entries in this chunk.
-            expected_logits: Running expected-logit accumulated so far.
+            running_entropy: Running entropy accumulated so far.
 
         Returns:
-            The updated running expected logit.
+            The updated running entropy.
         """
         chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
-        probs = jnp.exp(chunk - log_z[..., None])
-        return expected_logits + jnp.sum(probs * chunk, axis=-1)
+        shifted = chunk - logit_max[..., None]
+        log_p = shifted - log_exp_sum[..., None]
+        probs = jnp.exp(log_p)
+        safe_log_p = jnp.where(probs > 0, log_p, 0.0)
+        return running_entropy - jnp.sum(probs * safe_log_p, axis=-1)
 
     _entropy_step = jax.checkpoint(_entropy_step, prevent_cse=False, static_argnums=(1,))
 
-    def entropy_body(i: int, expected_logits: Array) -> Array:
+    def entropy_body(i: int, running_entropy: Array) -> Array:
         """``fori_loop`` body that calls ``_entropy_step`` for full-sized vocab chunks.
 
         Args:
             i: Chunk index in ``[0, num_full_chunks)``.
-            expected_logits: Current running expected logit.
+            running_entropy: Current running entropy.
 
         Returns:
-            The updated running expected logit.
+            The updated running entropy.
         """
-        return _entropy_step(i * chunk_size, chunk_size, expected_logits)
+        return _entropy_step(i * chunk_size, chunk_size, running_entropy)
 
-    expected_logits = jnp.zeros_like(log_z)
+    entropies = jnp.zeros_like(log_z)
     if num_full_chunks > 0:
-        expected_logits = lax.fori_loop(0, num_full_chunks, entropy_body, expected_logits)
+        entropies = lax.fori_loop(0, num_full_chunks, entropy_body, entropies)
     if tail:
-        expected_logits = _entropy_step(num_full_chunks * chunk_size, tail, expected_logits)
+        entropies = _entropy_step(num_full_chunks * chunk_size, tail, entropies)
 
-    entropies = log_z - expected_logits
     return token_log_probs, entropies
+
+
+def sum_logits_vocab_chunked(
+    logits: Array,
+    *,
+    chunk_size: int | None,
+) -> Array:
+    """Sum logits along the vocabulary axis in float32 without materializing a full float32 copy.
+
+    Args:
+        logits: Float array of shape ``[..., vocab_size]``.
+        chunk_size: Optional vocabulary chunk size. ``None`` or values ``<= 0`` or
+            ``>= vocab_size`` perform a single float32-accumulated reduction.
+
+    Returns:
+        Float32 array of shape ``[...]`` holding ``sum_v logits[..., v]``.
+    """
+    vocab_size = logits.shape[-1]
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= vocab_size:
+        return jnp.sum(logits, axis=-1, dtype=jnp.float32)
+
+    chunk_size = int(chunk_size)
+    num_full_chunks = vocab_size // chunk_size
+    tail = vocab_size - num_full_chunks * chunk_size
+
+    def _sum_chunk(start: int, size: int, running_sum: Array) -> Array:
+        chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1)
+        return running_sum + jnp.sum(chunk, axis=-1, dtype=jnp.float32)
+
+    _sum_chunk = jax.checkpoint(_sum_chunk, prevent_cse=False, static_argnums=(1,))
+
+    def _body(i: int, running_sum: Array) -> Array:
+        return _sum_chunk(i * chunk_size, chunk_size, running_sum)
+
+    acc = jnp.zeros(logits.shape[:-1], dtype=jnp.float32)
+    if num_full_chunks > 0:
+        acc = lax.fori_loop(0, num_full_chunks, _body, acc)
+    if tail:
+        acc = _sum_chunk(num_full_chunks * chunk_size, tail, acc)
+    return acc
 
 
 def compute_sequence_scores_from_hidden_states(
@@ -434,18 +483,19 @@ def compute_sequence_scores_from_hidden_states(
             return_entropy=False,
             chunk_size=vocab_chunk_size,
         )
-        chunk_mask_f = chunk_loss_mask.astype(jnp.float32)
-        chunk_logit_sums = jnp.sum(chunk_logits.astype(jnp.float32), axis=-1)
+        chunk_loss_mask_bool = chunk_loss_mask.astype(bool)
+        chunk_mask_f = chunk_loss_mask_bool.astype(jnp.float32)
+        chunk_logit_sums = sum_logits_vocab_chunked(chunk_logits, chunk_size=vocab_chunk_size)
         chunk_values = (
-            jnp.sum(jnp.where(chunk_loss_mask, chunk_logps, 0.0), axis=-1),
-            jnp.sum(chunk_logit_sums * chunk_mask_f, axis=-1),
+            jnp.sum(jnp.where(chunk_loss_mask_bool, chunk_logps, 0.0), axis=-1),
+            jnp.sum(jnp.where(chunk_loss_mask_bool, chunk_logit_sums, 0.0), axis=-1),
             jnp.sum(chunk_mask_f, axis=-1),
         )
         if not return_correct_counts:
             return chunk_values
         chunk_predictions = jnp.argmax(chunk_logits, axis=-1).astype(chunk_labels.dtype)
         chunk_correct_counts = jnp.sum(
-            chunk_mask_f * (chunk_predictions == chunk_labels).astype(jnp.float32),
+            jnp.where(chunk_loss_mask_bool, (chunk_predictions == chunk_labels).astype(jnp.float32), 0.0),
             axis=-1,
         )
         return (*chunk_values, chunk_correct_counts)
@@ -538,6 +588,7 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
     vocab_chunk_size: int | None,
     return_entropy: bool,
     vocab_shard_stage: int | None = None,
+    temperature: float = 1.0,
 ) -> tuple[Array, Array | None]:
     """Project hidden states through the LM head chunk-by-chunk and return per-token log-probabilities and optional entropies.
 
@@ -594,11 +645,17 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
         TypeError: If the model does not expose ``compute_lm_logits``.
     """
 
+    if float(temperature) <= 0.0:
+        raise ValueError(f"`temperature` must be strictly positive; got {temperature}.")
+
     projection_model = resolve_lmhead_projection_module(model)
     if projection_model is None:
         raise TypeError(f"{type(model).__name__} does not expose `compute_lm_logits` for headless scoring.")
 
     batch_size, seq_len = targets.shape
+    if seq_len == 0:
+        empty = jnp.zeros((batch_size, 0), dtype=jnp.float32)
+        return empty, empty if return_entropy else None
     token_chunk_size = max(1, min(int(token_chunk_size), int(seq_len)))
 
     _lm_head_fn = (
@@ -607,6 +664,9 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
         else projection_model.compute_lm_logits
     )
     _has_prepare = hasattr(projection_model, "prepare_lm_head_inputs")
+    _inv_temperature = (
+        jnp.asarray(1.0 / float(temperature), dtype=jnp.float32) if float(temperature) != 1.0 else None
+    )
 
     def _project_chunk(chunk_hidden_states: Array) -> Array:
         """Project a sequence-axis hidden-state chunk through the LM head.
@@ -637,6 +697,8 @@ def compute_per_token_logps_and_entropies_from_hidden_states(
             ``return_entropy`` setting.
         """
         chunk_logits = _project_chunk(chunk_hidden_states)
+        if _inv_temperature is not None:
+            chunk_logits = chunk_logits.astype(jnp.float32) * _inv_temperature
         return compute_token_logps_and_entropies_chunked(
             chunk_logits,
             chunk_targets,

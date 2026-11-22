@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import time
 import typing
+import weakref
 from collections import deque
 from concurrent.futures import Future
 from functools import partial
@@ -80,8 +81,11 @@ from easydel.inference.esurge.config import (
     resolve_num_draft_tokens,
     token_bucket_floor,
 )
-from easydel.inference.sampling_processors import SamplingConstraints
-from easydel.inference.speculative import DrafterProtocol, accept_or_reject, resample_rejected
+from easydel.inference.sampling_processors import (
+    SamplingConstraints,
+    compact_sampling_constraints,
+)
+from easydel.inference.speculative import DrafterProtocol
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.side_inputs import SideInputWindow
 from easydel.layers.quantization import TurboQuantConfig
@@ -113,6 +117,7 @@ from .sequence_buffer import SequenceBuffer
 from .slot_contract import resolve_recurrent_slot_contract, uses_pooled_recurrent_slots
 from .slot_pool import RecurrentSlotPool
 from .spec.interface import NullSpeculation, SpeculativeStrategy
+from .spec.rejection import spec_rejection_sample
 from .spec.sampling import score_sampled_tokens, summarize_logprobs
 from .spec.strategy import (
     DrafterSpeculation,
@@ -124,7 +129,7 @@ from .spec.strategy import (
     window_hidden_index,
     window_hidden_row,
 )
-from .spec.verify import pack_pooled_drafts
+from .spec.verify import pack_pooled_drafts, widen_spec_out
 from .state_sync import SequenceStateSync
 from .states import CachedRequestState
 from .vlm_prefill import VlmPrefillHelper
@@ -165,6 +170,9 @@ class _BatchedVerifyRow(typing.NamedTuple):
     argmaxes: list[int]
     gathered_hidden: jax.Array
     batched_logits: jax.Array
+    emitted: list[int] | None = None
+    accepted: int | None = None
+    known_len: int | None = None
 
 
 def derive_spec_token_buckets(
@@ -305,6 +313,7 @@ class _AsyncExecutionHandle:
         finalize: typing.Callable[[list[list[int]]], None] | None = None,
         resolve_logprobs: typing.Callable[[list[list[int]]], LogprobsLists | None] | None = None,
         host_rows: dict[int, list[int]] | None = None,
+        host_token_logprobs: dict[str, float] | None = None,
     ) -> None:
         """Initialize the deferred handle.
 
@@ -321,10 +330,13 @@ class _AsyncExecutionHandle:
             host_rows: Output index -> tokens of verify rows the host already
                 settled (accepted drafts plus one); reported verbatim instead of
                 the window's single sampled token.
+            host_token_logprobs: Request id -> post-verify scalar token logprob
+                overrides settled on the host (supersede pre-verify window scores).
         """
         self._model_runner_output = model_runner_output
         self._windows = windows
         self._host_rows = dict(host_rows or {})
+        self._host_token_logprobs = dict(host_token_logprobs or {})
         self._finalize = finalize
         self._resolve_logprobs = resolve_logprobs
         self._resolved_output: ModelRunnerOutput | None = None
@@ -366,6 +378,8 @@ class _AsyncExecutionHandle:
         for out_idx, tokens in self._host_rows.items():
             if 0 <= out_idx < len(sampled_token_ids):
                 sampled_token_ids[out_idx] = list(tokens)
+        if self._host_token_logprobs:
+            token_logprobs.update(self._host_token_logprobs)
 
         if self._finalize is not None:
             self._finalize(sampled_token_ids)
@@ -728,8 +742,9 @@ class eSurgeRunner:
             num_tokens_paddings=self.num_tokens_paddings,
             max_num_seq_buckets=self.max_num_seq_buckets,
         )
+        runner_ref = weakref.ref(self)
         self.vlm = VlmPrefillHelper(
-            model_getter=lambda: self.model,
+            model_getter=lambda _ref=runner_ref: getattr(_ref(), "model", None),
             metadata=self.metadata,
             compile_vision_encoder=compile_vision_encoder,
             vision_patch_buckets=vision_patch_buckets,
@@ -1596,6 +1611,13 @@ class eSurgeRunner:
         """
         return WindowPlanner.clamp_request_buckets_to_runtime_cap(buckets, runtime_cap)
 
+    def _resolved_vocab_size(self) -> int:
+        """Resolve the effective vocabulary width, honoring joint-vocab ``total_vocab_size``."""
+        cfg = self.model.config
+        get_text = getattr(cfg, "get_text_config", None)
+        text_config = get_text() if callable(get_text) else cfg
+        return int(getattr(text_config, "total_vocab_size", None) or text_config.vocab_size)
+
     def _setup_variables(self):
         """Initialize internal variables and preallocate reusable buffers.
 
@@ -1636,7 +1658,7 @@ class eSurgeRunner:
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
-            vocab_size=self.model.config.get_text_config().vocab_size,
+            vocab_size=self._resolved_vocab_size(),
             page_sizes=[self.metadata.page_size] * num_cache_groups,
             sharding=self._empty_sharding,
         )
@@ -2105,15 +2127,31 @@ class eSurgeRunner:
         if (self.drafter is None or int(self.num_draft_tokens) <= 0) and self.pipeline_plan.is_enabled:
             return None
         manager = self.executor_manager
+        model_exec = getattr(manager, "_model_executor", None)
+        if (
+            self.pipeline_plan.is_enabled
+            and model_exec is not None
+            and getattr(model_exec, "pipeline_runtime", None) is None
+            and not bool(getattr(model_exec, "supports_pipeline_model_step", False))
+        ):
+            return None
         req_buckets = sorted({int(b) for b in self.active_num_seq_buckets})
+        if not req_buckets:
+            return None
         table: dict[int, float] = {}
         # The timed steps run compile-shaped inputs through the live cache. Recurrent rows are restored afterwards
         # exactly as compile left them; paged KV receives the same dummy writes compile's own warm-up made.
         saved = snapshot_recurrent_state(manager.kv_pages)
         failed = False
+        has_compiled = getattr(model_exec, "has_compiled", None) if model_exec is not None else None
         try:
             for num_tokens in sorted({int(t) for t in num_tokens_paddings}):
-                padded = max([b for b in req_buckets if b <= num_tokens], default=req_buckets[0])
+                feasible = [b for b in req_buckets if b <= num_tokens]
+                if not feasible and self._allow_sparse_window_packing:
+                    continue
+                padded = max(feasible, default=req_buckets[0])
+                if callable(has_compiled) and not has_compiled(num_tokens, padded):
+                    continue
                 runs: list[float] = []
                 for _ in range(6):
                     inputs = manager.get_compile_configurations(
@@ -2139,6 +2177,8 @@ class eSurgeRunner:
             else:
                 manager.kv_pages = _restore_recurrent_state(manager.kv_pages, saved)
                 manager._reset_kv_pages_after_compile_warmup()
+        if not table:
+            return None
         logger.info("Model-step time per token bucket (ms): %s", {t: round(ms, 3) for t, ms in table.items()})
         return table
 
@@ -2201,14 +2241,18 @@ class eSurgeRunner:
         model = model.esurge_compatible_model
         graphdef = model.graphdef
         self.model = model
+        # Side-input providers (e.g. GatedEngram host tables) capture model modules and
+        # weight-dependent lookup tables; drop the cached provider so the next step
+        # rebuilds it against the updated model instead of pinning old weights/tables.
+        self._side_input_provider = None
         # Weight refreshes may reuse the same model object; identity alone is
         # insufficient to invalidate cached encoder outputs in that case.
         vlm = getattr(self, "vlm", None)
         if vlm is not None:
             vlm.reset_vision_cache()
-        self._vlm_image_features_jit = None
-        self._vlm_video_features_jit = None
-        self._vlm_vision_jit_disabled = False
+            self._vlm_image_features_jit = None
+            self._vlm_video_features_jit = None
+            self._vlm_vision_jit_disabled = False
 
         self.executor_manager.update_graphs(
             model=model,
@@ -2216,9 +2260,29 @@ class eSurgeRunner:
             graphstate=graphstate,
             graphother=graphother,
         )
+        drop_snaps = getattr(self.executor_manager, "drop_recurrent_snapshots", None)
+        if callable(drop_snaps):
+            drop_snaps()
+        reset_bases = getattr(self.executor_manager, "reset_recurrent_bases", None)
+        if callable(reset_bases):
+            reset_bases()
+        self._pre_async_results = None
+        self._spec_carry = None
+        self._spec_recorded_this_step = False
+        if hasattr(self, "_pending_spec_recurrent_commit_by_req"):
+            self._pending_spec_recurrent_commit_by_req.clear()
+        spec = getattr(self, "spec", None)
+        if spec is not None:
+            update_target = getattr(spec, "update_target_model", None)
+            if callable(update_target):
+                update_target(model)
 
         if reset_state:
+            if spec is not None:
+                spec.on_reset()
             self._setup_variables()
+        elif not self.requests and spec is not None:
+            spec.on_reset()
 
     def release_model_state(self, *, clear_compiled_cache: bool = False) -> None:
         """Drop model/graph references held by the runner to free memory.
@@ -2236,13 +2300,27 @@ class eSurgeRunner:
             raise RuntimeError("Cannot release model state while requests are active")
 
         self.reset_state()
+        spec = getattr(self, "spec", None)
+        if spec is not None:
+            release_target = getattr(spec, "release_target_model", None)
+            if callable(release_target):
+                release_target()
 
         self.executor_manager.release_model_state(clear_compiled_cache=clear_compiled_cache)
 
+        vlm = getattr(self, "vlm", None)
+        if vlm is not None:
+            vlm.reset_vision_cache()
+            vlm.reset_cpu_buffers()
+            self._vlm_image_features_jit = None
+            self._vlm_video_features_jit = None
+            self._vlm_vision_jit_disabled = False
         self.model = None
-        self._vlm_image_features_jit = None
-        self._vlm_video_features_jit = None
-        self._vlm_vision_jit_disabled = False
+        self._side_input_provider = None
+        if hasattr(self, "_handoff_positions_cache"):
+            self._handoff_positions_cache.clear()
+        if hasattr(self, "_handoff_scalar_cache"):
+            self._handoff_scalar_cache.clear()
 
     def destroy_kv_cache(self) -> None:
         """Drop the executor-manager's KV-pages reference to free HBM.
@@ -2255,8 +2333,19 @@ class eSurgeRunner:
         resume.
         """
         logger.info("Destroying eSurgeRunner ragged KV cache pages")
-        self.executor_manager.kv_pages = None
-        self.executor_manager.drop_recurrent_snapshots()
+        self._spec_carry = None
+        self._spec_recorded_this_step = False
+        destroy_fn = getattr(self.executor_manager, "destroy_kv_cache", None)
+        if callable(destroy_fn):
+            destroy_fn()
+        else:
+            self.executor_manager.kv_pages = None
+            drop_snaps = getattr(self.executor_manager, "drop_recurrent_snapshots", None)
+            if callable(drop_snaps):
+                drop_snaps()
+            reset_bases = getattr(self.executor_manager, "reset_recurrent_bases", None)
+            if callable(reset_bases):
+                reset_bases()
 
     def initialize_kv_cache(self) -> None:
         """Allocate the operations cache when the executor manager has none.
@@ -2735,15 +2824,35 @@ class eSurgeRunner:
             return False
         if not callable(getattr(self.drafter, "spec_step", None)):
             return False
+        spec = getattr(self, "spec", None)
+        if spec is not None:
+            can_div = getattr(spec, "can_draft_in_verify", None)
+            if callable(can_div) and not can_div():
+                return False
+            if (
+                bool(getattr(self, "spec_decode_recurrent_replay", False))
+                or int(getattr(spec, "reject_backoff_steps", 0) or 0) > 0
+                or int(getattr(self, "spec_decode_debug_max_traces", 0) or 0) > 0
+                or flags.get_bool(flags.EASYDEL_DISABLE_BATCHED_EMIT)
+            ):
+                return False
         if getattr(self, "_has_recurrent_layers", False) and getattr(self, "recurrent_slot_contract", None) != "verify":
             # Only verify-contract recurrent layers keep one state per verify token, so a step dispatched before its
             # predecessor commits can read the accepted prefix's state by index. Other recurrent layers stay sync.
             return False
         k = int(self.num_draft_tokens)
         drafts = scheduler_output.scheduled_spec_decode_tokens or {}
+        requests_map = getattr(self, "requests", None)
         for rid, n in scheduler_output.num_scheduled_tokens.items():
-            if int(n) != 1 + len(drafts.get(rid, ())) or len(drafts.get(rid, ())) not in (0, k):
+            row_drafts = drafts.get(rid, ())
+            if int(n) != 1 + len(row_drafts) or len(row_drafts) not in (0, k):
                 return False
+            if row_drafts and spec is not None and requests_map is not None and rid in requests_map:
+                req_state = requests_map.get(rid)
+                can_batch = getattr(spec, "can_batch_draft", None)
+                uses_pen = getattr(spec, "uses_history_penalties", None)
+                if (callable(can_batch) and not can_batch(req_state)) or (callable(uses_pen) and uses_pen(req_state)):
+                    return False
         if bool(getattr(scheduler_output, "pending_structured_output_tokens", False)):
             return False
         if self._uses_spmd_dp() or self._model_uses_vlm_inputs() or model_has_side_inputs(self.model):
@@ -2755,16 +2864,18 @@ class eSurgeRunner:
 
     def record_spec_out(self, spec_out: jax.Array, *, replace: bool = False) -> None:
         """Keep a dispatched step's packed speculative output, merging later pooled results by row."""
+        k_max = int(self.num_draft_tokens)
+        spec_out = widen_spec_out(spec_out, num_draft_tokens=k_max)
         if replace or not self._spec_recorded_this_step or self._spec_carry is None:
             merged = spec_out
         else:
-            current = self._spec_carry.spec_out
+            current = widen_spec_out(self._spec_carry.spec_out, num_draft_tokens=k_max)
             keep = jnp.any(current >= 0, axis=1)
             merged = jnp.where(keep[:, None], current, spec_out)
         self._spec_recorded_this_step = True
         self._spec_carry = SpecWindowCarry(
             spec_out=merged,
-            num_draft_tokens=int(self.num_draft_tokens),
+            num_draft_tokens=k_max,
             rows=dict(self.sequence_buffer.req_id_to_index),
         )
 
@@ -2774,16 +2885,27 @@ class eSurgeRunner:
             return
         merged = None
         k = int(self.num_draft_tokens)
+        req_id_to_index = self.sequence_buffer.req_id_to_index
         for window in windows:
-            valid = np.asarray(window.valid_mask, dtype=bool)
-            if not bool(valid.any()):
+            if not window.row_positions:
                 continue
-            output_rows = np.where(valid, np.asarray(window.row_positions, dtype=np.int32), -1)
+            row_pos_arr = np.asarray(window.row_positions, dtype=np.int32)
+            global_rows = np.asarray(
+                [
+                    int(req_id_to_index[rid]) if is_valid and rid in req_id_to_index else -1
+                    for rid, is_valid in zip(window.req_ids, window.valid_mask, strict=False)
+                ],
+                dtype=np.int32,
+            )
+            if not bool((global_rows >= 0).any()):
+                continue
+            seed_tokens = window.sampled_token_ids[jnp.asarray(row_pos_arr, dtype=jnp.int32)]
             part = pack_pooled_drafts(
-                window.sampled_token_ids,
-                jnp.full((len(window.row_positions), k), -1, dtype=jnp.int32),
-                jnp.asarray(output_rows, dtype=jnp.int32),
+                seed_tokens,
+                jnp.full((len(global_rows), k), -1, dtype=jnp.int32),
+                jnp.asarray(global_rows, dtype=jnp.int32),
                 num_rows=int(self.max_num_reqs),
+                num_draft_tokens=k,
             )
             if merged is None:
                 merged = part
@@ -3123,35 +3245,57 @@ class eSurgeRunner:
         return offsets, rank_bases
 
     def _score_output_row(
-        self, *, logits, sampled_tokens, history, seq_len: int, sampling_params
+        self,
+        *,
+        logits,
+        sampled_tokens,
+        history,
+        seq_len: int,
+        sampling_params,
+        sampling_constraints: SamplingConstraints | None = None,
+        row_pos: int = 0,
     ) -> tuple[typing.Any, typing.Any, typing.Any]:
         """Enqueue compact behavior-policy scores without host token readback."""
         params = sampling_params
         logits_sharding = getattr(logits, "sharding", None)
         tokens_sharding = getattr(sampled_tokens, "sharding", None)
+        logits_replicated = (
+            jax.sharding.NamedSharding(logits_sharding.mesh, jax.sharding.PartitionSpec())
+            if isinstance(logits_sharding, jax.sharding.NamedSharding)
+            else None
+        )
         if (
-            isinstance(logits_sharding, jax.sharding.NamedSharding)
+            logits_replicated is not None
             and tokens_sharding is not None
             and tokens_sharding.device_set != logits_sharding.device_set
         ):
             # Pipeline-parallel steps leave the logits on the final stage's devices while the sampled tokens
             # span the whole mesh; score them on the logits' devices.
-            sampled_tokens = jax.device_put(
-                sampled_tokens, jax.sharding.NamedSharding(logits_sharding.mesh, jax.sharding.PartitionSpec())
-            )
+            sampled_tokens = jax.device_put(sampled_tokens, logits_replicated)
+
+        def _place_host(arr):
+            return arr if logits_replicated is None else jax.device_put(arr, logits_replicated)
+
+        sparse_constraints = None
+        if sampling_constraints is not None:
+            compacted = compact_sampling_constraints(np.asarray([int(row_pos)], dtype=np.int64), sampling_constraints)
+            if compacted is not None:
+                sparse_constraints = tuple(_place_host(c) for c in compacted)
+
         arrays = score_sampled_tokens(
             logits,
             sampled_tokens,
-            np.asarray(history, dtype=np.int32)[None, :],
-            np.asarray([seq_len], dtype=np.int32),
-            np.asarray([params.temperature], dtype=np.float32),
-            np.asarray([params.top_p], dtype=np.float32),
-            np.asarray([params.top_k], dtype=np.int32),
-            np.asarray([params.min_p], dtype=np.float32),
-            np.asarray([params.frequency_penalty], dtype=np.float32),
-            np.asarray([params.presence_penalty], dtype=np.float32),
-            np.asarray([params.repetition_penalty], dtype=np.float32),
+            _place_host(np.asarray(history, dtype=np.int32)[None, :]),
+            _place_host(np.asarray([seq_len], dtype=np.int32)),
+            _place_host(np.asarray([params.temperature], dtype=np.float32)),
+            _place_host(np.asarray([params.top_p], dtype=np.float32)),
+            _place_host(np.asarray([params.top_k], dtype=np.int32)),
+            _place_host(np.asarray([params.min_p], dtype=np.float32)),
+            _place_host(np.asarray([params.frequency_penalty], dtype=np.float32)),
+            _place_host(np.asarray([params.presence_penalty], dtype=np.float32)),
+            _place_host(np.asarray([params.repetition_penalty], dtype=np.float32)),
             num_logprobs=max(0, int(params.logprobs or 0)),
+            sparse_constraints=sparse_constraints,
         )
         return tuple(jax.copy_to_host_async(array) for array in arrays)
 
@@ -3168,7 +3312,7 @@ class eSurgeRunner:
             The window rows' :class:`SamplingConstraints`, or ``None`` when no request in the window carries one.
             Tokens outside the vocabulary are dropped.
         """
-        vocab = int(self.model.config.get_text_config().vocab_size)
+        vocab = self._resolved_vocab_size()
         bias: list[tuple[int, int, float]] = []
         restricted: list[int] = []
         allowed: list[tuple[int, int]] = []
@@ -3321,11 +3465,17 @@ class eSurgeRunner:
             raise ValueError("This drafter requires synchronous scheduling because it has no spec_step program.")
         if self.drafter is not None:
             # Dynamic speculative-token scheduling: resolve the step's draft
-            # budget ONCE from the live concurrency (requests scheduled this
-            # step — drafts produced now are verified next step at ~the same
-            # concurrency). Verification of ALREADY-scheduled drafts is
-            # unaffected; only how many new drafts this step proposes changes.
-            self.spec.resolve_step_draft_budget(len(scheduler_output.num_scheduled_tokens))
+            # budget ONCE from the live concurrency and any engine-core verify
+            # budget (`num_draft_tokens_next >= 0`). Verification of
+            # ALREADY-scheduled drafts is unaffected; only how many new drafts
+            # this step proposes changes.
+            scheduled_k_next = getattr(scheduler_output, "num_draft_tokens_next", -1)
+            self.spec.resolve_step_draft_budget(
+                len(scheduler_output.num_scheduled_tokens),
+                num_draft_tokens_next=(
+                    None if scheduled_k_next is None or int(scheduled_k_next) < 0 else int(scheduled_k_next)
+                ),
+            )
         start_index = 0
         total_step_time = 0.0
         total_post_proc_time = 0.0
@@ -3882,13 +4032,9 @@ class eSurgeRunner:
                 self._spec_recurrent_commit_cpu.fill(0)
                 for _rid in applied_pending_commit_req_ids:
                     self._pending_spec_recurrent_commit_by_req.pop(str(_rid), None)
-            if device_token_handoff is not None and pending_pre_async_results is not None and pre_async_repair_pending:
-                # The previous async handle will repair CPU placeholders when
-                # the lifecycle loop drains it. Doing that repair here would
-                # immediately wait on the previous sampled token and erase the
-                # point of the device-side PP token handoff.
-                pre_async_repair_pending = False
-                pending_pre_async_results = None
+            # Keep `pending_pre_async_results` / `pre_async_repair_pending` alive across all
+            # windows when `device_token_handoff` handled this window, so subsequent windows
+            # (`1..N`) can also build device handoffs or repair CPU state instead of feeding 0s.
 
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
@@ -4000,6 +4146,12 @@ class eSurgeRunner:
                     sync_finalize_entries.append((req_state, req_idx, seq_len))
 
             window_metric_scores = None
+            _logits_sharding = getattr(_logits, "sharding", None)
+            _metric_sharding = (
+                jax.sharding.NamedSharding(_logits_sharding.mesh, jax.sharding.PartitionSpec())
+                if isinstance(_logits_sharding, jax.sharding.NamedSharding)
+                else None
+            )
             for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
                 if not is_valid or req_state is None:
                     continue
@@ -4011,12 +4163,22 @@ class eSurgeRunner:
                     history=token_ids_window_cpu[row_pos],
                     seq_len=int(seq_len),
                     sampling_params=req_state.sampling_params,
+                    sampling_constraints=sampling_constraints,
+                    row_pos=int(row_pos),
                 )
                 logprob_payloads[rid] = payload
                 if self.enable_sampler_metrics:
                     if window_metric_scores is None:
-                        window_metric_scores = jnp.zeros((padded_num_reqs,), dtype=jnp.float32)
-                    window_metric_scores = window_metric_scores.at[row_pos].set(payload[1][0, 0])
+                        zeros = np.zeros((padded_num_reqs,), dtype=np.float32)
+                        window_metric_scores = (
+                            jax.device_put(zeros, _metric_sharding)
+                            if _metric_sharding is not None
+                            else jnp.zeros((padded_num_reqs,), dtype=jnp.float32)
+                        )
+                    score_val = payload[1][0, 0]
+                    if _metric_sharding is not None and getattr(score_val, "sharding", None) != _metric_sharding:
+                        score_val = jax.device_put(score_val, _metric_sharding)
+                    window_metric_scores = window_metric_scores.at[row_pos].set(score_val)
 
             if needs_async_output:
                 copy_enqueue_start = time.time()
@@ -4187,13 +4349,15 @@ class eSurgeRunner:
                     _idxs = [*_meta.target_local_indices, int(_meta.bonus_local_index)]
                     _pending_bv.append((int(_rp), len(_flat_indices), len(_idxs), _meta))
                     _flat_indices.extend(int(_x) for _x in _idxs)
+                _has_overlapped_bv = any(
+                    any(int(_t) < 0 for _t in _meta2.scheduled_draft_tokens) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
+                )
                 # A lone request takes this pre-pass too when no replay follows its verify (``_single_ok``): its rows
                 # then run the programs a multi-request step runs, instead of a per-request gather and an LM head
-                # compiled for its row count. The fused draft-in-verify program below stays at >= 2 requests: a
-                # lone request routed through it changed greedy output vs plain on the real GLM-5.3 checkpoint
-                # (in-program LM-head argmax != runner lm_head executable on near-ties) with no throughput gain
-                # over the pooled draft.
-                if len(_pending_bv) >= (1 if _single_ok else 2):
+                # compiled for its row count. The fused draft-in-verify program below stays at >= 2 requests for
+                # committed (non-overlapped) batches (near-tie parity on GLM-5.3), while overlapped async verify rows
+                # carry `-1` host placeholders patched on device and MUST use `spec_step` even when alone.
+                if _has_overlapped_bv or len(_pending_bv) >= (1 if _single_ok else 2):
                     _total_rows = len(_flat_indices)
                     # Pad to a stable ``padded_num_reqs * (k+1)`` bucket so the
                     # on-demand LM-head executable count stays bounded (<= one
@@ -4222,22 +4386,18 @@ class eSurgeRunner:
                     # disappears — the step's only host sync returns argmaxes
                     # AND next-window drafts together. Gated to the exact cases
                     # whose host semantics the in-program acceptance reproduces:
-                    # greedy batched rows (>= 2), no recurrent replay (it
-                    # re-derives the corrected token after this point), no
-                    # reject-backoff, no debug traces (they need the full verify
-                    # logits), and a steady-state window (the verify width
-                    # k_pad equals this step's live draft budget — dynamic-K
-                    # transition steps fall back to the two-dispatch flow).
+                    # greedy batched rows (>= 2, or >= 1 when overlapped), no
+                    # recurrent replay, no reject-backoff, no debug traces, and
+                    # a steady-state window (or overlapped step).
                     # ``EASYDEL_DISABLE_DRAFT_IN_VERIFY=1`` forces the fallback.
                     fused_verify_results: dict | None = None
                     if (
-                        step_allows_batch
-                        and len(_pending_bv) >= 2
+                        (_has_overlapped_bv or (step_allows_batch and len(_pending_bv) >= 2))
                         and spec_token_ids_all is not None
                         and not self.spec_decode_recurrent_replay
                         and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
                         and self.spec_decode_debug_max_traces <= 0
-                        and int(_pad_window_k) == int(getattr(self.spec, "live_num_draft_tokens", 0))
+                        and (_has_overlapped_bv or int(_pad_window_k) == int(getattr(self.spec, "live_num_draft_tokens", 0)))
                         and self.spec.can_draft_in_verify()
                         and all(
                             self.spec.can_batch_draft(self.requests.get(str(_meta2.request_id)))
@@ -4273,6 +4433,9 @@ class eSurgeRunner:
                                 argmaxes=[int(_x) for _x in _res["argmaxes"]],
                                 gathered_hidden=_gathered_hidden,
                                 batched_logits=None,
+                                emitted=[int(_x) for _x in _res["emitted"]] if "emitted" in _res else None,
+                                accepted=int(_res["accepted"]) if "accepted" in _res else None,
+                                known_len=int(_res["known_len"]) if "known_len" in _res else None,
                             )
                             # Mark the request as already drafted so the emission
                             # loop reserves its output slot; the drafts (already
@@ -4282,31 +4445,38 @@ class eSurgeRunner:
                             _fused_drafts_by_rid[_rid2] = list(_res["drafts"])
                         fused_draft_batches.append((_fused_drafts_by_rid, early_draft_by_rid))
                     else:
-                        _project_start = time.time()
-                        _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
-                        total_spec_project_time += time.time() - _project_start
-                        _argmax_start = time.time()
-                        # Penalised requests get the sampler's history-penalty transform on their verify rows
-                        # (on device, only the argmaxes come back); ``None`` keeps the plain argmax.
-                        _penalized_argmax = self.spec.penalized_verify_argmaxes(
-                            _batched_logits,
-                            [(_meta2, int(_off2), int(_cnt2)) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv],
-                        )
-                        if _penalized_argmax is not None:
-                            _batched_argmax = np.asarray(_penalized_argmax).astype(np.int64)
-                        else:
-                            _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
-                        total_spec_argmax_sync_time += time.time() - _argmax_start
-                        for _rp, _off, _cnt, _meta in _pending_bv:
-                            verify_meta_by_row[_rp] = _meta
-                            batched_verify_by_row[_rp] = _BatchedVerifyRow(
-                                verify_meta=_meta,
-                                offset=int(_off),
-                                count=int(_cnt),
-                                argmaxes=[int(_x) for _x in _batched_argmax[_off : _off + _cnt].tolist()],
-                                gathered_hidden=_gathered_hidden,
-                                batched_logits=_batched_logits,
+                        # Exclude overlapped rows carrying `-1` draft placeholders from host-side argmax verify.
+                        _host_bv = [
+                            entry
+                            for entry in _pending_bv
+                            if all(int(_t) >= 0 for _t in entry[3].scheduled_draft_tokens)
+                        ]
+                        if len(_host_bv) >= (1 if _single_ok else 2):
+                            _project_start = time.time()
+                            _batched_logits = self.spec.project_hidden_rows(_gathered_hidden)
+                            total_spec_project_time += time.time() - _project_start
+                            _argmax_start = time.time()
+                            # Penalised requests get the sampler's history-penalty transform on their verify rows
+                            # (on device, only the argmaxes come back); ``None`` keeps the plain argmax.
+                            _penalized_argmax = self.spec.penalized_verify_argmaxes(
+                                _batched_logits,
+                                [(_meta2, int(_off2), int(_cnt2)) for (_rp2, _off2, _cnt2, _meta2) in _host_bv],
                             )
+                            if _penalized_argmax is not None:
+                                _batched_argmax = np.asarray(_penalized_argmax).astype(np.int64)
+                            else:
+                                _batched_argmax = np.asarray(jnp.argmax(_batched_logits, axis=-1)).astype(np.int64)
+                            total_spec_argmax_sync_time += time.time() - _argmax_start
+                            for _rp, _off, _cnt, _meta in _host_bv:
+                                verify_meta_by_row[_rp] = _meta
+                                batched_verify_by_row[_rp] = _BatchedVerifyRow(
+                                    verify_meta=_meta,
+                                    offset=int(_off),
+                                    count=int(_cnt),
+                                    argmaxes=[int(_x) for _x in _batched_argmax[_off : _off + _cnt].tolist()],
+                                    gathered_hidden=_gathered_hidden,
+                                    batched_logits=_batched_logits,
+                                )
             # Every input the batched drafter needs (per-request accepted count,
             # corrected token, seed position, seed hidden row) is derivable from
             # the pre-pass argmaxes, so ENQUEUE the drafter's device work here —
@@ -4377,10 +4547,16 @@ class eSurgeRunner:
 
                 scheduled_n = int(scheduled_list[row_pos])
                 scheduled_spec_tokens = [int(t) for t in scheduler_output.scheduled_spec_decode_tokens.get(rid, [])]
+                _resolved_overlapped_bv = (
+                    batched_verify_by_row.get(int(row_pos)) if int(row_pos) in batched_verify_by_row else None
+                )
                 has_scheduled_specs = (
                     self.drafter is not None
                     and bool(scheduled_spec_tokens)
-                    and all(int(t) >= 0 for t in scheduled_spec_tokens)
+                    and (
+                        all(int(t) >= 0 for t in scheduled_spec_tokens)
+                        or (_resolved_overlapped_bv is not None and _resolved_overlapped_bv.emitted is not None)
+                    )
                     and self.spec.is_spec_request(req_state)
                 )
 
@@ -4422,17 +4598,30 @@ class eSurgeRunner:
                     required_hidden_len = int(verify_meta.bonus_local_index) + 1
                     can_project_full_hidden = hidden_np_len >= required_hidden_len
                     _bv = batched_verify_by_row.get(int(row_pos)) if can_project_full_hidden else None
+                    _bv_emitted_override: list[int] | None = None
+                    _bv_known_len_override: int | None = None
                     if _bv is not None:
                         # Batched greedy fast path: this request's verify-row LM-head
                         # projection and greedy argmax were computed once in the
                         # per-step pre-pass over the whole running batch. Consume the
-                        # host argmaxes and the shared gathered hidden; no per-request
+                        # host argmaxes (or fused device-resolved emission for overlapped
+                        # async rows) and the shared gathered hidden; no per-request
                         # project / argmax / device->host sync happens here.
-                        for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
-                            if int(_bv.argmaxes[draft_idx]) != int(draft_token):
-                                break
-                            accepted += 1
-                        corrected_token = int(_bv.argmaxes[accepted])
+                        if _bv.emitted is not None and _bv.accepted is not None:
+                            accepted = int(_bv.accepted)
+                            _bv_emitted_override = list(_bv.emitted)
+                            corrected_token = (
+                                int(_bv_emitted_override[-1])
+                                if _bv_emitted_override
+                                else int(_bv.argmaxes[min(accepted, len(_bv.argmaxes) - 1)])
+                            )
+                            _bv_known_len_override = _bv.known_len
+                        else:
+                            for draft_idx, draft_token in enumerate(draft_tokens_for_verify):
+                                if int(_bv.argmaxes[draft_idx]) != int(draft_token):
+                                    break
+                                accepted += 1
+                            corrected_token = int(_bv.argmaxes[accepted])
                         if str(rid) in early_draft_by_rid:
                             # This request's next drafts were already dispatched by
                             # the early batched-draft pre-pass, which also fetched
@@ -4479,20 +4668,10 @@ class eSurgeRunner:
                                 accepted += 1
                             corrected_token = int(projected_target_tokens[accepted])
                             if self.spec_decode_recurrent_candidates and self.spec_decode_recurrent_replay:
-                                # Exact greedy path (default; required for
-                                # correctness): advance the live recurrent state via
-                                # a sequential-GDN replay and re-derive the corrected
-                                # token + seed hidden from it. The "fast" path
-                                # (EASYDEL_SPEC_RECURRENT_REPLAY=0) instead reused the
-                                # fused verify forward's argmax + the deferred
-                                # recurrent candidate-commit; that commit is NOT exact
-                                # for greedy, so the live GDN state diverged from
-                                # plain greedy decode -> greedy spec output diverged
-                                # from the target's greedy stream at the first verify
-                                # window and was cross-process non-deterministic
-                                # (stale/uninitialized candidate rows). See
-                                # tests/inference/esurge/test_spec_decode.py::
-                                # test_esurge_runner_spec_decode.
+                                # Opt-in exact sequential-GDN replay (`EASYDEL_SPEC_RECURRENT_REPLAY=1`;
+                                # defaults to False in `flags.py`): advance this row's live recurrent state
+                                # via sequential single-token replay (restoring only this row's slot) and
+                                # re-derive the corrected token + seed hidden from it.
                                 corrected_token, replay_hidden = _replay_prefix_sequential(
                                     int(row_pos),
                                     prefix_len=int(real_count + accepted),
@@ -4513,13 +4692,18 @@ class eSurgeRunner:
                             draft_fulls = self.spec.draft_full_log_probs_by_req.pop(str(rid), None)
                             if draft_fulls is None or int(draft_fulls.shape[0]) < len(draft_tokens_for_verify):
                                 target_fulls = self.spec.filtered_log_probs(logits_rows, req_state)
-                                corrected_token = self.spec.sample_distribution(target_fulls[:1], req_state)
+                                corrected_token = self.spec.sample_distribution(
+                                    target_fulls[:1],
+                                    req_state,
+                                    position=int(verify_meta.start_pos + real_count),
+                                )
                             else:
                                 accepted, corrected_token = self.spec.verify_sampled_window(
                                     target_logits=logits_rows,
                                     draft_log_probs=draft_fulls[: len(draft_tokens_for_verify)],
                                     draft_tokens=draft_tokens_for_verify,
                                     req_state=req_state,
+                                    start_position=int(verify_meta.start_pos + real_count),
                                 )
                         # Whole-block drafters (DSpark) draft after this loop from the rows handed over by
                         # ``observe_window_hidden`` and never read ``seed_hidden``; skip the per-request device slice.
@@ -4593,20 +4777,22 @@ class eSurgeRunner:
                                         trace_logits_rows.append(target_full[0])
                                     if want_output_scores:
                                         output_score_rows.append(target_full[0])
-                                    tok = jnp.asarray([int(draft_token)], dtype=jnp.int32)
                                     draft_full = draft_fulls[draft_idx : draft_idx + 1]
-                                    d_lp = jnp.take_along_axis(draft_full, tok[:, None], axis=-1).squeeze(-1)
-                                    t_lp = jnp.take_along_axis(target_full, tok[:, None], axis=-1).squeeze(-1)
-                                    accept_i = accept_or_reject(d_lp, t_lp, self.spec.rng_split(1)[0])
+                                    step_pos = int(verify_meta.start_pos + real_count + draft_idx)
+                                    step_rng = self.spec.request_rng_key(req_state, position=step_pos, stream=2)
+                                    acc_i, emit_i = spec_rejection_sample(
+                                        jnp.stack([target_full[0], target_full[0]], axis=0)[None, :, :],
+                                        draft_full[:, None, :],
+                                        jnp.asarray([[int(draft_token)]], dtype=jnp.int32),
+                                        jnp.asarray([1], dtype=jnp.int32),
+                                        step_rng,
+                                        jnp.asarray([step_pos], dtype=jnp.int32),
+                                    )
                                     seed_hidden = target_hidden
-                                    if int(np.asarray(accept_i).reshape(-1)[0]) == 1:
+                                    if int(np.asarray(acc_i).reshape(-1)[0]) == 1:
                                         accepted += 1
                                         continue
-                                    corrected_token = int(
-                                        np.asarray(
-                                            resample_rejected(target_full, draft_full, self.spec.rng_split(1)[0])
-                                        ).reshape(-1)[0]
-                                    )
+                                    corrected_token = int(np.asarray(emit_i)[0, 0])
                                     break
                                 else:
                                     _target_token, seed_hidden = _replay_prefix_sample(row_pos, real_count + accepted)
@@ -4614,7 +4800,11 @@ class eSurgeRunner:
                                         self.spec.project_hidden_rows(seed_hidden[None, :]),
                                         req_state,
                                     )
-                                    corrected_token = self.spec.sample_distribution(bonus_full, req_state)
+                                    corrected_token = self.spec.sample_distribution(
+                                        bonus_full,
+                                        req_state,
+                                        position=int(verify_meta.start_pos + real_count + accepted),
+                                    )
                                     if want_output_scores:
                                         output_score_rows.append(bonus_full[0])
                             else:
@@ -4631,7 +4821,11 @@ class eSurgeRunner:
                                     self.spec.project_hidden_rows(target_hidden[None, :]),
                                     req_state,
                                 )
-                                corrected_token = self.spec.sample_distribution(target_full, req_state)
+                                corrected_token = self.spec.sample_distribution(
+                                    target_full,
+                                    req_state,
+                                    position=int(verify_meta.start_pos + real_count),
+                                )
                                 seed_hidden = target_hidden
                                 if want_output_scores:
                                     output_score_rows.append(target_full[0])
@@ -4648,7 +4842,11 @@ class eSurgeRunner:
                         )
 
                     _emit_write_start = time.time()
-                    emitted = [int(t) for t in draft_tokens_for_verify[:accepted]] + [int(corrected_token)]
+                    emitted = (
+                        list(_bv_emitted_override)
+                        if _bv_emitted_override is not None
+                        else ([int(t) for t in draft_tokens_for_verify[:accepted]] + [int(corrected_token)])
+                    )
                     if want_output_scores:
                         emitted_array = jnp.asarray(emitted, dtype=jnp.int32)
                         if greedy_spec:
@@ -4673,14 +4871,18 @@ class eSurgeRunner:
                     sampled_token_ids_all.append(emitted)
                     req_state.output_token_ids.extend(emitted)
 
-                    emit_start = int(num_computed_tokens_window_cpu[row_pos]) + real_count
+                    if _bv_known_len_override is not None:
+                        known_len = int(_bv_known_len_override)
+                        emit_start = max(0, known_len - len(emitted))
+                    else:
+                        emit_start = int(num_computed_tokens_window_cpu[row_pos]) + real_count
+                        known_len = emit_start + len(emitted)
                     emit_end = emit_start + len(emitted)
                     if emit_end <= self.max_model_len:
                         self.sequence_buffer.token_ids[req_idx, emit_start:emit_end] = np.asarray(
                             emitted,
                             dtype=np.int32,
                         )
-                    known_len = int(num_computed_tokens_window_cpu[row_pos]) + real_count + len(emitted)
                     self.sequence_buffer.num_tokens_no_spec[req_idx] = min(known_len, self.max_model_len)
                     self.sequence_buffer.num_tokens[req_idx] = min(known_len, self.max_model_len)
                     total_spec_emit_write_time += time.time() - _emit_write_start
@@ -4785,11 +4987,17 @@ class eSurgeRunner:
                 else:
                     tid = sampled_token_at(row_pos)
                     if req_state is not None and seq_len is not None:
-                        if req_idx is not None and 0 <= seq_len < self.max_model_len:
-                            self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+                        if req_idx is not None:
+                            if 0 <= seq_len < self.max_model_len:
+                                self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+                            known_len_now = min(int(seq_len) + 1, self.max_model_len)
+                            self.sequence_buffer.num_tokens_no_spec[req_idx] = known_len_now
+                            self.sequence_buffer.num_tokens[req_idx] = known_len_now
+                        host_emitted_by_out[len(sampled_token_ids_all)] = [tid]
                         sampled_token_ids_all.append([tid])
                         req_state.output_token_ids.append(tid)
                     else:
+                        host_emitted_by_out[len(sampled_token_ids_all)] = [tid]
                         sampled_token_ids_all.append([tid])
 
                     if spec_token_ids_all is not None:
@@ -4975,6 +5183,9 @@ class eSurgeRunner:
 
             start_index = next_start_index
 
+        pre_async_repair_pending = False
+        pending_pre_async_results = None
+
         self._apply_recurrent_snapshot_saves(scheduler_output)
 
         # Draft every collected greedy inline-MTP request in ONE batched pass over
@@ -5128,6 +5339,7 @@ class eSurgeRunner:
                 ),
                 windows=async_windows,
                 host_rows=host_emitted_by_out,
+                host_token_logprobs=token_logprobs,
                 resolve_logprobs=partial(
                     _materialize_logprobs,
                     req_ids_all,
@@ -5512,8 +5724,30 @@ class eSurgeRunner:
         """
         self.requests.clear()
         self.sequence_buffer.clear()
+        slot_pool = getattr(self, "slot_pool", None)
+        if slot_pool is not None:
+            slot_pool.reset()
         self._pre_async_results = None
-        self.spec.on_reset()
+        self._spec_carry = None
+        self._spec_recorded_this_step = False
+        if hasattr(self, "_pending_spec_recurrent_commit_by_req"):
+            self._pending_spec_recurrent_commit_by_req.clear()
+        if hasattr(self, "_spec_recurrent_commit_cpu"):
+            self._spec_recurrent_commit_cpu.fill(0)
+        if getattr(self, "executor_manager", None) is not None:
+            self.executor_manager.last_batch_metadata = None
+            self.executor_manager.last_spec_window_delta = None
+            drop_snaps = getattr(self.executor_manager, "drop_recurrent_snapshots", None)
+            if callable(drop_snaps):
+                drop_snaps()
+            reset_bases = getattr(self.executor_manager, "reset_recurrent_bases", None)
+            if callable(reset_bases):
+                reset_bases()
+            elif hasattr(self.executor_manager, "_recurrent_base_by_slot"):
+                self.executor_manager._recurrent_base_by_slot.fill(0)
+        spec = getattr(self, "spec", None)
+        if spec is not None:
+            spec.on_reset()
 
     def wait_for_execution(self, future: Future | _AsyncExecutionHandle) -> ModelRunnerOutput:
         """Wait for an async execution to complete and return the result.
@@ -5541,9 +5775,81 @@ class eSurgeRunner:
         threads inside :class:`ModelStepExecutor` are joined. Safe to
         invoke when the runner has already been shut down.
         """
-        if self._executor is not None:
+        self._side_input_provider = None
+        if getattr(self, "_executor", None) is not None:
             logger.debug("Shutting down async executor")
             self._executor.shutdown(wait=True)
             self._executor = None
         if getattr(self, "executor_manager", None) is not None:
             self.executor_manager.shutdown()
+
+    def close(self) -> None:
+        """Terminal teardown: drop drafter/VLM/executor references and break all runner cycles.
+
+        Called from :meth:`eSurge.close` (leaving :meth:`shutdown` restartable for
+        :meth:`eSurge.terminate` / :meth:`eSurge.initiate`). Idempotent.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if getattr(self, "requests", None) is not None and getattr(self, "sequence_buffer", None) is not None:
+            try:
+                self.reset_state()
+            except Exception:
+                logger.debug("eSurgeRunner close: reset_state failed", exc_info=True)
+        if getattr(self, "executor_manager", None) is not None:
+            try:
+                self.destroy_kv_cache()
+            except Exception:
+                logger.debug("eSurgeRunner close: destroy_kv_cache failed", exc_info=True)
+            try:
+                if getattr(self, "model", None) is not None:
+                    self.release_model_state(clear_compiled_cache=True)
+            except Exception:
+                logger.debug("eSurgeRunner close: release_model_state failed", exc_info=True)
+        try:
+            self.shutdown()
+        except Exception:
+            logger.debug("eSurgeRunner close: shutdown failed", exc_info=True)
+        spec = getattr(self, "spec", None)
+        if spec is not None:
+            if callable(getattr(spec, "close", None)):
+                try:
+                    spec.close()
+                except Exception:
+                    logger.debug("eSurgeRunner close: spec.close failed", exc_info=True)
+            else:
+                if hasattr(spec, "drafter"):
+                    spec.drafter = None
+                if hasattr(spec, "_runner"):
+                    spec._runner = None
+            self.spec = None
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            release_target = getattr(drafter, "release_target_model", None)
+            if callable(release_target):
+                try:
+                    release_target()
+                except Exception:
+                    logger.debug("eSurgeRunner close: drafter.release_target_model failed", exc_info=True)
+            self.drafter = None
+        vlm = getattr(self, "vlm", None)
+        if vlm is not None:
+            if callable(getattr(vlm, "close", None)):
+                vlm.close()
+            elif hasattr(vlm, "model_getter"):
+                vlm.model_getter = None
+            self.vlm = None
+        em = getattr(self, "executor_manager", None)
+        if em is not None:
+            if callable(getattr(em, "close", None)):
+                try:
+                    em.close()
+                except Exception:
+                    logger.debug("eSurgeRunner close: executor_manager.close failed", exc_info=True)
+            self.executor_manager = None
+        if hasattr(self, "_state_sync"):
+            self._state_sync = None
+        self._side_input_provider = None
+        self._side_input_tokenizer_state = None
+        self.model = None

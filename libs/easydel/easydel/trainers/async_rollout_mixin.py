@@ -64,6 +64,7 @@ class AsyncRolloutResult:
     informations: dict[str, float | int | str]
     produced_at_step: int
     preprocessing_time: float
+    minibatches: tuple[dict[str, jax.Array], ...] = ()
 
 
 def _steps_per_rollout(trainer: object) -> int:
@@ -229,11 +230,35 @@ class AsyncRolloutMixin:
                 self._async_grpo_force_old_logps = False
         informations = dict(informations)
         informations["async_rollout/rollout_produced_at_step"] = produced_at_step
+
+        steps_per_generation = max(1, int(getattr(self, "steps_per_generation", 1) or 1))
+        num_iterations = max(1, int(getattr(self, "num_iterations", 1) or 1))
+        reuse_span = max(1, steps_per_generation * num_iterations)
+        slice_chunks = getattr(self, "_slice_model_batch_chunks", None)
+        if reuse_span > 1 and callable(slice_chunks):
+            prompt_ids = model_batch.get("prompt_ids")
+            expected_step_batch = int(getattr(self.arguments, "total_batch_size", 1) or 1)  # type: ignore[attr-defined]
+            if (
+                steps_per_generation > 1
+                and prompt_ids is not None
+                and int(prompt_ids.shape[0]) >= steps_per_generation * expected_step_batch
+                and int(prompt_ids.shape[0]) % steps_per_generation == 0
+            ):
+                chunks = slice_chunks(model_batch, steps_per_generation)
+                schedule = tuple(mb for _ in range(num_iterations) for mb in chunks)
+            else:
+                schedule = tuple(dict(model_batch) for _ in range(reuse_span))
+            first_batch = schedule[0]
+        else:
+            schedule = (model_batch,)
+            first_batch = model_batch
+
         return AsyncRolloutResult(
-            batch=model_batch,
+            batch=first_batch,
             informations=informations,
             produced_at_step=produced_at_step,
             preprocessing_time=float(preprocessing_time_fn()),
+            minibatches=schedule,
         )
 
     def _execute_preprocessed_train_step(
@@ -271,7 +296,10 @@ class AsyncRolloutMixin:
                 merged = dict(informations)
                 if metrics.other_metrics is not None:
                     merged.update(metrics.other_metrics)
-                metrics.other_metrics = merged
+                if hasattr(metrics, "replace"):
+                    metrics = metrics.replace(other_metrics=merged)
+                else:
+                    metrics.other_metrics = merged
             return state, metrics, None
         except (
             KeyboardInterrupt,
@@ -358,14 +386,29 @@ class AsyncRolloutMixin:
         pending_sync_time = 0.0
         pending_batch = None
         rollout_snapshot: OwnedPolicySnapshot | None = None
-        rollout_cache_scope_key = f"{state.esurge_cache_scope_key}-async-rollout"
+        # Reuse the live state's eSurge cache scope so eval()/maybe_generate()
+        # and rollouts share one eSurge engine rather than allocating 2x KV cache.
+        rollout_cache_scope_key = state.esurge_cache_scope_key
         max_workers = 1
         queue_capacity = int(self.arguments.max_inflight_tasks)  # type: ignore[attr-defined]
         if self.arguments.queue_maxsize:  # type: ignore[attr-defined]
             queue_capacity = min(queue_capacity, int(self.arguments.queue_maxsize))  # type: ignore[attr-defined]
+        sync_interval = int(self.arguments.weight_sync_steps)  # type: ignore[attr-defined]
+        max_staleness = int(self.arguments.max_staleness)  # type: ignore[attr-defined]
+        steps_per_generation = max(1, int(getattr(self, "steps_per_generation", 1) or 1))
+        num_iterations = max(1, int(getattr(self, "num_iterations", 1) or 1))
+        concat_chunks = getattr(self, "_concat_raw_prompt_batches", None)
+        reuse_span = max(1, steps_per_generation * num_iterations) if callable(concat_chunks) else 1
+        is_multihost = int(jax.process_count()) > 1
+        if is_multihost:
+            logger.warning_once(
+                "Async rollout background lookahead disabled on multi-host meshes (process_count=%d) "
+                "to prevent concurrent JAX/eSurge collective-order deadlocks.",
+                int(jax.process_count()),
+            )
         # (future, raw batch, data time, sync time, anchor policy step)
         pending_rollouts: deque[tuple[concurrent.futures.Future, dict[str, object], float, float, int]] = deque()
-        max_staleness = int(self.arguments.max_staleness)  # type: ignore[attr-defined]
+        active_reuse_batches: deque[tuple[dict[str, jax.Array], dict[str, float | int | str], int, float]] = deque()
         admission_deferred = 0
         stale_dropped = 0
         submitted_futures: set[concurrent.futures.Future] = set()
@@ -377,9 +420,22 @@ class AsyncRolloutMixin:
         def fetch_batch() -> tuple[dict[str, object], float]:
             nonlocal train_iter
             with capture_time() as data_collection_time:
-                raw_batch, train_iter = self._get_next_batch(train_iter, train_dataset)  # type: ignore[attr-defined]
-                collated = data_collator(raw_batch)
+                if steps_per_generation <= 1 or not callable(concat_chunks):
+                    raw_batch, train_iter = self._get_next_batch(train_iter, train_dataset)  # type: ignore[attr-defined]
+                    collated = data_collator(raw_batch)
+                else:
+                    chunks = []
+                    for _ in range(steps_per_generation):
+                        raw_chunk, train_iter = self._get_next_batch(train_iter, train_dataset)  # type: ignore[attr-defined]
+                        chunks.append(data_collator(raw_chunk))
+                    collated = concat_chunks(chunks)
             return collated, float(data_collection_time())
+
+        def wait_for_inflight_rollouts() -> None:
+            """Wait for currently queued/running rollouts to finish without discarding them."""
+            for future, _, _, _, _ in tuple(pending_rollouts):
+                if not future.done():
+                    future.result(timeout=rollout_timeout)
 
         def submit_rollout(
             executor: concurrent.futures.ThreadPoolExecutor,
@@ -478,75 +534,72 @@ class AsyncRolloutMixin:
                         state = self.on_step_start(state=state, step=current_step)  # type: ignore[attr-defined]
 
                         with capture_time() as rollout_wait_time:
-                            refresh_due = (
-                                rollout_snapshot is not None
-                                and rollout_lag(current_step, rollout_snapshot.policy_step)
-                                >= int(self.arguments.weight_sync_steps)  # type: ignore[attr-defined]
-                            )
-                            if refresh_due and pending_rollouts:
-                                queued = list(pending_rollouts)
-                                pending_rollouts.clear()
-                                for future, _, _, _, _ in queued:
-                                    if not future.cancel():
-                                        future.result(timeout=rollout_timeout)
-                                snapshot, sync_time = ensure_rollout_snapshot(state, current_step, force=True)
-                                for _, raw_batch, data_time, _, _ in queued:
-                                    future = submit_rollout(
+                            if active_reuse_batches:
+                                reused_batch, reused_infos, reused_produced_step, reused_pre_time = (
+                                    active_reuse_batches.popleft()
+                                )
+                                reused_infos = dict(reused_infos)
+                                reused_infos["generation_reused"] = 1
+                                reused_infos["generation_reuse_remaining"] = len(active_reuse_batches)
+                                rollout = AsyncRolloutResult(
+                                    batch=reused_batch,
+                                    informations=reused_infos,
+                                    produced_at_step=reused_produced_step,
+                                    preprocessing_time=reused_pre_time,
+                                )
+                                pending_batch = None
+                                pending_data_time = 0.0
+                                pending_sync_time = 0.0
+                            else:
+                                if pending_rollouts:
+                                    pending_future, pending_batch, pending_data_time, pending_sync_time, _ = (
+                                        pending_rollouts.popleft()
+                                    )
+                                if pending_future is None:
+                                    pending_batch, pending_data_time = fetch_batch()
+                                    # Never generate from a snapshot that is already past its deadline.
+                                    snapshot_expired = (
+                                        rollout_snapshot is not None
+                                        and rollout_lag(current_step, rollout_snapshot.policy_step) > max_staleness
+                                    )
+                                    snapshot, pending_sync_time = ensure_rollout_snapshot(
+                                        state,
+                                        current_step,
+                                        force=snapshot_expired,
+                                    )
+                                    pending_future = submit_rollout(
                                         executor,
                                         rollout_state=snapshot.state,
-                                        rollout_batch=raw_batch,
+                                        rollout_batch=pending_batch,
                                         produced_at_step=snapshot.policy_step,
                                     )
-                                    pending_rollouts.append(
-                                        (future, raw_batch, data_time, sync_time, snapshot.policy_step)
-                                    )
-                            if pending_rollouts:
-                                pending_future, pending_batch, pending_data_time, pending_sync_time, _ = (
-                                    pending_rollouts.popleft()
-                                )
-                            if pending_future is None:
-                                pending_batch, pending_data_time = fetch_batch()
-                                # Never generate from a snapshot that is already past its deadline.
-                                snapshot_expired = (
-                                    rollout_snapshot is not None
-                                    and rollout_lag(current_step, rollout_snapshot.policy_step) > max_staleness
-                                )
-                                snapshot, pending_sync_time = ensure_rollout_snapshot(
-                                    state,
-                                    current_step,
-                                    force=snapshot_expired,
-                                )
-                                pending_future = submit_rollout(
-                                    executor,
-                                    rollout_state=snapshot.state,
-                                    rollout_batch=pending_batch,
-                                    produced_at_step=snapshot.policy_step,
-                                )
-                            if not bool(getattr(self, "_async_grpo_train_compiled_once", False)):
-                                first_timeout = float(
-                                    getattr(
-                                        self.arguments,  # type: ignore[attr-defined]
-                                        "first_rollout_timeout",
-                                        max(rollout_timeout, 3600.0),
-                                    )
-                                )
-                                deadline = time.monotonic() + first_timeout
-                                while True:
-                                    remaining_s = deadline - time.monotonic()
-                                    if remaining_s <= 0:
-                                        raise TimeoutError(f"First async rollout timed out after {first_timeout:.1f}s.")
-                                    try:
-                                        rollout = pending_future.result(timeout=min(60.0, remaining_s))
-                                        break
-                                    except concurrent.futures.TimeoutError:
-                                        elapsed_s = first_timeout - max(0.0, deadline - time.monotonic())
-                                        logger.debug(
-                                            "Waiting for first async rollout / cold compile (%.0fs / %.0fs)...",
-                                            elapsed_s,
-                                            first_timeout,
+                                if not bool(getattr(self, "_async_grpo_train_compiled_once", False)):
+                                    first_timeout = float(
+                                        getattr(
+                                            self.arguments,  # type: ignore[attr-defined]
+                                            "first_rollout_timeout",
+                                            max(rollout_timeout, 3600.0),
                                         )
-                            else:
-                                rollout = pending_future.result(timeout=rollout_timeout)
+                                    )
+                                    deadline = time.monotonic() + first_timeout
+                                    while True:
+                                        remaining_s = deadline - time.monotonic()
+                                        if remaining_s <= 0:
+                                            raise TimeoutError(
+                                                f"First async rollout timed out after {first_timeout:.1f}s."
+                                            )
+                                        try:
+                                            rollout = pending_future.result(timeout=min(60.0, remaining_s))
+                                            break
+                                        except concurrent.futures.TimeoutError:
+                                            elapsed_s = first_timeout - max(0.0, deadline - time.monotonic())
+                                            logger.debug(
+                                                "Waiting for first async rollout / cold compile (%.0fs / %.0fs)...",
+                                                elapsed_s,
+                                                first_timeout,
+                                            )
+                                else:
+                                    rollout = pending_future.result(timeout=rollout_timeout)
                         rollout_wait_seconds = float(rollout_wait_time())
                         rollout_sync_seconds = pending_sync_time
                         pending_sync_time = 0.0
@@ -562,13 +615,18 @@ class AsyncRolloutMixin:
                         return state, exc, train_iter
 
                     rollout_staleness = rollout_lag(current_step, int(rollout.produced_at_step))
-                    if rollout_staleness > max_staleness:
+                    if rollout_staleness > max_staleness and pending_batch is not None:
                         # Safety net; deadline admission keeps this rare.
+                        # Cancel unstarted futures first before waiting on any
+                        # running worker so queued tasks are not drained and wasted.
                         stale_dropped += 1
                         queued_batches = []
-                        while pending_rollouts:
-                            future, queued_batch, data_time, _, _ = pending_rollouts.popleft()
-                            if not future.cancel():
+                        queued_items = list(pending_rollouts)
+                        pending_rollouts.clear()
+                        for future, _, _, _, _ in queued_items:
+                            future.cancel()
+                        for future, queued_batch, data_time, _, _ in queued_items:
+                            if not future.cancelled():
                                 future.result(timeout=rollout_timeout)
                             queued_batches.append((queued_batch, data_time))
                         snapshot, rollout_sync_seconds = ensure_rollout_snapshot(
@@ -595,22 +653,65 @@ class AsyncRolloutMixin:
                             )
                             pending_rollouts.append((future, queued_batch, data_time, 0.0, snapshot.policy_step))
 
+                    # Enqueue any additional minibatches produced for steps_per_generation / num_iterations.
+                    if len(rollout.minibatches) > 1:
+                        for extra_mb in rollout.minibatches[1:]:
+                            active_reuse_batches.append(
+                                (
+                                    dict(extra_mb),
+                                    dict(rollout.informations),
+                                    int(rollout.produced_at_step),
+                                    float(rollout.preprocessing_time),
+                                )
+                            )
+
                     compiled_train_ready = bool(getattr(self, "_async_grpo_train_compiled_once", False))
+                    step_limit = min(self.max_training_steps, epoch_end_step)  # type: ignore[attr-defined]
                     schedule_next = (
-                        compiled_train_ready
-                        and current_step + steps_per_rollout < self.max_training_steps  # type: ignore[attr-defined]
-                        and current_step + steps_per_rollout < epoch_end_step
+                        not is_multihost
+                        and compiled_train_ready
+                        and max_staleness > 0
+                        and current_step + steps_per_rollout < step_limit
                     )
                     next_data_time = 0.0
                     if schedule_next:
-                        remaining_steps = min(self.max_training_steps, epoch_end_step) - current_step  # type: ignore[attr-defined]
+                        # Refresh the snapshot *after* consuming valid rollouts when no
+                        # worker is reading the old snapshot and a weight sync is already
+                        # due, so lookahead work for upcoming steps runs on fresh weights
+                        # instead of being discarded at the next consumption step.
+                        if not pending_rollouts and rollout_snapshot is not None:
+                            if rollout_lag(current_step, rollout_snapshot.policy_step) >= sync_interval:
+                                rollout_snapshot, refresh_sync_time = ensure_rollout_snapshot(
+                                    state,
+                                    current_step,
+                                    force=True,
+                                )
+                                rollout_sync_seconds += refresh_sync_time
+
+                        # Bound lookahead lag so we never speculatively generate rollouts that
+                        # would cross a weight_sync_steps refresh boundary and get discarded.
+                        # With weight_sync_steps=1, allow 1-step pipelining (capped by max_staleness).
+                        sync_lag_cap = 1 if sync_interval == 1 else sync_interval - 1
+                        remaining_steps = step_limit - current_step
                         # Rollouts still to consume after this one: ceil(remaining_steps / k) - 1.
                         remaining = -(-remaining_steps // steps_per_rollout) - 1
                         while len(pending_rollouts) < min(queue_capacity, remaining):
+                            next_unscheduled_step = (
+                                current_step
+                                + (1 + len(active_reuse_batches) + len(pending_rollouts) * reuse_span)
+                                * steps_per_rollout
+                            )
+                            if next_unscheduled_step >= step_limit:
+                                break
                             snapshot, sync_time = ensure_rollout_snapshot(state, current_step)
-                            # Queued rollouts are consumed one per rollout after the current one.
-                            if not admits(int(snapshot.policy_step), current_step):
+                            next_lag = rollout_lag(next_unscheduled_step, int(snapshot.policy_step))
+                            # Check deadline admission first so staleness-capped lookahead logs
+                            # admission_deferred cleanly.
+                            if not admits(int(snapshot.policy_step), current_step) or next_lag > max_staleness:
                                 admission_deferred += 1
+                                rollout_sync_seconds += sync_time
+                                break
+                            if next_lag > sync_lag_cap:
                                 rollout_sync_seconds += sync_time
                                 break
                             next_batch, data_time = fetch_batch()
@@ -678,6 +779,14 @@ class AsyncRolloutMixin:
                         )
                         train_metrics["performance/data_collection_time"] = float(pending_data_time)
                         train_metrics["performance/async_next_data_collection_time"] = float(next_data_time)
+                        sync_ref_due = (
+                            bool(getattr(self.arguments, "sync_ref_model", False))  # type: ignore[attr-defined]
+                            and getattr(self, "ref_state", None) is not None
+                            and current_step % max(int(getattr(self.arguments, "ref_model_sync_steps", 1) or 1), 1) == 0  # type: ignore[attr-defined]
+                        )
+                        if sync_ref_due:
+                            # Idle background rollout workers before mutating self.ref_state.
+                            wait_for_inflight_rollouts()
                         state, metrics = self.on_step_end(  # type: ignore[attr-defined]
                             state=state,
                             metrics=metrics,
@@ -697,11 +806,21 @@ class AsyncRolloutMixin:
                             self.log_weight_distribution(state=state, step=current_step)  # type: ignore[attr-defined]
                         with capture_time() as watchers_time:
                             self.log_watchers(state=state, step=current_step)  # type: ignore[attr-defined]
+                        gen_interval = getattr(self.arguments, "generation_interval", None)  # type: ignore[attr-defined]
+                        gen_due = bool(gen_interval and gen_interval > 0 and current_step % int(gen_interval) == 0)
+                        if gen_due:
+                            wait_for_inflight_rollouts()
                         with capture_time() as generation_time:
                             try:
                                 self.maybe_generate(state=state, step=current_step, metrics=metrics)  # type: ignore[attr-defined]
                             except Exception as exc:
                                 logger.warning("Preview generation hook failed: %s", exc, exc_info=True)
+                        bench_interval = getattr(self.arguments, "benchmark_interval", None)  # type: ignore[attr-defined]
+                        bench_due = bool(
+                            bench_interval and bench_interval > 0 and current_step % int(bench_interval) == 0
+                        )
+                        if bench_due:
+                            wait_for_inflight_rollouts()
                         with capture_time() as benchmark_time:
                             try:
                                 self.maybe_benchmark(state=state, step=current_step)  # type: ignore[attr-defined]
@@ -715,6 +834,7 @@ class AsyncRolloutMixin:
                             )
                         with capture_time() as evaluation_time:
                             if self._should_run_evaluation(current_step):  # type: ignore[attr-defined]
+                                wait_for_inflight_rollouts()
                                 for _ in self.eval(model_state=state):  # type: ignore[attr-defined]
                                     ...
                         self.log_metrics(  # type: ignore[attr-defined]

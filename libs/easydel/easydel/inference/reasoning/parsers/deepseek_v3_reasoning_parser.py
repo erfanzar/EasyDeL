@@ -60,17 +60,25 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             :meth:`configure_prompt_context`.
     """
 
+    start_token = DeepSeekR1ReasoningParser.start_token
+    end_token = DeepSeekR1ReasoningParser.end_token
+
     def __init__(self, tokenizer):
         """Initialize and select delegate parser based on tokenizer chat template.
 
         Inspects the tokenizer's chat template for thinking/enable_thinking
-        support. If found, uses DeepSeekR1ReasoningParser; otherwise falls
-        back to IdentityReasoningParser.
+        support. If found (or when ``tokenizer is None``, e.g. text-only
+        stripping via ``make_reasoning_stripper``), uses
+        DeepSeekR1ReasoningParser; otherwise falls back to
+        IdentityReasoningParser.
 
         Args:
             tokenizer: Tokenizer whose chat template determines the delegate.
         """
         super().__init__(tokenizer)
+        if tokenizer is None:
+            self._delegate = DeepSeekR1ReasoningParser(tokenizer)
+            return
         chat_template = getattr(tokenizer, "chat_template", "") or ""
         has_thinking = (
             "thinking" in chat_template
@@ -81,6 +89,16 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             self._delegate = DeepSeekR1ReasoningParser(tokenizer)
         else:
             self._delegate = IdentityReasoningParser(tokenizer)
+
+    @property
+    def streaming_all_phases(self) -> bool:
+        """Forward ``streaming_all_phases`` from the active delegate."""
+        return bool(getattr(self._delegate, "streaming_all_phases", False))
+
+    def adjust_request(self, request):
+        """Forward request adjustment to the active delegate."""
+        self._sync_delegate_state()
+        return self._delegate.adjust_request(request)
 
     def _sync_delegate_state(self) -> None:
         """Mirror compatibility flags from this wrapper onto the delegate.
@@ -156,6 +174,18 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         """
         self._sync_delegate_state()
         return self._delegate.extract_reasoning(model_output, request)
+
+    def extract_reasoning_final(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Forward terminal channel extraction to the selected delegate."""
+        self._sync_delegate_state()
+        return self._delegate.extract_reasoning_final(model_output, request)
+
+    def finalize_streaming(
+        self, current_text: str, current_token_ids: Sequence[int] = (), request=None
+    ) -> DeltaMessage | None:
+        """Forward streaming finalization to the selected delegate."""
+        self._sync_delegate_state()
+        return self._delegate.finalize_streaming(current_text, current_token_ids, request)
 
     def extract_reasoning_streaming(
         self,

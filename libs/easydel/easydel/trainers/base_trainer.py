@@ -38,6 +38,7 @@ import collections.abc
 import copy
 import faulthandler
 import gc
+import inspect
 import itertools
 import json
 import logging
@@ -48,6 +49,7 @@ import sys
 import time
 import typing as tp
 from abc import abstractmethod
+from datetime import datetime
 from functools import cached_property
 from typing import NamedTuple
 
@@ -60,6 +62,7 @@ from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from jax import numpy as jnp
 from jax._src.stages import Compiled
+from jax.sharding import NamedSharding
 from spectrax import common_types
 from tqdm.autonotebook import tqdm
 from transformers import GenerationConfig, ProcessorMixin
@@ -2321,10 +2324,15 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             The integer pad token ID.
         """
-        if isinstance(self.processing_class, ProcessorMixin):
-            pad_token_id = self.processing_class.tokenizer.pad_token_id
-        else:
-            pad_token_id = self.processing_class.pad_token_id
+        proc = self._get_processing_class() if hasattr(self, "_get_processing_class") else self.processing_class
+        pad_token_id = None
+        if proc is not None:
+            if isinstance(proc, ProcessorMixin) or hasattr(proc, "tokenizer"):
+                pad_token_id = getattr(getattr(proc, "tokenizer", None), "pad_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = getattr(proc, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(getattr(self, "config", None), "pad_token_id", None)
         if pad_token_id is not None:
             return pad_token_id
         eos_ids = self._eos_token_id
@@ -2343,16 +2351,24 @@ class BaseTrainer(BaseTrainerProtocol):
             A list of unique EOS token IDs.
         """
         eos_ids = []
-        if isinstance(self.processing_class, ProcessorMixin):
-            proc_eos_token_id = self.processing_class.tokenizer.eos_token_id
-        else:
-            proc_eos_token_id = self.processing_class.eos_token_id
+        proc = self._get_processing_class() if hasattr(self, "_get_processing_class") else self.processing_class
+        proc_eos_token_id = None
+        if proc is not None:
+            if isinstance(proc, ProcessorMixin) or hasattr(proc, "tokenizer"):
+                proc_eos_token_id = getattr(getattr(proc, "tokenizer", None), "eos_token_id", None)
+            if proc_eos_token_id is None:
+                proc_eos_token_id = getattr(proc, "eos_token_id", None)
         if isinstance(proc_eos_token_id, int):
             proc_eos_token_id = [proc_eos_token_id]
         eos_ids.extend(proc_eos_token_id or [])
         generation_config = getattr(self.model, "generation_config", None)
         if generation_config is not None:
             conf_eos = generation_config.eos_token_id
+            if isinstance(conf_eos, int):
+                conf_eos = [conf_eos]
+            eos_ids.extend(conf_eos or [])
+        elif getattr(self, "config", None) is not None:
+            conf_eos = getattr(self.config, "eos_token_id", None)
             if isinstance(conf_eos, int):
                 conf_eos = [conf_eos]
             eos_ids.extend(conf_eos or [])
@@ -2506,6 +2522,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 if transform is not None:
                     setattr(self, attr, self._preprocess_source(source, transform))
 
+        self._unpacked_train_source = self._train_source
         if getattr(self.arguments, "sequence_packing", False):
             self._apply_sequence_packing_to_sources()
 
@@ -2531,15 +2548,32 @@ class BaseTrainer(BaseTrainerProtocol):
         if eval_enabled and self._eval_source is not None:
             self._eval_source = self._pack_token_source(self._eval_source, strategy=strategy)
 
-    def _pack_token_source(self, source: ShardedDataSource, *, strategy: str | None = None) -> ShardedDataSource:
-        """Return a packed view of a tokenized source unless it is already packed."""
+    def _pack_token_source(
+        self,
+        source: ShardedDataSource,
+        *,
+        strategy: str | None = None,
+        seq_length: int | None = None,
+    ) -> ShardedDataSource:
+        """Return a packed view of a tokenized source unless it is already packed to ``seq_length``."""
+        target_seq_length = (
+            int(seq_length) if seq_length is not None else int(getattr(self.arguments, "max_length", 0) or 0)
+        )
         if type(source).__name__ == "PackedShardedSource":
-            return source
+            current_seq_length = getattr(source, "seq_length", getattr(source, "_seq_length", None))
+            if current_seq_length == target_seq_length:
+                return source
+            inner_source = getattr(source, "_source", None)
+            if inner_source is None:
+                inner_source = getattr(source, "source", None)
+            if inner_source is not None:
+                source = inner_source
+            else:
+                return source
 
         from easydel.data.transforms.pack import PackedShardedSource
 
-        seq_length = int(getattr(self.arguments, "max_length", 0) or 0)
-        if seq_length <= 0:
+        if target_seq_length <= 0:
             raise ValueError("`max_length` must be positive when `sequence_packing=True`.")
 
         pad_token_id = self._tokenizer_int_attr("pad_token_id", 0)
@@ -2552,7 +2586,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
         return PackedShardedSource(
             source=source,
-            seq_length=seq_length,
+            seq_length=target_seq_length,
             eos_token_id=int(eos_token_id),
             pad_token_id=int(pad_token_id),
             strategy=strategy or self._sequence_packing_strategy(),
@@ -2564,7 +2598,8 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _tokenizer_int_attr(self, name: str, default: int | None = None) -> int | None:
         """Read an integer tokenizer attribute from tokenizer or nested processor."""
-        candidates = [self.processing_class, getattr(self.processing_class, "tokenizer", None)]
+        proc = getattr(self, "processing_class", None)
+        candidates = [proc, getattr(proc, "tokenizer", None)]
         for candidate in candidates:
             value = getattr(candidate, name, None)
             if value is not None:
@@ -2773,13 +2808,78 @@ class BaseTrainer(BaseTrainerProtocol):
     __str__ = __repr__
 
     @staticmethod
-    def finish():
-        """Clean up resources and finish any active logging sessions.
+    def _close_iterator(iterator: tp.Any) -> None:
+        """Best-effort close of a data/prefetch iterator to release worker threads and shared memory."""
+        if iterator is None:
+            return
+        close_fn = getattr(iterator, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                log_debug_maybe(f"Failed to close data iterator: {exc}")
 
-        Notes:
-            Currently only finishes wandb session if active.
-            Safe to call even if wandb is not initialized.
+    def _close_rich_progress_bar(self) -> None:
+        """Stop and detach any cached Rich Progress display and its refresh thread."""
+        progress = getattr(self, "_hidden_rich_pbar", None)
+        if progress is not None:
+            try:
+                delattr(self, "_hidden_rich_pbar")
+            except AttributeError:
+                pass
+            stop_fn = getattr(progress, "stop", None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception as exc:  # pragma: no cover - best-effort cleanup
+                    log_debug_maybe(f"Failed to stop Rich progress bar: {exc}")
+
+    def _close_bucket_iterators(self) -> None:
+        """Close and clear all active per-bucket data iterators."""
+        bucket_iters = getattr(self, "_bucket_iters", None)
+        if isinstance(bucket_iters, dict) and bucket_iters:
+            for iterator in list(bucket_iters.values()):
+                self._close_iterator(iterator)
+            bucket_iters.clear()
+
+    def _teardown_resources(self) -> None:
+        """Release trainer-owned host and device resources (TensorBoard, Rich, iterators, eSurge, tables)."""
+        self._close_rich_progress_bar()
+        self._close_bucket_iterators()
+
+        args = getattr(self, "arguments", None)
+        if args is not None:
+            close_tb = getattr(args, "close_tensorboard", None)
+            if callable(close_tb):
+                try:
+                    close_tb()
+                except Exception as exc:  # pragma: no cover - best-effort cleanup
+                    log_debug_maybe(f"Failed to close TensorBoard SummaryWriter: {exc}")
+
+        release_fn = getattr(self, "release_generation_runtime", None)
+        if callable(release_fn):
+            try:
+                release_fn(clear_esurge_compiled_cache=True)
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                log_debug_maybe(f"Failed to release generation runtime during teardown: {exc}")
+
+        for attr in ("preview_log_table", "benchmark_log_table", "training_generation_log_table"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+            for suffix in ("_increments", "_rows"):
+                counter_attr = f"_{attr}{suffix}"
+                if hasattr(self, counter_attr):
+                    setattr(self, counter_attr, 0)
+
+    def finish(self=None):
+        """Clean up trainer resources and finish any active logging sessions.
+
+        Can be invoked either on a trainer instance (``self.finish()``) or
+        directly on the class (``BaseTrainer.finish()``). Safe to call even
+        when optional loggers are not initialized.
         """
+        if self is not None:
+            self._teardown_resources()
         if wandb is not None:
             try:
                 wandb.finish()
@@ -2935,9 +3035,9 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         else:
             image_token_id = None  # genuinely text-only model
-        processor = self.processing_class
+        processor = self._get_processing_class() if hasattr(self, "_get_processing_class") else self.processing_class
         tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        pad_id = tokenizer.pad_token_id  # tokenizers/processors define this (value may be None = no pad)
+        pad_id = getattr(tokenizer, "pad_token_id", None)
         return image_token_id, pad_id
 
     def _apply_pose_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
@@ -3018,9 +3118,16 @@ class BaseTrainer(BaseTrainerProtocol):
         )
         if binding is None:
             return None
-        return EncoderProcessor(model, config, binding=binding)
+        # Pass model=None so EncoderProcessor never pins Step-0 weights in HBM;
+        # the live step model is supplied per call in _apply_process_encoder_to_batch.
+        return EncoderProcessor(None, config, binding=binding)
 
-    def _apply_process_encoder_to_batch(self, batch: tp.Any, step: int) -> tp.Any:
+    def _apply_process_encoder_to_batch(
+        self,
+        batch: tp.Any,
+        step: int,
+        state: EasyDeLState | None = None,
+    ) -> tp.Any:
         """Host-side, pre-forward vision-encoder processing on a collated batch.
 
         Runs the model's vision tower out of band on the batch's vision-bearing rows and
@@ -3033,6 +3140,7 @@ class BaseTrainer(BaseTrainerProtocol):
         Args:
             batch: The collated microbatch.
             step: Current global step, used for bucket routing.
+            state: Active trainer state for the current step (falls back to ``self.model_state``).
 
         Returns:
             The batch, with vision features substituted when processing ran.
@@ -3040,9 +3148,10 @@ class BaseTrainer(BaseTrainerProtocol):
         processor = getattr(self, "_encoder_processor", None)
         if processor is None:
             return batch
+        active_state = state if state is not None else self.model_state
         return processor.process(
             batch,
-            model=self.model_state.model,
+            model=active_state.model,
             bucket_index=self._bucket_for_step if self._has_buckets else None,
         )
 
@@ -3075,6 +3184,11 @@ class BaseTrainer(BaseTrainerProtocol):
             if key in ("assistant_only_mask", "dataset_ids"):
                 # -1 is the inert "inherit / unattributed" value; 0 would mean "opted out" / dataset 0.
                 return -1
+            if key == "input_ids" or key.endswith("_input_ids"):
+                pad_id = self._tokenizer_int_attr("pad_token_id", None)
+                if pad_id is None:
+                    pad_id = getattr(getattr(self, "config", None), "pad_token_id", None)
+                return int(pad_id) if pad_id is not None else 0
             if np.issubdtype(array.dtype, np.bool_):
                 return False
             return 0
@@ -3557,26 +3671,158 @@ class BaseTrainer(BaseTrainerProtocol):
             return sequences, prompt_ids, prompt_mask
         return sequences
 
+    def _auxiliary_generation_states(self) -> tuple[EasyDeLState, ...]:
+        """Return non-policy states (e.g. reference/teacher) that may own eSurge runtimes."""
+        states: list[EasyDeLState] = []
+        for attr in ("ref_state", "reference_state", "teacher_state"):
+            aux_state = getattr(self, attr, None)
+            if aux_state is not None:
+                states.append(aux_state)
+        return tuple(states)
+
+    @staticmethod
+    def _state_leaf_signature(tree: tp.Any) -> tuple[tp.Any, tuple[tuple[tp.Any, tp.Any], ...]] | None:
+        """Return ``(treedef, ((shape, dtype), ...))`` metadata for compatibility checks."""
+        if tree is None:
+            return None
+        try:
+            leaves, treedef = jax.tree_util.tree_flatten(tree)
+        except Exception:
+            return None
+        leaf_meta = tuple(
+            (getattr(leaf, "shape", None), getattr(leaf, "dtype", None))
+            for leaf in leaves
+        )
+        return treedef, leaf_meta
+
+    def _share_esurge_cache_scope_if_compatible(
+        self,
+        aux_state: EasyDeLState | None,
+        *,
+        primary_state: EasyDeLState | None = None,
+    ) -> EasyDeLState | None:
+        """Align ``aux_state.esurge_cache_scope_key`` with ``primary_state`` when compatible.
+
+        Sharing the eSurge cache scope key prevents explicit reference/teacher
+        states that match the policy architecture from allocating a second
+        persistent eSurge engine in ``_ESURGE_MAP_CACHE``. Checks either exact
+        ``graphdef`` equality or matching ``_source_layout_signature_for_esurge_metadata()``
+        along with identical mesh and ``graphstate``/``graphother`` leaf shapes/dtypes.
+        """
+        if aux_state is None:
+            return None
+        primary = primary_state if primary_state is not None else getattr(self, "model_state", None)
+        if primary is None:
+            return aux_state
+        primary_scope = getattr(primary, "esurge_cache_scope_key", None)
+        if not isinstance(primary_scope, str) or not primary_scope:
+            return aux_state
+        if getattr(aux_state, "esurge_cache_scope_key", None) == primary_scope:
+            return aux_state
+        if not callable(getattr(aux_state, "replace", None)):
+            return aux_state
+
+        aux_graphdef = getattr(aux_state, "graphdef", None)
+        primary_graphdef = getattr(primary, "graphdef", None)
+        compatible = False
+        if aux_graphdef is not None and primary_graphdef is not None:
+            try:
+                compatible = aux_graphdef is primary_graphdef or aux_graphdef == primary_graphdef
+            except Exception:
+                compatible = False
+
+        if not compatible:
+            try:
+                aux_model = aux_state.model
+                primary_model = primary.model
+                aux_sig_fn = getattr(aux_model, "_source_layout_signature_for_esurge_metadata", None)
+                primary_sig_fn = getattr(primary_model, "_source_layout_signature_for_esurge_metadata", None)
+                if callable(aux_sig_fn) and callable(primary_sig_fn):
+                    aux_sig = aux_sig_fn()
+                    primary_sig = primary_sig_fn()
+                    if aux_sig is not None and aux_sig == primary_sig:
+                        same_mesh = getattr(aux_model, "mesh", None) == getattr(primary_model, "mesh", None)
+                        if same_mesh:
+                            gs_aux = self._state_leaf_signature(getattr(aux_state, "graphstate", None))
+                            gs_pri = self._state_leaf_signature(getattr(primary, "graphstate", None))
+                            go_aux = self._state_leaf_signature(getattr(aux_state, "graphother", None))
+                            go_pri = self._state_leaf_signature(getattr(primary, "graphother", None))
+                            compatible = gs_aux is not None and gs_aux == gs_pri and go_aux == go_pri
+            except Exception:
+                compatible = False
+
+        if not compatible:
+            return aux_state
+        return aux_state.replace(esurge_cache_scope_key=primary_scope)
+
+    def _release_esurge_for_state(
+        self,
+        target_state: EasyDeLState | None,
+        *,
+        clear_esurge_compiled_cache: bool = False,
+    ) -> None:
+        """Pause and release any eSurge runtime attached to ``target_state``."""
+        if target_state is None:
+            return
+        try:
+            model = target_state.model
+            pause_esurge = getattr(model, "pause_esurge", None)
+            if callable(pause_esurge):
+                pause_esurge(
+                    release_model_state=True,
+                    clear_compiled_cache=clear_esurge_compiled_cache,
+                )
+        except Exception as exc:  # pragma: no cover - best-effort cleanup
+            log_debug_maybe(f"Failed to release generation runtime: {exc}")
+
     def release_generation_runtime(
         self,
         *,
         state: EasyDeLState | None = None,
+        extra_states: collections.abc.Iterable[EasyDeLState | None] = (),
         clear_esurge_compiled_cache: bool = False,
     ) -> None:
-        """Pause generation runtime while reclaiming rollout KV memory."""
+        """Pause generation runtime while reclaiming rollout KV memory.
+
+        When ``state`` is given, pauses and releases that state (plus any
+        ``extra_states``). When ``state`` is ``None``, releases
+        ``self.model_state`` along with any auxiliary generation states
+        returned by :meth:`_auxiliary_generation_states` (such as
+        ``ref_state``, ``reference_state``, and ``teacher_state``) and
+        ``extra_states``, deduplicated by object identity and cache scope key.
+        """
 
         self.generate_function = None
         self.generate_function_with_model_kwargs = None
 
-        state = state or self.model_state
+        targets: list[EasyDeLState] = []
         if state is not None:
-            try:
-                state.model.pause_esurge(
-                    release_model_state=True,
-                    clear_compiled_cache=clear_esurge_compiled_cache,
-                )
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                log_debug_maybe(f"Failed to release generation runtime: {exc}")
+            targets.append(state)
+        else:
+            model_state = getattr(self, "model_state", None)
+            if model_state is not None:
+                targets.append(model_state)
+            targets.extend(self._auxiliary_generation_states())
+        for extra in extra_states:
+            if extra is not None:
+                targets.append(extra)
+
+        seen_ids: set[int] = set()
+        seen_scopes: set[str] = set()
+        for target in targets:
+            target_id = id(target)
+            if target_id in seen_ids:
+                continue
+            seen_ids.add(target_id)
+            scope_key = getattr(target, "esurge_cache_scope_key", None)
+            if isinstance(scope_key, str) and scope_key:
+                if scope_key in seen_scopes:
+                    continue
+                seen_scopes.add(scope_key)
+            self._release_esurge_for_state(
+                target,
+                clear_esurge_compiled_cache=clear_esurge_compiled_cache,
+            )
 
         gc.collect()
 
@@ -3748,7 +3994,17 @@ class BaseTrainer(BaseTrainerProtocol):
             )
             use_esurge = False
         pad_token_id = self._pad_token_id
-        sampling_params = esurge_generation.resolve_sampling(args, config_overrides)
+        try:
+            sampling_params = esurge_generation.resolve_sampling(
+                args,
+                config_overrides,
+                generate_kwargs=generate_kwargs or None,
+            )
+        except TypeError:
+            merged_overrides = dict(config_overrides or {})
+            if generate_kwargs:
+                merged_overrides.update({k: v for k, v in generate_kwargs.items() if v is not None})
+            sampling_params = esurge_generation.resolve_sampling(args, merged_overrides or None)
 
         if use_esurge:
             return self._generate_via_esurge(
@@ -3763,6 +4019,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 all_gather=all_gather,
                 release_runtime_after_generation=release_runtime_after_generation,
                 clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
+                generate_kwargs=generate_kwargs,
             )
         return self._generate_via_compiled(
             input_ids=input_ids,
@@ -3798,6 +4055,7 @@ class BaseTrainer(BaseTrainerProtocol):
         all_gather,
         release_runtime_after_generation,
         clear_esurge_compiled_cache_after_generation,
+        generate_kwargs: dict[str, tp.Any] | None = None,
     ) -> GenerationResults:
         """Run one rollout through eSurge and return unified results.
 
@@ -3856,8 +4114,24 @@ class BaseTrainer(BaseTrainerProtocol):
         # Request the sampled token only (no vocabulary top-k payload). Keep
         # caller-owned params unchanged, including for follow-up tool rollouts.
         sampling_params = copy.copy(sampling_params)
+        if generate_kwargs:
+            _direct_overrides = {
+                k: v
+                for k, v in generate_kwargs.items()
+                if v is not None and k not in {"use_tqdm", "stream"}
+            }
+            if _direct_overrides and hasattr(esurge_generation, "apply_sampling_overrides"):
+                sampling_params = esurge_generation.apply_sampling_overrides(
+                    sampling_params,
+                    _direct_overrides,
+                )
         if sampling_params.logprobs is None:
             sampling_params.logprobs = 0
+        use_tqdm = (
+            bool(generate_kwargs["use_tqdm"])
+            if generate_kwargs and generate_kwargs.get("use_tqdm") is not None
+            else args.esurge_use_tqdm
+        )
         max_new_tokens = sampling_params.max_tokens
         if max_new_tokens is None:
             max_new_tokens = esurge_generation.DEFAULT_MAX_NEW_TOKENS
@@ -3892,9 +4166,12 @@ class BaseTrainer(BaseTrainerProtocol):
             """
             if esurge_engine is None:
                 try:
-                    # If setup failed before returning an engine handle, fall back to
-                    # model-level pause to clean any partially initialized cached engine.
-                    state.model.pause_esurge()
+                    # If setup failed before returning an engine handle, release via
+                    # the trainer runtime helper so model state and compiled cache flags match.
+                    self.release_generation_runtime(
+                        state=state,
+                        clear_esurge_compiled_cache=clear_esurge_compiled_cache_after_generation,
+                    )
                 except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
                     log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
                 return
@@ -3916,29 +4193,40 @@ class BaseTrainer(BaseTrainerProtocol):
                     prompts=prompts,
                     sampling_params=sampling_params,
                     stream=False,
-                    use_tqdm=args.esurge_use_tqdm,
+                    use_tqdm=use_tqdm,
                 )
             else:
                 outputs = esurge_engine.generate(
                     prompts=prompts,
                     sampling_params=sampling_params,
-                    use_tqdm=args.esurge_use_tqdm,
+                    use_tqdm=use_tqdm,
                     prompt_token_ids=prompt_token_ids,
                 )
-        except Exception:
+        except BaseException:
             _cleanup_failed_esurge_generation()
             raise
 
         try:
-            arrays = esurge_generation.outputs_to_arrays(
-                outputs,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_prompts=return_prompts,
-                pad_token_id=pad_token_id,
-                max_seq_len=prompt_seq_len,
-                max_new_tokens=max_new_tokens,
-            )
+            outputs_kwargs: dict[str, tp.Any] = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "return_prompts": return_prompts,
+                "pad_token_id": pad_token_id,
+                "max_seq_len": prompt_seq_len,
+                "max_new_tokens": max_new_tokens,
+            }
+            if "mesh" in inspect.signature(esurge_generation.outputs_to_arrays).parameters:
+                resolved_mesh = getattr(getattr(state, "model", None), "mesh", None)
+                if resolved_mesh is None:
+                    model_ref = getattr(self, "_model", None)
+                    if model_ref is None:
+                        try:
+                            model_ref = self.model
+                        except AttributeError:
+                            model_ref = None
+                    resolved_mesh = getattr(model_ref, "mesh", None)
+                outputs_kwargs["mesh"] = resolved_mesh
+            arrays = esurge_generation.outputs_to_arrays(outputs, **outputs_kwargs)
             prompt_ids = arrays.prompt_ids
             prompt_mask = arrays.prompt_mask
             sequences = arrays.sequences
@@ -3981,7 +4269,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 release_runtime_after_generation=release_runtime_after_generation,
                 clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
             )
-        except Exception:
+        except BaseException:
             _cleanup_failed_esurge_generation()
             raise
         return results
@@ -4031,49 +4319,53 @@ class BaseTrainer(BaseTrainerProtocol):
             max_seq_len = args.max_length or 2048
 
             # Ensure left-padding for RL training (prompts should align at the right)
+            has_padding_side = hasattr(processor, "padding_side")
             original_padding_side = getattr(processor, "padding_side", None)
-            if hasattr(processor, "padding_side"):
+            if has_padding_side:
                 processor.padding_side = "left"
 
             encoded_ids: list[np.ndarray] = []
             encoded_masks: list[np.ndarray] = []
 
-            for normalized in normalized_prompts:
-                if isinstance(normalized, list):
-                    if not apply_chat_template or not hasattr(processor, "apply_chat_template"):
-                        raise ValueError("Chat prompts require apply_chat_template=True when using compiled generation")
-                    encoding = processor.apply_chat_template(
-                        normalized,
-                        return_tensors="np",
-                        padding="max_length",
-                        max_length=max_seq_len,
-                        truncation=True,
-                        add_generation_prompt=True,
-                        return_dict=True,
-                    )
-                    prompt_text_records.append(str(normalized))
-                else:
-                    encoding = processor(
-                        normalized,
-                        return_tensors="np",
-                        padding="max_length",
-                        max_length=max_seq_len,
-                        truncation=True,
-                        add_special_tokens=True,
-                    )
-                    prompt_text_records.append(normalized)
+            try:
+                for normalized in normalized_prompts:
+                    if isinstance(normalized, list):
+                        if not apply_chat_template or not hasattr(processor, "apply_chat_template"):
+                            raise ValueError(
+                                "Chat prompts require apply_chat_template=True when using compiled generation"
+                            )
+                        encoding = processor.apply_chat_template(
+                            normalized,
+                            return_tensors="np",
+                            padding="max_length",
+                            max_length=max_seq_len,
+                            truncation=True,
+                            add_generation_prompt=True,
+                            return_dict=True,
+                        )
+                        prompt_text_records.append(str(normalized))
+                    else:
+                        encoding = processor(
+                            normalized,
+                            return_tensors="np",
+                            padding="max_length",
+                            max_length=max_seq_len,
+                            truncation=True,
+                            add_special_tokens=True,
+                        )
+                        prompt_text_records.append(normalized)
 
-                ids = np.asarray(encoding["input_ids"], dtype=np.int32)
-                mask = encoding.get("attention_mask")
-                if mask is None:
-                    mask = np.ones_like(ids, dtype=np.int32)
-                else:
-                    mask = np.asarray(mask, dtype=np.int32)
-                encoded_ids.append(ids)
-                encoded_masks.append(mask)
-
-            if hasattr(processor, "padding_side") and original_padding_side is not None:
-                processor.padding_side = original_padding_side
+                    ids = np.asarray(encoding["input_ids"], dtype=np.int32)
+                    mask = encoding.get("attention_mask")
+                    if mask is None:
+                        mask = np.ones_like(ids, dtype=np.int32)
+                    else:
+                        mask = np.asarray(mask, dtype=np.int32)
+                    encoded_ids.append(ids)
+                    encoded_masks.append(mask)
+            finally:
+                if has_padding_side and original_padding_side is not None:
+                    processor.padding_side = original_padding_side
 
             input_ids = jnp.asarray(np.concatenate(encoded_ids, axis=0), dtype=jnp.int32)
             attention_mask = jnp.asarray(np.concatenate(encoded_masks, axis=0), dtype=jnp.int32)
@@ -4455,8 +4747,13 @@ class BaseTrainer(BaseTrainerProtocol):
                 log_debug_maybe(f"Unsupported prompt list format for preview generation: {type(prompt[0])}")
                 return None
 
+            prev_padding_side = getattr(processor, "padding_side", None)
+            inner_tok = getattr(processor, "tokenizer", None)
+            prev_tok_padding_side = getattr(inner_tok, "padding_side", None) if inner_tok is not None else None
             try:
                 processor.padding_side = "left"
+                if inner_tok is not None and hasattr(inner_tok, "padding_side"):
+                    inner_tok.padding_side = "left"
                 encoded = _apply_chat_template(prompt, **encode_kwargs)
                 try:
                     prompt_text = _apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
@@ -4465,6 +4762,11 @@ class BaseTrainer(BaseTrainerProtocol):
             except Exception as exc:  # pragma: no cover - tokenizer issues
                 log_debug_maybe(f"Failed to tokenize generation chat prompt: {exc}")
                 return None
+            finally:
+                if prev_padding_side is not None:
+                    processor.padding_side = prev_padding_side
+                if inner_tok is not None and prev_tok_padding_side is not None:
+                    inner_tok.padding_side = prev_tok_padding_side
             input_ids = encoded["input_ids"]
             attention = encoded.get("attention_mask")
         elif isinstance(prompt, str):
@@ -4473,8 +4775,13 @@ class BaseTrainer(BaseTrainerProtocol):
                 return None
             prompt_text = prompt
 
+            prev_padding_side = getattr(processor, "padding_side", None)
+            inner_tok = getattr(processor, "tokenizer", None)
+            prev_tok_padding_side = getattr(inner_tok, "padding_side", None) if inner_tok is not None else None
             try:
                 processor.padding_side = "left"
+                if inner_tok is not None and hasattr(inner_tok, "padding_side"):
+                    inner_tok.padding_side = "left"
                 messages = [{"role": "user", "content": prompt}]
                 encoded = _apply_chat_template(messages, **encode_kwargs)
                 if tools is not None:
@@ -4485,6 +4792,11 @@ class BaseTrainer(BaseTrainerProtocol):
             except Exception as exc:  # pragma: no cover - tokenizer issues
                 log_debug_maybe(f"Failed to tokenize generation prompt: {exc}")
                 return None
+            finally:
+                if prev_padding_side is not None:
+                    processor.padding_side = prev_padding_side
+                if inner_tok is not None and prev_tok_padding_side is not None:
+                    inner_tok.padding_side = prev_tok_padding_side
             input_ids = encoded["input_ids"]
             attention = encoded.get("attention_mask")
         else:
@@ -4613,22 +4925,18 @@ class BaseTrainer(BaseTrainerProtocol):
                 return
             self.latest_generation_samples = records
 
-            prompt_repr = "<prompt tokens>"
-            record: dict[str, tp.Any] = {}
-            for record in records:
-                prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
-
             if (
                 wandb is not None
                 and getattr(args, "use_wandb", False)
                 and args.can_log_metrics
                 and args.generation_log_to_wandb
             ):
-                if self.preview_log_table is None:
-                    self.preview_log_table = wandb.Table(
-                        columns=["step", "prompt", "completion_id", "completion", "reasoning", "tool_calls"],
-                        log_mode="INCREMENTAL",
-                    )
+                incoming_rows = sum(len(record["completions"]) for record in records)
+                table = self._get_or_rotate_wandb_table(
+                    "preview_log_table",
+                    columns=["step", "prompt", "completion_id", "completion", "reasoning", "tool_calls"],
+                    incoming_rows=incoming_rows,
+                )
                 for record in records:
                     prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
                     reasoning = record.get("reasoning", [])
@@ -4636,7 +4944,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     for idx, completion in enumerate(record["completions"]):
                         reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
                         tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
-                        self.preview_log_table.add_data(
+                        table.add_data(
                             step,
                             prompt_repr,
                             idx,
@@ -4644,17 +4952,19 @@ class BaseTrainer(BaseTrainerProtocol):
                             reasoning_entry,
                             tool_calls_entry,
                         )
-                wandb.log({"preview_generations": self.preview_log_table}, step=step)
+                wandb.log({"preview_generations": table}, step=step)
             if args.generation_preview_print:
-                logger.info(f"[preview step {step}] prompt: {prompt_repr}")
-                reasoning = record.get("reasoning", [])
-                tool_calls = record.get("tool_calls", [])
-                for idx, completion in enumerate(record["completions"]):
-                    reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
-                    tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
-                    logger.info(f"  completion[{idx}]: {completion}")
-                    logger.info(f"  reasoning[{idx}]: {reasoning_entry}")
-                    logger.info(f"  tool_calls[{idx}]: {tool_calls_entry}")
+                for record in records:
+                    prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+                    logger.info(f"[preview step {step}] prompt: {prompt_repr}")
+                    reasoning = record.get("reasoning", [])
+                    tool_calls = record.get("tool_calls", [])
+                    for idx, completion in enumerate(record["completions"]):
+                        reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
+                        tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
+                        logger.info(f"  completion[{idx}]: {completion}")
+                        logger.info(f"  reasoning[{idx}]: {reasoning_entry}")
+                        logger.info(f"  tool_calls[{idx}]: {tool_calls_entry}")
 
         prepared_prompts: list[dict[str, tp.Any]] = []
         for _prompt_idx, prompt in enumerate(prompts):
@@ -4902,25 +5212,60 @@ class BaseTrainer(BaseTrainerProtocol):
         if flat_metrics:
             self.arguments.log_metrics(metrics=flat_metrics, step=step)
 
+    _WANDB_TABLE_MAX_ROWS: tp.ClassVar[int] = 1024
+    _WANDB_TABLE_MAX_INCREMENTS: tp.ClassVar[int] = 50
+
+    def _get_or_rotate_wandb_table(
+        self,
+        attr_name: str,
+        *,
+        columns: list[str],
+        incoming_rows: int = 0,
+        max_rows: int | None = None,
+        max_increments: int | None = None,
+    ) -> tp.Any:
+        """Return a bounded incremental W&B table, rotating before host RAM grows unboundedly.
+
+        ``wandb.Table(log_mode="INCREMENTAL")`` keeps every appended row in
+        ``table.data`` on the host and warns/truncates past 100 increments.
+        Rotating to a fresh table whenever the row or increment budget is
+        reached keeps host memory strictly bounded across long runs.
+        """
+        row_limit = self._WANDB_TABLE_MAX_ROWS if max_rows is None else max(int(max_rows), 1)
+        inc_limit = self._WANDB_TABLE_MAX_INCREMENTS if max_increments is None else max(int(max_increments), 1)
+        table = getattr(self, attr_name, None)
+        inc_attr = f"_{attr_name}_increments"
+        row_attr = f"_{attr_name}_rows"
+        increments = int(getattr(self, inc_attr, 0))
+        tracked_rows = int(getattr(self, row_attr, 0))
+        existing_data = getattr(table, "data", None)
+        current_rows = len(existing_data) if isinstance(existing_data, collections.abc.Sized) else tracked_rows
+        if (
+            table is None
+            or increments >= inc_limit
+            or (current_rows > 0 and current_rows + max(int(incoming_rows), 0) > row_limit)
+        ):
+            table = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+            setattr(self, attr_name, table)
+            increments = 0
+            current_rows = 0
+        setattr(self, inc_attr, increments + 1)
+        setattr(self, row_attr, current_rows + max(int(incoming_rows), 0))
+        return table
+
     def _log_benchmark_results_to_wandb(
         self,
         *,
         step: int,
         benchmark_results: dict[str, dict[str, tp.Any]],
     ) -> None:
-        """Log benchmark summaries to W&B as an incremental table."""
+        """Log benchmark summaries to W&B as a bounded incremental table."""
 
         args = self.arguments
         if args is None or wandb is None or not getattr(args, "use_wandb", False) or not args.can_log_metrics:
             return
 
-        if self.benchmark_log_table is None:
-            self.benchmark_log_table = wandb.Table(
-                columns=["step", "benchmark", "task", "metric", "value"],
-                log_mode="INCREMENTAL",
-            )
-
-        rows_added = False
+        pending_rows: list[tuple[int, str, str, str, float]] = []
         for benchmark_name, result in benchmark_results.items():
             result_metrics = result.get("results", {})
             if not isinstance(result_metrics, collections.abc.Mapping):
@@ -4936,13 +5281,17 @@ class BaseTrainer(BaseTrainerProtocol):
                         numeric_value = float(value)
                     if numeric_value is None:
                         continue
-                    self.benchmark_log_table.add_data(
-                        step, benchmark_name, str(task_name), str(metric_name), numeric_value
-                    )
-                    rows_added = True
+                    pending_rows.append((step, benchmark_name, str(task_name), str(metric_name), numeric_value))
 
-        if rows_added:
-            wandb.log({"benchmark_results": self.benchmark_log_table}, step=step)
+        if pending_rows:
+            table = self._get_or_rotate_wandb_table(
+                "benchmark_log_table",
+                columns=["step", "benchmark", "task", "metric", "value"],
+                incoming_rows=len(pending_rows),
+            )
+            for row in pending_rows:
+                table.add_data(*row)
+            wandb.log({"benchmark_results": table}, step=step)
 
     @staticmethod
     def _wandb_stringify_generation_value(value: tp.Any) -> str | None:
@@ -4981,22 +5330,6 @@ class BaseTrainer(BaseTrainerProtocol):
             or not args.log_training_generations_to_wandb
         ):
             return
-
-        if self.training_generation_log_table is None:
-            self.training_generation_log_table = wandb.Table(
-                columns=[
-                    "step",
-                    "source",
-                    "sample_idx",
-                    "prompt",
-                    "completion",
-                    "completion_length",
-                    "generation_time",
-                    "reasoning",
-                    "tool_calls",
-                ],
-                log_mode="INCREMENTAL",
-            )
 
         if hasattr(prompts, "shape"):
             prompt_ids = np.asarray(jax.device_get(prompts))
@@ -5058,12 +5391,28 @@ class BaseTrainer(BaseTrainerProtocol):
         cur_step = int(jax.device_get(state.step))
         reasoning = list(reasoning or [])
         tool_calls = list(tool_calls or [])
+        paired_rows = list(zip(prompt_rows, completion_rows, strict=False))
+        table = self._get_or_rotate_wandb_table(
+            "training_generation_log_table",
+            columns=[
+                "step",
+                "source",
+                "sample_idx",
+                "prompt",
+                "completion",
+                "completion_length",
+                "generation_time",
+                "reasoning",
+                "tool_calls",
+            ],
+            incoming_rows=len(paired_rows),
+        )
 
-        for idx, (prompt, completion) in enumerate(zip(prompt_rows, completion_rows, strict=False)):
+        for idx, (prompt, completion) in enumerate(paired_rows):
             reason = reasoning[idx] if idx < len(reasoning) else None
             tools = tool_calls[idx] if idx < len(tool_calls) else None
             completion_length = None if length_rows is None or idx >= len(length_rows) else float(length_rows[idx])
-            self.training_generation_log_table.add_data(
+            table.add_data(
                 cur_step,
                 source,
                 idx,
@@ -5074,18 +5423,38 @@ class BaseTrainer(BaseTrainerProtocol):
                 self._wandb_stringify_generation_value(reason),
                 self._wandb_stringify_generation_value(tools),
             )
-        wandb.log({"training_generations": self.training_generation_log_table}, step=cur_step)
+        wandb.log({"training_generations": table}, step=cur_step)
 
-    def _all_gather(self, arr: jax.Array) -> jax.Array:
+    def _all_gather(self, arr: jax.Array | np.ndarray) -> jax.Array:
         """Gather array from all devices to a single replicated array.
+
+        Safely handles already-global sharded JAX arrays, host ``np.ndarray``
+        inputs, and process-local ``SingleDeviceSharding`` arrays on both
+        single-host and multi-host meshes.
 
         Args:
             arr: Array to gather across devices.
 
         Returns:
-            Array replicated across all devices.
+            Array replicated across all devices of ``self.model.mesh``.
         """
-        return jax.device_put(arr, replicated_named_sharding(self.model.mesh))
+        target = replicated_named_sharding(self.model.mesh)
+        if isinstance(arr, jax.Array):
+            current = getattr(arr, "sharding", None)
+            if isinstance(current, NamedSharding) and current.is_equivalent_to(target, arr.ndim):
+                return arr
+            current_devices = getattr(current, "device_set", None)
+            target_devices = getattr(target, "device_set", None)
+            if current_devices is not None and target_devices is not None and current_devices == target_devices:
+                return jax.device_put(arr, target)
+            if getattr(target, "is_fully_addressable", True):
+                return jax.device_put(arr, target)
+            host = np.asarray(jax.device_get(arr))
+            return jax.make_array_from_callback(host.shape, target, lambda index: host[index])
+        host = np.asarray(arr)
+        if getattr(target, "is_fully_addressable", True):
+            return jax.device_put(jnp.asarray(host), target)
+        return jax.make_array_from_callback(host.shape, target, lambda index: host[index])
 
     def initialize_trainer_utils(self):
         """
@@ -5224,7 +5593,6 @@ class BaseTrainer(BaseTrainerProtocol):
         if not self._has_buckets:
             self._runtime_trace("_configure_buckets.skipped", reason="no buckets")
             return
-        import spectrax as spx
 
         if self._resumed_from_checkpoint:
             logger.warning(
@@ -5276,15 +5644,12 @@ class BaseTrainer(BaseTrainerProtocol):
             base_model = self.model_state.model
             base_gstate = self.model_state.graphstate
             base_struct = jax.tree_util.tree_structure(base_gstate)
-            module_cls = type(base_model)
             for i, bucket in enumerate(self._buckets):
                 cfg_i = resolve_bucket_config(base_model.config, bucket)
-                module_i = module_cls.lazy_init(
+                module_i = self._build_variant_module(
+                    base_model=base_model,
                     config=cfg_i,
-                    dtype=base_model.dtype,
-                    param_dtype=base_model.param_dtype,
-                    precision=base_model.precision,
-                    rngs=spx.Rngs(0),
+                    eval_mode=bool(getattr(self.arguments, "disable_dropout", False)),
                 )
                 gdef_i, gstate_i, _ = module_i.split_module(
                     trainable_selector=self.arguments.trainable_selector,
@@ -5302,14 +5667,26 @@ class BaseTrainer(BaseTrainerProtocol):
                 # source when provided; otherwise fall back to the (already
                 # transform-prepared) primary train source. Only apply the
                 # preprocess transform to *raw* bucket sources, not the fallback,
-                # so we don't double-transform.
+                # so we don't double-transform. When sequence_packing is enabled
+                # and the bucket length differs from arguments.max_length, pack
+                # the unpacked train source to the bucket's own max_length.
                 if i < len(self._bucket_sources):
                     source = self._prepare_bucket_source(self._bucket_sources[i], bucket=bucket)
+                elif (
+                    getattr(self.arguments, "sequence_packing", False)
+                    and getattr(self, "_unpacked_train_source", None) is not None
+                    and int(bucket.max_length) != int(getattr(self.arguments, "max_length", 0) or 0)
+                ):
+                    source = self._pack_token_source(
+                        self._unpacked_train_source,
+                        seq_length=int(bucket.max_length),
+                    )
                 else:
                     source = self._train_source
                 loader, collator_i = self._build_bucket_loader(bucket=bucket, source=source)
                 self._bucket_loaders[i] = loader
                 self._bucket_collators[i] = collator_i
+                self._close_iterator(self._bucket_iters.get(i))
                 self._bucket_iters[i] = iter(loader)
                 logger.info(
                     "Configured bucket %d %r: max_length=%d, dataloader=%s.",
@@ -5320,6 +5697,82 @@ class BaseTrainer(BaseTrainerProtocol):
                 )
         self.timer.log("configure buckets")
         self._runtime_trace("_configure_buckets.done", num_buckets=len(self._buckets))
+
+    def _build_variant_module(
+        self,
+        *,
+        base_model,
+        config,
+        eval_mode: bool = False,
+    ):
+        """Construct a lazy module variant preserving quantization, LoRA adapters, and eval mode."""
+        import spectrax as spx
+
+        module = type(base_model).lazy_init(
+            config=config,
+            dtype=base_model.dtype,
+            param_dtype=base_model.param_dtype,
+            precision=base_model.precision,
+            rngs=spx.Rngs(0),
+        )
+        if getattr(base_model, "is_quantized", False):
+            normalize_qcfg = getattr(base_model, "_normalize_rebuild_quantization_config", None)
+            qcfg = normalize_qcfg(config) if callable(normalize_qcfg) else getattr(config, "quantization_config", None)
+            if qcfg is not None:
+                from easydel.layers import EasyQuantizer
+
+                module = EasyQuantizer(quantization_config=qcfg).apply_quantization(module, verbose=False)
+        if getattr(base_model, "lora_is_enabled", False):
+            from easydel.layers.linears._lora import eLoRA
+            from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
+
+            for path, live_lora in iter_module_search(base_model, spx.nn.LoRA):
+                target_sub = get_module_from_path(model=module, path=path)
+                if target_sub is None or isinstance(target_sub, spx.nn.LoRA):
+                    continue
+                lora_a = getattr(live_lora, "lora_a", None)
+                lora_a_val = getattr(lora_a, "value", lora_a)
+                lora_b = getattr(live_lora, "lora_b", None)
+                lora_b_val = getattr(lora_b, "value", lora_b)
+                rank = getattr(live_lora, "rank", None)
+                if rank is None and hasattr(lora_a_val, "shape") and len(lora_a_val.shape) >= 2:
+                    rank = int(lora_a_val.shape[-1])
+                d_in = (
+                    getattr(live_lora, "d_in", None)
+                    or getattr(live_lora, "in_features", None)
+                    or getattr(target_sub, "in_features", None)
+                )
+                if d_in is None and hasattr(lora_a_val, "shape") and len(lora_a_val.shape) >= 2:
+                    d_in = int(lora_a_val.shape[0])
+                d_out = (
+                    getattr(live_lora, "d_out", None)
+                    or getattr(live_lora, "out_features", None)
+                    or getattr(target_sub, "out_features", None)
+                )
+                if d_out is None and hasattr(lora_b_val, "shape") and len(lora_b_val.shape) >= 2:
+                    d_out = int(lora_b_val.shape[-1])
+                if rank is None or d_in is None or d_out is None:
+                    continue
+                wrapper_cls = type(live_lora) if issubclass(type(live_lora), spx.nn.LoRA) else eLoRA
+                lora_kwargs: dict[str, tp.Any] = {
+                    "base_module": target_sub,
+                    "rngs": spx.Rngs(0),
+                    "dtype": getattr(live_lora, "dtype", getattr(target_sub, "dtype", None)),
+                }
+                alpha = getattr(live_lora, "alpha", None)
+                if hasattr(live_lora, "has_alpha"):
+                    if getattr(live_lora, "has_alpha", False) and alpha is not None:
+                        lora_kwargs["alpha"] = alpha
+                elif alpha is not None:
+                    lora_kwargs["alpha"] = alpha
+                set_module_from_path(
+                    model=module,
+                    path=path,
+                    new_value=wrapper_cls(int(d_in), int(rank), int(d_out), **lora_kwargs),
+                )
+        if eval_mode:
+            module.eval()
+        return module
 
     def _build_config_override_graphdef(
         self,
@@ -5335,13 +5788,15 @@ class BaseTrainer(BaseTrainerProtocol):
 
         Mirrors the per-bucket variant construction in :meth:`_configure_buckets`:
         the overridden config is baked into a fresh ``lazy_init`` module (so
-        graphdef-static knobs like ``attn_mechanism`` take effect) whose
-        graphstate structure must match ``reference_graphstate`` — the variant
-        shares the caller's parameter/optimizer buffers and never copies them.
+        graphdef-static knobs like ``attn_mechanism`` take effect, while preserving
+        LoRA adapters, quantization wrappers, and ``disable_dropout`` / eval mode)
+        whose graphstate structure must match ``reference_graphstate`` — the
+        variant shares the caller's parameter/optimizer buffers and never copies
+        them.
 
         Args:
             model: The base module whose class/dtypes/config are mirrored.
-            overrides: Config field overrides (``setattr`` on a deep copy).
+            overrides: Config field overrides (applied recursively on a deep copy).
             reference_graphstate: Graphstate whose tree structure the variant
                 must preserve (the state that will be run under the new graphdef).
             trainable_selector: Selector forwarded to ``split_module`` so the
@@ -5357,18 +5812,9 @@ class BaseTrainer(BaseTrainerProtocol):
         Raises:
             ValueError: if the overrides change the parameter tree structure.
         """
-        import spectrax as spx
-
         cfg = apply_config_overrides(model.config, overrides, label=label)
-        module = type(model).lazy_init(
-            config=cfg,
-            dtype=model.dtype,
-            param_dtype=model.param_dtype,
-            precision=model.precision,
-            rngs=spx.Rngs(0),
-        )
-        if eval_mode:
-            module.eval()
+        should_eval = bool(eval_mode or getattr(self.arguments, "disable_dropout", False))
+        module = self._build_variant_module(base_model=model, config=cfg, eval_mode=should_eval)
         graphdef, graphstate, _ = module.split_module(trainable_selector=trainable_selector)
         if jax.tree_util.tree_structure(graphstate) != jax.tree_util.tree_structure(reference_graphstate):
             raise ValueError(
@@ -5398,6 +5844,7 @@ class BaseTrainer(BaseTrainerProtocol):
             reference_graphstate=self.model_state.graphstate,
             trainable_selector=self.arguments.trainable_selector,
             label="eval_config_overrides",
+            eval_mode=True,
         )
         logger.info("Evaluation config override active: %s (dedicated eval graphdef built).", overrides)
         self._runtime_trace("_configure_eval_config_override.done", overrides=tuple(overrides.keys()))
@@ -5435,15 +5882,12 @@ class BaseTrainer(BaseTrainerProtocol):
         source: "ShardedDataSource | None",
         bucket: "TrainingBucket | None" = None,
     ) -> "ShardedDataSource | None":
-        """Wrap a bucket's raw source with the trainer's preprocess transform.
+        """Wrap a bucket's raw source with the trainer's preprocess transform and optional packing.
 
         Mirrors ``_apply_preprocess_transforms`` for the primary source: convert
-        to a ShardedDataSource and apply the flavor-specific tokenization
-        transform (e.g. DPO pairing) if one is configured. The transform is
-        resolved via :meth:`_get_bucket_preprocess_transform`, which flavors may
-        override to gate on the bucket source's own schema (a bucket can be raw
-        text while the primary source is pretokenized, or vice versa) and to
-        honour the bucket's own ``max_length`` / collator.
+        to a ShardedDataSource, apply the flavor-specific tokenization transform
+        classified against ``source`` itself with the bucket's ``max_length``,
+        and pack to ``bucket.max_length`` when ``sequence_packing=True``.
         """
         sharded = self._to_sharded_source(source) if not isinstance(source, ShardedDataSource) else source
         if sharded is None:
@@ -5451,6 +5895,8 @@ class BaseTrainer(BaseTrainerProtocol):
         transform = self._get_bucket_preprocess_transform(sharded, bucket)
         if transform is not None:
             sharded = self._preprocess_source(sharded, transform)
+        if getattr(self.arguments, "sequence_packing", False) and bucket is not None:
+            sharded = self._pack_token_source(sharded, seq_length=int(bucket.max_length))
         return sharded
 
     def _get_bucket_preprocess_transform(
@@ -5460,14 +5906,20 @@ class BaseTrainer(BaseTrainerProtocol):
     ) -> "Transform | None":
         """Resolve the preprocess transform for a single bucket source.
 
-        The base implementation defers to :meth:`_get_preprocess_transform`,
-        which gates on the *primary* train source — backward-compatible for
-        homogeneous setups. Flavors whose buckets can differ from the primary in
-        tokenization state or sequence length (e.g. distillation mixing a
-        pretokenized long-context bucket with a raw-text SFT bucket) override
-        this to gate on ``source`` itself and build a bucket-sized transform.
+        Temporarily binds ``self._train_source = source`` (via
+        :meth:`_preprocess_transform_for_source`) and ``arguments.max_length =
+        bucket.max_length`` so raw-text bucket datasets are properly tokenized
+        even after the primary ``_train_source`` has already been preprocessed.
         """
-        return self._get_preprocess_transform()
+        orig_max_length = getattr(self.arguments, "max_length", None)
+        override_max_length = bucket is not None and orig_max_length != int(bucket.max_length)
+        try:
+            if override_max_length:
+                self.arguments.max_length = int(bucket.max_length)
+            return self._preprocess_transform_for_source(source)
+        finally:
+            if override_max_length:
+                self.arguments.max_length = orig_max_length
 
     def _resolve_bucket_step_args(self, i: int) -> tuple[tuple, tuple]:
         """Resolve the (extra_args, static_args) for bucket ``i``'s compiled step.
@@ -5890,6 +6342,91 @@ class BaseTrainer(BaseTrainerProtocol):
                 else:
                     yield batch
 
+    def _create_grain_dataloader_for_dataset(self, dataset: Dataset | IterableDataset, is_train: bool) -> grain.DataLoader:
+        """Create a Grain DataLoader from a Hugging Face Dataset."""
+        if is_train:
+            batch_size = self.training_batch_size
+            shuffle = self.arguments.shuffle_train_dataset
+            num_epochs = self.arguments.num_train_epochs
+        else:
+            batch_size = self.evaluation_batch_size
+            shuffle = False
+            num_epochs = 1
+        shard_options = grain.ShardOptions(
+            shard_index=self.arguments.grain_shard_index or 0,
+            shard_count=self.arguments.grain_shard_count or 1,
+            drop_remainder=True,
+        )
+        from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+
+        if is_train and hasattr(self, "model_state") and self.model_state is not None:
+            current_step = int(jax.device_get(self.model_state.step))
+            if current_step > 0:
+                logger.info(f"Note: Grain dataloader will start fresh, but model continues from step {current_step}")
+
+        if isinstance(dataset, IterableDataset):
+            data_source = HFDataSource(dataset=dataset, shard_options=shard_options, num_threads=1)
+            sampler = grain.IndexSampler(
+                num_records=len(data_source),
+                shard_options=shard_options,
+                seed=self.arguments.shuffle_seed_train if is_train else 0,
+                num_epochs=num_epochs,
+                shuffle=shuffle,
+            )
+        else:
+            data_source = grain.MapDataset.source(dataset)
+            sampler = grain.IndexSampler(
+                num_records=len(data_source),
+                shard_options=shard_options,
+                seed=self.arguments.shuffle_seed_train if is_train else 0,
+                num_epochs=num_epochs,
+                shuffle=shuffle,
+            )
+        collate_fn = self.create_grain_collect_function(
+            max_sequence_length=self.arguments.max_length,
+            truncation_mode=self.arguments.truncation_mode,
+        )
+        return grain.DataLoader(
+            data_source=data_source,
+            sampler=sampler,
+            operations=[
+                ToNumpy(),
+                CollateMapTransform(collate_fn=collate_fn),
+                grain.Batch(batch_size=batch_size, drop_remainder=True),
+            ],
+            worker_count=0,
+            worker_buffer_size=1,
+            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
+        )
+
+    def _configure_eval_dataloader(self) -> tuple[tp.Any, int]:
+        """Configure only the evaluation dataloader without touching ``dataset_train`` or train metadata."""
+        if self.dataset_eval is None or not self.arguments.do_eval:
+            return None, 0
+        eval_resolution = self._resolve_step_count(
+            self.dataset_eval,
+            source=self._eval_source,
+            is_train=False,
+            drop_remainder=True,
+        )
+        self._set_dataset_size_metadata(is_train=False, resolution=eval_resolution)
+        max_evaluation_steps = eval_resolution.steps
+        if self._eval_source is not None:
+            dataloader_eval = _ReiterableDataLoader(
+                factory=lambda: self._create_dataloader_from_source(
+                    source=self._eval_source,
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    shuffle=False,
+                    num_epochs=1,
+                    drop_remainder=True,
+                ),
+                length=max_evaluation_steps,
+            )
+        else:
+            dataloader_eval = self._create_grain_dataloader_for_dataset(self.dataset_eval, is_train=False)
+        return dataloader_eval, max_evaluation_steps
+
     def _configure_grain_dataloader(self):
         """Configure Grain dataloaders for training and evaluation.
 
@@ -5904,65 +6441,6 @@ class BaseTrainer(BaseTrainerProtocol):
             Grain is Google's data loading library optimized for JAX.
             Handles dataset sharding, batching, and preprocessing.
         """
-
-        def _create_grain_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> grain.DataLoader:
-            """Creates a Grain DataLoader from a Hugging Face Dataset."""
-
-            if is_train:
-                batch_size = self.training_batch_size
-                shuffle = self.arguments.shuffle_train_dataset
-                num_epochs = self.arguments.num_train_epochs
-            else:
-                batch_size = self.evaluation_batch_size
-                shuffle = False
-                num_epochs = 1
-            shard_options = grain.ShardOptions(
-                shard_index=self.arguments.grain_shard_index or 0,
-                shard_count=self.arguments.grain_shard_count or 1,
-                drop_remainder=True,
-            )
-            from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
-
-            if is_train and hasattr(self, "model_state") and self.model_state is not None:
-                current_step = int(jax.device_get(self.model_state.step))
-                if current_step > 0:
-                    logger.info(f"Note: Grain dataloader will start fresh, but model continues from step {current_step}")
-
-            if isinstance(dataset, IterableDataset):
-                data_source = HFDataSource(dataset=dataset, shard_options=shard_options, num_threads=1)
-                sampler = grain.IndexSampler(
-                    num_records=len(data_source),
-                    shard_options=shard_options,
-                    seed=self.arguments.shuffle_seed_train if is_train else 0,
-                    num_epochs=num_epochs,
-                    shuffle=shuffle,
-                )
-            else:
-                data_source = grain.MapDataset.source(dataset)
-                sampler = grain.IndexSampler(
-                    num_records=len(data_source),
-                    shard_options=shard_options,
-                    seed=self.arguments.shuffle_seed_train if is_train else 0,
-                    num_epochs=num_epochs,
-                    shuffle=shuffle,
-                )
-            collate_fn = self.create_grain_collect_function(
-                max_sequence_length=self.arguments.max_length,
-                truncation_mode=self.arguments.truncation_mode,
-            )
-            return grain.DataLoader(
-                data_source=data_source,
-                sampler=sampler,
-                operations=[
-                    ToNumpy(),
-                    CollateMapTransform(collate_fn=collate_fn),
-                    grain.Batch(batch_size=batch_size, drop_remainder=True),
-                ],
-                worker_count=0,
-                worker_buffer_size=1,
-                read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
-            )
-
         train_resolution = self._resolve_step_count(
             self.dataset_train,
             source=self._train_source,
@@ -5995,33 +6473,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 length=max_training_steps,
             )
         else:
-            dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
+            dataloader_train = self._create_grain_dataloader_for_dataset(self.dataset_train, is_train=True)
 
-        dataloader_eval, max_evaluation_steps = None, 0
-        if self.dataset_eval is not None and self.arguments.do_eval:
-            eval_resolution = self._resolve_step_count(
-                self.dataset_eval,
-                source=self._eval_source,
-                is_train=False,
-                drop_remainder=True,
-            )
-            self._set_dataset_size_metadata(is_train=False, resolution=eval_resolution)
-            max_evaluation_steps = eval_resolution.steps
-            # Use _eval_source if available (has transforms applied)
-            if self._eval_source is not None:
-                dataloader_eval = _ReiterableDataLoader(
-                    factory=lambda: self._create_dataloader_from_source(
-                        source=self._eval_source,
-                        batch_size=self.evaluation_batch_size,
-                        is_train=False,
-                        shuffle=False,
-                        num_epochs=1,
-                        drop_remainder=True,
-                    ),
-                    length=max_evaluation_steps,
-                )
-            else:
-                dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
+        dataloader_eval, max_evaluation_steps = self._configure_eval_dataloader()
 
         return TrainerConfigureDataloaderOutput(
             dataloader_train=dataloader_train,
@@ -6186,7 +6640,10 @@ class BaseTrainer(BaseTrainerProtocol):
                 length=max_training_steps,
             )
         else:
-            dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
+            dataloader_train = _ReiterableDataLoader(
+                factory=lambda: to_tf_dataloader(self.dataset_train, is_train=True),
+                length=max_training_steps,
+            )
 
         if self.dataset_eval is not None and self.arguments.do_eval:
             eval_resolution = self._resolve_step_count(
@@ -6211,7 +6668,10 @@ class BaseTrainer(BaseTrainerProtocol):
                     length=max_evaluation_steps,
                 )
             else:
-                dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
+                dataloader_eval = _ReiterableDataLoader(
+                    factory=lambda: to_tf_dataloader(self.dataset_eval, is_train=False),
+                    length=max_evaluation_steps,
+                )
         else:
             dataloader_eval, max_evaluation_steps = None, 0
 
@@ -6269,9 +6729,7 @@ class BaseTrainer(BaseTrainerProtocol):
         )
         dataloader_eval, max_evaluation_steps = None, 0
         if self.dataset_eval is not None and self.arguments.do_eval:
-            fallback = self._configure_grain_dataloader() if self.arguments.use_grain else None
-            if fallback is not None:
-                dataloader_eval, max_evaluation_steps = fallback.dataloader_eval, fallback.max_evaluation_steps
+            dataloader_eval, max_evaluation_steps = self._configure_eval_dataloader()
         return TrainerConfigureDataloaderOutput(
             dataloader_train=loader,
             max_training_steps=int(steps),
@@ -6585,41 +7043,67 @@ class BaseTrainer(BaseTrainerProtocol):
 
         from spectrax.serialization import read_checkpoint_metadata
 
-        if not save_dir.exists():
+        if not (save_dir.is_dir() or save_dir.exists()):
             return
 
-        checkpoint_dirs = []
+        checkpoint_entries: list[tuple[ePathLike, dict[str, tp.Any]]] = []
         for path in save_dir.glob("run-*"):
             if path.is_dir() and (path / "metadata.json").exists():
                 try:
                     metadata = read_checkpoint_metadata(str(path))
                     if not metadata.get("is_temporary", False):
-                        checkpoint_dirs.append(path)
+                        checkpoint_entries.append((path, metadata if isinstance(metadata, dict) else {}))
                 except Exception:
                     continue
 
-        if len(checkpoint_dirs) <= self.arguments.save_total_limit:
+        limit = int(self.arguments.save_total_limit)
+        if len(checkpoint_entries) <= limit:
             return
 
-        # Sort by modification time (oldest first)
-        def get_mtime(path):
-            """Return the modification time of a checkpoint directory.
-
-            Args:
-                path: Path-like object pointing to a checkpoint directory.
-
-            Returns:
-                Modification timestamp as a float, or 0 on failure.
-            """
+        def _checkpoint_sort_key(entry: tuple[ePathLike, dict[str, tp.Any]]) -> tuple[int, float, float, str]:
+            """Sort oldest checkpoints first using metadata step/timestamp, falling back to metadata.json mtime."""
+            path, metadata = entry
+            raw_step = metadata.get("step")
+            step_val: int | None = None
+            if raw_step is not None and not isinstance(raw_step, bool):
+                try:
+                    step_val = int(raw_step)
+                except (TypeError, ValueError):
+                    step_val = None
+            if step_val is None:
+                name = getattr(path, "name", str(path).rstrip("/").rsplit("/", 1)[-1])
+                if name.startswith("run-"):
+                    suffix = name[4:]
+                    if suffix.isdigit():
+                        step_val = int(suffix)
+            raw_ts = metadata.get("timestamp")
+            ts_val = 0.0
+            if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+                ts_val = float(raw_ts)
+            elif isinstance(raw_ts, str):
+                try:
+                    ts_val = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    try:
+                        ts_val = float(raw_ts)
+                    except ValueError:
+                        ts_val = 0.0
+            mtime_val = 0.0
             try:
-                return path.stat().get("mtime", 0)
+                mtime_val = float((path / "metadata.json").stat().get("mtime", 0) or 0)
             except Exception:
-                return 0
+                try:
+                    mtime_val = float(path.stat().get("mtime", 0) or 0)
+                except Exception:
+                    mtime_val = 0.0
+            if step_val is not None:
+                return (1, float(step_val), ts_val or mtime_val, str(path))
+            return (0, ts_val or mtime_val, mtime_val, str(path))
 
-        checkpoint_dirs.sort(key=get_mtime)
+        checkpoint_entries.sort(key=_checkpoint_sort_key)
 
         # Queue oldest checkpoints for async deletion
-        to_delete = checkpoint_dirs[: -self.arguments.save_total_limit]
+        to_delete = [path for path, _ in (checkpoint_entries if limit <= 0 else checkpoint_entries[:-limit])]
         for old_checkpoint in to_delete:
             logger.info(f"Queueing old permanent checkpoint for deletion: {old_checkpoint}")
             self.checkpointer._queue_checkpoint_removal(str(old_checkpoint))
@@ -6778,7 +7262,7 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         try:
             output_path = ePath(output_path)
-            output_path.mkdir(parents=True, exist_ok=True)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(self._get_information())
 
             logger.info(f"Information saved successfully to {output_path}")
@@ -6907,7 +7391,8 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             int: Total FLOPs count.
         """
-        return 6 * sum(x.size for x in jax.tree_util.tree_flatten(params)[0])
+        factor = 6 if is_training else 2
+        return factor * sum(x.size for x in jax.tree_util.tree_flatten(params)[0])
 
     @staticmethod
     def count_model_parameters(prm):
@@ -7023,7 +7508,11 @@ class BaseTrainer(BaseTrainerProtocol):
             """
             if not isinstance(function, Compiled):
                 logger.info("Compiling function: %s", tag)
-                batch, _ = self._get_next_batch(iter(dataloader), dataloader)
+                sample_iter = iter(dataloader)
+                try:
+                    batch, sample_iter = self._get_next_batch(sample_iter, dataloader)
+                finally:
+                    self._close_iterator(sample_iter)
                 if self.data_collator is not None:
                     batch = self.data_collator(batch)
                 batch, _ = self._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
@@ -7253,6 +7742,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.warning("KeyboardInterrupt: Training interrupted. Saving current state...")
             elif isinstance(run_exception, EasyDeLTimerError):
                 logger.warning("Training reached maximum time limit. Saving current state...")
+            elif isinstance(run_exception, EasyDeLBreakRequest):
+                logger.warning(f"Training stopped early via break request ({run_exception}). Saving current state...")
             elif isinstance(run_exception, EasyDeLPreemptionSignal):
                 ...  # simply just pass
             elif self._is_memory_oom_exception(run_exception):
@@ -7303,6 +7794,10 @@ class BaseTrainer(BaseTrainerProtocol):
             logger.warning("KeyboardInterrupt: Training interrupted. Saving current state...")
         elif isinstance(exception, EasyDeLTimerError):
             logger.warning("Training reached maximum time limit. Saving current state...")
+        elif isinstance(exception, EasyDeLBreakRequest):
+            logger.warning(f"Training stopped early via break request ({exception}). Saving current state...")
+        elif isinstance(exception, EasyDeLPreemptionSignal):
+            ...
         else:
             raise RuntimeError("EasyDeL Runtime dumped") from exception
         return self._prepare_training_output(
@@ -7321,7 +7816,8 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         model_size = self.count_model_parameters(state.graphstate)
         config_metrics = {
-            "Number of Model Parameters (Billion)": model_size,
+            "Number of Model Parameters (Billion)": model_size / 1e9,
+            "Number of Model Parameters": model_size,
             "process_count": jax.process_count(),
             "device_count": jax.device_count(),
             "local_device_count": jax.local_device_count(),
@@ -7364,10 +7860,12 @@ class BaseTrainer(BaseTrainerProtocol):
         try:
             batch = next(data_iter)
         except (StopIteration, IndexError):
+            self._close_iterator(data_iter)
             data_iter = iter(dataloader)
             try:
                 batch = next(data_iter)
             except StopIteration as exc:
+                self._close_iterator(data_iter)
                 raise RuntimeError("Dataloader is empty and cannot provide batches.") from exc
 
         ids_to_pop = tuple(self.arguments.ids_to_pop_from_dataset or ())
@@ -7407,7 +7905,10 @@ class BaseTrainer(BaseTrainerProtocol):
                 f"Seeking dataloader to resume at batch offset {num_batches}; skipped batches will not be materialized."
             )
             try:
-                return iter_from_batch(num_batches)
+                new_iter = iter_from_batch(num_batches)
+                if new_iter is not data_iter:
+                    self._close_iterator(data_iter)
+                return new_iter
             except NotImplementedError:
                 pass
         builtin_sequence_iterators = (type(iter([])), type(iter(())), type(iter(range(0))))
@@ -7424,10 +7925,12 @@ class BaseTrainer(BaseTrainerProtocol):
             remaining -= skipped
             if remaining <= 0:
                 break
+            self._close_iterator(data_iter)
             data_iter = iter(dataloader)
             try:
                 next(data_iter)
             except StopIteration as exc:
+                self._close_iterator(data_iter)
                 raise RuntimeError("Dataloader is empty and cannot be fast-forwarded.") from exc
             remaining -= 1
         return data_iter
@@ -7504,6 +8007,9 @@ class BaseTrainer(BaseTrainerProtocol):
 
             if hasattr(self, "_hidden_rich_pbar"):
                 progress = self._hidden_rich_pbar
+                live = getattr(progress, "live", None)
+                if live is not None and not getattr(live, "is_started", True):
+                    progress.start()
             else:
                 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
@@ -7580,7 +8086,9 @@ class BaseTrainer(BaseTrainerProtocol):
             force_report: Whether to bypass ``report_steps`` gating.
         """
 
-        if update_progress and step % self.arguments.log_steps == 0:
+        log_steps = getattr(self.arguments, "log_steps", 1)
+        report_steps = getattr(self.arguments, "report_steps", 1)
+        if update_progress and log_steps and log_steps > 0 and step % log_steps == 0:
             if step == 0:
                 pbar.reset()
             display_metrics = {
@@ -7589,7 +8097,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 if not (k.startswith("train/grad_norm") or k.startswith("eval/grad_norm"))
             }
             pbar.set_postfix(**display_metrics)
-            update_size = 0 if step == 0 else self.arguments.log_steps
+            update_size = 0 if step == 0 else log_steps
             pbar.update(update_size)
-        if log_to_backends and (force_report or step % self.arguments.report_steps == 0):
+        if log_to_backends and (force_report or (report_steps and report_steps > 0 and step % report_steps == 0)):
             self.arguments.log_metrics(metrics=metrics, step=step)

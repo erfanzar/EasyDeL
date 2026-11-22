@@ -26,7 +26,10 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from ..logger import logger
+from ..multimodal.types import compute_content_hash
 from .interface import CacheGroupSpec, ChunkedLocalAttentionSpec, FullAttentionSpec, SlidingWindowSpec
 
 _KIND = {FullAttentionSpec: 0, SlidingWindowSpec: 1, ChunkedLocalAttentionSpec: 2}
@@ -36,17 +39,56 @@ EngineRequest = Any
 """Any object with the request fields the KV core reads (id, tokens, computed count, sampling params, vision data)."""
 
 
+def _hash_media_payload(value: Any) -> Any:
+    """Compute a deterministic content hash for a raw media array or sequence of arrays."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        try:
+            return compute_content_hash(np.asarray(value))
+        except (TypeError, ValueError):
+            return tuple(_hash_media_payload(item) for item in value)
+    return compute_content_hash(value)
+
+
+def _fallback_multimodal_nonce(request: EngineRequest) -> tuple[Any, ...]:
+    """Return a per-request non-colliding key when multimodal identity extraction fails."""
+    return ("multimodal-nonce", str(getattr(request, "request_id", "")), id(request))
+
+
 def request_page_hash_extra_keys(request: EngineRequest) -> tuple[Any, ...] | None:
     """Return the same multimodal identity for initial and incremental page hashes."""
+    if not getattr(request, "has_vision", False):
+        return None
     mm_features = getattr(request, "mm_features", None)
-    if getattr(request, "has_vision", False) and mm_features:
-        try:
-            return tuple(
-                (str(getattr(feat, "modality", "mm")), str(getattr(feat, "mm_hash", ""))) for feat in mm_features
-            )
-        except Exception:
-            return ("multimodal",)
-    return None
+    try:
+        if mm_features:
+            feature_keys: list[tuple[Any, ...]] = []
+            for feat in mm_features:
+                modality = str(getattr(feat, "modality", "mm"))
+                mm_hash = str(getattr(feat, "mm_hash", ""))
+                if not mm_hash:
+                    pix = getattr(feat, "pixel_values", None)
+                    grid = getattr(feat, "grid_thw", None)
+                    if pix is not None or grid is not None:
+                        mm_hash = repr((_hash_media_payload(pix), _hash_media_payload(grid)))
+                    else:
+                        return _fallback_multimodal_nonce(request)
+                feature_keys.append((modality, mm_hash))
+            return tuple(feature_keys)
+
+        raw_fields = (
+            ("pixel_values", getattr(request, "pixel_values", None)),
+            ("image_grid_thw", getattr(request, "image_grid_thw", None)),
+            ("pixel_values_videos", getattr(request, "pixel_values_videos", None)),
+            ("video_grid_thw", getattr(request, "video_grid_thw", None)),
+        )
+        raw_keys = tuple((name, _hash_media_payload(val)) for name, val in raw_fields if val is not None)
+        if raw_keys:
+            return raw_keys
+        return _fallback_multimodal_nonce(request)
+    except Exception:
+        return _fallback_multimodal_nonce(request)
 
 
 def page_hash_extra_key(request: EngineRequest) -> int:
@@ -128,12 +170,28 @@ class CacheManager:
             groups.append((kind, int(spec.page_size), int(window), types.setdefault(spec.type_id, len(types))))
         if not isinstance(num_pages, int) or num_pages <= 0:
             raise ValueError("num_pages must be a positive integer")
+        # Detect the 2-type (Full, Sliding) HitSearch::Hybrid layout when use_eagle=True.
+        # Older compiled surgecore wheels double-subtract the EAGLE reserve page on this layout;
+        # we perform the single reserve step explicitly in Python while keeping the Rust fix in sync.
+        full_indices = [i for i, g in enumerate(groups) if g[0] == 0]
+        other_indices = [i for i, g in enumerate(groups) if g[0] != 0]
+        self._hybrid_sliding_eagle = (
+            bool(use_eagle)
+            and self.enable_caching
+            and len(groups) > 1
+            and bool(full_indices)
+            and bool(other_indices)
+            and len({groups[i][3] for i in full_indices}) == 1
+            and len({groups[i][3] for i in other_indices}) == 1
+            and (max(full_indices) < min(other_indices) or max(other_indices) < min(full_indices))
+            and groups[other_indices[0]][0] == 1
+        )
         self._core = KvCore(
             num_pages=num_pages,
             groups=groups,
             max_model_len=int(max_model_len),
             caching=self.enable_caching,
-            eagle=bool(use_eagle),
+            eagle=False if self._hybrid_sliding_eagle else bool(use_eagle),
         )
         self._slots: dict[str, int] = {}
         self.page_pool = _PagePoolView(self._core)
@@ -159,8 +217,30 @@ class CacheManager:
             slot = self._slots[request.request_id] = self._core.open(page_hash_extra_key(request))
         return slot
 
+    def _expected_num_keys(self, request: EngineRequest) -> int:
+        if not self.page_size:
+            return 0
+        return len(request.all_token_ids) // self.page_size
+
     def _tokens_if_unkeyed(self, slot: int | None, request: EngineRequest) -> list[int] | None:
-        return request.all_token_ids[:] if slot is None or self._core.num_keys(slot) == 0 else None
+        if slot is None:
+            return request.all_token_ids[:]
+        known = self._core.num_keys(slot)
+        if known == 0 or known < self._expected_num_keys(request):
+            return request.all_token_ids[:]
+        return None
+
+    def _prepare_slot_and_tokens(self, request: EngineRequest) -> tuple[int, list[int] | None]:
+        """Ensure a slot's cached keys are refreshed when tokens grew past previously hashed pages."""
+        slot = self._slot(request)
+        tokens = self._tokens_if_unkeyed(slot, request)
+        if tokens is not None and self._core.num_keys(slot) > 0:
+            # Older compiled surgecore wheels skip ensure_keys when req.keys is non-empty.
+            # Forgetting stale keys preserves held pages/cached counts and forces full re-chaining.
+            if self._core.forget_keys(slot):
+                self._slots.pop(request.request_id, None)
+                slot = self._slot(request)
+        return slot, tokens
 
     @staticmethod
     def _no_hit(request: EngineRequest) -> bool:
@@ -177,23 +257,28 @@ class CacheManager:
         """The longest prefix hit (none when prompt logprobs are requested); records the request's page keys."""
         if not self.enable_caching:
             return self.create_empty_page_list(), 0
-        slot = self._slot(request)
+        slot, tokens_arg = self._prepare_slot_and_tokens(request)
         max_len = request.num_tokens - 1
         if max_cache_hit_tokens is not None:
             max_len = min(max_len, int(max_cache_hit_tokens))
         hint = None if dp_shard_hint is None else int(dp_shard_hint)
         dp = None if data_parallel_size is None else int(data_parallel_size)
-        pages, tokens = self._core.lookup(
-            slot, self._tokens_if_unkeyed(slot, request), self._no_hit(request), max_len, hint, dp
-        )
+        no_hit = self._no_hit(request)
+        pages, tokens = self._core.lookup(slot, tokens_arg, no_hit, max_len, hint, dp)
+        if self._hybrid_sliding_eagle and not no_hit and tokens > 0:
+            ps = int(self.page_size or 0)
+            reserved_max = tokens - ps
+            if reserved_max <= 0:
+                return self.create_empty_page_list(), 0
+            pages, tokens = self._core.lookup(slot, None, False, reserved_max, hint, dp)
         return CachePages(tuple(pages)), tokens
 
     def request_page_hashes(self, request: EngineRequest) -> list[int]:
         """The chained full-page keys (128-bit ints) of the request's tokens, computed on first use."""
         if not self.enable_caching:
             raise AssertionError("page keys need prefix caching")
-        slot = self._slot(request)
-        return self._core.keys(slot, self._tokens_if_unkeyed(slot, request))
+        slot, tokens_arg = self._prepare_slot_and_tokens(request)
+        return self._core.keys(slot, tokens_arg)
 
     def probe_num_computed_tokens(self, request: EngineRequest) -> int:
         """Read-only prefix probe: the cached-token count, keeping no per-request state."""
@@ -201,7 +286,19 @@ class CacheManager:
             return 0
         slot = self._slots.get(request.request_id)
         tokens = self._tokens_if_unkeyed(slot, request)
-        return int(self._core.probe(slot, tokens, page_hash_extra_key(request), request.num_tokens - 1))
+        # If the existing slot has stale keys (tokens grew past num_keys), probe with slot=None
+        # so read-only probing hashes fresh keys into scratch without mutating the slot.
+        probe_slot = None if (slot is not None and tokens is not None and self._core.num_keys(slot) > 0) else slot
+        extra = page_hash_extra_key(request)
+        max_len = request.num_tokens - 1
+        hit_tokens = int(self._core.probe(probe_slot, tokens, extra, max_len))
+        if self._hybrid_sliding_eagle and hit_tokens > 0:
+            ps = int(self.page_size or 0)
+            reserved_max = hit_tokens - ps
+            if reserved_max <= 0:
+                return 0
+            hit_tokens = int(self._core.probe(probe_slot, tokens, extra, reserved_max))
+        return hit_tokens
 
     def allocate_slots(
         self,
@@ -301,6 +398,14 @@ class CacheManager:
         if slot is None:
             raise KeyError(request.request_id)
         n = int(num_computed_tokens)
+        # Clamp to allocated page capacity so older compiled surgecore wheels never overshoot req.cached[g].
+        page_ids = self._core.page_ids(slot)
+        if page_ids and self.kv_cache_groups:
+            max_publishable = min(
+                len(group_pages) * int(group.kv_cache_spec.page_size)
+                for group_pages, group in zip(page_ids, self.kv_cache_groups, strict=True)
+            )
+            n = min(n, max_publishable)
         needed = self._core.publish(slot, n)
         if needed is not None:
             lo, hi = needed

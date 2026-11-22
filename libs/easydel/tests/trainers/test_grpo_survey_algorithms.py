@@ -167,7 +167,13 @@ def test_gmpo_policy_terms_match_log_space_geometric_mean_reference():
     assert np.isfinite(np.asarray(loss)).all()
     np.testing.assert_allclose(np.asarray(loss[:, 0]), expected, rtol=1e-5)
     np.testing.assert_allclose(np.asarray(loss), np.broadcast_to(expected[:, None], loss.shape), rtol=1e-5)
-    np.testing.assert_allclose(np.asarray(ratios), np.exp(np.asarray(per_token_logps)), rtol=1e-5)
+    mask_bool = np.asarray(mask) > 0
+    np.testing.assert_allclose(
+        np.asarray(ratios)[mask_bool],
+        np.exp(np.asarray(per_token_logps))[mask_bool],
+        rtol=1e-5,
+    )
+    np.testing.assert_array_equal(np.asarray(ratios)[~mask_bool], np.ones((2,), dtype=np.float32))
 
 
 @pytest.mark.parametrize("chunk_size", [None, 1, 3])

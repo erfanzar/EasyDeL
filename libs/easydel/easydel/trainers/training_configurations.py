@@ -34,8 +34,10 @@ import json
 import os
 import re
 import traceback
+import types
 import typing as tp
 import warnings
+import weakref
 from copy import deepcopy
 from dataclasses import InitVar, dataclass, field, fields
 
@@ -113,11 +115,143 @@ def get_safe_arr(xs):
     Returns:
         Python scalar if input is a size-1 array, otherwise the original value.
     """
-    if isinstance(xs, np.generic | jax.Array):
+    if isinstance(xs, np.ndarray | np.generic | jax.Array):
         if xs.size == 1:  # Only try .item() on size-1 arrays
             return xs.item()
         return xs
     return xs
+
+
+def _is_dtype_like(value: tp.Any) -> bool:
+    """Return True for numpy/JAX dtype objects and scalar dtype classes (e.g. ``jnp.bfloat16``)."""
+    if isinstance(value, np.dtype):
+        return True
+    if isinstance(value, type):
+        if issubclass(value, np.generic):
+            return True
+        if isinstance(getattr(value, "dtype", None), np.dtype):
+            return True
+    return False
+
+
+def _parse_dtype(value: tp.Any) -> tp.Any:
+    """Normalize a serialized or string dtype representation back to a JAX dtype."""
+    if value is None or _is_dtype_like(value):
+        return value
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        if token.startswith("<class '") and token.endswith("'>"):
+            token = token[len("<class '") : -len("'>")].rsplit(".", 1)[-1]
+        resolved = getattr(jnp, token, None)
+        if resolved is not None and _is_dtype_like(resolved):
+            return resolved
+        try:
+            return jnp.dtype(token)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid dtype specified: {value!r}") from exc
+    return value
+
+
+def _is_real_number(value: tp.Any) -> bool:
+    """Return True for real numeric scalars, explicitly excluding booleans."""
+    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_))
+
+
+def _is_real_int(value: tp.Any) -> bool:
+    """Return True for integer scalars, explicitly excluding booleans."""
+    return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+
+
+def _expects_tuple_type(field_type: tp.Any) -> bool:
+    """Return whether a type annotation is a tuple or an optional/union tuple (and not a list)."""
+    if field_type is None:
+        return False
+    origin = tp.get_origin(field_type)
+    if origin is tuple or field_type is tuple:
+        return True
+    if origin in (tp.Union, types.UnionType):
+        args = [arg for arg in tp.get_args(field_type) if arg is not type(None)]
+        has_tuple = any(tp.get_origin(arg) is tuple or arg is tuple for arg in args)
+        has_list = any(tp.get_origin(arg) is list or arg is list for arg in args)
+        return has_tuple and not has_list
+    return False
+
+
+def _close_summary_writer(writer: tp.Any) -> None:
+    """Flush and close a TensorBoard SummaryWriter safely."""
+    if writer is None:
+        return
+    try:
+        if hasattr(writer, "flush"):
+            writer.flush()
+    except Exception:
+        pass
+    try:
+        if hasattr(writer, "close"):
+            writer.close()
+    except Exception:
+        pass
+
+
+_TB_HISTOGRAM_MAX_SAMPLES = 4096
+
+
+def _histogram_tuple_to_samples(
+    bin_counts: tp.Any,
+    bin_edges: tp.Any,
+    *,
+    max_samples: int = _TB_HISTOGRAM_MAX_SAMPLES,
+) -> np.ndarray:
+    """Convert pre-binned ``(bin_counts, bin_edges)`` to a bounded host sample array.
+
+    Proportionally downsamples large histograms (such as LLM weight tensors with
+    hundreds of millions of elements) to at most ``max_samples`` bin-center samples
+    while preserving non-empty bins whenever possible, avoiding host CPU OOM.
+    """
+    counts_arr = np.asarray(jax.device_get(bin_counts) if isinstance(bin_counts, jax.Array) else bin_counts).reshape(-1)
+    edges_arr = np.asarray(jax.device_get(bin_edges) if isinstance(bin_edges, jax.Array) else bin_edges).reshape(-1)
+    if edges_arr.dtype == jnp.bfloat16:
+        edges_arr = edges_arr.astype(np.float32)
+
+    n_bins = min(counts_arr.size, max(edges_arr.size - 1, 0))
+    if n_bins == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    counts = np.maximum(np.rint(counts_arr[:n_bins].astype(np.float64)).astype(np.int64), 0)
+    total = int(counts.sum())
+    if total <= 0:
+        return np.empty((0,), dtype=np.float64)
+
+    if total > max_samples:
+        scale = max_samples / float(total)
+        scaled = np.rint(counts * scale).astype(np.int64)
+        nonzero = counts > 0
+        num_nonzero = int(nonzero.sum())
+        preserve_nonzero = num_nonzero <= max_samples
+        if preserve_nonzero:
+            scaled = np.where(nonzero & (scaled == 0), 1, scaled)
+        excess = int(scaled.sum()) - max_samples
+        if excess > 0:
+            floor_per_bin = 1 if preserve_nonzero else 0
+            for idx in np.argsort(scaled)[::-1]:
+                if excess <= 0:
+                    break
+                min_keep = floor_per_bin if nonzero[idx] else 0
+                reducible = int(scaled[idx]) - min_keep
+                if reducible > 0:
+                    take = min(reducible, excess)
+                    scaled[idx] -= take
+                    excess -= take
+        if int(scaled.sum()) == 0:
+            nz_idx = np.flatnonzero(nonzero)
+            stride = max(1, len(nz_idx) // max_samples)
+            scaled[nz_idx[::stride][:max_samples]] = 1
+        counts = scaled
+
+    bin_centers = 0.5 * (edges_arr[:n_bins].astype(np.float64) + edges_arr[1 : n_bins + 1].astype(np.float64))
+    return np.repeat(bin_centers, counts)
 
 
 def _normalize_partition_spec_entry(value: tp.Any) -> tp.Any:
@@ -204,11 +338,27 @@ def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp
         A new dictionary with deprecated aliases replaced by current field names.
     """
     data = dict(data)
+    if "max_sequence_length" in data:
+        legacy_max_seq_len = data.pop("max_sequence_length")
+        if legacy_max_seq_len is not None:
+            warnings.warn(
+                "`max_sequence_length` is deprecated; use `max_length` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            if data.get("max_length") is None:
+                data["max_length"] = legacy_max_seq_len
+            elif data["max_length"] != legacy_max_seq_len:
+                warnings.warn(
+                    f"Both `max_length` ({data['max_length']}) and `max_sequence_length` ({legacy_max_seq_len}) "
+                    "are set; ignoring `max_sequence_length`.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
     if "quantization_block" in data:
-        if "quantization_group_size" not in data:
-            data["quantization_group_size"] = data["quantization_block"]
-        # Drop deprecated alias for constructor calls built from serialized configs.
-        data.pop("quantization_block", None)
+        legacy_quant_block = data.pop("quantization_block")
+        if legacy_quant_block is not None and data.get("quantization_group_size") is None:
+            data["quantization_group_size"] = legacy_quant_block
     for key, reason in _REMOVED_TRAINING_ARGS.items():
         if key in data:
             value = data.pop(key)
@@ -1532,6 +1682,18 @@ class TrainingArguments:
         """
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("`gradient_accumulation_steps` can't be lower than 1.")
+        if self.total_batch_size <= 0:
+            raise ValueError("`total_batch_size` must be > 0.")
+        if self.eval_batch_size <= 0:
+            raise ValueError("`eval_batch_size` must be > 0.")
+        if self.max_length <= 0:
+            raise ValueError("`max_length` must be > 0.")
+        if self.log_steps <= 0:
+            raise ValueError("`log_steps` must be > 0.")
+        if self.report_steps <= 0:
+            raise ValueError("`report_steps` must be > 0.")
+        if self.warmup_steps < 0:
+            raise ValueError("`warmup_steps` must be >= 0.")
         if self.gradient_accumulation_mode not in ("scan", "execution"):
             raise ValueError(
                 f"`gradient_accumulation_mode` must be 'scan' or 'execution', got {self.gradient_accumulation_mode!r}."
@@ -1583,32 +1745,34 @@ class TrainingArguments:
             )
         for name in ("zero_supervision_report_fraction", "zero_supervision_abort_fraction"):
             value = getattr(self, name)
-            if value is not None and not (isinstance(value, int | float) and 0.0 <= float(value) <= 1.0):
+            if value is not None and (
+                not _is_real_number(value) or not np.isfinite(float(value)) or not (0.0 <= float(value) <= 1.0)
+            ):
                 raise ValueError(f"`{name}` must be None or within [0, 1], got {value!r}.")
-        if int(self.zero_supervision_dump_limit) < 0:
-            raise ValueError("`zero_supervision_dump_limit` must be >= 0.")
-        if int(self.arrayrecord_num_threads) < 1:
-            raise ValueError("`arrayrecord_num_threads` must be >= 1.")
-        if int(self.arrayrecord_prefetch_buffer) < 0:
-            raise ValueError("`arrayrecord_prefetch_buffer` must be >= 0.")
+        for name, min_val in (
+            ("zero_supervision_dump_limit", 0),
+            ("arrayrecord_num_threads", 1),
+            ("arrayrecord_prefetch_buffer", 0),
+            ("parquetra_pack_seq_len", 0),
+            ("parquetra_pack_embed_cap", 0),
+            ("parquetra_pack_misfit_patience", 1),
+            ("parquetra_mp_workers", 0),
+            ("parquetra_fast_tokenizer_verify_rows", 1),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool | np.bool_):
+                raise TypeError(f"`{name}` must be an int, got {type(value).__name__}: {value!r}")
+            if int(value) < min_val:
+                raise ValueError(f"`{name}` must be >= {min_val}.")
         rate = self.arrayrecord_read_rate_limit_mb_per_sec
         if rate is not None:
-            if isinstance(rate, bool) or not isinstance(rate, int | float) or rate < 0 or not np.isfinite(rate):
+            if not _is_real_number(rate) or rate < 0 or not np.isfinite(rate):
                 raise ValueError(
                     "`arrayrecord_read_rate_limit_mb_per_sec` must be None, 0, or a positive finite number."
                 )
-        if float(self.arrayrecord_read_rate_burst_seconds) <= 0:
-            raise ValueError("`arrayrecord_read_rate_burst_seconds` must be > 0.")
-        if int(self.parquetra_pack_seq_len) < 0:
-            raise ValueError("`parquetra_pack_seq_len` must be >= 0.")
-        if int(self.parquetra_pack_embed_cap) < 0:
-            raise ValueError("`parquetra_pack_embed_cap` must be >= 0.")
-        if int(self.parquetra_pack_misfit_patience) < 1:
-            raise ValueError("`parquetra_pack_misfit_patience` must be >= 1.")
-        if int(self.parquetra_mp_workers) < 0:
-            raise ValueError("`parquetra_mp_workers` must be >= 0.")
-        if int(self.parquetra_fast_tokenizer_verify_rows) < 1:
-            raise ValueError("`parquetra_fast_tokenizer_verify_rows` must be >= 1.")
+        burst = self.arrayrecord_read_rate_burst_seconds
+        if not _is_real_number(burst) or not np.isfinite(float(burst)) or float(burst) <= 0:
+            raise ValueError("`arrayrecord_read_rate_burst_seconds` must be a finite number > 0.")
 
     def _setup_distributed(self):
         """
@@ -1625,19 +1789,8 @@ class TrainingArguments:
 
         JaxDistributedConfig.initialize(self.jax_distributed_config)
 
-    def _setup_optimizer(self):
-        """
-        Configure optimizer and learning rate scheduler settings.
-
-        This method prepares the optimizer_kwargs dictionary with all necessary
-        parameters for optimizer creation, including:
-        - Learning rate and schedule parameters
-        - Weight decay and gradient clipping
-        - Optimizer-specific settings from extra_optimizer_kwargs
-        - Data type specifications for optimizer states
-
-        The actual optimizer creation is deferred until training setup.
-        """
+    def _build_optimizer_kwargs(self) -> dict[str, tp.Any]:
+        """Build optimizer keyword arguments from the current live fields."""
         extra_optimizer_kwargs = self.extra_optimizer_kwargs if self.extra_optimizer_kwargs is not None else {}
         own_optimizer_kwargs = {
             "learning_rate": self.learning_rate,
@@ -1649,7 +1802,7 @@ class TrainingArguments:
             "weight_decay": self.weight_decay,
             "steps": self.max_training_steps,
             "clip_grad": self.clip_grad,
-            "mu_dtype": self.tx_mu_dtype,
+            "mu_dtype": _parse_dtype(self.tx_mu_dtype),
         }
         # Extra kwargs must not silently override TrainingArguments fields; unset tx_mu_dtype may be filled.
         colliding = {
@@ -1670,7 +1823,22 @@ class TrainingArguments:
                 f"{details}. Set the TrainingArguments field directly, or pass optimizer-specific settings under "
                 "a name that does not shadow a TrainingArguments field."
             )
-        self.optimizer_kwargs = {**own_optimizer_kwargs, **extra_optimizer_kwargs}
+        return {**own_optimizer_kwargs, **extra_optimizer_kwargs}
+
+    def _setup_optimizer(self):
+        """
+        Configure optimizer and learning rate scheduler settings.
+
+        This method prepares the optimizer_kwargs dictionary with all necessary
+        parameters for optimizer creation, including:
+        - Learning rate and schedule parameters
+        - Weight decay and gradient clipping
+        - Optimizer-specific settings from extra_optimizer_kwargs
+        - Data type specifications for optimizer states
+
+        The actual optimizer creation is deferred until training setup.
+        """
+        self.optimizer_kwargs = self._build_optimizer_kwargs()
 
     def _setup_logging(self):
         """
@@ -1780,50 +1948,45 @@ class TrainingArguments:
         self.lmhead_chunksize = _coerce_int(self.lmhead_chunksize)
         self.quantization_group_size = _coerce_int(self.quantization_group_size)
         self.quantization_bits = _coerce_int(self.quantization_bits)
+        self.total_batch_size = _coerce_int(self.total_batch_size)
+        self.eval_batch_size = _coerce_int(self.eval_batch_size)
+        self.max_length = _coerce_int(self.max_length)
+        self.log_steps = _coerce_int(self.log_steps)
+        self.report_steps = _coerce_int(self.report_steps)
+        self.tx_mu_dtype = _parse_dtype(self.tx_mu_dtype)
 
         for name in ("learning_rate", "weight_decay"):
             value = getattr(self, name, None)
-            if not isinstance(value, (float, int, np.floating, np.integer)):
+            if not _is_real_number(value):
                 raise TypeError(f"`{name}` must be a number, got {type(value).__name__}: {value!r}")
 
-        if self.learning_rate_end is not None and not isinstance(
-            self.learning_rate_end, (float, int, np.floating, np.integer)
-        ):
+        if self.learning_rate_end is not None and not _is_real_number(self.learning_rate_end):
             raise TypeError(
                 "`learning_rate_end` must be a number when provided, got "
                 f"{type(self.learning_rate_end).__name__}: {self.learning_rate_end!r}"
             )
 
-        if self.clip_grad is not None and not isinstance(self.clip_grad, (float, int, np.floating, np.integer)):
+        if self.clip_grad is not None and not _is_real_number(self.clip_grad):
             raise TypeError(
                 f"`clip_grad` must be a number when provided, got {type(self.clip_grad).__name__}: {self.clip_grad!r}"
             )
 
-        if not isinstance(self.warmup_steps, (int, np.integer)):
-            raise TypeError(
-                f"`warmup_steps` must be an int, got {type(self.warmup_steps).__name__}: {self.warmup_steps!r}"
-            )
+        for name in (
+            "warmup_steps",
+            "gradient_accumulation_steps",
+            "total_batch_size",
+            "max_length",
+            "log_steps",
+            "report_steps",
+        ):
+            value = getattr(self, name, None)
+            if not _is_real_int(value):
+                raise TypeError(f"`{name}` must be an int, got {type(value).__name__}: {value!r}")
 
-        if not isinstance(self.gradient_accumulation_steps, (int, np.integer)):
-            raise TypeError(
-                "`gradient_accumulation_steps` must be an int, got "
-                f"{type(self.gradient_accumulation_steps).__name__}: {self.gradient_accumulation_steps!r}"
-            )
-        if self.lmhead_chunksize is not None and not isinstance(self.lmhead_chunksize, (int, np.integer)):
-            raise TypeError(
-                "`lmhead_chunksize` must be an int when provided, got "
-                f"{type(self.lmhead_chunksize).__name__}: {self.lmhead_chunksize!r}"
-            )
-        if self.quantization_group_size is not None and not isinstance(self.quantization_group_size, (int, np.integer)):
-            raise TypeError(
-                "`quantization_group_size` must be an int when provided, got "
-                f"{type(self.quantization_group_size).__name__}: {self.quantization_group_size!r}"
-            )
-        if self.quantization_bits is not None and not isinstance(self.quantization_bits, (int, np.integer)):
-            raise TypeError(
-                "`quantization_bits` must be an int when provided, got "
-                f"{type(self.quantization_bits).__name__}: {self.quantization_bits!r}"
-            )
+        for name in ("eval_batch_size", "lmhead_chunksize", "quantization_group_size", "quantization_bits"):
+            value = getattr(self, name, None)
+            if value is not None and not _is_real_int(value):
+                raise TypeError(f"`{name}` must be an int when provided, got {type(value).__name__}: {value!r}")
 
         if isinstance(self.quantization_mode, str):
             quantization_mode = self.quantization_mode.strip().lower()
@@ -2078,19 +2241,21 @@ class TrainingArguments:
             gradient clipping, weight decay, and other transformations.
         """
 
-        optimizer_kwargs = deepcopy(self.optimizer_kwargs)
-        optimizer_kwargs["steps"] = steps or optimizer_kwargs["steps"]
+        optimizer_kwargs = deepcopy(self._build_optimizer_kwargs())
+        if steps is not None:
+            optimizer_kwargs["steps"] = steps
         scheduler = optimizer_kwargs.pop("scheduler", None)
         if scheduler == "none":
             scheduler = None
         if scheduler == EasyDeLSchedulers.NONE:
             scheduler = None
+        warmup_steps = optimizer_kwargs.pop("warmup_steps", None)
         scheduler_config = SchedulerConfig(
             scheduler_type=scheduler,
             steps=optimizer_kwargs.pop("steps"),
             learning_rate=optimizer_kwargs.pop("learning_rate"),
             learning_rate_end=optimizer_kwargs.pop("learning_rate_end"),
-            warmup_steps=optimizer_kwargs.pop("warmup_steps"),
+            warmup_steps=warmup_steps or None,
             exponent=optimizer_kwargs.pop("exponent", 1),
         )
         optimizer_kwargs.pop("gradient_accumulation_steps", 0)
@@ -2162,39 +2327,48 @@ class TrainingArguments:
             return datetime.timedelta(minutes=self.save_interval_minutes)
         return None
 
-    @functools.cached_property
+    @property
     def _tensorboard(self):
         """Lazy initialization of the SpectraX TensorBoard writer.
 
         Returns:
             SummaryWriter | None: TensorBoard writer instance, or None if the
-                save path is not configured.
-
-        Note:
-            Cached property to avoid multiple initializations.
+                save path is not configured or metrics logging is disabled on
+                this worker.
         """
+        if not self.can_log_metrics:
+            return None
+        writer = self.__dict__.get("_tensorboard_writer")
+        if writer is not None:
+            return writer
         from easydel.utils.helpers import SummaryWriter
 
         path = self._get_save_directory(create=True)
         if path is None:
             return None
-        return SummaryWriter(log_dir=str(path))
+        writer = SummaryWriter(log_dir=str(path))
+        self.__dict__["_tensorboard_writer"] = writer
+        weakref.finalize(self, _close_summary_writer, writer)
+        return writer
 
     def get_tensorboard(self) -> SummaryWriter | None:
         """Get the SpectraX TensorBoard SummaryWriter for logging metrics.
 
         Returns:
             SummaryWriter | None: The TensorBoard writer instance, or None if it
-                is not available or not configured.
-
-        Note:
-            Handles ModuleNotFoundError gracefully if SpectraX is not installed.
-            Uses cached property internally for efficiency.
+                is not available, not configured, or disabled for this worker.
         """
+        if not self.can_log_metrics:
+            return None
         try:
             return self._tensorboard
         except ModuleNotFoundError:
             return None
+
+    def close_tensorboard(self) -> None:
+        """Flush and close the cached TensorBoard SummaryWriter, if one was opened."""
+        writer = self.__dict__.pop("_tensorboard_writer", None)
+        _close_summary_writer(writer)
 
     def get_wandb_init(self):
         """
@@ -2219,7 +2393,9 @@ class TrainingArguments:
             WandB initialization is skipped in performance mode to reduce overhead.
         """
         if self.can_log_metrics:
-            if not self.use_wandb or wandb is None:
+            if not self.use_wandb:
+                return None
+            if wandb is None:
                 warnings.warn(
                     "you have used `use_wandb=True` but you haven't install wandb.",
                     stacklevel=1,
@@ -2396,11 +2572,19 @@ class TrainingArguments:
                                 histogram.bin_edges.tolist(),
                             )
 
-                            base_path = path.replace("/histogram", "")
-                            metrics[f"weights-information/{base_path}/mean"] = float(histogram.mean)
-                            metrics[f"weights-information/{base_path}/std"] = histogram.std.item()
-                            metrics[f"weights-information/{base_path}/min"] = histogram.min.item()
-                            metrics[f"weights-information/{base_path}/max"] = histogram.max.item()
+                            base_path = key.removesuffix("/histogram").replace("/", ".")
+                            metrics[f"weights-information/{base_path}/mean"] = float(
+                                np.asarray(histogram.mean).reshape(()).item()
+                            )
+                            metrics[f"weights-information/{base_path}/std"] = float(
+                                np.asarray(histogram.std).reshape(()).item()
+                            )
+                            metrics[f"weights-information/{base_path}/min"] = float(
+                                np.asarray(histogram.min).reshape(()).item()
+                            )
+                            metrics[f"weights-information/{base_path}/max"] = float(
+                                np.asarray(histogram.max).reshape(()).item()
+                            )
                         else:
                             path = key.replace("/", ".")
                             metrics[f"weights-information/{path}"] = histogram
@@ -2462,9 +2646,17 @@ class TrainingArguments:
                     try:
                         if isinstance(value, tuple) and len(value) == 2:
                             bin_counts, bin_edges = value
-                            if isinstance(bin_counts, list | jax.Array) and isinstance(bin_edges, list | jax.Array):
-                                bin_counts = np.array(bin_counts).reshape(-1)
-                                bin_edges = np.array(bin_edges).reshape(-1)
+                            if isinstance(bin_counts, list | np.ndarray | jax.Array) and isinstance(
+                                bin_edges, list | np.ndarray | jax.Array
+                            ):
+                                bin_counts = np.asarray(
+                                    jax.device_get(bin_counts) if isinstance(bin_counts, jax.Array) else bin_counts
+                                ).reshape(-1)
+                                bin_edges = np.asarray(
+                                    jax.device_get(bin_edges) if isinstance(bin_edges, jax.Array) else bin_edges
+                                ).reshape(-1)
+                                if bin_edges.dtype == jnp.bfloat16:
+                                    bin_edges = bin_edges.astype(np.float32)
                                 np_histogram = (bin_counts, bin_edges)
 
                                 wandb_metrics[key] = wandb.Histogram(np_histogram=np_histogram)
@@ -2502,29 +2694,28 @@ class TrainingArguments:
         """
         summary_writer = self.get_tensorboard()
         if summary_writer is not None:
-            for key, value in metrics.items():
-                try:
-                    if isinstance(value, float | int):
-                        summary_writer.add_scalar(key, value, step)
-                    elif isinstance(value, tuple) and len(value) == 2:
-                        bin_counts, bin_edges = value
-                        if isinstance(bin_counts, list | jax.Array) and isinstance(bin_edges, list | jax.Array):
-                            bin_counts = np.array(bin_counts)
-                            bin_edges = np.array(bin_edges)
-                            values = []
-                            for i, count in enumerate(bin_counts):
-                                if i < len(bin_edges) - 1:
-                                    bin_center = (bin_edges[i] + bin_edges[i + 1]) / 2
-                                    values.extend([bin_center] * int(count))
-
-                            if values:
-                                summary_writer.add_histogram(key, np.array(values), step)
-                    elif isinstance(value, list | np.ndarray | jnp.ndarray):
-                        summary_writer.add_histogram(key, np.array(value), step)
-                except Exception as e:
-                    warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
-                finally:
-                    summary_writer.flush()
+            try:
+                for key, value in metrics.items():
+                    try:
+                        if isinstance(value, float | int | np.floating | np.integer):
+                            summary_writer.add_scalar(key, float(value) if isinstance(value, np.floating) else value, step)
+                        elif isinstance(value, tuple) and len(value) == 2:
+                            bin_counts, bin_edges = value
+                            if isinstance(bin_counts, list | np.ndarray | jax.Array) and isinstance(
+                                bin_edges, list | np.ndarray | jax.Array
+                            ):
+                                samples = _histogram_tuple_to_samples(bin_counts, bin_edges)
+                                if samples.size > 0:
+                                    summary_writer.add_histogram(key, samples, step)
+                        elif isinstance(value, list | np.ndarray | jax.Array):
+                            arr = np.asarray(jax.device_get(value) if isinstance(value, jax.Array) else value)
+                            if arr.dtype == jnp.bfloat16:
+                                arr = arr.astype(np.float32)
+                            summary_writer.add_histogram(key, arr, step)
+                    except Exception as e:
+                        warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
+            finally:
+                summary_writer.flush()
 
     def _create_wandb_histogram(self, value):
         """Create a wandb.Histogram object from the given value.
@@ -2566,17 +2757,28 @@ class TrainingArguments:
         """
         return json.loads(ePath(json_file).read_text())
 
+    _RUNTIME_ONLY_FIELDS: tp.ClassVar[frozenset[str]] = frozenset(
+        {
+            "buckets",
+            "bucket_datasets",
+            "watchers",
+            "custom_scheduler",
+            "pruning_module",
+            "tensor_straight_through",
+            "straight_through_emulator",
+            "mpmd_scheduler",
+        }
+    )
+
     def to_dict(self) -> dict[str, tp.Any]:
         """Serializes this instance to a dictionary.
 
         Returns:
             dict[str, tp.Any]: A dictionary containing all serializable fields.
         """
-        # Runtime-only fields that are not reconstructable from JSON: the
-        # resolved bucket objects/dataloaders are rebuilt by the trainer/eLarge
-        # from `bucket_rule` + `bucket_configs` (dicts), so they must not leak
-        # into the saved projection.
-        _runtime_only_fields = {"buckets", "bucket_datasets"}
+        # Runtime-only fields (callables, live watchers, bucket objects/dataloaders,
+        # pruning wrappers, MPMD schedules) are not reconstructable from JSON and
+        # must not leak as stringified objects into the saved projection.
         result = {}
         for field_obj in fields(self):
             value = getattr(self, field_obj.name)
@@ -2584,18 +2786,25 @@ class TrainingArguments:
                 continue
             if field_obj.name.startswith("_"):
                 continue
-            if field_obj.name in _runtime_only_fields:
+            if field_obj.name in self._RUNTIME_ONLY_FIELDS:
                 continue
-            if isinstance(value, tuple):
-                result[field_obj.name] = list(value)
+            if _is_dtype_like(value):
+                result[field_obj.name] = jnp.dtype(value).name
+            elif isinstance(value, tuple):
+                result[field_obj.name] = [jnp.dtype(v).name if _is_dtype_like(v) else v for v in value]
             elif value is None:
                 result[field_obj.name] = None
             elif hasattr(value, "to_dict") and callable(value.to_dict):
                 result[field_obj.name] = value.to_dict()
             else:
+                candidate = (
+                    {k: jnp.dtype(v).name if _is_dtype_like(v) else v for k, v in value.items()}
+                    if isinstance(value, dict)
+                    else value
+                )
                 try:
-                    json.dumps(value)
-                    result[field_obj.name] = value
+                    json.dumps(candidate)
+                    result[field_obj.name] = candidate
                 except (TypeError, OverflowError):
                     result[field_obj.name] = str(value)
         return result
@@ -2613,7 +2822,12 @@ class TrainingArguments:
         data = _apply_training_args_legacy_aliases(data)
 
         processed_data = {}
-        type_hints = tp.get_type_hints(cls)
+        try:
+            type_hints = tp.get_type_hints(cls)
+        except Exception:
+            type_hints = {}
+            for base in reversed(cls.__mro__):
+                type_hints.update(getattr(base, "__annotations__", {}))
 
         for field_obj in fields(cls):
             field_name = field_obj.name
@@ -2623,7 +2837,15 @@ class TrainingArguments:
             value = data[field_name]
             field_type = type_hints.get(field_name)
 
-            if field_name == "pose" and isinstance(value, dict):
+            if field_name in cls._RUNTIME_ONLY_FIELDS and (
+                isinstance(value, str)
+                or (field_name == "watchers" and isinstance(value, list) and any(isinstance(item, str) for item in value))
+            ):
+                continue
+
+            if field_name == "tx_mu_dtype":
+                processed_data[field_name] = _parse_dtype(value)
+            elif field_name == "pose" and isinstance(value, dict):
                 processed_data[field_name] = PoSEConfig.from_dict(value)
             elif field_name == "randomized_yarn" and isinstance(value, dict):
                 processed_data[field_name] = RandomizedYaRNConfig.from_dict(value)
@@ -2635,12 +2857,7 @@ class TrainingArguments:
                 from easydel.trainers.buckets import BucketRule
 
                 processed_data[field_name] = BucketRule.from_dict(value)
-            elif (
-                value is not None
-                and isinstance(value, list)
-                and field_type is not None
-                and tp.get_origin(field_type) is tuple
-            ):
+            elif value is not None and isinstance(value, list) and _expects_tuple_type(field_type):
                 processed_data[field_name] = tuple(value)
             else:
                 processed_data[field_name] = value
@@ -2700,9 +2917,16 @@ class TrainingArguments:
         if "trainer_config_class" in config_dict.keys():
             import easydel as ed
 
-            cls = getattr(ed, config_dict.pop("trainer_config_class"))
-            if cls is None:
-                raise ValueError("We couldn't clarify the trainer config class from provided json.")
+            class_name = config_dict.pop("trainer_config_class")
+            resolved_cls = getattr(ed, class_name, None) if isinstance(class_name, str) else None
+            if resolved_cls is None:
+                if class_name == cls.__name__:
+                    resolved_cls = cls
+                else:
+                    raise ValueError(
+                        f"We couldn't clarify the trainer config class {class_name!r} from provided json."
+                    )
+            cls = resolved_cls
         return cls.from_dict(config_dict)
 
     def save_arguments(self, json_file_path: str | os.PathLike | ePathLike):

@@ -61,14 +61,18 @@ Note:
     These are optional dependencies of EasyDeL.
 """
 
+import asyncio
 import os
 import tempfile
+import threading
 import typing as tp
+from contextlib import asynccontextmanager
 from enum import StrEnum
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from jax import numpy as jnp
 from pydantic import BaseModel, Field
 from transformers import WhisperProcessor, WhisperTokenizer
@@ -76,6 +80,194 @@ from transformers import WhisperProcessor, WhisperTokenizer
 import easydel as ed
 
 from .core import vWhisperInference
+
+DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MiB
+MAX_UPLOAD_BYTES_ENV_VAR = "VWHISPER_MAX_UPLOAD_BYTES"
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
+
+def _resolve_max_upload_bytes(max_upload_bytes: int | None = None) -> int:
+    """Resolve the upload byte limit from explicit config or environment."""
+    if max_upload_bytes is None:
+        raw_env = os.environ.get(MAX_UPLOAD_BYTES_ENV_VAR)
+        if raw_env is None or not raw_env.strip():
+            return DEFAULT_MAX_UPLOAD_BYTES
+        try:
+            max_upload_bytes = int(raw_env)
+        except ValueError as err:
+            raise ValueError(f"{MAX_UPLOAD_BYTES_ENV_VAR} must be a positive integer, got {raw_env!r}") from err
+    if isinstance(max_upload_bytes, bool) or max_upload_bytes <= 0:
+        raise ValueError(f"max_upload_bytes must be a positive integer, got {max_upload_bytes!r}")
+    return max_upload_bytes
+
+
+def _cleanup_temp_file(path: str | None) -> None:
+    """Remove a temporary file if it still exists."""
+    if path is not None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+@asynccontextmanager
+async def _uploaded_temp_file(file: UploadFile, max_upload_bytes: int) -> tp.AsyncIterator[str]:
+    """Stream an uploaded file to a temporary file with size enforcement and guaranteed cleanup."""
+    suffix = os.path.splitext(os.path.basename(file.filename or ""))[1]
+    temp_file = await asyncio.to_thread(tempfile.NamedTemporaryFile, delete=False, suffix=suffix)
+    temp_file_path = temp_file.name
+    try:
+        total_bytes = 0
+        try:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds maximum allowed size of {max_upload_bytes} bytes.",
+                    )
+                await asyncio.to_thread(temp_file.write, chunk)
+        finally:
+            try:
+                await asyncio.to_thread(temp_file.close)
+            except BaseException:
+                temp_file.close()
+                raise
+        yield temp_file_path
+    finally:
+        try:
+            await asyncio.to_thread(_cleanup_temp_file, temp_file_path)
+        except BaseException:
+            _cleanup_temp_file(temp_file_path)
+            raise
+
+
+def _should_return_timestamps(
+    response_format: "ResponseFormat",
+    timestamp_granularities: list[str] | None,
+) -> bool:
+    """Determine whether Whisper generation must emit timestamps for the request."""
+    if response_format in {ResponseFormat.srt, ResponseFormat.vtt, ResponseFormat.verbose_json}:
+        return True
+    if not timestamp_granularities:
+        return False
+    requested = {
+        part.strip().lower()
+        for item in timestamp_granularities
+        for part in item.split(",")
+        if part.strip()
+    }
+    return bool(requested & {"word", "segment"})
+
+
+def _format_timestamp(seconds: float | None, *, decimal_marker: str) -> str:
+    """Format a timestamp in seconds as HH:MM:SS{decimal_marker}mmm."""
+    total_ms = round(max(0.0, float(seconds or 0.0)) * 1000)
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{decimal_marker}{millis:03d}"
+
+
+def _normalize_segments(result: dict[str, tp.Any]) -> list[dict[str, tp.Any]]:
+    """Normalize vWhisper chunks into structured OpenAI-compatible segment dicts."""
+    chunks = result.get("chunks")
+    segments: list[dict[str, tp.Any]] = []
+    if chunks:
+        for idx, chunk in enumerate(chunks):
+            ts = chunk.get("timestamp")
+            if isinstance(ts, list | tuple) and len(ts) >= 2:
+                start = 0.0 if ts[0] is None else float(ts[0])
+                end = start if ts[1] is None else float(ts[1])
+            else:
+                start = float(chunk.get("start", 0.0) or 0.0)
+                end = float(chunk.get("end", start) or start)
+            segments.append(
+                {
+                    "id": idx,
+                    "start": start,
+                    "end": end,
+                    "text": chunk.get("text", ""),
+                    "timestamp": [start, end],
+                }
+            )
+    elif result.get("text"):
+        segments.append(
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 0.0,
+                "text": result["text"],
+                "timestamp": [0.0, 0.0],
+            }
+        )
+    return segments
+
+
+def _format_srt(segments: list[dict[str, tp.Any]]) -> str:
+    """Render normalized segments in SubRip (SRT) subtitle format."""
+    blocks = []
+    for idx, seg in enumerate(segments, start=1):
+        start_ts = _format_timestamp(seg["start"], decimal_marker=",")
+        end_ts = _format_timestamp(seg["end"], decimal_marker=",")
+        blocks.append(f"{idx}\n{start_ts} --> {end_ts}\n{seg['text'].strip()}\n")
+    return "\n".join(blocks)
+
+
+def _format_vtt(segments: list[dict[str, tp.Any]]) -> str:
+    """Render normalized segments in WebVTT subtitle format."""
+    lines = ["WEBVTT", ""]
+    for seg in segments:
+        start_ts = _format_timestamp(seg["start"], decimal_marker=".")
+        end_ts = _format_timestamp(seg["end"], decimal_marker=".")
+        lines.append(f"{start_ts} --> {end_ts}\n{seg['text'].strip()}\n")
+    return "\n".join(lines)
+
+
+def _format_whisper_response(
+    result: dict[str, tp.Any],
+    response_format: "ResponseFormat",
+    *,
+    task: str,
+    language: str | None = None,
+):
+    """Format vWhisper inference output according to OpenAI Whisper response_format."""
+    text = result.get("text", "")
+    if response_format == ResponseFormat.text:
+        return PlainTextResponse(content=text)
+
+    if response_format == ResponseFormat.srt:
+        return PlainTextResponse(content=_format_srt(_normalize_segments(result)))
+
+    if response_format == ResponseFormat.vtt:
+        return PlainTextResponse(content=_format_vtt(_normalize_segments(result)))
+
+    if response_format == ResponseFormat.verbose_json:
+        segments = _normalize_segments(result)
+        duration = max((seg["end"] for seg in segments), default=0.0)
+        resolved_language = language or result.get("language")
+        if resolved_language is None:
+            for chunk in result.get("chunks") or ():
+                if chunk.get("language"):
+                    resolved_language = chunk["language"]
+                    break
+        if resolved_language is None and task == "translate":
+            resolved_language = "en"
+        return {
+            "task": task,
+            "language": resolved_language,
+            "duration": duration,
+            "text": text,
+            "segments": segments,
+        }
+
+    response: dict[str, tp.Any] = {"text": text}
+    if "chunks" in result:
+        response["segments"] = result["chunks"]
+    return response
 
 
 class WhisperModel:
@@ -125,14 +317,16 @@ class WhisperModel:
         - Call with model_name=None after initialization returns existing instance
     """
 
-    _instance = None
+    _instance: tp.ClassVar["WhisperModel | None"] = None
+    _lock: tp.ClassVar[threading.RLock] = threading.RLock()
 
     def __new__(cls, model_name=None, dtype=jnp.bfloat16):
         """Create or return the singleton WhisperModel instance.
 
-        Implements the singleton pattern to ensure only one model instance
-        exists. The model is initialized on the first call when model_name
-        is provided.
+        Implements a thread-safe singleton pattern to ensure only one model
+        instance exists. The model is initialized on the first call when
+        ``model_name`` is provided, and the singleton reference is only
+        published after ``_initialize()`` succeeds.
 
         Args:
             model_name (str | None, optional): HuggingFace model identifier
@@ -142,25 +336,41 @@ class WhisperModel:
                 jnp.float16, and jnp.bfloat16. Defaults to jnp.bfloat16.
 
         Returns:
-            WhisperModel: The singleton instance. Returns None if called
+            WhisperModel | None: The singleton instance, or None if called
                 without model_name when no instance exists.
 
-        Example:
-            First call initializes the model::
-
-                >>> model = WhisperModel("openai/whisper-base")
-
-            Subsequent calls return the same instance::
-
-                >>> same_model = WhisperModel()
-                >>> assert model is same_model
+        Raises:
+            ValueError: If an instance is already initialized with a different
+                ``model_name`` or ``dtype``.
         """
-        if cls._instance is None and model_name is not None:
-            cls._instance = super().__new__(cls)
-            cls._instance.model_name = model_name
-            cls._instance.dtype = dtype
-            cls._instance._initialize()
-        return cls._instance
+        with cls._lock:
+            if cls._instance is not None:
+                if model_name is not None and (
+                    cls._instance.model_name != model_name or cls._instance.dtype != dtype
+                ):
+                    raise ValueError(
+                        f"WhisperModel singleton is already initialized with "
+                        f"model_name={cls._instance.model_name!r}, dtype={cls._instance.dtype!r}; "
+                        f"cannot reinitialize with model_name={model_name!r}, dtype={dtype!r}. "
+                        f"Call WhisperModel.reset() first to load a different model."
+                    )
+                return cls._instance
+
+            if model_name is None:
+                return None
+
+            instance = super().__new__(cls)
+            instance.model_name = model_name
+            instance.dtype = dtype
+            instance._initialize()
+            cls._instance = instance
+            return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        """Clear the cached singleton instance."""
+        with cls._lock:
+            cls._instance = None
 
     def _initialize(self):
         """Initialize model components.
@@ -224,8 +434,8 @@ class ResponseFormat(StrEnum):
             ... )
 
     Note:
-        Currently, only "json" and "text" formats are fully implemented.
-        Other formats return JSON as a fallback.
+        All formats ("json", "text", "srt", "verbose_json", and "vtt") are
+        supported; "text", "srt", and "vtt" are returned as ``text/plain``.
     """
 
     json = "json"
@@ -271,7 +481,11 @@ class TranscriptionResponse(BaseModel):
     segments: list[dict[str, tp.Any]] | None = Field(None, description="Segments with timestamps")
 
 
-def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=jnp.bfloat16):
+def create_whisper_app(
+    model_name: str = "openai/whisper-large-v3-turbo",
+    dtype=jnp.bfloat16,
+    max_upload_bytes: int | None = None,
+):
     """Create a FastAPI application for Whisper transcription.
 
     Factory function that creates and configures a FastAPI application
@@ -289,30 +503,15 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
             Whisper model to load. Defaults to "openai/whisper-large-v3-turbo".
         dtype: JAX data type for model computations. Supports jnp.float32,
             jnp.float16, and jnp.bfloat16. Defaults to jnp.bfloat16.
+        max_upload_bytes (int | None, optional): Maximum upload size in bytes.
+            If None, reads ``VWHISPER_MAX_UPLOAD_BYTES`` or defaults to 100 MiB.
 
     Returns:
         FastAPI: Configured FastAPI application instance ready to be
             served with uvicorn or another ASGI server.
-
-    Example:
-        Creating and running the app::
-
-            >>> app = create_whisper_app("openai/whisper-base")
-            >>> import uvicorn
-            >>> uvicorn.run(app, host="0.0.0.0", port=8000)
-
-        Using with custom configuration::
-
-            >>> app = create_whisper_app(
-            ...     model_name="openai/whisper-large-v3-turbo",
-            ...     dtype=jnp.float16
-            ... )
-
-    Note:
-        - Model loading happens during app creation, which may take time
-        - The app uses a singleton WhisperModel to avoid reloading
-        - CORS is configured to allow all origins for development
     """
+    resolved_max_upload_bytes = _resolve_max_upload_bytes(max_upload_bytes)
+
     app = FastAPI(
         title="EasyDeL Whisper API",
         description="API for Whisper ASR model powered by EasyDeL",
@@ -322,7 +521,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -340,7 +539,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         """
         return {"message": "EasyDeL Whisper API", "model": model_instance.model_name}
 
-    @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+    @app.post("/v1/audio/transcriptions", response_model=None)
     async def create_transcription(  # pyright: ignore[reportUnusedFunction]
         file: UploadFile = File(...),  # pyright: ignore[reportCallInDefaultInitializer]
         model: str = Form(model_name),  # pyright: ignore[reportCallInDefaultInitializer]
@@ -349,87 +548,33 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         temperature: float = Form(0.0),  # pyright: ignore[reportCallInDefaultInitializer]
         language: str | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
         timestamp_granularities: list[str] | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
+        timestamp_granularities_bracket: list[str] | None = Form(  # pyright: ignore[reportCallInDefaultInitializer]
+            None, alias="timestamp_granularities[]"
+        ),
     ):
-        """Transcribe audio to text using the Whisper model.
-
-        This endpoint accepts audio files and returns the transcribed text.
-        It is compatible with OpenAI's Whisper transcription API format.
-
-        Args:
-            file (UploadFile): The audio file to transcribe. Supports
-                formats like mp3, wav, m4a, webm, etc.
-            model (str): Model identifier (for API compatibility, not
-                used as model is pre-loaded). Defaults to the loaded model.
-            prompt (str | None): Optional text to guide the model's style.
-                Currently not implemented.
-            response_format (ResponseFormat): Output format. Options are
-                "json", "text", "srt", "verbose_json", "vtt".
-                Defaults to "json".
-            temperature (float): Sampling temperature. Currently not
-                implemented. Defaults to 0.0.
-            language (str | None): Language code for the audio (e.g., "en",
-                "fr"). If None, language may be auto-detected.
-            timestamp_granularities (list[str] | None): Timestamp detail
-                level. Include "word" for word-level timestamps.
-
-        Returns:
-            TranscriptionResponse: Dictionary containing:
-                - "text": Transcribed text
-                - "segments": List of segments (if timestamps requested)
-
-        Raises:
-            HTTPException: 500 error if transcription fails.
-
-        Example:
-            Using curl::
-
-                $ curl -X POST http://localhost:8000/v1/audio/transcriptions \
-                    -F "file=@speech.mp3" \
-                    -F "language=en" \
-                    -F "response_format=json"
-
-            Response::
-
-                {
-                    "text": "Hello, this is a test transcription."
-                }
-        """
-        temp_file_path: str | None = None
+        """Transcribe audio to text using the Whisper model."""
+        merged_granularities = [*(timestamp_granularities or ()), *(timestamp_granularities_bracket or ())] or None
+        return_timestamps = _should_return_timestamps(response_format, merged_granularities)
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
-                audio_content = await file.read()
-                temp_file.write(audio_content)
-                temp_file_path = temp_file.name
-
-            return_timestamps = False
-            if timestamp_granularities and "word" in timestamp_granularities:
-                return_timestamps = True
-
-            result = model_instance.inference(
-                audio_input=temp_file_path,
+            async with _uploaded_temp_file(file, resolved_max_upload_bytes) as temp_file_path:
+                result = await asyncio.to_thread(
+                    model_instance.inference,
+                    audio_input=temp_file_path,
+                    language=language,
+                    return_timestamps=return_timestamps,
+                )
+            return _format_whisper_response(
+                result,
+                response_format,
+                task="transcribe",
                 language=language,
-                return_timestamps=return_timestamps,
             )
-
-            if response_format == ResponseFormat.text:
-                return {"text": result["text"]}
-            elif response_format == ResponseFormat.json:
-                response = {"text": result["text"]}
-                if "chunks" in result:
-                    response["segments"] = result["chunks"]
-                return response
-            else:
-                # For other formats, return JSON for now (can be extended)
-                return {"text": result["text"]}
-
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error processing audio: {e!s}") from e
 
-        finally:
-            if temp_file_path is not None and os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-
-    @app.post("/v1/audio/translations")
+    @app.post("/v1/audio/translations", response_model=None)
     async def create_translation(  # pyright: ignore[reportUnusedFunction]
         file: UploadFile = File(...),  # pyright: ignore[reportCallInDefaultInitializer]
         model: str = Form(model_name),  # pyright: ignore[reportCallInDefaultInitializer]
@@ -437,86 +582,31 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         response_format: ResponseFormat = Form(ResponseFormat.json),  # pyright: ignore[reportCallInDefaultInitializer]
         temperature: float = Form(0.0),  # pyright: ignore[reportCallInDefaultInitializer]
         timestamp_granularities: list[str] | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
+        timestamp_granularities_bracket: list[str] | None = Form(  # pyright: ignore[reportCallInDefaultInitializer]
+            None, alias="timestamp_granularities[]"
+        ),
     ):
-        """Translate audio to English text using the Whisper model.
-
-        This endpoint accepts audio files in any supported language and
-        returns the English translation. It is compatible with OpenAI's
-        Whisper translation API format.
-
-        Args:
-            file (UploadFile): The audio file to translate. Supports
-                formats like mp3, wav, m4a, webm, etc.
-            model (str): Model identifier (for API compatibility, not
-                used as model is pre-loaded). Defaults to the loaded model.
-            prompt (str | None): Optional text to guide the model's style.
-                Currently not implemented.
-            response_format (ResponseFormat): Output format. Options are
-                "json", "text", "srt", "verbose_json", "vtt".
-                Defaults to "json".
-            temperature (float): Sampling temperature. Currently not
-                implemented. Defaults to 0.0.
-            timestamp_granularities (list[str] | None): Timestamp detail
-                level. Include "word" for word-level timestamps.
-
-        Returns:
-            dict: Dictionary containing:
-                - "text": Translated English text
-                - "segments": List of segments (if timestamps requested)
-
-        Raises:
-            HTTPException: 500 error if translation fails.
-
-        Example:
-            Translating French audio to English::
-
-                $ curl -X POST http://localhost:8000/v1/audio/translations \
-                    -F "file=@french_speech.mp3"
-
-            Response::
-
-                {
-                    "text": "Hello, this is the English translation."
-                }
-
-        Note:
-            Unlike transcription, translation always outputs English
-            regardless of the source language.
-        """
-        temp_file_path: str | None = None
+        """Translate audio to English text using the Whisper model."""
+        merged_granularities = [*(timestamp_granularities or ()), *(timestamp_granularities_bracket or ())] or None
+        return_timestamps = _should_return_timestamps(response_format, merged_granularities)
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
-                audio_content = await file.read()
-                temp_file.write(audio_content)
-                temp_file_path = temp_file.name
-
-            return_timestamps = False
-            if timestamp_granularities and "word" in timestamp_granularities:
-                return_timestamps = True
-
-            result = model_instance.inference(
-                audio_input=temp_file_path,
+            async with _uploaded_temp_file(file, resolved_max_upload_bytes) as temp_file_path:
+                result = await asyncio.to_thread(
+                    model_instance.inference,
+                    audio_input=temp_file_path,
+                    task="translate",
+                    return_timestamps=return_timestamps,
+                )
+            return _format_whisper_response(
+                result,
+                response_format,
                 task="translate",
-                return_timestamps=return_timestamps,
+                language="en",
             )
-
-            if response_format == ResponseFormat.text:
-                return {"text": result["text"]}
-            elif response_format == ResponseFormat.json:
-                response = {"text": result["text"]}
-                if "chunks" in result:
-                    response["segments"] = result["chunks"]
-                return response
-            else:
-                # For other formats, return JSON for now (can be extended)
-                return {"text": result["text"]}
-
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")  # noqa
-
-        finally:
-            if temp_file_path is not None and os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            raise HTTPException(status_code=500, detail=f"Error processing audio: {e!s}") from e
 
     return app
 
@@ -526,6 +616,7 @@ def run_server(
     host: str = "0.0.0.0",
     port: int = 8000,
     dtype=jnp.bfloat16,
+    max_upload_bytes: int | None = None,
 ):
     """Run the vWhisper FastAPI server.
 
@@ -535,49 +626,20 @@ def run_server(
 
     Args:
         model_name (str, optional): HuggingFace model identifier for the
-            Whisper model. Common options include:
-            - "openai/whisper-tiny" (fastest, lowest quality)
-            - "openai/whisper-base"
-            - "openai/whisper-small"
-            - "openai/whisper-medium"
-            - "openai/whisper-large-v3" (slowest, highest quality)
-            - "openai/whisper-large-v3-turbo" (optimized large model)
-            Defaults to "openai/whisper-large-v3-turbo".
-        host (str, optional): Host address to bind the server. Use
-            "0.0.0.0" to accept connections from any address, or
-            "127.0.0.1" for localhost only. Defaults to "0.0.0.0".
+            Whisper model. Defaults to "openai/whisper-large-v3-turbo".
+        host (str, optional): Host address to bind the server.
+            Defaults to "0.0.0.0".
         port (int, optional): Port number to listen on.
             Defaults to 8000.
-        dtype: JAX data type for model computations. Options:
-            - jnp.float32: Full precision (most compatible)
-            - jnp.float16: Half precision (faster, less memory)
-            - jnp.bfloat16: Brain float (good balance)
+        dtype: JAX data type for model computations.
             Defaults to jnp.bfloat16.
+        max_upload_bytes (int | None, optional): Maximum allowed upload size in
+            bytes. If None, uses ``VWHISPER_MAX_UPLOAD_BYTES`` or 100 MiB.
 
     Returns:
         None: This function blocks until the server is stopped.
-
-    Example:
-        Basic usage::
-
-            >>> from easydel.inference.vwhisper import run_server
-            >>> run_server()  # Uses defaults
-
-        Custom configuration::
-
-            >>> run_server(
-            ...     model_name="openai/whisper-small",
-            ...     host="127.0.0.1",
-            ...     port=9000,
-            ...     dtype=jnp.float32
-            ... )
-
-    Note:
-        - The server blocks until interrupted (Ctrl+C)
-        - Model loading happens during startup
-        - API documentation is available at http://host:port/docs
     """
-    app = create_whisper_app(model_name=model_name, dtype=dtype)
+    app = create_whisper_app(model_name=model_name, dtype=dtype, max_upload_bytes=max_upload_bytes)
     uvicorn.run(app, host=host, port=port)
 
 

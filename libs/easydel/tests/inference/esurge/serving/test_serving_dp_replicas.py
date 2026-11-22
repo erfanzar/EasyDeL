@@ -136,8 +136,15 @@ def test_each_dp_half_of_a_v5p_128_becomes_its_own_slice():
         assert hostnames == [f"10.0.0.{p}" for p in ordered]
         assert plans[ordered[0]][0].coordinator == f"10.0.0.{ordered[0]}:19667"
         assert all(plans[p][0].leaders == plans[ordered[0]][0].leaders for _, p in members)
-    # Replica 0's leader starts the front; no replica process is the front itself.
-    assert [p for p, (plan, _) in plans.items() if plan.spawns_front] == [0]
+        # Every process knows every replica's hosts in plan order; the planned rank 0 is listed first.
+        assert all(plans[p][0].hosts == plans[ordered[0]][0].hosts for _, p in members)
+    some = next(iter(plans.values()))[0]
+    for index in (0, 1):
+        assert some.hosts[index] == tuple(f"10.0.0.{p}" for _, p in sorted(groups[index]))
+        assert some.leaders[index] == some.hosts[index][0]
+    # Any replica-0 process may turn out to lead its engine (libtpu picks the order), so all of them are eligible to
+    # start the front; only the one with jax.process_index() == 0 does. No replica process is the front itself.
+    assert sorted(p for p, (plan, _) in plans.items() if plan.spawns_front) == sorted(p for _, p in groups[0])
     assert not any(plan.is_front for plan, _ in plans.values())
 
 
@@ -160,7 +167,10 @@ def test_plan_round_trips_and_hands_the_token_through_a_pipe():
     read_fd, write_fd = os.pipe()
     os.write(write_fd, b"tok-123")
     os.close(write_fd)
-    plan = ReplicaPlan(index=1, rank=3, num_processes=8, coordinator="10.0.0.2:19667", leaders=("a", "b"))
+    plan = ReplicaPlan(
+        index=1, rank=3, num_processes=8, coordinator="10.0.0.2:19667", leaders=("a", "b"), hosts=(("a", "c"), ("b",))
+    )
+    assert ReplicaPlan.from_json(plan.to_json()).hosts == (("a", "c"), ("b",))
     back = ReplicaPlan.from_json(dataclasses.replace(plan, token_fd=read_fd).to_json())
     assert back.leaders == ("a", "b") and not back.is_front
     assert back.read_token() == "tok-123"
@@ -257,6 +267,61 @@ def test_front_serves_with_the_first_ready_replica_and_attaches_late_and_returni
     up["a"] = True
     assert attacher.attach_round() == 1
     assert opened[0].closed and router.members[0] is opened[-1] and len(router.members) == 2
+
+
+def test_front_finds_a_replica_leader_that_is_not_the_planned_rank_0():
+    """libtpu may number a replica world so that its engine leader is not the plan's rank 0 (seen on v5p-1024: plan
+    ranks 0,1,2,3 became process 2,3,0,1). The front must attach to whichever host serves the request plane."""
+    from easydel.inference.esurge.distributed.request_plane import RequestPlaneUnavailable
+    from easydel.inference.esurge.serving.app import ReplicaAttacher, replica_candidates
+
+    plan = ReplicaPlan(
+        index=0,
+        rank=2,
+        num_processes=4,
+        coordinator="10.0.0.0:19667",
+        leaders=("10.0.0.0", "10.0.1.0"),
+        hosts=(("10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3"), ("10.0.1.0", "10.0.1.1")),
+    )
+    # Engine leaders: replica 0's is its third planned host, replica 1's its first.
+    serving = {"10.0.0.2", "10.0.1.0"}
+    tried: list[str] = []
+
+    def connect(addr):
+        tried.append(addr)
+        if addr not in serving:
+            raise RequestPlaneUnavailable(f"{addr} not serving")
+        return _Handle(addr)
+
+    attacher = ReplicaAttacher(replica_candidates(plan), connect=connect, log=lambda m: None, interval_s=0.01)
+    assert attacher.attach_round() == 2
+    assert [m.addr for m in attacher.router.members] == ["10.0.0.2", "10.0.1.0"]
+    assert attacher.leaders == ["10.0.0.2", "10.0.1.0"]
+    assert tried == ["10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.1.0"]
+    # Plans from before `hosts` existed still attach to their recorded leaders.
+    old = dataclasses.replace(plan, hosts=())
+    assert replica_candidates(old) == (("10.0.0.0",), ("10.0.1.0",))
+
+
+def test_only_the_engine_leader_of_replica_0_may_start_the_front():
+    for rank in range(4):
+        assert ReplicaPlan(index=0, rank=rank, num_processes=4, coordinator="h:1", leaders=("a", "b")).spawns_front
+    assert not ReplicaPlan(index=1, rank=0, num_processes=4, coordinator="h:1", leaders=("a", "b")).spawns_front
+    front = ReplicaPlan(index=0, rank=0, num_processes=4, coordinator="h:1", leaders=("a", "b"), role="front")
+    assert not front.spawns_front
+
+
+def test_port_probe_tells_a_listening_port_from_a_closed_one():
+    import socket
+
+    from easydel.inference.esurge.serving.app import port_open
+
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        assert port_open("127.0.0.1", port)
+    assert not port_open("127.0.0.1", port, timeout_s=0.5)
 
 
 def test_launch_wide_limits_split_over_replicas():

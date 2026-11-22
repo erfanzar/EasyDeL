@@ -81,9 +81,11 @@ def slice_world() -> tuple[str, int, int] | None:
     """``(coordinator host, process count, process id)`` of the joined multi-process JAX world, or ``None``."""
     from jax._src.distributed import global_state
 
+    from ..distributed.coordinator import _split_host_port
+
     if global_state.client is None or int(global_state.num_processes or 0) <= 1:
         return None
-    host = str(global_state.coordinator_address).rsplit(":", 1)[0]
+    host, _port = _split_host_port(str(global_state.coordinator_address))
     return host, int(global_state.num_processes), int(global_state.process_id)
 
 
@@ -134,6 +136,19 @@ def decode_probe_result(data: bytes) -> tuple[tp.Any, dict[str, str], str] | Non
     return ReplicaPlan.from_json(obj["plan"]), {str(k): str(v) for k, v in obj["env"].items()}, str(obj["token"])
 
 
+def _reap_subprocess(proc: subprocess.Popen, *, timeout: float = 5.0) -> None:
+    """Terminate (escalating to SIGKILL on timeout) and reap a child subprocess."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    else:
+        proc.wait()
+
+
 def run_probe(request: Mapping[str, tp.Any]) -> tuple[tp.Any, dict[str, str], str] | None:
     """Run the planning subprocess; its result (which carries the token) comes back over a pipe, never argv or logs.
 
@@ -149,9 +164,21 @@ def run_probe(request: Mapping[str, tp.Any]) -> tuple[tp.Any, dict[str, str], st
         raise
     finally:
         os.close(write_fd)
-    with os.fdopen(read_fd, "rb") as result:
-        data = result.read()
-    code = proc.wait()
+    fd_wrapped = False
+    try:
+        result_file = os.fdopen(read_fd, "rb")
+        fd_wrapped = True
+        with result_file as result:
+            data = result.read()
+        code = proc.wait()
+    except BaseException:
+        if not fd_wrapped:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+        _reap_subprocess(proc)
+        raise
     if code != 0 or not data:
         raise RuntimeError(f"dp replica planning subprocess failed (exit code {code})")
     return decode_probe_result(data)
@@ -243,8 +270,9 @@ def maybe_enter_host_replica(cfg: Mapping[str, tp.Any]) -> tp.Any | None:
     assert world is not None
     host, num_processes, process_id = world
     port = control_port_of(cfg)
+    coord_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     request = {
-        "coordinator": f"{host}:{port + PROBE_PORT_OFFSET}",
+        "coordinator": f"{coord_host}:{port + PROBE_PORT_OFFSET}",
         "num_processes": num_processes,
         "process_id": process_id,
         "dims": list(dims),
@@ -316,12 +344,7 @@ def become_single_process() -> None:
     global_state.coordinator_address = None
 
 
-def leader_engine_main() -> None:
-    """A replica leader's engine process: rank 0 of the replica world, its ``dp = 1`` engine and request plane.
-
-    Reads ``(replica config, plan)`` from the inherited pipe (the config carries the token, so it never reaches argv)
-    and runs until the front that started it exits.
-    """
+def _leader_engine_body() -> None:
     read_fd, parent = int(sys.argv[1]), int(sys.argv[2])
     with os.fdopen(read_fd, "rb") as source:
         node_cfg, plan = pickle.load(source)
@@ -342,11 +365,29 @@ def leader_engine_main() -> None:
     )
     engine = build_esurge(node_cfg)
     try:
-        # The coordinator's IO thread serves the request plane; this process lives as long as its front.
-        while os.getppid() == parent:
+        # The coordinator's IO thread serves the request plane; this process lives as long as its front and engine.
+        while os.getppid() == parent and getattr(engine, "alive", True):
             time.sleep(1.0)
+        if not getattr(engine, "alive", True):
+            raise RuntimeError(f"replica {plan.index} leader engine is no longer alive")
     finally:
         engine.close()
+
+
+def leader_engine_main() -> None:
+    """A replica leader's engine process: rank 0 of the replica world, its ``dp = 1`` engine and request plane.
+
+    Reads ``(replica config, plan)`` from the inherited pipe (the config carries the token, so it never reaches argv)
+    and runs until the front that started it exits or SIGTERM is received (closing the engine cleanly so workers do
+    not wait out their heartbeat timeout).
+    """
+    from .app import ShutdownRequested, sigterm_raises
+
+    with sigterm_raises():
+        try:
+            _leader_engine_body()
+        except ShutdownRequested:
+            logger.info("replica leader engine received SIGTERM; shut down cleanly")
 
 
 def start_leader_engine(node_cfg: Mapping[str, tp.Any], plan: tp.Any, env: Mapping[str, str]) -> subprocess.Popen:
@@ -360,8 +401,20 @@ def start_leader_engine(node_cfg: Mapping[str, tp.Any], plan: tp.Any, env: Mappi
         raise
     finally:
         os.close(read_fd)
-    with os.fdopen(write_fd, "wb") as sink:
-        pickle.dump((dict(node_cfg), plan), sink)
+    fd_wrapped = False
+    try:
+        sink_file = os.fdopen(write_fd, "wb")
+        fd_wrapped = True
+        with sink_file as sink:
+            pickle.dump((dict(node_cfg), plan), sink)
+    except BaseException:
+        if not fd_wrapped:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+        _reap_subprocess(proc)
+        raise
     return proc
 
 
@@ -376,20 +429,15 @@ def _leader_front(
     """This process becomes a host-only front over every replica; its replica's engine runs in a child process."""
     import jax
 
-    from easydel.inference.esurge.distributed.remote_engine import RemoteEngineHandle
     from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
 
-    from .app import ReplicaAttacher
+    from .app import ReplicaAttacher, elarge_replica_connector, replica_candidates
 
     jax.config.update("jax_platforms", "cpu")  # the engine child owns this host's chips
     become_single_process()
+    connect = elarge_replica_connector(cfg, control_port=port, token=token)
     proc = start_leader_engine(node_cfg, plan, env)
     logger.info("replica %d leader engine started in process %d; this process is its front", plan.index, proc.pid)
-    model = cfg.get("model") or {}
-    tokenizer = model.get("tokenizer") or model.get("name_or_path")
-
-    def connect(addr: str) -> tp.Any:
-        return RemoteEngineHandle(addr, port, auth_token=token, tokenizer_source=tokenizer, connect_timeout_s=10.0)
 
     attacher: ReplicaAttacher | None = None
 
@@ -400,6 +448,7 @@ def _leader_front(
                 proc.wait(timeout=ENGINE_STOP_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait()
 
     class ReplicaRoutedEngine(RoutedEngine):
         """The front's router; ``close()`` also stops attaching replicas and this replica's engine process."""
@@ -412,7 +461,9 @@ def _leader_front(
             finally:
                 stop_engine()
 
-    attacher = ReplicaAttacher(plan.leaders, connect=connect, log=logger.info, router_factory=ReplicaRoutedEngine)
+    attacher = ReplicaAttacher(
+        replica_candidates(plan), connect=connect, log=logger.info, router_factory=ReplicaRoutedEngine
+    )
     try:
         while attacher.router is None:
             attacher.attach_round()
@@ -423,9 +474,13 @@ def _leader_front(
                         "came up"
                     )
                 time.sleep(5.0)
+        attacher.start()
     except BaseException:
-        attacher.stop()
-        stop_engine()
+        try:
+            attacher.stop()
+            if attacher.router is not None:
+                attacher.router.close()
+        finally:
+            stop_engine()
         raise
-    attacher.start()
     return attacher.router

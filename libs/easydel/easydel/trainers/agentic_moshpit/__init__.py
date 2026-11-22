@@ -98,6 +98,7 @@ from .tools import (
     register_tool,
 )
 from .utils import (
+    compute_advantages_agentic,
     compute_advantages_episode,
     compute_advantages_gigpo,
     compute_advantages_step,
@@ -134,6 +135,7 @@ __all__ = (
     "UnitConverterTool",
     "WebFetchTool",
     "WikipediaTool",
+    "compute_advantages_agentic",
     "compute_advantages_episode",
     "compute_advantages_gigpo",
     "compute_advantages_step",

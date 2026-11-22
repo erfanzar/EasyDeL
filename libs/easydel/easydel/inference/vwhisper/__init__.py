@@ -95,7 +95,7 @@ Example:
         ... )
         >>>
         >>> # Transcribe audio file
-        >>> result = engine.transcribe(
+        >>> result = engine.generate(
         ...     "path/to/audio.mp3",
         ...     language="en",
         ...     return_timestamps=True
@@ -115,7 +115,7 @@ CLI Usage:
     Run the vWhisper server from command line::
 
         $ python -m easydel.inference.vwhisper.cli \
-            --model-id openai/whisper-base \
+            --model openai/whisper-base \
             --host 0.0.0.0 \
             --port 8000 \
             --dtype bfloat16

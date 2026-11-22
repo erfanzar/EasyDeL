@@ -26,32 +26,42 @@ from transformers import PreTrainedTokenizerFast
 pytestmark = pytest.mark.cpu_ok
 
 
-@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig, SSDConfig])
+@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig])
 @pytest.mark.parametrize("feedback_length", [4, 8])
 def test_teacher_budget_rejects_nonpositive_completion_length(config_cls, feedback_length):
     with pytest.raises(ValueError, match="positive completion budget"):
         config_cls(max_length=16, max_prompt_length=12, max_completion_length=4, max_feedback_length=feedback_length)
 
 
-@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig, SSDConfig])
+@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig])
 def test_teacher_budget_preserves_positive_remaining_completion_length(config_cls):
     config = config_cls(max_length=16, max_prompt_length=8, max_completion_length=8, max_feedback_length=4)
     assert config.max_completion_length == 4
     assert config.max_prompt_length + config.max_feedback_length + config.max_completion_length == 16
 
 
-@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig, SSDConfig])
+@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig])
 def test_default_teacher_budget_keeps_generation_positive(config_cls):
     config = config_cls()
     assert config.max_completion_length == 256
     assert config.max_length == config.max_prompt_length + config.max_feedback_length + config.max_completion_length
 
 
-@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig, SSDConfig])
+@pytest.mark.parametrize("config_cls", [SDPOConfig, SDFTConfig])
 def test_explicit_teacher_headroom_is_not_lost_in_parent_normalization(config_cls):
     config = config_cls(max_length=32, max_prompt_length=4, max_completion_length=3, max_feedback_length=8)
     assert config.max_length == 32
     assert config.max_completion_length == 3
+
+
+def test_ssd_config_inherits_grpo_without_unused_feedback_budget():
+    config = SSDConfig(max_length=16, max_prompt_length=8, max_completion_length=8)
+    assert not hasattr(config, "max_feedback_length")
+    assert config.beta == 0.0
+    assert config.num_generations == 1
+    assert config.num_return_sequences == 1
+    assert config.max_prompt_length + config.max_completion_length == config.max_length
+    assert isinstance(hash(config), int)
 
 
 @pytest.mark.parametrize("contexts", [["ctxA", "ctxB"], ["ctxA", "ctxA", "ctxB", "ctxB"]])

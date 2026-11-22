@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -49,40 +50,80 @@ class BEMACallback:
         """Validate BEMA update cadence and smoothing hyperparameters.
 
         BEMA updates are scheduled by positive step intervals and optional
-        non-negative warmup offsets. Negative multipliers would invert the
-        smoothing schedule, so they are rejected before the callback is attached
-        to a trainer.
+        non-negative warmup offsets. Invalid or out-of-range smoothing
+        hyperparameters (negative lag/powers, non-finite values, or
+        multipliers outside valid bounds) are rejected before the callback is
+        attached to a trainer.
         """
-        if self.update_freq <= 0:
+        if isinstance(self.update_freq, bool) or self.update_freq <= 0:
             raise ValueError("`update_freq` must be positive.")
-        if self.ref_model_update_freq <= 0:
+        if isinstance(self.ref_model_update_freq, bool) or self.ref_model_update_freq <= 0:
             raise ValueError("`ref_model_update_freq` must be positive.")
-        if self.update_after < 0 or self.ref_model_update_after < 0:
+        if (
+            isinstance(self.update_after, bool)
+            or self.update_after < 0
+            or isinstance(self.ref_model_update_after, bool)
+            or self.ref_model_update_after < 0
+        ):
             raise ValueError("BEMA update-after steps must be non-negative.")
-        if self.multiplier < 0.0 or self.min_ema_multiplier < 0.0:
-            raise ValueError("BEMA multipliers must be non-negative.")
+        if isinstance(self.lag, bool) or self.lag < 0:
+            raise ValueError("`lag` must be non-negative.")
+        if isinstance(self.multiplier, bool) or not math.isfinite(float(self.multiplier)) or self.multiplier < 0.0:
+            raise ValueError("`multiplier` must be finite and non-negative.")
+        if (
+            isinstance(self.min_ema_multiplier, bool)
+            or not math.isfinite(float(self.min_ema_multiplier))
+            or not (0.0 <= float(self.min_ema_multiplier) <= 1.0)
+        ):
+            raise ValueError("`min_ema_multiplier` must be finite and in [0.0, 1.0].")
+        if isinstance(self.ema_power, bool) or not math.isfinite(float(self.ema_power)) or self.ema_power < 0.0:
+            raise ValueError("`ema_power` must be finite and non-negative.")
+        if isinstance(self.bias_power, bool) or not math.isfinite(float(self.bias_power)) or self.bias_power < 0.0:
+            raise ValueError("`bias_power` must be finite and non-negative.")
+        if self.lag == 0 and self.multiplier == 0.0:
+            raise ValueError("`lag` and `multiplier` cannot both be zero.")
 
     _theta0_graphstate: tp.Any = field(default=None, init=False, repr=False)
     _ema_graphstate: tp.Any = field(default=None, init=False, repr=False)
     _bema_graphstate: tp.Any = field(default=None, init=False, repr=False)
 
     def _ema_beta(self, step: int) -> float:
-        """Return the per-step EMA interpolation coefficient.
+        """Return the per-step EMA interpolation coefficient clamped to ``[min_ema_multiplier, 1.0]``.
 
         The coefficient decays as training progresses according to ``ema_power``
-        and is lower-bounded by ``min_ema_multiplier``. It controls how much of
-        the current policy graphstate is mixed into the running EMA state.
+        and is bounded within ``[min_ema_multiplier, 1.0]`` so ``(1 - beta)``
+        never becomes negative and ``lag == 0`` at ``step == 0`` never divides
+        by zero.
         """
-        beta = (self.lag + self.multiplier * step) ** (-self.ema_power)
-        return max(beta, self.min_ema_multiplier)
+        base = float(self.lag) + float(self.multiplier) * max(int(step), 0)
+        if base <= 0.0:
+            beta = 1.0
+        else:
+            beta = float(base ** (-float(self.ema_power)))
+        return float(min(max(beta, float(self.min_ema_multiplier)), 1.0))
 
     def _bema_alpha(self, step: int) -> float:
-        """Return the bias-correction coefficient for the BEMA graphstate.
+        """Return the bias-correction coefficient clamped to ``[0.0, 1.0]``.
 
         This value decays independently from the EMA coefficient and scales the
         correction between the current graphstate and the initial graphstate.
         """
-        return (self.lag + self.multiplier * step) ** (-self.bias_power)
+        base = float(self.lag) + float(self.multiplier) * max(int(step), 0)
+        if base <= 0.0:
+            alpha = 1.0
+        else:
+            alpha = float(base ** (-float(self.bias_power)))
+        return float(min(max(alpha, 0.0), 1.0))
+
+    @staticmethod
+    def _is_floating_array(leaf: object) -> bool:
+        """Return True when ``leaf`` is a concrete floating-point array."""
+        return (
+            hasattr(leaf, "shape")
+            and hasattr(leaf, "dtype")
+            and not isinstance(leaf, jax.ShapeDtypeStruct)
+            and bool(jnp.issubdtype(leaf.dtype, jnp.floating))
+        )
 
     @staticmethod
     def _copy_graphstate(graphstate: tp.Any) -> tp.Any:
@@ -93,7 +134,10 @@ class BEMACallback:
         through unchanged because they represent structure or metadata rather
         than mutable trainable values.
         """
-        return jax.tree_util.tree_map(lambda leaf: jnp.array(leaf) if hasattr(leaf, "shape") else leaf, graphstate)
+        return jax.tree_util.tree_map(
+            lambda leaf: jnp.array(leaf) if hasattr(leaf, "shape") and not isinstance(leaf, jax.ShapeDtypeStruct) else leaf,
+            graphstate,
+        )
 
     def update_graphstate(self, graphstate: tp.Any, step: int) -> tp.Any | None:
         """Update and return the BEMA graphstate for a policy pytree.
@@ -101,7 +145,8 @@ class BEMACallback:
         Before ``update_after`` the method returns ``None`` to signal that no
         BEMA state should be applied. On the first eligible step it initializes
         the initial, EMA, and BEMA snapshots; on later eligible update steps it
-        refreshes EMA/BEMA leaves while preserving non-array metadata.
+        refreshes EMA/BEMA floating-point leaves while preserving non-floating
+        array leaves and non-array metadata untouched.
         """
         if step < self.update_after:
             return None
@@ -124,23 +169,33 @@ class BEMACallback:
         def _update(current: object, theta0: object, ema: object) -> object:
             """Compute the bias-corrected BEMA leaf for one pytree position.
 
-            Array leaves receive the BEMA correction. Non-array leaves are
-            returned from the current graphstate so tree metadata remains valid.
+            Floating-point array leaves receive the BEMA correction in at least
+            float32 and are cast back to ``current.dtype``. Non-floating array
+            leaves and metadata leaves are returned unchanged.
             """
-            if not hasattr(current, "shape"):
+            if not self._is_floating_array(current):
                 return current
-            return ema + alpha * (current - theta0)
+            compute_dtype = jnp.promote_types(current.dtype, jnp.float32)
+            updated = ema.astype(compute_dtype) + jnp.asarray(alpha, dtype=compute_dtype) * (
+                current.astype(compute_dtype) - theta0.astype(compute_dtype)
+            )
+            return updated.astype(current.dtype)
 
         def _update_ema(current: object, ema: object) -> object:
-            """Update one EMA leaf while leaving metadata leaves unchanged.
+            """Update one EMA leaf while leaving non-floating and metadata leaves unchanged.
 
-            The update is a standard exponential moving average over array
-            leaves. Non-array leaves are not blended because they do not have
-            arithmetic semantics.
+            The update is a standard exponential moving average over floating
+            array leaves computed in at least float32 and cast back to
+            ``current.dtype``.
             """
-            if not hasattr(current, "shape"):
+            if not self._is_floating_array(current):
                 return current
-            return (1.0 - beta) * ema + beta * current
+            compute_dtype = jnp.promote_types(current.dtype, jnp.float32)
+            beta_arr = jnp.asarray(beta, dtype=compute_dtype)
+            updated = (jnp.asarray(1.0, dtype=compute_dtype) - beta_arr) * ema.astype(
+                compute_dtype
+            ) + beta_arr * current.astype(compute_dtype)
+            return updated.astype(current.dtype)
 
         self._ema_graphstate = jax.tree_util.tree_map(_update_ema, current_graphstate, self._ema_graphstate)
         self._bema_graphstate = jax.tree_util.tree_map(

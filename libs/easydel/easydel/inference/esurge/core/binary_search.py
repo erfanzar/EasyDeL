@@ -65,16 +65,18 @@ def int32_bsearch(
     """
     current_bits = jnp.zeros(batch_shape, dtype=jnp.int32)
 
-    # Bit 31 (sign bit) requires special handling due to two's complement
+    # Bit 31 (sign bit) requires special handling due to two's complement.
+    # Keep operands strictly int32 so jax_enable_x64=True never promotes
+    # current_bits to int64 (which would break float32 bitcasts).
     midpoint = current_bits
     predicate_satisfied = predicate(midpoint)
-    current_bits = current_bits | jnp.where(predicate_satisfied, jnp.uint32(1 << 31), jnp.uint32(0))
+    current_bits = current_bits | jnp.where(predicate_satisfied, jnp.int32(-2147483648), jnp.int32(0))
     del midpoint, predicate_satisfied
 
     def loop_body(i, current_bits):
         """Test bit `i` and set it in the result based on the predicate."""
-        bit_index = 30 - i
-        bit = jnp.int32(1 << bit_index)
+        bit_index = jnp.int32(30) - jnp.int32(i)
+        bit = jnp.left_shift(jnp.int32(1), bit_index)
         midpoint = current_bits | bit
         predicate_satisfied = predicate(midpoint)
         current_bits = current_bits | jnp.where(predicate_satisfied, jnp.int32(0), bit)

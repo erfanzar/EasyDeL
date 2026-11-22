@@ -258,6 +258,8 @@ class CPOTrainer(Trainer):
                 "truncation_mode",
                 "aux_loss_enabled",
                 "loss_type",
+                "logprob_vocab_chunk_size",
+                "vocab_shard_stage",
             ),
         )
 

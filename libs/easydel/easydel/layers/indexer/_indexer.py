@@ -32,7 +32,13 @@ from easydel.layers.linears import ColumnParallelLinear
 from ._config import IndexerConfig, IndexerKind
 from ._distill import indexer_distillation_loss
 from ._paged import paged_pool_select
-from ._primitives import CompactLayout, compact_valid_layout, indices_to_bool_mask, visible_causal_mask
+from ._primitives import (
+    CompactLayout,
+    SegmentPoolLayout,
+    compact_valid_layout,
+    indices_to_bool_mask,
+    visible_causal_mask,
+)
 from ._rope import apply_indexer_rope, truncate_cos_sin
 from ._selection import BaseIndexer, IndexerSelection, SelectionSpec, top_k_indices
 from ._shared_key import fused_head_scores
@@ -1142,6 +1148,7 @@ class SparseIndexer(BaseIndexer):
         as_indices: bool = False,
         row_split: object | None = None,
         layout: CompactLayout | None = None,
+        segment_layout: SegmentPoolLayout | None = None,
     ) -> tuple[Array, Array | None]:
         """Training-time pool selection without any ``[seq, seq]`` or ``[seq, heads, pools]`` tensor.
 
@@ -1172,6 +1179,9 @@ class SparseIndexer(BaseIndexer):
                 is unchanged.
             layout: The :class:`~._primitives.CompactLayout` the consuming attention uses for its keys; computed from
                 ``attention_mask`` when omitted. With both ``None`` every token is valid and the grid is physical.
+            segment_layout: Packed documents (:func:`~._primitives.segment_pool_layout`) in place of ``layout``: keys
+                live on its pool-aligned grid, positions and tails are grid slots, and a query may only select pools
+                of its own document. Not combinable with ``packed``.
 
         Returns:
             ``(pool_mask [batch, seq, ceil(seq / kpool)] bool, tails [batch, seq, kpool - 1] int32 or None)``; with
@@ -1190,14 +1200,29 @@ class SparseIndexer(BaseIndexer):
             raise ValueError("select_pools_chunked: `packed` and `as_indices` are mutually exclusive.")
         batch_size, seq_len, _ = hidden_states.shape
         kpool = self.config.kpool_size
-        if layout is None and attention_mask is not None:
+        if segment_layout is not None and layout is not None:
+            raise ValueError("select_pools_chunked: pass `layout` or `segment_layout`, not both.")
+        if segment_layout is not None and packed:
+            raise ValueError("select_pools_chunked: `segment_layout` selections are ids or masks, not packed words.")
+        if segment_layout is None and layout is None and attention_mask is not None:
             layout = compact_valid_layout(attention_mask.astype(jnp.bool_))
         query, key, gate_scores = self._project(hidden_states, q_resid, None, None)
         if self.config.stop_gradient:
             query, key, gate_scores, hidden_states = jax.lax.stop_gradient((query, key, gate_scores, hidden_states))
         # The dense strategy stores gate scores in the key-dtype packed state before pooling; round the same way.
         gates = gate_scores.astype(key.dtype).astype(jnp.float32)
-        if layout is None:
+        key_len = seq_len
+        query_docs = None
+        if segment_layout is not None:
+            # Packed documents: keys on the pool-aligned grid (every document starts a pool), queries take their grid
+            # slot as causal position and may only pick pools of their own document.
+            key, gates = segment_layout.gather(key), segment_layout.gather(gates)
+            positions = segment_layout.rank
+            valid = positions >= 0
+            key_valid = segment_layout.order >= 0
+            key_len = int(segment_layout.order.shape[1])
+            query_docs = segment_layout.query_segments
+        elif layout is None:
             positions = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], (batch_size, seq_len))
             valid = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
             key_valid = valid
@@ -1211,8 +1236,12 @@ class SparseIndexer(BaseIndexer):
             key_valid = jnp.arange(seq_len, dtype=jnp.int32)[None, :] < num_valid
 
         # Pool summaries over the compact kpool grid.
-        num_pools = -(-seq_len // kpool)
-        pad = num_pools * kpool - seq_len
+        num_pools = -(-key_len // kpool)
+        pad = num_pools * kpool - key_len
+        pool_docs = None
+        if segment_layout is not None:
+            pool_docs = jnp.pad(segment_layout.key_segments, ((0, 0), (0, pad)), constant_values=-1)
+            pool_docs = pool_docs.reshape(batch_size, num_pools, kpool)[..., 0]
         grouped_keys = jnp.pad(key, ((0, 0), (0, pad), (0, 0))).reshape(batch_size, num_pools, kpool, -1)
         grouped_gates = jnp.pad(gates, ((0, 0), (0, pad), (0, 0))).reshape(batch_size, num_pools, kpool, -1)
         grouped_valid = jnp.pad(key_valid, ((0, 0), (0, pad))).reshape(batch_size, num_pools, kpool)
@@ -1235,7 +1264,7 @@ class SparseIndexer(BaseIndexer):
             return jnp.moveaxis(x.reshape(batch_size, num_chunks, chunk, *x.shape[2:]), 1, 0)
 
         def select_chunk(inputs):
-            q_chunk, h_chunk, v_chunk, p_chunk = inputs
+            q_chunk, h_chunk, v_chunk, p_chunk, d_chunk = inputs
             if self._uses_fused_scoring(q_chunk):
                 scores = self._fused_scores(q_chunk, pool_keys_f32, h_chunk, mesh_source=row_source)
             else:
@@ -1247,6 +1276,8 @@ class SparseIndexer(BaseIndexer):
                     scores = jax.nn.relu(scores)
                 scores = self._reduce_heads(scores, h_chunk)
             candidates = (pool_end[None, None, :] <= p_chunk[:, :, None]) & pool_valid[:, None, :] & v_chunk[:, :, None]
+            if pool_docs is not None:
+                candidates = candidates & (pool_docs[:, None, :] == d_chunk[:, :, None])
             scores = jnp.where(candidates, scores, jnp.finfo(jnp.float32).min)
             selection = self.select_candidates(scores, select_k, candidates, row_source)
             if as_indices:
@@ -1258,8 +1289,10 @@ class SparseIndexer(BaseIndexer):
             mask = mask & candidates
             return pack_pool_bits(mask) if packed else mask
 
+        docs = positions if query_docs is None else query_docs  # unread without a segment layout
         masks = jax.lax.map(
-            select_chunk, (to_chunks(query), to_chunks(hidden_states), to_chunks(valid), to_chunks(positions))
+            select_chunk,
+            (to_chunks(query), to_chunks(hidden_states), to_chunks(valid), to_chunks(positions), to_chunks(docs)),
         )
         width = masks.shape[-1]
         pool_mask = jnp.moveaxis(masks, 0, 1).reshape(batch_size, num_chunks * chunk, width)[:, :seq_len]

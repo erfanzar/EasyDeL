@@ -196,10 +196,10 @@ def test_dpo_forward_matches_dense_log_softmax_reference():
         shift=1,
         axis=1,
     ).sum(-1)
-    expected_mean_chosen_logits = jnp.where(loss_mask[:2], logits[:2].sum(axis=-1), 0.0).sum() / jnp.maximum(
+    expected_mean_chosen_logits = jnp.where(loss_mask[:2], logits[:2].mean(axis=-1), 0.0).sum() / jnp.maximum(
         loss_mask[:2].sum(), 1
     )
-    expected_mean_rejected_logits = jnp.where(loss_mask[2:], logits[2:].sum(axis=-1), 0.0).sum() / jnp.maximum(
+    expected_mean_rejected_logits = jnp.where(loss_mask[2:], logits[2:].mean(axis=-1), 0.0).sum() / jnp.maximum(
         loss_mask[2:].sum(), 1
     )
 
@@ -258,10 +258,10 @@ def test_dpo_forward_matches_dense_reference_with_headless_chunked_lm_head():
         shift=1,
         axis=1,
     ).sum(-1)
-    expected_mean_chosen_logits = jnp.where(loss_mask[:2], logits[:2].sum(axis=-1), 0.0).sum() / jnp.maximum(
+    expected_mean_chosen_logits = jnp.where(loss_mask[:2], logits[:2].mean(axis=-1), 0.0).sum() / jnp.maximum(
         loss_mask[:2].sum(), 1
     )
-    expected_mean_rejected_logits = jnp.where(loss_mask[2:], logits[2:].sum(axis=-1), 0.0).sum() / jnp.maximum(
+    expected_mean_rejected_logits = jnp.where(loss_mask[2:], logits[2:].mean(axis=-1), 0.0).sum() / jnp.maximum(
         loss_mask[2:].sum(), 1
     )
 

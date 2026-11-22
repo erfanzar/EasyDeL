@@ -57,6 +57,56 @@ class _PrefetcherClosed(Exception):
     """Raised inside worker tasks awakened after :meth:`TrainBatchPrefetcher.close`."""
 
 
+class _ReplayIterator(collections.abc.Iterator[tp.Any]):
+    """Flat, owner-detaching replay iterator over lookahead buffers and a tail iterator.
+
+    Materializing on :meth:`TrainBatchPrefetcher.close` (or first ``next()``)
+    drains any nested ``_ReplayIterator`` tail into a single deque and drops
+    the reference to the closed prefetcher, preventing O(E) generator chaining
+    and closed-executor retention across epochs.
+    """
+
+    __slots__ = ("_buffered", "_owner", "_tail")
+
+    def __init__(self, owner: "TrainBatchPrefetcher") -> None:
+        self._owner: TrainBatchPrefetcher | None = owner
+        self._buffered: collections.deque[tp.Any] = collections.deque()
+        self._tail: collections.abc.Iterator[tp.Any] | None = None
+
+    def _materialize_from_closed_owner(self) -> None:
+        owner = self._owner
+        if owner is None:
+            return
+        self._owner = None
+        buffered = [owner._undelivered.pop(ticket) for ticket in sorted(owner._undelivered)]
+        tail = owner._data_iter
+        if isinstance(tail, _ReplayIterator):
+            tail._materialize()
+            buffered.extend(tail._buffered)
+            tail._buffered.clear()
+            tail = tail._tail
+        self._buffered = collections.deque(buffered)
+        self._tail = tail
+
+    def _materialize(self) -> None:
+        owner = self._owner
+        if owner is not None:
+            owner.close()
+            self._materialize_from_closed_owner()
+
+    def __iter__(self) -> "_ReplayIterator":
+        return self
+
+    def __next__(self) -> tp.Any:
+        if self._owner is not None:
+            self._materialize()
+        if self._buffered:
+            return self._buffered.popleft()
+        if self._tail is None:
+            raise StopIteration
+        return next(self._tail)
+
+
 class TrainBatchPrefetcher:
     """Ordered lookahead pipeline for host-side dataloader fetch and collation.
 
@@ -136,11 +186,11 @@ class TrainBatchPrefetcher:
         # raw lookahead for replay instead, including when collation mutates it.
         self._undelivered: dict[int, tp.Any] = {}
         self._last_delivered_iter = data_iter
-        self._resume_iter = self._resume_batches()
+        self._resume_iter = _ReplayIterator(self)
         self._top_up()
 
     def _load(self, ticket: int) -> tuple[tp.Any, float, float, tp.Any]:
-        """Produce one batch: fetch in ticket order, then collate.
+        """Produce one batch: fetch in ticket order, then deepcopy and collate in parallel.
 
         Args:
             ticket: This task's position in the global fetch order.
@@ -166,7 +216,6 @@ class TrainBatchPrefetcher:
                 raw_batch, next_iter = self._fetch_fn(data_iter, self._dataloader)
             fetch_seconds = float(fetch_time())
             record_replay = isinstance(next_iter, collections.abc.Iterator)
-            replay_copy = copy.deepcopy(raw_batch) if record_replay else None
         except BaseException:
             # Advance the turn even on a failed fetch so later tickets don't deadlock waiting for
             # one that will never complete. ``_data_iter`` is left where it was.
@@ -175,20 +224,27 @@ class TrainBatchPrefetcher:
                 self._fetch_cond.notify_all()
             raise
         with self._fetch_cond:
-            # Publish the advanced iterator and the raw replay copy even when ``close()`` ran
-            # during the fetch: the source has moved, so the row must be replayed exactly once,
-            # in ticket order, by :attr:`data_iter`.
+            # Publish the advanced iterator and raw batch immediately, then release the fetch
+            # turn so other workers can fetch while this worker runs deepcopy + collation.
             self._data_iter = next_iter
             if record_replay:
-                self._undelivered[ticket] = replay_copy
+                self._undelivered[ticket] = raw_batch
             self._next_fetch_ticket = ticket + 1
             self._fetch_cond.notify_all()
             closed = self._closed
         iter_snapshot = next_iter
         if closed:
-            # Nobody will consume this batch; skip collation so ``close()`` joins after at most
-            # one in-flight ``_fetch_fn`` call.
+            # Nobody will consume this batch; skip deepcopy/collation so ``close()`` joins
+            # after at most one in-flight ``_fetch_fn`` call while preserving ``raw_batch``.
             raise _PrefetcherClosed
+        if record_replay:
+            # Deep-copy outside the fetch turn so worker threads copy in parallel before
+            # collation can mutate ``raw_batch`` in place.
+            replay_copy = copy.deepcopy(raw_batch)
+            with self._fetch_cond:
+                self._undelivered[ticket] = replay_copy
+                if self._closed:
+                    raise _PrefetcherClosed
         with capture_time() as collate_time:
             batch = self._data_collator(raw_batch)
         return batch, fetch_seconds, float(collate_time()), (ticket, iter_snapshot)
@@ -271,13 +327,6 @@ class TrainBatchPrefetcher:
                 return self._last_delivered_iter
             return self._resume_iter
 
-    def _resume_batches(self) -> collections.abc.Iterator[tp.Any]:
-        """Quiesce producers before replaying raw lookahead and the source tail."""
-        self.close()
-        for ticket in sorted(self._undelivered):
-            yield self._undelivered.pop(ticket)
-        yield from self._data_iter
-
     @property
     def last_fetch_seconds(self) -> float | None:
         """Producer fetch time of the most recently consumed batch."""
@@ -305,3 +354,5 @@ class TrainBatchPrefetcher:
             future.cancel()
         # Joining in-flight fetches guarantees every fetched row is recorded for replay.
         self._executor.shutdown(wait=True, cancel_futures=True)
+        # Detach the replay iterator from this prefetcher and flatten any chained tail.
+        self._resume_iter._materialize_from_closed_owner()

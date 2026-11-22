@@ -110,26 +110,13 @@ class GptOssReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Split a complete generation into reasoning and visible content.
 
-        Args:
-            model_output: Full decoded text produced by the model.
-            request: Optional inference request; unused, kept for interface
-                parity with sibling parsers.
-
-        Returns:
-            Tuple ``(reasoning, content)``. ``reasoning`` is ``None`` when
-            the ``<|channel|>`` marker is absent; ``content`` is ``None``
-            when the ``<|message|>`` marker has not yet been emitted.
+        Uses the same leading-delimiter semantics as :meth:`extract_reasoning_streaming`
+        via :class:`BaseThinkingReasoningParser` so batch and streaming outputs never
+        diverge on mid-response ``<|channel|>`` mentions or content whitespace.
         """
-        if self.CHANNEL_TAG not in model_output:
+        if not model_output:
             return None, model_output
-
-        after_channel = model_output.split(self.CHANNEL_TAG, 1)[1]
-
-        if self.MESSAGE_TAG not in after_channel:
-            return after_channel.strip() or None, None
-
-        reasoning, content = after_channel.split(self.MESSAGE_TAG, 1)
-        return reasoning.strip() or None, content.strip() or None
+        return super().extract_reasoning(model_output, request)
 
     def extract_reasoning_streaming(
         self,
