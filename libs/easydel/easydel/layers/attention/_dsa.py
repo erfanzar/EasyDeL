@@ -37,6 +37,8 @@ A view wrapped in a :class:`ParallelHybridCacheView` is routed by its transforme
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import typing as tp
 
 import jax
@@ -81,7 +83,64 @@ from ._unified import UnifiedAttention
 
 logger = get_logger(__name__)
 
-__all__ = ("DeepSeekSparseAttention",)
+__all__ = ("DeepSeekSparseAttention", "dsa_segment_pool_scope")
+
+_DSA_POOL_LAYOUT_CACHE: contextvars.ContextVar[
+    tuple[str, tuple[int, int], int | None, tp.Any] | None
+] = contextvars.ContextVar("_dsa_pool_layout_cache", default=None)
+
+
+@contextlib.contextmanager
+def dsa_segment_pool_scope(
+    mask_info: MaskInfo | None,
+    *,
+    seq_len: int,
+    kpool: int,
+    enabled: bool = True,
+):
+    """Precompute and share DSA pool key layouts across layers for one forward pass.
+
+    Every pooled-DSA layer in a forward pass sees the same document boundaries and padding
+    mask. Precomputing :func:`segment_pool_layout` (for packed batches) or
+    :func:`compact_valid_layout` (for padding-only batches) once outside ``self.layers.scan``
+    avoids repeating ``searchsorted`` layout construction on every layer and rematerialization
+    pass (especially important under ``jax.vmap(..., spmd_axis_name="dp")``, where ``lax.cond``
+    inside ``compact_valid_layout`` lowers both branches).
+
+    Args:
+        mask_info: Attention mask metadata for the forward pass.
+        seq_len: Sequence length seen by the decoder layers.
+        kpool: Keys per indexer pool (``config.index_kpool``).
+        enabled: When ``False`` (e.g. MPMD pipeline parallelism or cached decode), the scope
+            is a no-op and layers compute layouts locally.
+    """
+    if not enabled or mask_info is None:
+        yield None
+        return
+    q_len = int(seq_len)
+    kpool_int = int(kpool)
+    entry: tuple[str, tuple[int, int], int | None, tp.Any] | None = None
+    if not mask_info.padding_only:
+        raw_seg = getattr(mask_info, "_q_segment_ids", None)
+        if raw_seg is not None:
+            segments = raw_seg[:, 0] if raw_seg.ndim == 3 else raw_seg
+            segments = segments[:, :q_len].astype(jnp.int32)
+            layout = segment_pool_layout(segments, kpool_int)
+            entry = ("segment", (int(segments.shape[0]), int(segments.shape[1])), kpool_int, layout)
+    else:
+        q_mask = getattr(mask_info, "q_attention_mask", None)
+        if q_mask is not None:
+            q_mask = q_mask[:, :q_len].astype(jnp.bool_)
+            layout = compact_valid_layout(q_mask)
+            entry = ("compact", (int(q_mask.shape[0]), int(q_mask.shape[1])), None, layout)
+    if entry is None:
+        yield None
+        return
+    token = _DSA_POOL_LAYOUT_CACHE.set(entry)
+    try:
+        yield entry[3]
+    finally:
+        _DSA_POOL_LAYOUT_CACHE.reset(token)
 
 
 def _with_rope(nope: Array, rope: Array) -> Array:
@@ -575,7 +634,16 @@ class DeepSeekSparseAttention(UnifiedAttention):
         if tail_error is not None:
             raise ValueError(tail_error)
         bsz, q_len, _ = hidden_states.shape
-        layout = None if q_mask is None else compact_valid_layout(q_mask)
+        cached_layout = _DSA_POOL_LAYOUT_CACHE.get()
+        if (
+            q_mask is not None
+            and cached_layout is not None
+            and cached_layout[0] == "compact"
+            and cached_layout[1] == (bsz, q_len)
+        ):
+            layout = cached_layout[3]
+        else:
+            layout = None if q_mask is None else compact_valid_layout(q_mask)
         pool_mask, tails = self.indexer.select_pools_chunked(
             hidden_states,
             q_resid,
@@ -654,13 +722,29 @@ class DeepSeekSparseAttention(UnifiedAttention):
         kpool = self.indexer.config.kpool_size
         seg_layout = None
         key_layout = None
+        cached_layout = _DSA_POOL_LAYOUT_CACHE.get()
         if segments is not None:
             # Packed documents: every document starts a pool on the key grid, so neither a selected pool nor the tail
             # crosses a document boundary, and the indexer only offers a query pools of its own document.
-            seg_layout = segment_pool_layout(segments, kpool)
+            if (
+                cached_layout is not None
+                and cached_layout[0] == "segment"
+                and cached_layout[1] == (int(segments.shape[0]), int(segments.shape[1]))
+                and cached_layout[2] == int(kpool)
+            ):
+                seg_layout = cached_layout[3]
+            else:
+                seg_layout = segment_pool_layout(segments, kpool)
             key_layout = seg_layout
         elif q_mask is not None:
-            key_layout = compact_valid_layout(q_mask)
+            if (
+                cached_layout is not None
+                and cached_layout[0] == "compact"
+                and cached_layout[1] == (int(q_mask.shape[0]), int(q_mask.shape[1]))
+            ):
+                key_layout = cached_layout[3]
+            else:
+                key_layout = compact_valid_layout(q_mask)
         pool_ids, _ = self.indexer.select_pools_chunked(
             hidden_states,
             q_resid,
@@ -708,6 +792,10 @@ class DeepSeekSparseAttention(UnifiedAttention):
             preferred_element_type=jnp.float32,
         ).astype(hidden_states.dtype)
         if split:
+            # Pin the projection output to the query-sequence split before returning to the head-parallel
+            # layout so the value contraction runs locally and the all-to-all carries the narrower
+            # ``v_head_dim`` result rather than the ``kv_lora_rank``-wide latent.
+            attn = layout.constrain(attn, layout.query_spec)
             attn = layout.constrain(attn, layout.head_parallel_spec)
         return self._pool_training_output(attn.reshape(bsz, q_len, -1))
 

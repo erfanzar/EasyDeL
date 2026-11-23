@@ -80,6 +80,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SparseDecoderLayerOutput,
 )
+from easydel.infra.sharding import is_mpmd_mesh
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, blockwise_ffn
 from easydel.layers import (
     BaseMoeModule,
@@ -97,7 +98,7 @@ from easydel.layers import (
     gated_mlp_forward,
     split_fused_gate_up_projection,
 )
-from easydel.layers.attention import DeepSeekSparseAttention
+from easydel.layers.attention import DeepSeekSparseAttention, dsa_segment_pool_scope
 from easydel.layers.indexer import (
     IndexerConfig,
     IndexerKind,
@@ -1383,7 +1384,22 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
             )
 
         initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0, None, None)
-        final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
+        precompute_dsa_layout = (
+            bool(getattr(self.config, "dsa_pool_training", False))
+            and not is_mpmd_mesh(self.config.mesh)
+            and not needs_trace_cache
+            and not output_attentions
+            and not has_shared_indexers
+            and not indexer_aux_active
+            and any(t != LINEAR_ATTENTION_LAYER_TYPE for t in self.config.layer_types)
+        )
+        with dsa_segment_pool_scope(
+            mask_info,
+            seq_len=sequence_length,
+            kpool=self.config.index_kpool,
+            enabled=precompute_dsa_layout,
+        ):
+            final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
         hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _, _, indexer_aux_loss = final
 
         # Unweighted mean over mHC streams, then final norm.

@@ -858,21 +858,27 @@ class SparseIndexer(BaseIndexer):
     def _reduce_heads(
         self,
         scores: Float[Array, "batch seq heads n"],
-        hidden_states: Float[Array, "batch seq hidden"],
+        hidden_states: Float[Array, "batch seq hidden"] | None,
+        *,
+        head_weights: Float[Array, "batch seq heads"] | None = None,
     ) -> Float[Array, "batch seq n"]:
         """Collapse the head axis of the per-dot scores.
 
         Args:
             scores: Per-head scores ``[batch, seq, heads, n]`` already
                 scaled/activated.
-            hidden_states: Layer input for the learned head weights.
+            hidden_states: Layer input for the learned head weights (unused
+                when ``head_weights`` is precomputed).
+            head_weights: Optional precomputed ``self.weights_proj(hidden_states)``
+                logits ``[batch, seq, heads]`` in float32.
 
         Returns:
             Per-candidate scores ``[batch, seq, n]``.
         """
         if self.config.head_reduction == "uniform":
             return jnp.sum(scores, axis=2)
-        weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5)
+        raw_weights = self.weights_proj(hidden_states).astype(jnp.float32) if head_weights is None else head_weights
+        weights = raw_weights * (self.n_heads**-0.5)
         return jnp.einsum("bsh,bshn->bsn", weights, scores, precision=self.precision)
 
     def _uses_fused_scoring(self, query: Array) -> bool:
@@ -883,8 +889,10 @@ class SparseIndexer(BaseIndexer):
         self,
         query: Float[Array, "batch seq heads head_dim"],
         keys: Float[Array, "batch n head_dim"],
-        hidden_states: Float[Array, "batch seq hidden"],
+        hidden_states: Float[Array, "batch seq hidden"] | None,
         mesh_source: object | None = None,
+        *,
+        head_weights: Float[Array, "batch seq heads"] | None = None,
     ) -> Float[Array, "batch seq n"]:
         """Head-reduced relu scores ``[batch, seq, n]`` through :func:`fused_head_scores`.
 
@@ -894,8 +902,11 @@ class SparseIndexer(BaseIndexer):
         Args:
             query: Roped indexer queries.
             keys: Candidate keys (tokens or pool summaries).
-            hidden_states: Layer input for the learned head weights.
+            hidden_states: Layer input for the learned head weights (unused
+                when ``head_weights`` is precomputed).
             mesh_source: Row-layout provider overriding ``self.mesh_source`` (e.g. a ``ScoreRowSplit``).
+            head_weights: Optional precomputed ``self.weights_proj(hidden_states)``
+                logits ``[batch, seq, heads]`` in float32.
 
         Returns:
             fp32 scores equal to the dense ``_reduce_heads(relu(scale * q.k))`` path.
@@ -903,7 +914,10 @@ class SparseIndexer(BaseIndexer):
         if self.config.head_reduction == "uniform":
             weights = jnp.full(query.shape[:3], self.softmax_scale, jnp.float32)
         else:
-            weights = self.weights_proj(hidden_states).astype(jnp.float32) * (self.n_heads**-0.5 * self.softmax_scale)
+            raw_weights = (
+                self.weights_proj(hidden_states).astype(jnp.float32) if head_weights is None else head_weights
+            )
+            weights = raw_weights * (self.n_heads**-0.5 * self.softmax_scale)
         source = self.mesh_source if mesh_source is None else mesh_source
         return fused_head_scores(query, keys, weights, precision=self.precision, mesh_source=source)
 
@@ -1259,14 +1273,27 @@ class SparseIndexer(BaseIndexer):
         num_chunks = -(-seq_len // chunk)
         qpad = num_chunks * chunk - seq_len
 
+        # Project head weights once outside the query-chunk scan so FSDP/TP
+        # all-gathers of ``weights_proj`` execute once per layer rather than
+        # once per query chunk.
+        use_precomputed_weights = self.config.head_reduction != "uniform"
+        head_weights = (
+            self.weights_proj(hidden_states).astype(jnp.float32)
+            if use_precomputed_weights
+            else None
+        )
+        if head_weights is not None and self.config.stop_gradient:
+            head_weights = jax.lax.stop_gradient(head_weights)
+
         def to_chunks(x: Array) -> Array:
             x = jnp.pad(x, [(0, 0), (0, qpad)] + [(0, 0)] * (x.ndim - 2))
             return jnp.moveaxis(x.reshape(batch_size, num_chunks, chunk, *x.shape[2:]), 1, 0)
 
         def select_chunk(inputs):
-            q_chunk, h_chunk, v_chunk, p_chunk, d_chunk = inputs
+            q_chunk, w_chunk, v_chunk, p_chunk, d_chunk = inputs
+            hw = w_chunk if use_precomputed_weights else None
             if self._uses_fused_scoring(q_chunk):
-                scores = self._fused_scores(q_chunk, pool_keys_f32, h_chunk, mesh_source=row_source)
+                scores = self._fused_scores(q_chunk, pool_keys_f32, None, mesh_source=row_source, head_weights=hw)
             else:
                 scores = jnp.einsum(
                     "bshd,bpd->bshp", q_chunk.astype(jnp.float32), pool_keys_f32, precision=self.precision
@@ -1274,7 +1301,7 @@ class SparseIndexer(BaseIndexer):
                 scores = scores * self.softmax_scale
                 if self.config.score_activation == "relu":
                     scores = jax.nn.relu(scores)
-                scores = self._reduce_heads(scores, h_chunk)
+                scores = self._reduce_heads(scores, None, head_weights=hw)
             candidates = (pool_end[None, None, :] <= p_chunk[:, :, None]) & pool_valid[:, None, :] & v_chunk[:, :, None]
             if pool_docs is not None:
                 candidates = candidates & (pool_docs[:, None, :] == d_chunk[:, :, None])
@@ -1290,9 +1317,10 @@ class SparseIndexer(BaseIndexer):
             return pack_pool_bits(mask) if packed else mask
 
         docs = positions if query_docs is None else query_docs  # unread without a segment layout
+        w_input = to_chunks(head_weights) if head_weights is not None else to_chunks(valid)
         masks = jax.lax.map(
             select_chunk,
-            (to_chunks(query), to_chunks(hidden_states), to_chunks(valid), to_chunks(positions), to_chunks(docs)),
+            (to_chunks(query), w_input, to_chunks(valid), to_chunks(positions), to_chunks(docs)),
         )
         width = masks.shape[-1]
         pool_mask = jnp.moveaxis(masks, 0, 1).reshape(batch_size, num_chunks * chunk, width)[:, :seq_len]
@@ -1305,7 +1333,7 @@ class SparseIndexer(BaseIndexer):
             tail_start = visible_count - tail_count
             offsets = jnp.arange(kpool - 1, dtype=jnp.int32)
             tails = jnp.where(offsets < tail_count[..., None], tail_start[..., None] + offsets, -1).astype(jnp.int32)
-        return jax.lax.stop_gradient(pool_mask), tails
+        return checkpoint_name(jax.lax.stop_gradient(pool_mask), "indexer_pool_ids"), tails
 
     @staticmethod
     def _compact_valid_indices(key_valid: Bool[Array, "batch kv"]) -> Array:

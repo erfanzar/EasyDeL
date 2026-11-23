@@ -89,7 +89,12 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jaxtyping import Array, Float, Int
 from spectrax import nn
 
-from easydel.infra.sharding import is_mpmd_mesh, moe_expert_param_layout_scope, replicated_named_sharding
+from easydel.infra.sharding import (
+    is_mpmd_mesh,
+    moe_expert_param_layout_scope,
+    normalize_axis_names,
+    replicated_named_sharding,
+)
 from easydel.infra.utils import ArrayParam, materialize_meta_leaves
 from easydel.layers.norms import LayerNorm
 from easydel.utils import traversals
@@ -3756,6 +3761,82 @@ class EasyDeLBaseModule(
             ),
         )
 
+    _LM_HEAD_PREGATHER_MAX_SHARD_BYTES: tp.ClassVar[int] = 1 << 30
+
+    def _pregather_lm_head_weight(self: Self, head: tp.Any, w: Array | None) -> Array | None:
+        """All-gather an FSDP-sharded LM-head kernel once outside chunked-loss loops.
+
+        Chunked cross-entropy and distillation losses call the projection returned by
+        :meth:`make_lm_head_fn` once per token chunk. When the LM-head kernel is sharded
+        over FSDP, each chunk otherwise triggers its own FSDP all-gather and backward
+        reduce-scatter. Constraining the weight once outside the chunk loop (preserving
+        TP/vocab sharding) hoists FSDP communication to a single pair per step.
+
+        Skipped eagerly (outside JAX tracing), on MPMD meshes, when FSDP has size 1,
+        when the weight is not FSDP-sharded, or when the per-shard gathered kernel would
+        exceed ``config.lm_head_pregather_max_bytes`` (default 1 GiB; ``<= 0`` disables).
+        """
+        raw_limit = getattr(self.config, "lm_head_pregather_max_bytes", None)
+        max_shard_bytes = self._LM_HEAD_PREGATHER_MAX_SHARD_BYTES if raw_limit is None else int(raw_limit)
+        if max_shard_bytes <= 0:
+            return w
+        raw = w if w is not None else getattr(getattr(head, "weight", None), "value", None)
+        if not isinstance(raw, jax.core.Tracer) or raw.ndim != 2:
+            return w
+        mesh = getattr(self.config, "mesh", None)
+        if mesh is None or is_mpmd_mesh(mesh):
+            return w
+        paxis = getattr(self.config, "partition_axis", None)
+        if paxis is None:
+            return w
+        try:
+            fsdp_resolved = paxis.resolve_axis(axes=[spx.common_types.FSDP], mode=spx.common_types.MODE_TRAIN)[0]
+        except Exception:
+            return w
+        fsdp_axes = set(normalize_axis_names(fsdp_resolved))
+        mesh_shape = dict(getattr(mesh, "shape", {}) or {})
+        fsdp_size = 1
+        for ax in fsdp_axes:
+            fsdp_size *= int(mesh_shape.get(ax, 1))
+        if fsdp_size <= 1:
+            return w
+        spec = self._lm_head_kernel_spec(head, tuple(raw.shape))
+        if spec is None or len(spec) != 2:
+            return w
+
+        def _drop_fsdp(entry: tp.Any) -> tp.Any:
+            if entry is None:
+                return None
+            if isinstance(entry, str):
+                return None if entry in fsdp_axes else entry
+            kept = tuple(ax for ax in entry if ax not in fsdp_axes)
+            if not kept:
+                return None
+            return kept[0] if len(kept) == 1 else kept
+
+        gathered_spec = PartitionSpec(*(_drop_fsdp(e) for e in spec))
+        if gathered_spec == spec:
+            return w
+
+        shard_div = 1
+        for entry in gathered_spec:
+            for ax in normalize_axis_names(entry):
+                shard_div *= int(mesh_shape.get(ax, 1))
+        target_dtype = getattr(head, "dtype", None) or raw.dtype
+        shard_bytes = (int(raw.shape[0]) * int(raw.shape[1]) * jnp.dtype(target_dtype).itemsize) // max(1, shard_div)
+        if shard_bytes > max_shard_bytes:
+            return w
+
+        pregathered = raw.astype(target_dtype) if raw.dtype != target_dtype else raw
+        return tp.cast(
+            Array,
+            spx.with_sharding_constraint(
+                pregathered,
+                gathered_spec,
+                mesh=mesh,
+            ),
+        )
+
     def make_lm_head_fn(self, vocab_shard_stage: int | None = None) -> "Callable[[Array], Array]":
         """Return a trace-safe callable that projects hidden states to logits.
 
@@ -3791,6 +3872,7 @@ class EasyDeLBaseModule(
         del vocab_shard_stage
         head = self.get_lm_head()
         w = self._tied_lm_head_weight(head)
+        w = self._pregather_lm_head_weight(head, w)
 
         _native_forward = getattr(head, "native_forward", None)
 
