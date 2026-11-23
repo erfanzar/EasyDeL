@@ -712,6 +712,7 @@ class BaseTrainerCfg(TypedDict, total=False):
 
     # Grain random-access data lanes (see easydel.trainers.data_lanes): ArrayRecord (msgpack rows) and raw
     # parquet ("parquetra", tokenized in the loader; `parquetra_pack_seq_len > 0` selects the packed lane).
+    data_lane_local_batch: NotRequired[bool]
     arrayrecord_train_files: NotRequired[str | list[str] | None]
     arrayrecord_train_datasets: NotRequired[dict[str, str | list[str]] | None]
     arrayrecord_mixture_weights: NotRequired[dict[str, float] | None]

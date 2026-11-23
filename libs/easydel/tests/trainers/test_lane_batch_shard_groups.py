@@ -119,3 +119,52 @@ def test_explicit_grain_shard_wins(monkeypatch):
     monkeypatch.setattr(jax, "process_index", lambda: 5)
     monkeypatch.setattr(jax, "process_count", lambda: 16)
     assert data_lanes._host_shard(_trainer(torus_mesh(), grain_shard_index=3, grain_shard_count=7)) == (3, 7)
+
+
+def test_resolve_lane_batch_size_local_and_fallback(monkeypatch):
+    monkeypatch.setattr(jax, "process_count", lambda: 16)
+    devs = torus_mesh()
+
+    def _tr(mesh_devs, training_batch_size=32, **arguments):
+        defaults = dict(
+            grain_shard_index=None,
+            grain_shard_count=None,
+            data_lane_local_batch=True,
+            gradient_accumulation_steps=1,
+            gradient_accumulation_mode="scan",
+            step_partition_spec=PartitionSpec(BATCH, "sp"),
+        )
+        defaults.update(arguments)
+        mesh = types.SimpleNamespace(devices=mesh_devs, axis_names=NAMES)
+        return types.SimpleNamespace(
+            arguments=types.SimpleNamespace(**defaults),
+            mesh=mesh,
+            training_batch_size=training_batch_size,
+        )
+
+    # Disabled by default -> global batch size.
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    assert data_lanes.resolve_lane_batch_size(_tr(devs, 32, data_lane_local_batch=False)) == (32, False)
+
+    # Enabled on 16-host torus (8 batch-shard groups) -> 32 / 8 = 4 local rows per group.
+    for proc in (0, 5, 15):
+        monkeypatch.setattr(jax, "process_index", lambda proc=proc: proc)
+        assert data_lanes.resolve_lane_batch_size(_tr(devs, 32)) == (4, True)
+
+    # Enabled on 16-host per-host mesh (16 groups) -> 32 / 16 = 2 local rows per host.
+    monkeypatch.setattr(jax, "process_index", lambda: 5)
+    assert data_lanes.resolve_lane_batch_size(_tr(per_host_mesh(), 32)) == (2, True)
+
+    # Execution-mode GA where microbatch divides batch_ways (16): 64 / 2 = 32 -> 4 rows/step (2/micro).
+    assert data_lanes.resolve_lane_batch_size(
+        _tr(devs, 64, gradient_accumulation_steps=2, gradient_accumulation_mode="execution")
+    ) == (8, True)
+
+    # Execution-mode GA where microbatch (8) does not divide batch_ways (16) -> safe fallback to global.
+    assert data_lanes.resolve_lane_batch_size(
+        _tr(devs, 16, gradient_accumulation_steps=2, gradient_accumulation_mode="execution")
+    ) == (16, False)
+
+    # Conflicting explicit grain_shard overrides raise loudly when local batch is enabled.
+    with pytest.raises(ValueError, match="grain_shard_index"):
+        data_lanes.resolve_lane_batch_size(_tr(devs, 32, grain_shard_index=0, grain_shard_count=7))

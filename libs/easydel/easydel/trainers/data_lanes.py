@@ -1119,6 +1119,86 @@ def _host_shard(trainer: tp.Any) -> tuple[int, int]:
     return int(me), max(int(jax.process_count()), 1)
 
 
+def resolve_lane_batch_size(trainer: tp.Any) -> tuple[int, bool]:
+    """Return ``(batch_size, local_active)`` for a grain data lane on ``trainer``.
+
+    When ``trainer.arguments.data_lane_local_batch`` is ``False`` (default), returns
+    ``(int(trainer.training_batch_size), False)`` so every host constructs the full global batch.
+
+    When ``data_lane_local_batch`` is ``True`` on an SPMD mesh, returns ``(len(group_rows), True)``
+    where ``group_rows`` is the sorted tuple of global batch row indices owned by this host's
+    batch-shard process group (see :func:`~easydel.trainers.batch_placement.batch_shard_group_rows`).
+    Falls back to ``(global_batch_size, False)`` when the batch is replicated across all processes
+    (single host, no mesh, MPMD mesh, or a batch size not divisible by the mesh's batch axes).
+
+    Raises:
+        ValueError: When explicit ``grain_shard_index`` / ``grain_shard_count`` overrides disagree
+            with the mesh's batch-shard process groups while ``data_lane_local_batch=True``.
+    """
+    import jax
+    from jax.sharding import PartitionSpec
+
+    global_batch_size = int(trainer.training_batch_size)
+    arguments = trainer.arguments
+    if not bool(getattr(arguments, "data_lane_local_batch", False)):
+        return global_batch_size, False
+    try:
+        mesh = getattr(trainer, "mesh", None)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        mesh = None
+    if mesh is None or bool(getattr(mesh, "is_mpmd", False)):
+        if jax.process_count() > 1:
+            logger.warn_once(
+                "data lanes: `data_lane_local_batch=True` requested without an SPMD mesh; falling back to global batch."
+            )
+        return global_batch_size, False
+    spec = getattr(arguments, "step_partition_spec", None)
+    if not isinstance(spec, PartitionSpec):
+        return global_batch_size, False
+
+    groups = _trainer_process_groups(trainer)
+    if (
+        groups is not None
+        and len(groups) > 1
+        and (arguments.grain_shard_index is not None or arguments.grain_shard_count is not None)
+    ):
+        me = jax.process_index()
+        my_idx = next((i for i, g in enumerate(groups) if me in g), None)
+        explicit_idx = int(arguments.grain_shard_index if arguments.grain_shard_index is not None else me)
+        explicit_cnt = int(
+            arguments.grain_shard_count if arguments.grain_shard_count is not None else jax.process_count()
+        )
+        if explicit_cnt != len(groups) or (my_idx is not None and explicit_idx != my_idx):
+            raise ValueError(
+                "`data_lane_local_batch=True` requires `grain_shard_index` / `grain_shard_count` to match the "
+                f"mesh's batch-shard process groups (expected ({my_idx}, {len(groups)}), got "
+                f"({explicit_idx}, {explicit_cnt})); leave both unset to derive them from the mesh."
+            )
+
+    from .batch_placement import batch_shard_group_rows
+
+    group_rows = batch_shard_group_rows(global_batch_size, spec, mesh)
+    local_batch_size = len(group_rows)
+    if local_batch_size >= global_batch_size:
+        return global_batch_size, False
+
+    grad_accum = int(getattr(arguments, "gradient_accumulation_steps", 1) or 1)
+    grad_mode = getattr(arguments, "gradient_accumulation_mode", "scan") or "scan"
+    if grad_mode == "execution" and grad_accum > 1:
+        if global_batch_size % grad_accum != 0:
+            return global_batch_size, False
+        global_micro = global_batch_size // grad_accum
+        micro_rows = batch_shard_group_rows(global_micro, spec, mesh)
+        if len(micro_rows) >= global_micro or local_batch_size != grad_accum * len(micro_rows):
+            logger.warn_once(
+                "data lanes: `data_lane_local_batch=True` with execution-mode gradient accumulation requires "
+                "each microbatch to be evenly sharded across the mesh batch axes; falling back to global batch."
+            )
+            return global_batch_size, False
+
+    return local_batch_size, True
+
+
 def _require_user_collator(trainer: tp.Any, field_name: str) -> None:
     if not getattr(trainer, "_user_data_collator", False):
         raise ValueError(
@@ -1257,7 +1337,17 @@ def configure_parquetra_lane(trainer: tp.Any) -> tuple[tp.Any, int]:
         for name in names
     }
     tokenizers = _parquetra_tokenizers(trainer, names)
-    batch_size = int(trainer.training_batch_size)
+    batch_size, local_active = resolve_lane_batch_size(trainer)
+    trainer._data_lane_batch_size = batch_size
+    trainer._data_lane_local_batch = local_active
+    if local_active:
+        logger.info(
+            "parquetra lane: local batch sharding active (local_batch_size=%d, global_batch_size=%d, shard=%d/%d).",
+            batch_size,
+            int(trainer.training_batch_size),
+            shard_index,
+            shard_count,
+        )
     seed = int(arguments.shuffle_seed_train)
     shuffle = bool(arguments.shuffle_train_dataset)
     pack_seq_len = int(arguments.parquetra_pack_seq_len)
@@ -1359,7 +1449,17 @@ def configure_arrayrecord_lane(trainer: tp.Any) -> tuple[tp.Any, int]:
     rate = read_rate_bytes_per_second(arguments.arrayrecord_read_rate_limit_mb_per_sec)
     burst = float(arguments.arrayrecord_read_rate_burst_seconds)
     shard_index, shard_count = _host_shard(trainer)
-    batch_size = int(trainer.training_batch_size)
+    batch_size, local_active = resolve_lane_batch_size(trainer)
+    trainer._data_lane_batch_size = batch_size
+    trainer._data_lane_local_batch = local_active
+    if local_active:
+        logger.info(
+            "arrayrecord lane: local batch sharding active (local_batch_size=%d, global_batch_size=%d, shard=%d/%d).",
+            batch_size,
+            int(trainer.training_batch_size),
+            shard_index,
+            shard_count,
+        )
     seed = int(arguments.shuffle_seed_train)
     per_source, rows = [], {}
     for i, name in enumerate(names):
@@ -1417,5 +1517,6 @@ __all__ = (
     "read_lane_cursor",
     "read_rate_bytes_per_second",
     "resolve_lane_assistant_only",
+    "resolve_lane_batch_size",
     "write_lane_cursor",
 )

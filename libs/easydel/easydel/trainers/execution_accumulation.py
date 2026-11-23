@@ -64,6 +64,7 @@ class _LazyMicrobatchSequence(collections.abc.Sequence):
         num_steps: int,
         batch_spec: tp.Any,
         mesh: tp.Any,
+        global_microbatch_size: int | None = None,
     ) -> None:
         self._batch = batch
         self._batch_size = int(batch_size)
@@ -71,6 +72,7 @@ class _LazyMicrobatchSequence(collections.abc.Sequence):
         self._micro_size = self._batch_size // self._num_steps
         self._batch_spec = batch_spec
         self._mesh = mesh
+        self._global_microbatch_size = None if global_microbatch_size is None else int(global_microbatch_size)
 
     def __len__(self) -> int:
         return self._num_steps
@@ -86,7 +88,9 @@ class _LazyMicrobatchSequence(collections.abc.Sequence):
         part = slice_host_minibatch(self._batch, self._batch_size, idx * self._micro_size, self._micro_size)
         if self._batch_spec is None:
             return part
-        return place_batch(part, self._batch_spec, self._mesh)
+        if self._global_microbatch_size is None:
+            return place_batch(part, self._batch_spec, self._mesh)
+        return place_batch(part, self._batch_spec, self._mesh, global_batch_size=self._global_microbatch_size)
 
     def __iter__(self) -> collections.abc.Iterator[tp.Any]:
         for k in range(self._num_steps):
@@ -121,6 +125,7 @@ class ExecutionAccumulation:
         jit_options: dict[str, tp.Any] | None = None,
         batch_spec: tp.Any = None,
         mesh: tp.Any = None,
+        global_batch_size: int | None = None,
     ) -> None:
         if int(num_steps) < 2:
             raise ValueError(f"execution-mode gradient accumulation needs >= 2 microbatches, got {num_steps}.")
@@ -131,6 +136,15 @@ class ExecutionAccumulation:
         self.step_fn = step_fn
         self._batch_spec = batch_spec
         self._mesh = mesh
+        if global_batch_size is None:
+            self._global_microbatch_size = None
+        else:
+            global_batch_size = int(global_batch_size)
+            if global_batch_size % self.num_steps:
+                raise ValueError(
+                    f"global_batch_size={global_batch_size} is not divisible by {self.num_steps} microbatches."
+                )
+            self._global_microbatch_size = global_batch_size // self.num_steps
         in_shardings = release_batch_slot(tuple(in_shardings), batch_spec)
         acc_pos = 2 + n_extra
         shifted_statics = tuple(int(i) + 1 for i in static_argnums)
@@ -189,6 +203,7 @@ class ExecutionAccumulation:
             num_steps=self.num_steps,
             batch_spec=self._batch_spec,
             mesh=self._mesh,
+            global_microbatch_size=getattr(self, "_global_microbatch_size", None),
         )
 
     def run(self, state, batch, extra_args: tuple[tp.Any, ...], static_args: tuple[tp.Any, ...]):
@@ -233,6 +248,9 @@ def build_execution_accumulation(
         raise ValueError("gradient_accumulation_mode='execution' is not supported together with training buckets.")
     logger.info("gradient accumulation by separate executions: %d microbatches per optimizer step", steps)
     mesh = getattr(getattr(trainer, "model", None), "mesh", None)
+    global_batch_size = (
+        int(trainer.training_batch_size) if getattr(trainer, "_data_lane_local_batch", False) else None
+    )
     return ExecutionAccumulation(
         step_fn=step_fn,
         num_steps=steps,
@@ -243,4 +261,5 @@ def build_execution_accumulation(
         jit_options=jit_options,
         batch_spec=replicated_batch_slot_spec(arguments, mesh, tuple(in_shardings)),
         mesh=mesh,
+        global_batch_size=global_batch_size,
     )

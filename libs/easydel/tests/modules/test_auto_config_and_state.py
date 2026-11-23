@@ -248,3 +248,32 @@ def test_dbrx_import_does_not_modify_transformers_auxiliary_loss():
     assert modeling_dbrx.DbrxForCausalLM is original_class
     assert registry.get_module_registration(TaskType.CAUSAL_LM, "dbrx") is original_registration
     assert original_registration.module is original_class
+
+
+@pytest.mark.cpu_ok
+def test_auto_config_from_pretrained_coerces_non_str_path_like(tmp_path):
+    from easydel.modules.auto.auto_configuration import AutoEasyDeLConfig
+    from easydel.modules.llama import LlamaConfig
+
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    )
+    cfg.save_pretrained(str(tmp_path))
+
+    class _RemoteLikePath:
+        """Simulates a cloud path object (e.g. GCSPath) that stringifies without implementing os.PathLike."""
+
+        def __init__(self, value: str):
+            self._value = value
+
+        def __str__(self) -> str:
+            return self._value
+
+    loaded = AutoEasyDeLConfig.from_pretrained(_RemoteLikePath(str(tmp_path)))
+    assert loaded.model_type == "llama"
+    assert loaded.hidden_size == 64

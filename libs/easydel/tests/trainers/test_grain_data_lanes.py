@@ -307,3 +307,57 @@ def test_cpu_only_worker_init_edits_only_the_calling_process(monkeypatch):
     clone = pickle.loads(pickle.dumps(init))  # must survive the spawn pickle
     assert clone.overrides == {"JAX_PLATFORMS": "cpu", "ENABLE_DISTRIBUTED_INIT": "0"}
     assert os.environ["TPU_WORKER_ID"] == "3"  # building/pickling the initializer touches nothing
+
+
+def test_packed_and_arrayrecord_lanes_honor_data_lane_local_batch(tmp_path, monkeypatch):
+    import jax
+    from jax.sharding import PartitionSpec
+
+    # Simulate a 4-host mesh (4 distinct batch-shard groups) with global_batch_size=8 -> local_batch_size=2.
+    devs = np.array([types.SimpleNamespace(process_index=p) for p in range(4)], dtype=object).reshape(4, 1)
+    mesh = types.SimpleNamespace(devices=devs, axis_names=("fsdp", "tp"))
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    monkeypatch.setattr(jax, "process_index", lambda: 1)
+
+    data = {"alpha": _corpus(tmp_path / "local.parquet", 64, seed=5, lo=16, hi=48)}
+    args = _arguments(
+        tmp_path,
+        grain_shard_index=None,
+        grain_shard_count=None,
+        data_lane_local_batch=True,
+        step_partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+        parquetra_train_datasets=data,
+        parquetra_pack_seq_len=128,
+        parquetra_pack_misfit_patience=4,
+        total_batch_size=8,
+        max_training_steps=10,
+    )
+    trainer = _trainer(args, batch_size=8)
+    trainer.mesh = mesh
+    loader, steps = data_lanes.configure_parquetra_lane(trainer)
+    assert steps == 10
+    assert trainer._data_lane_local_batch is True
+    assert trainer._data_lane_batch_size == 2
+    assert loader.batch_size == 2
+    first_set = next(iter(loader))
+    assert 0 < sum(len(r["input_ids"]) for r in first_set) <= 2 * 128
+
+    # Default data_lane_local_batch=False keeps full global batch size.
+    args_global = _arguments(
+        tmp_path,
+        grain_shard_index=None,
+        grain_shard_count=None,
+        data_lane_local_batch=False,
+        step_partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+        parquetra_train_datasets=data,
+        parquetra_pack_seq_len=128,
+        parquetra_pack_misfit_patience=4,
+        total_batch_size=8,
+        max_training_steps=10,
+    )
+    trainer_global = _trainer(args_global, batch_size=8)
+    trainer_global.mesh = mesh
+    loader_global, _ = data_lanes.configure_parquetra_lane(trainer_global)
+    assert trainer_global._data_lane_local_batch is False
+    assert trainer_global._data_lane_batch_size == 8
+    assert loader_global.batch_size == 8

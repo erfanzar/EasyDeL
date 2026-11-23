@@ -427,6 +427,8 @@ class AutoEasyDeLConfig:
             written. The class resolved in step 4 loads it properly, with the
             family's own validation.
         """
+        if pretrained_model_name_or_path is not None and not isinstance(pretrained_model_name_or_path, str):
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         if partition_axis is None:
             partition_axis = PartitionAxis()
         from transformers import AutoConfig
@@ -809,6 +811,8 @@ class AutoShardAndGatherFunctions:
         Returns:
             A tuple containing the shard and gather functions.
         """
+        if pretrained_model_name_or_path is not None and not isinstance(pretrained_model_name_or_path, str):
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         if partition_axis is None:
             partition_axis = PartitionAxis()
         config = AutoEasyDeLConfig.from_pretrained(

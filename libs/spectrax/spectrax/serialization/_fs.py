@@ -69,6 +69,12 @@ def joinpath(a: str, *parts: str) -> str:
     result = a.rstrip("/")
     for b in parts:
         b = b.lstrip("/")
+        while b.startswith("./"):
+            b = b[2:]
+        if b == ".":
+            if not result:
+                result = "."
+            continue
         result = f"{result}/{b}" if result and b else (result or b)
     return result
 

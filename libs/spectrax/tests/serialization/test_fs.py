@@ -66,6 +66,16 @@ class TestJoinpath:
         """Single part."""
         assert joinpath("gs://bucket") == "gs://bucket"
 
+    @pytest.mark.cpu_ok
+    def test_dot_segments_dropped(self):
+        """Dot segments do not produce literal '/.' prefixes on object stores."""
+        assert joinpath("gs://bucket/run-1", ".") == "gs://bucket/run-1"
+        assert joinpath("gs://bucket/run-1", "./") == "gs://bucket/run-1"
+        assert joinpath("gs://bucket/run-1", ".", "file.json") == "gs://bucket/run-1/file.json"
+        assert joinpath("gs://bucket/run-1", "./sub/file.json") == "gs://bucket/run-1/sub/file.json"
+        assert joinpath("gs://bucket/run-1", "..") == "gs://bucket/run-1/.."
+        assert joinpath("", ".") == "."
+
 
 class TestMkdir:
     """Tests for mkdir."""

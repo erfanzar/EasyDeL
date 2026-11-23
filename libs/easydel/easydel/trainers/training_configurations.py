@@ -628,6 +628,16 @@ class TrainingArguments:
             "number of batch-shard host groups, see grain_shard_index)."
         },
     )
+    data_lane_local_batch: bool = field(
+        default=False,
+        metadata={
+            "help": "When True on the grain data lanes (`parquetra_train_datasets` / `arrayrecord_train_*`), each "
+            "batch-shard host group loads and collates only its own local batch rows instead of the full global "
+            "batch, and `place_batch` lifts each group's local batch into the global sharded array. Requires a "
+            "`data_collator` sized to the local group batch (see `data_lanes.resolve_lane_batch_size`). Default "
+            "False preserves the global-batch contract."
+        },
+    )
     arrayrecord_train_files: str | list[str] | None = field(
         default=None,
         metadata={

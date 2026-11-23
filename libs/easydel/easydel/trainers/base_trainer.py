@@ -6133,6 +6133,18 @@ class BaseTrainer(BaseTrainerProtocol):
 
             self.sharded_training_step_function = sharded_training_step_function
             self.sharded_evaluation_step_function = sharded_evaluation_step_function
+            if getattr(self, "_data_lane_local_batch", False):
+                from .batch_placement import BatchPlacedStep
+
+                if isinstance(self.sharded_training_step_function, BatchPlacedStep):
+                    self.sharded_training_step_function = self.sharded_training_step_function.with_global_batch_size(
+                        int(self.training_batch_size)
+                    )
+                elif getattr(self, "_execution_accumulation", None) is None:
+                    raise ValueError(
+                        "`data_lane_local_batch=True` requires a BatchPlacedStep training step (SPMD mesh with "
+                        "replicated batch slot); disable `data_lane_local_batch` for MPMD or custom step shardings."
+                    )
             self.mesh = functions.mesh
             self.checkpoint_manager = functions.checkpoint_manager
             self.checkpointer = self._create_checkpointer()
