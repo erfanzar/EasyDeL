@@ -21,8 +21,10 @@ selection is the whole causal triangle.
 
 Metadata (XLA, one SMEM row per query): ``[count, tail_len, slot_0 .. slot_{ng*G-1}, pad]``. Slot 0 is the query's own
 (incomplete) pool when ``tail_len > 0``; slots ``1 .. count`` are the open selected pools in ascending order; every other
-slot holds ``P`` (= number of pools), a trash row: latent reads clamp it to ``P - 1`` and its scores are masked, gradient
-writes land in an extra accumulator row that is dropped.
+slot holds a striped trash id ``P + (slot % TRASH_ROWS)`` (where ``P`` = number of pools): latent reads map it across
+distinct in-bounds pools and mask its scores, gradient writes land in trailing accumulator rows that are dropped.
+Striping across ``TRASH_ROWS`` rows prevents HBM bank serialization when many slots are invalid (e.g. short packed
+documents).
 
 The latent is viewed as 32-bit words ``[B, S / pack, pack, D]`` (``pack`` keys per word: 2 for bf16, 1 for fp32) so one
 pool is one DMA at an untiled leading offset. Pools are fetched ``G`` at a time into an ``nbuf``-deep VMEM ring.
@@ -30,9 +32,9 @@ pool is one DMA at an untiled leading offset. Pools are fetched ``G`` at a time 
 Forward: grid over blocks of ``qb`` queries; online softmax per query; emits ``out`` and ``lse``.
 
 Backward: grid ``(cores, blocks per core)``; per query and group, ``dq`` accumulates in VMEM and the group's ``dK``
-rows are read-modify-written into an fp32 HBM accumulator ``[cores, B, P + 1, kpool, D]`` (one copy per TensorCore,
-summed in XLA). Pools inside one query are distinct, and the accumulator reads of query ``i + 1`` start only after all
-writes of query ``i`` completed, so no update is lost.
+rows are read-modify-written into an fp32 HBM accumulator ``[cores, B, P + TRASH_ROWS, kpool, D]`` (one copy per
+TensorCore, summed in XLA). Pools inside one query are distinct, and the accumulator reads of query ``i + 1`` start
+only after all writes of query ``i`` completed, so no update is lost.
 
 Fused backward (:func:`gather_bwd_fused`, one pool group per query): the backward above is bound by DMA issue, with
 three DMAs per (query, pool) (key read, accumulator read, accumulator write). Each pool instead owns one fp32 HBM row
@@ -57,6 +59,8 @@ NEG = -1e30
 F32 = jnp.float32
 META_HEAD = 2  # [count, tail_len] precede the slots
 DEFAULT_VMEM_LIMIT = 48 * 2**20
+TRASH_ROWS = 64
+"""Trailing trash rows striped across invalid/padding slots to prevent single-row HBM bank serialization."""
 
 
 def dtype_packing(dtype) -> int:
@@ -103,8 +107,10 @@ def build_meta(
     g_sz: int,
     ng: int,
     num_pools: int,
+    trash_rows: int = TRASH_ROWS,
 ) -> jax.Array:
     """``[B, N, M]`` int32 metadata rows (see the module docstring); ``M`` is a multiple of 128."""
+    n_trash = max(1, int(trash_rows))
     ok = selected_ok & (indices < num_pools)
     count = jnp.sum(ok, axis=-1, dtype=jnp.int32)
     ids = jnp.sort(jnp.where(ok, indices, num_pools).astype(jnp.int32), axis=-1)  # open ids first, ascending
@@ -112,6 +118,8 @@ def build_meta(
     own_slot = jnp.where(tail > 0, own, num_pools).astype(jnp.int32)
     slots = jnp.concatenate([own_slot[..., None], ids], axis=-1)
     slots = jnp.pad(slots, ((0, 0), (0, 0), (0, ng * g_sz - slots.shape[-1])), constant_values=num_pools)
+    slot_pos = jnp.arange(slots.shape[-1], dtype=jnp.int32)
+    slots = jnp.where(slots >= num_pools, num_pools + (slot_pos % n_trash), slots)
     meta = jnp.concatenate([count[..., None], tail[..., None], slots], axis=-1)
     width = -(-meta.shape[-1] // 128) * 128
     return jnp.pad(meta, ((0, 0), (0, 0), (0, width - meta.shape[-1])), constant_values=num_pools).astype(jnp.int32)
@@ -134,7 +142,8 @@ def _fwd_kernel(
         i = lax.div(t, ng)
         base = META_HEAD + lax.rem(t, ng) * g_sz
         for j in range(g_sz):
-            p = jnp.minimum(meta_ref[i, base + j], num_pools - 1)
+            raw = meta_ref[i, base + j]
+            p = jnp.where(raw >= num_pools, jnp.minimum(raw - num_pools, num_pools - 1), raw)
             pltpu.make_async_copy(
                 lat_hbm.at[b, pl.ds(p * wp, wp)], kbuf.at[slot, pl.ds(j * wp, wp)], sem.at[slot]
             ).start()
@@ -271,7 +280,8 @@ def _bwd_kernel(
         i = lax.div(t, ng)
         g = lax.rem(t, ng)
         for j in range(g_sz):
-            p = jnp.minimum(pool(i, g, j), num_pools - 1)
+            raw = pool(i, g, j)
+            p = jnp.where(raw >= num_pools, jnp.minimum(raw - num_pools, num_pools - 1), raw)
             pltpu.make_async_copy(
                 lat_hbm.at[b, pl.ds(p * wp, wp)], kbuf.at[slot, pl.ds(j * wp, wp)], ksem.at[slot]
             ).start()
@@ -370,6 +380,7 @@ def gather_bwd(
     nbuf: int,
     num_pools: int,
     cores: int,
+    trash_rows: int = TRASH_ROWS,
     vmem_limit_bytes: int | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -391,7 +402,7 @@ def gather_bwd(
     m_w = meta.shape[-1]
     nblk = bsz * ns
     nb = nblk // cores
-    acc0 = jnp.zeros((cores, bsz, num_pools + 1, kpool, d), F32)
+    acc0 = jnp.zeros((cores, bsz, num_pools + max(1, int(trash_rows)), kpool, d), F32)
     kernel = functools.partial(
         _bwd_kernel, qb=qb, g_sz=g_sz, ng=ng, kpool=kpool, pack=pack, scale=float(scale), ns=ns, nb=nb, nbuf=nbuf,
         num_pools=num_pools,
@@ -463,11 +474,11 @@ def fused_bwd_vmem_bytes(g_sz: int, *, kpool: int, head_dim: int, num_heads: int
     return fixed + rows + live
 
 
-def fused_rows(latent: jax.Array, *, kpool: int, cores: int) -> jax.Array:
-    """``[cores, B, P + 1, 2, kpool, D]`` fp32 rows (zero accumulator, key) per pool; row ``P`` is the zero trash row."""
+def fused_rows(latent: jax.Array, *, kpool: int, cores: int, trash_rows: int = TRASH_ROWS) -> jax.Array:
+    """``[cores, B, P + trash_rows, 2, kpool, D]`` fp32 rows (zero accumulator, key) per pool; trailing rows are zero trash rows."""
     bsz, s, d = latent.shape
     keys = latent.astype(F32).reshape(bsz, s // kpool, kpool, d)
-    keys = jnp.pad(keys, ((0, 0), (0, 1), (0, 0), (0, 0)))
+    keys = jnp.pad(keys, ((0, 0), (0, max(1, int(trash_rows))), (0, 0), (0, 0)))
     one = jnp.stack([jnp.zeros_like(keys), keys], axis=2)
     return jnp.broadcast_to(one[None], (cores, *one.shape))
 
@@ -545,7 +556,7 @@ def gather_bwd_fused(
 
     Args:
         query, meta, do, lse, delta: As in :func:`gather_bwd` (``meta`` built with ``g_sz`` slots, one group).
-        rows: :func:`fused_rows` of the latent, ``[cores, B, P + 1, 2, kpool, D]`` fp32 (donated: aliased output).
+        rows: :func:`fused_rows` of the latent, ``[cores, B, P + TRASH_ROWS, 2, kpool, D]`` fp32 (donated: aliased output).
         cores: Accumulator copies / leading parallel grid axis (``(B * N / qb) % cores == 0``).
 
     Returns:
@@ -598,6 +609,7 @@ __all__ = (
     "DEFAULT_VMEM_LIMIT",
     "FUSED_ALIGN",
     "FUSED_SPLIT",
+    "TRASH_ROWS",
     "build_meta",
     "dtype_packing",
     "fused_bwd_vmem_bytes",

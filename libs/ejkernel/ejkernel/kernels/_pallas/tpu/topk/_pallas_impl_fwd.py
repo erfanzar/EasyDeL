@@ -51,6 +51,11 @@ from ejkernel.callib import ejit
 
 _LANES = 128
 _INT_MIN = -(2**31)
+# IEEE-754 float32 -inf under _monotone_key: bits 0xFF800000 XOR 0x7FFFFFFF (signed int32),
+# and its biased representation (key XOR _INT_MIN) for unsigned radix bisection.
+_F32_NEG_INF_BITS = 0xFF800000
+_NEG_INF_KEY = (_F32_NEG_INF_BITS ^ 0x7FFFFFFF) - (1 << 32)
+_NEG_INF_BIASED = (_F32_NEG_INF_BITS ^ 0x7FFFFFFF) ^ (1 << 31)
 _CHUNK_GROUP = 4
 _MAX_BLOCK_ROWS = 64
 #: Up to this many 128-lane output blocks a masked sweep of every block is
@@ -113,12 +118,25 @@ def _threshold_topk_kernel(x_ref, idx_ref, key_ref, keys_ref, *, k: int, k_pad: 
     while n_chunks % group:
         group -= 1
 
-    def fill(c, carry):
-        start = pl.multiple_of(c * _LANES, _LANES)
-        keys_ref[:, pl.ds(start, _LANES)] = _monotone_key(x_ref[:, pl.ds(start, _LANES)])
-        return carry
+    neg_inf_key = jnp.int32(_NEG_INF_KEY)
 
-    jax.lax.fori_loop(0, n_chunks, fill, 0, unroll=group)
+    # Single fill pass: compute monotone keys and count (kc > -inf, kc >= -inf) so rows whose
+    # k-th largest element is -inf (e.g. masked causal/packed attention scores) finish bisection
+    # immediately instead of forcing the entire block through all 32 bisection passes.
+    def fill(c, accs):
+        a_gt, a_ge = accs
+        start = pl.multiple_of(c * _LANES, _LANES)
+        kc = _monotone_key(x_ref[:, pl.ds(start, _LANES)])
+        keys_ref[:, pl.ds(start, _LANES)] = kc
+        return a_gt + (kc > neg_inf_key).astype(jnp.int32), a_ge + (kc >= neg_inf_key).astype(jnp.int32)
+
+    z = jnp.zeros((rows, _LANES), jnp.int32)
+    a_gt, a_ge = jax.lax.fori_loop(0, n_chunks, fill, (z, z), unroll=group)
+    n_gt_neginf = jnp.sum(a_gt, axis=1, keepdims=True)
+    n_ge_neginf = jnp.sum(a_ge, axis=1, keepdims=True)
+    is_neginf_tau = (n_gt_neginf < k) & (n_ge_neginf >= k)
+    init_biased = jnp.where(is_neginf_tau, jnp.int32(_NEG_INF_BIASED), jnp.int32(0))
+    init_done = is_neginf_tau.astype(jnp.int32)
 
     def chunk_keys(c):
         return keys_ref[:, pl.ds(pl.multiple_of(c * _LANES, _LANES), _LANES)]
@@ -141,94 +159,132 @@ def _threshold_topk_kernel(x_ref, idx_ref, key_ref, keys_ref, *, k: int, k_pad: 
         bit, _, done = state
         return (bit < 32) & (jnp.min(done) == 0)
 
-    start = (jnp.int32(0), jnp.zeros((rows, 1), jnp.int32), jnp.zeros((rows, 1), jnp.int32))
-    _, biased, _ = jax.lax.while_loop(unfinished, bisect, start)
+    _, biased, _ = jax.lax.while_loop(unfinished, bisect, (jnp.int32(0), init_biased, init_done))
     tau = biased ^ jnp.int32(_INT_MIN)
-    need = k - count(lambda kc: kc > tau)
-    take_all_ties = jnp.all(count(lambda kc: kc == tau) == need)
+
+    # Single fused pass for both count(kc > tau) and count(kc == tau).
+    def gt_eq_body(c, accs):
+        agt, aeq = accs
+        kc = chunk_keys(c)
+        return agt + (kc > tau).astype(jnp.int32), aeq + (kc == tau).astype(jnp.int32)
+
+    agt, aeq = jax.lax.fori_loop(0, n_chunks, gt_eq_body, (z, z), unroll=group)
+    need = k - jnp.sum(agt, axis=1, keepdims=True)
+    take_all_ties = jnp.all(jnp.sum(aeq, axis=1, keepdims=True) == need)
 
     idx_ref[...] = jnp.zeros((rows, k_pad), jnp.int32)
     key_ref[...] = jnp.full((rows, k_pad), _INT_MIN, jnp.int32)
     out_lane = jax.lax.broadcasted_iota(jnp.int32, (rows, k_pad), 1)
+    n_groups = n_chunks // group
 
-    def compact_group(g, carry, exact_ties: bool):
-        offset, ties = carry
-        chunks = [g * group + j for j in range(group)]
-        kcs = [chunk_keys(c) for c in chunks]
-        sels = []
-        for kc in kcs:
-            if exact_ties:
-                eq = (kc == tau).astype(jnp.int32)
-                tie_rank = _prefix_sum_lanes(eq, lane) - eq + ties
-                sels.append(((kc > tau) | ((eq == 1) & (tie_rank < need))).astype(jnp.int32))
-                ties = ties + jnp.sum(eq, axis=1, keepdims=True)
-            else:
-                sels.append((kc >= tau).astype(jnp.int32))
-        incls = [_prefix_sum_lanes(sel, lane) for sel in sels]
-        # Source lane of the t-th selected key: the first lane with incl >= t + 1.
-        poss = [jnp.zeros((rows, _LANES), jnp.int32) for _ in kcs]
-        step = _LANES // 2
-        while step >= 1:
-            probes = [
-                jnp.take_along_axis(incl, pos + step - 1, axis=1, mode="promise_in_bounds")
-                for incl, pos in zip(incls, poss, strict=True)
-            ]
-            poss = [jnp.where(probe < lane + 1, pos + step, pos) for probe, pos in zip(probes, poss, strict=True)]
-            step //= 2
-        sources = []
-        start = offset
-        for c, kc, pos, incl in zip(chunks, kcs, poss, incls, strict=True):
-            cnt = incl[:, _LANES - 1 :]
-            rotate = (lane - offset) & (_LANES - 1)
-            src_idx = jnp.take_along_axis(c * _LANES + pos, rotate, axis=1, mode="promise_in_bounds")
-            src_key = jnp.take_along_axis(
-                jnp.take_along_axis(kc, pos, axis=1, mode="promise_in_bounds"),
-                rotate,
-                axis=1,
-                mode="promise_in_bounds",
-            )
-            sources.append((offset, cnt, src_idx, src_key))
-            offset = offset + cnt
+    def run_compact(exact_ties: bool):
+        def cond(state):
+            g, offset, _ = state
+            return (g < n_groups) & (jnp.min(offset) < k)
 
-        if k_pad // _LANES > _FULL_MERGE_MAX_BLOCKS:
-            # Rows advance at similar rates, so a group lands in a few output
-            # blocks; merging only those beats sweeping every block for large k.
-            first_block = jnp.min(start) // _LANES
-            last_block = jnp.minimum((jnp.max(offset) - 1) // _LANES, k_pad // _LANES - 1)
+        def body(state):
+            g, offset, ties = state
+            chunks = [g * group + j for j in range(group)]
+            kcs = [chunk_keys(c) for c in chunks]
+            sels = []
+            for kc in kcs:
+                if exact_ties:
+                    eq = (kc == tau).astype(jnp.int32)
 
-            def merge(block, carry):
-                base = pl.multiple_of(block * _LANES, _LANES)
-                out_pos = base + lane
-                blk_idx = idx_ref[:, pl.ds(base, _LANES)]
-                blk_key = key_ref[:, pl.ds(base, _LANES)]
-                for off, cnt, src_idx, src_key in sources:
-                    hit = (out_pos >= off) & (out_pos < off + cnt)
-                    blk_idx = jnp.where(hit, src_idx, blk_idx)
-                    blk_key = jnp.where(hit, src_key, blk_key)
-                idx_ref[:, pl.ds(base, _LANES)] = blk_idx
-                key_ref[:, pl.ds(base, _LANES)] = blk_key
-                return carry
+                    def _with_ties(args, _kc=kc):
+                        eq_in, ties_in = args
+                        tr = _prefix_sum_lanes(eq_in, lane) - eq_in + ties_in
+                        sel_t = ((_kc > tau) | ((eq_in == 1) & (tr < need))).astype(jnp.int32)
+                        return sel_t, ties_in + jnp.sum(eq_in, axis=1, keepdims=True)
 
-            jax.lax.fori_loop(first_block, last_block + 1, merge, 0)
-        else:
-            new_idx, new_key = idx_ref[...], key_ref[...]
-            for off, cnt, src_idx, src_key in sources:
-                hit = (out_lane >= off) & (out_lane < off + cnt)
-                new_idx = jnp.where(hit, jnp.tile(src_idx, (1, k_pad // _LANES)), new_idx)
-                new_key = jnp.where(hit, jnp.tile(src_key, (1, k_pad // _LANES)), new_key)
-            idx_ref[...] = new_idx
-            key_ref[...] = new_key
-        return offset, ties
+                    def _no_ties(args, _kc=kc):
+                        _, ties_in = args
+                        return (_kc > tau).astype(jnp.int32), ties_in
 
-    init = (jnp.zeros((rows, 1), jnp.int32), jnp.zeros((rows, 1), jnp.int32))
+                    need_ties = (jnp.max(eq) > 0) & (jnp.min((ties >= need).astype(jnp.int32)) == 0)
+                    sel_c, ties = jax.lax.cond(need_ties, _with_ties, _no_ties, (eq, ties))
+                    sels.append(sel_c)
+                else:
+                    sels.append((kc >= tau).astype(jnp.int32))
+
+            any_sel = sels[0]
+            for s in sels[1:]:
+                any_sel = any_sel | s
+            has_any = jnp.max(any_sel) > 0
+
+            def do_compact(off_in):
+                incls = [_prefix_sum_lanes(sel, lane) for sel in sels]
+                # Source lane of the t-th selected key: the first lane with incl >= t + 1.
+                poss = [jnp.zeros((rows, _LANES), jnp.int32) for _ in kcs]
+                step = _LANES // 2
+                while step >= 1:
+                    probes = [
+                        jnp.take_along_axis(incl, pos + step - 1, axis=1, mode="promise_in_bounds")
+                        for incl, pos in zip(incls, poss, strict=True)
+                    ]
+                    poss = [
+                        jnp.where(probe < lane + 1, pos + step, pos) for probe, pos in zip(probes, poss, strict=True)
+                    ]
+                    step //= 2
+                sources = []
+                start_off = off_in
+                cur_off = off_in
+                for c, kc, pos, incl in zip(chunks, kcs, poss, incls, strict=True):
+                    cnt = incl[:, _LANES - 1 :]
+                    rotate = (lane - cur_off) & (_LANES - 1)
+                    src_idx = jnp.take_along_axis(c * _LANES + pos, rotate, axis=1, mode="promise_in_bounds")
+                    src_key = jnp.take_along_axis(
+                        jnp.take_along_axis(kc, pos, axis=1, mode="promise_in_bounds"),
+                        rotate,
+                        axis=1,
+                        mode="promise_in_bounds",
+                    )
+                    sources.append((cur_off, cnt, src_idx, src_key))
+                    cur_off = cur_off + cnt
+
+                if k_pad // _LANES > _FULL_MERGE_MAX_BLOCKS:
+                    # Rows advance at similar rates, so a group lands in a few output
+                    # blocks; merging only those beats sweeping every block for large k.
+                    first_block = jnp.min(start_off) // _LANES
+                    last_block = jnp.minimum((jnp.max(cur_off) - 1) // _LANES, k_pad // _LANES - 1)
+
+                    def merge(block, carry):
+                        base = pl.multiple_of(block * _LANES, _LANES)
+                        out_pos = base + lane
+                        blk_idx = idx_ref[:, pl.ds(base, _LANES)]
+                        blk_key = key_ref[:, pl.ds(base, _LANES)]
+                        for off, cnt, src_idx, src_key in sources:
+                            hit = (out_pos >= off) & (out_pos < off + cnt)
+                            blk_idx = jnp.where(hit, src_idx, blk_idx)
+                            blk_key = jnp.where(hit, src_key, blk_key)
+                        idx_ref[:, pl.ds(base, _LANES)] = blk_idx
+                        key_ref[:, pl.ds(base, _LANES)] = blk_key
+                        return carry
+
+                    jax.lax.fori_loop(first_block, last_block + 1, merge, 0)
+                else:
+                    new_idx, new_key = idx_ref[...], key_ref[...]
+                    for off, cnt, src_idx, src_key in sources:
+                        hit = (out_lane >= off) & (out_lane < off + cnt)
+                        new_idx = jnp.where(hit, jnp.tile(src_idx, (1, k_pad // _LANES)), new_idx)
+                        new_key = jnp.where(hit, jnp.tile(src_key, (1, k_pad // _LANES)), new_key)
+                    idx_ref[...] = new_idx
+                    key_ref[...] = new_key
+                return cur_off
+
+            offset = jax.lax.cond(has_any, do_compact, lambda o: o, offset)
+            return g + 1, offset, ties
+
+        init = (jnp.int32(0), jnp.zeros((rows, 1), jnp.int32), jnp.zeros((rows, 1), jnp.int32))
+        jax.lax.while_loop(cond, body, init)
 
     @pl.when(take_all_ties)
     def _():
-        jax.lax.fori_loop(0, n_chunks // group, functools.partial(compact_group, exact_ties=False), init)
+        run_compact(False)
 
     @pl.when(jnp.logical_not(take_all_ties))
     def _():
-        jax.lax.fori_loop(0, n_chunks // group, functools.partial(compact_group, exact_ties=True), init)
+        run_compact(True)
 
 
 def _threshold_topk_fwd_impl(operand: Array, k: int) -> tuple[Array, Array]:
