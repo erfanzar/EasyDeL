@@ -32,10 +32,16 @@ members keep serving.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
+import mmap
+import os
+import struct
 import threading
+import time
 import typing
+import weakref
 from collections import OrderedDict
 
 from ..logger import logger
@@ -50,6 +56,125 @@ if typing.TYPE_CHECKING:
 _DEFAULT_BLOCK_CHARS = 512
 #: Longest prefix (in blocks) tracked per prompt.
 _MAX_BLOCKS_PER_PROMPT = 32
+#: Maximum canonical replica slots tracked per front in the shared mmap table.
+_SHARED_MAX_MEMBERS = 64
+#: Leading bytes per front row holding the owning front PID (int64, 0 when unowned/closed).
+_SHARED_HEADER_BYTES = 8
+#: Bytes of per-member int32 inflight counts in one front row.
+_SHARED_COUNTS_BYTES = _SHARED_MAX_MEMBERS * 4
+#: Total bytes per front row in ``router_inflight.bin`` (8-byte aligned).
+_SHARED_ROW_BYTES = _SHARED_HEADER_BYTES + _SHARED_COUNTS_BYTES
+#: Whether Linux procfs ``/proc/<pid>/stat`` is available for zombie detection.
+_HAS_PROC_SELF_STAT = os.path.exists("/proc/self/stat")
+#: How long a peer front PID's liveness result is cached per router before re-probing.
+_PID_ALIVE_TTL_S = 0.25
+
+
+def _allocate_shared_file(fd: int, size: int) -> None:
+    """Ensure ``fd`` has at least ``size`` backing bytes (avoiding sparse-file SIGBUS when supported)."""
+    if os.fstat(fd).st_size >= size:
+        return
+    fallocate = getattr(os, "posix_fallocate", None)
+    if fallocate is not None:
+        try:
+            fallocate(fd, 0, size)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS):
+                raise
+    if os.fstat(fd).st_size < size:
+        os.ftruncate(fd, size)
+
+
+def _clear_shared_row_buf(buf: mmap.mmap, front_index: int, *, expected_pid: int | None = None) -> bool:
+    """Clear owner PID first, then zero every member counter for ``front_index``."""
+    row_off = front_index * _SHARED_ROW_BYTES
+    if expected_pid is not None:
+        owner_pid = struct.unpack_from("<q", buf, row_off)[0]
+        if owner_pid != int(expected_pid):
+            return False
+    struct.pack_into("<q", buf, row_off, 0)
+    counts_off = row_off + _SHARED_HEADER_BYTES
+    buf[counts_off : counts_off + _SHARED_COUNTS_BYTES] = b"\x00" * _SHARED_COUNTS_BYTES
+    return True
+
+
+def _close_shared_buf(buf: mmap.mmap, front_index: int, owner_pid: int | None = None) -> None:
+    """Best-effort clear + close for a front's shared inflight mmap buffer."""
+    try:
+        if not buf.closed:
+            _clear_shared_row_buf(buf, front_index, expected_pid=owner_pid)
+            buf.close()
+    except Exception:
+        logger.debug("Shared inflight table cleanup failed", exc_info=True)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return whether ``pid`` is a live, non-zombie same-user process."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # router_inflight.bin is 0o600 in a 0o700 dir; peer fronts always share our UID.
+        # PermissionError means the original front exited and its PID was recycled by another user.
+        return False
+    except OSError:
+        return False
+    # On Linux, an unreaped crashed child (zombie) still responds to kill(pid, 0).
+    if _HAS_PROC_SELF_STAT:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                stat = fh.read()
+            rparen = stat.rfind(b")")
+            if rparen != -1:
+                rest = stat[rparen + 1 :].lstrip()
+                if rest and rest[:1] in (b"Z", b"X", b"x"):
+                    return False
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
+    return True
+
+
+def clear_shared_inflight_row(
+    shared_inflight_dir: str | os.PathLike[str] | None,
+    front_index: int,
+    front_count: int,
+    *,
+    expected_pid: int | None = None,
+) -> bool:
+    """Zero one front's row in ``router_inflight.bin`` (e.g. when a supervisor reaps a crashed front).
+
+    When ``expected_pid`` is supplied, the row is only cleared if its recorded
+    owner PID matches, avoiding any race with a newly restarted front on the
+    same ``front_index``.
+    """
+    shared_dir = "" if shared_inflight_dir is None else os.fspath(shared_inflight_dir).strip()
+    idx = int(front_index)
+    count = max(1, int(front_count))
+    if not shared_dir or count <= 1 or not (0 <= idx < count):
+        return False
+    path = os.path.join(shared_dir, "router_inflight.bin")
+    size = count * _SHARED_ROW_BYTES
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if os.fstat(fd).st_size < size:
+            return False
+        with mmap.mmap(fd, size) as buf:
+            return _clear_shared_row_buf(buf, idx, expected_pid=expected_pid)
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
 
 
 class PrefixAffinityMap:
@@ -124,13 +249,16 @@ class _SlotCounter:
 
     Pinned to the member instance rather than its slot index so that
     :meth:`RoutedEngine.replace_member` gives the replacement a fresh counter
-    and unwinding requests from the old member never decrement the replacement.
+    and unwinding requests from the old member never decrement the replacement
+    or clobber its shared mmap count.
     """
 
-    __slots__ = ("count",)
+    __slots__ = ("active", "count", "member_id")
 
-    def __init__(self) -> None:
+    def __init__(self, member_id: int = 0) -> None:
         self.count = 0
+        self.member_id = int(member_id)
+        self.active = True
 
 
 class _ReleasedIterator:
@@ -211,11 +339,23 @@ class RoutedEngine:
         affinity_block_chars: Prefix block width for the affinity map;
             defaults to a page-size-derived estimate when a member reports
             one (≈4 characters per token), else ``512`` characters.
-        affinity_max_imbalance: How many more router-local in-flight requests
+        affinity_max_imbalance: How many more in-flight requests (router-local,
+            or summed across peer fronts when ``shared_inflight_dir`` is active)
             the prefix-pinned member may hold than the least-loaded live member
             before affinity yields to join-shortest-queue. A prefix shared by a
             burst (one system prompt, one benchmark prompt) otherwise lands
             every request on one member while the others idle.
+        planned_members: Optional total replica count expected for the
+            deployment (used to size ``max_num_seqs`` and tie-breaking while
+            late replicas are still attaching).
+        tie_breaker_offset: Per-front rotation offset applied to canonical
+            ``member_id`` when breaking equal-load ties.
+        shared_inflight_dir: Optional directory for ``router_inflight.bin``
+            used to sum live in-flight counts across ``front_count`` host fronts.
+        front_index: Zero-based index of this front in ``[0, front_count)``.
+        front_count: Total number of peer fronts sharing ``shared_inflight_dir``.
+        member_ids: Optional canonical replica index per initial member
+            (defaults to ``0..len(members)-1``).
     """
 
     def __init__(
@@ -225,6 +365,11 @@ class RoutedEngine:
         affinity_block_chars: int | None = None,
         affinity_max_imbalance: int = 4,
         planned_members: int | None = None,
+        tie_breaker_offset: int = 0,
+        shared_inflight_dir: str | os.PathLike[str] | None = None,
+        front_index: int = 0,
+        front_count: int = 1,
+        member_ids: typing.Sequence[int] | None = None,
     ) -> None:
         if not members:
             raise ValueError("RoutedEngine needs at least one member")
@@ -233,18 +378,153 @@ class RoutedEngine:
         if planned_members is not None and int(planned_members) < len(members):
             raise ValueError(f"planned_members={planned_members} is below the {len(members)} members given")
         self.members = list(members)
+        if member_ids is None:
+            resolved_member_ids = list(range(len(self.members)))
+        else:
+            resolved_member_ids = [int(mid) for mid in member_ids]
+            if len(resolved_member_ids) != len(self.members):
+                raise ValueError(
+                    f"member_ids length ({len(resolved_member_ids)}) must match members length ({len(self.members)})"
+                )
+            seen_ids: set[int] = set()
+            for mid in resolved_member_ids:
+                if mid < 0:
+                    raise ValueError(f"member_id must be >= 0, got {mid}")
+                if mid in seen_ids:
+                    raise ValueError(f"duplicate member_id: {mid}")
+                seen_ids.add(mid)
         self.planned_members = None if planned_members is None else int(planned_members)
         self.affinity_max_imbalance = int(affinity_max_imbalance)
+        self._tie_breaker_offset = int(tie_breaker_offset)
+        self._front_index = int(front_index)
+        self._front_count = max(1, int(front_count))
+        self._shared_buf: mmap.mmap | None = None
+        self._shared_owner_pid: int | None = None
+        self._shared_finalizer: weakref.finalize | None = None
+        self._pid_alive_cache: dict[int, tuple[bool, float]] = {}
+        self._warned_shared_overflow = False
+        shared_dir = "" if shared_inflight_dir is None else os.fspath(shared_inflight_dir).strip()
+        if shared_dir and self._front_count > 1:
+            if not (0 <= self._front_index < self._front_count):
+                logger.warning(
+                    "RoutedEngine front_index=%d is outside [0, %d); disabling shared inflight table",
+                    self._front_index,
+                    self._front_count,
+                )
+            else:
+                try:
+                    os.makedirs(shared_dir, exist_ok=True)
+                    path = os.path.join(shared_dir, "router_inflight.bin")
+                    size = self._front_count * _SHARED_ROW_BYTES
+                    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                    try:
+                        _allocate_shared_file(fd, size)
+                        self._shared_buf = mmap.mmap(fd, size)
+                    finally:
+                        os.close(fd)
+                    owner_pid = os.getpid()
+                    _clear_shared_row_buf(self._shared_buf, self._front_index)
+                    struct.pack_into("<q", self._shared_buf, self._front_index * _SHARED_ROW_BYTES, owner_pid)
+                    self._shared_owner_pid = owner_pid
+                    self._shared_finalizer = weakref.finalize(
+                        self, _close_shared_buf, self._shared_buf, self._front_index, owner_pid
+                    )
+                except (OSError, ValueError):
+                    logger.debug(
+                        "Could not open shared router inflight table; falling back to local counts", exc_info=True
+                    )
+                    if self._shared_buf is not None:
+                        _close_shared_buf(self._shared_buf, self._front_index, self._shared_owner_pid)
+                    self._shared_buf = None
+                    self._shared_owner_pid = None
+                    self._shared_finalizer = None
         if affinity_block_chars is None:
             page_size = next((int(getattr(m, "page_size", 0) or 0) for m in self.members), 0)
             affinity_block_chars = page_size * 4 if page_size > 0 else _DEFAULT_BLOCK_CHARS
         self.affinity = PrefixAffinityMap(block_chars=affinity_block_chars)
         self._route_lock = threading.Lock()
-        # Router-local in-flight counts (one _SlotCounter per member instance):
+        # Per-member-instance in-flight counts (one _SlotCounter per member):
         # the JSQ primary signal. Remote QueueStats ride 1s heartbeats, so a
         # burst arriving between beats would otherwise dump entirely on the
-        # lowest-indexed member.
-        self._slot_counters: list[_SlotCounter] = [_SlotCounter() for _ in self.members]
+        # lowest-indexed member. When multiple host fronts share a mmap table,
+        # each front writes its own row and sums all live fronts lock-free.
+        self._slot_counters: list[_SlotCounter] = [_SlotCounter(member_id=mid) for mid in resolved_member_ids]
+        for mid in resolved_member_ids:
+            self._warn_shared_overflow_locked(mid)
+
+    def _warn_shared_overflow_locked(self, member_id: int) -> None:
+        if self._shared_buf is not None and member_id >= _SHARED_MAX_MEMBERS and not self._warned_shared_overflow:
+            self._warned_shared_overflow = True
+            logger.warning(
+                "RoutedEngine member_id=%d exceeds shared inflight table capacity (%d); "
+                "falling back to router-local counts while out-of-range members are live",
+                member_id,
+                _SHARED_MAX_MEMBERS,
+            )
+
+    def _write_shared_member_locked(self, member_id: int) -> None:
+        buf = self._shared_buf
+        if buf is None or not (0 <= member_id < _SHARED_MAX_MEMBERS):
+            return
+        local_total = sum(c.count for c in self._slot_counters if c.member_id == member_id)
+        offset = self._front_index * _SHARED_ROW_BYTES + _SHARED_HEADER_BYTES + member_id * 4
+        struct.pack_into("<i", buf, offset, local_total)
+
+    def _sync_shared_locked(self, counter: _SlotCounter) -> None:
+        if not counter.active:
+            return
+        self._write_shared_member_locked(counter.member_id)
+
+    def _is_peer_pid_alive_locked(self, owner_pid: int, *, now: float) -> bool:
+        cached = self._pid_alive_cache.get(owner_pid)
+        if cached is not None:
+            alive, checked_at = cached
+            if now - checked_at < _PID_ALIVE_TTL_S:
+                return alive
+        alive = _is_pid_alive(owner_pid)
+        if len(self._pid_alive_cache) >= max(32, self._front_count * 4):
+            self._pid_alive_cache.clear()
+        self._pid_alive_cache[owner_pid] = (alive, now)
+        return alive
+
+    def _total_inflight_locked(self, slot: int, *, now: float | None = None) -> int:
+        counter = self._slot_counters[slot]
+        buf = self._shared_buf
+        mid = counter.member_id
+        if buf is None or not (0 <= mid < _SHARED_MAX_MEMBERS):
+            return counter.count
+        total = sum(c.count for c in self._slot_counters if c.member_id == mid)
+        check_now = time.monotonic() if now is None else now
+        for f in range(self._front_count):
+            if f == self._front_index:
+                continue
+            row_off = f * _SHARED_ROW_BYTES
+            owner_pid = struct.unpack_from("<q", buf, row_off)[0]
+            if owner_pid <= 0:
+                continue
+            val = struct.unpack_from("<i", buf, row_off + _SHARED_HEADER_BYTES + mid * 4)[0]
+            if val <= 0:
+                continue
+            if self._is_peer_pid_alive_locked(owner_pid, now=check_now):
+                total += val
+        return total
+
+    def set_member_id(self, slot: int, member_id: int) -> None:
+        """Bind a member slot to its canonical replica index for cross-front accounting."""
+        mid = int(member_id)
+        if mid < 0:
+            raise ValueError(f"member_id must be >= 0, got {member_id}")
+        with self._route_lock:
+            counter = self._slot_counters[slot]
+            old_id = counter.member_id
+            if old_id == mid:
+                return
+            if any(i != slot and c.member_id == mid for i, c in enumerate(self._slot_counters)):
+                raise ValueError(f"duplicate member_id: {mid}")
+            counter.member_id = mid
+            self._warn_shared_overflow_locked(mid)
+            self._write_shared_member_locked(old_id)
+            self._write_shared_member_locked(mid)
 
     @property
     def _inflight(self) -> list[int]:
@@ -252,23 +532,46 @@ class RoutedEngine:
         with self._route_lock:
             return [counter.count for counter in self._slot_counters]
 
-    def add_member(self, member) -> int:
+    def add_member(self, member, *, member_id: int | None = None) -> int:
         """Attach a member that came up after the router started serving (a late replica).
 
         Returns:
             The new member's index.
         """
         with self._route_lock:
+            slot = len(self.members)
+            used_ids = {c.member_id for c in self._slot_counters}
+            if member_id is None:
+                if slot not in used_ids:
+                    mid = slot
+                else:
+                    mid = 0
+                    while mid in used_ids:
+                        mid += 1
+            else:
+                mid = int(member_id)
+                if mid < 0:
+                    raise ValueError(f"member_id must be >= 0, got {member_id}")
+                if mid in used_ids:
+                    raise ValueError(f"duplicate member_id: {mid}")
             # In-flight first: a reader that sees the member under the lock also sees its counter.
-            self._slot_counters.append(_SlotCounter())
+            counter = _SlotCounter(member_id=mid)
+            self._slot_counters.append(counter)
             self.members.append(member)
-            return len(self.members) - 1
+            self._warn_shared_overflow_locked(mid)
+            self._sync_shared_locked(counter)
+            return slot
 
     def replace_member(self, index: int, member) -> None:
         """Put a fresh member in a dead member's slot (a replica that came back on the same address)."""
         with self._route_lock:
+            old_counter = self._slot_counters[index]
+            old_counter.active = False
+            mid = old_counter.member_id
             self.members[index] = member
-            self._slot_counters[index] = _SlotCounter()
+            counter = _SlotCounter(member_id=mid)
+            self._slot_counters[index] = counter
+            self._sync_shared_locked(counter)
         self.affinity.drop_member(index)
 
     def _pick_member_locked(self, pinned: int | None) -> tuple[int | None, list[int]]:
@@ -287,16 +590,27 @@ class RoutedEngine:
                 dead.append(index)
         if not alive:
             return None, dead
+        use_shared = self._shared_buf is not None and all(
+            0 <= self._slot_counters[index].member_id < _SHARED_MAX_MEMBERS for index in alive
+        )
+        if use_shared:
+            now = time.monotonic()
+            loads = {index: self._total_inflight_locked(index, now=now) for index in alive}
+        else:
+            loads = {index: self._slot_counters[index].count for index in alive}
         if pinned is not None and pinned in alive:
-            least = min(self._slot_counters[index].count for index in alive)
-            if self._slot_counters[pinned].count - least <= self.affinity_max_imbalance:
+            least = min(loads[index] for index in alive)
+            if loads[pinned] - least <= self.affinity_max_imbalance:
                 return pinned, dead
+        max_mid = max(self._slot_counters[index].member_id for index in alive)
+        span = max(1, self.planned_members or 0, len(self.members), max_mid + 1)
         chosen = min(
             alive,
             key=lambda index: (
-                self._slot_counters[index].count,
+                loads[index],
                 _member_pending_prefill_tokens(self.members[index]),
-                index,
+                (self._slot_counters[index].member_id - self._tie_breaker_offset) % span,
+                self._slot_counters[index].member_id,
             ),
         )
         return chosen, dead
@@ -318,16 +632,20 @@ class RoutedEngine:
 
     def _acquire(self, member_index: int) -> None:
         with self._route_lock:
-            self._slot_counters[member_index].count += 1
+            counter = self._slot_counters[member_index]
+            counter.count += 1
+            self._sync_shared_locked(counter)
 
     def _release(self, member_index: int) -> None:
         with self._route_lock:
             counter = self._slot_counters[member_index]
             counter.count = max(0, counter.count - 1)
+            self._sync_shared_locked(counter)
 
     def _release_counter(self, counter: _SlotCounter) -> None:
         with self._route_lock:
             counter.count = max(0, counter.count - 1)
+            self._sync_shared_locked(counter)
 
     def _select_and_acquire(self, prompt: str) -> tuple[int, typing.Any, _SlotCounter]:
         """Atomically select a live member, increment its counter, and record prefix affinity."""
@@ -338,6 +656,7 @@ class RoutedEngine:
                 member = self.members[member_index]
                 counter = self._slot_counters[member_index]
                 counter.count += 1
+                self._sync_shared_locked(counter)
         for index in dead:
             self.affinity.drop_member(index)
         if member_index is None:
@@ -348,13 +667,14 @@ class RoutedEngine:
     def select_member(self, prompt: str) -> int:
         """Pick the member for one prompt: bounded prefix affinity, then JSQ.
 
-        The prefix-pinned member wins while its router-local in-flight count
-        is at most ``affinity_max_imbalance`` above the least-loaded live
-        member's; beyond that the request joins the shortest queue (the
-        caller then re-pins the prefix there). The queue key is (router-local
-        in-flight, owner-reported pending prefill tokens, index): the local
-        count is instantaneous, the remote signal covers load from other
-        clients.
+        The prefix-pinned member wins while its in-flight count (router-local,
+        or summed across live peer fronts when ``shared_inflight_dir`` is
+        active) is at most ``affinity_max_imbalance`` above the least-loaded
+        live member's; beyond that the request joins the shortest queue (the
+        caller then re-pins the prefix there). The queue key is (in-flight
+        count, owner-reported pending prefill tokens, rotated canonical
+        ``member_id``, ``member_id``): the in-flight count is instantaneous,
+        and the remote signal covers load from other clients.
 
         Args:
             prompt: The incoming prompt text.
@@ -626,7 +946,9 @@ class RoutedEngine:
 
     def abort_request(self, request_id: str) -> None:
         """Cancel a request wherever it landed (no-op on non-owners)."""
-        for member in self.members:
+        with self._route_lock:
+            members = list(self.members)
+        for member in members:
             try:
                 member.abort_request(request_id)
             except Exception:
@@ -634,7 +956,19 @@ class RoutedEngine:
 
     def close(self) -> None:
         """Close remote members (local engines are left to their owners)."""
-        for member in self.members:
+        with self._route_lock:
+            finalizer = self._shared_finalizer
+            self._shared_finalizer = None
+            if finalizer is not None:
+                finalizer.detach()
+            buf = self._shared_buf
+            self._shared_buf = None
+            owner_pid = self._shared_owner_pid
+            self._shared_owner_pid = None
+            members = list(self.members)
+            if buf is not None:
+                _close_shared_buf(buf, self._front_index, owner_pid)
+        for member in members:
             close = getattr(member, "close", None)
             if close is not None:
                 try:

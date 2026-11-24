@@ -23,12 +23,14 @@ unchanged to the underlying XLA forward implementation in ``_xla_impl_fwd``.
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_fwd import ragged_gated_delta_rule_v2 as _ragged_gated_delta_rule_v2_xla
+from ._xla_impl_fwd import ragged_gdn_conv_decode_xla as _ragged_gdn_conv_decode_xla
 
 
 @kernel_registry.register("ragged_gated_delta_rule_v2", Platform.XLA, Backend.ANY)
@@ -102,7 +104,7 @@ def ragged_gated_delta_rule_v2(
         has_initial_state: Optional boolean flags per request indicating which
             carry a non-empty initial recurrent state, shape
             ``(num_requests,)``. Defaults to all-``True`` when ``None``;
-            currently only consumed for that default.
+            consumed to zero stale slots when ``mask_initial_state=True``.
         n_kq: Number of key/query heads before GQA-style head expansion.
         n_v: Number of value heads after head expansion (``num_value_heads``).
         d_k: Per-head key/query dimension (``qk_head_dim``).
@@ -156,4 +158,54 @@ def ragged_gated_delta_rule_v2(
         use_recurrent_scan_prefill=use_recurrent_scan_prefill,
         mask_initial_state=mask_initial_state,
         runtime_dtype=runtime_dtype,
+    )
+
+
+@kernel_registry.register("ragged_gdn_conv_decode", Platform.XLA, Backend.ANY, priority=0)
+@jaxtyping.jaxtyped(typechecker=beartype)
+def ragged_gdn_conv_decode(
+    conv_input: Float[Array, "num_tokens conv_dim"],
+    b_raw: Float[Array, "num_tokens num_value_heads"],
+    a_raw: Float[Array, "num_tokens num_value_heads"],
+    conv_weight: Float[Array, "conv_dim d_conv"],
+    conv_pool: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_pool: Float[Array, "num_slots num_value_heads qk_head_dim v_head_dim"],
+    A_log: Float[Array, "num_value_heads"],
+    dt_bias: Float[Array, "num_value_heads"],
+    token_slots: Int[Array, "num_tokens"],
+    token_init: Bool[Array, "num_tokens"],
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    use_qk_l2norm: bool = True,
+    apply_silu: bool = True,
+    conv_output_dtype: object | None = None,
+    out_dtype: object = jnp.float32,
+) -> tuple[
+    Float[Array, "num_tokens num_value_heads v_head_dim"],
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_value_heads qk_head_dim v_head_dim"],
+]:
+    """Run fused causal Conv1D + SiLU + L2Norm + GDN decode on XLA."""
+    return _ragged_gdn_conv_decode_xla(
+        conv_input,
+        b_raw,
+        a_raw,
+        conv_weight,
+        conv_pool,
+        recurrent_pool,
+        A_log,
+        dt_bias,
+        token_slots,
+        token_init,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        use_qk_l2norm=use_qk_l2norm,
+        apply_silu=apply_silu,
+        conv_output_dtype=conv_output_dtype,
+        out_dtype=out_dtype,
     )

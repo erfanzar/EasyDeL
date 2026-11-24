@@ -1075,8 +1075,42 @@ def _metadata_has_compound_axis_names(metadata: Mapping[str, tp.Any]) -> bool:
         return False
 
 
+def _make_jit_key_user_context(name: str, default_value: bool = False) -> tuple[tp.Any, tp.Any]:
+    """Build a JAX ``include_in_jit_key=True`` user context (or legacy xla_client fallback)."""
+    try:
+        return jax.make_user_context(default_value=default_value), None
+    except AttributeError:  # pragma: no cover - older JAX fallback
+        pass
+    try:
+        from jax._src.lib import xla_client as _xla_client
+
+        return None, _xla_client._xla.config.Config(name, default_value, include_in_jit_key=True)
+    except Exception:  # pragma: no cover - defensive fallback
+        return None, None
+
+
+@contextmanager
+def _enter_jit_key_context(user_ctx: tp.Any, legacy_state: tp.Any, value: bool) -> tp.Iterator[None]:
+    """Activate ``user_ctx`` via its public context manager, or fall back to legacy xla_client state."""
+    if user_ctx is not None:
+        with user_ctx(value):
+            yield
+        return
+    if legacy_state is not None:
+        previous_state = legacy_state.swap_local(value)
+        try:
+            yield
+        finally:
+            legacy_state.set_local(previous_state)
+        return
+    yield
+
+
 _decode_mode_specs_var: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "easydel_decode_mode_specs", default=False
+)
+_JAX_DECODE_MODE_SPECS, _DECODE_MODE_SPECS_LEGACY_STATE = _make_jit_key_user_context(
+    "easydel_decode_mode_specs_state", default_value=False
 )
 
 
@@ -1097,15 +1131,21 @@ def decode_mode_specs(enabled: bool = True) -> tp.Iterator[bool]:
     (435 -> 482 collectives: the RMSNorm all-reduces anchor to the MoE
     shard_map out_spec, not to constraints) — keep the two in sync.
 
+    Mirrored into a JAX ``include_in_jit_key=True`` user context so toggling
+    this scope invalidates ``jax.jit`` cache keys when a shared jitted
+    callable is invoked both inside and outside ``decode_mode_specs(True)``.
+
     Args:
         enabled: Whether the forcing is active inside the block.
 
     Yields:
         The ``enabled`` value.
     """
-    token = _decode_mode_specs_var.set(bool(enabled))
+    flag = bool(enabled)
+    token = _decode_mode_specs_var.set(flag)
     try:
-        yield bool(enabled)
+        with _enter_jit_key_context(_JAX_DECODE_MODE_SPECS, _DECODE_MODE_SPECS_LEGACY_STATE, flag):
+            yield flag
     finally:
         _decode_mode_specs_var.reset(token)
 
@@ -1131,6 +1171,9 @@ _inference_mode_forces_decode = inference_mode_forces_decode
 _single_token_rows_var: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "easydel_single_token_rows", default=False
 )
+_JAX_SINGLE_TOKEN_ROWS, _SINGLE_TOKEN_ROWS_LEGACY_STATE = _make_jit_key_user_context(
+    "easydel_single_token_rows_state", default_value=False
+)
 
 
 @dataclasses.dataclass(slots=True)
@@ -1154,15 +1197,20 @@ def single_token_rows(enabled: bool = True) -> tp.Iterator[bool]:
     path at run time (a ``lax.cond`` on the row lengths) can take it statically there, without the conditional and the
     copies of the state it carries. Outside the scope :func:`inference_mode_single_token_rows` is ``False``.
 
+    Mirrored into a JAX ``include_in_jit_key=True`` user context so toggling this scope invalidates ``jax.jit`` cache
+    keys even when a shared jitted callable is invoked both inside and outside ``single_token_rows(True)``.
+
     Args:
         enabled: Whether the promise holds inside the block.
 
     Yields:
         The ``enabled`` value.
     """
-    token = _single_token_rows_var.set(bool(enabled))
+    flag = bool(enabled)
+    token = _single_token_rows_var.set(flag)
     try:
-        yield bool(enabled)
+        with _enter_jit_key_context(_JAX_SINGLE_TOKEN_ROWS, _SINGLE_TOKEN_ROWS_LEGACY_STATE, flag):
+            yield flag
     finally:
         _single_token_rows_var.reset(token)
 

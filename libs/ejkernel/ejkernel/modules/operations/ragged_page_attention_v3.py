@@ -67,13 +67,20 @@ from dataclasses import dataclass
 from typing import Literal
 
 import jax
+import jax.numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int32
 
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._utils import (
+    align_to,
+    cdiv,
+    get_dtype_packing,
+    get_lookup_keys,
+    get_lookup_keys_h64,
     get_tuned_block_sizes,
     get_tuned_block_sizes_h64,
+    lookup_tuned_block_sizes,
 )
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.kernels._xla.ragged_page_attention_v3._sinks import reduce_sinks_to_heads
@@ -87,6 +94,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.ops.utils.fingerprint import abstractify, short_hash
 
 from ..base import detect_platform
 from .configs import RaggedPageAttentionv3Config
@@ -175,12 +183,20 @@ def _round_up_to_step(value: int, step: int) -> int:
     return ((int(value) + step - 1) // step) * step
 
 
+def _largest_power_of_2_leq(value: int, min_val: int = 1) -> int:
+    """Return the largest power of 2 <= ``value``, clamped to at least ``min_val``."""
+    v = int(value)
+    if v <= min_val:
+        return min_val
+    return max(min_val, 1 << (v.bit_length() - 1))
+
+
 def _suggest_block_sizes(workload: _RPAWorkload, aggressive: bool) -> tuple[int, int]:
     """Suggest initial block sizes based on workload characteristics.
 
     Computes reasonable default block sizes for KV pages and query tokens
-    based on the workload dimensions. These serve as starting points for
-    autotuning or as fallback heuristic values.
+    based on the workload dimensions. Emits power-of-2 query block sizes >= 16
+    so GPU/Triton backends always receive valid tile dimensions.
 
     Args:
         workload: Workload characteristics including head_dim, page_size, etc.
@@ -198,24 +214,24 @@ def _suggest_block_sizes(workload: _RPAWorkload, aggressive: bool) -> tuple[int,
     if page_size <= 64:
         kv_pref = 8 if aggressive else 4
     elif page_size <= 128:
-        kv_pref = 6 if aggressive else 3
+        kv_pref = 4 if aggressive else 2
     elif page_size <= 256:
         kv_pref = 4 if aggressive else 2
     else:
         kv_pref = 2 if aggressive else 1
     kv_pages = max(1, min(pages_per_seq, min(page_budget, kv_pref)))
+    if page_size < 16 and pages_per_seq * page_size >= 16:
+        min_kv = min(pages_per_seq, (16 + page_size - 1) // page_size)
+        kv_pages = max(kv_pages, min_kv)
 
     token_cap = max(1, min(workload.max_num_tokens, 512))
     if workload.head_dim <= 64:
-        q_pref = 96 if aggressive else 64
+        q_pref = 128 if aggressive else 64
     elif workload.head_dim <= 128:
-        q_pref = 64 if aggressive else 48
+        q_pref = 64 if aggressive else 32
     else:
-        q_pref = 48 if aggressive else 32
-    q_pref = max(8, min(token_cap, q_pref))
-    q_pref = max(8, (q_pref // 8) * 8)
-    if q_pref > token_cap:
-        q_pref = max(8, token_cap)
+        q_pref = 32 if aggressive else 16
+    q_pref = _largest_power_of_2_leq(min(token_cap, q_pref), min_val=16)
 
     return kv_pages, q_pref
 
@@ -307,6 +323,127 @@ def _is_tpu() -> bool:
         return False
 
 
+def _tpu_vmem_capacity_bytes() -> int:
+    """Return per-core TPU VMEM capacity in bytes, or 0 when unavailable."""
+    try:
+        from jax.experimental.pallas import tpu as pltpu
+
+        return int(pltpu.get_tpu_info().vmem_capacity_bytes)
+    except Exception:
+        return 0
+
+
+def _has_bank_conflicts(stride: int, distance: int = 24, num_banks: int = 32) -> bool:
+    """Return whether a VMEM stride is likely to trigger bank conflicts."""
+    banks: set[int] = set()
+    for i in range(distance):
+        bank = (i * stride) % num_banks
+        if bank in banks:
+            return True
+        banks.add(bank)
+    return False
+
+
+def _estimate_tpu_vmem_bytes(workload: _RPAWorkload, bkv_p: int, bq_sz: int) -> int:
+    """Estimate TPU Pallas RPA v3 scoped VMEM usage in bytes for ``(bkv_p, bq_sz)``."""
+    q_dtype = workload.q_dtype or jnp.bfloat16
+    kv_dtype = workload.kv_dtype or q_dtype
+    actual_num_kv_heads = max(1, int(workload.num_kv_heads))
+    actual_num_q_heads_per_kv_head = max(1, int(workload.num_q_heads) // actual_num_kv_heads)
+    bkv_sz = max(1, int(bkv_p)) * max(1, int(workload.page_size))
+    bq_sz = max(1, int(bq_sz))
+    q_packing = get_dtype_packing(q_dtype)
+    kv_packing = get_dtype_packing(kv_dtype)
+    num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
+
+    if workload.head_dim == 64:
+        num_kv_heads = align_to(actual_num_kv_heads, kv_packing)
+        head_dim = workload.head_dim * 2
+        total_bits = (
+            (2 * bkv_sz * num_kv_heads * head_dim) * (32 // kv_packing)
+            + 2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * (32 // q_packing)
+            + 2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
+            + (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
+        )
+        return cdiv(total_bits, 8)
+
+    bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
+    if _has_bank_conflicts(bkv_stride):
+        bkv_stride += 1
+    head_dim = align_to(workload.head_dim, 128)
+    kv_elem_bits = 32 // kv_packing
+    total_bits = (
+        (2 * bkv_sz * bkv_stride * kv_packing * head_dim) * kv_elem_bits
+        + 2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * (32 // q_packing)
+        + 2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
+        + (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
+        + (bkv_sz * head_dim) * (2 * kv_elem_bits + 16)
+        + (3 * bq_sz * num_q_heads_per_kv_head * bkv_sz) * 32
+    )
+    return cdiv(total_bits, 8)
+
+
+def _tpu_vmem_budget_bytes(
+    workload: _RPAWorkload,
+    vmem_limit_bytes: int | None,
+    vmem_capacity_bytes: int,
+) -> int:
+    """Return scoped VMEM budget matching the Pallas TPU RPA v3 kernel clampers."""
+    if workload.head_dim == 64:
+        default_limit = 16 << 20
+        if 0 < vmem_capacity_bytes < (16 << 20):
+            default_limit = min(default_limit, int(vmem_capacity_bytes * 0.75))
+    else:
+        default_limit = 12 << 20
+        if vmem_capacity_bytes >= (32 << 20):
+            default_limit = 24 << 20
+        elif vmem_capacity_bytes > 0:
+            default_limit = min(16 << 20, int(vmem_capacity_bytes * 0.75))
+    if vmem_limit_bytes is not None:
+        return min(int(vmem_limit_bytes), default_limit)
+    return default_limit
+
+
+def _normalize_spec_for_cache_key(spec: object) -> object:
+    """Convert PartitionSpec / nested tuples into a stable JSON-serializable key."""
+    if spec is None:
+        return None
+    if isinstance(spec, PartitionSpec):
+        return tuple(_normalize_spec_for_cache_key(axis) for axis in spec)
+    if isinstance(spec, (tuple, list)):
+        return tuple(_normalize_spec_for_cache_key(item) for item in spec)
+    return str(spec)
+
+
+def _rpa_v3_key_builder(inv: Invocation[RaggedPageAttentionv3Config, Array]) -> str:
+    """Build a sharding-aware cache key for RaggedPageAttentionv3 invocations.
+
+    Preserves the default Invocation key structure for unsharded calls and
+    includes mesh shape and sharding specs for ``shard_map`` calls so different
+    per-device head/token layouts never collide in memory or persistent caches.
+    """
+    spec: dict[str, object] = dict(
+        args_spec=abstractify(inv.args),
+        kwargs_spec=abstractify(dict(inv.kwargs)),
+        batch_axes=inv.batch_axes,
+        method=inv.method,
+    )
+    mesh = getattr(inv, "mesh", None) or inv.kwargs.get("mesh")
+    in_specs = getattr(inv, "in_specs", None) or inv.kwargs.get("in_specs")
+    out_specs = getattr(inv, "out_specs", None) or inv.kwargs.get("out_specs")
+    if inv.method == "shard_map" or mesh is not None or in_specs is not None or out_specs is not None:
+        mesh_shape = getattr(mesh, "shape", None) if mesh is not None else None
+        if mesh_shape is not None and hasattr(mesh_shape, "items"):
+            spec["mesh_shape"] = [(str(k), int(v)) for k, v in mesh_shape.items()]
+        elif mesh_shape is not None:
+            spec["mesh_shape"] = repr(mesh_shape)
+        if in_specs is not None:
+            spec["in_specs"] = _normalize_spec_for_cache_key(in_specs)
+        if out_specs is not None:
+            spec["out_specs"] = _normalize_spec_for_cache_key(out_specs)
+    return short_hash(spec)
+
+
 def _lookup_tuned_pair(workload: _RPAWorkload) -> tuple[int, int] | None:
     """Look up pre-tuned block sizes for the given workload.
 
@@ -352,6 +489,49 @@ def _lookup_tuned_pair(workload: _RPAWorkload) -> tuple[int, int] | None:
         return None
 
 
+def _lookup_exact_tuned_pair(workload: _RPAWorkload) -> tuple[int, int] | None:
+    """Look up an exact measured ``(bkv_pages, bq)`` entry from ``tuned_kernels.db``.
+
+    Unlike :func:`_lookup_tuned_pair`, returns ``None`` on a database miss
+    instead of falling back to TPU-version default constants, so devices without
+    shipped rows (such as TPU v5p) fall through cleanly to ``candidate_cfgs_tpu``.
+    """
+    if not _is_tpu():
+        return None
+    try:
+        max_model_len = workload.page_size * workload.pages_per_seq
+        if workload.head_dim == 64:
+            keys = get_lookup_keys_h64(
+                workload.page_size,
+                workload.q_dtype,
+                workload.kv_dtype,
+                workload.num_q_heads,
+                workload.num_kv_heads,
+                workload.head_dim,
+                max_model_len,
+            )
+        else:
+            keys = get_lookup_keys(
+                workload.page_size,
+                workload.q_dtype,
+                workload.kv_dtype,
+                workload.num_q_heads,
+                workload.num_kv_heads,
+                workload.head_dim,
+                max_model_len,
+            )
+        tuned = lookup_tuned_block_sizes(*keys)
+        if tuned is None:
+            return None
+        bkv = min(workload.pages_per_seq, int(tuned[0]))
+        bq = min(workload.max_num_tokens, int(tuned[1]))
+        if bkv <= 0 or bq <= 0:
+            return None
+        return bkv, bq
+    except (AssertionError, KeyError, ValueError, RuntimeError):
+        return None
+
+
 class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Array]]):
     """Ragged Page Attention v3 with fused KV-cache write.
 
@@ -382,7 +562,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         - Memory-constrained deployment requiring paged cache management
     """
 
-    version = "1"
+    version = "3"
+    key_builder = staticmethod(_rpa_v3_key_builder)
 
     def __init__(self):
         """Initialize Ragged Page Attention module.
@@ -744,6 +925,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         Returns:
             _RPAWorkload with extracted dimensions, or None if extraction fails.
         """
+        if inv is None:
+            return None
         try:
             queries = _resolve_inv_arg(inv, "queries")
             keys = _resolve_inv_arg(inv, "keys")
@@ -769,6 +952,40 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         pages_per_seq = block_table_dim // kv_lens_dim
         if pages_per_seq <= 0 or max_num_tokens <= 0:
             return None
+
+        # Account for sharding under shard_map so heuristics and tuned-table
+        # lookups see the per-device head/token counts. Executor stores
+        # shard_map metadata on `inv.mesh` / `inv.in_specs` (not `inv.kwargs`).
+        try:
+            mesh = getattr(inv, "mesh", None) or inv.kwargs.get("mesh")
+            in_specs = getattr(inv, "in_specs", None) or inv.kwargs.get("in_specs")
+            mesh_shape = getattr(mesh, "shape", None) if mesh is not None else None
+            if mesh_shape is not None and isinstance(in_specs, (tuple, list)) and len(in_specs) >= 2:
+
+                def _axis_shard_size(spec, dim: int) -> int:
+                    if not isinstance(spec, (PartitionSpec, tuple, list)) or len(spec) <= dim or spec[dim] is None:
+                        return 1
+                    ax = spec[dim]
+                    axes = ax if isinstance(ax, (tuple, list)) else (ax,)
+                    prod = 1
+                    for name in axes:
+                        if name is None:
+                            continue
+                        size = mesh_shape.get(name, 1) if hasattr(mesh_shape, "get") else mesh_shape[name]
+                        prod *= int(size)
+                    return max(1, prod)
+
+                tok_shard = _axis_shard_size(in_specs[0], 0)
+                q_shard = _axis_shard_size(in_specs[0], 1)
+                kv_shard = _axis_shard_size(in_specs[1], 1)
+                if tok_shard > 1 and max_num_tokens % tok_shard == 0:
+                    max_num_tokens //= tok_shard
+                if q_shard > 1 and num_q_heads % q_shard == 0:
+                    num_q_heads //= q_shard
+                if kv_shard > 1 and num_kv_heads % kv_shard == 0:
+                    num_kv_heads //= kv_shard
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            pass
 
         return _RPAWorkload(
             q_dtype=getattr(queries, "dtype", None),
@@ -852,6 +1069,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             min_value=1,
             step=4 if _is_tpu() else 16,
         )
+        if not _is_tpu():
+            q_candidates = [qb for qb in q_candidates if qb >= 16 and (qb & (qb - 1)) == 0] or [16]
 
         pairs: list[tuple[int, int]] = []
         for kv in kv_candidates:
@@ -968,6 +1187,56 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             Default configuration with conservative block sizes suitable for
             typical ragged attention workloads with variable sequence lengths
         """
+        requested = inv.kwargs.get("platform", None) if inv is not None else None
+        if _is_tpu():
+            tpu_platform = "xla" if requested == "xla" else "pallas"
+            tpu_backend = "any" if tpu_platform == "xla" else "tpu"
+            workload = self._extract_workload(inv)
+            if workload is not None:
+                exact_tuned = _lookup_exact_tuned_pair(workload)
+                if exact_tuned is not None:
+                    return RaggedPageAttentionv3Config(
+                        num_kv_pages_per_block=exact_tuned[0],
+                        num_queries_per_block=exact_tuned[1],
+                        num_warps=None,
+                        num_stages=None,
+                        platform=tpu_platform,
+                        backend=tpu_backend,
+                    )
+                if workload.max_num_tokens == 1:
+                    return RaggedPageAttentionv3Config(
+                        num_kv_pages_per_block=None,
+                        num_queries_per_block=1,
+                        num_warps=None,
+                        num_stages=None,
+                        platform=tpu_platform,
+                        backend=tpu_backend,
+                    )
+            tpu_cands = self.candidate_cfgs_tpu(inv)
+            if tpu_cands:
+                chosen = tpu_cands[0]
+                if tpu_platform != chosen.platform:
+                    return RaggedPageAttentionv3Config(
+                        num_kv_pages_per_block=chosen.num_kv_pages_per_block,
+                        num_queries_per_block=chosen.num_queries_per_block,
+                        num_warps=chosen.num_warps,
+                        num_stages=chosen.num_stages,
+                        platform=tpu_platform,
+                        backend=tpu_backend,
+                    )
+                return chosen
+        else:
+            workload = self._extract_workload(inv)
+            if workload is not None:
+                kv_block, q_block = _suggest_block_sizes(workload, aggressive=False)
+                return RaggedPageAttentionv3Config(
+                    num_kv_pages_per_block=kv_block,
+                    num_queries_per_block=q_block,
+                    num_warps=4,
+                    num_stages=1,
+                    platform=requested if requested not in (None, "auto") else "auto",
+                    backend="any",
+                )
         pairs = self._candidate_pairs(inv, prefer_tuned=True, max_candidates=1)
         kv_block = pairs[0][0] if pairs else None
         q_block = pairs[0][1] if pairs else None
@@ -1015,7 +1284,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         and XLA candidates at the operation level.  An explicit public
         ``platform=...`` request narrows the list to that backend.
         """
-        requested = inv.kwargs.get("platform", None)
+        requested = inv.kwargs.get("platform", None) if inv is not None else None
         platforms = ("cuda", "triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         candidates: list[RaggedPageAttentionv3Config] = []
         if "cuda" in platforms:
@@ -1080,14 +1349,17 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         """Generate candidate configurations for autotuning on TPU (Pallas backend).
 
         Produces configurations optimized for TPU execution with Pallas backend.
-        Uses power-of-2 block sizes within strict bounds to ensure efficient
-        TPU tile execution.
+        Uses power-of-2 block sizes ordered by VMEM-fitting priority so default
+        selection avoids oversized query blocks that would force KV-block
+        clamping down to 1 page.
 
         Heuristics:
             - Enforces power-of-2 block sizes for TPU efficiency
-            - Restricts Q and KV block sizes to max 64
-            - Minimum KV block size: 16, minimum Q block size: 4
-            - chunk_prefill_size always set to None
+            - Prioritizes VMEM-fitting ``(bkv_pages, bq)`` pairs first
+            - Keeps ``bq <= 32`` preferred first for ``head_dim == 64``
+            - Allows ``bq = 128`` on large-VMEM (>=32 MiB) TPUs for compact
+              ``128 <= head_dim <= 256`` prefill/mixed workloads
+            - ``chunk_prefill_size`` always set to None
 
         Args:
             inv: Invocation object containing input tensors and metadata.
@@ -1096,19 +1368,31 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
 
         Returns:
             List of RaggedPageAttentionv3Config objects optimized for TPU.
-            Each configuration uses power-of-2 block sizes within the
-            specified bounds. Returns empty list if workload extraction fails.
-
-        Note:
-            KV page candidates: 16, 32, 64 (bounded by pages_per_seq)
-            Query candidates: 4, 8, 16, 32, 64 (bounded by max_num_tokens, capped at 512)
+            Returns empty list if workload extraction fails.
         """
         workload = self._extract_workload(inv)
         if workload is None:
             return []
 
         kv_candidates = list(_tpu_kv_candidates(workload))
-        q_candidates = [4, 8, 16, 32, 64]
+        # Large-VMEM TPUs (>=32 MiB, e.g. v5p/v6e/v7) with compact local head
+        # counts benefit significantly from bq=128 on prefill/mixed buckets
+        # (measured -11 ms on 16L 8k@32k and -19 ms on 16L 16k@32k on v5p).
+        vmem_capacity = _tpu_vmem_capacity_bytes()
+        large_vmem = vmem_capacity >= 32 * 1024 * 1024
+        q_itemsize = jnp.dtype(workload.q_dtype).itemsize if workload.q_dtype is not None else 2
+        allow_q128 = (
+            large_vmem
+            and 128 <= workload.head_dim <= 256
+            and q_itemsize <= 2
+            and workload.num_q_heads <= 8
+            and workload.num_kv_heads <= 2
+            and workload.max_num_tokens >= 256
+        )
+        if workload.head_dim == 64:
+            q_candidates = [32, 16, 8, 4, 64]
+        else:
+            q_candidates = [128, 64, 32, 16, 8, 4] if allow_q128 else [64, 32, 16, 8, 4]
 
         kv_limit = max(1, workload.pages_per_seq)
         q_limit = max(1, min(workload.max_num_tokens, 512))
@@ -1123,7 +1407,17 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 pairs.append((kv, q))
 
         if not pairs:
-            pairs.append((16, 4))
+            fallback_kv = max(1, min(kv_candidates[0] if kv_candidates else 1, kv_limit))
+            fallback_q = max(1, min(4, q_limit))
+            pairs.append((fallback_kv, fallback_q))
+
+        vmem_limit_bytes = inv.kwargs.get("vmem_limit_bytes") if inv is not None else None
+        vmem_budget = _tpu_vmem_budget_bytes(workload, vmem_limit_bytes, vmem_capacity)
+        fitting_pairs = [(kv, q) for kv, q in pairs if _estimate_tpu_vmem_bytes(workload, kv, q) <= vmem_budget]
+        if fitting_pairs:
+            fitting_set = set(fitting_pairs)
+            overflow_pairs = [pair for pair in pairs if pair not in fitting_set]
+            pairs = [*fitting_pairs, *overflow_pairs]
 
         return [
             *self._materialize_configs(
@@ -1151,7 +1445,7 @@ _ragged_page_attention_executor: Executor[RaggedPageAttentionv3Config, Array] = 
         cache=ConfigCache(),
         policy=AutotunePolicy(
             allow_autotune=True,
-            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "heuristics"),
             validate_backward=False,
         ),
         tuner=Tuner(warmup=5, iters=100),

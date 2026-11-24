@@ -156,6 +156,28 @@ _QUANT_CONSUMED = object()
 _QUANTIZED_LOAD_CHUNK_SIZE = 16
 
 
+def _normalize_linear_attention_config_kwargs(config_kwargs: tp.Mapping[str, tp.Any] | None) -> dict[str, tp.Any]:
+    """Normalize single-flag linear-attention mode overrides in ``config_kwargs``.
+
+    ``linear_attention_merged_split_proj`` and ``linear_attention_separate_proj``
+    are mutually exclusive. When a caller overrides only one of them to ``True``
+    via ``config_kwargs``, clear the opposite flag so the loaded config does not
+    retain both as ``True`` from ``config.json`` or family defaults.
+    """
+    normalized = dict(config_kwargs) if config_kwargs is not None else {}
+    if (
+        normalized.get("linear_attention_merged_split_proj") is True
+        and "linear_attention_separate_proj" not in normalized
+    ):
+        normalized["linear_attention_separate_proj"] = False
+    elif (
+        normalized.get("linear_attention_separate_proj") is True
+        and "linear_attention_merged_split_proj" not in normalized
+    ):
+        normalized["linear_attention_merged_split_proj"] = False
+    return normalized
+
+
 def _build_quant_decoder(hf_config: tp.Any, ckpt_keys: tp.Iterable[str]):
     """Build a decoder for a pre-quantized checkpoint, or ``None``.
 
@@ -2600,20 +2622,21 @@ class EasyBridgeMixin(PushToHubMixin):
                 # interleave with that tp recorded in config.json / the sidecar
                 # marker. Re-interleave from the recorded tp to the live tp,
                 # then overwrite the live config so it always describes the
-                # layout the weights actually carry. Legacy checkpoints (no
-                # recorded tp) are loaded verbatim — only correct when the
-                # load tp matches the save tp.
+                # layout the weights actually carry. Legacy checkpoints without
+                # a recorded tp are assumed canonical (tp=1) and re-interleaved
+                # with a warning.
                 from easydel.layers.layouts import (
                     fused_layout_param_specs,
                     read_fused_checkpoint_tp,
                     retp_fused_state,
                     stamp_fused_tp_config,
                 )
+                from easydel.layers.layouts._canonical import reconcile_linear_attention_native_layout
                 from easydel.layers.layouts._runtime import tensor_parallel_size as _cf_tp_size
 
                 _cf_saved_tp = read_fused_checkpoint_tp(resolved_archive_file, getattr(model, "config", None))
                 _cf_live_tp = _cf_tp_size(getattr(model, "config", None))
-                if _cf_saved_tp is None and fused_layout_param_specs(model):
+                if _cf_saved_tp is None and (getattr(model, "fused_params", None) or fused_layout_param_specs(model)):
                     # No recorded fused-param tp: assume the canonical (tp=1)
                     # layout. Conversions write canonical order and trainer
                     # saves stamp their tp, so canonical is the common case
@@ -2629,6 +2652,12 @@ class EasyBridgeMixin(PushToHubMixin):
                             "stamp its real `fused_param_tp` into the checkpoint's config.json "
                             "(metadata only, no weight rewrite)."
                         )
+                native_unfused_count = reconcile_linear_attention_native_layout(
+                    resolved_archive_file,
+                    model,
+                    state,
+                    saved_tp=_cf_saved_tp,
+                )
                 if _cf_saved_tp is not None:
                     state = retp_fused_state(model, state, saved_tp=_cf_saved_tp, target_tp=_cf_live_tp)
                 if hasattr(model, "config") and _cf_saved_tp is not None:
@@ -2649,7 +2678,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 for label, count in native_fused_counts.items():
                     logger.info("Fused %d native checkpoint %s into runtime merged weights.", count, label)
 
-                if native_fused_counts or _cf_saved_tp is not None:
+                if native_fused_counts or native_unfused_count or _cf_saved_tp is not None:
                     # Leaves synthesized after the rule-based tensorstore read
                     # (native fusions, tp re-interleaves) bypassed the loader's
                     # placement: their sources matched no live-variable rule and
@@ -3066,6 +3095,7 @@ class EasyBridgeMixin(PushToHubMixin):
             get_modules_by_type,
         )
 
+        _caller_partition_axis = partition_axis
         if partition_axis is None:
             partition_axis = PartitionAxis()
         if precision is None:
@@ -3160,16 +3190,19 @@ class EasyBridgeMixin(PushToHubMixin):
                 # As in the shared adapter, inability to re-read metadata must
                 # not prevent loading an otherwise resolved configuration.
                 logger.debug("Could not read selected config for legacy defaults (%s).", exc)
-        config_kwargs = {} if config_kwargs is None else config_kwargs
-        config.add_basic_configurations(
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            backend=backend,
-            platform=platform,
-            **config_kwargs,
-        )
+        config_kwargs = _normalize_linear_attention_config_kwargs(config_kwargs)
+        _basic_cfg_kwargs: dict[str, tp.Any] = {
+            "sharding_axis_dims": sharding_axis_dims,
+            "sharding_dcn_axis_dims": sharding_dcn_axis_dims,
+            "sharding_axis_names": sharding_axis_names,
+            "backend": backend,
+            "platform": platform,
+        }
+        if "partition_axis" not in config_kwargs and (
+            _caller_partition_axis is not None or "axis_policy" not in config_kwargs
+        ):
+            _basic_cfg_kwargs["partition_axis"] = partition_axis
+        config.add_basic_configurations(**{**_basic_cfg_kwargs, **config_kwargs})
         if quantization_config is None:
             quantization_config = _normalize_quantization_config(
                 getattr(config, "quantization_config", None), strict=False
@@ -3585,16 +3618,17 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug("adding hf_model basic EasyDeL configurations.")
         if hasattr(ed_config, "attach_custom_arguments"):
             ed_config.attach_custom_arguments()
-        config_kwargs = {} if config_kwargs is None else config_kwargs
-        ed_config.add_basic_configurations(
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            backend=backend,
-            platform=platform,
-            **config_kwargs,
-        )
+        config_kwargs = _normalize_linear_attention_config_kwargs(config_kwargs)
+        _torch_basic_cfg_kwargs: dict[str, tp.Any] = {
+            "sharding_axis_dims": sharding_axis_dims,
+            "sharding_dcn_axis_dims": sharding_dcn_axis_dims,
+            "sharding_axis_names": sharding_axis_names,
+            "backend": backend,
+            "platform": platform,
+        }
+        if "partition_axis" not in config_kwargs and (partition_axis is not None or "axis_policy" not in config_kwargs):
+            _torch_basic_cfg_kwargs["partition_axis"] = partition_axis if partition_axis is not None else PartitionAxis()
+        ed_config.add_basic_configurations(**{**_torch_basic_cfg_kwargs, **config_kwargs})
 
         logger.debug("creating easydel model")
         model = module.lazy_init(
@@ -3633,19 +3667,7 @@ class EasyBridgeMixin(PushToHubMixin):
             if not is_flatten(shard_fns):
                 shard_fns = flatten_dict(shard_fns)
         elif auto_shard_model:
-            shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
-                # The staged metadata copy for a gs:// source; the source itself otherwise.
-                pretrained_model_name_or_path=_config_source,
-                sharding_axis_dims=sharding_axis_dims,
-                sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-                sharding_axis_names=sharding_axis_names,
-                partition_axis=partition_axis,
-                backend=backend,
-                platform=platform,
-                config_kwargs=config_kwargs,
-                trust_remote_code=trust_remote_code,
-                model_task=cls._model_task,
-            )
+            shard_fns, _ = AutoShardAndGatherFunctions.from_model(model)
 
         logger.debug("converting huggingface-model to easydel-model.")
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
@@ -3712,6 +3734,10 @@ class EasyBridgeMixin(PushToHubMixin):
         if stacked_layer_paths:
             # Eager stacking drops the per-layer mesh placement; re-place the stacked leaves on the mesh.
             model = _restack_layer_containers(model, stacked_layer_paths).shard_model()
+        from easydel.layers.layouts import stamp_fused_tp_config
+        from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_tp_size
+
+        stamp_fused_tp_config(model.config, _fused_tp_size(model.config))
         logger.debug("model and parameters pytree merged.")
 
         if converted_save_directory is not None:
@@ -5295,7 +5321,8 @@ class EasyBridgeMixin(PushToHubMixin):
         )
         if hasattr(ed_config, "attach_custom_arguments"):
             ed_config.attach_custom_arguments()
-        config_kwargs = {} if config_kwargs is None else config_kwargs
+        config_kwargs = _normalize_linear_attention_config_kwargs(config_kwargs)
+        _caller_partition_axis = partition_axis
         if partition_axis is None:
             partition_axis = PartitionAxis()
         add_config_overrides: dict[str, tp.Any] = {}
@@ -5307,16 +5334,18 @@ class EasyBridgeMixin(PushToHubMixin):
                 if bool(ed_config.gradient_checkpointing)
                 else EasyDeLGradientCheckPointers.NONE
             )
-        ed_config.add_basic_configurations(
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            backend=backend,
-            platform=platform,
-            **add_config_overrides,
-            **config_kwargs,
-        )
+        _basic_cfg_kwargs2: dict[str, tp.Any] = {
+            "sharding_axis_dims": sharding_axis_dims,
+            "sharding_dcn_axis_dims": sharding_dcn_axis_dims,
+            "sharding_axis_names": sharding_axis_names,
+            "backend": backend,
+            "platform": platform,
+        }
+        if "partition_axis" not in config_kwargs and (
+            _caller_partition_axis is not None or "axis_policy" not in config_kwargs
+        ):
+            _basic_cfg_kwargs2["partition_axis"] = partition_axis
+        ed_config.add_basic_configurations(**{**_basic_cfg_kwargs2, **add_config_overrides, **config_kwargs})
 
         model = module.lazy_init(
             config=ed_config,

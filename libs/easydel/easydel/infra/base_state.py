@@ -1496,6 +1496,7 @@ class EasyDeLState(_PyTreeNode):
             read_fused_checkpoint_tp,
             retp_fused_optimizer_state,
         )
+        from easydel.layers.layouts._canonical import validate_linear_attention_native_optimizer_layout
         from easydel.layers.layouts._runtime import tensor_parallel_size as _fused_layout_tp_size
 
         model = self.model
@@ -1504,16 +1505,19 @@ class EasyDeLState(_PyTreeNode):
         # been loaded from a newer checkpoint than this tx state.
         saved_tp = read_fused_checkpoint_tp(load_directory)
         live_tp = _fused_layout_tp_size(getattr(model, "config", None))
+        if saved_tp is None and (getattr(model, "fused_params", None) or fused_layout_param_specs(model)):
+            saved_tp = 1
+            if live_tp > 1:
+                logger.warning(
+                    "Legacy optimizer checkpoint without a recorded fused-param tp loaded under "
+                    f"tp={live_tp}: assuming canonical tp=1 and re-interleaving fused optimizer "
+                    "moments to match native weight loading. If this checkpoint was actually saved "
+                    "under a different tensor-parallel size, stamp its real `fused_param_tp` into "
+                    "the checkpoint's config.json (metadata only, no weight rewrite)."
+                )
+        validate_linear_attention_native_optimizer_layout(load_directory, model, opt_state)
         if saved_tp is not None:
             opt_state = retp_fused_optimizer_state(model, opt_state, saved_tp=saved_tp, target_tp=live_tp)
-        elif live_tp > 1 and fused_layout_param_specs(model):
-            logger.warning(
-                "Legacy optimizer checkpoint without a recorded fused-param tp loaded under "
-                f"tp={live_tp}: fused optimizer moments are assumed to already carry this exact "
-                "interleave. If the checkpoint was saved under a different tensor-parallel size, "
-                "Adam/optimizer moments for Q/K/V and gate/up weights will be silently scrambled; "
-                "re-save it with the current code to make trainer resumes mesh-portable."
-            )
         if template is not None:
             opt_state, casts = _reconcile_optimizer_dtypes(opt_state, template)
             if casts:

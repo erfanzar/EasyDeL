@@ -21,6 +21,8 @@ computation to ``ejkernel.modules.operations.ragged_gated_delta_rule_v2``.
 
 from __future__ import annotations
 
+import typing as tp
+
 import jax
 import jax.numpy as jnp
 from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
@@ -28,6 +30,7 @@ from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_decode_only,
     ragged_gated_delta_rule_mixed_prefill,
     ragged_gated_delta_rule_v2_op,
+    ragged_gdn_conv_decode_head_sharded,
     set_gdn_kernel_tile_policy,
 )
 from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
@@ -37,6 +40,8 @@ from ejkernel.modules.operations.ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_v2_with_window_states as _ejkernel_ragged_gdn_v2_with_window_states,
 )
 
+from easydel.utils.helpers import check_bool_flag
+
 from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
@@ -45,6 +50,22 @@ from ..requirements import (
     OperationRequirements,
     RequirementsBuilder,
 )
+
+_UNSET: tp.Final[object] = object()
+
+
+def _normalize_ejkernel_platform(platform: object | None, *, keep_auto: bool = False) -> str | None:
+    """Normalize an EasyDeL/eJKernel platform enum or string for eJKernel dispatch."""
+    if platform is None:
+        return None
+    raw = str(getattr(platform, "value", platform)).strip().lower()
+    if not raw:
+        return None
+    if raw == "auto":
+        return "auto" if keep_auto else None
+    if raw == "jax":
+        return "xla"
+    return raw
 
 
 @OperationRegistry.register
@@ -162,6 +183,12 @@ class RaggedGatedDeltaRule(OperationImpl):
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
         head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
         cfg = self.metadata.get_operation_config("ragged_gated_delta_rule_v2")
+        if check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+            platform = "xla"
+        elif _normalize_ejkernel_platform(getattr(cfg, "platform", None)) is not None:
+            platform = None
+        else:
+            platform = _normalize_ejkernel_platform(getattr(self.metadata, "platform", None))
 
         return _ejkernel_ragged_gated_delta_rule_v2(
             mixed_qkv=mixed_qkv,
@@ -188,6 +215,7 @@ class RaggedGatedDeltaRule(OperationImpl):
             runtime_dtype=self.metadata.runtime_dtype,
             mesh=self.metadata.mesh,
             head_axis=head_axis,
+            platform=platform,
             cfg=cfg,
         )
 
@@ -261,6 +289,12 @@ class RaggedGatedDeltaRule(OperationImpl):
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
         head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
         cfg = self.metadata.get_operation_config("ragged_gated_delta_rule_v2")
+        if check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+            platform = "xla"
+        elif _normalize_ejkernel_platform(getattr(cfg, "platform", None)) is not None:
+            platform = None
+        else:
+            platform = _normalize_ejkernel_platform(getattr(self.metadata, "platform", None))
 
         return _ejkernel_ragged_gdn_v2_with_window_states(
             mixed_qkv,
@@ -290,7 +324,123 @@ class RaggedGatedDeltaRule(OperationImpl):
             runtime_dtype=self.metadata.runtime_dtype,
             mesh=self.metadata.mesh,
             head_axis=head_axis,
+            platform=platform,
             cfg=cfg,
+        )
+
+    @jax.named_scope("easydel-ragged-gdn-conv-decode")
+    def forward_conv_decode(
+        self,
+        conv_input: jnp.ndarray,
+        b_raw: jnp.ndarray,
+        a_raw: jnp.ndarray,
+        conv_weight: jnp.ndarray,
+        conv_pool: jnp.ndarray,
+        recurrent_pool: jnp.ndarray,
+        A_log: jnp.ndarray,
+        dt_bias: jnp.ndarray,
+        token_slots: jnp.ndarray,
+        token_init: jnp.ndarray,
+        *,
+        n_kq: int,
+        n_v: int,
+        d_k: int,
+        d_v: int,
+        use_qk_l2norm: bool = True,
+        apply_silu: bool = True,
+        conv_output_dtype: jax.typing.DTypeLike | None = None,
+        out_dtype: jax.typing.DTypeLike = jnp.float32,
+        pre_sharded: bool = False,
+        mesh: object = _UNSET,
+        head_axis: object = _UNSET,
+        allow_axis_fallback: bool | None = None,
+        platform: str | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Run fused causal Conv1D + SiLU + L2Norm + GDN single-token decode.
+
+        Routes through the ``OperationRegistry``-registered ``RaggedGatedDeltaRule``
+        adapter so ``FORCE_NATIVE_RUNTIME=1``, ``operation_configs["ragged_gated_delta_rule_v2"]``,
+        and ``self.metadata.platform`` control backend selection while normal TPU
+        execution uses the in-place Pallas decode kernel.
+
+        Args:
+            conv_input: Pre-conv flat tokens ``[T, conv_dim]``.
+            b_raw: Pre-sigmoid beta gate inputs ``[T, n_v]``.
+            a_raw: Pre-softplus alpha gate inputs ``[T, n_v]``.
+            conv_weight: Depthwise conv kernel ``[conv_dim, d_conv]``.
+            conv_pool: Rolling conv-state pool ``[S, conv_dim, d_conv]``.
+            recurrent_pool: GDN state pool ``[S, n_v, d_k, d_v]``.
+            A_log: Per-value-head log-decay ``[n_v]``.
+            dt_bias: Per-value-head dt bias ``[n_v]``.
+            token_slots: Pool slot per token ``[T]`` (out-of-range = idle).
+            token_init: Bool per token ``[T]`` (``False`` = fresh zero state).
+            n_kq: Number of key/query heads.
+            n_v: Number of value heads.
+            d_k: Key head dimension.
+            d_v: Value head dimension.
+            use_qk_l2norm: Whether to L2-normalize Q and K.
+            apply_silu: Whether to apply SiLU after Conv1D.
+            conv_output_dtype: Optional dtype for post-conv activations.
+            out_dtype: Output dtype. Defaults to ``jnp.float32``.
+            pre_sharded: Whether ``conv_input`` and ``conv_weight`` already
+                carry per-shard interleaved ``[Q_r | K_r | V_r]`` ordering.
+            mesh: Optional mesh override (defaults to ``self.metadata.mesh``;
+                explicit ``None`` disables mesh sharding).
+            head_axis: Optional head-sharding axis override (defaults to the
+                resolved ``bthd`` head axis; explicit ``None`` disables sharding
+                unless ``allow_axis_fallback=True``).
+            allow_axis_fallback: Whether to fall back to another non-pipeline
+                mesh axis (e.g. ``fsdp``) when ``head_axis`` cannot shard the
+                heads. Defaults to ``False`` when ``head_axis=None`` is passed
+                explicitly, and ``True`` otherwise.
+            platform: Optional explicit eJKernel platform override.
+
+        Returns:
+            ``(token_outputs [T, n_v, d_v], updated_conv_pool, updated_recurrent_pool)``.
+        """
+        resolved_mesh = self.metadata.mesh if mesh is _UNSET else mesh
+        if head_axis is _UNSET:
+            mode = self.get_mode(query=jnp.expand_dims(conv_input, 0), BTHD=False)
+            shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
+            resolved_head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+        else:
+            resolved_head_axis = head_axis
+        resolved_allow_axis_fallback = (
+            (head_axis is not None) if allow_axis_fallback is None else bool(allow_axis_fallback)
+        )
+        cfg = self.metadata.get_operation_config("ragged_gated_delta_rule_v2")
+        if platform is not None:
+            resolved_platform = _normalize_ejkernel_platform(platform, keep_auto=True)
+        elif check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+            resolved_platform = "xla"
+        else:
+            resolved_platform = _normalize_ejkernel_platform(getattr(cfg, "platform", None))
+            if resolved_platform is None:
+                resolved_platform = _normalize_ejkernel_platform(getattr(self.metadata, "platform", None))
+        return ragged_gdn_conv_decode_head_sharded(
+            conv_input,
+            b_raw,
+            a_raw,
+            conv_weight,
+            conv_pool,
+            recurrent_pool,
+            A_log,
+            dt_bias,
+            token_slots,
+            token_init,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            use_qk_l2norm=use_qk_l2norm,
+            apply_silu=apply_silu,
+            conv_output_dtype=conv_output_dtype,
+            out_dtype=out_dtype,
+            pre_sharded=pre_sharded,
+            mesh=resolved_mesh,
+            head_axis=resolved_head_axis,
+            allow_axis_fallback=resolved_allow_axis_fallback,
+            platform=tp.cast(tp.Any, resolved_platform),
         )
 
     def forward_tpu(self, *args, **kwargs) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -360,5 +510,6 @@ __all__ = (
     "ragged_gated_delta_rule_decode_only",
     "ragged_gated_delta_rule_mixed_prefill",
     "ragged_gated_delta_rule_v2_op",
+    "ragged_gdn_conv_decode_head_sharded",
     "set_gdn_kernel_tile_policy",
 )

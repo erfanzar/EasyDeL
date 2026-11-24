@@ -364,16 +364,42 @@ def get_vmem_estimate_bytes(
         bkv_stride += 1
     head_dim = align_to(actual_head_dim, 128)
 
+    # Explicit double-buffered scratch allocations plus the live working set
+    # inside the KV block loop (unpacked bk/bv + temporary mask + fp32 s/p/mask).
+    kv_elem_bits = 32 // kv_packing
     total_bits = (
-        (2 * bkv_sz * bkv_stride * kv_packing * head_dim) * (32 // kv_packing)
+        (2 * bkv_sz * bkv_stride * kv_packing * head_dim) * kv_elem_bits
         + 2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * (32 // q_packing)
         + 2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
         + (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
+        + (bkv_sz * head_dim) * (2 * kv_elem_bits + 16)
+        + (3 * bq_sz * num_q_heads_per_kv_head * bkv_sz) * 32
     )
     return cdiv(total_bits, 8)
 
 
 DEFAULT_SCOPED_VMEM_LIMIT_BYTES = 16 << 20
+
+
+def _effective_scoped_vmem_limit_bytes(vmem_limit_bytes: int | None) -> int:
+    """Return scoped VMEM budget for RPA v3 block clamping.
+
+    Caps scratch plus working-set VMEM at 75% of per-core capacity (24 MiB on
+    >=32 MiB TPUs such as v5p/v6e/v7; 12 MiB on 16 MiB TPUs such as v4/v5e),
+    preserving headroom for compiler temporaries and DMA/SMEM metadata.
+    """
+    default_limit = 12 << 20
+    try:
+        cap = int(pltpu.get_tpu_info().vmem_capacity_bytes)
+        if cap >= (32 << 20):
+            default_limit = 24 << 20
+        elif cap > 0:
+            default_limit = min(DEFAULT_SCOPED_VMEM_LIMIT_BYTES, int(cap * 0.75))
+    except Exception:
+        pass
+    if vmem_limit_bytes is not None:
+        return min(int(vmem_limit_bytes), default_limit)
+    return default_limit
 
 
 def _clamp_block_sizes_to_vmem(
@@ -389,9 +415,7 @@ def _clamp_block_sizes_to_vmem(
     vmem_limit_bytes,
 ):
     """Clamp TPU block sizes until scratch buffers fit within scoped VMEM."""
-    limit = DEFAULT_SCOPED_VMEM_LIMIT_BYTES
-    if vmem_limit_bytes is not None:
-        limit = min(int(vmem_limit_bytes), limit)
+    limit = _effective_scoped_vmem_limit_bytes(vmem_limit_bytes)
 
     bkv_p = max(1, int(bkv_p))
     bq_sz = max(1, int(bq_sz))
@@ -1717,10 +1741,18 @@ def ragged_paged_attention(
 
     def get_case_block_sizes(case: RpaCase):
         bkv_p = base_bkv_p if num_kv_pages_per_block is None else num_kv_pages_per_block
-        if num_queries_per_block is not None:
-            bq_sz = num_queries_per_block
-        elif case == RpaCase.DECODE:
+        if case == RpaCase.DECODE:
+            # Decode sequences always have static_q_len == 1; never pad Q blocks
+            # beyond 1 token. When bkv_p was not explicitly sized for decode
+            # (auto or paired with a multi-token prefill/mixed bq_sz > 1), use
+            # larger KV blocks (up to 4096 KV tokens, VMEM-clamped below) for
+            # peak HBM bandwidth while still honoring explicit decode overrides.
             bq_sz = 1
+            if num_kv_pages_per_block is None or (num_queries_per_block is not None and num_queries_per_block > 1):
+                decode_target = min(pages_per_seq, max(1, 4096 // page_size))
+                bkv_p = max(bkv_p, decode_target)
+        elif num_queries_per_block is not None:
+            bq_sz = num_queries_per_block
         elif case == RpaCase.PREFILL and chunk_prefill_size is not None:
             bq_sz = min(base_bq_sz, chunk_prefill_size)
         else:

@@ -78,7 +78,8 @@ Continuous-Batching / Inference Operations:
 
     RaggedGatedDeltaRule: Packed ragged GDN v2 operation.
         Mixed prefill/decode gated-delta recurrence over a flat token stream for
-        eSurge serving.
+        eSurge serving. Also re-exports ``ragged_gdn_conv_decode_head_sharded``
+        from eJKernel.
 
     GDNComputeScheduleV2 / GDNComputeScheduleV2Config / compute_schedule_table_v2:
         Grid-schedule construction for the ragged GDN Pallas kernels under
@@ -129,7 +130,7 @@ from .inference_conv1d import (
     ragged_causal_conv1d_head_sharded,
     reorder_conv_features_for_sharding,
 )
-from .inference_gdn import RaggedGatedDeltaRule
+from .inference_gdn import RaggedGatedDeltaRule, ragged_gdn_conv_decode_head_sharded
 from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate, fused_kda_gate_per_channel
 from .multi_latent_ragged_page_attention import MultiLatentRaggedPageAttn
 from .paged_flash_attention import PagedFlashAttn
@@ -202,5 +203,6 @@ __all__ = (
     "packed_ssm2_fwd",
     "ragged_causal_conv1d",
     "ragged_causal_conv1d_head_sharded",
+    "ragged_gdn_conv_decode_head_sharded",
     "reorder_conv_features_for_sharding",
 )

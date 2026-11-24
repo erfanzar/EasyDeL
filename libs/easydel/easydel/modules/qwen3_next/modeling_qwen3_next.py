@@ -97,6 +97,8 @@ from easydel.infra.sequence_packing import normalize_packed_segment_ids as _norm
 from easydel.infra.sharding import (
     RuntimeShardingResolver,
     coerce_runtime_sharding_resolver,
+    inference_mode_single_token_rows,
+    is_mpmd_mesh,
     mesh_axis_size,
     resolve_stage_mesh,
 )
@@ -145,6 +147,7 @@ from easydel.operations.kernels import (
     reorder_conv_features_for_sharding,
 )
 from easydel.utils import is_inference_mode
+from easydel.utils.helpers import check_bool_flag
 
 from .qwen3_next_configuration import Qwen3NextConfig
 
@@ -387,6 +390,34 @@ class Qwen3NextLinearAttentionLayout:
             return tuple(jnp.split(projected_qkvz, [self.key_dim * 2 + self.value_dim], axis=-1))
         return conv_input, z_parts[3]
 
+    def split_projected_qkvz_pre_sharded(self, projected_qkvz: Array) -> tuple[Array, Array]:
+        """Split TP-interleaved ``[q | k | v | z]`` keeping ``conv_input`` in per-shard ``[Q_r | K_r | V_r]`` order.
+
+        Performs a strictly shard-local slice with zero ICI collectives: each TP
+        rank already holds ``[Q_r | K_r | V_r | Z_r]``, so slicing off ``Z_r``
+        leaves ``conv_input`` ready for head-sharded depthwise conv1d and GDN
+        without ``reorder_conv_features_for_sharding``.
+        """
+        tp_size = _qwen3_next_tp_size(self.config)
+        conv_dim = self.key_dim * 2 + self.value_dim
+        if (
+            tp_size <= 1
+            or self.key_dim % tp_size != 0
+            or self.value_dim % tp_size != 0
+            or int(projected_qkvz.shape[-1]) != conv_dim + self.value_dim
+        ):
+            conv_part, z_part = jnp.split(projected_qkvz, [conv_dim], axis=-1)
+            return conv_part, z_part
+        local_conv = conv_dim // tp_size
+        local_z = self.value_dim // tp_size
+        interleaved = jnp.reshape(projected_qkvz, (*projected_qkvz.shape[:-1], tp_size, local_conv + local_z))
+        conv_local = jnp.reshape(interleaved[..., :local_conv], (*projected_qkvz.shape[:-1], conv_dim))
+        z_local = jnp.reshape(interleaved[..., local_conv:], (*projected_qkvz.shape[:-1], self.value_dim))
+        return (
+            with_tp_last_axis_sharding(conv_local, self.config),
+            with_tp_last_axis_sharding(z_local, self.config),
+        )
+
     def split_projected_ba(self, projected_ba: Array, num_v_heads: int) -> tuple[Array, Array]:
         """Split the packed ``[beta | alpha]`` projection into its halves.
 
@@ -552,14 +583,30 @@ def _build_qwen3_next_linear_attention_reform_param(
     """
 
     def _conv1d_weight(tensor):
-        """Permute the HF conv1d weight ``[conv_dim, 1, k]`` into EasyDeL's ``[k, 1, conv_dim]``."""
+        """Permute HF conv1d weight ``[conv_dim, 1, k]`` into EasyDeL's ``[k, 1, conv_dim]``."""
+        if include_qkvz_fusion:
+            tp_size = _qwen3_next_tp_size(config)
+            if tp_size > 1 and key_dim % tp_size == 0 and value_dim % tp_size == 0:
+                import torch
+
+                q, k, v = torch.split(tensor, (key_dim, key_dim, value_dim), dim=0)
+                tensor = torch_interleave_segments_for_tp(torch, (q, k, v), tp_size=tp_size)
         tensor = tensor.permute(2, 1, 0)
         return tensor.contiguous()
+
+    def _conv1d_weight_inverse(torch, kernel):
+        out = kernel.permute(2, 1, 0).contiguous()
+        if include_qkvz_fusion:
+            tp_size = _qwen3_next_tp_size(config)
+            if tp_size > 1 and key_dim % tp_size == 0 and value_dim % tp_size == 0:
+                q, k, v = torch_deinterleave_segments_for_tp(torch, out, (key_dim, key_dim, value_dim), tp_size=tp_size)
+                out = torch.cat((q, k, v), dim=0).contiguous()
+        return out
 
     reform_param = {
         "conv1d.weight$": {
             "splits": [{"name": "conv1d.weight", "spliter": _conv1d_weight}],
-            "inverse_spliter": lambda torch, kernel: kernel.permute(2, 1, 0),
+            "inverse_spliter": _conv1d_weight_inverse,
         },
     }
     if include_qkvz_fusion:
@@ -1436,6 +1483,7 @@ def _qwen3_next_spec_window_prep(
     num_requests: Int[Array, ""],
     split_sizes: tuple[int, ...],
     use_head_sharded: bool,
+    pre_sharded: bool = False,
     mesh=None,
     head_axis=None,
 ) -> tuple[Int[Array, "base_slots num_steps"], Bool[Array, "base_slots num_steps"], int, Array] | None:
@@ -1504,7 +1552,7 @@ def _qwen3_next_spec_window_prep(
     step_valid = spec_slot_mask[:, None] & (step_ids[None, :] < scheduled_tokens[:, None])
 
     token_cols = conv_input[0, safe_positions]
-    if use_head_sharded:
+    if use_head_sharded and not pre_sharded:
         # The persistent conv-state pool is stored in the interleaved
         # per-shard feature layout (see ragged_causal_conv1d_head_sharded);
         # bring the window token columns into the same layout.
@@ -1524,6 +1572,96 @@ def _qwen3_next_spec_window_prep(
     candidate_conv_block = jnp.concatenate(stacked_conv, axis=0).astype(conv_states.dtype)
 
     return safe_positions, step_valid, candidate_count, candidate_conv_block
+
+
+def _deinterleave_pre_sharded_conv_inputs(
+    conv_input: Array,
+    kernel: Array,
+    split_sizes: tuple[int, int, int],
+    tp_size: int,
+) -> tuple[Array, Array]:
+    """Convert TP-interleaved ``conv_input`` ``[B, S, C]`` and ``kernel`` ``[C, d_conv]`` to canonical ``[Q|K|V]``."""
+    parts_in = split_interleaved_segments_last_axis(conv_input, split_sizes, tp_size=tp_size, apply_sharding=False)
+    parts_k = split_interleaved_segments_last_axis(kernel.T, split_sizes, tp_size=tp_size, apply_sharding=False)
+    if parts_in is not None and parts_k is not None:
+        conv_input = jnp.concatenate(parts_in, axis=-1)
+        kernel = jnp.concatenate(parts_k, axis=-1).T
+    return conv_input, kernel
+
+
+def _normalize_axis_key(axis: object | None) -> object | None:
+    """Normalize a 1-element mesh-axis tuple (e.g. ``('tp',)``) to its scalar name."""
+    if isinstance(axis, tuple) and len(axis) == 1:
+        return axis[0]
+    return axis
+
+
+def _qwen3_next_fast_pallas_chunk_eligible(
+    *,
+    ragged_gdr_op: RaggedGatedDeltaRule,
+    stage_mesh: object | None,
+    head_axis: object | None,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    chunk_size: int,
+    conv_output_dtype: jnp.dtype,
+    recurrent_states_dtype: jnp.dtype,
+) -> bool:
+    """Whether the direct-DMA Pallas TPU chunk/decode GDN kernel will be selected.
+
+    Shared by ``use_direct_pool`` (outer pool gather/scatter bypass) and
+    ``use_fast_pallas_chunk`` (inner recurrent-scan prefill bypass) so both
+    predicates stay aligned with ``_pallas_impl_fwd.py`` and
+    ``pallas_gdn_chunk_prefill_supported``.
+    """
+    if jax.default_backend() != "tpu" or check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+        return False
+    if int(chunk_size) not in (64, 128):
+        return False
+    if int(head_k_dim) != 128 or int(head_v_dim) != 128:
+        return False
+    if jnp.dtype(conv_output_dtype) not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)):
+        return False
+    if jnp.dtype(recurrent_states_dtype) not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)):
+        return False
+
+    gdr_meta = ragged_gdr_op.get_impl_metadata()
+    gdr_cfg = gdr_meta.get_operation_config("ragged_gated_delta_rule_v2")
+    if bool(getattr(gdr_cfg, "use_fused_gdn_decode", False)):
+        return False
+    cfg_platform = getattr(gdr_cfg, "platform", None)
+    cfg_platform_key = str(getattr(cfg_platform, "value", cfg_platform or "")).strip().lower()
+    if cfg_platform_key and cfg_platform_key != "auto":
+        platform_key = cfg_platform_key
+    else:
+        meta_platform = getattr(gdr_meta, "platform", None)
+        platform_key = str(getattr(meta_platform, "value", meta_platform or "auto")).strip().lower()
+    if platform_key not in {"", "auto", "pallas"}:
+        return False
+
+    tp_size = int(mesh_axis_size(stage_mesh, head_axis))
+    split_sizes = (
+        int(num_k_heads * head_k_dim),
+        int(num_k_heads * head_k_dim),
+        int(num_v_heads * head_v_dim),
+    )
+    use_head_sharded = (
+        stage_mesh is not None
+        and head_axis is not None
+        and tp_size > 1
+        and int(num_k_heads) % tp_size == 0
+        and int(num_v_heads) % tp_size == 0
+        and all(size % tp_size == 0 for size in split_sizes)
+    )
+    local_n_kq = int(num_k_heads) // tp_size if use_head_sharded else int(num_k_heads)
+    local_n_v = int(num_v_heads) // tp_size if use_head_sharded else int(num_v_heads)
+    if local_n_kq <= 0 or local_n_v <= 0 or local_n_v > 128 or local_n_v % local_n_kq != 0:
+        return False
+    if (local_n_v > 8 and local_n_v % 8 != 0) or (local_n_kq > 8 and local_n_kq % 8 != 0):
+        return False
+    return True
 
 
 def _apply_qwen3_next_packed_updates_ragged(
@@ -1546,6 +1684,8 @@ def _apply_qwen3_next_packed_updates_ragged(
     dt_bias: Float[Array, "num_v_heads"],
     context_lens: Int[Array, "num_slots"] | None = None,
     spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+    state_indices: Int[Array, "num_rows"] | None = None,
+    pre_sharded_conv: bool = False,
     disable_recurrent_scan_prefill: bool = False,
     ragged_gdr_chunk_size: int = 16,
     force_recurrent_scan_prefill: bool = False,
@@ -1623,8 +1763,9 @@ def _apply_qwen3_next_packed_updates_ragged(
         - ``new_recurrent_state``: Refreshed GDN-state pool, same shape and
           dtype as ``recurrent_states``.
         - ``token_outputs``: Per-token linear-attention output,
-          shape ``(seq_len, num_v_heads, head_v_dim)``, cast to float32 for
-          downstream projections.
+          shape ``(seq_len, num_v_heads, head_v_dim)``, in ``conv_output_dtype``
+          (or ``float32`` on speculative window passes / empty batches),
+          consumed by :class:`RMSNormGated` which normalizes in ``float32``.
 
     Notes:
         When ``num_slots == 0`` (no active slots in the static shape) the
@@ -1635,38 +1776,48 @@ def _apply_qwen3_next_packed_updates_ragged(
     seq_len = conv_input.shape[1]
     d_conv = kernel.shape[1]
     token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
-    num_slots = min(conv_states.shape[0], query_start_loc.shape[0] - 1)
+    direct_pool_mode = state_indices is not None
+    num_pool_slots = int(conv_states.shape[0])
+    num_slots = (
+        int(query_start_loc.shape[0]) - 1 if direct_pool_mode else min(num_pool_slots, int(query_start_loc.shape[0]) - 1)
+    )
     slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
     scheduled_tokens = query_start_loc[1 : num_slots + 1] - query_start_loc[:num_slots]
-    active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
 
-    if num_slots == 0:
+    if num_slots == 0 or num_pool_slots == 0:
         return conv_states, recurrent_states, token_outputs
 
-    extra_slots = conv_states.shape[0] - num_slots
-    candidate_count = extra_slots // num_slots if num_slots > 0 and extra_slots > 0 else 0
-    if candidate_count > 0 and spec_recurrent_commit is not None:
-        commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
-        raw_prefix = commit[1, :num_slots]
-        commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
-        # Prefix-major candidate layout: base + prefix * num_slots + slot.
-        candidate_rows = num_slots + (raw_prefix - 1) * num_slots + slot_ids
-        safe_rows = jnp.clip(candidate_rows, 0, conv_states.shape[0] - 1)
-        row_valid = commit_active & (candidate_rows < conv_states.shape[0])
-        conv_states = conv_states.at[:num_slots].set(
-            jnp.where(row_valid[:, None, None], conv_states[safe_rows], conv_states[:num_slots]).astype(
-                conv_states.dtype
+    if direct_pool_mode:
+        effective_state_indices = jnp.asarray(state_indices, dtype=jnp.int32).reshape(-1)[:num_slots]
+        slot_ok = (effective_state_indices >= 0) & (effective_state_indices < num_pool_slots)
+        active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0) & slot_ok
+        candidate_count = 0
+    else:
+        effective_state_indices = jnp.arange(num_slots, dtype=jnp.int32)
+        active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
+        extra_slots = num_pool_slots - num_slots
+        candidate_count = extra_slots // num_slots if num_slots > 0 and extra_slots > 0 else 0
+        if candidate_count > 0 and spec_recurrent_commit is not None:
+            commit = jnp.asarray(spec_recurrent_commit, dtype=jnp.int32)
+            raw_prefix = commit[1, :num_slots]
+            commit_active = (commit[0, :num_slots] > 0) & (raw_prefix > 0) & (raw_prefix <= int(candidate_count))
+            # Prefix-major candidate layout: base + prefix * num_slots + slot.
+            candidate_rows = num_slots + (raw_prefix - 1) * num_slots + slot_ids
+            safe_rows = jnp.clip(candidate_rows, 0, num_pool_slots - 1)
+            row_valid = commit_active & (candidate_rows < num_pool_slots)
+            conv_states = conv_states.at[:num_slots].set(
+                jnp.where(row_valid[:, None, None], conv_states[safe_rows], conv_states[:num_slots]).astype(
+                    conv_states.dtype
+                )
             )
-        )
-        recurrent_states = recurrent_states.at[:num_slots].set(
-            jnp.where(
-                row_valid[:, None, None, None],
-                recurrent_states[safe_rows],
-                recurrent_states[:num_slots],
-            ).astype(recurrent_states.dtype)
-        )
+            recurrent_states = recurrent_states.at[:num_slots].set(
+                jnp.where(
+                    row_valid[:, None, None, None],
+                    recurrent_states[safe_rows],
+                    recurrent_states[:num_slots],
+                ).astype(recurrent_states.dtype)
+            )
 
-    state_indices = jnp.arange(num_slots, dtype=jnp.int32)
     qsl = query_start_loc[: num_slots + 1]
     if context_lens is None:
         has_initial_state = jnp.ones((num_slots,), dtype=jnp.bool_)
@@ -1688,29 +1839,59 @@ def _apply_qwen3_next_packed_updates_ragged(
     shardings_bthd = gdr_metadata.get_shardings(gdr_mode, layout="bthd")
     head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
     mesh = gdr_metadata.mesh
-    tp_size = int(mesh_axis_size(mesh, head_axis))
+    stage_mesh = resolve_stage_mesh(mesh, arr=conv_input) or mesh
+    tp_size = int(mesh_axis_size(stage_mesh, head_axis))
     split_sizes = (
         int(num_k_heads * head_k_dim),
         int(num_k_heads * head_k_dim),
         int(num_v_heads * head_v_dim),
     )
     use_head_sharded_conv = (
-        mesh is not None and head_axis is not None and tp_size > 1 and all(size % tp_size == 0 for size in split_sizes)
+        stage_mesh is not None
+        and head_axis is not None
+        and tp_size > 1
+        and int(num_k_heads) % tp_size == 0
+        and int(num_v_heads) % tp_size == 0
+        and all(size % tp_size == 0 for size in split_sizes)
     )
-    # Speculative-decode verify windows (recognized statically by the presence
-    # of candidate state rows) route the multi-token main pass through the
-    # fused recurrent-scan kernel: a K+1-token window per slot is a terrible
-    # fit for the chunked path (full WY machinery on chunk-16 padding cost
-    # ~27ms/forward on the 27B at tp=4; the scan costs ~4ms). Small buckets
-    # only — chunked prefill keeps the large prompt buckets. Non-speculative
-    # runners are unaffected.
-    _has_candidate_rows = conv_states.shape[0] > (query_start_loc.shape[0] - 1)
+    cfg_tp_axis = tensor_parallel_axis(gdr_metadata.base_config)
+    cfg_tp_size = int(mesh_axis_size(stage_mesh, cfg_tp_axis))
+    pre_sharded_matches_head = (
+        pre_sharded_conv
+        and use_head_sharded_conv
+        and _normalize_axis_key(head_axis) == _normalize_axis_key(cfg_tp_axis)
+        and tp_size == cfg_tp_size
+    )
+    if pre_sharded_conv and not pre_sharded_matches_head and cfg_tp_size > 1:
+        conv_input, kernel = _deinterleave_pre_sharded_conv_inputs(conv_input, kernel, split_sizes, cfg_tp_size)
+    effective_chunk_size = int(ragged_gdr_chunk_size)
+    if effective_chunk_size == 128 and int(seq_len) <= 64:
+        effective_chunk_size = 64
+
+    _has_candidate_rows = not direct_pool_mode and candidate_count > 0
+    # When the direct-DMA Pallas TPU chunked GDN kernel is active (cs in {64, 128})
+    # on a non-speculative step, prefer it over the legacy recurrent-scan fallback
+    # even for small seq_len buckets so mixed batches avoid serial scan overhead
+    # and handle direct-pool state_indices uniformly.
+    use_fast_pallas_chunk = not _has_candidate_rows and _qwen3_next_fast_pallas_chunk_eligible(
+        ragged_gdr_op=ragged_gdr_op,
+        stage_mesh=stage_mesh,
+        head_axis=head_axis,
+        num_k_heads=num_k_heads,
+        head_k_dim=head_k_dim,
+        num_v_heads=num_v_heads,
+        head_v_dim=head_v_dim,
+        chunk_size=effective_chunk_size,
+        conv_output_dtype=conv_output_dtype,
+        recurrent_states_dtype=recurrent_states.dtype,
+    )
     use_recurrent_scan_prefill = (
         jax.default_backend() == "tpu"
         and not bool(disable_recurrent_scan_prefill)
+        and not direct_pool_mode
         and (
             force_recurrent_scan_prefill
-            or (1 < seq_len <= recurrent_scan_prefill_max_seq_len)
+            or (not use_fast_pallas_chunk and 1 < seq_len <= recurrent_scan_prefill_max_seq_len)
             or (_has_candidate_rows and seq_len <= 256)
         )
     )
@@ -1733,27 +1914,32 @@ def _apply_qwen3_next_packed_updates_ragged(
             conv_states,
             kernel,
             qsl,
-            state_indices,
+            effective_state_indices,
             distribution,
             split_sizes=split_sizes,
-            mesh=mesh,
-            head_axis=head_axis,
+            mesh=stage_mesh,
+            head_axis=head_axis if use_head_sharded_conv else None,
             d_conv=d_conv,
             apply_silu=not use_recurrent_scan_prefill,
-            pre_sharded=False,
+            pre_sharded=pre_sharded_matches_head,
         )
         conv_outputs_flat = conv_outputs_flat.astype(conv_output_dtype)
 
-        window_prep = _qwen3_next_spec_window_prep(
-            conv_states=conv_states,
-            conv_input=conv_input,
-            query_start_loc=query_start_loc,
-            context_lens=context_lens,
-            num_requests=num_requests,
-            split_sizes=split_sizes,
-            use_head_sharded=use_head_sharded_conv,
-            mesh=mesh,
-            head_axis=head_axis,
+        window_prep = (
+            _qwen3_next_spec_window_prep(
+                conv_states=conv_states,
+                conv_input=conv_input,
+                query_start_loc=query_start_loc,
+                context_lens=context_lens,
+                num_requests=num_requests,
+                split_sizes=split_sizes,
+                use_head_sharded=use_head_sharded_conv,
+                pre_sharded=pre_sharded_matches_head,
+                mesh=stage_mesh,
+                head_axis=head_axis,
+            )
+            if _has_candidate_rows
+            else None
         )
 
         if window_prep is not None:
@@ -1766,7 +1952,7 @@ def _apply_qwen3_next_packed_updates_ragged(
                 A_log=A_log,
                 dt_bias=dt_bias,
                 query_start_loc=qsl,
-                state_indices=state_indices,
+                state_indices=effective_state_indices,
                 distribution=distribution,
                 window_positions=safe_positions,
                 window_valid=step_valid,
@@ -1779,7 +1965,7 @@ def _apply_qwen3_next_packed_updates_ragged(
                 use_qk_norm_in_gdn=True,
                 pre_sharded_mixed_qkv=use_head_sharded_conv,
                 flat_tp_shard=use_head_sharded_conv,
-                chunk_size=ragged_gdr_chunk_size,
+                chunk_size=effective_chunk_size,
                 apply_silu_in_gdr=use_recurrent_scan_prefill,
                 use_recurrent_scan_prefill=use_recurrent_scan_prefill,
                 mask_initial_state=context_lens is not None,
@@ -1804,7 +1990,7 @@ def _apply_qwen3_next_packed_updates_ragged(
             A_log=A_log,
             dt_bias=dt_bias,
             query_start_loc=qsl,
-            state_indices=state_indices,
+            state_indices=effective_state_indices,
             distribution=distribution,
             has_initial_state=has_initial_state,
             n_kq=num_k_heads,
@@ -1814,13 +2000,13 @@ def _apply_qwen3_next_packed_updates_ragged(
             use_qk_norm_in_gdn=True,
             pre_sharded_mixed_qkv=use_head_sharded_conv,
             flat_tp_shard=use_head_sharded_conv,
-            chunk_size=ragged_gdr_chunk_size,
+            chunk_size=effective_chunk_size,
             apply_silu_in_gdr=use_recurrent_scan_prefill,
             use_recurrent_scan_prefill=use_recurrent_scan_prefill,
             mask_initial_state=context_lens is not None,
         )
         token_outputs_i = token_outputs_i.reshape(seq_len, num_v_heads, head_v_dim)
-        return updated_conv_states, new_recurrent_state, token_outputs_i.astype(jnp.float32)
+        return updated_conv_states, new_recurrent_state, token_outputs_i
 
     return _run_normal_ragged_path(None)
 
@@ -1850,6 +2036,8 @@ def _apply_qwen3_next_packed_updates(
     dt_bias: Float[Array, "num_v_heads"] | None = None,
     context_lens: Int[Array, "num_slots"] | None = None,
     spec_recurrent_commit: Int[Array, "2 num_slots"] | None = None,
+    state_indices: Int[Array, "num_rows"] | None = None,
+    pre_sharded_conv: bool = False,
     disable_recurrent_scan_prefill: bool = False,
     use_ragged_gdr: bool = True,
     ragged_gdr_chunk_size: int = 16,
@@ -1894,7 +2082,21 @@ def _apply_qwen3_next_packed_updates(
 
     use_ragged = is_inference_mode() and bool(use_ragged_gdr)
     if not use_ragged:
-        return _apply_qwen3_next_packed_updates_unified(
+        deinterleaved_tp = 1
+        segs = (int(key_dim), int(key_dim), int(num_v_heads * head_v_dim))
+        if pre_sharded_conv:
+            gdr_meta = gdr_op.get_impl_metadata()
+            stage_mesh = resolve_stage_mesh(gdr_meta.mesh, arr=conv_input) or gdr_meta.mesh
+            tp_size = int(mesh_axis_size(stage_mesh, tensor_parallel_axis(gdr_meta.base_config)))
+            if tp_size > 1:
+                conv_input, kernel = _deinterleave_pre_sharded_conv_inputs(conv_input, kernel, segs, tp_size)
+                parts_st = split_interleaved_segments_last_axis(
+                    jnp.swapaxes(conv_states, 1, 2), segs, tp_size=tp_size, apply_sharding=False
+                )
+                if parts_st is not None:
+                    conv_states = jnp.swapaxes(jnp.concatenate(parts_st, axis=-1), 1, 2)
+                    deinterleaved_tp = tp_size
+        updated_conv_states, updated_recurrent_states, token_outputs = _apply_qwen3_next_packed_updates_unified(
             conv_states=conv_states,
             recurrent_states=recurrent_states,
             conv_input=conv_input,
@@ -1918,6 +2120,11 @@ def _apply_qwen3_next_packed_updates(
             context_lens=context_lens,
             spec_recurrent_commit=spec_recurrent_commit,
         )
+        if deinterleaved_tp > 1:
+            offsets = (segs[0], segs[0] + segs[1])
+            st_segs = jnp.split(jnp.swapaxes(updated_conv_states, 1, 2), offsets, axis=-1)
+            updated_conv_states = jnp.swapaxes(interleave_segments_last_axis(st_segs, tp_size=deinterleaved_tp), 1, 2)
+        return updated_conv_states, updated_recurrent_states, token_outputs
 
     return _apply_qwen3_next_packed_updates_ragged(
         conv_states=conv_states,
@@ -1938,6 +2145,8 @@ def _apply_qwen3_next_packed_updates(
         dt_bias=dt_bias,
         context_lens=context_lens,
         spec_recurrent_commit=spec_recurrent_commit,
+        state_indices=state_indices,
+        pre_sharded_conv=pre_sharded_conv,
         disable_recurrent_scan_prefill=disable_recurrent_scan_prefill,
         ragged_gdr_chunk_size=ragged_gdr_chunk_size,
         force_recurrent_scan_prefill=force_recurrent_scan_prefill,
@@ -2720,9 +2929,13 @@ class Qwen3NextLinearAttention(spx.Module):
         if requested_split_proj and requested_merged_split_proj:
             raise ValueError("linear_attention_separate_proj and linear_attention_merged_split_proj are exclusive")
         active_tp_size = _qwen3_next_tp_size(config)
-        # The merged QKV/Z activation layout is only validated for unsharded TP.
-        # On TP>1, keep the checkpoint contract split so Q/K/V/Z order stays local.
-        self.uses_merged_split_proj = requested_merged_split_proj and active_tp_size <= 1
+        can_merge_tp = active_tp_size <= 1 or (
+            self.key_dim % active_tp_size == 0
+            and self.value_dim % active_tp_size == 0
+            and self.num_k_heads % active_tp_size == 0
+            and self.num_v_heads % active_tp_size == 0
+        )
+        self.uses_merged_split_proj = requested_merged_split_proj and can_merge_tp
         self.uses_split_proj = requested_split_proj or (requested_merged_split_proj and not self.uses_merged_split_proj)
         if self.uses_merged_split_proj:
             self.in_proj_qkvz = ColumnParallelLinear(
@@ -3073,9 +3286,13 @@ class Qwen3NextLinearAttention(spx.Module):
             if cache_metadata is not None:
                 raise NotImplementedError("Prefix-shared linear attention does not take cache metadata.")
         expand_ratio = self.num_v_heads // self.num_k_heads
+        pre_sharded_conv = self.uses_merged_split_proj and _qwen3_next_tp_size(self.config) > 1
         if self.uses_merged_split_proj:
             projected_qkvz = self.in_proj_qkvz(hidden_states)
-            conv_input, z_flat = self.linear_attention_layout.split_projected_qkvz(projected_qkvz)
+            if pre_sharded_conv:
+                conv_input, z_flat = self.linear_attention_layout.split_projected_qkvz_pre_sharded(projected_qkvz)
+            else:
+                conv_input, z_flat = self.linear_attention_layout.split_projected_qkvz(projected_qkvz)
             z = z_flat.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
             mixed_ba = self.in_proj_ba(hidden_states)
             beta, alpha = self.linear_attention_layout.split_projected_ba(mixed_ba, self.num_v_heads)
@@ -3158,6 +3375,18 @@ class Qwen3NextLinearAttention(spx.Module):
                     and seq_len_static > 1
                     and (force_dp_recurrent_scan_prefill or seq_len_static <= dp_recurrent_scan_max_prefill)
                 )
+                # Direct-DMA Pallas GDN kernels (cs in {64, 128}) use PrefetchScalarGridSpec +
+                # input_output_aliases inside shard_map, which cannot be jax.vmapped across DP ranks.
+                use_dp_pallas_chunk_loop = (
+                    jax.default_backend() == "tpu"
+                    and is_inference_mode()
+                    and bool(self.config.use_ragged_gdr)
+                    and not check_bool_flag("FORCE_NATIVE_RUNTIME", False)
+                    and int(self.config.ragged_gdr_chunk_size) in (64, 128)
+                    and int(self.head_k_dim) == 128
+                    and int(self.head_v_dim) == 128
+                )
+                use_dp_rank_loop = use_dp_recurrent_scan_prefill or use_dp_pallas_chunk_loop
                 query_start_loc_by_rank = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
                 rows_per_rank = int(query_start_loc_by_rank.shape[1] - 1)
                 dp_size = int(query_start_loc_by_rank.shape[0])
@@ -3210,7 +3439,13 @@ class Qwen3NextLinearAttention(spx.Module):
                         state_idx_i,
                     ) = args
                     row_ids = jnp.arange(rows_per_rank, dtype=jnp.int32)
-                    active_rows = row_ids < num_requests_i
+                    row_lens_i = qsl_i[1 : rows_per_rank + 1] - qsl_i[:rows_per_rank]
+                    live_rows = (
+                        (row_ids < num_requests_i)
+                        & (row_lens_i > 0)
+                        & (state_idx_i >= 0)
+                        & (state_idx_i < rows_per_rank)
+                    )
                     safe_state_idx = jnp.clip(state_idx_i, 0, rows_per_rank - 1)
                     selected_conv_state = conv_state_i[safe_state_idx]
                     selected_recurrent_state = recurrent_state_i[safe_state_idx]
@@ -3241,18 +3476,19 @@ class Qwen3NextLinearAttention(spx.Module):
                         dt_bias=self.dt_bias.value,
                         context_lens=ctx_i if use_context_lens else None,
                         spec_recurrent_commit=None,
+                        pre_sharded_conv=pre_sharded_conv,
                         disable_recurrent_scan_prefill=not use_dp_recurrent_scan_prefill,
                         use_ragged_gdr=bool(self.config.use_ragged_gdr),
                         ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
                         force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
                         recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
                     )
-                    scatter_idx = jnp.where(active_rows, safe_state_idx, rows_per_rank)
+                    scatter_idx = jnp.where(live_rows, state_idx_i, rows_per_rank)
                     conv_state_i = conv_state_i.at[scatter_idx].set(updated_conv_state, mode="drop")
                     recurrent_state_i = recurrent_state_i.at[scatter_idx].set(updated_recurrent_state, mode="drop")
                     return conv_state_i, recurrent_state_i, token_output
 
-                if use_dp_recurrent_scan_prefill:
+                if use_dp_rank_loop:
                     updated_conv_by_rank_list = []
                     updated_recurrent_by_rank_list = []
                     token_outputs_list = []
@@ -3302,66 +3538,193 @@ class Qwen3NextLinearAttention(spx.Module):
                 query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
                 num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
                 num_requests = num_seqs_arr[0]
-                # eSurge names every row's pool slot (``recurrent_state_indices``) when a row window can start past
-                # slot 0 (several row windows per step, sparse row packing): run the rows on their gathered slots and
-                # scatter the new states back below. The speculative candidate layout keeps row r on slot r.
                 num_rows = int(query_start_loc.shape[0]) - 1
-                pool_states = None
-                if packed_recurrent_state_indices is not None and packed_spec_recurrent_commit is None:
-                    pool_states = (conv_states, recurrent_states)
-                    num_pool_slots = int(conv_states.shape[0])
-                    row_slots = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32).reshape(-1)[:num_rows]
-                    read_slots = jnp.clip(row_slots, 0, num_pool_slots - 1)
-                    conv_states = conv_states[read_slots]
-                    recurrent_states = recurrent_states[read_slots]
-
-                conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
-                    conv_states=conv_states,
-                    recurrent_states=recurrent_states,
-                    conv_input=conv_input,
-                    beta=beta,
-                    decay=decay,
-                    kernel=kernel,
-                    query_start_loc=query_start_loc,
-                    num_requests=num_requests,
-                    key_dim=self.key_dim,
-                    num_k_heads=self.num_k_heads,
-                    head_k_dim=self.head_k_dim,
-                    num_v_heads=self.num_v_heads,
-                    head_v_dim=self.head_v_dim,
-                    expand_ratio=expand_ratio,
-                    conv_output_dtype=conv_output_dtype,
-                    gdr_op=self.gdr_op,
-                    ragged_gdr_op=self.ragged_gdr_op,
-                    alpha_raw=alpha_raw,
-                    beta_raw=beta_raw,
-                    A_log=self.A_log.value,
-                    dt_bias=self.dt_bias.value,
-                    context_lens=packed_context_lens,
-                    spec_recurrent_commit=packed_spec_recurrent_commit,
-                    use_ragged_gdr=bool(self.config.use_ragged_gdr),
-                    ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
-                    force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
-                    recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
+                num_pool_slots = int(conv_states.shape[0])
+                use_ragged = is_inference_mode() and bool(self.config.use_ragged_gdr)
+                single_token_eligible = (
+                    use_ragged
+                    and packed_spec_recurrent_commit is None
+                    and seq_len > 0
+                    and num_rows > 0
+                    and num_pool_slots > 0
                 )
-                if pool_states is not None:
-                    # Rows without tokens (eSurge points padding rows at slot 0) and out-of-range slots write nothing.
-                    row_lens = query_start_loc[1:] - query_start_loc[:-1]
-                    live = (
-                        (jnp.arange(num_rows, dtype=jnp.int32) < num_requests)
-                        & (row_lens > 0)
+                if single_token_eligible and inference_mode_single_token_rows():
+                    # eSurge's single-token decode twin: every row carries at most one token.
+                    # Run the fused in-place Conv1D + SiLU + L2Norm + GDN decode kernel
+                    # directly on the full state pools (zero lax.switch, zero gather/scatter).
+                    row_ids = jnp.arange(num_rows, dtype=jnp.int32)
+                    starts = query_start_loc[:-1]
+                    lens = query_start_loc[1:] - starts
+                    if packed_recurrent_state_indices is None:
+                        row_slots = row_ids
+                    else:
+                        row_slots = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32).reshape(-1)[:num_rows]
+                    advance = (
+                        (row_ids < num_requests)
+                        & (lens == 1)
+                        & (starts >= 0)
+                        & (starts < seq_len)
                         & (row_slots >= 0)
                         & (row_slots < num_pool_slots)
                     )
-                    write_slots = jnp.where(live, row_slots, num_pool_slots)
-                    pool_conv, pool_recurrent = pool_states
-                    conv_states = pool_conv.at[write_slots].set(
-                        conv_states[:num_rows].astype(pool_conv.dtype), mode="drop"
+                    if packed_context_lens is None:
+                        has_prefix = jnp.ones((num_rows,), dtype=jnp.bool_)
+                    else:
+                        ctx_i = jnp.asarray(packed_context_lens, dtype=jnp.int32).reshape(-1)[:num_rows]
+                        has_prefix = (ctx_i - lens) > 0
+                    tok = jnp.clip(starts, 0, seq_len - 1)
+                    dest = jnp.where(advance, tok, seq_len)
+                    token_slots = jnp.full((seq_len,), -1, dtype=jnp.int32).at[dest].set(row_slots, mode="drop")
+                    token_init = jnp.zeros((seq_len,), dtype=jnp.bool_).at[dest].set(has_prefix, mode="drop")
+
+                    gdr_metadata = self.ragged_gdr_op.get_impl_metadata()
+                    gdr_mode = self.ragged_gdr_op.get_mode(query=conv_input, BTHD=False)
+                    shardings_bthd = gdr_metadata.get_shardings(gdr_mode, layout="bthd")
+                    head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+                    stage_mesh_dec = resolve_stage_mesh(gdr_metadata.mesh, arr=conv_input) or gdr_metadata.mesh
+                    tp_size_dec = int(mesh_axis_size(stage_mesh_dec, head_axis))
+                    split_sizes_dec = (self.key_dim, self.key_dim, self.value_dim)
+                    use_head_sharded_dec = (
+                        stage_mesh_dec is not None
+                        and head_axis is not None
+                        and tp_size_dec > 1
+                        and self.num_k_heads % tp_size_dec == 0
+                        and self.num_v_heads % tp_size_dec == 0
+                        and all(s % tp_size_dec == 0 for s in split_sizes_dec)
                     )
-                    recurrent_states = pool_recurrent.at[write_slots].set(
-                        recurrent_states[:num_rows].astype(pool_recurrent.dtype), mode="drop"
+                    cfg_tp_axis_dec = tensor_parallel_axis(self.config)
+                    cfg_tp_size_dec = int(mesh_axis_size(stage_mesh_dec, cfg_tp_axis_dec))
+                    pre_sharded_dec = (
+                        pre_sharded_conv
+                        and use_head_sharded_dec
+                        and _normalize_axis_key(head_axis) == _normalize_axis_key(cfg_tp_axis_dec)
+                        and tp_size_dec == cfg_tp_size_dec
                     )
-                output = token_outputs[None, ...]
+                    if pre_sharded_conv and not pre_sharded_dec and cfg_tp_size_dec > 1:
+                        conv_input_dec, kernel_dec = _deinterleave_pre_sharded_conv_inputs(
+                            conv_input, kernel, split_sizes_dec, cfg_tp_size_dec
+                        )
+                    else:
+                        conv_input_dec, kernel_dec = conv_input, kernel
+                    token_outputs, conv_states, recurrent_states = self.ragged_gdr_op.forward_conv_decode(
+                        conv_input_dec[0],
+                        beta_raw[0, :seq_len],
+                        alpha_raw[0, :seq_len],
+                        kernel_dec,
+                        conv_states,
+                        recurrent_states,
+                        self.A_log.value,
+                        self.dt_bias.value,
+                        token_slots,
+                        token_init,
+                        n_kq=self.num_k_heads,
+                        n_v=self.num_v_heads,
+                        d_k=self.head_k_dim,
+                        d_v=self.head_v_dim,
+                        use_qk_l2norm=True,
+                        apply_silu=True,
+                        conv_output_dtype=conv_output_dtype,
+                        out_dtype=jnp.float32,
+                        pre_sharded=pre_sharded_dec,
+                        mesh=stage_mesh_dec,
+                        head_axis=head_axis,
+                        allow_axis_fallback=True,
+                    )
+                    output = token_outputs[None, ...]
+                else:
+                    # Direct-pool ragged mode avoids outer gather/scatter of the full state pools
+                    # when using the in-place chunked Pallas GDN kernel (cs in {64, 128}).
+                    if use_ragged:
+                        _dp_meta = self.ragged_gdr_op.get_impl_metadata()
+                        _dp_mode = self.ragged_gdr_op.get_mode(query=conv_input, BTHD=False)
+                        _dp_shardings = _dp_meta.get_shardings(_dp_mode, layout="bthd")
+                        _dp_head_axis = _dp_shardings.query[2] if _dp_shardings.query is not None else None
+                        _dp_mesh = resolve_stage_mesh(_dp_meta.mesh, arr=conv_input) or _dp_meta.mesh
+                        _dp_chunk_size = int(self.config.ragged_gdr_chunk_size)
+                        if _dp_chunk_size == 128 and int(seq_len) <= 64:
+                            _dp_chunk_size = 64
+                        _dp_fast_pallas_eligible = _qwen3_next_fast_pallas_chunk_eligible(
+                            ragged_gdr_op=self.ragged_gdr_op,
+                            stage_mesh=_dp_mesh,
+                            head_axis=_dp_head_axis,
+                            num_k_heads=self.num_k_heads,
+                            head_k_dim=self.head_k_dim,
+                            num_v_heads=self.num_v_heads,
+                            head_v_dim=self.head_v_dim,
+                            chunk_size=_dp_chunk_size,
+                            conv_output_dtype=conv_output_dtype,
+                            recurrent_states_dtype=recurrent_states.dtype,
+                        )
+                    else:
+                        _dp_fast_pallas_eligible = False
+                    use_direct_pool = (
+                        _dp_fast_pallas_eligible
+                        and packed_recurrent_state_indices is not None
+                        and packed_spec_recurrent_commit is None
+                        and not bool(self.config.force_recurrent_scan_prefill)
+                    )
+                    pool_states = None
+                    direct_state_indices = None
+                    if use_direct_pool:
+                        direct_state_indices = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32).reshape(-1)[
+                            :num_rows
+                        ]
+                    elif packed_recurrent_state_indices is not None and packed_spec_recurrent_commit is None:
+                        pool_states = (conv_states, recurrent_states)
+                        row_slots = jnp.asarray(packed_recurrent_state_indices, dtype=jnp.int32).reshape(-1)[:num_rows]
+                        read_slots = jnp.clip(row_slots, 0, num_pool_slots - 1)
+                        conv_states = conv_states[read_slots]
+                        recurrent_states = recurrent_states[read_slots]
+
+                    conv_states, recurrent_states, token_outputs = _apply_qwen3_next_packed_updates(
+                        conv_states=conv_states,
+                        recurrent_states=recurrent_states,
+                        conv_input=conv_input,
+                        beta=beta,
+                        decay=decay,
+                        kernel=kernel,
+                        query_start_loc=query_start_loc,
+                        num_requests=num_requests,
+                        key_dim=self.key_dim,
+                        num_k_heads=self.num_k_heads,
+                        head_k_dim=self.head_k_dim,
+                        num_v_heads=self.num_v_heads,
+                        head_v_dim=self.head_v_dim,
+                        expand_ratio=expand_ratio,
+                        conv_output_dtype=conv_output_dtype,
+                        gdr_op=self.gdr_op,
+                        ragged_gdr_op=self.ragged_gdr_op,
+                        alpha_raw=alpha_raw,
+                        beta_raw=beta_raw,
+                        A_log=self.A_log.value,
+                        dt_bias=self.dt_bias.value,
+                        context_lens=packed_context_lens,
+                        spec_recurrent_commit=packed_spec_recurrent_commit,
+                        state_indices=direct_state_indices,
+                        pre_sharded_conv=pre_sharded_conv,
+                        use_ragged_gdr=bool(self.config.use_ragged_gdr),
+                        ragged_gdr_chunk_size=int(self.config.ragged_gdr_chunk_size),
+                        force_recurrent_scan_prefill=bool(self.config.force_recurrent_scan_prefill),
+                        recurrent_scan_prefill_max_seq_len=int(self.config.recurrent_scan_prefill_max_seq_len),
+                    )
+                    if pool_states is not None:
+                        # Rows without tokens (eSurge points padding rows at slot 0) and out-of-range slots write nothing.
+                        row_lens = query_start_loc[1:] - query_start_loc[:-1]
+                        live = (
+                            (jnp.arange(num_rows, dtype=jnp.int32) < num_requests)
+                            & (row_lens > 0)
+                            & (row_slots >= 0)
+                            & (row_slots < num_pool_slots)
+                        )
+                        write_slots = jnp.where(live, row_slots, num_pool_slots)
+                        pool_conv, pool_recurrent = pool_states
+                        conv_states = pool_conv.at[write_slots].set(
+                            conv_states[:num_rows].astype(pool_conv.dtype), mode="drop"
+                        )
+                        recurrent_states = pool_recurrent.at[write_slots].set(
+                            recurrent_states[:num_rows].astype(pool_recurrent.dtype), mode="drop"
+                        )
+                    output = token_outputs[None, ...]
 
             new_cache_view = cache_view.replace(
                 conv_state=conv_states,
@@ -3402,14 +3765,28 @@ class Qwen3NextLinearAttention(spx.Module):
             conv_output = jax.nn.silu(self._segment_aware_depthwise_conv(conv_input, seg_ids))
         else:
             # Training/prefill without cache: use the full convolution directly.
-            if self.uses_split_proj or self.uses_merged_split_proj:
+            # Under MPMD PP stage slicing, route through _stage_replicated_depthwise_conv
+            # so groups == conv_dim never produces invalid grouped-conv stage layouts.
+            if (self.uses_split_proj or self.uses_merged_split_proj) and not is_mpmd_mesh(self.config.mesh):
                 conv_output = jax.nn.silu(self.conv1d(conv_input))
             else:
                 conv_output = jax.nn.silu(self._stage_replicated_depthwise_conv(conv_input))
 
-        conv_query = conv_output[:, :, : self.key_dim]
-        conv_key = conv_output[:, :, self.key_dim : self.key_dim * 2]
-        conv_value = conv_output[:, :, self.key_dim * 2 :]
+        deinterleaved_conv = (
+            split_interleaved_segments_last_axis(
+                conv_output,
+                (self.key_dim, self.key_dim, self.value_dim),
+                config=self.config,
+            )
+            if pre_sharded_conv
+            else None
+        )
+        if deinterleaved_conv is not None:
+            conv_query, conv_key, conv_value = deinterleaved_conv
+        else:
+            conv_query = conv_output[:, :, : self.key_dim]
+            conv_key = conv_output[:, :, self.key_dim : self.key_dim * 2]
+            conv_value = conv_output[:, :, self.key_dim * 2 :]
 
         query = conv_query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         key = conv_key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)

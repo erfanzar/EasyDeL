@@ -2866,7 +2866,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         else:
             normalized_axis_policy = AxisPolicy.from_partition_axis(axis_policy)
             set_attrs_smartly(self, "axis_policy", AxisPolicy(), normalized_axis_policy)
-        if partition_axis is NOT_GIVEN:
+        if partition_axis is NOT_GIVEN or partition_axis is None:
             partition_axis = self.axis_policy.to_partition_axis()
         set_attrs_smartly(self, "partition_axis", self.axis_policy.to_partition_axis(), partition_axis)
         if isinstance(self.partition_axis, dict):

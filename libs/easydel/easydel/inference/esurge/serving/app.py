@@ -140,7 +140,9 @@ def build_engine_sections(
     sections = {name: dict(value or {}) for name, value in config.esurge.items()}
     if world_size > 1 or enable_request_plane:
         if not token or not control_bind_host:
-            raise ValueError("a multi-host world or request-plane replica needs a coordination token and a control bind host")
+            raise ValueError(
+                "a multi-host world or request-plane replica needs a coordination token and a control bind host"
+            )
         sections["distributed"] = {
             "coordination": "zmq",
             "distributed_auth_token": token,
@@ -402,10 +404,21 @@ def _serve(config: ServingConfig, plan: tp.Any | None = None) -> None:
                         f"front {index} (pid {front.pid}) exited with code {front.returncode} after {lived:.0f}s; "
                         f"restarting it in {wait:.0f}s",
                     )
+                    if front_socket_dir:
+                        from easydel.inference.esurge.distributed.routed_engine import clear_shared_inflight_row
+
+                        clear_shared_inflight_row(front_socket_dir, index, FRONT_PROCESSES, expected_pid=front.pid)
                     fronts[index], due[index] = None, now + wait
                 time.sleep(1.0)
             # Engine stopped/died (not SIGTERM). Keep already-running fronts decoupled per replicas.py so they
             # continue routing to the remaining healthy replicas, and preserve front_socket_dir for their /metrics.
+            if front_socket_dir:
+                from easydel.inference.esurge.distributed.routed_engine import clear_shared_inflight_row
+
+                for index, front in list(fronts.items()):
+                    if front is not None and front.poll() is not None:
+                        clear_shared_inflight_row(front_socket_dir, index, FRONT_PROCESSES, expected_pid=front.pid)
+                        fronts[index] = None
             if any(front is not None and front.poll() is None for front in fronts.values()):
                 keep_fronts_alive = True
                 _log(
@@ -448,8 +461,30 @@ def _serve_front(config: ServingConfig, plan: tp.Any) -> None:
     token = plan.read_token()
     tag = f"front {plan.front_index}"
     _log(0, f"{tag} of {plan.count} dp replicas (host-only); easydel {ed.__version__} from {ed.__file__}")
+
+    def _front_router_factory(
+        members: list[tp.Any],
+        *,
+        planned_members: int | None = None,
+        member_ids: tp.Sequence[int] | None = None,
+    ) -> tp.Any:
+        from easydel.inference.esurge.distributed.routed_engine import RoutedEngine
+
+        return RoutedEngine(
+            members,
+            planned_members=planned_members,
+            member_ids=member_ids,
+            tie_breaker_offset=int(plan.front_index),
+            shared_inflight_dir=plan.front_socket_dir or None,
+            front_index=int(plan.front_index),
+            front_count=FRONT_PROCESSES,
+        )
+
     attacher = ReplicaAttacher(
-        replica_candidates(plan), connect=_replica_connector(config, token), log=lambda m: _log(0, f"{tag}: {m}")
+        replica_candidates(plan),
+        connect=_replica_connector(config, token),
+        log=lambda m: _log(0, f"{tag}: {m}"),
+        router_factory=_front_router_factory,
     )
     routed = None
     try:
@@ -570,6 +605,25 @@ def _replica_connector(config: ServingConfig, token: str) -> tp.Callable[[str], 
     )
 
 
+def _accepts_kwarg(fn: tp.Any, name: str) -> bool:
+    """Return whether ``fn`` accepts ``name`` as a keyword argument."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    for param in parameters:
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
 class ReplicaAttacher:
     """Builds the front's router from the replicas that are up, and keeps attaching the rest.
 
@@ -660,18 +714,42 @@ class ReplicaAttacher:
                 if self._stop.is_set():
                     to_close = handle
                 else:
+                    owned_by_router = False
+                    created_router = None
                     try:
                         if self.router is None:
                             factory = self._router_factory or RoutedEngine
-                            self.router = factory([handle], planned_members=len(self.leaders))
+                            if _accepts_kwarg(factory, "member_ids"):
+                                router = factory([handle], planned_members=len(self.leaders), member_ids=[index])
+                            else:
+                                router = factory([handle], planned_members=len(self.leaders))
+                                created_router = router
+                                owned_by_router = True
+                                if hasattr(router, "set_member_id"):
+                                    router.set_member_id(0, index)
+                            self.router = router
                             self._slots[index] = 0
                         elif slot is None:
-                            self._slots[index] = self.router.add_member(handle)
+                            if _accepts_kwarg(self.router.add_member, "member_id"):
+                                new_slot = self.router.add_member(handle, member_id=index)
+                            else:
+                                new_slot = self.router.add_member(handle)
+                                owned_by_router = True
+                                self._slots[index] = new_slot
+                                if hasattr(self.router, "set_member_id"):
+                                    self.router.set_member_id(new_slot, index)
+                            self._slots[index] = new_slot
                         else:
                             self.router.replace_member(slot, handle)
                             to_close = old
                     except BaseException:
-                        self._close_handle(handle)
+                        if created_router is not None:
+                            if getattr(created_router, "close", None) is not None:
+                                self._close_handle(created_router)
+                            else:
+                                self._close_handle(handle)
+                        elif not owned_by_router:
+                            self._close_handle(handle)
                         raise
             if to_close is handle:
                 self._close_handle(handle)

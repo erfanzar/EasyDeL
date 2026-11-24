@@ -81,7 +81,9 @@ def _normalize_pretrained_loading(self) -> None:
     if self.precision is None:
         self.precision = jax.lax.Precision("fastest")
     if self.partition_axis is None:
-        self.partition_axis = PartitionAxis()
+        cfg_kw = self.config_kwargs or {}
+        if "axis_policy" not in cfg_kw and "partition_axis" not in cfg_kw:
+            self.partition_axis = PartitionAxis()
 
 
 @typed_config(

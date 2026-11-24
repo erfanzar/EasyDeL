@@ -130,6 +130,7 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
         linear_attention_separate_proj: bool | None = None,
+        linear_attention_merged_split_proj: bool = False,
         mtp_num_hidden_layers: int = 0,
         mtp_use_dedicated_embeddings: bool = False,
         mtp_loss_coef: float = 0.3,
@@ -144,6 +145,12 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
             rope_theta = rope_scaling.get("rope_theta")
         if rope_theta is None:
             rope_theta = 10000.0
+
+        # HF Qwen3.5 checkpoints expose split linear-attention projections
+        # (`in_proj_qkv/z/b/a`). Keep that layout by default when the flag is
+        # omitted unless merged-split projections were requested.
+        if linear_attention_separate_proj is None:
+            linear_attention_separate_proj = not bool(linear_attention_merged_split_proj)
 
         super().__init__(
             vocab_size=vocab_size,
@@ -180,16 +187,11 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
             output_router_logits=output_router_logits,
             router_aux_loss_coef=router_aux_loss_coef,
             mlp_only_layers=mlp_only_layers,
+            linear_attention_separate_proj=bool(linear_attention_separate_proj),
+            linear_attention_merged_split_proj=bool(linear_attention_merged_split_proj),
             **kwargs,
         )
 
-        # HF Qwen3.5 checkpoints expose split linear-attention projections
-        # (`in_proj_qkv/z/b/a`). Keep that layout by default when the flag is
-        # omitted, while still honoring explicit user overrides.
-        if linear_attention_separate_proj is None:
-            self.linear_attention_separate_proj = True
-        else:
-            self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
         # Multi-Token-Prediction head config (DeepSeek-V3 style, depth-1). NOT forwarded to
         # super().__init__ (Qwen3NextConfig does not accept these); stored here. The MTP head
         # reuses qwen3_5's dense Qwen3_5MTPHead (see modeling_qwen3_5_moe).

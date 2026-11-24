@@ -15,7 +15,14 @@
 """TPU Pallas ragged GDN v2 kernel."""
 
 from ._gdn_policy import KERNEL_TILE_POLICIES, KernelTilePolicy, normalize_kernel_tile_policy
-from ._interface import ragged_gated_delta_rule_v2
+from ._interface import ragged_gated_delta_rule_v2, ragged_gdn_conv_decode
+from ._pallas_gdn_chunk import (
+    pallas_gdn_chunk_prefill,
+    pallas_gdn_chunk_prefill_supported,
+    pallas_gdn_conv_decode,
+    pallas_gdn_conv_decode_supported,
+    pallas_gdn_decode_inplace,
+)
 from ._pallas_impl_fwd import (
     ragged_gated_delta_rule_decode_only,
     ragged_gated_delta_rule_mixed_prefill,
@@ -26,8 +33,14 @@ __all__ = (
     "KERNEL_TILE_POLICIES",
     "KernelTilePolicy",
     "normalize_kernel_tile_policy",
+    "pallas_gdn_chunk_prefill",
+    "pallas_gdn_chunk_prefill_supported",
+    "pallas_gdn_conv_decode",
+    "pallas_gdn_conv_decode_supported",
+    "pallas_gdn_decode_inplace",
     "ragged_gated_delta_rule_decode_only",
     "ragged_gated_delta_rule_mixed_prefill",
     "ragged_gated_delta_rule_v2",
+    "ragged_gdn_conv_decode",
     "set_gdn_kernel_tile_policy",
 )

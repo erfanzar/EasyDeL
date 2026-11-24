@@ -365,6 +365,7 @@ from .ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_v2,
     ragged_gated_delta_rule_v2_op,
     ragged_gated_delta_rule_v2_with_window_states,
+    ragged_gdn_conv_decode_head_sharded,
     set_gdn_kernel_tile_policy,
 )
 from .ragged_gather import RaggedGather, ragged_gather
@@ -648,6 +649,7 @@ __all__ = (
     "ragged_gated_delta_rule_v2_with_window_states",
     "ragged_gather",
     "ragged_gather_reduce",
+    "ragged_gdn_conv_decode_head_sharded",
     "ragged_kda",
     "ragged_kda_conv_decode",
     "ragged_kda_conv_decode_head_sharded",

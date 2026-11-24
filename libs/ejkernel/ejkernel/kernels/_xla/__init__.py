@@ -65,6 +65,7 @@ Available Operations:
         - compute_schedule_table_v2: Build the GDN v2 packed-batch schedule table
         - ragged_causal_conv1d: Short causal depthwise conv1d over a packed token buffer
         - fused_conv_decode: Single-token conv-state shift + depthwise conv + activation
+        - ragged_gdn_conv_decode: Fused causal Conv1D + SiLU + L2Norm + GDN decode
 
     Losses:
         - fused_cross_entropy: Fused cross-entropy loss
@@ -144,7 +145,7 @@ from .quantized_matmul import quantized_matmul
 from .ragged_causal_conv1d import ragged_causal_conv1d
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
-from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
+from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2, ragged_gdn_conv_decode
 from .ragged_gather import ragged_gather
 from .ragged_gather_reduce import ragged_gather_reduce
 from .ragged_kda import ragged_kda
@@ -237,6 +238,7 @@ __all__ = [
     "ragged_gated_delta_rule_v2",
     "ragged_gather",
     "ragged_gather_reduce",
+    "ragged_gdn_conv_decode",
     "ragged_kda",
     "ragged_kda_conv_decode",
     "ragged_kda_decode",

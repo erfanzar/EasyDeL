@@ -16,11 +16,16 @@
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Bool, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
+from ...._xla.ragged_gated_delta_rule_v2._xla_impl_fwd import (
+    ragged_gdn_conv_decode_xla as _ragged_gdn_conv_decode_xla,
+)
+from ._pallas_gdn_chunk import pallas_gdn_conv_decode, pallas_gdn_conv_decode_supported
 from ._pallas_impl_fwd import ragged_gated_delta_rule_v2 as _ragged_gated_delta_rule_v2_pallas
 
 
@@ -77,7 +82,8 @@ def ragged_gated_delta_rule_v2(
             ``(num_requests + 1,)`` in ``int32``; request ``i`` spans
             ``[query_start_loc[i], query_start_loc[i + 1])``.
         state_indices: Mapping from request index to its slot in ``recurrent_state``, shape
-            ``(num_requests,)`` in ``int32``.
+            ``(num_requests,)`` in ``int32``. Active requests within a single call must map to distinct slots
+            when running the in-place TPU Pallas fast paths.
         distribution: Three-element ``int32`` vector describing the prefill/decode split of the packed
             batch used to schedule the ragged kernel. ``distribution[2]`` bounds the positional row prefix;
             empty (``q_len == 0``) rows inside it are skipped.
@@ -133,4 +139,100 @@ def ragged_gated_delta_rule_v2(
         kernel_tile_policy=kernel_tile_policy,
         use_fused_gdn_decode=use_fused_gdn_decode,
         runtime_dtype=runtime_dtype,
+    )
+
+
+@kernel_registry.register("ragged_gdn_conv_decode", Platform.PALLAS, Backend.TPU, priority=10)
+@jaxtyping.jaxtyped(typechecker=beartype)
+def ragged_gdn_conv_decode(
+    conv_input: Float[Array, "num_tokens conv_dim"],
+    b_raw: Float[Array, "num_tokens num_value_heads"],
+    a_raw: Float[Array, "num_tokens num_value_heads"],
+    conv_weight: Float[Array, "conv_dim d_conv"],
+    conv_pool: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_pool: Float[Array, "num_slots num_value_heads qk_head_dim v_head_dim"],
+    A_log: Float[Array, "num_value_heads"],
+    dt_bias: Float[Array, "num_value_heads"],
+    token_slots: Int[Array, "num_tokens"],
+    token_init: Bool[Array, "num_tokens"],
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    use_qk_l2norm: bool = True,
+    apply_silu: bool = True,
+    conv_output_dtype: object | None = None,
+    out_dtype: object = jnp.float32,
+) -> tuple[
+    Float[Array, "num_tokens num_value_heads v_head_dim"],
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_value_heads qk_head_dim v_head_dim"],
+]:
+    """Run fused causal Conv1D + SiLU + L2Norm + GDN decode on TPU Pallas with XLA fallback."""
+    if int(n_kq) <= 0 or int(n_v) <= 0 or int(n_v) % int(n_kq) != 0:
+        raise ValueError(f"Expected positive n_kq and n_v divisible by n_kq, got n_kq={n_kq}, n_v={n_v}.")
+    if int(d_k) <= 0 or int(d_v) <= 0:
+        raise ValueError(f"Expected positive d_k and d_v, got d_k={d_k}, d_v={d_v}.")
+    expected_conv_dim = 2 * int(n_kq) * int(d_k) + int(n_v) * int(d_v)
+    if int(conv_input.shape[-1]) != expected_conv_dim:
+        raise ValueError(
+            f"conv_input width {conv_input.shape[-1]} does not match 2*n_kq*d_k + n_v*d_v = {expected_conv_dim}."
+        )
+    if tuple(int(dim) for dim in recurrent_pool.shape[1:]) != (int(n_v), int(d_k), int(d_v)):
+        raise ValueError(
+            f"recurrent_pool trailing shape {recurrent_pool.shape[1:]} does not match "
+            f"(n_v, d_k, d_v)={(int(n_v), int(d_k), int(d_v))}."
+        )
+    if pallas_gdn_conv_decode_supported(
+        conv_input=conv_input,
+        conv_weight=conv_weight,
+        conv_pool=conv_pool,
+        recurrent_pool=recurrent_pool,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        out_dtype=out_dtype,
+        conv_output_dtype=conv_output_dtype,
+    ):
+        return pallas_gdn_conv_decode(
+            conv_input,
+            b_raw,
+            a_raw,
+            conv_weight,
+            conv_pool,
+            recurrent_pool,
+            A_log,
+            dt_bias,
+            token_slots,
+            token_init,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            use_qk_l2norm=use_qk_l2norm,
+            apply_silu=apply_silu,
+            conv_output_dtype=conv_output_dtype,
+            out_dtype=out_dtype,
+        )
+    return _ragged_gdn_conv_decode_xla(
+        conv_input,
+        b_raw,
+        a_raw,
+        conv_weight,
+        conv_pool,
+        recurrent_pool,
+        A_log,
+        dt_bias,
+        token_slots,
+        token_init,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        use_qk_l2norm=use_qk_l2norm,
+        apply_silu=apply_silu,
+        conv_output_dtype=conv_output_dtype,
+        out_dtype=out_dtype,
     )

@@ -35,6 +35,7 @@ def _fix_query_start_loc(query_start_loc: jnp.ndarray, num_valid_seqs: jnp.ndarr
         jnp.ndarray: A copy of ``query_start_loc`` with padding entries
         clamped to the last valid offset.
     """
+    num_valid_seqs = jnp.clip(num_valid_seqs, 0, query_start_loc.shape[0] - 1)
     last_valid_loc = query_start_loc[num_valid_seqs]
     valid_loc_mask = jnp.arange(query_start_loc.shape[0]) <= num_valid_seqs
     return jnp.where(valid_loc_mask, query_start_loc, last_valid_loc)
@@ -59,11 +60,11 @@ def _depthwise_conv1d_flat(x: jnp.ndarray, kernel: jnp.ndarray) -> jnp.ndarray:
     """
     num_tokens = x.shape[0]
     d_conv = kernel.shape[-1]
-    padded_x = jnp.pad(x.astype(jnp.float32), ((d_conv - 1, 0), (0, 0)))
+    padded_x = jnp.pad(x, ((d_conv - 1, 0), (0, 0)))
     kernel = kernel.astype(jnp.float32)
     out = jnp.zeros((num_tokens, x.shape[-1]), dtype=jnp.float32)
     for k in range(d_conv):
-        out = out + padded_x[k : k + num_tokens, :] * kernel[None, :, k]
+        out = out + padded_x[k : k + num_tokens, :].astype(jnp.float32) * kernel[None, :, k]
     return out
 
 
@@ -213,13 +214,16 @@ def _ragged_causal_conv1d_impl(
           (typically 4, the Qwen3-Next / GDR default).
     """
     num_tokens, dim = x.shape
+    num_pool_slots = conv_state.shape[0]
     max_reqs = state_indices.shape[0]
 
-    num_valid_seqs = distribution[2]
+    num_valid_seqs = jnp.clip(distribution[2], 0, query_start_loc.shape[0] - 1)
     effective_query_start_loc = _fix_query_start_loc(query_start_loc, num_valid_seqs)
     lengths = effective_query_start_loc[1:] - effective_query_start_loc[:-1]
 
-    gathered_state = conv_state[state_indices]
+    slot_ok = (state_indices >= 0) & (state_indices < num_pool_slots)
+    safe_state_indices = jnp.clip(state_indices, 0, num_pool_slots - 1)
+    gathered_state = jnp.where(slot_ok[:, None, None], conv_state[safe_state_indices], 0.0)
 
     out = _depthwise_conv1d_flat(x, kernel)
 
@@ -269,13 +273,17 @@ def _ragged_causal_conv1d_impl(
     )
     new_state = new_state_jchw.transpose(0, 2, 1).astype(conv_state.dtype)
 
-    true_valid_seq_mask = jnp.arange(max_reqs) < num_valid_seqs
-    updated_conv_state = conv_state.at[state_indices].set(
-        jnp.where(
-            true_valid_seq_mask[:, None, None],
-            new_state,
-            conv_state[state_indices],
-        )
+    true_valid_seq_mask = (
+        (jnp.arange(max_reqs) < num_valid_seqs)
+        & (padded_lengths > 0)
+        & (state_indices >= 0)
+        & (state_indices < num_pool_slots)
+    )
+    write_indices = jnp.where(true_valid_seq_mask, state_indices, num_pool_slots)
+    updated_conv_state = conv_state.at[write_indices].set(
+        new_state,
+        mode="drop",
+        wrap_negative_indices=False,
     )
 
     return out.astype(x.dtype), updated_conv_state

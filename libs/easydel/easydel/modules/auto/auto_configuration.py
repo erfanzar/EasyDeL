@@ -429,6 +429,7 @@ class AutoEasyDeLConfig:
         """
         if pretrained_model_name_or_path is not None and not isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+        _caller_partition_axis = partition_axis
         if partition_axis is None:
             partition_axis = PartitionAxis()
         from transformers import AutoConfig
@@ -509,22 +510,73 @@ class AutoEasyDeLConfig:
             model_type,
             cls.bind_model_task(model_task, architectures),
         )[0]
-        config = config_class.from_pretrained(pretrained_model_name_or_path, **config_loading_kwargs)
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in config_loading_kwargs}
+        init_flag_kwargs = {
+            k: extra_kwargs[k]
+            for k in ("linear_attention_merged_split_proj", "linear_attention_separate_proj")
+            if k in extra_kwargs
+        }
+        if init_flag_kwargs.get("linear_attention_merged_split_proj") and init_flag_kwargs.get(
+            "linear_attention_separate_proj"
+        ):
+            raise ValueError(
+                "linear_attention_separate_proj and linear_attention_merged_split_proj are mutually exclusive"
+            )
+        if (
+            init_flag_kwargs.get("linear_attention_merged_split_proj") is True
+            and "linear_attention_separate_proj" not in init_flag_kwargs
+        ):
+            init_flag_kwargs["linear_attention_separate_proj"] = False
+        elif (
+            init_flag_kwargs.get("linear_attention_separate_proj") is True
+            and "linear_attention_merged_split_proj" not in init_flag_kwargs
+        ):
+            init_flag_kwargs["linear_attention_merged_split_proj"] = False
+        is_composite_config = bool(getattr(config_class, "sub_configs", None))
+        if is_composite_config:
+            config = config_class.from_pretrained(pretrained_model_name_or_path, **config_loading_kwargs)
+            if init_flag_kwargs:
+                text_cfg = config.get_text_config() if hasattr(config, "get_text_config") else None
+                targets = [config]
+                if text_cfg is not None and text_cfg is not config:
+                    targets.append(text_cfg)
+                for target_cfg in targets:
+                    for flag_name, flag_val in init_flag_kwargs.items():
+                        setattr(target_cfg, flag_name, bool(flag_val))
+                    if getattr(target_cfg, "linear_attention_separate_proj", False) and getattr(
+                        target_cfg, "linear_attention_merged_split_proj", False
+                    ):
+                        raise ValueError(
+                            "linear_attention_separate_proj and linear_attention_merged_split_proj "
+                            "are mutually exclusive"
+                        )
+        else:
+            config = config_class.from_pretrained(
+                pretrained_model_name_or_path, **config_loading_kwargs, **init_flag_kwargs
+            )
         if hasattr(config, "attach_custom_arguments"):
             config.attach_custom_arguments()
 
-        config.add_basic_configurations(
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            backend=backend,
-            platform=platform,
-        )
+        basic_cfg_kwargs: dict[str, tp.Any] = {
+            "sharding_axis_dims": sharding_axis_dims,
+            "sharding_dcn_axis_dims": sharding_dcn_axis_dims,
+            "sharding_axis_names": sharding_axis_names,
+            "backend": backend,
+            "platform": platform,
+        }
+        if "partition_axis" not in extra_kwargs and (
+            _caller_partition_axis is not None or "axis_policy" not in extra_kwargs
+        ):
+            basic_cfg_kwargs["partition_axis"] = partition_axis
+        if "axis_policy" in extra_kwargs:
+            basic_cfg_kwargs["axis_policy"] = extra_kwargs["axis_policy"]
+        if "partition_axis" in extra_kwargs:
+            basic_cfg_kwargs["partition_axis"] = extra_kwargs["partition_axis"]
+        config.add_basic_configurations(**basic_cfg_kwargs)
         if trust_remote_code is not None:
             config.trust_remote_code = trust_remote_code
-        for k, v in kwargs.items():
-            if k not in config_loading_kwargs:
+        for k, v in extra_kwargs.items():
+            if k not in ("axis_policy", "partition_axis", *init_flag_kwargs):
                 setattr(config, k, v)
 
         return config
@@ -813,25 +865,37 @@ class AutoShardAndGatherFunctions:
         """
         if pretrained_model_name_or_path is not None and not isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
-        if partition_axis is None:
+        cfg_kwargs = dict(config_kwargs) if config_kwargs is not None else {}
+        if partition_axis is None and "axis_policy" not in cfg_kwargs and "partition_axis" not in cfg_kwargs:
             partition_axis = PartitionAxis()
+        _explicit_keys = {
+            "sharding_axis_dims",
+            "sharding_dcn_axis_dims",
+            "sharding_axis_names",
+            "partition_axis",
+            "backend",
+            "platform",
+            "from_torch",
+            "trust_remote_code",
+            "model_task",
+        }
+        forwarded_cfg_kwargs = {k: v for k, v in cfg_kwargs.items() if k not in _explicit_keys}
+        resolved_model_task = cfg_kwargs.get("model_task", model_task)
         config = AutoEasyDeLConfig.from_pretrained(
             pretrained_model_name_or_path,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            backend=backend,
-            platform=platform,
-            from_torch=from_torch,
-            trust_remote_code=trust_remote_code,
-            model_task=model_task,
+            sharding_axis_dims=cfg_kwargs.get("sharding_axis_dims", sharding_axis_dims),
+            sharding_dcn_axis_dims=cfg_kwargs.get("sharding_dcn_axis_dims", sharding_dcn_axis_dims),
+            sharding_axis_names=cfg_kwargs.get("sharding_axis_names", sharding_axis_names),
+            partition_axis=cfg_kwargs.get("partition_axis", partition_axis),
+            backend=cfg_kwargs.get("backend", backend),
+            platform=cfg_kwargs.get("platform", platform),
+            from_torch=cfg_kwargs.get("from_torch", from_torch),
+            trust_remote_code=cfg_kwargs.get("trust_remote_code", trust_remote_code),
+            model_task=resolved_model_task,
+            **forwarded_cfg_kwargs,
         )
-        if config_kwargs is not None:
-            for k, v in config_kwargs.items():
-                setattr(config, k, v)
         return cls.from_config(  # pyright: ignore[reportReturnType]
             config=config,
             flatten=flatten,
-            model_task=model_task,
+            model_task=resolved_model_task,
         )

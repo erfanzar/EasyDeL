@@ -125,6 +125,8 @@ def fused_layout_param_specs(module: tp.Any) -> list[tuple[str, tuple[int, ...]]
             ba = getattr(gdr, "ba_segment_sizes", None)
             if qkvz and getattr(sub, "in_proj_qkvz", None) is not None:
                 specs.append((f"{dotted}.in_proj_qkvz", tuple(int(x) for x in qkvz)))
+            if getattr(sub, "conv1d", None) is not None:
+                specs.append((f"{dotted}.conv1d", (int(gdr.key_dim), int(gdr.key_dim), int(gdr.value_dim))))
             in_proj_ba = getattr(sub, "in_proj_ba", None)
             if in_proj_ba is not None:
                 # packed [beta | alpha]: equal halves of 2 * num_v_heads
@@ -159,39 +161,82 @@ def fused_layout_param_specs(module: tp.Any) -> list[tuple[str, tuple[int, ...]]
     return specs
 
 
-def _transform_last_axis(x: tp.Any, segment_sizes: tuple[int, ...], tp_size: int, *, to_canonical: bool) -> tp.Any:
+def _transform_last_axis(
+    x: tp.Any,
+    segment_sizes: tuple[int, ...],
+    tp_size: int,
+    *,
+    to_canonical: bool,
+    allow_packed_stride: bool = False,
+    leaf_name: str | None = None,
+) -> tp.Any:
     """De-/re-interleave the last axis of a fused parameter.
 
     Args:
-        x: Parameter value ``[..., sum(segment_sizes)]`` (weight or bias).
+        x: Parameter value ``[..., sum(segment_sizes)]`` (weight or bias), or a
+            word-/group-packed quantized leaf ``[..., sum(segment_sizes) // stride]``
+            when ``allow_packed_stride=True``.
         segment_sizes: Logical segment widths.
         tp_size: Tensor-parallel size of the interleave.
         to_canonical: ``True`` = interleaved -> contiguous;
             ``False`` = contiguous -> interleaved.
+        allow_packed_stride: When ``True`` (quantized ``quant_*`` leaves), scale
+            ``segment_sizes`` by ``stride = sum(segment_sizes) // x.shape[-1]``
+            when every ``s // tp_size`` divides cleanly by ``stride``, and raise
+            ``ValueError`` instead of silently no-oping when indivisible.
+        leaf_name: Optional leaf path used in error messages.
 
     Returns:
         The transformed array (same type family as the input), or ``x``
-        unchanged when the transform does not apply (tp<=1, shape mismatch,
-        or indivisible segments).
+        unchanged when the transform does not apply (tp<=1, non-array, or
+        non-quantized shape mismatch / indivisible segments).
     """
     total = sum(segment_sizes)
-    if tp_size <= 1 or not hasattr(x, "shape") or x.ndim < 1 or int(x.shape[-1]) != total:
+    if tp_size <= 1 or x is None or not hasattr(x, "shape") or x.ndim < 1:
         return x
-    if any(s % tp_size for s in segment_sizes):
+    last_dim = int(x.shape[-1])
+    effective_segments = segment_sizes
+    if last_dim != total:
+        if not allow_packed_stride:
+            return x
+        if last_dim <= 0 or total % last_dim != 0:
+            raise ValueError(
+                f"Cannot re-interleave packed quantized fused leaf {leaf_name or '<unknown>'} "
+                f"(shape={tuple(x.shape)}) for tp={tp_size}: last dim {last_dim} does not evenly "
+                f"divide logical fused width {total} (segments={segment_sizes})."
+            )
+        stride = total // last_dim
+        if any(s % (tp_size * stride) != 0 for s in segment_sizes):
+            raise ValueError(
+                f"Cannot re-interleave packed quantized fused leaf {leaf_name or '<unknown>'} "
+                f"(shape={tuple(x.shape)}, stride={stride}) for tp={tp_size}: segment sizes "
+                f"{segment_sizes} do not divide cleanly by tp*stride={tp_size * stride} "
+                "(quantization words/groups straddle segment or TP boundaries; load from a dense "
+                "checkpoint with apply_quantization=True or load at the saved TP size)."
+            )
+        effective_segments = tuple(s // stride for s in segment_sizes)
+    elif any(s % tp_size for s in segment_sizes):
+        if allow_packed_stride:
+            raise ValueError(
+                f"Cannot re-interleave quantized fused leaf {leaf_name or '<unknown>'} "
+                f"(shape={tuple(x.shape)}) for tp={tp_size}: segment sizes {segment_sizes} "
+                f"are not divisible by tp={tp_size}."
+            )
         return x
 
+    eff_total = sum(effective_segments)
     xp = np if isinstance(x, np.ndarray) else jnp
-    locals_ = [s // tp_size for s in segment_sizes]
+    locals_ = [s // tp_size for s in effective_segments]
     if to_canonical:
         # [..., T, sum(local)] rank-major -> logical segments
-        ranked = xp.reshape(x, (*x.shape[:-1], tp_size, total // tp_size))
+        ranked = xp.reshape(x, (*x.shape[:-1], tp_size, eff_total // tp_size))
         offsets = np.cumsum(locals_)[:-1].tolist()
         parts = xp.split(ranked, offsets, axis=-1)
         return xp.concatenate(
-            [xp.reshape(p, (*x.shape[:-1], s)) for p, s in zip(parts, segment_sizes, strict=True)], axis=-1
+            [xp.reshape(p, (*x.shape[:-1], s)) for p, s in zip(parts, effective_segments, strict=True)], axis=-1
         )
     # canonical -> rank-major interleave
-    offsets = np.cumsum(segment_sizes)[:-1].tolist()
+    offsets = np.cumsum(effective_segments)[:-1].tolist()
     segs = xp.split(x, offsets, axis=-1)
     per_rank = []
     for r in range(tp_size):
@@ -242,14 +287,25 @@ def _key_to_string(key: tp.Any) -> str:
 #: the output axis last. ``_transform_last_axis`` re-checks
 #: ``shape[-1] == sum(segment_sizes)`` and no-ops otherwise, so a leaf whose
 #: last axis is not the fused one is skipped rather than corrupted.
-_FUSED_LEAF_SUFFIXES: tp.Final = (
-    ".weight",
-    ".bias",
+_QUANTIZED_LEAF_SUFFIXES: tp.Final = (
     ".quant_kernel",
     ".quant_scales",
     ".quant_biases",
     ".quant_kernel_packed",
 )
+
+_FUSED_LEAF_SUFFIXES: tp.Final = (
+    ".weight",
+    ".bias",
+    *_QUANTIZED_LEAF_SUFFIXES,
+)
+
+
+def _is_quantized_leaf(key_str: str) -> bool:
+    for suffix in _QUANTIZED_LEAF_SUFFIXES:
+        if key_str.endswith(suffix) or key_str.endswith(f"{suffix}.value"):
+            return True
+    return False
 
 
 def _fused_leaf_markers(module_path: str) -> tuple[str, ...]:
@@ -263,7 +319,7 @@ def _fused_leaf_markers(module_path: str) -> tuple[str, ...]:
 
 def _matches_fused_leaf(key_str: str, module_path: str) -> bool:
     for marker in _fused_leaf_markers(module_path):
-        if key_str.endswith(marker):
+        if key_str == marker or key_str.endswith(f".{marker}"):
             return True
     return False
 
@@ -308,21 +364,83 @@ def _module_fused_specs(module) -> list[tuple[str, tuple[int, ...]]]:
     return fused_layout_param_specs(module)
 
 
-def _apply(module, flat_state: dict, tp_size: int, *, to_canonical: bool, log_label: str) -> dict:
+def _split_origin_conv1d_paths(
+    specs: list[tuple[str, tuple[int, ...]]],
+    flat_state: dict,
+) -> set[str]:
+    """Return ``*.conv1d`` spec paths whose checkpoint state came from split projections.
+
+    A native checkpoint saved with ``linear_attention_separate_proj=True`` stores
+    ``in_proj_qkv`` (not ``in_proj_qkvz``) and stores ``conv1d.weight`` in
+    contiguous ``[Q | K | V]`` order even when ``fused_param_tp > 1`` (stamped for
+    full-attention ``qkv_proj`` / MLP ``gate_up_proj``). When such a checkpoint is
+    loaded into a live ``uses_merged_split_proj=True`` model, those ``conv1d``
+    leaves are already canonical (``saved_tp=1``) and must skip de-interleaving
+    while still being interleaved to ``target_tp``.
+    """
+    split_paths: set[str] = set()
+    for module_path, _ in specs:
+        if not module_path.endswith(".conv1d"):
+            continue
+        parent = module_path[: -len(".conv1d")]
+        if _match_keys(flat_state, f"{parent}.in_proj_qkv") and not _match_keys(flat_state, f"{parent}.in_proj_qkvz"):
+            split_paths.add(module_path)
+    return split_paths
+
+
+def _split_origin_conv1d_paths_in_tree(
+    specs: list[tuple[str, tuple[int, ...]]],
+    tree: tp.Any,
+) -> set[str]:
+    """Optimizer-pytree counterpart of :func:`_split_origin_conv1d_paths`."""
+    conv_parents = {
+        module_path[: -len(".conv1d")]: module_path for module_path, _ in specs if module_path.endswith(".conv1d")
+    }
+    if not conv_parents:
+        return set()
+    seen_qkv: set[str] = set()
+    seen_qkvz: set[str] = set()
+    for path, _ in jax.tree_util.tree_leaves_with_path(tree):
+        key_str = tree_path_to_string(path, sep=".")
+        for parent in conv_parents:
+            if _matches_fused_optimizer_leaf(key_str, f"{parent}.in_proj_qkv"):
+                seen_qkv.add(parent)
+            if _matches_fused_optimizer_leaf(key_str, f"{parent}.in_proj_qkvz"):
+                seen_qkvz.add(parent)
+    return {conv_parents[parent] for parent in (seen_qkv - seen_qkvz)}
+
+
+def _apply(
+    module,
+    flat_state: dict,
+    tp_size: int,
+    *,
+    to_canonical: bool,
+    log_label: str,
+    specs_override: list[tuple[str, tuple[int, ...]]] | None = None,
+) -> dict:
     if tp_size <= 1:
         return flat_state
-    specs = _module_fused_specs(module)
+    specs = specs_override if specs_override is not None else _module_fused_specs(module)
     if not specs:
         return flat_state
     touched = 0
     for module_path, sizes in specs:
         for key in _match_keys(flat_state, module_path):
+            key_str = _key_to_string(key)
             value = flat_state[key]
             inner = value
             is_param = hasattr(value, "value") and not hasattr(value, "shape")
             if is_param:
                 inner = value.value
-            new_inner = _transform_last_axis(inner, sizes, tp_size, to_canonical=to_canonical)
+            new_inner = _transform_last_axis(
+                inner,
+                sizes,
+                tp_size,
+                to_canonical=to_canonical,
+                allow_packed_stride=_is_quantized_leaf(key_str),
+                leaf_name=key_str,
+            )
             if new_inner is not inner:
                 new_inner = _reshard_like_source(new_inner, inner)
                 touched += 1
@@ -355,10 +473,18 @@ def runtimeize_fused_state(module, flat_state: dict, config: EasyDeLBaseConfig |
     return _apply(module, flat_state, tp_size, to_canonical=False, log_label="Re-interleaved")
 
 
-def _apply_pytree(module, tree: tp.Any, tp_size: int, *, to_canonical: bool, log_label: str) -> tp.Any:
+def _apply_pytree(
+    module,
+    tree: tp.Any,
+    tp_size: int,
+    *,
+    to_canonical: bool,
+    log_label: str,
+    specs_override: list[tuple[str, tuple[int, ...]]] | None = None,
+) -> tp.Any:
     if tree is None or tp_size <= 1:
         return tree
-    specs = _module_fused_specs(module)
+    specs = specs_override if specs_override is not None else _module_fused_specs(module)
     if not specs:
         return tree
 
@@ -369,7 +495,14 @@ def _apply_pytree(module, tree: tp.Any, tp_size: int, *, to_canonical: bool, log
         key_str = tree_path_to_string(path, sep=".")
         for module_path, sizes in specs:
             if _matches_fused_optimizer_leaf(key_str, module_path):
-                new_value = _transform_last_axis(value, sizes, tp_size, to_canonical=to_canonical)
+                new_value = _transform_last_axis(
+                    value,
+                    sizes,
+                    tp_size,
+                    to_canonical=to_canonical,
+                    allow_packed_stride=_is_quantized_leaf(key_str),
+                    leaf_name=key_str,
+                )
                 if new_value is not value:
                     new_value = _reshard_like_source(new_value, value)
                     touched += 1
@@ -408,23 +541,340 @@ def retp_fused_state(module, flat_state: dict, *, saved_tp: int, target_tp: int)
     ``saved_tp`` to the canonical contiguous order, then interleave for the
     live mesh's ``target_tp``. ``canonical`` is simply ``tp=1`` — both legs
     no-op at 1.
+
+    Split-origin linear-attention ``conv1d`` leaves (detected by the presence of
+    ``in_proj_qkv`` without ``in_proj_qkvz``) are always contiguous on disk
+    (``saved_tp=1``), so they skip de-interleaving and are still interleaved to
+    ``target_tp`` even when ``saved_tp == target_tp > 1``.
     """
     saved_tp, target_tp = int(saved_tp), int(target_tp)
-    if saved_tp == target_tp:
+    specs = _module_fused_specs(module)
+    if not specs:
         return flat_state
-    flat_state = _apply(module, flat_state, saved_tp, to_canonical=True, log_label=f"De-interleaved (tp={saved_tp})")
-    return _apply(module, flat_state, target_tp, to_canonical=False, log_label="Re-interleaved")
+    split_conv_paths = _split_origin_conv1d_paths(specs, flat_state)
+    if saved_tp == target_tp:
+        if split_conv_paths and target_tp > 1:
+            conv_specs = [spec for spec in specs if spec[0] in split_conv_paths]
+            return _apply(
+                module,
+                flat_state,
+                target_tp,
+                to_canonical=False,
+                log_label="Re-interleaved (split-origin conv1d)",
+                specs_override=conv_specs,
+            )
+        return flat_state
+    deinterleave_specs = [spec for spec in specs if spec[0] not in split_conv_paths]
+    flat_state = _apply(
+        module,
+        flat_state,
+        saved_tp,
+        to_canonical=True,
+        log_label=f"De-interleaved (tp={saved_tp})",
+        specs_override=deinterleave_specs,
+    )
+    return _apply(
+        module,
+        flat_state,
+        target_tp,
+        to_canonical=False,
+        log_label="Re-interleaved",
+        specs_override=specs,
+    )
 
 
 def retp_fused_optimizer_state(module, opt_state: tp.Any, *, saved_tp: int, target_tp: int) -> tp.Any:
     """Re-interleave fused optimizer moments from ``saved_tp`` to ``target_tp``."""
     saved_tp, target_tp = int(saved_tp), int(target_tp)
-    if saved_tp == target_tp:
+    if opt_state is None:
         return opt_state
+    specs = _module_fused_specs(module)
+    if not specs:
+        return opt_state
+    split_conv_paths = _split_origin_conv1d_paths_in_tree(specs, opt_state)
+    if saved_tp == target_tp:
+        if split_conv_paths and target_tp > 1:
+            conv_specs = [spec for spec in specs if spec[0] in split_conv_paths]
+            return _apply_pytree(
+                module,
+                opt_state,
+                target_tp,
+                to_canonical=False,
+                log_label="Re-interleaved (split-origin conv1d)",
+                specs_override=conv_specs,
+            )
+        return opt_state
+    deinterleave_specs = [spec for spec in specs if spec[0] not in split_conv_paths]
     opt_state = _apply_pytree(
-        module, opt_state, saved_tp, to_canonical=True, log_label=f"De-interleaved (tp={saved_tp})"
+        module,
+        opt_state,
+        saved_tp,
+        to_canonical=True,
+        log_label=f"De-interleaved (tp={saved_tp})",
+        specs_override=deinterleave_specs,
     )
-    return _apply_pytree(module, opt_state, target_tp, to_canonical=False, log_label="Re-interleaved")
+    return _apply_pytree(
+        module,
+        opt_state,
+        target_tp,
+        to_canonical=False,
+        log_label="Re-interleaved",
+        specs_override=specs,
+    )
+
+
+def _read_saved_linear_attention_flags(load_directory) -> tuple[bool | None, bool | None, bool]:
+    """Read ``(linear_attention_merged_split_proj, linear_attention_separate_proj, found_config)`` from config.json."""
+    if not load_directory:
+        return None, None, False
+    try:
+        base = ePath(str(load_directory))
+        config_path = base / "config.json"
+        if not config_path.exists():
+            parent_config = base.parent / "config.json"
+            if parent_config.exists():
+                config_path = parent_config
+            else:
+                return None, None, False
+        payload = json.loads(config_path.read_text())
+    except Exception:  # pragma: no cover
+        return None, None, False
+    if not isinstance(payload, dict):
+        return None, None, False
+    candidates = []
+    text_cfg = payload.get("text_config")
+    if isinstance(text_cfg, dict):
+        candidates.append(text_cfg)
+    candidates.append(payload)
+    saved_merged: bool | None = None
+    saved_separate: bool | None = None
+    for cfg in candidates:
+        if saved_merged is None and "linear_attention_merged_split_proj" in cfg:
+            saved_merged = bool(cfg["linear_attention_merged_split_proj"])
+        if saved_separate is None and "linear_attention_separate_proj" in cfg:
+            saved_separate = bool(cfg["linear_attention_separate_proj"])
+    return saved_merged, saved_separate, True
+
+
+def _replace_leaf_parent(key: tp.Any, old_child: str, new_child: str) -> tp.Any:
+    if isinstance(key, tuple):
+        if len(key) >= 2 and str(key[-2]) == old_child:
+            return (*key[:-2], new_child, key[-1])
+        if len(key) >= 3 and str(key[-3]) == old_child and str(key[-1]) == "value":
+            return (*key[:-3], new_child, key[-2], key[-1])
+        return key
+    key_str = str(key)
+    if key_str.startswith(f"{old_child}."):
+        return f"{new_child}.{key_str[len(old_child) + 1 :]}"
+    return key_str.replace(f".{old_child}.", f".{new_child}.")
+
+
+def reconcile_linear_attention_native_layout(
+    load_directory,
+    module,
+    flat_state: dict,
+    *,
+    saved_tp: int | None,
+) -> int:
+    """Validate and reconcile cross-mode Qwen3-Next/3.5 linear-attention native checkpoints.
+
+    Guards against silent weight corruption when ``linear_attention_merged_split_proj``
+    differs between the saved checkpoint and the live model:
+
+    - **merged_split_proj ↔ default packed mode** (identical leaf names and shapes
+      ``in_proj_qkvz`` / ``in_proj_ba`` / ``conv1d``, incompatible channel layouts):
+      always raises ``ValueError`` rather than silently scrambling projections.
+    - **saved ``merged_split_proj=True`` → live ``uses_split_proj=True``** (explicit
+      ``linear_attention_separate_proj=True`` override OR automatic ``can_merge_tp``
+      fallback at higher TP): de-interleaves ``in_proj_qkvz``, ``in_proj_ba``, and
+      ``conv1d`` from ``saved_tp`` and unfuses dense ``in_proj_qkvz``/``in_proj_ba``
+      into ``in_proj_qkv``/``in_proj_z``/``in_proj_b``/``in_proj_a``.
+
+    Returns:
+        Number of linear-attention layers unfused from merged-split to split layout.
+    """
+    if not flat_state:
+        return 0
+    saved_merged_flag, _, found_config = _read_saved_linear_attention_flags(load_directory)
+    if not found_config:
+        return 0
+    saved_merged = bool(saved_merged_flag)
+    eff_saved_tp = 1 if saved_tp is None else int(saved_tp)
+
+    unfused_layers = 0
+    seen: set[int] = set()
+    for path, sub in iter_module_search(module, object):
+        if id(sub) in seen:
+            continue
+        seen.add(id(sub))
+        gdr = getattr(sub, "linear_attention_layout", None)
+        if gdr is None:
+            continue
+        dotted = ".".join(str(p) for p in path)
+        live_merged = bool(getattr(sub, "uses_merged_split_proj", False))
+        live_split = bool(getattr(sub, "uses_split_proj", False))
+
+        qkvz_keys = _match_keys(flat_state, f"{dotted}.in_proj_qkvz")
+        qkv_keys = _match_keys(flat_state, f"{dotted}.in_proj_qkv")
+        if not qkvz_keys or qkv_keys:
+            continue
+
+        # Checkpoint carries in_proj_qkvz (not split in_proj_qkv).
+        if saved_merged and not live_merged and not live_split:
+            raise ValueError(
+                f"Checkpoint {load_directory} was saved with linear_attention_merged_split_proj=True "
+                f"([Q|K|V|Z] layout) and cannot be loaded into default per-key-head packed mode "
+                f"(layer {dotted}). Pass linear_attention_merged_split_proj=True (or "
+                f"linear_attention_separate_proj=True to unfuse into split projections)."
+            )
+        if not saved_merged and live_merged:
+            raise ValueError(
+                f"Checkpoint {load_directory} stores default per-key-head packed linear-attention weights "
+                f"(linear_attention_merged_split_proj=False) and cannot be loaded with "
+                f"linear_attention_merged_split_proj=True (layer {dotted})."
+            )
+        if not saved_merged and live_split:
+            raise ValueError(
+                f"Checkpoint {load_directory} stores default per-key-head packed linear-attention weights "
+                f"and cannot be unfused into linear_attention_separate_proj=True (layer {dotted})."
+            )
+        if not (saved_merged and live_split):
+            continue
+
+        # Saved merged_split_proj=True -> live uses_split_proj=True: unfuse cleanly.
+        ba_keys = _match_keys(flat_state, f"{dotted}.in_proj_ba")
+        conv_keys = _match_keys(flat_state, f"{dotted}.conv1d")
+        if any(_is_quantized_leaf(_key_to_string(k)) for k in (*qkvz_keys, *ba_keys)):
+            raise ValueError(
+                f"Cannot unfuse quantized linear_attention_merged_split_proj checkpoint into split "
+                f"projections (layer {dotted}); load from a dense checkpoint or with a TP size where "
+                f"linear_attention_merged_split_proj stays active."
+            )
+
+        qkvz_sizes = tuple(int(x) for x in gdr.qkvz_segment_sizes)
+        conv_dim = int(gdr.key_dim) * 2 + int(gdr.value_dim)
+        for key in list(qkvz_keys):
+            raw = flat_state.pop(key)
+            val = raw.value if hasattr(raw, "value") and not hasattr(raw, "shape") else raw
+            canon = _transform_last_axis(val, qkvz_sizes, eff_saved_tp, to_canonical=True)
+            xp = np if isinstance(canon, np.ndarray) else jnp
+            qkv_part, z_part = xp.split(canon, [conv_dim], axis=-1)
+            flat_state[_replace_leaf_parent(key, "in_proj_qkvz", "in_proj_qkv")] = qkv_part
+            flat_state[_replace_leaf_parent(key, "in_proj_qkvz", "in_proj_z")] = z_part
+
+        num_v_heads = int(getattr(sub, "num_v_heads", 0))
+        for key in list(ba_keys):
+            raw = flat_state.pop(key)
+            val = raw.value if hasattr(raw, "value") and not hasattr(raw, "shape") else raw
+            half = num_v_heads if num_v_heads > 0 else int(val.shape[-1]) // 2
+            canon = _transform_last_axis(val, (half, half), eff_saved_tp, to_canonical=True)
+            xp = np if isinstance(canon, np.ndarray) else jnp
+            b_part, a_part = xp.split(canon, [half], axis=-1)
+            flat_state[_replace_leaf_parent(key, "in_proj_ba", "in_proj_b")] = b_part
+            flat_state[_replace_leaf_parent(key, "in_proj_ba", "in_proj_a")] = a_part
+
+        conv_sizes = (int(gdr.key_dim), int(gdr.key_dim), int(gdr.value_dim))
+        for key in list(conv_keys):
+            raw = flat_state[key]
+            is_param = hasattr(raw, "value") and not hasattr(raw, "shape")
+            val = raw.value if is_param else raw
+            canon = _transform_last_axis(val, conv_sizes, eff_saved_tp, to_canonical=True)
+            if canon is not val:
+                canon = _reshard_like_source(canon, val)
+                if is_param:
+                    raw.value = canon
+                else:
+                    flat_state[key] = canon
+
+        unfused_layers += 1
+
+    if unfused_layers:
+        logger.info(
+            "Unfused %d native merged-split linear-attention layer(s) (saved_tp=%d) into split projections.",
+            unfused_layers,
+            eff_saved_tp,
+        )
+    return unfused_layers
+
+
+def validate_linear_attention_native_optimizer_layout(
+    load_directory,
+    module,
+    opt_state: tp.Any,
+) -> None:
+    """Reject incompatible cross-mode linear-attention optimizer checkpoints.
+
+    Mirrors :func:`reconcile_linear_attention_native_layout` for optimizer
+    pytrees: when a checkpoint's optimizer state carries ``in_proj_qkvz``
+    (without ``in_proj_qkv``) and the live model uses a different
+    linear-attention projection layout — including ``can_merge_tp`` fallback
+    to split projections at a higher TP size — fail loudly with ``ValueError``
+    rather than silently retaining stale ``in_proj_qkvz`` / TP-interleaved
+    ``conv1d`` optimizer moments.
+    """
+    if opt_state is None:
+        return
+    saved_merged_flag, _, found_config = _read_saved_linear_attention_flags(load_directory)
+    if not found_config:
+        return
+    saved_merged = bool(saved_merged_flag)
+
+    linear_subs: list[tuple[str, bool, bool]] = []
+    seen: set[int] = set()
+    for path, sub in iter_module_search(module, object):
+        if id(sub) in seen:
+            continue
+        seen.add(id(sub))
+        if getattr(sub, "linear_attention_layout", None) is None:
+            continue
+        dotted = ".".join(str(p) for p in path)
+        linear_subs.append(
+            (
+                dotted,
+                bool(getattr(sub, "uses_merged_split_proj", False)),
+                bool(getattr(sub, "uses_split_proj", False)),
+            )
+        )
+    if not linear_subs:
+        return
+
+    seen_qkvz: set[str] = set()
+    seen_qkv: set[str] = set()
+    for path, _ in jax.tree_util.tree_leaves_with_path(opt_state):
+        key_str = tree_path_to_string(path, sep=".")
+        for dotted, _, _ in linear_subs:
+            if _matches_fused_optimizer_leaf(key_str, f"{dotted}.in_proj_qkvz"):
+                seen_qkvz.add(dotted)
+            if _matches_fused_optimizer_leaf(key_str, f"{dotted}.in_proj_qkv"):
+                seen_qkv.add(dotted)
+
+    for dotted, live_merged, live_split in linear_subs:
+        if dotted not in seen_qkvz or dotted in seen_qkv:
+            continue
+        if saved_merged and not live_merged and not live_split:
+            raise ValueError(
+                f"Optimizer checkpoint {load_directory} was saved with linear_attention_merged_split_proj=True "
+                f"and cannot be loaded into default per-key-head packed mode (layer {dotted})."
+            )
+        if not saved_merged and live_merged:
+            raise ValueError(
+                f"Optimizer checkpoint {load_directory} stores default per-key-head packed linear-attention moments "
+                f"(linear_attention_merged_split_proj=False) and cannot be loaded with "
+                f"linear_attention_merged_split_proj=True (layer {dotted})."
+            )
+        if not saved_merged and live_split:
+            raise ValueError(
+                f"Optimizer checkpoint {load_directory} stores default per-key-head packed linear-attention moments "
+                f"and cannot be loaded into linear_attention_separate_proj=True (layer {dotted})."
+            )
+        if saved_merged and live_split:
+            raise ValueError(
+                f"Optimizer checkpoint {load_directory} was saved with linear_attention_merged_split_proj=True "
+                f"(merged in_proj_qkvz/in_proj_ba moments) and cannot be restored into a split-projection model "
+                f"(layer {dotted}, e.g. explicit linear_attention_separate_proj=True or can_merge_tp fallback at "
+                f"higher TP). Re-initialize the optimizer or resume at a TP size where "
+                f"linear_attention_merged_split_proj stays active."
+            )
 
 
 def write_fused_layout_marker(save_directory, tp_size: int = 1) -> None:

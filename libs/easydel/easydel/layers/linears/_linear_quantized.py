@@ -1472,6 +1472,23 @@ class ParallelLinearQuantized(spx.Module):
                 scale_spec = sanitize_partition_spec_for_shape(scale_spec, tuple(scale_value.shape), mesh)
                 if bias_value is not None:
                     bias_spec = sanitize_partition_spec_for_shape(bias_spec, tuple(bias_value.shape), mesh)
+                if (
+                    not _spec_is_sharded(kernel_spec)
+                    or not _spec_matches_kernel_parallel_layout(kernel_spec, scale_spec, self._direction)
+                    or (
+                        bias_value is not None
+                        and not _spec_matches_kernel_parallel_layout(kernel_spec, bias_spec, self._direction)
+                    )
+                ):
+                    # Tiny projections (e.g. Qwen3-Next in_proj_ba [H, 64] with group_size=64 -> scales [H, 1])
+                    # or indivisible contraction/output dims can sanitize kernel and/or scales to replicated.
+                    # Replicate all leaves of this layer and clear tp_axis_name so row-parallel never psums
+                    # replicated outputs and shard_map never enters with mismatched kernel/scale specs.
+                    kernel_spec = jax.sharding.PartitionSpec(*((None,) * len(kernel_value.shape)))
+                    scale_spec = jax.sharding.PartitionSpec(*((None,) * len(scale_value.shape)))
+                    if bias_value is not None:
+                        bias_spec = jax.sharding.PartitionSpec(*((None,) * len(bias_value.shape)))
+                    tp_axis_name = None
 
         if not use_forced_layout:
             if not any(_spec_is_sharded(s) for s in (input_spec, kernel_spec, scale_spec, bias_spec)):

@@ -1065,3 +1065,672 @@ def test_fused_train_state_checkpoint_is_tp_portable(tmp_path, load_tp, family):
         f"[{family}] one-step resume diverged after save_tp={save_tp} -> load_tp={load_tp} "
         f"(max|Δlogits|={next_logits_err})"
     )
+
+
+def _qwen3_next_linear_variant(
+    tp: int,
+    *,
+    separate_proj: bool = False,
+    merged_split_proj: bool = False,
+    num_k_heads: int = 8,
+    num_v_heads: int = 8,
+    head_dim: int = 8,
+    hidden_size: int = 64,
+    intermediate_size: int = 128,
+):
+    import spectrax as spx
+
+    cfg = ed.Qwen3NextConfig(
+        vocab_size=128,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        head_dim=head_dim,
+        max_position_embeddings=64,
+        linear_num_key_heads=num_k_heads,
+        linear_num_value_heads=num_v_heads,
+        linear_key_head_dim=head_dim,
+        linear_value_head_dim=head_dim,
+        linear_conv_kernel_dim=4,
+        linear_attention_separate_proj=separate_proj,
+        linear_attention_merged_split_proj=merged_split_proj,
+        attn_mechanism=ed.AttentionMechanisms.VANILLA,
+        mlp_only_layers=[0, 1],
+    )
+    cfg.sharding_axis_dims = (1, 1, -1, 1, tp, 1)
+    return ed.Qwen3NextForCausalLM(config=cfg, rngs=spx.Rngs(0), dtype=jnp.float32, param_dtype=jnp.float32)
+
+
+@pytest.mark.parametrize(
+    ("save_tp", "load_tp"),
+    [(1, 2), (1, 4), (1, 8), (2, 1), (2, 4), (2, 8), (4, 1), (4, 2), (4, 8), (8, 1), (8, 2), (8, 4)],
+)
+def test_qwen3_next_merged_split_proj_tp_portability(tmp_path, save_tp, load_tp):
+    """Merged-split Qwen3-Next (2D in_proj_qkvz/in_proj_ba + 3D conv1d) is portable across TP=1/2/4/8."""
+    if jax.device_count() < max(save_tp, load_tp):
+        pytest.skip(f"needs >= {max(save_tp, load_tp)} devices")
+
+    from easydel.layers.layouts import fused_layout_param_specs, read_fused_checkpoint_tp
+
+    save_model = _qwen3_next_linear_variant(save_tp, merged_split_proj=True)
+    spec_paths = {path for path, _ in fused_layout_param_specs(save_model)}
+    assert any(p.endswith(".conv1d") for p in spec_paths)
+    assert any(p.endswith(".in_proj_qkvz") for p in spec_paths)
+    assert any(p.endswith(".in_proj_ba") for p in spec_paths)
+
+    ref_logits = _logits(save_model)
+    ref_canon = _canonical_fused_parameter_leaves(save_model)
+    assert any(p.endswith(".conv1d.weight") and arr.ndim == 3 for p, arr in ref_canon.items())
+
+    ckpt = tmp_path / f"merged-tp{save_tp}-to-tp{load_tp}"
+    save_model.save_pretrained(str(ckpt))
+    assert read_fused_checkpoint_tp(ckpt) == save_tp
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+        auto_shard_model=True,
+    )
+    assert getattr(loaded.config, "fused_param_tp", None) == load_tp
+
+    loaded_canon = _canonical_fused_parameter_leaves(loaded)
+    assert loaded_canon.keys() == ref_canon.keys()
+    for path, expected in ref_canon.items():
+        np.testing.assert_array_equal(loaded_canon[path], expected, err_msg=path)
+
+    logits_err = float(np.max(np.abs(ref_logits - _logits(loaded))))
+    assert logits_err < 5e-4, f"merged_split_proj tp={save_tp}->{load_tp} changed logits (max|Δ|={logits_err})"
+
+
+@pytest.mark.parametrize("load_tp", [1, 4, 8])
+def test_qwen3_next_merged_split_proj_optimizer_state_tp_portability(tmp_path, load_tp):
+    """3D conv1d and 2D in_proj_qkvz/in_proj_ba optimizer moments stay aligned across TP=2 -> 1/4/8."""
+    if jax.device_count() < load_tp:
+        pytest.skip(f"needs >= {load_tp} devices")
+
+    save_model = _qwen3_next_linear_variant(2, merged_split_proj=True)
+    tx = optax.adam(1e-3)
+    state = ed.EasyDeLState.create(model=save_model, tx=tx, init_opt_state=True)
+    state, _ = _train_step(state)
+    ref_logits = _state_logits(state)
+    ref_opt = _canonical_fused_optimizer_leaves(state)
+    assert any(".conv1d.weight" in p for p in ref_opt)
+
+    ckpt = tmp_path / f"merged-opt-tp2-to-tp{load_tp}"
+    state.save_state(ckpt, float_dtype=None, save_optimizer=True)
+
+    loaded = ed.EasyDeLState.load_state(
+        load_directory=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+        auto_shard_model=True,
+        tx_template=tx,
+    ).replace(tx=tx)
+
+    loaded_opt = _canonical_fused_optimizer_leaves(loaded)
+    assert loaded_opt.keys() == ref_opt.keys()
+    for path, expected in ref_opt.items():
+        assert float(np.max(np.abs(expected - loaded_opt[path]))) < 1e-6, path
+    assert float(np.max(np.abs(ref_logits - _state_logits(loaded)))) < 5e-4
+
+
+@pytest.mark.parametrize(("save_tp", "load_tp"), [(1, 2), (2, 2), (2, 4), (2, 1), (4, 2)])
+def test_qwen3_next_separate_to_merged_cross_mode_tp_portability(tmp_path, save_tp, load_tp):
+    """Saved separate_proj=True at any TP loads cleanly into merged_split_proj=True at any TP (incl. same TP>1)."""
+    save_model = _qwen3_next_linear_variant(save_tp, separate_proj=True)
+    ref_logits = _logits(save_model)
+
+    ckpt = tmp_path / f"sep-tp{save_tp}-to-merged-tp{load_tp}"
+    save_model.save_pretrained(str(ckpt))
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+        config_kwargs={"linear_attention_separate_proj": False, "linear_attention_merged_split_proj": True},
+        auto_shard_model=True,
+    )
+    assert loaded.model.layers[0].linear_attn.uses_merged_split_proj is True
+    logits_err = float(np.max(np.abs(ref_logits - _logits(loaded))))
+    assert logits_err < 5e-4, f"separate(tp={save_tp})->merged(tp={load_tp}) changed logits (max|Δ|={logits_err})"
+
+
+@pytest.mark.parametrize("load_tp", [1, 2, 4])
+def test_qwen3_next_merged_to_separate_cross_mode_tp_portability(tmp_path, load_tp):
+    """Saved merged_split_proj=True at TP=2 unfuses cleanly into separate_proj=True at TP=1/2/4."""
+    save_model = _qwen3_next_linear_variant(2, merged_split_proj=True)
+    ref_logits = _logits(save_model)
+
+    ckpt = tmp_path / f"merged-tp2-to-sep-tp{load_tp}"
+    save_model.save_pretrained(str(ckpt))
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+        config_kwargs={"linear_attention_merged_split_proj": False, "linear_attention_separate_proj": True},
+        auto_shard_model=True,
+    )
+    assert loaded.model.layers[0].linear_attn.uses_split_proj is True
+    logits_err = float(np.max(np.abs(ref_logits - _logits(loaded))))
+    assert logits_err < 5e-4, f"merged(tp=2)->separate(tp={load_tp}) changed logits (max|Δ|={logits_err})"
+
+
+def test_qwen3_next_merged_to_can_merge_tp_fallback_unfusion(tmp_path):
+    """Saved merged_split_proj=True at TP=2 unfuses cleanly when loaded at TP=8 where num_k_heads=4 < TP."""
+    if jax.device_count() < 8:
+        pytest.skip("needs >= 8 devices")
+
+    save_model = _qwen3_next_linear_variant(2, merged_split_proj=True, num_k_heads=4, num_v_heads=4)
+    ref_logits = _logits(save_model)
+
+    ckpt = tmp_path / "merged-tp2-to-fallback-tp8"
+    save_model.save_pretrained(str(ckpt))
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 8, 1),
+        auto_shard_model=True,
+    )
+    assert loaded.model.layers[0].linear_attn.uses_merged_split_proj is False
+    assert loaded.model.layers[0].linear_attn.uses_split_proj is True
+    logits_err = float(np.max(np.abs(ref_logits - _logits(loaded))))
+    assert logits_err < 5e-4, f"merged(tp=2)->fallback(tp=8) changed logits (max|Δ|={logits_err})"
+
+
+def test_qwen3_next_merged_vs_default_packed_mismatch_raises(tmp_path):
+    """Loading merged_split_proj checkpoint as default packed (or vice versa) raises ValueError instead of corrupting."""
+    merged = _qwen3_next_linear_variant(2, merged_split_proj=True)
+    merged_ckpt = tmp_path / "merged-ckpt"
+    merged.save_pretrained(str(merged_ckpt))
+    with pytest.raises(ValueError, match="linear_attention_merged_split_proj"):
+        ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=str(merged_ckpt),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+            config_kwargs={"linear_attention_merged_split_proj": False, "linear_attention_separate_proj": False},
+            auto_shard_model=True,
+        )
+
+    packed = _qwen3_next_linear_variant(2, merged_split_proj=False, separate_proj=False)
+    packed_ckpt = tmp_path / "packed-ckpt"
+    packed.save_pretrained(str(packed_ckpt))
+    with pytest.raises(ValueError, match="linear_attention_merged_split_proj"):
+        ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=str(packed_ckpt),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+            config_kwargs={"linear_attention_merged_split_proj": True, "linear_attention_separate_proj": False},
+            auto_shard_model=True,
+        )
+
+
+def test_quantized_fused_cross_tp_portability_and_indivisible_guard(tmp_path):
+    """Quantized fused checkpoints transform word/group-scaled leaves across TP or fail loudly when indivisible."""
+    from easydel.layers.layouts import retp_fused_state
+    from easydel.layers.quantization import QuantizationConfig, QuantizationType
+
+    # 1. Channelwise quantized merged-split Qwen3-Next: TP=2 -> TP=1 and TP=4.
+    cw_cfg = QuantizationConfig.for_matmul("w8a16")
+    cw_model = _qwen3_next_linear_variant(2, merged_split_proj=True).quantize(
+        quantization_config=cw_cfg, apply_quantization=True, verbose=False
+    )
+    cw_ref_logits = _logits(cw_model)
+    cw_ckpt = tmp_path / "cw-merged-tp2"
+    cw_model.save_pretrained(str(cw_ckpt))
+
+    for load_tp in (1, 4):
+        cw_loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=str(cw_ckpt),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            sharding_axis_dims=(1, 1, -1, 1, load_tp, 1),
+            quantization_config=cw_cfg,
+            auto_shard_model=True,
+        )
+        assert float(np.max(np.abs(cw_ref_logits - _logits(cw_loaded)))) < 5e-4
+
+    # 2. Packed grouped (NF4, group_size=16) Llama: qkv/gate_up segments all divide tp*16 (and tp*8).
+    nf4_cfg = QuantizationConfig(dtype=QuantizationType.NF4, group_size=16)
+    nf4_model = _llama(tp=2).quantize(quantization_config=nf4_cfg, apply_quantization=True, verbose=False)
+    nf4_ref_logits = _logits(nf4_model)
+    nf4_ckpt = tmp_path / "nf4-llama-tp2"
+    nf4_model.save_pretrained(str(nf4_ckpt))
+
+    nf4_tp1 = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(nf4_ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
+        quantization_config=nf4_cfg,
+        auto_shard_model=True,
+    )
+    assert float(np.max(np.abs(nf4_ref_logits - _logits(nf4_tp1)))) < 5e-4
+
+    # 3. Indivisible packed quantized scales (segments=(32, 32), stride=64 -> shape[-1]=1) must raise ValueError.
+    class _DummyFused:
+        def __init__(self):
+            self.fused_params = {"proj": (32, 32)}
+
+    indivisible_state = {
+        ("parameters", "proj", "quant_kernel"): jnp.zeros((16, 8), dtype=jnp.uint32),
+        ("parameters", "proj", "quant_scales"): jnp.ones((16, 1), dtype=jnp.float32),
+    }
+    with pytest.raises(ValueError, match="Cannot re-interleave packed quantized fused leaf"):
+        retp_fused_state(_DummyFused(), indivisible_state, saved_tp=1, target_tp=2)
+
+    # 4. Forced-layout TPU shard spec resolution for tiny grouped-quantized projections (e.g. in_proj_ba [H, 64],
+    # group_size=64 -> scales [H, 1]) on TP=4 must replicate kernel & scales instead of returning mismatched specs.
+    import spectrax as spx
+    from easydel.layers.linears._linear_quantized import ColumnParallelLinearQuantized, RowParallelLinearQuantized
+
+    ba_layer = ColumnParallelLinearQuantized(
+        in_features=64,
+        out_features=64,
+        use_bias=False,
+        config=QuantizationConfig(dtype=QuantizationType.INT8, group_size=64),
+        rngs=spx.Rngs(0),
+    )
+    cfg_tp4 = _config(tp=4)
+    resolved = ba_layer._resolve_shard_specs(
+        cfg_tp4.mesh,
+        jnp.zeros((2, 64), dtype=jnp.float32),
+        ba_layer.quant_kernel.value,
+        ba_layer.quant_scales.value,
+        ba_layer.quant_biases.value,
+        is_tpu=True,
+    )
+    assert resolved is not None
+    _, kernel_spec, scale_spec, bias_spec, _, tp_axis_name = resolved
+    assert kernel_spec == scale_spec
+    assert bias_spec == kernel_spec
+    assert tp_axis_name is None
+
+    # 5. RowParallelLinearQuantized with in_features indivisible by TP=4 (both kernel & scales sanitize to
+    # replicated) must ALSO clear tp_axis_name=None so _local_matmul does not psum replicated outputs by tp_size.
+    row_indivisible = RowParallelLinearQuantized(
+        in_features=62,
+        out_features=64,
+        use_bias=False,
+        config=QuantizationConfig(dtype=QuantizationType.INT8, group_size=64),
+        rngs=spx.Rngs(0),
+    )
+    resolved_row = row_indivisible._resolve_shard_specs(
+        cfg_tp4.mesh,
+        jnp.zeros((2, 62), dtype=jnp.float32),
+        row_indivisible.quant_kernel.value,
+        row_indivisible.quant_scales.value,
+        row_indivisible.quant_biases.value,
+        is_tpu=True,
+    )
+    assert resolved_row is not None
+    _, r_kspec, r_sspec, r_bspec, _, r_tp = resolved_row
+    assert r_kspec == jax.sharding.PartitionSpec(None, None)
+    assert r_sspec == jax.sharding.PartitionSpec(None, None)
+    assert r_bspec == jax.sharding.PartitionSpec(None, None)
+    assert r_tp is None
+
+    # 6. ColumnParallelLinearQuantized where BOTH kernel and scales sanitize to replicated (out=16, bits=4 ->
+    # kernel (H, 2), scales (H, 1) on TP=4) must also clear tp_axis_name=None.
+    col_both_rep = ColumnParallelLinearQuantized(
+        in_features=64,
+        out_features=16,
+        use_bias=False,
+        config=QuantizationConfig(dtype=QuantizationType.NF4, group_size=16),
+        rngs=spx.Rngs(0),
+    )
+    resolved_col = col_both_rep._resolve_shard_specs(
+        cfg_tp4.mesh,
+        jnp.zeros((2, 64), dtype=jnp.float32),
+        col_both_rep.quant_kernel.value,
+        col_both_rep.quant_scales.value,
+        col_both_rep.quant_biases.value,
+        is_tpu=True,
+    )
+    assert resolved_col is not None
+    _, c_kspec, c_sspec, _, _, c_tp = resolved_col
+    assert c_kspec == jax.sharding.PartitionSpec(None, None)
+    assert c_sspec == jax.sharding.PartitionSpec(None, None)
+    assert c_tp is None
+
+
+def test_axis_policy_and_config_guards(tmp_path):
+    """axis_policy={'hidden_state_axis': None} survives base_config, AutoConfig, AutoShardAndGather, and from_pretrained."""
+    import json as _json
+
+    from easydel.layers.layouts._canonical import _read_saved_linear_attention_flags
+    from easydel.modules.auto.auto_configuration import AutoEasyDeLConfig, AutoShardAndGatherFunctions
+    from easydel.modules.qwen3_5_moe.qwen3_5_moe_configuration import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
+
+    # Qwen3.5-MoE must allow linear_attention_merged_split_proj=True without colliding with separate_proj,
+    # and must reject passing both flags as True simultaneously.
+    q35_moe_cfg = Qwen3_5MoeTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_attention_merged_split_proj=True,
+    )
+    assert q35_moe_cfg.linear_attention_merged_split_proj is True
+    assert q35_moe_cfg.linear_attention_separate_proj is False
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Qwen3_5MoeTextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_attention_separate_proj=True,
+            linear_attention_merged_split_proj=True,
+        )
+
+    # Composite VLM config: single-flag override via AutoEasyDeLConfig.from_pretrained must update text_config
+    # even when saved text_config has linear_attention_separate_proj=True, and _read_saved_linear_attention_flags
+    # must prefer text_config over conflicting top-level flags.
+    vlm_dir = tmp_path / "qwen3_5_moe_vlm_cfg"
+    vlm_cfg = Qwen3_5MoeConfig(
+        text_config=Qwen3_5MoeTextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_attention_separate_proj=True,
+        )
+    )
+    vlm_cfg.save_pretrained(str(vlm_dir))
+    vlm_loaded_cfg = AutoEasyDeLConfig.from_pretrained(
+        str(vlm_dir),
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        linear_attention_merged_split_proj=True,
+    )
+    assert vlm_loaded_cfg.text_config.linear_attention_merged_split_proj is True
+    assert vlm_loaded_cfg.text_config.linear_attention_separate_proj is False
+
+    # Conflicting top-level flag must not shadow text_config in _read_saved_linear_attention_flags.
+    vlm_json = _json.loads((vlm_dir / "config.json").read_text())
+    vlm_json["linear_attention_merged_split_proj"] = False
+    vlm_json["text_config"]["linear_attention_merged_split_proj"] = True
+    vlm_json["text_config"]["linear_attention_separate_proj"] = False
+    (vlm_dir / "config.json").write_text(_json.dumps(vlm_json))
+    saved_merged, saved_sep, found = _read_saved_linear_attention_flags(vlm_dir)
+    assert (saved_merged, saved_sep, found) == (True, False, True)
+
+    # add_basic_configurations with partition_axis=None + axis_policy must NOT wipe axis_policy.
+    cfg = _config(tp=2)
+    cfg.add_basic_configurations(axis_policy={"hidden_state_axis": None}, partition_axis=None)
+    assert cfg.partition_axis is not None
+    assert cfg.partition_axis.hidden_state_axis is None
+    assert cfg.axis_policy.hidden_state_axis is None
+
+    # Save a native checkpoint and verify AutoEasyDeLConfig, AutoShardAndGatherFunctions, and from_pretrained.
+    model = _llama(tp=2)
+    ckpt = tmp_path / "axis-policy-ckpt"
+    model.save_pretrained(str(ckpt))
+
+    auto_cfg = AutoEasyDeLConfig.from_pretrained(
+        str(ckpt),
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        axis_policy={"hidden_state_axis": None},
+    )
+    assert auto_cfg.partition_axis.hidden_state_axis is None
+    assert auto_cfg.axis_policy.hidden_state_axis is None
+
+    shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
+        str(ckpt),
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        config_kwargs={
+            "axis_policy": {"hidden_state_axis": None},
+            "sharding_axis_dims": (1, 1, -1, 1, 2, 1),
+            "from_torch": False,
+            "trust_remote_code": False,
+            "model_task": ed.TaskType.CAUSAL_LM,
+        },
+    )
+    assert shard_fns
+
+    loaded = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        config_kwargs={
+            "axis_policy": {"hidden_state_axis": None},
+            "sharding_axis_dims": (1, 1, -1, 1, 2, 1),
+            "platform": "jax",
+        },
+        auto_shard_model=True,
+    )
+    assert loaded.config.partition_axis.hidden_state_axis is None
+    assert loaded.config.axis_policy.hidden_state_axis is None
+
+    # Explicit partition_axis + config_kwargs={"partition_axis": ...} must not raise duplicate-kwarg TypeError.
+    loaded_override = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        partition_axis=ed.PartitionAxis(),
+        config_kwargs={"partition_axis": ed.PartitionAxis(hidden_state_axis=None)},
+        auto_shard_model=True,
+    )
+    assert loaded_override.config.partition_axis.hidden_state_axis is None
+
+    # HF from_torch=True must also preserve axis_policy in config_kwargs and stamp fused_param_tp.
+    pytest.importorskip("torch")
+    hf_dir = tmp_path / "hf-axis-policy-ckpt"
+    model.to_torch().save_pretrained(str(hf_dir))
+    loaded_hf = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(hf_dir),
+        from_torch=True,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        config_kwargs={"axis_policy": {"hidden_state_axis": None}},
+        auto_shard_model=True,
+    )
+    assert loaded_hf.config.partition_axis.hidden_state_axis is None
+    assert loaded_hf.config.axis_policy.hidden_state_axis is None
+    assert getattr(loaded_hf.config, "fused_param_tp", None) == 2
+
+
+def test_single_flag_linear_attention_override_and_optimizer_fallback_rejection(tmp_path):
+    """Single-flag linear-attention config_kwargs work both ways; cross-mode fallback rejects stale optimizer state."""
+    import json as _json
+
+    # 1. Saved separate_proj=True -> single-flag config_kwargs={"linear_attention_merged_split_proj": True}
+    sep_model = _qwen3_next_linear_variant(2, separate_proj=True)
+    sep_ref = _logits(sep_model)
+    sep_ckpt = tmp_path / "single-flag-sep"
+    sep_model.save_pretrained(str(sep_ckpt))
+
+    loaded_merged = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(sep_ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        config_kwargs={"linear_attention_merged_split_proj": True},
+        auto_shard_model=True,
+    )
+    assert loaded_merged.model.layers[0].linear_attn.uses_merged_split_proj is True
+    assert float(np.max(np.abs(sep_ref - _logits(loaded_merged)))) < 5e-4
+
+    # 2. Saved merged_split_proj=True -> single-flag config_kwargs={"linear_attention_separate_proj": True}
+    merged_ckpt = tmp_path / "single-flag-merged"
+    loaded_merged.save_pretrained(str(merged_ckpt))
+    loaded_sep = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=str(merged_ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        config_kwargs={"linear_attention_separate_proj": True},
+        auto_shard_model=True,
+    )
+    assert loaded_sep.model.layers[0].linear_attn.uses_split_proj is True
+    assert float(np.max(np.abs(sep_ref - _logits(loaded_sep)))) < 5e-4
+
+    # 3. Unstamped legacy optimizer checkpoint assumes canonical tp=1 and re-interleaves for live tp=2.
+    state_tp1, tx = _train_state("llama", 1)
+    ref_opt_tp1 = _canonical_fused_optimizer_leaves(state_tp1)
+    unstamped_ckpt = tmp_path / "unstamped-opt-ckpt"
+    state_tp1.save_state(unstamped_ckpt, float_dtype=None, save_optimizer=True)
+    (unstamped_ckpt / "fused_param_layout.json").unlink()
+    cfg_payload = _json.loads((unstamped_ckpt / "config.json").read_text())
+    cfg_payload.pop("fused_param_tp", None)
+    cfg_payload.pop("fused_param_layout", None)
+    (unstamped_ckpt / "config.json").write_text(_json.dumps(cfg_payload))
+
+    reloaded_opt = ed.EasyDeLState.load_state(
+        load_directory=str(unstamped_ckpt),
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        sharding_axis_dims=(1, 1, -1, 1, 2, 1),
+        auto_shard_model=True,
+        tx_template=tx,
+    )
+    reloaded_opt_leaves = _canonical_fused_optimizer_leaves(reloaded_opt)
+    assert reloaded_opt_leaves.keys() == ref_opt_tp1.keys()
+    for path, expected in ref_opt_tp1.items():
+        assert float(np.max(np.abs(expected - reloaded_opt_leaves[path]))) < 1e-6, path
+
+    # 4. Cross-mode can_merge_tp fallback rejects raw merged-split optimizer state with ValueError.
+    if jax.device_count() >= 8:
+        merged_opt_model = _qwen3_next_linear_variant(2, merged_split_proj=True, num_k_heads=4, num_v_heads=4)
+        opt_tx = optax.adam(1e-3)
+        merged_state = ed.EasyDeLState.create(model=merged_opt_model, tx=opt_tx, init_opt_state=True)
+        merged_state, _ = _train_step(merged_state)
+        merged_opt_ckpt = tmp_path / "merged-opt-fallback"
+        merged_state.save_state(merged_opt_ckpt, float_dtype=None, save_optimizer=True)
+        with pytest.raises(ValueError, match="linear_attention_merged_split_proj"):
+            ed.EasyDeLState.load_state(
+                load_directory=str(merged_opt_ckpt),
+                dtype=jnp.float32,
+                param_dtype=jnp.float32,
+                sharding_axis_dims=(1, 1, -1, 1, 8, 1),
+                auto_shard_model=True,
+                tx_template=None,
+                allow_optimizer_restore_failure=False,
+            )
+        fallback_state = ed.EasyDeLState.load_state(
+            load_directory=str(merged_opt_ckpt),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            sharding_axis_dims=(1, 1, -1, 1, 8, 1),
+            auto_shard_model=True,
+            tx_template=None,
+        )
+        assert fallback_state.opt_state is None
+
+
+def test_single_token_rows_invalidates_jit_key_and_tp_sharding_helpers():
+    """single_token_rows & decode_mode_specs invalidate jax.jit keys; with_tp_last_axis_sharding respects scopes."""
+    from easydel.infra.sharding import (
+        decode_mode_specs,
+        dp_spmd_vmap_scope,
+        inference_mode_forces_decode,
+        inference_mode_single_token_rows,
+        single_token_rows,
+    )
+    from easydel.layers.layouts._runtime import with_tp_last_axis_sharding
+
+    trace_count = 0
+
+    @jax.jit
+    def _branch(x):
+        nonlocal trace_count
+        trace_count += 1
+        return x + 1.0 if inference_mode_single_token_rows() else x - 1.0
+
+    x = jnp.zeros((2,), dtype=jnp.float32)
+    out_false = _branch(x)
+    with single_token_rows(True):
+        out_true = _branch(x)
+    out_false_again = _branch(x)
+
+    assert trace_count == 2
+    np.testing.assert_array_equal(np.asarray(out_false), np.array([-1.0, -1.0]))
+    np.testing.assert_array_equal(np.asarray(out_true), np.array([1.0, 1.0]))
+    np.testing.assert_array_equal(np.asarray(out_false_again), np.array([-1.0, -1.0]))
+
+    decode_trace_count = 0
+
+    @jax.jit
+    def _decode_branch(y):
+        nonlocal decode_trace_count
+        decode_trace_count += 1
+        return y + 2.0 if inference_mode_forces_decode() else y - 2.0
+
+    dec_false = _decode_branch(x)
+    with decode_mode_specs(True):
+        dec_true = _decode_branch(x)
+    dec_false_again = _decode_branch(x)
+
+    assert decode_trace_count == 2
+    np.testing.assert_array_equal(np.asarray(dec_false), np.array([-2.0, -2.0]))
+    np.testing.assert_array_equal(np.asarray(dec_true), np.array([2.0, 2.0]))
+    np.testing.assert_array_equal(np.asarray(dec_false_again), np.array([-2.0, -2.0]))
+
+    # with_tp_last_axis_sharding inside dp_spmd_vmap_scope("dp") when dp > fsdp must not re-shard on "dp",
+    # and must not emit duplicate "tp" axes when an input already carries "tp" on an earlier dimension.
+    if jax.device_count() >= 8:
+        cfg = _config(tp=2)
+        cfg.sharding_axis_dims = (1, 4, 1, 1, 2, 1)
+        mesh = cfg.mesh
+        with mesh:
+
+            @jax.jit
+            def _vmapped(inp):
+                with dp_spmd_vmap_scope("dp"):
+                    return jax.vmap(
+                        lambda y: with_tp_last_axis_sharding(y, cfg),
+                        in_axes=0,
+                        out_axes=0,
+                        spmd_axis_name="dp",
+                    )(inp)
+
+            arr = jnp.ones((4, 4, 2, 8), dtype=jnp.float32)
+            res = _vmapped(arr)
+            assert res.shape == arr.shape
+
+            dup_tp_arr = jax.device_put(
+                jnp.ones((2, 4, 8), dtype=jnp.float32),
+                jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("tp", None, None)),
+            )
+            dedup_res = with_tp_last_axis_sharding(dup_tp_arr, cfg)
+            assert dedup_res.sharding.spec == jax.sharding.PartitionSpec(None, None, "tp")
+
+        # decode_mode_specs with sp > 1 must use decode_query_sequence_axis (None) instead of "sp"
+        # and re-trace on a shared jitted callable.
+        cfg_sp = _config(tp=2)
+        cfg_sp.sharding_axis_dims = (1, 1, 1, 1, 2, 4)
+        with cfg_sp.mesh:
+
+            @jax.jit
+            def _constrain(inp):
+                return with_tp_last_axis_sharding(inp, cfg_sp)
+
+            arr_dec = jnp.ones((1, 4, 8), dtype=jnp.float32)
+            res_prefill = _constrain(arr_dec)
+            assert res_prefill.sharding.spec == jax.sharding.PartitionSpec(None, "sp", "tp")
+            with decode_mode_specs(True):
+                res_dec = _constrain(arr_dec)
+            assert res_dec.sharding.spec == jax.sharding.PartitionSpec(None, None, "tp")

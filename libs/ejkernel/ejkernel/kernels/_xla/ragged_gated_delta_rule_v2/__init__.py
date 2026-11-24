@@ -28,16 +28,23 @@ Public symbols:
     - ``ragged_gated_delta_rule_mixed_prefill``: Chunked algorithm that pads
       each request to a multiple of ``chunk_size`` and propagates inter-chunk
       state via ``lax.scan``.
+    - ``ragged_gdn_conv_decode``: Registered (Platform.XLA, Backend.ANY) fused
+      causal Conv1D + SiLU + L2Norm + GDN single-token decode entry point.
+    - ``ragged_gdn_conv_decode_xla``: Portable XLA forward implementation for
+      ``ragged_gdn_conv_decode``.
 """
 
-from ._interface import ragged_gated_delta_rule_v2
+from ._interface import ragged_gated_delta_rule_v2, ragged_gdn_conv_decode
 from ._xla_impl_fwd import (
     ragged_gated_delta_rule_decode_only,
     ragged_gated_delta_rule_mixed_prefill,
+    ragged_gdn_conv_decode_xla,
 )
 
 __all__ = (
     "ragged_gated_delta_rule_decode_only",
     "ragged_gated_delta_rule_mixed_prefill",
     "ragged_gated_delta_rule_v2",
+    "ragged_gdn_conv_decode",
+    "ragged_gdn_conv_decode_xla",
 )

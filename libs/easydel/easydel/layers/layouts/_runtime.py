@@ -38,10 +38,13 @@ from spectrax import PartitionAxis, with_sharding_constraint
 
 from easydel.infra.sharding import (
     OptionalMesh,
+    active_dp_spmd_axis,
+    inference_mode_forces_decode,
     mesh_axis_size,
     partition_spec_for_mesh,
     resolve_stage_mesh,
     sanitize_partition_spec_for_shape,
+    strip_axis_from_spec,
 )
 
 from ._types import Array, EasyDeLBaseConfig
@@ -65,6 +68,8 @@ def _partition_axis(config: EasyDeLBaseConfig | None = None) -> PartitionAxis:
         Resolved :class:`PartitionAxis` for sharding-axis lookups.
     """
     partition_axis = getattr(config, "partition_axis", None) if config is not None else None
+    if isinstance(partition_axis, dict):
+        return PartitionAxis(**partition_axis)
     if partition_axis is not None:
         return partition_axis
     return PartitionAxis()
@@ -199,20 +204,41 @@ def with_tp_last_axis_sharding(
     if tp_size <= 1 or x.ndim < 1 or int(x.shape[-1]) % tp_size != 0:
         return x
 
+    dp_axis = active_dp_spmd_axis()
     current_spec = partition_spec_for_mesh(x, stage_mesh)
     if len(current_spec) == x.ndim:
-        spec = PartitionSpec(*tuple(current_spec[:-1]), tp_axis)
+        leading = strip_axis_from_spec(PartitionSpec(*tuple(current_spec[:-1])), tp_axis)
+        spec = PartitionSpec(*tuple(leading), tp_axis)
     elif config is not None and x.ndim == 3:
         axis = _partition_axis(config)
-        batch_axis = _fit_axis_entry(axis.batch_axis, int(x.shape[0]), stage_mesh)
-        sequence_axis = _fit_axis_entry(axis.sequence_axis, int(x.shape[1]), stage_mesh)
+        if inference_mode_forces_decode():
+            raw_batch = getattr(axis, "decode_batch_axis", axis.batch_axis)
+            raw_seq = getattr(axis, "decode_query_sequence_axis", None)
+        else:
+            raw_batch = axis.batch_axis
+            raw_seq = axis.sequence_axis
+        if dp_axis is not None:
+            raw_batch = strip_axis_from_spec(PartitionSpec(_axis_entry(raw_batch)), dp_axis)[0]
+            raw_seq = strip_axis_from_spec(PartitionSpec(_axis_entry(raw_seq)), dp_axis)[0]
+        raw_batch = strip_axis_from_spec(PartitionSpec(_axis_entry(raw_batch)), tp_axis)[0]
+        raw_seq = strip_axis_from_spec(PartitionSpec(_axis_entry(raw_seq)), tp_axis)[0]
+        batch_axis = _fit_axis_entry(raw_batch, int(x.shape[0]), stage_mesh)
+        sequence_axis = _fit_axis_entry(raw_seq, int(x.shape[1]), stage_mesh)
         spec = PartitionSpec(batch_axis, sequence_axis, tp_axis)
     elif config is not None and x.ndim == 2:
         axis = _partition_axis(config)
-        batch_axis = _fit_axis_entry(axis.batch_axis, int(x.shape[0]), stage_mesh)
+        raw_batch = (
+            getattr(axis, "decode_batch_axis", axis.batch_axis) if inference_mode_forces_decode() else axis.batch_axis
+        )
+        if dp_axis is not None:
+            raw_batch = strip_axis_from_spec(PartitionSpec(_axis_entry(raw_batch)), dp_axis)[0]
+        raw_batch = strip_axis_from_spec(PartitionSpec(_axis_entry(raw_batch)), tp_axis)[0]
+        batch_axis = _fit_axis_entry(raw_batch, int(x.shape[0]), stage_mesh)
         spec = PartitionSpec(batch_axis, tp_axis)
     else:
         spec = PartitionSpec(*([None] * (x.ndim - 1)), tp_axis)
+    if dp_axis is not None:
+        spec = strip_axis_from_spec(spec, dp_axis)
     spec = sanitize_partition_spec_for_shape(spec, tuple(int(dim) for dim in x.shape), stage_mesh)
     return tp.cast(Array, with_sharding_constraint(x, spec, mesh=stage_mesh))
 

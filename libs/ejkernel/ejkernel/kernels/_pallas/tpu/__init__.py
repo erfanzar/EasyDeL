@@ -42,6 +42,8 @@ Available kernels:
     quantized_matmul: Packed-weight quantized matrix multiplication.
     ragged_decode_attention: Decode-phase attention for ragged batches.
     ragged_gated_delta_rule: Ragged-batch gated delta-rule recurrence.
+    ragged_gated_delta_rule_v2: Packed-inference ragged GDN v2 forward pass.
+    ragged_gdn_conv_decode: Fused causal Conv1D + SiLU + L2Norm + GDN decode.
     ragged_page_attention_v2: Variable-length paged attention v2.
     ragged_page_attention_v3: Variable-length paged attention v3 (VMEM-safe).
     reduce_scatter_matmul: Matmul fused with reduce-scatter collective.
@@ -88,7 +90,7 @@ from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
-from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2
+from .ragged_gated_delta_rule_v2 import ragged_gated_delta_rule_v2, ragged_gdn_conv_decode
 from .ragged_kda import ragged_kda
 from .ragged_kda_conv_decode import ragged_kda_conv_decode
 from .ragged_kda_decode import ragged_kda_decode
@@ -153,6 +155,7 @@ __all__ = (
     "ragged_decode_attention",
     "ragged_gated_delta_rule",
     "ragged_gated_delta_rule_v2",
+    "ragged_gdn_conv_decode",
     "ragged_kda",
     "ragged_kda_conv_decode",
     "ragged_kda_decode",

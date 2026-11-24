@@ -44,8 +44,10 @@ from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule_v2 import (
     ragged_gated_delta_rule_mixed_prefill,
     set_gdn_kernel_tile_policy,
 )
-from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.kernels._xla.ragged_gated_delta_rule_v2._xla_impl_fwd import ragged_gated_delta_rule
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.kernels._xla.ragged_gated_delta_rule_v2._xla_impl_fwd import (
+    ragged_gated_delta_rule,
+)
 from ejkernel.modules.base import mesh_to_jax_mesh
 from ejkernel.ops import (
     AutotunePolicy,
@@ -255,6 +257,37 @@ def _reorder_concatenated_tensor_for_sharding(
         start_offset += int(split_size)
     reordered_tensor = jnp.concatenate(split_tensors, axis=dim + 1)
     return reordered_tensor.reshape(old_shape)
+
+
+def _deinterleave_concatenated_tensor_from_sharding(
+    interleaved_tensor: jax.Array,
+    split_sizes: tuple[int, ...],
+    n_shards: int,
+    dim: int,
+) -> jax.Array:
+    """Inverse of :func:`_reorder_concatenated_tensor_for_sharding`.
+
+    Converts a per-shard interleaved axis ``[A0|B0|C0|A1|B1|C1|...]`` back to
+    the canonical concatenated layout ``[A|B|C]``.
+    """
+    if dim < 0:
+        dim += interleaved_tensor.ndim
+    old_shape = interleaved_tensor.shape
+    n_shards_int = int(n_shards)
+    reshaped = interleaved_tensor.reshape(*old_shape[:dim], n_shards_int, -1, *old_shape[dim + 1 :])
+    blocks = []
+    start_offset = 0
+    for split_size in split_sizes:
+        shard_size = int(split_size) // n_shards_int
+        block = jax.lax.slice_in_dim(
+            reshaped,
+            start_offset,
+            start_offset + shard_size,
+            axis=dim + 1,
+        )
+        blocks.append(block.reshape(*old_shape[:dim], int(split_size), *old_shape[dim + 1 :]))
+        start_offset += shard_size
+    return jnp.concatenate(blocks, axis=dim)
 
 
 class RaggedGatedDeltaRuleV2(Kernel[RaggedGatedDeltaRuleV2Config, tuple[Array, Array]]):
@@ -1431,6 +1464,212 @@ def ragged_gated_delta_rule_v2_with_window_states(
     )
 
 
+def ragged_gdn_conv_decode_head_sharded(
+    conv_input: jnp.ndarray,
+    b_raw: jnp.ndarray,
+    a_raw: jnp.ndarray,
+    conv_weight: jnp.ndarray,
+    conv_pool: jnp.ndarray,
+    recurrent_pool: jnp.ndarray,
+    A_log: jnp.ndarray,
+    dt_bias: jnp.ndarray,
+    token_slots: jnp.ndarray,
+    token_init: jnp.ndarray,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    use_qk_l2norm: bool = True,
+    apply_silu: bool = True,
+    conv_output_dtype: object | None = None,
+    out_dtype: object = jnp.float32,
+    pre_sharded: bool = False,
+    mesh: object | None = None,
+    head_axis: object | None = None,
+    allow_axis_fallback: bool = True,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Fused causal Conv1D + SiLU + L2Norm + GDN single-token decode with head sharding.
+
+    Dispatches through :data:`ejkernel.kernels._registry.kernel_registry`
+    (``"ragged_gdn_conv_decode"``), selecting the in-place TPU Pallas kernel on
+    TPU when shapes fit VMEM and falling back to the portable XLA reference
+    otherwise.
+
+    Follows the same ``head_axis`` sharding contract as
+    :func:`ragged_causal_conv1d_head_sharded`: when ``mesh`` and ``head_axis``
+    enable head sharding, ``conv_pool`` is expected in per-``head_axis``-shard
+    interleaved feature order. When ``pre_sharded`` is ``True``, ``conv_input``
+    and ``conv_weight`` are assumed to already carry that interleaved layout,
+    eliminating all ICI feature permutations.
+
+    When ``head_axis`` has size 1 (or is ``None``) on a multi-device mesh and
+    ``allow_axis_fallback=True`` (with ``pre_sharded=False``), this wrapper
+    selects an alternate divisible non-pipeline mesh axis via
+    :func:`_select_head_shard_axis`, interleaves canonical ``conv_input``,
+    ``conv_weight``, and ``conv_pool`` across that axis for ``jax.shard_map``,
+    and deinterleaves ``updated_conv_pool`` back to canonical ``[Q|K|V]`` order
+    on return.
+
+    Returns:
+        ``(out [T, n_v, d_v], updated_conv_pool, updated_recurrent_pool)``.
+    """
+    n_kq = int(n_kq)
+    n_v = int(n_v)
+    d_k = int(d_k)
+    d_v = int(d_v)
+    if n_kq <= 0 or n_v <= 0 or d_k <= 0 or d_v <= 0:
+        raise ValueError(
+            f"n_kq, n_v, d_k, and d_v must be positive integers, got n_kq={n_kq}, n_v={n_v}, d_k={d_k}, d_v={d_v}."
+        )
+    if n_v % n_kq != 0:
+        raise ValueError(f"n_v ({n_v}) must be divisible by n_kq ({n_kq}).")
+
+    tp_size = int(mesh_axis_size(mesh, head_axis))
+    key_dim = n_kq * d_k
+    value_dim = n_v * d_v
+    split_sizes = (key_dim, key_dim, value_dim)
+    can_head_shard = (
+        mesh is not None
+        and head_axis is not None
+        and tp_size > 1
+        and n_kq % tp_size == 0
+        and n_v % tp_size == 0
+        and all(size % tp_size == 0 for size in split_sizes)
+    )
+
+    def _resolve_impl(*, allow_pallas: bool):
+        requested = platform or "auto"
+        if not allow_pallas and requested in ("auto", "pallas"):
+            requested = "xla"
+        resolved_platform = detect_platform("ragged_gdn_conv_decode", requested)
+        resolved_backend = Backend.TPU if resolved_platform == Platform.PALLAS else Backend.ANY
+        return kernel_registry.get(
+            "ragged_gdn_conv_decode",
+            platform=resolved_platform,
+            backend=resolved_backend,
+        )
+
+    active_axis = head_axis
+    active_shards = tp_size
+    deinterleave_conv_pool = False
+
+    if not can_head_shard:
+        if pre_sharded:
+            raise ValueError(
+                "pre_sharded=True requires valid head-axis sharding over mesh/head_axis "
+                f"(got tp_size={tp_size}, n_kq={n_kq}, n_v={n_v})."
+            )
+        if allow_axis_fallback and mesh is not None and _has_nontrivial_mesh_axis(mesh):
+            alt_axis = _select_head_shard_axis(mesh, head_axis, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v)
+            if _supports_head_shard(mesh, axis_name=alt_axis, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v):
+                active_axis = alt_axis
+                active_shards = int(mesh_axis_size(mesh, alt_axis))
+                deinterleave_conv_pool = True
+                can_head_shard = True
+
+    if not can_head_shard:
+        allow_pallas = _is_tpu_pallas_request(platform=platform, cfg=None) and not _has_nontrivial_mesh_axis(mesh)
+        impl = _resolve_impl(allow_pallas=allow_pallas)
+        return impl(
+            conv_input,
+            b_raw,
+            a_raw,
+            conv_weight,
+            conv_pool,
+            recurrent_pool,
+            A_log,
+            dt_bias,
+            token_slots,
+            token_init,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            use_qk_l2norm=use_qk_l2norm,
+            apply_silu=apply_silu,
+            conv_output_dtype=conv_output_dtype,
+            out_dtype=out_dtype,
+        )
+
+    if not pre_sharded:
+        conv_input = _reorder_concatenated_tensor_for_sharding(conv_input, split_sizes, active_shards, -1)
+        conv_weight = _reorder_concatenated_tensor_for_sharding(conv_weight, split_sizes, active_shards, 0)
+        if deinterleave_conv_pool:
+            conv_pool = _reorder_concatenated_tensor_for_sharding(conv_pool, split_sizes, active_shards, 1)
+
+    local_n_kq = n_kq // active_shards
+    local_n_v = n_v // active_shards
+    impl = _resolve_impl(allow_pallas=_is_tpu_pallas_request(platform=platform, cfg=None))
+
+    def _wrapped(l_x, l_b, l_a, l_w, l_cp, l_rp, l_A, l_dt, l_slots, l_init):
+        return impl(
+            l_x,
+            l_b,
+            l_a,
+            l_w,
+            l_cp,
+            l_rp,
+            l_A,
+            l_dt,
+            l_slots,
+            l_init,
+            n_kq=local_n_kq,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            use_qk_l2norm=use_qk_l2norm,
+            apply_silu=apply_silu,
+            conv_output_dtype=conv_output_dtype,
+            out_dtype=out_dtype,
+        )
+
+    feat_spec = PartitionSpec(None, active_axis)
+    head_spec = PartitionSpec(active_axis)
+    w_spec = PartitionSpec(active_axis, None)
+    conv_pool_spec = PartitionSpec(None, active_axis, None)
+    rec_pool_spec = PartitionSpec(None, active_axis, None, None)
+    out_spec = PartitionSpec(None, active_axis, None)
+    replicated = PartitionSpec()
+
+    shard_map_fn = jax.shard_map(
+        _wrapped,
+        mesh=mesh_to_jax_mesh(mesh),
+        in_specs=(
+            feat_spec,
+            feat_spec,
+            feat_spec,
+            w_spec,
+            conv_pool_spec,
+            rec_pool_spec,
+            head_spec,
+            head_spec,
+            replicated,
+            replicated,
+        ),
+        out_specs=(out_spec, conv_pool_spec, rec_pool_spec),
+        check_vma=False,
+    )
+    out, updated_conv_pool, updated_rec_pool = shard_map_fn(
+        conv_input,
+        b_raw,
+        a_raw,
+        conv_weight,
+        conv_pool,
+        recurrent_pool,
+        A_log,
+        dt_bias,
+        token_slots,
+        token_init,
+    )
+    if deinterleave_conv_pool:
+        updated_conv_pool = _deinterleave_concatenated_tensor_from_sharding(
+            updated_conv_pool, split_sizes, active_shards, 1
+        )
+    return out, updated_conv_pool, updated_rec_pool
+
+
 __all__ = (
     "KERNEL_TILE_POLICIES",
     "KernelTilePolicy",
@@ -1441,5 +1680,6 @@ __all__ = (
     "ragged_gated_delta_rule_mixed_prefill",
     "ragged_gated_delta_rule_v2",
     "ragged_gated_delta_rule_v2_op",
+    "ragged_gdn_conv_decode_head_sharded",
     "set_gdn_kernel_tile_policy",
 )
