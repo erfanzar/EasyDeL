@@ -14,7 +14,7 @@
 
 """DeepSeek-V4 DSpark draft model parity against DeepSeek's V4-Flash-0731 reference ``Transformer.forward_spec``.
 
-The oracle is the released ``inference/model.py`` (copied to ``.xerxes/projects/mtp-sweep/ref-v4-0731``) with the
+The oracle is the released ``inference/model.py`` (copied to ``.agents/projects/mtp-sweep/ref-v4-0731``) with the
 pure-torch kernel stand-ins of ``tests/modules/_deepseek_v41_reference.py`` (fp8/fp4 activation fake-quant = identity,
 fp32 weights), built with ``temperature=0`` (greedy). Random parameters are copied into both sides (every reference
 ``mtp.*`` tensor exactly once); the main hidden states are random inputs, so the draft model is checked on its own. A
@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover
 
 REF_PATH = (
     pathlib.Path(__file__).resolve().parents[5]
-    / ".xerxes"
+    / ".agents"
     / "projects"
     / "mtp-sweep"
     / "ref-v4-0731"

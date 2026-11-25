@@ -22,7 +22,7 @@ from easydel.modules.deepseek_v41.modeling_deepseek_v41 import DEEPSEEK_V41_KEY_
 
 pytestmark = pytest.mark.cpu_ok
 
-_INDEX = Path(__file__).resolve().parents[5] / ".xerxes/projects/deepseek-v41/ref/model.safetensors.index.json"
+_INDEX = Path(__file__).resolve().parents[5] / ".agents/projects/deepseek-v41/ref/model.safetensors.index.json"
 
 
 def _write_safetensors(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) -> None:

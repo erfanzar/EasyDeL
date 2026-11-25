@@ -2,7 +2,8 @@
 
 This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)
 monorepo containing six packages that are developed together and released
-independently:
+independently (plus the standalone `libs/esurge-dashboard` Rust binary crate,
+which is not published to PyPI):
 
 | package   | path             | import      | PyPI           | mirror repo           |
 | --------- | ---------------- | ----------- | -------------- | --------------------- |
@@ -20,21 +21,23 @@ directly (a direct push makes the sync fail until reconciled with
 
 ## What each package owns
 
-The stack splits along one line: the foundation libs know nothing
-about language models; easydel knows nothing about how to write a kernel,
-shard an array, split a pipeline, or manage Ray pods — it composes the
-foundation packages.
+The stack splits along one line: the five companion libraries (four Python
+foundation libraries plus the Rust `surgecore` crate) know nothing about
+language models; `easydel` knows nothing about how to write a kernel, shard an
+array, split a pipeline, or manage Ray pods — it composes the companion
+packages.
 
 ### spectrax — the module system *and* the pipeline runtime
 
 Two things in one package. First, a JAX-native module API — PyTorch-shaped
 `spx.Module`/`spx.Parameter` over an explicit graph/state split (filling
-the role flax nnx plays elsewhere). Second, and what sets it apart: an
-**execution runtime** that compiles a model into true MPMD pipeline
-parallelism — per-rank executables (`sxjit`/`sxcall`), automatic stage
-splitting, and 9+ schedules — a capability JAX's single-program SPMD model
-does not natively provide (an SPMD pipeline path exists alongside it).
-Every EasyDeL model is an `spx.Module` executed through this runtime.
+the role flax nnx plays elsewhere) plus EasyDeL's primary live sharding,
+TensorStore/OCDBT checkpointing, and path-rule QT/QAT quantization stack.
+Second, and what sets it apart: an **execution runtime** that compiles a model
+into true MPMD pipeline parallelism — per-rank executables (`sxjit`/`sxcall`),
+automatic stage splitting, and 9+ schedules — a capability JAX's single-program
+SPMD model does not natively provide (an SPMD pipeline path exists alongside
+it). Every EasyDeL model is an `spx.Module` executed through this runtime.
 
 | area                                           | owns                                                                                                                                      |
 | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -42,16 +45,19 @@ Every EasyDeL model is an `spx.Module` executed through this runtime.
 | `nn`, `functional`, `init`                     | 70+ layer modules (Linear/Conv/Attention/LoRA/FP8), stateless ops, initializers                                                           |
 | `transforms`                                   | module-aware `jit`/`grad`/`vmap`/`scan`/`remat` with mutable state                                                                        |
 | `runtime`                                      | pipeline parallelism: true-MPMD (per-rank executables via `sxjit`) and SPMD paths, 9+ schedules (GPipe, 1F1B, ZeroBubble, DualPipeV, ...) |
-| `sharding`, `rng`                              | logical axis naming / `PartitionSpec` derivation; named-stream deterministic RNG                                                          |
-| `serialization`, `hooks`, `inspect`, `loggers` | TensorStore checkpointing, forward/variable hooks, model summaries, TB/W&B logging                                                        |
+| `sharding`, `rng`                              | `SpxMesh`, logical axis naming / `PartitionSpec` derivation, `strict`/`audit`; named-stream deterministic RNG                             |
+| `quantization`                                 | module-path QT/QAT (`QuantProvider`, `QuantRule`, `quantize_model`, `qdot_general`, `qeinsum`, `qragged_dot`, `QArray`)                   |
+| `serialization`, `hooks`, `inspect`, `loggers` | TensorStore/OCDBT checkpointing (`Checkpointer`, `AsyncCheckpointManager`), hooks, `hlo_cost`/summaries, TB/W&B logging                   |
 
 ### ejkernel — the kernel library
 
 Hardware-optimized implementations of every expensive op, behind a
 priority-based registry that dispatches per platform (Triton / Pallas-TPU /
-Pallas-GPU / CUDA-FFI / CUTLASS CuTe / TileLang) with an XLA fallback for
-everything, plus config autotuning and caching. easydel never writes
-kernels — it calls these.
+Pallas-GPU / CUDA-FFI / CUTLASS CuTe / TileLang) with a mandatory XLA fallback
+for everything, plus config autotuning, a shipped SQLite tuned DB
+(`ops/tuned/tuned_kernels.db`), and persistent config caching. `easydel` never
+writes hardware kernels — it calls these through registered `OperationImpl`
+adapters.
 
 | family                       | examples                                                                                                                 |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -59,18 +65,18 @@ kernels — it calls these.
 | paged / inference attention  | page, decode, unified prefill+decode, ragged_page_attention v2/v3 (chunked prefill, attention sinks; `csrc/` C++ for v3) |
 | linear attention / recurrent | gated delta rule (GDR), gated linear attention, lightning, KDA, RWKV 4/6/7                                               |
 | state space                  | Mamba-1 (`state_space_v1`), Mamba-2 SSD (`state_space_v2`)                                                               |
-| losses & matmul              | fused/chunked cross-entropy and KL, quantized + grouped matmul                                                           |
+| losses, matmul & quant       | fused/chunked cross-entropy and KL, quantized + grouped matmul, `quantization/` (affine/NF4/MXFP/NVFP, TurboQuant)       |
 
 ### eformer — the infrastructure library
 
-Everything about *running* JAX at scale that is neither a model nor a kernel:
+Scale infrastructure that is neither a model nor a kernel:
 
 | area                                            | owns                                                                                         |
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `escale`                                        | mesh creation, `PartitionAxis`/`PartitionManager`, auto partition specs for DP/FSDP/TP/EP/SP |
-| `executor`                                      | Legacy execution compatibility and SLURM integration                                         |
-| `optimizers`                                    | optimizer + scheduler factories (AdamW, Adafactor, Lion, Muon, fused variants)               |
-| `serialization`, `paths`                        | TensorStore sharded checkpointing without all-gathers; `ePath` local/GCS path abstraction    |
+| `escale`                                        | standalone mesh creation, `PartitionAxis`/`PartitionManager`, auto partition specs           |
+| `executor`                                      | legacy execution compatibility and SLURM integration                                         |
+| `optimizers`                                    | optimizer + scheduler factories (AdamW, Adafactor, Lion, Muon, `_stage_local.py`, fused tx)  |
+| `serialization`, `paths`                        | SafeTensors/msgpack `CheckpointManager`, legacy TensorStore; `ePath` local/GCS abstraction   |
 | `mpric`                                         | mixed-precision policies and dynamic loss scaling                                            |
 | `jaximus`, `ops`                                | implicit/lazy arrays for quantization (NF4/INT8/binary) via JAX primitive registration       |
 | `aparser`, `pytree`, `loggings`, `common_types` | dataclass CLI/YAML parsing, pytree utilities, logging/profiling, semantic axis constants     |
@@ -78,42 +84,67 @@ Everything about *running* JAX at scale that is neither a model nor a kernel:
 ### eray — Ray orchestration and remote execution
 
 Ray-based distributed execution, resource pools, TPU/GPU pod orchestration,
-Docker helpers, and CLI workflows that used to live under the eformer executor
-surface.
+GCP queued-resource/fleet provisioning, chip-split swarms, Docker helpers, and
+CLI workflows.
 
-| area                    | owns                                                                 |
-| ----------------------- | -------------------------------------------------------------------- |
-| `cli`                   | TPU connect/disconnect/status/health/list commands                   |
-| `execution`             | `execute`, `execute_resumable`, autoscale execution, remote wrappers |
-| `pool`                  | Ray actor pools for slices and device hosts                          |
-| `resources`             | CPU/GPU/TPU accelerator configs and Ray resource helpers             |
-| `docker`, `core`, `utils` | container execution, cluster models, exception helpers, sentinels  |
+| area                    | owns                                                                             |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| `cli`                   | `eray` CLI (`tpu`, `qr`, `fleet`, `autoscale`, `dashboard`, `jobs`, `hostjob`)   |
+| `execution`             | `RayExecutor`, `execute`, `execute_resumable`, autoscale execution               |
+| `pool`                  | Ray actor pools for slices and device hosts (`SlicePoolManager`, `SliceActor`)   |
+| `provision`             | GCP provisioning: `fleet`, `qr` (Queued Resources), `launcher`, `tunnel`, `watcher` |
+| `resources`, `swarm.py` | CPU/GPU/TPU accelerator configs, `SwarmConfig`, `GpuSwarmConfig`, host splitting |
+| `docker`, `core`        | container execution, cluster models, exception helpers, sentinels                |
+
+### surgecore — native Rust host core for eSurge
+
+EasyDeL's native host library for the eSurge inference engine (`libs/surgecore`,
+Rust crate compiled as PyO3 `abi3-py311` extension `surgecore._native` via
+maturin). Only eSurge imports it; `import easydel` and training do not need it.
+
+| component            | owns                                                                                                                               |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `EngineCore`         | host state machine: request table, per-DP queues, token budget, scheduler (FCFS/priority, chunked prefill, preemption), speculative verification & stop checks (`schedule()` → `Plan`, `commit()` → `Events`, GIL-released) |
+| `KvCore`             | paged KV pool with LRU free list, chained prefix-cache map, full/sliding/chunked-local group rules, transactional allocation/rollback (`CacheManager` binding) |
+| `SnapshotIndex`      | recurrent-state snapshot slots at prefix-cache page boundaries for linear-attention/SSM prefix reuse                               |
+| `HostPayloadBuilder` | GIL-released filling of preallocated step-input staging arrays (token/position packing, DP packing, page-table rows, sampling vectors) |
+| `Detokenizer`        | in-process batched incremental detokenization with incomplete UTF-8 buffering and suffix reconciliation                            |
+
+### esurge-dashboard — standalone monitoring binary
+
+`libs/esurge-dashboard` is a standalone Rust/Axum server-rendered monitoring
+dashboard (`publish = false`, not a uv workspace member) that polls an eSurge
+OpenAI API server's `GET /metrics` endpoint and serves sixteen inline-SVG live
+charts (throughput, load, latency, prefix cache, requests, per-key access) with
+no Grafana/Prometheus dependency. Build and check in `libs/esurge-dashboard`:
+`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 
 ### easydel — the LLM framework
 
-The only package allowed to import the foundation packages. By subsystem:
+The only package allowed to import the five companion packages. By subsystem:
 
 | subsystem                        | owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `infra/`                         | the contracts everything implements: `EasyDeLBaseConfig` (HF-compatible config + sharding/mesh), `EasyDeLBaseModule` (model lifecycle, HF interop via the bridge mixin: `from_pretrained`/`from_torch`/`to_torch`), `EasyDeLState` (params + optimizer + step), loss utils, the task/model registry (`TaskType`, `register_module`)                                                                                                                                                                               |
-| `infra/elarge/`                  | eLarge: the dict-literal/YAML config system that builds an entire run (model + data + trainer + eval + serving engine) from one typed config; driven by `scripts/elarge.py`                                                                                                                                                                                                                                                                                                                                       |
-| `layers/`                        | reusable NN building blocks: `UnifiedAttention` + `FlexibleAttentionModule` (kernel-dispatching attention base), Column/Row-parallel linears, fused-projection **layouts** (`layers/layouts`: QKV/gate-up fusion, TP interleaving, checkpoint reform rules, `fused_param_tp` mesh portability), MoE routing/dispatch, norms, rotary variants, quantization                                                                                                                                                        |
-| `operations/`                    | the registry that routes attention calls to concrete ejkernel-backed implementations (FlashAttn, RaggedPageV3, Ring, ...) by hardware and runtime mode                                                                                                                                                                                                                                                                                                                                                            |
-| `caching/`                       | KV-cache state types per architecture class: transformer pages, recurrent/linear-attention states, MLA, hybrid combinations                                                                                                                                                                                                                                                                                                                                                                                       |
-| `modules/`                       | the model zoo: ~74 architecture families (dense, MoE, SSM/Mamba, linear-attention hybrids, VLMs, speech, embeddings, diffusion-LM, plus EasyDeL-native models like xerxes and the gemma4_assistant speculative drafter). Convention: one directory per family holding `modeling_<x>.py` + `<x>_configuration.py`; task wrappers come from `_base/`; `auto/` exposes `AutoEasyDeLModelForCausalLM` and friends over the registry                                                                                   |
-| `trainers/`                      | ~40 trainers over one compiled-step foundation (`base_trainer`): SFT; the preference family (DPO/ORPO/CPO/KTO/BCO/Nash-MD/online-DPO); the policy-gradient family (GRPO/GSPO/GFPO/RLOO/PPO + async-GRPO over eSurge rollouts); reward + process-reward models; the distillation family (logit KD, GKD, sequence-KD, on-policy, self-distillation); embeddings (contrastive/Matryoshka); RLVR verifiable rewards; agentic multi-turn tool-use training (`agentic_moshpit`); `RewardProtocol` for pluggable rewards |
-| `inference/`                     | **eSurge**: the continuous-batching paged-attention serving engine (scheduler + runners/executors, page-pool KV management, speculative decoding, multimodal preprocessing, Prometheus metrics, ZMQ leader/worker multi-host mode) with an OpenAI-compatible FastAPI server (auth/RBAC/quotas); plus vWhisper speech serving, 25+ model-specific tool-call parsers, reasoning parsers, sampling/logits processing                                                                                                 |
-| `data/`                          | sharded dataset sources (parquet/arrow/json/HF), deterministic mixtures + shuffling, transform DSL (chat templates, tokenization, packing), Ray-distributed preprocessing                                                                                                                                                                                                                                                                                                                                         |
-| `utils/`, `workers/`, `scripts/` | HF↔EasyDeL weight conversion (`parameters_transformation`), `ejit` compilation caching, traversals, memory analysis; ZMQ inference workers + response stores; CLI entry points                                                                                                                                                                                                                                                                                                                                    |
+| `infra/`                         | the contracts everything implements: `EasyDeLBaseConfig` (HF-compatible config + sharding/mesh), `EasyDeLBaseModule` (model lifecycle, HF interop via the bridge mixin: `from_pretrained`/`from_torch`/`to_torch`), `EasyDeLState` (params + optimizer + step), `layer_scan.py`, loss utils, the task/model registry (`TaskType`, `register_module`)                                                                                                                                                               |
+| `infra/elarge/`                  | eLarge: the dict-literal/YAML config system that builds an entire run (model + data + trainer + eval + serving engine) from one typed config; driven by `easydel/scripts/elarge.py`                                                                                                                                                                                                                                                                                                                               |
+| `layers/`                        | reusable NN building blocks: `UnifiedAttention` + `FlexibleAttentionModule` (kernel-dispatching attention base), Column/Row-parallel & MoE linears, fused-projection **layouts** (`layers/layouts`: QKV/gate-up fusion, TP interleaving, checkpoint reform rules, `fused_param_tp` mesh portability), MoE routing/dispatch, compressed_window, embeddings, engram, indexer, linear_attention, norms, residual, rotary, sparse_attention, quantization                                                                    |
+| `operations/`                    | the registry that routes attention and kernel calls to concrete ejkernel-backed `OperationImpl` adapters (FlashAttn, RaggedPageV3, Ring, GDR, ...) by hardware and runtime mode                                                                                                                                                                                                                                                                                                                                   |
+| `caching/`                       | 10 inference cache families + budgeting (`budget.py`): `Transformer`, `RaggedPages`, `MLARaggedPages`, `TurboQuantRaggedPages`, `UnifiedAttention`, `Recurrent`, `Hybrid`, `KDA`, `CompressedWindow`, and `SharedPrefix`                                                                                                                                                                                                                                                                                          |
+| `modules/`                       | the model zoo: 89 architecture families (dense, MoE, SSM/Mamba, linear-attention hybrids, VLMs, speech, embeddings, diffusion-LM, plus EasyDeL-native models like xerxes and the gemma4_assistant speculative drafter). Convention: one directory per family holding `modeling_<x>.py` + `<x>_configuration.py`; task wrappers come from `_base/`; `auto/` exposes `AutoEasyDeLModelForCausalLM` and friends over the registry                                                                                    |
+| `trainers/`                      | 52 subdirs / 42 registered trainers over one compiled-step foundation (`base_trainer`, `trainer_protocol`): SFT; preference family (DPO/ORPO/CPO/KTO/BCO/Nash-MD/online-DPO); policy-gradient & online-RL family (GRPO/GSPO/GFPO/RLOO/DPPO/GDPO/GMPO/PPO/SAO/async-GRPO over eSurge rollouts + `_online_rl/` disaggregated weight transport); reward + PRM; distillation (logit KD, GKD, seq-KD, on-policy, SDFT, SDPO); embeddings; RLVR; agentic multi-turn tool-use (`agent_flow_trainer`, `agentic_moshpit`, `environments/`); `data_lanes.py` + `batch_placement.py`; `RewardProtocol` |
+| `inference/`                     | **eSurge**: continuous-batching paged-attention serving engine (`esurge_engine.py`, `engine/`, `runners/`, `core/` cache+sampler backed by Rust `surgecore` `EngineCore`/`KvCore`, speculative decoding, MPMD pipeline serving, multimodal, ZMQ leader/worker multi-host mode, OpenAI-compatible FastAPI `server/`, multi-replica `serving/` cluster/dashboard; `scheduler/` holds `output.py` structs only); plus `vwhisper/` speech serving, 34 tool-call parser files (37 registered names), 16 reasoning parser files (25 registered names), `parsing/`, `evaluations/`, sampling |
+| `data/`                          | sharded dataset sources (Parquet/random-access/rowgroup-shuffle/HF), deterministic mixtures + shuffling, transform DSL (`>>`), sequence packing, `teacher_cache.py`, Ray-distributed preprocessing                                                                                                                                                                                                                                                                                                               |
+| `utils/`, `workers/`, `scripts/` | HF↔EasyDeL weight conversion (`parameters_transformation`), `ejit` compilation caching, traversals, memory analysis; ZMQ inference workers + auth + response stores; CLI entry points                                                                                                                                                                                                                                                                                                                             |
 
 **How a forward pass flows:** `AutoEasyDeLModelForCausalLM.from_pretrained`
 resolves a config + module from the registry, converts HF weights
 (`utils/parameters_transformation`, fused via `layers/layouts`), builds
-`spx.Module`s sharded by eformer/spectrax meshes; attention goes
-module → `FlexibleAttentionModule` → `operations` registry → ejkernel
-kernel for the current platform. Training wraps it in `EasyDeLState` with
-eformer optimizers inside a trainer's compiled step; serving hands it to
-eSurge; checkpoints flow through the TensorStore serialization stack.
+`spx.Module`s sharded by `spectrax.sharding` meshes; attention goes
+module → `UnifiedAttention` → `FlexibleAttentionModule` → `operations` registry
+→ ejkernel kernel for the current platform. Training wraps it in `EasyDeLState`
+with eformer optimizers inside a trainer's compiled step; serving hands it to
+eSurge (with Rust `surgecore` on the host path); checkpoints flow through
+`spectrax.serialization` (TensorStore/OCDBT).
 
 ## Development
 
@@ -166,19 +197,22 @@ env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NA
   uv run pytest libs/ejkernel/test
 ```
 
-The CPU trio is only for tests that do no array computation (eray, tool/reasoning
-parsers, config/CLI/YAML parsing, data text transforms, loggers, paths, docs):
+The CPU trio is only for tests that do no array computation (`eray`, `surgecore`,
+tool/reasoning parsers, config/CLI/YAML parsing, data text transforms, loggers,
+paths, docs):
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
-  uv run pytest libs/eray/tests
+  uv run pytest libs/eray/tests libs/surgecore/tests
 ```
 
-Each library's tests `conftest.py` refuses to run computation tests on a CPU
-backend; pure-Python test files are allow-listed or marked `@pytest.mark.cpu_ok`.
-A CPU run of a computation test is never validation — with no accelerator
-available, report the change as unverified on hardware.
+The four JAX-library test suites (`easydel`, `spectrax`, `eformer`, `ejkernel`)
+enforce this in `conftest.py` via an array-library import regex
+(`_ARRAY_LIBRARY_IMPORT`), runtime XLA compile trapping (`_cpu_compile_guard`),
+and `@pytest.mark.cpu_ok` (`eray` and `surgecore` do no JAX computation and run
+on CPU). A CPU run of a computation test is never validation — with no
+accelerator available, report the change as unverified on hardware.
 
 ## Releasing
 
@@ -199,8 +233,8 @@ also bumps the crate's `[package] version` and its own entry in `libs/surgecore/
 and it syncs easydel's `surgecore==` pin like the other pins. A `surgecore-v*` tag skips the `uv build` job and
 runs the `surgecore-*` jobs of `publish.yaml` instead: maturin builds manylinux_2_28 wheels for x86_64 and
 aarch64 and a macOS arm64 wheel (abi3, so one wheel per platform covers Python 3.11-3.13) plus an sdist, and one
-step publishes them. easydel pins an exact surgecore version, so that version must be on PyPI before an easydel
-release that requires it is published.
+step publishes them. Because `easydel` pins exact sibling versions (`==`), any bumped foundation library or
+`surgecore` version must be on PyPI before an `easydel` release that requires it is published.
 
 ## Mirror sync
 

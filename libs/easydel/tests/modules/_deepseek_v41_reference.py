@@ -14,7 +14,7 @@
 
 """Independent torch oracle for EasyDeL's DeepSeek-V4.1 model (pure torch, no JAX).
 
-The oracle is DeepSeek's own reference ``model.py`` (``.xerxes/projects/deepseek-v41/ref``), loaded by file path
+The oracle is DeepSeek's own reference ``model.py`` (``.agents/projects/deepseek-v41/ref``), loaded by file path
 with its CUDA/tilelang dependencies replaced by pure-torch CPU fp32 stubs:
 
 * ``kernel.sparse_attn`` follows ``kernel.py:311-403`` (gather ``topk_idxs`` from ``kv``, ``-1`` ignored, per-head sink
@@ -60,7 +60,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-REF_DIR = pathlib.Path(__file__).resolve().parents[4] / ".xerxes" / "projects" / "deepseek-v41" / "ref"
+REF_DIR = pathlib.Path(__file__).resolve().parents[4] / ".agents" / "projects" / "deepseek-v41" / "ref"
 
 VOCAB = 256
 CASE_BATCH = 2

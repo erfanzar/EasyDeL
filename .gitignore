@@ -28,7 +28,7 @@ wandb
 .ruff_cache/*
 launch_test.py
 # no leaks on internal stuff hehehe
-.xerxes/projects
+.agents/projects
 .gradio
 *.easy
 tmp-files

@@ -14,7 +14,7 @@
 
 """Bit-exact parity of the NumPy engram hasher against the official DeepSeek-V4.1 reference ``engram.py``.
 
-The reference (``.xerxes/projects/deepseek-v41/ref/engram.py``) is loaded by file path and run on CPU torch; nothing
+The reference (``.agents/projects/deepseek-v41/ref/engram.py``) is loaded by file path and run on CPU torch; nothing
 here does accelerator array computation.
 """
 
@@ -41,7 +41,7 @@ from easydel.modules.deepseek_v41.deepseek_v41_configuration import DeepseekV41C
 
 pytestmark = pytest.mark.cpu_ok
 
-_REF_PATH = Path(__file__).resolve().parents[5] / ".xerxes" / "projects" / "deepseek-v41" / "ref" / "engram.py"
+_REF_PATH = Path(__file__).resolve().parents[5] / ".agents" / "projects" / "deepseek-v41" / "ref" / "engram.py"
 
 _PAD_ID = 2
 

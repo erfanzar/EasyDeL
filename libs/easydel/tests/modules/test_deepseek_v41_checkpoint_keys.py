@@ -34,7 +34,7 @@ from easydel.modules.deepseek_v41.modeling_deepseek_v41 import DEEPSEEK_V41_KEY_
 pytestmark = pytest.mark.cpu_ok
 
 # tests/modules/<this file>: parents[0]=modules, [1]=tests, [2]=libs/easydel, [3]=libs, [4]=repository root.
-_INDEX_PATH = Path(__file__).resolve().parents[4] / ".xerxes/projects/deepseek-v41/ref/model.safetensors.index.json"
+_INDEX_PATH = Path(__file__).resolve().parents[4] / ".agents/projects/deepseek-v41/ref/model.safetensors.index.json"
 _TOTAL_KEYS = 96_085
 _UNOWNED_ROOTS = frozenset({"image_start", "image_end", "image_newline"})
 _UNOWNED_PREFIXES = ("mtp.", "vision.", "aligner.")

@@ -14,7 +14,7 @@
 
 """DeepSeek-V4.1 text model (``model_type="deepseek_v41"``).
 
-Semantics follow DeepSeek's reference ``inference/model.py`` (see ``.xerxes/projects/deepseek-v41/SPEC.md``).
+Semantics follow DeepSeek's reference ``inference/model.py`` (see ``.agents/projects/deepseek-v41/SPEC.md``).
 Relative to DeepSeek-V4:
 
 - Per-layer integer compression ratios. Only ``kv_source_layer_ids`` run a compressor; every later layer with the

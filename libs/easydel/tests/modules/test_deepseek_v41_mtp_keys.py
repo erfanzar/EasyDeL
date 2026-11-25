@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover
 
 pytestmark = pytest.mark.cpu_ok
 
-_INDEX_PATH = Path(__file__).resolve().parents[4] / ".xerxes/projects/deepseek-v41/ref/model.safetensors.index.json"
+_INDEX_PATH = Path(__file__).resolve().parents[4] / ".agents/projects/deepseek-v41/ref/model.safetensors.index.json"
 _NUM_MTP_KEYS = 2401
 _STAGES = 3
 _EXPERTS = 128

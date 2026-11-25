@@ -1,0 +1,185 @@
+# Machine-readable architecture map of the EasyDeL monorepo.
+# Audience: AI coding sessions. Humans: read WORKSPACE.md instead.
+# Keep in sync when subsystems move; verified against the tree on 2026-11-25.
+
+workspace:
+  kind: uv-workspace monorepo (source of truth; 6 workspace libs + standalone esurge-dashboard Rust crate; 5 companion libs mirrored on push)
+  layering_contract:
+    rule: only easydel may import spectrax/ejkernel/eformer/eray/surgecore; foundation libs and surgecore independent of each other
+    enforced_by: [ uv run lint-imports, .github/workflows/workspace-ci.yaml ]
+  # Computation tests MUST run on an accelerator (AGENTS.md golden rule 4); conftest guards refuse them on CPU.
+  test_env_accelerator_tpu: "env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu"
+  test_env_accelerator_gpu: "env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu"
+  test_env_cpu_non_computation: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"  # eray, surgecore (pytest + cargo test --locked), parsers, configs, or @pytest.mark.cpu_ok
+  mesh_axes_easydel: [ pp, dp, fsdp, ep, tp, sp ]   # EasyDeLBaseConfig order; -1 dim auto-fills
+
+packages:
+  easydel:
+    path: libs/easydel
+    role: LLM framework (only consumer of the companion libs)
+    tests: libs/easydel/tests
+    subsystems:
+      infra:
+        path: libs/easydel/easydel/infra
+        owns: [ EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState, TaskType/registry (factory.py),
+                LossConfig/LossMetrics (loss_utils.py), AxisPolicy/RuntimeShardingResolver (sharding.py),
+                HF bridge (mixins/bridge.py), generation mixin, layer_scan.py, elarge/ ]
+        extension_points:
+          - register_config("<model_type>") / register_module(TaskType, ...)  # factory.py
+          - BaseLossStrategy subclasses (loss_utils.py)
+          - eLarge config sections (elarge/types/*)
+      layers:
+        path: libs/easydel/easydel/layers
+        owns: [ UnifiedAttention (attention/_unified.py), FlexibleAttentionModule (attention/_flexible.py),
+                Column/RowParallelLinear + ParallelMoELinear (linears/), fused layouts + reform rules (layouts/),
+                BaseMoeModule + _layout_planner.py (moe/), compressed_window/, embeddings/, engram/, indexer/,
+                linear_attention/, mlp.py, norms/, quantization/, residual/, rotary/, sparse_attention/ ]
+      operations:
+        path: libs/easydel/easydel/operations
+        owns: [ OperationRegistry, BaseOperation platform dispatch, OperationMetadata sharding,
+                requirements/ (cache+metadata contracts), kernels/ (ejkernel adapters) ]
+        exemplar_adapter: libs/easydel/easydel/operations/kernels/gated_delta_rule.py
+      modules:
+        path: libs/easydel/easydel/modules
+        owns: [ "89 model families: <family>/{modeling_<family>.py,<family>_configuration.py}",
+                _base/ task wrappers, auto/ factory classes ]
+      caching:
+        path: libs/easydel/easydel/caching
+        owns: [ Transformer, RaggedPages, MLARaggedPages, TurboQuantRaggedPages, UnifiedAttention,
+                Recurrent, Hybrid, KDA, CompressedWindow, SharedPrefix caches, budget.py ]
+      trainers:
+        path: libs/easydel/easydel/trainers
+        owns: [ base_trainer.py, trainer_protocol.py, trainer/trainer.py,
+                "training_configurations.py (TrainingArguments, ~190+ dataclass fields)",
+                "52 subdirs (42 registered trainers; each: <name>_config.py + <name>_trainer.py + _fn.py)",
+                _online_rl/, _shared/, agentic_moshpit/, agentic_rollout/, esurge_rollout/,
+                merge_callback/, ray_scaler/, data_lanes.py, batch_placement.py, dp_sharding.py,
+                fused_optimizers.py, reward_protocol.py ]
+        registration: '@Registry.register("trainer-arguments", name) AND @Registry.register("trainer", name)'
+      environments:
+        path: libs/easydel/easydel/environments
+        owns: [ agentic RL sandboxes, harnesses, async_collector, code_judge, python_tir, swe_repo, terminal, rewards ]
+      inference:
+        path: libs/easydel/easydel/inference
+        owns: [ "esurge/ (esurge_engine.py, engine/, runners/, core/ cache+sampler, server/, serving/, distributed/, multimodal/; scheduler/ holds output.py structs only — live scheduling is in surgecore EngineCore)",
+                "tools/parsers/ (34 files, 37 registered names)",
+                "reasoning/parsers/ (16 files, 25 registered names)",
+                parsing/ (DelegatingParser), evaluations/, vwhisper/, speculative.py, sampling ]
+      data:
+        path: libs/easydel/easydel/data
+        owns: [ Pipeline builder (execution/pipeline.py), sources/ (ParquetShardedSource, ParquetRandomAccessSource, RowGroupShuffledParquetSource),
+                transforms DSL (">>"), teacher_cache.py, distributed/ Ray preprocessing ]
+      utils_workers:
+        paths: [ libs/easydel/easydel/utils, libs/easydel/easydel/workers, libs/easydel/easydel/scripts ]
+        owns: [ parameters_transformation (HF<->EasyDeL), ejit/compiling_utils, jit_context,
+                ZMQ workers + auth + response stores, elarge.py runner, normalize_openai_tool_dataset.py ]
+  spectrax:
+    path: libs/spectrax
+    role: spx.Module object model + MPMD/SPMD pipeline runtime + primary EasyDeL sharding/serialization/QT-QAT stack
+    import_alias: spx
+    tests: libs/spectrax/tests
+    owns:
+      core: [ Module, Parameter/Buffer/RngStream, GraphDef/State via export()/bind(), Selector, containers ]
+      nn_functional_init: [ nn/, functional/, init/ ]
+      transforms: [ spx.jit (mutable-aware), grad/value_and_grad (wrt selector), scan (carry/invariant), vmap, remat ]
+      runtime: [ mpmd/ (sxcall/sxjit, sxstage_iter/sxstage_region markers, per-rank compile),
+                 spmd/ (shard_map path), schedules/ (GPipe, 1F1B, ZeroBubble, Interleaved, DualPipeV, ...) ]
+      sharding: [ logical axis rules, get_named_sharding, SpxMesh (is_mpmd), strict.py, audit.py ]
+      serialization: [ Checkpointer, AsyncCheckpointManager (TensorStore/OCDBT v1 commit protocol) ]
+      quantization: [ QuantProvider, QuantRule, quantize_model, fake_quant, qdot_general, qeinsum, qragged_dot, QArray ]
+      tooling: [ hooks/, inspect/ (counting.py, tabulate.py hlo_cost), loggers/, rng/ ]
+  ejkernel:
+    path: libs/ejkernel
+    role: hardware kernels behind priority registry with mandatory XLA fallback
+    tests: libs/ejkernel/test          # singular; _pallas/tpu needs real TPU
+    benchmarks: libs/ejkernel/benchmarks
+    owns:
+      modules_operations: "Kernel[Config,Out] subclasses + configs (modules/operations/)"
+      backends: [ kernels/_triton, "kernels/_pallas/{tpu,gpu}", kernels/_cuda, kernels/_cute, kernels/_tilelang, kernels/_xla, csrc/ ]
+      registry: "kernels/_registry.py — @kernel_registry.register(name, Platform, Backend, priority); XLA fallback priority 0 (Backend.ANY)"
+      ops: [ Executor, autotune, 7-tier config selection, ops/tuned/tuned_kernels.db, persistent cache ~/ejkernel-presistent-cache/, fingerprinting ]
+      quantization: [ weight compression (affine/NF4/MXFP/NVFP/bitpack), turboquant/ KV compression ]
+      callib: [ triton_call, buffered_pallas_call, cute_call, build_tilelang_call, tilelang_call, ejit ]
+  eformer:
+    path: libs/eformer
+    role: scale infrastructure (optimizers, mixed precision, implicit arrays, standalone escale/serialization/ePath)
+    tests: libs/eformer/tests
+    owns:
+      escale: [ create_mesh (multi-slice DCN), PartitionAxis, PartitionManager, auto_partition_spec ]
+      optimizers: "OptimizerFactory + @register_optimizer builders; scheduler factories; _stage_local.py"
+      serialization: [ SafeTensors/msgpack CheckpointManager, legacy TensorStore serialization ]
+      mpric: [ Policy, PrecisionHandler, DynamicLossScale ]
+      jaximus_ops: [ ImplicitArray dispatch, NF4/INT8 quantized arrays ]
+      misc: [ aparser (dataclass CLI/YAML), pytree utils, ePath (local/GCS), common_types semantic axes ]
+  eray:
+    path: libs/eray
+    role: Ray orchestration and GCP provisioning for TPU/GPU pods
+    tests: libs/eray/tests
+    owns: [ cli (tpu, qr, fleet, autoscale, dashboard, jobs, hostjob),
+            execution (RayExecutor, autoscale_execute_resumable),
+            pool (SlicePoolManager/SliceActor/DeviceHostActor),
+            provision (fleet, qr, launcher, tunnel, watcher),
+            resources (CPU/GPU/TPU accelerator configs), swarm.py, docker ]
+  surgecore:
+    path: libs/surgecore
+    role: EasyDeL's native host library for eSurge (Rust crate; PyO3 abi3-py311 extension surgecore._native, built by maturin)
+    tests: libs/surgecore/tests   # pytest, cpu_ok; plus cargo test --locked & --no-default-features in libs/surgecore
+    imports: numpy only; imported only by easydel (eSurge host path)
+    build: uv sync compiles it through maturin, so a Rust toolchain (cargo) is required
+    release: surgecore-v* tags -> publish.yaml surgecore-* jobs (manylinux_2_28 x86_64/aarch64 + macOS arm64 wheels, sdist)
+    mirror: erfanzar/esurgecore (subtree, like the foundation libs)
+  esurge-dashboard:
+    path: libs/esurge-dashboard
+    role: Standalone Rust/Axum server-rendered monitoring dashboard binary reading eSurge GET /metrics (publish = false; not a uv workspace member)
+    tests: "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test (in libs/esurge-dashboard)"
+
+flows:
+  model_forward:
+    - AutoEasyDeLModelForCausalLM.from_pretrained -> registry resolve (infra/factory.py)
+    - HF weights -> utils/parameters_transformation (+ layers/layouts reform rules for fused QKV/gate-up)
+    - spx.Module init inside parameter-init sharding context (mesh from EasyDeLBaseConfig.mesh)
+    - attention: module -> UnifiedAttention -> FlexibleAttentionModule -> OperationRegistry.create(config.attn_mechanism, metadata) -> ejkernel kernel by platform priority
+  training:
+    - trainer (_config/_trainer/_fn) -> EasyDeLState (params+opt+step) with eformer OptimizerFactory
+    - compiled sharded step -> data/ Pipeline + Grain data_lanes.py + batch_placement.py -> async spectrax.serialization TensorStore/OCDBT checkpoints
+    - online-RL variants generate rollouts via eSurge inside the loop (_online_rl/, esurge_rollout/, async_grpo_trainer/, agent_flow_trainer/)
+  inference:
+    - request -> eSurge engine (esurge_engine.py -> engine/{admission,loop,core_driver,output_pipeline}) -> surgecore EngineCore (continuous batching; paged KV + prefix cache in KvCore)
+    - runner compile-bucketed forward (ragged page attention; version-keyed page_table_cpu mirror in BatchMetadataPreparer) -> SamplerExecutor -> EngineCoreDriver.commit -> EngineCoreOutputs
+    - server/api_server.py exposes OpenAI-compatible endpoints; serving/ manages multi-replica cluster/dashboard; tools+reasoning parsers post-process
+  pipeline_parallelism:
+    - sharding_axis_dims[0]>1 -> SpxMesh(is_mpmd) -> layer stage assignment (EasyDeLLayerStackMixin)
+    - spectrax runtime compiles per-rank executables; schedule orchestrates microbatches
+  data:
+    - Pipeline.source -> tokenize -> mix -> pack -> load (transforms chained with ">>"; Ray for distributed preprocessing; Grain data_lanes.py + batch_placement.py in trainers)
+  release:
+    - scripts/release.sh <lib> <ver> (bump+pins+commit, local) -> scripts/publish.sh <lib> (tag -> CI PyPI; exact-pin siblings published before easydel)
+    - git push triggers subtree mirror sync (scripts/subtree-sync.sh auto)
+
+ci:
+  - workspace-ci.yaml: affected-only import/forward smoke, lint-imports, and surgecore Rust fmt/clippy/test/wheel/CPU-pytest job on PR/push (main and vnext)
+  - lint.yaml: ruff check + report-only (continue-on-error) basedpyright scoped to libs/easydel/easydel/
+  - uv-lock-checkup.yaml: verifies uv lock --check on push and fork PRs
+  - publish.yaml: tag-triggered per-package PyPI publish (uv build for Python libs; surgecore-* maturin wheel/sdist jobs for surgecore-v*)
+  - sync-subtrees.yaml: server-side mirror backstop for the 5 mirrored libs
+  - docker-image_{cpu,gpu,tpu}.yaml: CPU, GPU, and TPU container image build workflows
+
+ownership_routing: # which .agents/agents expert owns a surface
+  libs/easydel/easydel/infra: [ architect, sharding-expert ]
+  libs/easydel/easydel/modules: [ model-expert ]
+  libs/easydel/easydel/layers: [ model-expert, quantization-expert ]
+  libs/easydel/easydel/operations: [ kernel-expert ]
+  libs/easydel/easydel/caching: [ model-expert, inference-expert ]
+  libs/easydel/easydel/trainers: [ trainer-expert, rlhf-expert, data-expert ]
+  libs/easydel/easydel/environments: [ rlhf-expert ]
+  libs/easydel/easydel/inference: [ inference-expert ]
+  libs/easydel/easydel/data: [ data-expert ]
+  libs/easydel/easydel/utils: [ model-expert, jax-expert ]
+  libs/easydel/easydel/workers: [ inference-expert ]
+  libs/easydel/easydel/scripts: [ trainer-expert, inference-expert ]
+  libs/spectrax: [ jax-expert, sharding-expert, quantization-expert ]
+  libs/ejkernel: [ kernel-expert, tpu-expert, gpu-expert ]
+  libs/eformer: [ sharding-expert, quantization-expert ]
+  libs/eray: [ tpu-expert, gpu-expert ]
+  libs/surgecore: [ inference-expert ]
+  libs/esurge-dashboard: [ inference-expert ]

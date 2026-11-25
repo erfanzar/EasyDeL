@@ -70,7 +70,7 @@ def skip_gated_hf_model_configs(request, monkeypatch):
     monkeypatch.setattr(AutoConfig, "from_pretrained", classmethod(from_pretrained))
 
 
-# --- Computation tests run on an accelerator (XERXES.md golden rule 5) ---------------------------
+# --- Computation tests run on an accelerator (AGENTS.md golden rule 5) ---------------------------
 # A test file that imports an array / accelerator library is a computation test and must run on a
 # TPU or GPU JAX backend; a CPU run of it validates nothing. Pure-Python tests (parsers, configs,
 # orchestration) either import none of these libraries or carry ``@pytest.mark.cpu_ok``.

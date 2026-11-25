@@ -26,7 +26,7 @@ DeepSeek-V4.1 keeps V4's shared-KV MQA with sinks, grouped output projection, mH
 - DSpark MTP layers and a vision tower (``vision_config``).
 
 Semantics follow DeepSeek's reference implementation (``inference/model.py`` in the model repository); see
-``.xerxes/projects/deepseek-v41/SPEC.md``. transformers does not ship this architecture.
+``.agents/projects/deepseek-v41/SPEC.md``. transformers does not ship this architecture.
 """
 
 from __future__ import annotations
