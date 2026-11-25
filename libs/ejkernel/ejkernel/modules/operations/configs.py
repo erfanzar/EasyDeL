@@ -736,6 +736,39 @@ class CompressedWindowAttentionConfig(BaseOperationConfig):
 
 
 @dataclass
+class DualStreamAttentionConfig(BaseOperationConfig):
+    """Configuration for Dual-Stream Hybrid Attention (global + local sliding-window KV).
+
+    Args:
+        fwd_params: Optional ``FwdParams`` block-size hints for the global SplashAttention forward.
+        bwd_params: Optional ``BwdParams`` block-size hints for the global SplashAttention backward.
+        sliding_window: Width ``W`` of the local sliding-window KV stream (default: 128).
+        overlap: If ``True``, the global stream attends causally ``k <= q`` (overlapping the
+            local window); if ``False``, the global stream attends disjointly ``k <= q - W``.
+        q_chunk_size: Query block size for the blocked XLA fallback (default: 512).
+        kv_chunk_size: Global-KV block size for the blocked XLA fallback (default: 1024).
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
+    sliding_window: int = 128
+    overlap: bool = True
+    q_chunk_size: int = 512
+    kv_chunk_size: int = 1024
+
+    def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedPageAttentionv2Config(BaseOperationConfig):
     """Configuration for Ragged Page Attention operation.
 
@@ -1790,5 +1823,31 @@ class DsaGatherAttentionConfig(BaseOperationConfig):
     num_buffers: int | None = None
     num_cores: int | None = None
     fused_backward: bool | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DualStreamRaggedPageAttentionConfig(BaseOperationConfig):
+    """Configuration for Dual-Stream Ragged Paged Attention (shared global KV + local sliding-window KV).
+
+    Args:
+        sliding_window: Width ``W`` of the local sliding window (default: 128).
+        overlap: If ``True`` (default), Stream 1 attends causally ``k <= q``;
+            if ``False``, Stream 1 attends disjointly ``k <= q - W``.
+        chunk_prefill_size: Optional prefill chunk size override.
+        num_kv_pages_per_block: Optional KV pages per tile block.
+        num_queries_per_block: Optional query tokens per tile block.
+        vmem_limit_bytes: Optional TPU VMEM budget hint.
+        platform: Target platform (pallas/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    sliding_window: int = 128
+    overlap: bool = True
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    vmem_limit_bytes: int | None = None
 
     __hash__ = hash_fn

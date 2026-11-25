@@ -25,14 +25,12 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float
 
 from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_bwd
 from ._pallas_impl_fwd import (
-    _N_FUSE,
     _chunk_blockspec,
     _dot,
     _neumann_inv,
@@ -76,7 +74,8 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
     g_diff = g_cumsum - g_cumsum.T
     decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
 
-    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
+    kk = _dot(k_beta, k.T)
+    attn_neg = -(kk * decay_mask) * strict_lower
     attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
     attn = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
@@ -99,8 +98,10 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
         return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
     k_beta_scaled = k_beta * g_cumsum_exp
-    value_local = _s(_dot(attn, v_beta))
-    k_cumdecay = _s(_dot(attn, k_beta_scaled))
+    V_dim = v_beta.shape[-1]
+    vk_local = _s(_dot(attn, jnp.concatenate([v_beta, k_beta_scaled], axis=-1)))
+    value_local = vk_local[:, :V_dim]
+    k_cumdecay = vk_local[:, V_dim:]
 
     attn_qk_base = _dot(q, k.T)
     attn_qk = _s(attn_qk_base * decay_mask)
@@ -136,8 +137,9 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
     d_k = d_k + _dot(d_attn_qk_base.T, q)
 
     d_attn = _s(_dot(d_value_local, v_beta.T) + _dot(d_k_cumdecay, k_beta_scaled.T))
-    d_value_beta = _s(_dot(attn.T, d_value_local))
-    d_key_beta_scaled = _s(_dot(attn.T, d_k_cumdecay))
+    d_vk_beta = _s(_dot(attn.T, jnp.concatenate([d_value_local, d_k_cumdecay], axis=-1)))
+    d_value_beta = d_vk_beta[:, :V_dim]
+    d_key_beta_scaled = d_vk_beta[:, V_dim:]
 
     d_key_beta = d_key_beta_scaled * g_cumsum_exp
     d_g_exp = d_g_exp + jnp.sum(d_key_beta_scaled * k_beta, axis=-1, keepdims=True)
@@ -146,7 +148,6 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
     d_k_attn = _s(-_dot(tmp, attn.T))
     d_k_attn = d_k_attn * strict_lower
 
-    kk = _dot(k_beta, k.T)
     d_kk = d_k_attn * decay_mask
     d_decay_mask = _s((d_decay_mask_from_qk + d_k_attn * kk) * lower_mask)
 
@@ -171,20 +172,6 @@ def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
 
     d_state = _s(d_state)
     return d_state, d_q, d_k, d_v, d_beta, d_decay_final
-
-
-def _segmented_cumsum_1d(decay, seg, valid_bool, C):
-    """Segment-local cumulative decay for one chunk, reset at packed boundaries."""
-    values = []
-    running = jnp.array(0.0, dtype=jnp.float32)
-    for i in range(C):
-        if i == 0:
-            is_start = valid_bool[i]
-        else:
-            is_start = valid_bool[i] & ((seg[i] != seg[i - 1]) | ~valid_bool[i - 1])
-        running = jnp.where(is_start, decay[i], jnp.where(valid_bool[i], running + decay[i], 0.0))
-        values.append(running)
-    return jnp.stack(values, axis=0)[:, None]
 
 
 def _bwd_one_chunk_segmented(
@@ -225,7 +212,8 @@ def _bwd_one_chunk_segmented(
     g_diff = g_cumsum - g_cumsum.T
     decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
 
-    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
+    kk = _dot(k_beta, k.T)
+    attn_neg = -(kk * decay_mask) * strict_lower
     attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
     attn = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
@@ -238,8 +226,10 @@ def _bwd_one_chunk_segmented(
         return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
     k_beta_scaled = k_beta * g_cumsum_exp
-    value_local = _s(_dot(attn, v_beta))
-    k_cumdecay = _s(_dot(attn, k_beta_scaled))
+    V_dim = v_beta.shape[-1]
+    combined_fwd = _s(_dot(attn, jnp.concatenate([v_beta, k_beta_scaled], axis=-1)))
+    value_local = combined_fwd[:, :V_dim]
+    k_cumdecay = combined_fwd[:, V_dim:]
 
     attn_qk_base = _dot(q, k.T)
     attn_qk = _s(attn_qk_base * decay_mask)
@@ -281,8 +271,9 @@ def _bwd_one_chunk_segmented(
     d_k = d_k + _dot(d_attn_qk_base.T, q)
 
     d_attn = _s(_dot(d_value_local, v_beta.T) + _dot(d_k_cumdecay, k_beta_scaled.T))
-    d_value_beta = _s(_dot(attn.T, d_value_local))
-    d_key_beta_scaled = _s(_dot(attn.T, d_k_cumdecay))
+    combined_bwd = _s(_dot(attn.T, jnp.concatenate([d_value_local, d_k_cumdecay], axis=-1)))
+    d_value_beta = combined_bwd[:, :V_dim]
+    d_key_beta_scaled = combined_bwd[:, V_dim:]
 
     d_key_beta = d_key_beta_scaled * g_cumsum_exp
     d_g_exp = d_g_exp + jnp.sum(d_key_beta_scaled * k_beta, axis=-1, keepdims=True)
@@ -290,7 +281,6 @@ def _bwd_one_chunk_segmented(
     tmp = _dot(attn.T, d_attn)
     d_k_attn = _s(-_dot(tmp, attn.T)) * strict_lower
 
-    kk = _dot(k_beta, k.T)
     d_kk = d_k_attn * decay_mask
     d_decay_mask = _s((d_decay_mask_from_qk + d_k_attn * kk) * lower_mask)
 
@@ -317,85 +307,80 @@ def _bwd_one_chunk_segmented(
     return d_state, d_q, d_k, d_v, d_beta, d_decay_final
 
 
-def _gdr_bwd_grad_kernel(
-    state_pre_ref,
-    q_ref,
-    k_ref,
-    v_ref,
-    beta_ref,
-    decay_ref,
-    d_out_ref,
-    d_state_next_ref,
-    d_state_ref,
-    d_q_ref,
-    d_k_ref,
-    d_v_ref,
-    d_beta_ref,
-    d_decay_ref,
+def _run_grouped_dense_bwd_vmem_scan(
+    state_pre,
+    query_c,
+    key_c,
+    value_c,
+    beta_c,
+    decay_c,
+    d_out_c,
+    d_final_state,
+    *,
+    expand_ratio: int,
+    grad_dtype=jnp.float32,
 ):
-    """Pallas kernel for one reverse-scan step, processing ``num_fused`` chunks.
+    """Single-launch reverse VMEM-resident Pallas backward for dense (unpacked) GDR.
 
-    Here ``num_fused`` is the per-block group size (``q_ref.shape[2]``) and ``C``
-    is the chunk size (``q_ref.shape[3]``). The kernel iterates the chunks of the
-    group in reverse order, threading the state gradient ``d_state_next`` from
-    the last chunk back to the first. For chunk ``i > 0`` it re-runs the forward
-    pass (``_process_one_chunk``) for chunks ``0 … i-1`` to recover the
-    intermediate pre-chunk state, since only the state *before* the fused group
-    is saved in ``state_pre_ref``. All ref reads/writes are sanitized with
-    ``nan_to_num``.
-
-    Grid: ``(batch, num_heads)``; both axes are "parallel". Refs are per-block
-    slices (leading batch/head dims already indexed to size 1 by the BlockSpec).
-
-    Args:
-        state_pre_ref: [1, 1, K, V] — recurrent state before the fused group.
-        q_ref: [1, 1, num_fused, C, K] — queries for the group.
-        k_ref: [1, 1, num_fused, C, K] — keys for the group.
-        v_ref: [1, 1, num_fused, C, V] — values for the group.
-        beta_ref: [1, 1, 1, num_fused, C] — gate per token.
-        decay_ref: [1, 1, 1, num_fused, C] — log-decay per token.
-        d_out_ref: [1, 1, num_fused, C, V] — upstream output gradient.
-        d_state_next_ref: [1, 1, K, V] — gradient arriving from the next group.
-        d_state_ref: [1, 1, K, V] — output ref for the gradient of the state
-            before this group.
-        d_q_ref: [1, 1, num_fused, C, K] — output ref for the query gradient.
-        d_k_ref: [1, 1, num_fused, C, K] — output ref for the key gradient.
-        d_v_ref: [1, 1, num_fused, C, V] — output ref for the value gradient.
-        d_beta_ref: [1, 1, num_fused, C, 1] — output ref for the beta gradient.
-        d_decay_ref: [1, 1, num_fused, C, 1] — output ref for the decay gradient.
-
-    Returns:
-        None. All results are written in place into the output refs listed above.
+    Processes chunks in reverse order (``rc = num_chunks - 1 - c``) inside a single
+    ``pl.pallas_call`` with ``d_state`` held in VMEM scratch across all chunks. Works
+    for both grouped (``expand_ratio > 1``) and non-grouped (``expand_ratio == 1``)
+    layouts with zero inter-chunk forward recomputation and zero Q/K repetition.
     """
-    num_fused = q_ref.shape[2]
-    C = q_ref.shape[3]
+    bsz, num_value_heads, num_chunks, chunk_size, v_dim = value_c.shape
+    qk_dim = query_c.shape[-1]
 
-    d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
-    d_state_next = jnp.nan_to_num(d_state_next, nan=0.0, posinf=0.0, neginf=0.0)
+    beta_in = beta_c.astype(jnp.float32)[:, :, :, None, :]
+    decay_in = decay_c.astype(jnp.float32)[:, :, :, None, :]
+    d_final_in = d_final_state.astype(jnp.float32)
 
-    for i in range(num_fused - 1, -1, -1):
-        q = q_ref[0, 0, i].astype(jnp.float32)
-        k = k_ref[0, 0, i].astype(jnp.float32)
-        v = v_ref[0, 0, i].astype(jnp.float32)
-        beta = beta_ref[0, 0, 0, i]
-        decay = decay_ref[0, 0, 0, i]
-        d_out = d_out_ref[0, 0, i].astype(jnp.float32)
-        if i == 0:
-            state_pre = state_pre_ref[0, 0].astype(jnp.float32)
-            state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
-        else:
-            from ._pallas_impl_fwd import _process_one_chunk
+    def _bh_spec(shape):
+        return pl.BlockSpec(shape, lambda b, h, c: (b, h, *([0] * (len(shape) - 2))))
 
-            sp = state_pre_ref[0, 0].astype(jnp.float32)
-            sp = jnp.nan_to_num(sp, nan=0.0, posinf=0.0, neginf=0.0)
-            for j in range(i):
-                qj = q_ref[0, 0, j].astype(jnp.float32)
-                kj = k_ref[0, 0, j].astype(jnp.float32)
-                vj = v_ref[0, 0, j].astype(jnp.float32)
-                bj = beta_ref[0, 0, 0, j]
-                dj = decay_ref[0, 0, 0, j]
-                _, sp = _process_one_chunk(qj, kj, vj, bj, dj, sp, C)
-            state_pre = sp
+    def _rev_bhc_spec(shape):
+        return pl.BlockSpec(shape, lambda b, h, c: (b, h, num_chunks - 1 - c, *([0] * (len(shape) - 3))))
+
+    def _rev_qk_spec(shape):
+        return pl.BlockSpec(
+            shape,
+            lambda b, h, c: (b, h // expand_ratio, num_chunks - 1 - c, *([0] * (len(shape) - 3))),
+        )
+
+    def _kernel(
+        state_pre_ref,
+        q_ref,
+        k_ref,
+        v_ref,
+        beta_ref,
+        decay_ref,
+        d_out_ref,
+        d_final_state_ref,
+        d_initial_state_ref,
+        d_q_ref,
+        d_k_ref,
+        d_v_ref,
+        d_beta_ref,
+        d_decay_ref,
+        d_state_scratch,
+    ):
+        c_idx = pl.program_id(2)
+
+        @pl.when(c_idx == 0)
+        def _init_d_state():
+            d_state_scratch[...] = jnp.nan_to_num(
+                d_final_state_ref[0, 0].astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+        d_state_next = d_state_scratch[...]
+        state_p = jnp.nan_to_num(state_pre_ref[0, 0, 0].astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+        C = q_ref.shape[3]
+        q = q_ref[0, 0, 0].astype(jnp.float32)
+        k = k_ref[0, 0, 0].astype(jnp.float32)
+        v = v_ref[0, 0, 0].astype(jnp.float32)
+        beta = beta_ref[0, 0, 0, 0]
+        decay = decay_ref[0, 0, 0, 0]
+        d_out = d_out_ref[0, 0, 0].astype(jnp.float32)
 
         d_st, d_q_c, d_k_c, d_v_c, d_beta_c, d_decay_c = _bwd_one_chunk(
             q,
@@ -404,65 +389,171 @@ def _gdr_bwd_grad_kernel(
             beta,
             decay,
             d_out,
-            state_pre,
+            state_p,
             d_state_next,
             C,
         )
-        d_state_next = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
+        d_st_clean = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
+        d_state_scratch[...] = d_st_clean
 
-        d_q_ref[0, 0, i] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
-        d_k_ref[0, 0, i] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
-        d_v_ref[0, 0, i] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
-        d_beta_ref[0, 0, i, :, :] = jnp.nan_to_num(d_beta_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_beta_ref.dtype)
-        d_decay_ref[0, 0, i, :, :] = jnp.nan_to_num(d_decay_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_decay_ref.dtype)
+        d_q_ref[0, 0, 0] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
+        d_k_ref[0, 0, 0] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
+        d_v_ref[0, 0, 0] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
+        d_beta_ref[0, 0, 0, 0] = jnp.nan_to_num(d_beta_c[:, 0], nan=0.0, posinf=0.0, neginf=0.0).astype(d_beta_ref.dtype)
+        d_decay_ref[0, 0, 0, 0] = jnp.nan_to_num(d_decay_c[:, 0], nan=0.0, posinf=0.0, neginf=0.0).astype(
+            d_decay_ref.dtype
+        )
 
-    d_state_ref[0, 0] = d_state_next.astype(d_state_ref.dtype)
+        @pl.when(c_idx == num_chunks - 1)
+        def _flush_d_init():
+            d_initial_state_ref[0, 0] = d_st_clean.astype(d_initial_state_ref.dtype)
+
+    call = pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                _rev_bhc_spec((1, 1, 1, qk_dim, v_dim)),
+                _rev_qk_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_qk_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, v_dim)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, v_dim)),
+                _bh_spec((1, 1, qk_dim, v_dim)),
+            ],
+            out_specs=[
+                _bh_spec((1, 1, qk_dim, v_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, v_dim)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+            ],
+            scratch_shapes=[pltpu.VMEM((qk_dim, v_dim), jnp.float32)],
+            grid=(bsz, num_value_heads, num_chunks),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((bsz, num_value_heads, qk_dim, v_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, chunk_size, v_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, 1, chunk_size), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, 1, chunk_size), grad_dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary")),
+    )
+    d_init, d_q_rep, d_k_rep, d_v_c, d_beta_out, d_decay_out = call(
+        state_pre,
+        query_c,
+        key_c,
+        value_c,
+        beta_in,
+        decay_in,
+        d_out_c,
+        d_final_in,
+    )
+    return d_init, d_q_rep, d_k_rep, d_v_c, d_beta_out[:, :, :, 0, :], d_decay_out[:, :, :, 0, :]
 
 
-def _gdr_bwd_grad_segmented_kernel(
-    state_pre_ref,
-    state_seg_pre_ref,
-    q_ref,
-    k_ref,
-    v_ref,
-    beta_ref,
-    decay_ref,
-    g_cumsum_ref,
-    d_out_ref,
-    seg_ref,
-    has_valid_ref,
-    seg_last_ref,
-    g_end_ref,
-    d_state_next_ref,
-    d_state_ref,
-    d_q_ref,
-    d_k_ref,
-    d_v_ref,
-    d_beta_ref,
-    d_decay_ref,
+def _run_grouped_segmented_bwd_vmem_scan(
+    state_pre,
+    state_seg_pre,
+    query_c,
+    key_c,
+    value_c,
+    beta_c,
+    decay_c,
+    g_cumsum_c,
+    d_out_c,
+    seg_c,
+    chunk_has_valid,
+    seg_last,
+    g_end_c,
+    d_final_state,
+    *,
+    expand_ratio: int,
+    grad_dtype=jnp.float32,
 ):
-    """Pallas backward kernel for packed chunks with segment-aware state flow."""
-    num_fused = q_ref.shape[2]
-    C = q_ref.shape[3]
+    """Single-launch reverse VMEM-resident Pallas backward for packed grouped GDR.
 
-    d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
-    d_state_next = jnp.nan_to_num(d_state_next, nan=0.0, posinf=0.0, neginf=0.0)
-    state_pre = state_pre_ref[0, 0].astype(jnp.float32)
-    state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
-    state_seg = state_seg_pre_ref[0, 0, 0, 0]
+    Processes chunks in reverse order (``rc = num_chunks - 1 - c``) inside a single
+    ``pl.pallas_call`` with ``d_state`` held in VMEM scratch across all chunks,
+    eliminating ``num_chunks`` separate Pallas launches, HBM ``d_state`` round-trips,
+    per-chunk ``jnp.repeat`` of Q/K, and 6-D transpose copies.
+    """
+    bsz, num_value_heads, num_chunks, chunk_size, v_dim = value_c.shape
+    qk_dim = query_c.shape[-1]
 
-    for i in range(num_fused - 1, -1, -1):
-        q = q_ref[0, 0, i].astype(jnp.float32)
-        k = k_ref[0, 0, i].astype(jnp.float32)
-        v = v_ref[0, 0, i].astype(jnp.float32)
-        beta = beta_ref[0, 0, 0, i]
-        decay = decay_ref[0, 0, 0, i]
-        g_cumsum = g_cumsum_ref[0, 0, i].astype(jnp.float32)
-        d_out = d_out_ref[0, 0, i].astype(jnp.float32)
-        seg = seg_ref[0, 0, i]
-        has_valid = has_valid_ref[0, 0, i, 0].astype(jnp.float32)
-        seg_last = seg_last_ref[0, 0, i, 0]
-        g_end_value = g_end_ref[0, 0, i, 0].astype(jnp.float32)
+    state_seg_in = state_seg_pre.astype(jnp.int32)[:, :, :, None, None]
+    beta_in = beta_c.astype(jnp.float32)[:, :, :, None, :]
+    decay_in = decay_c.astype(jnp.float32)[:, :, :, None, :]
+    g_cumsum_in = g_cumsum_c.astype(jnp.float32)[:, :, :, None, :]
+    seg_in = seg_c.astype(jnp.int32)[:, :, :, None, :]
+    has_valid_in = chunk_has_valid.astype(jnp.float32)[:, :, :, None, None]
+    seg_last_in = seg_last.astype(jnp.int32)[:, :, :, None, None]
+    g_end_in = g_end_c.astype(jnp.float32)[:, :, :, None, None]
+    d_final_in = d_final_state.astype(jnp.float32)
+
+    def _bh_spec(shape):
+        return pl.BlockSpec(shape, lambda b, h, c: (b, h, *([0] * (len(shape) - 2))))
+
+    def _rev_bhc_spec(shape):
+        return pl.BlockSpec(shape, lambda b, h, c: (b, h, num_chunks - 1 - c, *([0] * (len(shape) - 3))))
+
+    def _rev_qk_spec(shape):
+        return pl.BlockSpec(
+            shape,
+            lambda b, h, c: (b, h // expand_ratio, num_chunks - 1 - c, *([0] * (len(shape) - 3))),
+        )
+
+    def _kernel(
+        state_pre_ref,
+        state_seg_ref,
+        q_ref,
+        k_ref,
+        v_ref,
+        beta_ref,
+        decay_ref,
+        g_cumsum_ref,
+        d_out_ref,
+        seg_ref,
+        has_valid_ref,
+        seg_last_ref,
+        g_end_ref,
+        d_final_state_ref,
+        d_initial_state_ref,
+        d_q_ref,
+        d_k_ref,
+        d_v_ref,
+        d_beta_ref,
+        d_decay_ref,
+        d_state_scratch,
+    ):
+        c_idx = pl.program_id(2)
+
+        @pl.when(c_idx == 0)
+        def _init_d_state():
+            d_state_scratch[...] = jnp.nan_to_num(
+                d_final_state_ref[0, 0].astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+        d_state_next = d_state_scratch[...]
+        state_p = jnp.nan_to_num(state_pre_ref[0, 0, 0].astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        state_seg_val = state_seg_ref[0, 0, 0, 0, 0]
+
+        C = q_ref.shape[3]
+        q = q_ref[0, 0, 0].astype(jnp.float32)
+        k = k_ref[0, 0, 0].astype(jnp.float32)
+        v = v_ref[0, 0, 0].astype(jnp.float32)
+        beta = beta_ref[0, 0, 0, 0]
+        decay = decay_ref[0, 0, 0, 0]
+        g_cumsum = g_cumsum_ref[0, 0, 0, 0].astype(jnp.float32)
+        d_out = d_out_ref[0, 0, 0].astype(jnp.float32)
+        seg = seg_ref[0, 0, 0, 0]
+        has_valid = has_valid_ref[0, 0, 0, 0, 0].astype(jnp.float32)
+        seg_last_val = seg_last_ref[0, 0, 0, 0, 0]
+        g_end_value = g_end_ref[0, 0, 0, 0, 0].astype(jnp.float32)
 
         d_st, d_q_c, d_k_c, d_v_c, d_beta_c, d_decay_c = _bwd_one_chunk_segmented(
             q,
@@ -472,193 +563,88 @@ def _gdr_bwd_grad_segmented_kernel(
             decay,
             g_cumsum,
             d_out,
-            state_pre,
+            state_p,
             d_state_next,
             seg,
-            state_seg,
+            state_seg_val,
             has_valid,
-            seg_last,
+            seg_last_val,
             g_end_value,
             C,
         )
-        d_state_next = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
+        d_st_clean = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
+        d_state_scratch[...] = d_st_clean
 
-        d_q_ref[0, 0, i] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
-        d_k_ref[0, 0, i] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
-        d_v_ref[0, 0, i] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
-        d_beta_ref[0, 0, i, :, :] = jnp.nan_to_num(d_beta_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_beta_ref.dtype)
-        d_decay_ref[0, 0, i, :, :] = jnp.nan_to_num(d_decay_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_decay_ref.dtype)
+        d_q_ref[0, 0, 0] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
+        d_k_ref[0, 0, 0] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
+        d_v_ref[0, 0, 0] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
+        d_beta_ref[0, 0, 0, 0] = jnp.nan_to_num(d_beta_c[:, 0], nan=0.0, posinf=0.0, neginf=0.0).astype(d_beta_ref.dtype)
+        d_decay_ref[0, 0, 0, 0] = jnp.nan_to_num(d_decay_c[:, 0], nan=0.0, posinf=0.0, neginf=0.0).astype(
+            d_decay_ref.dtype
+        )
 
-    d_state_ref[0, 0] = d_state_next.astype(d_state_ref.dtype)
-
-
-def _run_bwd_grad_step(
-    state_pre,
-    q_i,
-    k_i,
-    v_i,
-    beta_i,
-    decay_i,
-    d_out_i,
-    d_state_next,
-    *,
-    grad_dtype=jnp.float32,
-):
-    """Launch the backward gradient Pallas kernel for one fused chunk group.
-
-    Wraps ``_gdr_bwd_grad_kernel`` in a ``pl.pallas_call`` with a
-    ``(batch, num_heads)`` grid, where ``num_fused`` is the group size and
-    ``chunk_size`` is the per-chunk token count.
-
-    Args:
-        state_pre: [B, H, K, V] — recurrent state before this fused group.
-        q_i: [B, H, num_fused, chunk_size, K] — queries for the group.
-        k_i: [B, H, num_fused, chunk_size, K] — keys for the group.
-        v_i: [B, H, num_fused, chunk_size, V] — values for the group.
-        beta_i: [B, H, 1, num_fused, chunk_size] float32 — gate per token.
-        decay_i: [B, H, 1, num_fused, chunk_size] float32 — log-decay per token.
-        d_out_i: [B, H, num_fused, chunk_size, V] — upstream output gradient.
-        d_state_next: [B, H, K, V] — gradient from the following group.
-
-    Returns:
-        Six-element tuple ``(d_state_prev, d_q, d_k, d_v, d_beta, d_decay)``
-        as float32 arrays:
-        ``d_state_prev`` [B, H, K, V]; ``d_q``/``d_k``
-        [B, H, num_fused, chunk_size, K]; ``d_v``
-        [B, H, num_fused, chunk_size, V]; ``d_beta``/``d_decay``
-        [B, H, num_fused, chunk_size, 1].
-    """
-    bsz, num_heads, num_fused, chunk_size, qk_dim = q_i.shape
-    v_dim = v_i.shape[-1]
+        @pl.when(c_idx == num_chunks - 1)
+        def _flush_d_init():
+            d_initial_state_ref[0, 0] = d_st_clean.astype(d_initial_state_ref.dtype)
 
     call = pl.pallas_call(
-        _gdr_bwd_grad_kernel,
+        _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
-                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
-                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
-                _chunk_blockspec((1, 1, qk_dim, v_dim)),
+                _rev_bhc_spec((1, 1, 1, qk_dim, v_dim)),
+                _rev_bhc_spec((1, 1, 1, 1, 1)),
+                _rev_qk_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_qk_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, v_dim)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, v_dim)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, 1, 1)),
+                _rev_bhc_spec((1, 1, 1, 1, 1)),
+                _rev_bhc_spec((1, 1, 1, 1, 1)),
+                _bh_spec((1, 1, qk_dim, v_dim)),
             ],
             out_specs=[
-                _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
+                _bh_spec((1, 1, qk_dim, v_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, qk_dim)),
+                _rev_bhc_spec((1, 1, 1, chunk_size, v_dim)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
+                _rev_bhc_spec((1, 1, 1, 1, chunk_size)),
             ],
-            grid=(bsz, num_heads),
+            scratch_shapes=[pltpu.VMEM((qk_dim, v_dim), jnp.float32)],
+            grid=(bsz, num_value_heads, num_chunks),
         ),
         out_shape=[
-            jax.ShapeDtypeStruct((bsz, num_heads, qk_dim, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, v_dim), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, qk_dim, v_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, chunk_size, qk_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, chunk_size, v_dim), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, 1, chunk_size), grad_dtype),
+            jax.ShapeDtypeStruct((bsz, num_value_heads, num_chunks, 1, chunk_size), grad_dtype),
         ],
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary")),
     )
-    return call(
+    d_init, d_q_rep, d_k_rep, d_v_c, d_beta_out, d_decay_out = call(
         state_pre,
-        q_i,
-        k_i,
-        v_i,
-        beta_i,
-        decay_i,
-        d_out_i,
-        d_state_next,
+        state_seg_in,
+        query_c,
+        key_c,
+        value_c,
+        beta_in,
+        decay_in,
+        g_cumsum_in,
+        d_out_c,
+        seg_in,
+        has_valid_in,
+        seg_last_in,
+        g_end_in,
+        d_final_in,
     )
-
-
-def _run_bwd_grad_step_segmented(
-    state_pre,
-    state_seg_pre,
-    q_i,
-    k_i,
-    v_i,
-    beta_i,
-    decay_i,
-    g_cumsum_i,
-    d_out_i,
-    seg_i,
-    has_valid_i,
-    seg_last_i,
-    g_end_i,
-    d_state_next,
-    *,
-    grad_dtype=jnp.float32,
-):
-    """Launch one packed, segment-aware backward gradient Pallas step."""
-    bsz, num_heads, num_fused, chunk_size, qk_dim = q_i.shape
-    v_dim = v_i.shape[-1]
-    state_seg_pre_ref = state_seg_pre[:, :, None, None]
-    has_valid_ref = has_valid_i.astype(jnp.float32)[..., None]
-    seg_last_ref = seg_last_i[..., None]
-    g_end_ref = g_end_i.astype(jnp.float32)[..., None]
-
-    call = pl.pallas_call(
-        _gdr_bwd_grad_segmented_kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, 1, 1)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
-                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
-                _chunk_blockspec((1, 1, 1, num_fused, chunk_size)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size)),
-                _chunk_blockspec((1, 1, num_fused, 1)),
-                _chunk_blockspec((1, 1, num_fused, 1)),
-                _chunk_blockspec((1, 1, num_fused, 1)),
-                _chunk_blockspec((1, 1, qk_dim, v_dim)),
-            ],
-            out_specs=[
-                _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, qk_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, v_dim)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
-                _chunk_blockspec((1, 1, num_fused, chunk_size, 1)),
-            ],
-            grid=(bsz, num_heads),
-        ),
-        out_shape=[
-            jax.ShapeDtypeStruct((bsz, num_heads, qk_dim, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, qk_dim), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, v_dim), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
-            jax.ShapeDtypeStruct((bsz, num_heads, num_fused, chunk_size, 1), grad_dtype),
-        ],
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
-    )
-    return call(
-        state_pre,
-        state_seg_pre_ref,
-        q_i,
-        k_i,
-        v_i,
-        beta_i,
-        decay_i,
-        g_cumsum_i,
-        d_out_i,
-        seg_i,
-        has_valid_ref,
-        seg_last_ref,
-        g_end_ref,
-        d_state_next,
-    )
+    return d_init, d_q_rep, d_k_rep, d_v_c, d_beta_out[:, :, :, 0, :], d_decay_out[:, :, :, 0, :]
 
 
 def _cast_grad(x, dtype):
@@ -778,138 +764,57 @@ def _chunk_gdr_bwd(
 
     if pad_size > 0:
         d_out = jnp.pad(d_out, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-    d_out = d_out.reshape(B, H, num_chunks, chunk_size, V_dim)
+    d_out_c = d_out.reshape(B, H, num_chunks, chunk_size, V_dim)
 
     segmented = seg_c is not None
-    # the segmented grad kernel does not recompute intra-group pre-states, so it
-    # must see exactly one chunk per group (matches the segmented fwd cores)
-    group_size = 1 if segmented else (_N_FUSE if _N_FUSE > 1 and num_chunks % _N_FUSE == 0 else 1)
-    num_groups = num_chunks // group_size
-
-    q_tm = query.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
-    k_tm = key.reshape(B, H, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
-    v_tm = value.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
-    beta_tm = beta.reshape(B, H, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
-    decay_tm = decay.reshape(B, H, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
-    if int(state_pre_all.shape[2]) == num_groups:
-        state_pre_tm = state_pre_all.transpose(2, 0, 1, 3, 4)
-    elif int(state_pre_all.shape[2]) == num_chunks:
-        state_pre_tm = state_pre_all[:, :, ::group_size].transpose(2, 0, 1, 3, 4)
-    else:
+    if int(state_pre_all.shape[2]) != num_chunks:
         raise ValueError(
-            f"Unexpected GDR state residual chunks: got {state_pre_all.shape[2]}, "
-            f"expected {num_groups} grouped or {num_chunks} per-chunk states."
+            f"Unexpected GDR state residual chunks: got {state_pre_all.shape[2]}, expected {num_chunks}."
         )
-    d_out_tm = d_out.reshape(B, H, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
     if segmented:
         g_cumsum_c = _segmented_chunk_cumsum(decay[:, :, :, None, :], seg_c, valid_c)
         positions = jnp.arange(chunk_size, dtype=jnp.int32)
         last_valid_idx = jnp.max(jnp.where(valid_c, positions[None, None, None, :], 0), axis=-1)
         g_end_c = jnp.take_along_axis(g_cumsum_c, last_valid_idx[..., None], axis=-1)[..., 0]
         g_end_c = g_end_c * chunk_has_valid.astype(jnp.float32)
-        g_cumsum_tm = g_cumsum_c.reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
-        seg_tm = seg_c.reshape(B, H, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
-        chunk_has_valid_tm = chunk_has_valid.reshape(B, H, num_groups, group_size).transpose(2, 0, 1, 3)
-        seg_last_tm = seg_last.reshape(B, H, num_groups, group_size).transpose(2, 0, 1, 3)
-        g_end_tm = g_end_c.reshape(B, H, num_groups, group_size).transpose(2, 0, 1, 3)
-        if int(state_seg_pre_all.shape[2]) == num_groups:
-            state_seg_pre_tm = state_seg_pre_all.transpose(2, 0, 1)
-        elif int(state_seg_pre_all.shape[2]) == num_chunks:
-            state_seg_pre_tm = state_seg_pre_all[:, :, ::group_size].transpose(2, 0, 1)
-        else:
-            raise ValueError(
-                f"Unexpected GDR segment-state residual chunks: got {state_seg_pre_all.shape[2]}, "
-                f"expected {num_groups} grouped or {num_chunks} per-chunk states."
-            )
-
-    d_final_state = d_final_state.astype(jnp.float32)
-
-    def grad_step(d_state_next, inputs):
-        """Reverse-scan step computing one chunk group's gradients.
-
-        Body of the ``lax.scan`` (run with ``reverse=True``) over chunk groups. Unpacks the per-group slices,
-        invokes ``_run_bwd_grad_step`` (a Pallas kernel launch) to backprop through the group, and threads the
-        state gradient backward to the previous group.
-
-        Args:
-            d_state_next: Carry — gradient of the recurrent state flowing in from the next (later) group, [K, V].
-            inputs: Per-group scan slice ``(state_pre, q, k, v, beta, decay, d_out)`` for the current group.
-
-        Returns:
-            Two-tuple ``(d_state_prev, per_group_grads)`` where ``d_state_prev`` is the carry passed to the
-            previous group and ``per_group_grads`` is ``(d_q, d_k, d_v, d_beta, d_decay)`` stacked by the scan.
-        """
-        if segmented:
-            sp_i, ss_i, q_i, k_i, v_i, b_i, dc_i, gc_i, do_i, seg_i, has_i, last_i, ge_i = inputs
-            d_state_i, d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step_segmented(
-                sp_i,
-                ss_i,
-                q_i,
-                k_i,
-                v_i,
-                b_i,
-                dc_i,
-                gc_i,
-                do_i,
-                seg_i,
-                has_i,
-                last_i,
-                ge_i,
-                d_state_next,
-                grad_dtype=input_dtype,
-            )
-        else:
-            sp_i, q_i, k_i, v_i, b_i, dc_i, do_i = inputs
-            d_state_i, d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step(
-                sp_i,
-                q_i,
-                k_i,
-                v_i,
-                b_i,
-                dc_i,
-                do_i,
-                d_state_next,
-                grad_dtype=input_dtype,
-            )
-        return d_state_i, (d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i)
-
-    scan_inputs = (state_pre_tm, q_tm, k_tm, v_tm, beta_tm, decay_tm, d_out_tm)
-    if segmented:
-        scan_inputs = (
-            state_pre_tm,
-            state_seg_pre_tm,
-            q_tm,
-            k_tm,
-            v_tm,
-            beta_tm,
-            decay_tm,
-            g_cumsum_tm,
-            d_out_tm,
-            seg_tm,
-            chunk_has_valid_tm,
-            seg_last_tm,
-            g_end_tm,
+        d_initial_state, d_q_c, d_k_c, d_v_c, d_beta_c, d_decay_c = _run_grouped_segmented_bwd_vmem_scan(
+            state_pre_all,
+            state_seg_pre_all,
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            g_cumsum_c,
+            d_out_c,
+            seg_c,
+            chunk_has_valid,
+            seg_last,
+            g_end_c,
+            d_final_state,
+            expand_ratio=1,
+            grad_dtype=input_dtype,
+        )
+    else:
+        d_initial_state, d_q_c, d_k_c, d_v_c, d_beta_c, d_decay_c = _run_grouped_dense_bwd_vmem_scan(
+            state_pre_all,
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            d_out_c,
+            d_final_state,
+            expand_ratio=1,
+            grad_dtype=input_dtype,
         )
 
-    d_initial_state, grads_tm = lax.scan(
-        grad_step,
-        d_final_state,
-        scan_inputs,
-        reverse=True,
-    )
-    d_q_group, d_k_group, d_v_group, d_beta_group, d_decay_group = grads_tm
-    d_q_tm = d_q_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, K_dim)
-    d_k_tm = d_k_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, K_dim)
-    d_v_tm = d_v_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, V_dim)
-    d_beta_tm = d_beta_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, 1)
-    d_decay_tm = d_decay_group.transpose(0, 3, 1, 2, 4, 5).reshape(num_chunks, B, H, chunk_size, 1)
-
     total_len = seq_len + pad_size
-    d_query = d_q_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
-    d_key = d_k_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
-    d_value = d_v_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, V_dim)[:, :, :seq_len, :]
-    d_beta = d_beta_tm.transpose(1, 2, 0, 3, 4).squeeze(-1).reshape(B, H, total_len)[:, :, :seq_len]
-    d_decay = d_decay_tm.transpose(1, 2, 0, 3, 4).squeeze(-1).reshape(B, H, total_len)[:, :, :seq_len]
+    d_query = d_q_c.reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
+    d_key = d_k_c.reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
+    d_value = d_v_c.reshape(B, H, total_len, V_dim)[:, :, :seq_len, :]
+    d_beta = d_beta_c.reshape(B, H, total_len)[:, :, :seq_len]
+    d_decay = d_decay_c.reshape(B, H, total_len)[:, :, :seq_len]
 
     d_query = d_query * scale
     if use_qk_l2norm:
@@ -1016,111 +921,65 @@ def _chunk_gdr_grouped_bwd(
     if Hv % Hq != 0:
         raise ValueError(f"grouped GDR requires value heads ({Hv}) to be a multiple of query heads ({Hq})")
     expand_ratio = Hv // Hq
-    group_size = int(group_size)
-    num_groups = num_chunks // group_size
+    if int(group_size) != 1 or int(state_group_pre.shape[2]) != num_chunks:
+        raise ValueError(
+            f"Unexpected grouped GDR state residual chunks: got {state_group_pre.shape[2]} "
+            f"(group_size={group_size}), expected {num_chunks} per-chunk states."
+        )
     scale = 1.0 / math.sqrt(K_dim)
 
     if pad_size > 0:
         d_out = jnp.pad(d_out, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
-    d_out = d_out.reshape(B, Hv, num_groups, group_size, chunk_size, V_dim)
 
-    q_tm = query.reshape(B, Hq, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
-    k_tm = key.reshape(B, Hq, num_groups, group_size, chunk_size, K_dim).transpose(2, 0, 1, 3, 4, 5)
-    v_tm = value.reshape(B, Hv, num_groups, group_size, chunk_size, V_dim).transpose(2, 0, 1, 3, 4, 5)
-    beta_tm = beta.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
-    decay_tm = decay.reshape(B, Hv, num_groups, group_size, chunk_size)[:, :, :, None, :, :].transpose(2, 0, 1, 3, 4, 5)
-    state_pre_tm = state_group_pre.transpose(2, 0, 1, 3, 4)
-    d_out_tm = d_out.transpose(2, 0, 1, 3, 4, 5)
+    total_len = seq_len + pad_size
+    d_out_c = d_out.reshape(B, Hv, num_chunks, chunk_size, V_dim)
     if segmented:
         g_cumsum_c = _segmented_chunk_cumsum(decay[:, :, :, None, :], seg_c, valid_c)
         positions = jnp.arange(chunk_size, dtype=jnp.int32)
         last_valid_idx = jnp.max(jnp.where(valid_c, positions[None, None, None, :], 0), axis=-1)
         g_end_c = jnp.take_along_axis(g_cumsum_c, last_valid_idx[..., None], axis=-1)[..., 0]
         g_end_c = g_end_c * chunk_has_valid.astype(jnp.float32)
-        g_cumsum_tm = g_cumsum_c.reshape(B, Hv, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
-        seg_tm = seg_c.reshape(B, Hv, num_groups, group_size, chunk_size).transpose(2, 0, 1, 3, 4)
-        chunk_has_valid_tm = chunk_has_valid.reshape(B, Hv, num_groups, group_size).transpose(2, 0, 1, 3)
-        seg_last_tm = seg_last.reshape(B, Hv, num_groups, group_size).transpose(2, 0, 1, 3)
-        g_end_tm = g_end_c.reshape(B, Hv, num_groups, group_size).transpose(2, 0, 1, 3)
-        state_seg_pre_tm = state_seg_group_pre.transpose(2, 0, 1)
-    d_final_state = d_final_state.astype(jnp.float32)
 
-    def _sum_value_head_grads(x):
-        return x.reshape(x.shape[0], Hq, expand_ratio, *x.shape[2:]).sum(axis=2)
-
-    def grad_step(d_state_next, inputs):
-        if segmented:
-            sp_i, ss_i, q_i, k_i, v_i, b_i, dc_i, gc_i, do_i, seg_i, has_i, last_i, ge_i = inputs
-        else:
-            sp_i, q_i, k_i, v_i, b_i, dc_i, do_i = inputs
-        q_rep_i = jnp.repeat(q_i, expand_ratio, axis=1)
-        k_rep_i = jnp.repeat(k_i, expand_ratio, axis=1)
-        if segmented:
-            d_state_i, d_q_rep_i, d_k_rep_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step_segmented(
-                sp_i,
-                ss_i,
-                q_rep_i,
-                k_rep_i,
-                v_i,
-                b_i,
-                dc_i,
-                gc_i,
-                do_i,
-                seg_i,
-                has_i,
-                last_i,
-                ge_i,
-                d_state_next,
-                grad_dtype=input_dtype,
-            )
-        else:
-            d_state_i, d_q_rep_i, d_k_rep_i, d_v_i, d_beta_i, d_decay_i = _run_bwd_grad_step(
-                sp_i,
-                q_rep_i,
-                k_rep_i,
-                v_i,
-                b_i,
-                dc_i,
-                do_i,
-                d_state_next,
-                grad_dtype=input_dtype,
-            )
-        d_q_i = _sum_value_head_grads(d_q_rep_i)
-        d_k_i = _sum_value_head_grads(d_k_rep_i)
-        return d_state_i, (d_q_i, d_k_i, d_v_i, d_beta_i, d_decay_i)
-
-    scan_inputs = (state_pre_tm, q_tm, k_tm, v_tm, beta_tm, decay_tm, d_out_tm)
-    if segmented:
-        scan_inputs = (
-            state_pre_tm,
-            state_seg_pre_tm,
-            q_tm,
-            k_tm,
-            v_tm,
-            beta_tm,
-            decay_tm,
-            g_cumsum_tm,
-            d_out_tm,
-            seg_tm,
-            chunk_has_valid_tm,
-            seg_last_tm,
-            g_end_tm,
+        d_initial_state, d_q_rep, d_k_rep, d_v_c, d_beta_c, d_decay_c = _run_grouped_segmented_bwd_vmem_scan(
+            state_group_pre,
+            state_seg_group_pre,
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            g_cumsum_c,
+            d_out_c,
+            seg_c,
+            chunk_has_valid,
+            seg_last,
+            g_end_c,
+            d_final_state,
+            expand_ratio=expand_ratio,
+            grad_dtype=input_dtype,
         )
-
-    d_initial_state, grads_tm = lax.scan(
-        grad_step,
-        d_final_state,
-        scan_inputs,
-        reverse=True,
+    else:
+        d_initial_state, d_q_rep, d_k_rep, d_v_c, d_beta_c, d_decay_c = _run_grouped_dense_bwd_vmem_scan(
+            state_group_pre,
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            d_out_c,
+            d_final_state,
+            expand_ratio=expand_ratio,
+            grad_dtype=input_dtype,
+        )
+    d_query = (
+        d_q_rep.reshape(B, Hq, expand_ratio, total_len, K_dim).sum(axis=2, dtype=jnp.float32)[:, :, :seq_len, :]
     )
-    d_q_group, d_k_group, d_v_group, d_beta_group, d_decay_group = grads_tm
-
-    total_len = seq_len + pad_size
-    d_query = d_q_group.transpose(1, 2, 0, 3, 4, 5).reshape(B, Hq, total_len, K_dim)[:, :, :seq_len, :]
-    d_key = d_k_group.transpose(1, 2, 0, 3, 4, 5).reshape(B, Hq, total_len, K_dim)[:, :, :seq_len, :]
-    d_value = d_v_group.transpose(1, 2, 0, 3, 4, 5).reshape(B, Hv, total_len, V_dim)[:, :, :seq_len, :]
-    d_beta = d_beta_group.transpose(1, 2, 0, 3, 4, 5).squeeze(-1).reshape(B, Hv, total_len)[:, :, :seq_len]
-    d_decay = d_decay_group.transpose(1, 2, 0, 3, 4, 5).squeeze(-1).reshape(B, Hv, total_len)[:, :, :seq_len]
+    d_key = (
+        d_k_rep.reshape(B, Hq, expand_ratio, total_len, K_dim).sum(axis=2, dtype=jnp.float32)[:, :, :seq_len, :]
+    )
+    d_value = d_v_c.reshape(B, Hv, total_len, V_dim)[:, :, :seq_len, :]
+    d_beta = d_beta_c.reshape(B, Hv, total_len)[:, :, :seq_len]
+    d_decay = d_decay_c.reshape(B, Hv, total_len)[:, :, :seq_len]
 
     d_query = d_query * scale
     if use_qk_l2norm:

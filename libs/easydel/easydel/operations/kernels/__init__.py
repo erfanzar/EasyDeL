@@ -116,6 +116,8 @@ from .compressed_window_decode import CompressedWindowDecodeAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .dsa_gather_attention import DsaGatherAttn
 from .dsa_pool_sparse_attention import DsaPoolSparseAttn
+from .dual_stream_attention import DualStreamAttn
+from .dual_stream_ragged_page_attention import DualStreamRaggedPageAttn
 from .flash_attention import FlashAttn
 from .fused_mlp import FusedMlpOp
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
@@ -156,6 +158,8 @@ __all__ = (
     "CompressedWindowDecodeAttn",
     "DsaGatherAttn",
     "DsaPoolSparseAttn",
+    "DualStreamAttn",
+    "DualStreamRaggedPageAttn",
     "FlashAttn",
     "FusedMlpOp",
     "GDNComputeScheduleV2",

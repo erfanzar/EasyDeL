@@ -404,6 +404,38 @@ class EasyShardingMixin:
         empty_sharding = replicated_named_sharding(mesh)
         rules = self.resolve_shardings_regex(mesh=mesh)
 
+        # Fast path: resolve_shardings_regex emits literal patterns wrapped as
+        # ``^(?:.*/)?<escaped>(?:/.*)?$``. Unwrap them into an O(1) lookup table
+        # keyed by plain path while keeping rule indices to preserve exact
+        # first-match priority against any non-literal fallback regexes.
+        literal_rules: dict[str, tuple[int, tp.Any]] = {}
+        compiled_fallback: list[tuple[int, re.Pattern[str], tp.Any]] = []
+        _prefix, _suffix = r"^(?:.*/)?", r"(?:/.*)?$"
+        for idx, (pattern, sharding) in enumerate(rules):
+            if isinstance(pattern, str) and pattern.startswith(_prefix) and pattern.endswith(_suffix):
+                core = pattern[len(_prefix) : -len(_suffix)]
+                plain = re.sub(r"\\(.)", r"\1", core)
+                if re.escape(plain) == core:
+                    literal_rules.setdefault(plain, (idx, sharding))
+                    continue
+            compiled_fallback.append((idx, re.compile(pattern), sharding))
+
+        def _finalize(sharding: tp.Any, leaf: tp.Any) -> NamedSharding:
+            out = (
+                sharding
+                if isinstance(sharding, NamedSharding)
+                else NamedSharding(
+                    mesh=jax_mesh,
+                    spec=PartitionSpec(*tuple(sharding)),
+                )
+            )
+            if hasattr(leaf, "ndim") and len(out.spec) > leaf.ndim:
+                out = NamedSharding(
+                    mesh=out.mesh,
+                    spec=PartitionSpec(*tuple(out.spec)[: leaf.ndim]),
+                )
+            return out
+
         def _spec_for(path: str, leaf: tp.Any):
             """Resolve the NamedSharding for a single ``(path, leaf)`` pair.
 
@@ -415,22 +447,33 @@ class EasyShardingMixin:
                 NamedSharding: A regex-matched sharding, or the replicated
                 fallback for small/scalar/non-array leaves.
             """
-            for pattern, sharding in rules:
-                if re.search(pattern, path):
-                    out = (
-                        sharding
-                        if isinstance(sharding, NamedSharding)
-                        else NamedSharding(
-                            mesh=jax_mesh,
-                            spec=PartitionSpec(*tuple(sharding)),
-                        )
-                    )
-                    if hasattr(leaf, "ndim") and len(out.spec) > leaf.ndim:
-                        out = NamedSharding(
-                            mesh=out.mesh,
-                            spec=PartitionSpec(*tuple(out.spec)[: leaf.ndim]),
-                        )
-                    return out
+            best_idx: int | None = None
+            best_sharding: tp.Any = None
+            if literal_rules:
+                hit = literal_rules.get(path)
+                if hit is not None:
+                    best_idx, best_sharding = hit
+                segs = path.split("/")
+                n_segs = len(segs)
+                if n_segs > 1:
+                    for i in range(n_segs):
+                        acc = segs[i]
+                        sub_hit = literal_rules.get(acc)
+                        if sub_hit is not None and (best_idx is None or sub_hit[0] < best_idx):
+                            best_idx, best_sharding = sub_hit
+                        for j in range(i + 1, n_segs):
+                            acc = f"{acc}/{segs[j]}"
+                            sub_hit = literal_rules.get(acc)
+                            if sub_hit is not None and (best_idx is None or sub_hit[0] < best_idx):
+                                best_idx, best_sharding = sub_hit
+            for idx, compiled_pat, sharding in compiled_fallback:
+                if best_idx is not None and idx >= best_idx:
+                    break
+                if compiled_pat.search(path):
+                    best_idx, best_sharding = idx, sharding
+                    break
+            if best_sharding is not None:
+                return _finalize(best_sharding, leaf)
             return empty_sharding
 
         return jax.tree_util.tree_map_with_path(lambda path, leaf: _spec_for(jax_path_to_string(path), leaf), tree)

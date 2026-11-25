@@ -43,7 +43,11 @@ from ._config import (
     WhiteKronConfig,
 )
 from ._stage_local import make_unsupported_stage_local_gradient_transformation
-from ._tx import optax_add_scheduled_weight_decay
+from ._tx import (
+    build_path_exclusion_mask,
+    optax_add_scheduled_weight_decay,
+    optax_scale_by_path_multipliers,
+)
 
 TxConfigs = (
     AdafactorConfig
@@ -224,6 +228,8 @@ class OptimizerFactory:
         *,
         weight_decay: float = 0.0,
         weight_decay_mask: tp.Any | None = None,
+        no_weight_decay_patterns: tp.Sequence[str] | None = None,
+        param_lr_multipliers: tp.Mapping[str, float] | None = None,
         gradient_accumulation_steps: int = 1,
         clip_grad: float | None = None,
         custom_scheduler: tp.Callable[[int], optax.Schedule] | None = None,
@@ -293,7 +299,7 @@ class OptimizerFactory:
         builder.validate()
         base_optimizer = builder.build(scheduler)
 
-        # Build the full optimizer chain (clip, base optimizer, weight decay, multi-step)
+        # Build the full optimizer chain (clip, base optimizer, weight decay, path LR multipliers, multi-step)
         return cls._build_optimizer_chain(
             builder=builder,
             base_optimizer=base_optimizer,
@@ -301,6 +307,8 @@ class OptimizerFactory:
             scheduler=scheduler,
             weight_decay=weight_decay,
             weight_decay_mask=weight_decay_mask,
+            no_weight_decay_patterns=no_weight_decay_patterns,
+            param_lr_multipliers=param_lr_multipliers,
             gradient_accumulation_steps=gradient_accumulation_steps,
             clip_grad=clip_grad,
         )
@@ -355,6 +363,8 @@ class OptimizerFactory:
         scheduler: optax.Schedule,
         weight_decay: float = 0.0,
         weight_decay_mask: tp.Any | None = None,
+        no_weight_decay_patterns: tp.Sequence[str] | None = None,
+        param_lr_multipliers: tp.Mapping[str, float] | None = None,
         gradient_accumulation_steps: int = 1,
         clip_grad: float | None = None,
     ) -> tuple[optax.GradientTransformation, optax.Schedule]:
@@ -392,13 +402,20 @@ class OptimizerFactory:
 
         chain.append(base_optimizer)
 
+        effective_wd_mask = weight_decay_mask
+        if no_weight_decay_patterns:
+            effective_wd_mask = build_path_exclusion_mask(no_weight_decay_patterns, base_mask=effective_wd_mask)
+
         if weight_decay != 0.0:
             chain.append(
                 optax_add_scheduled_weight_decay(
                     lambda step: -scheduler(step) * weight_decay,
-                    weight_decay_mask,
+                    effective_wd_mask,
                 )
             )
+
+        if param_lr_multipliers:
+            chain.append(optax_scale_by_path_multipliers(param_lr_multipliers))
 
         tx = optax.chain(*chain)
 

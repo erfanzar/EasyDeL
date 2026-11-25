@@ -537,7 +537,12 @@ class OperationMetadata:
         softmax_aux_sharding: jax.sharding.PartitionSpec | None = None
         if softmax_aux is not None:
             head_sizes = {size for size in (num_q_heads, num_kv_heads) if size is not None and size > 1}
-            if softmax_aux.ndim == 2:
+            if softmax_aux.ndim == 4:
+                head_axis = HEAD if softmax_aux.shape[1] in head_sizes else EMPTY
+                softmax_aux_sharding = resolver.resolve(
+                    axes=[BATCH, head_axis, QUERY_LENGTH, EMPTY], mode=mode, shape=softmax_aux.shape
+                )
+            elif softmax_aux.ndim == 2:
                 first_axis = HEAD if softmax_aux.shape[0] in head_sizes else EMPTY
                 softmax_aux_sharding = resolver.resolve(axes=[first_axis, EMPTY], mode=mode, shape=softmax_aux.shape)
             else:

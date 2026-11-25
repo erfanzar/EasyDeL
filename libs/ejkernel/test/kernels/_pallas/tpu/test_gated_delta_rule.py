@@ -655,3 +655,62 @@ def test_segmented_gdr_ignores_high_t_padding_tail():
     assert jnp.allclose(out_full[:, :valid_len], out_prefix, atol=1e-5, rtol=0)
     assert jnp.max(jnp.abs(out_full[:, valid_len:])) == 0
     assert jnp.allclose(state_full, state_prefix, atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("segmented", [False, True])
+@pytest.mark.parametrize("with_decay", [True, False])
+def test_pallas_vmem_scan_fwd_bwd_matches_xla(grouped, segmented, with_decay):
+    """Verify VMEM-resident Pallas fwd+bwd matches XLA for grouped/non-grouped, segmented/dense, unaligned seq_len."""
+    batch, seq_len, chunk_size, qk_dim, v_dim = 2, 37, 16, 16, 16
+    q_heads = 2 if grouped else 4
+    v_heads = 6 if grouped else 4
+    keys = jax.random.split(jax.random.PRNGKey(202 + 10 * int(grouped) + 2 * int(segmented) + int(with_decay)), 6)
+    q = jax.random.normal(keys[0], (batch, seq_len, q_heads, qk_dim), dtype=jnp.float32) * 0.5
+    k = jax.random.normal(keys[1], (batch, seq_len, q_heads, qk_dim), dtype=jnp.float32) * 0.5
+    v = jax.random.normal(keys[2], (batch, seq_len, v_heads, v_dim), dtype=jnp.float32) * 0.5
+    beta = jax.nn.sigmoid(jax.random.normal(keys[3], (batch, seq_len, v_heads), dtype=jnp.float32))
+    decay = (
+        -jax.nn.softplus(jax.random.normal(keys[4], (batch, seq_len, v_heads), dtype=jnp.float32)) * 0.05
+        if with_decay
+        else None
+    )
+    init = jax.random.normal(keys[5], (batch, v_heads, qk_dim, v_dim), dtype=jnp.float32) * 0.05
+    if segmented:
+        # Multi-document packed batch with cross-chunk boundary, intra-chunk reset, and -1 padding tail.
+        seg_row0 = [0] * 11 + [1] * 12 + [2] * 9 + [-1] * 5
+        seg_row1 = [0] * 20 + [1] * 14 + [-1] * 3
+        seg_ids = jnp.asarray([seg_row0, seg_row1], dtype=jnp.int32)
+    else:
+        seg_ids = None
+
+    def _run(kernel, qi, ki, vi, bi, di, st):
+        return kernel(
+            qi,
+            ki,
+            vi,
+            bi,
+            di,
+            chunk_size=chunk_size,
+            initial_state=st,
+            use_chunked=True,
+            seg_ids=seg_ids,
+        )
+
+    out_p, st_p = _run(gated_delta_rule_pallas, q, k, v, beta, decay, init)
+    out_x, st_x = _run(gated_delta_rule_xla, q, k, v, beta, decay, init)
+    assert out_p.shape == out_x.shape
+    assert st_p.shape == st_x.shape
+    assert jnp.allclose(out_p, out_x, atol=3e-2, rtol=0), f"fwd out max diff: {jnp.max(jnp.abs(out_p - out_x))}"
+    assert jnp.allclose(st_p, st_x, atol=3e-2, rtol=0), f"fwd state max diff: {jnp.max(jnp.abs(st_p - st_x))}"
+
+    def _loss(kernel, qi, ki, vi, bi, di, st):
+        o, s = _run(kernel, qi, ki, vi, bi, di, st)
+        return jnp.mean(o**2) + 0.1 * jnp.mean(s**2)
+
+    argnums = (0, 1, 2, 3, 4, 5) if with_decay else (0, 1, 2, 3, 5)
+    grads_p = jax.grad(lambda *xs: _loss(gated_delta_rule_pallas, *xs), argnums=argnums)(q, k, v, beta, decay, init)
+    grads_x = jax.grad(lambda *xs: _loss(gated_delta_rule_xla, *xs), argnums=argnums)(q, k, v, beta, decay, init)
+    for idx, (gp, gx) in enumerate(zip(grads_p, grads_x, strict=True)):
+        assert jnp.all(jnp.isfinite(gp)), f"grad[{idx}] non-finite"
+        assert jnp.allclose(gp, gx, atol=4e-2, rtol=0), f"grad[{idx}] max diff: {jnp.max(jnp.abs(gp - gx))}"

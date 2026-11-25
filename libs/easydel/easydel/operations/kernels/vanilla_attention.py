@@ -242,6 +242,7 @@ class VanillaAttn(OperationImpl):
                 self._can_use_segmented_attention(mask_info)
                 or not normalize_output
                 or (dropout_prob > 0.0 and not deterministic)
+                or (softmax_aux is not None and softmax_aux.ndim == 4)
             ):
                 outputs, weights = self._forward_segmented(
                     query=query,
@@ -407,24 +408,44 @@ class VanillaAttn(OperationImpl):
 
         if softmax_aux is not None:
             # Settled sink layout (r15 S07-1): 1-D of length Hq is per query head, any other 1-D length is
-            # shared; 2-D rows are Hq (per head), Hkv (per KV head, blocked GQA repeat) or 1 (shared).
+            # shared; 2-D rows are Hq (per head), Hkv (per KV head, blocked GQA repeat) or 1 (shared);
+            # 4-D (B, Hq|Hkv|1, Q|1, S) carries per-token dynamic sinks (e.g. Inkling 2).
             aux = jnp.asarray(softmax_aux, dtype=logits.dtype)
-            if aux.ndim == 1:
-                aux = aux[:, None] if aux.shape[0] == num_q_heads else aux[None, :]
-            if aux.ndim != 2:
-                raise ValueError(f"softmax_aux must be 1-D or 2-D, got shape {aux.shape}.")
-            if aux.shape[0] == num_q_heads:
-                pass
-            elif aux.shape[0] == 1:
-                aux = jnp.broadcast_to(aux, (num_q_heads, aux.shape[1]))
-            elif aux.shape[0] == num_kv_heads and num_q_heads % num_kv_heads == 0:
-                aux = jnp.repeat(aux, num_q_heads // num_kv_heads, axis=0)
+            if aux.ndim == 4:
+                if aux.shape[0] not in (1, batch_size) or aux.shape[2] not in (1, q_len):
+                    raise ValueError(
+                        f"4-D softmax_aux must match batch ({batch_size}) and q_len ({q_len}) or 1; "
+                        f"got shape {aux.shape}."
+                    )
+                if aux.shape[1] == num_q_heads:
+                    pass
+                elif aux.shape[1] == 1:
+                    pass
+                elif aux.shape[1] == num_kv_heads and num_q_heads % num_kv_heads == 0:
+                    aux = jnp.repeat(aux, num_q_heads // num_kv_heads, axis=1)
+                else:
+                    raise ValueError(
+                        f"4-D softmax_aux head dim must be 1, num_kv_heads ({num_kv_heads}) or "
+                        f"num_q_heads ({num_q_heads}); got shape {aux.shape}."
+                    )
+                aux = jnp.broadcast_to(aux, (batch_size, num_q_heads, q_len, aux.shape[-1]))
             else:
-                raise ValueError(
-                    f"softmax_aux rows must be 1, num_kv_heads ({num_kv_heads}) or num_q_heads ({num_q_heads}); "
-                    f"got shape {aux.shape}."
-                )
-            aux = jnp.broadcast_to(aux[None, :, None, :], (batch_size, num_q_heads, q_len, aux.shape[-1]))
+                if aux.ndim == 1:
+                    aux = aux[:, None] if aux.shape[0] == num_q_heads else aux[None, :]
+                if aux.ndim != 2:
+                    raise ValueError(f"softmax_aux must be 1-D, 2-D, or 4-D, got shape {aux.shape}.")
+                if aux.shape[0] == num_q_heads:
+                    pass
+                elif aux.shape[0] == 1:
+                    aux = jnp.broadcast_to(aux, (num_q_heads, aux.shape[1]))
+                elif aux.shape[0] == num_kv_heads and num_q_heads % num_kv_heads == 0:
+                    aux = jnp.repeat(aux, num_q_heads // num_kv_heads, axis=0)
+                else:
+                    raise ValueError(
+                        f"softmax_aux rows must be 1, num_kv_heads ({num_kv_heads}) or num_q_heads ({num_q_heads}); "
+                        f"got shape {aux.shape}."
+                    )
+                aux = jnp.broadcast_to(aux[None, :, None, :], (batch_size, num_q_heads, q_len, aux.shape[-1]))
             all_logits = jnp.concatenate([logits, aux], axis=-1)
         else:
             all_logits = logits

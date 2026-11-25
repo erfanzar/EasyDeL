@@ -70,6 +70,8 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "gradient_accumulation_mode": "execution",
         "warmup_steps": 250,
         "weight_decay": 0.05,
+        "param_lr_multipliers": {"loop_gates": 10.0, "loop_iter_embeddings": 10.0},
+        "no_weight_decay_patterns": ["loop_gates", "loop_iter_embeddings"],
         "clip_grad": 1.5,
         "optimizer": EasyDeLOptimizers.LION,
         "scheduler": EasyDeLSchedulers.COSINE,
@@ -261,6 +263,7 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "xla_compiler_options": {"xla_tpu_enable_latency_hiding_scheduler": "true"},
         "host_phase_log_path": "/tmp/roundtrip-host-phases.jsonl",
         "sequence_packing": True,
+        "data_lane_local_batch": True,
         "process_encoder": {"enabled": True, "row_bucket_multiple": 4, "max_rows_per_step": 16},
         # Training buckets (runtime-only objects excluded from to_dict;
         # bucket_rule survives as a reconstructed BucketRule) ----

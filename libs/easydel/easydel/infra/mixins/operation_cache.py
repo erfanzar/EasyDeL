@@ -40,7 +40,7 @@ Module exports:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from easydel.caching.budget import PagedCacheBudget, cap_paged_cache_pages, compute_paged_cache_budget
 from easydel.operations import OperationRegistry
@@ -520,8 +520,9 @@ class OperationCacheMixin:
         prefill_op = attn_mechanism or "vanilla"
         decode_op = decode_attn_mechanism or prefill_op
 
-        layer_types = getattr(config, "layer_types", None)
-        num_hidden_layers = getattr(config, "num_hidden_layers", 1)
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+        layer_types = getattr(text_config, "effective_layer_types", None) or getattr(text_config, "layer_types", None)
+        num_hidden_layers = getattr(text_config, "num_cache_layers", None) or getattr(text_config, "num_hidden_layers", 1)
 
         layers: list[LayerOperationInfo] = []
         combined_cache = CacheType.any()
@@ -837,9 +838,44 @@ class OperationCacheMixin:
             if cache_slot_counts.get(layer.layer_index, 0) <= 1:
                 layer.slot = None
 
+        layers = self._expand_layers_for_loop_schedule(layers)
         layers.sort(key=lambda x: (x.layer_index, x.slot or "", x.operation_name))
 
         return self._build_cache_info_from_layers(layers, has_separate_decode)
+
+    def _expand_layers_for_loop_schedule(
+        self,
+        layers: list[LayerOperationInfo],
+    ) -> list[LayerOperationInfo]:
+        """Expand physical per-layer operations across virtual looped cache slots.
+
+        For non-looped models this is a no-op. For looped models whose
+        ``text_config.loop_layer_schedule`` repeats a shared middle block, each
+        virtual execution slot gets its own ``LayerOperationInfo`` entry pointing
+        to the slot index so every loop pass owns an isolated KV / recurrent view.
+        """
+        config = getattr(self, "config", None)
+        if config is None or not layers:
+            return layers
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+        if not getattr(text_config, "is_looped", False):
+            return layers
+
+        schedule = text_config.loop_layer_schedule
+        by_physical: dict[int, list[LayerOperationInfo]] = {}
+        passthrough: list[LayerOperationInfo] = []
+        for info in layers:
+            # Keep vision / non-cache operations untouched; only decoder cache-bearing layers loop.
+            if info.layer_type == "vision_attention" or info.requirements.cache.cache_view_class is None:
+                passthrough.append(info)
+            else:
+                by_physical.setdefault(info.layer_index, []).append(info)
+
+        expanded: list[LayerOperationInfo] = list(passthrough)
+        for slot_idx, (phys_idx, _loop_iter) in enumerate(schedule):
+            for info in by_physical.get(phys_idx, ()):
+                expanded.append(replace(info, layer_index=slot_idx))
+        return expanded
 
     def _extract_layer_index_from_path(self, path: tuple) -> int:
         """Extract layer index from module path.

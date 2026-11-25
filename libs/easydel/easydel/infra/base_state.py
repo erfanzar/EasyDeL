@@ -1057,6 +1057,48 @@ class EasyDeLState(_PyTreeNode):
         # 1. Per-leaf NamedShardings -- MPMD-aware (per-stage submesh preserved).
         param_shardings = spx.extract_sharding_structure(self.graphstate, mesh=mesh)
 
+        # Fast path for single-mesh SPMD (pp=1): evaluate the abstract opt-state
+        # structure once and materialize all optimizer leaves in a single jitted
+        # XLA call rather than dispatching thousands of eager zero-init kernels
+        # and per-leaf device_puts. Multi-submesh MPMD falls through to the
+        # per-leaf placement path below because jax.jit rejects multi-mesh
+        # out_shardings.
+        opt_state_struct = None
+        try:
+            opt_state_struct = jax.eval_shape(tx.init, self.graphstate)
+        except Exception:
+            opt_state_struct = None
+
+        if opt_state_struct is not None:
+            out_shardings = _optimizer_state_shardings_from_params(tx, opt_state_struct, param_shardings, replicated)
+            sharding_leaves = jax.tree_util.tree_leaves(
+                out_shardings,
+                is_leaf=lambda x: isinstance(x, jax.sharding.Sharding) or x is None,
+            )
+            param_sharding_leaves = jax.tree_util.tree_leaves(
+                param_shardings,
+                is_leaf=lambda x: isinstance(x, jax.sharding.Sharding) or x is None,
+            )
+            all_named = all(isinstance(s, jax.sharding.NamedSharding) for s in sharding_leaves if s is not None)
+            all_param_named = all(
+                isinstance(s, jax.sharding.NamedSharding) for s in param_sharding_leaves if s is not None
+            )
+            meshes = {
+                s.mesh
+                for s in (*sharding_leaves, *param_sharding_leaves)
+                if isinstance(s, jax.sharding.NamedSharding) and isinstance(getattr(s, "mesh", None), jax.sharding.Mesh)
+            }
+            struct_leaves = jax.tree_util.tree_leaves(opt_state_struct)
+            all_array_leaves = all(isinstance(leaf, (jax.ShapeDtypeStruct, jax.Array)) for leaf in struct_leaves)
+            if all_named and all_param_named and len(meshes) == 1 and all_array_leaves:
+                single_mesh = next(iter(meshes))
+                with single_mesh:
+                    opt_state = jax.jit(tx.init, out_shardings=out_shardings)(self.graphstate)
+                opt_state = spx.place_setup_tree_with_shardings(
+                    opt_state, out_shardings, label="EasyDeLState.init_tx"
+                )
+                return self.replace(tx=tx, opt_state=opt_state)
+
         opt_state = tx.init(self.graphstate)
 
         # 2. Mirror each param's NamedSharding onto its matching opt-state slot.

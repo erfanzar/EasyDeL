@@ -1205,8 +1205,10 @@ def _count_kv_layers(text_config) -> int:
     Returns:
         int: Number of layers that need KV pages allocated.
     """
-    num_hidden_layers = int(getattr(text_config, "num_hidden_layers", 1) or 1)
-    layer_types = getattr(text_config, "layer_types", None)
+    num_hidden_layers = int(
+        getattr(text_config, "num_cache_layers", None) or getattr(text_config, "num_hidden_layers", 1) or 1
+    )
+    layer_types = getattr(text_config, "effective_layer_types", None) or getattr(text_config, "layer_types", None)
     if isinstance(layer_types, (list, tuple)):
         num_kv_layers = sum(1 for layer_type in layer_types if _is_kv_attention_layer_type(layer_type))
         if num_kv_layers > 0:
@@ -1485,9 +1487,17 @@ class EasyGenerationMixin:
         if pad_token_id is None:
             pad_token_id = getattr(text_config, "pad_token_id", 0)
 
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+        num_hidden_layers = getattr(text_config, "num_cache_layers", None) or getattr(
+            text_config, "num_hidden_layers", 1
+        )
 
-        num_kv_heads, key_dim, value_dim = _resolve_expanded_kv_cache_geometry(text_config, layer_idx=layer_idx)
+        phys_layer_idx = layer_idx
+        if layer_idx is not None and getattr(text_config, "is_looped", False):
+            schedule = text_config.loop_layer_schedule
+            if 0 <= int(layer_idx) < len(schedule):
+                phys_layer_idx = schedule[int(layer_idx)][0]
+
+        num_kv_heads, key_dim, value_dim = _resolve_expanded_kv_cache_geometry(text_config, layer_idx=phys_layer_idx)
 
         return TransformerCacheConfig.create(
             batch_size=batch_size,
@@ -1524,7 +1534,9 @@ class EasyGenerationMixin:
         if partition_axis is None:
             partition_axis = PartitionAxis()
 
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+        num_hidden_layers = getattr(text_config, "num_cache_layers", None) or getattr(
+            text_config, "num_hidden_layers", 1
+        )
 
         # 1) Qwen3-Next / GatedDeltaRule-style linear attention
         has_linear_attn_fields = any(
@@ -2182,7 +2194,9 @@ class EasyGenerationMixin:
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
 
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+        num_hidden_layers = getattr(text_config, "num_cache_layers", None) or getattr(
+            text_config, "num_hidden_layers", None
+        )
         if num_hidden_layers is None:
             num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
 
@@ -2615,7 +2629,13 @@ class EasyGenerationMixin:
                 otherwise the shared masking-details object.
             """
             if isinstance(masking_details, dict):
-                return masking_details.get(layer_index)
+                if layer_index in masking_details:
+                    return masking_details.get(layer_index)
+                if getattr(text_config, "is_looped", False):
+                    schedule = text_config.loop_layer_schedule
+                    if 0 <= int(layer_index) < len(schedule):
+                        return masking_details.get(schedule[int(layer_index)][0])
+                return None
             return masking_details
 
         if dtype is None:
@@ -2626,7 +2646,9 @@ class EasyGenerationMixin:
         recurrent_cache_dtype = _resolve_recurrent_cache_dtype(text_config, dtype)
 
         with self.mesh:
-            num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+            num_hidden_layers = getattr(text_config, "num_cache_layers", None) or getattr(
+                text_config, "num_hidden_layers", None
+            )
             if num_hidden_layers is None:
                 num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
 

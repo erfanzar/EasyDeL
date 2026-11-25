@@ -403,3 +403,55 @@ def test_block_scan_keeps_a_shared_rng_threaded_like_the_python_loop():
     ref = looped.scan(lambda m, c: m(c), x, trace=True)
     np.testing.assert_allclose(np.asarray(out), np.asarray(ref), rtol=1e-6, atol=1e-6)
     assert rngs.stream("default")._unpack()[2] == looped_rngs.stream("default")._unpack()[2]
+
+
+class _SilentRngDense(_Dense):
+    """Holds a shared ``Rngs`` stream (like disabled Dropout) without drawing from it."""
+
+    def __init__(self, k, key, rngs):
+        super().__init__(k, key)
+        self.rngs = rngs
+
+
+def test_unwritten_shared_rng_allows_block_scan_prefetch_and_readonly_transform():
+    """Unwritten shared RNG streams must not raise IllegalMutationError or disable block_scan/prefetch."""
+    from spectrax.rng.rngs import Rngs
+
+    keys = iter(jax.random.split(jax.random.PRNGKey(9), 32))
+    rngs = Rngs(0)
+    mods = []
+    for b in range(3):
+        mods += [_Mlp(next(keys)), _SilentRngDense(b, next(keys), rngs), _SilentRngDense(b + 1, next(keys), rngs)]
+    layers = ModuleList(mods)
+    mesh = _mesh()
+
+    # 1. Read-only transform (no mutable rng collection, like teacher_forward in distillation):
+    #    must succeed for both plain scan and block_scan + prefetch_axes without IllegalMutationError.
+    gdef, state = spx.export(layers)
+    with use_mesh(mesh), jax.default_matmul_precision("highest"):
+        st = _place(state, mesh)
+        x = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(2), (BATCH, D), jnp.float32), NamedSharding(mesh, P("fsdp", None))
+        )
+
+        @spx.jit
+        def _readonly_plain(m, inp):
+            return m.scan(lambda layer, c: layer(c), inp, block_scan=False)
+
+        @spx.jit
+        def _readonly_prefetch(m, inp):
+            return m.scan(lambda layer, c: layer(c), inp, block_scan=True, prefetch_axes=("fsdp",))
+
+        bound = spx.bind(gdef, st)
+        y_plain = _readonly_plain(bound, x)
+        y_prefetch = _readonly_prefetch(bound, x)
+        np.testing.assert_allclose(np.asarray(y_prefetch), np.asarray(y_plain), rtol=1e-5, atol=1e-5)
+
+        # Verify prefetch_axes actually lowered through custom_vjp_call despite the shared unwritten RNG.
+        fwd_jaxpr = jax.make_jaxpr(
+            lambda s_in, inp: spx.bind(gdef, s_in).scan(
+                lambda layer, c: layer(c), inp, block_scan=True, prefetch_axes=("fsdp",)
+            )
+        )(st, x)
+        assert "custom_vjp_call" in str(fwd_jaxpr)
+        assert rngs.stream("default")._unpack()[2] == 0

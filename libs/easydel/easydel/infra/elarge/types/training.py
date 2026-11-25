@@ -547,6 +547,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     scheduler: NotRequired[str]
     warmup_steps: NotRequired[int]
     weight_decay: NotRequired[float]
+    param_lr_multipliers: NotRequired[dict[str, float] | None]
+    no_weight_decay_patterns: NotRequired[list[str] | None]
     clip_grad: NotRequired[float | None]
     extra_optimizer_kwargs: NotRequired[dict]
     custom_scheduler: NotRequired[Any]

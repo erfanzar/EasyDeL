@@ -106,6 +106,37 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         output_router_logits: Whether to output router logits.
         router_aux_loss_coef: Coefficient for auxiliary routing loss.
         mlp_only_layers: Layer indices that use dense MLP instead of MoE.
+        loop_start_layer: Optional inclusive start index of the shared recurrent
+            loop core (GLM-5.4-style Loop Transformer). ``None`` disables looping.
+        loop_end_layer: Optional exclusive end index of the shared loop core
+            (``0 <= loop_start_layer < loop_end_layer <= num_hidden_layers``).
+        num_loop_iterations: Number of times the ``[loop_start_layer, loop_end_layer)``
+            block executes per forward pass. ``1`` disables looping; ``2`` runs a
+            GLM-5.4-style 2-pass loop with per-token gated progressive updates.
+        loop_gate_type: Granularity of the per-token progressive update gate
+            (``"scalar"`` for ``[B, S, 1]`` or ``"channel"`` for ``[B, S, H]``).
+        loop_gate_init_biases: Optional per-iteration initial bias values for the
+            sigmoid loop gates. Defaults to ``(-5.0, ..., -5.0, 5.0)`` so Pass 1
+            starts near identity and the final pass commits ~1.0, giving near-exact
+            step-0 function preservation when uptraining from a pure checkpoint.
+        loop_use_iteration_embedding: When ``True``, adds a zero-initialized
+            per-iteration learned embedding before each loop pass to help dense
+            FFN layers specialize across iterations.
+        loop_kv_cache_mode: KV caching strategy for looped full-attention layers
+            on Pass 2+:
+            - ``"separate"`` (default): allocates a full-length KV cache slot per
+              loop pass (simplest, zero custom kernels, full global Pass-2 KV).
+            - ``"hybrid_sliding_window"``: GLM-5.4 Hybrid KV Cache — Pass 2+
+              reuses Pass 1's global KV stream and maintains only a fixed
+              ``loop_kv_sliding_window`` local KV ring buffer (e.g. 128 tokens).
+        loop_kv_sliding_window: Local sliding-window width (tokens) for Pass 2+
+            when ``loop_kv_cache_mode="hybrid_sliding_window"``. Defaults to 128
+            (matching GLM-5.4).
+        loop_kv_overlap: When ``True`` (GLM-5.4 default), Pass-1 global KV and
+            Pass-2 local sliding-window KV overlap on recent positions so Pass 2
+            attends to both streams simultaneously. When ``False``, partitions
+            history disjointly (``[0..t-W]`` from Pass 1, ``[t-W+1..t]`` from
+            Pass 2) for exact step-0 identity at arbitrary sequence lengths.
     """
 
     model_type = "qwen3_next"
@@ -158,6 +189,15 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
+        loop_start_layer: int | None = None,
+        loop_end_layer: int | None = None,
+        num_loop_iterations: int = 1,
+        loop_gate_type: str = "scalar",
+        loop_gate_init_biases: list[float] | tuple[float, ...] | None = None,
+        loop_use_iteration_embedding: bool = False,
+        loop_kv_cache_mode: str = "separate",
+        loop_kv_sliding_window: int = 128,
+        loop_kv_overlap: bool = True,
         **kwargs,
     ):
         """Initialize Qwen3NextConfig with hybrid attention and MoE hyperparameters.
@@ -223,10 +263,161 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
 
+        self.loop_start_layer = loop_start_layer
+        self.loop_end_layer = loop_end_layer
+        self.num_loop_iterations = int(num_loop_iterations)
+        self.loop_gate_type = str(loop_gate_type)
+        self.loop_gate_init_biases = (
+            [float(v) for v in loop_gate_init_biases] if loop_gate_init_biases is not None else None
+        )
+        self.loop_use_iteration_embedding = bool(loop_use_iteration_embedding)
+        self.loop_kv_cache_mode = str(loop_kv_cache_mode)
+        self.loop_kv_sliding_window = int(loop_kv_sliding_window)
+        self.loop_kv_overlap = bool(loop_kv_overlap)
+
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        self.validate_loop_config()
+
+    def validate_loop_config(self) -> None:
+        """Validate Loop Transformer parameters (safe to call again after ``config_kwargs`` mutation)."""
+        num_loops = int(getattr(self, "num_loop_iterations", 1) or 1)
+        self.num_loop_iterations = num_loops
+        if num_loops < 1:
+            raise ValueError(f"num_loop_iterations must be >= 1, got {num_loops}.")
+
+        start = getattr(self, "loop_start_layer", None)
+        end = getattr(self, "loop_end_layer", None)
+        if num_loops == 1:
+            if (start is None) ^ (end is None):
+                raise ValueError(
+                    f"loop_start_layer ({start}) and loop_end_layer ({end}) must both be set or both be None."
+                )
+            return
+
+        if start is None or end is None:
+            raise ValueError(
+                f"num_loop_iterations={num_loops} > 1 requires both loop_start_layer and loop_end_layer to be set."
+            )
+        start = int(start)
+        end = int(end)
+        self.loop_start_layer = start
+        self.loop_end_layer = end
+
+        if not (0 <= start < end <= self.num_hidden_layers):
+            raise ValueError(
+                f"Invalid loop range [{start}, {end}) for num_hidden_layers={self.num_hidden_layers}. "
+                "Expected 0 <= loop_start_layer < loop_end_layer <= num_hidden_layers."
+            )
+
+        gate_type = str(getattr(self, "loop_gate_type", "scalar"))
+        if gate_type not in ("scalar", "channel"):
+            raise ValueError(f"loop_gate_type must be 'scalar' or 'channel', got {gate_type!r}.")
+        self.loop_gate_type = gate_type
+
+        kv_mode = str(getattr(self, "loop_kv_cache_mode", "separate"))
+        if kv_mode not in ("separate", "hybrid_sliding_window"):
+            raise ValueError(
+                f"loop_kv_cache_mode must be 'separate' or 'hybrid_sliding_window', got {kv_mode!r}."
+            )
+        self.loop_kv_cache_mode = kv_mode
+        kv_sw = int(getattr(self, "loop_kv_sliding_window", 128) or 0)
+        if kv_mode == "hybrid_sliding_window" and kv_sw <= 0:
+            raise ValueError(f"loop_kv_sliding_window must be > 0 in hybrid_sliding_window mode, got {kv_sw}.")
+        self.loop_kv_sliding_window = kv_sw
+        self.loop_kv_overlap = bool(getattr(self, "loop_kv_overlap", True))
+
+        biases = getattr(self, "loop_gate_init_biases", None)
+        if biases is not None:
+            biases = [float(v) for v in biases]
+            if len(biases) != num_loops:
+                raise ValueError(
+                    f"loop_gate_init_biases length ({len(biases)}) must match num_loop_iterations ({num_loops})."
+                )
+            self.loop_gate_init_biases = biases
+
+        interval = int(getattr(self, "full_attention_interval", 1) or 1)
+        if interval > 1 and (start % interval != 0 or (end - start) % interval != 0):
+            logger.warning(
+                "Loop block [%d, %d) is not aligned to full_attention_interval=%d; "
+                "re-entering the loop will shift the 3:1 GatedDeltaNet/FullAttention cadence.",
+                start,
+                end,
+                interval,
+            )
+
+    @property
+    def is_looped(self) -> bool:
+        """Whether the middle loop block executes for multiple iterations per forward pass."""
+        return (
+            int(getattr(self, "num_loop_iterations", 1) or 1) > 1
+            and getattr(self, "loop_start_layer", None) is not None
+            and getattr(self, "loop_end_layer", None) is not None
+        )
+
+    @property
+    def resolved_loop_gate_init_biases(self) -> tuple[float, ...]:
+        """Per-iteration initial sigmoid gate biases (defaults to ``(-5.0, ..., -5.0, 5.0)``)."""
+        num_loops = int(getattr(self, "num_loop_iterations", 1) or 1)
+        biases = getattr(self, "loop_gate_init_biases", None)
+        if biases is not None:
+            return tuple(float(v) for v in biases)
+        if num_loops <= 1:
+            return ()
+        return (*([-5.0] * (num_loops - 1)), 5.0)
+
+    @property
+    def loop_layer_schedule(self) -> tuple[tuple[int, int], ...]:
+        """Ordered ``(physical_layer_idx, loop_iteration)`` schedule for forward execution and cache views."""
+        if not self.is_looped:
+            return tuple((idx, 0) for idx in range(self.num_hidden_layers))
+        self.validate_loop_config()
+        start = int(self.loop_start_layer)  # type: ignore[arg-type]
+        end = int(self.loop_end_layer)  # type: ignore[arg-type]
+        schedule: list[tuple[int, int]] = [(idx, 0) for idx in range(0, start)]
+        for it in range(self.num_loop_iterations):
+            for idx in range(start, end):
+                schedule.append((idx, it))
+        schedule.extend((idx, 0) for idx in range(end, self.num_hidden_layers))
+        return tuple(schedule)
+
+    @property
+    def num_cache_layers(self) -> int:
+        """Total cache view slots (physical layers + extra slots for looped iterations)."""
+        return len(self.loop_layer_schedule)
+
+    @property
+    def effective_layer_types(self) -> list[str] | None:
+        """Per-cache-slot attention types expanded over looped iterations."""
+        if self.layer_types is None or not self.is_looped:
+            return self.layer_types
+        return [self.layer_types[phys_idx] for phys_idx, _ in self.loop_layer_schedule]
+
+    def get_mask_details(self) -> dict[int, object] | None:
+        """Return per-cache-slot attention mask details for GLM-5.4 Hybrid KV caching.
+
+        When ``loop_kv_cache_mode == "hybrid_sliding_window"``, Pass 2+ of looped
+        full-attention layers receive ``AttnMaskDetail(SLIDING, size=loop_kv_sliding_window)``
+        so ``TransformerCacheView.init`` allocates only a fixed ``W``-token local
+        ring buffer instead of duplicating the full-context KV cache.
+        """
+        if not self.is_looped or getattr(self, "loop_kv_cache_mode", "separate") != "hybrid_sliding_window":
+            return None
+        from easydel.caching.transformer.cache import AttnMaskDetail
+        from easydel.infra.utils import AttnMaskType
+
+        window = int(self.loop_kv_sliding_window)
+        details: dict[int, object] = {}
+        for slot_idx, (phys_idx, loop_iter) in enumerate(self.loop_layer_schedule):
+            if not self.is_full_attention_layer(phys_idx):
+                details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.LINEAR, size=None)
+            elif loop_iter > 0:
+                details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=window)
+            else:
+                details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.FULL, size=None)
+        return details or None
 
     @property
     def rotary_dim(self) -> int:

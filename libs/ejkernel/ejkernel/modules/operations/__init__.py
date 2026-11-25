@@ -198,6 +198,8 @@ from .configs import (
     DeepSeekAttentionConfig,
     DsaGatherAttentionConfig,
     DsaSparseAttentionConfig,
+    DualStreamAttentionConfig,
+    DualStreamRaggedPageAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
     FusedCakldTvConfig,
@@ -256,6 +258,8 @@ from .decode_attention import DecodeAttention, decode_attention
 from .deepseek_attn import DeepSeekAttention, deepseek_attn
 from .dsa_gather_attention import DsaGatherAttention, dsa_gather_attention
 from .dsa_sparse_attention import DSA_SPARSE_MAX_TAIL_KEYS, DsaSparseAttention, dsa_sparse_attention, pack_pool_bits
+from .dual_stream_attention import DualStreamAttention, dual_stream_attention
+from .dual_stream_ragged_page_attention import DualStreamRaggedPageAttention, dual_stream_ragged_page_attention
 from .flash_attention import FlashAttention, flash_attention
 from .fused_cakld_tv import CakldTvOutput, FusedCakldTv, fused_cakld_tv
 from .fused_conv_decode import FusedConvDecode, fused_conv_decode, fused_conv_decode_op
@@ -444,6 +448,10 @@ __all__ = (
     "DsaGatherAttentionConfig",
     "DsaSparseAttention",
     "DsaSparseAttentionConfig",
+    "DualStreamAttention",
+    "DualStreamAttentionConfig",
+    "DualStreamRaggedPageAttention",
+    "DualStreamRaggedPageAttentionConfig",
     "FlashAttention",
     "FlashAttentionConfig",
     "FlashMLA",
@@ -581,6 +589,8 @@ __all__ = (
     "deepseek_attn",
     "dsa_gather_attention",
     "dsa_sparse_attention",
+    "dual_stream_attention",
+    "dual_stream_ragged_page_attention",
     "flash_attention",
     "flash_mla",
     "fused_cakld_tv",

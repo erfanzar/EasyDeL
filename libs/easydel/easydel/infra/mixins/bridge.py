@@ -2870,11 +2870,65 @@ class EasyBridgeMixin(PushToHubMixin):
                 # Old EasyDeL saves either omitted the collection wrapper or used
                 # the legacy `params` collection name; align them to the live model.
                 state = _adapt_legacy_checkpoint_collections(state, required_params)
+                pre_upgrade_keys = set(state.keys())
                 # Model-specific reshaping of leaves from older native saves
-                # (e.g. Kimi-Linear's per-head KDA gates).
+                # (e.g. Kimi-Linear's per-head KDA gates, or newly added Loop
+                # Transformer gates when loading an unlooped base checkpoint).
                 _upgrade_legacy = getattr(model, "_upgrade_legacy_native_state", None)
                 if callable(_upgrade_legacy):
                     state = _upgrade_legacy(state, required_param_leaves)
+                upgraded_numpy_keys = {
+                    key
+                    for key in set(state.keys()) - pre_upgrade_keys
+                    if isinstance(state.get(key), np.ndarray | np.generic)
+                }
+                if upgraded_numpy_keys and mesh is not None:
+                    _up_rules = tuple(sharding_rules or ())
+                    _up_literal: dict[str, tp.Any] = {}
+                    _up_prefix, _up_suffix = r"^(?:.*/)?", r"(?:/.*)?$"
+                    for _pat, _shard in _up_rules:
+                        _core = _pat
+                        if _core.startswith(_up_prefix):
+                            _core = _core[len(_up_prefix) :]
+                        if _core.endswith(_up_suffix):
+                            _core = _core[: -len(_up_suffix)]
+                        _plain = re.sub(r"\\(.)", r"\1", _core)
+                        if re.escape(_plain) == _core:
+                            _up_literal.setdefault(_plain, _shard)
+
+                    _jax_mesh = getattr(mesh, "jax_mesh", mesh)
+                    _replicated = jax.sharding.NamedSharding(_jax_mesh, jax.sharding.PartitionSpec())
+
+                    def _up_sharding_for(key_tuple):
+                        parts = [str(p) for p in key_tuple]
+                        if parts and parts[0] in ("parameters", "params", "buffers"):
+                            parts = parts[1:]
+                        path = "/".join(parts)
+                        hit = _up_literal.get(path)
+                        if hit is not None:
+                            return hit
+                        for pat, shard in _up_rules:
+                            if re.fullmatch(pat, path):
+                                return shard
+                        return _replicated
+
+                    for _ukey in upgraded_numpy_keys:
+                        _uval = np.asarray(state[_ukey])
+                        _target_dt = fp32_pinned_dtype(_ukey, param_dtype, fp32_patterns)
+                        _target_sh = _up_sharding_for(_ukey)
+                        if jnp.issubdtype(jnp.dtype(_uval.dtype), jnp.inexact) and jnp.dtype(_uval.dtype) != _target_dt:
+                            _np_dt = np.dtype(_target_dt)
+                            state[_ukey] = jax.make_array_from_callback(
+                                _uval.shape,
+                                _target_sh,
+                                lambda idx, _a=_uval, _dt=_np_dt: np.asarray(_a[idx], dtype=_dt),
+                            )
+                        else:
+                            state[_ukey] = jax.make_array_from_callback(
+                                _uval.shape,
+                                _target_sh,
+                                lambda idx, _a=_uval: _a[idx],
+                            )
                 model_config = getattr(model, "config", None)
                 tie_word_embeddings = bool(getattr(model_config, "tie_word_embeddings", False))
                 text_config = getattr(model_config, "text_config", None)

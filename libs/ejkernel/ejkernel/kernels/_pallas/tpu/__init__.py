@@ -60,6 +60,8 @@ from .compressed_window_decode import compressed_window_decode
 from .deepseek_attn import deepseek_attn
 from .dsa_gather_attention import dsa_gather_attention
 from .dsa_sparse_attention import dsa_sparse_attention
+from .dual_stream_attention import dual_stream_attention
+from .dual_stream_ragged_page_attention import dual_stream_ragged_page_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
 from .fused_conv_decode import fused_conv_decode
@@ -117,6 +119,8 @@ __all__ = (
     "deepseek_attn",
     "dsa_gather_attention",
     "dsa_sparse_attention",
+    "dual_stream_attention",
+    "dual_stream_ragged_page_attention",
     "flash_attention",
     "flash_mla",
     "fused_conv_decode",

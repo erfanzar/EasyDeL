@@ -1157,7 +1157,11 @@ class eSurgeRunner:
                 if hasattr(config, name) and hasattr(self.metadata, name):
                     setattr(config, name, getattr(self.metadata, name))
             configs.append(config)
-        layer_count = int(getattr(self.model.config.get_text_config(), "num_hidden_layers", len(layer_groups)))
+        text_cfg = self.model.config.get_text_config()
+        layer_count = int(
+            getattr(text_cfg, "num_cache_layers", None)
+            or getattr(text_cfg, "num_hidden_layers", len(layer_groups))
+        )
         if set(layer_groups) != set(range(layer_count)):
             raise ValueError("KV pool ownership must cover every model layer")
         return tuple(configs), tuple(layer_groups[index] for index in range(layer_count))
@@ -1323,8 +1327,10 @@ class eSurgeRunner:
             text_config = self.model.config.get_text_config()
             model_type = getattr(text_config, "model_type", "unknown")
             attn_mechanism = getattr(text_config, "attn_mechanism", "unknown")
-            num_layers = getattr(text_config, "num_hidden_layers", 0)
-            layer_types = getattr(text_config, "layer_types", None)
+            num_layers = getattr(text_config, "num_cache_layers", None) or getattr(text_config, "num_hidden_layers", 0)
+            layer_types = getattr(text_config, "effective_layer_types", None) or getattr(
+                text_config, "layer_types", None
+            )
             cache_info = None
             try:
                 cache_info = self.model.get_operations_cache_info()

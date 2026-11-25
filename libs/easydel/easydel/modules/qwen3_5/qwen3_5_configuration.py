@@ -166,6 +166,15 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         mtp_use_dedicated_embeddings: bool = False,
         mtp_loss_coef: float = 0.3,
         attn_output_gate: bool = True,
+        loop_start_layer: int | None = None,
+        loop_end_layer: int | None = None,
+        num_loop_iterations: int = 1,
+        loop_gate_type: str = "scalar",
+        loop_gate_init_biases: list[float] | tuple[float, ...] | None = None,
+        loop_use_iteration_embedding: bool = False,
+        loop_kv_cache_mode: str = "separate",
+        loop_kv_sliding_window: int = 128,
+        loop_kv_overlap: bool = True,
         **kwargs,
     ):
         """Initialize Qwen3.5 text config with hybrid attention and MoE parameters.
@@ -221,6 +230,15 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             mlp_only_layers=mlp_only_layers,
             linear_attention_separate_proj=bool(linear_attention_separate_proj),
             linear_attention_merged_split_proj=linear_attention_merged_split_proj,
+            loop_start_layer=loop_start_layer,
+            loop_end_layer=loop_end_layer,
+            num_loop_iterations=num_loop_iterations,
+            loop_gate_type=loop_gate_type,
+            loop_gate_init_biases=loop_gate_init_biases,
+            loop_use_iteration_embedding=loop_use_iteration_embedding,
+            loop_kv_cache_mode=loop_kv_cache_mode,
+            loop_kv_sliding_window=loop_kv_sliding_window,
+            loop_kv_overlap=loop_kv_overlap,
             **kwargs,
         )
         # Mirror HF naming for rope config interop.

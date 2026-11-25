@@ -1451,6 +1451,8 @@ class eLargeModel:
 
         aux_config = dict(self._config)
         aux_config["model"] = section
+        if self._config.get(f"{role}_base_config"):
+            aux_config["base_config"] = self._config[f"{role}_base_config"]
         if self._config.get(f"{role}_loader"):
             aux_config["loader"] = self._config[f"{role}_loader"]
         override_sharding = self._config.get(f"{role}_sharding")

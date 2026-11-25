@@ -73,6 +73,7 @@ from easydel.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextModel,
     Qwen3NextRMSNorm,
     Qwen3NextSparseMoeBlock,
+    materialize_missing_loop_state,
 )
 from easydel.modules.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VisionTransformerPretrainedModel,
@@ -532,6 +533,16 @@ class Qwen3_5ForCausalLM(Qwen3_5MTPMixin, Qwen3NextForCausalLM):
         else:
             self.mtp = None
 
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Remap VLM-nested language_model keys when loading as text-only CausalLM, then init missing loop gates."""
+        for key in list(state):
+            if key in expected_leaves or len(key) < 3 or key[1:3] != ("model", "language_model"):
+                continue
+            target = (key[0], "model", *key[3:])
+            if target in expected_leaves and target not in state:
+                state[target] = state.pop(key)
+        return materialize_missing_loop_state(self.config, state, expected_leaves)
+
     def forward(
         self,
         input_ids: jax.Array | None = None,
@@ -675,6 +686,10 @@ class Qwen3_5Model(Qwen3VLModel):
             precision=precision,
             rngs=rngs,
         )
+
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Auto-initialize missing loop gate leaves when loading a pure checkpoint."""
+        return materialize_missing_loop_state(self.config, state, expected_leaves)
 
     def forward(
         self,
@@ -862,6 +877,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5VisionMTPMixin, BaseVisionLanguageM
             )
         else:
             self.mtp = None
+
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Auto-initialize missing loop gate leaves when loading a pure checkpoint."""
+        return materialize_missing_loop_state(self.config, state, expected_leaves)
 
     def forward(self, *args, **kwargs):
         """Vision-language forward with the MTP auxiliary loss folded in.

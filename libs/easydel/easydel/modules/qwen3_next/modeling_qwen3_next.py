@@ -59,7 +59,9 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import spectrax as spx
+from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
@@ -75,6 +77,7 @@ from spectrax import (
 from easydel.caching import (
     HybridCache,
     OperationsMetadata,
+    ParallelHybridCacheView,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -83,6 +86,7 @@ from easydel.caching import (
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
+    UnifiedAttentionCacheView,
 )
 from easydel.caching.shared_prefix import is_shared_prefix_recurrent_view
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -112,6 +116,7 @@ from easydel.layers import (
     FusedSegment,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    ParallelLinear,
     RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
@@ -138,7 +143,7 @@ from easydel.layers.linear_attention import (
 )
 from easydel.layers.norms import RMSNorm, lowfloats
 from easydel.modules._base import BaseCausalLMModule
-from easydel.operations import OperationMetadata
+from easydel.operations import OperationMetadata, OperationRegistry
 from easydel.operations.kernels import (
     GatedDeltaRuleOp,
     GatedDeltaRuleOutput,
@@ -150,6 +155,8 @@ from easydel.utils import is_inference_mode
 from easydel.utils.helpers import check_bool_flag
 
 from .qwen3_next_configuration import Qwen3NextConfig
+
+logger = get_logger(__name__)
 
 
 def l2norm_decode(
@@ -2727,7 +2734,9 @@ class Qwen3NextFullAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
+        shared_global_kv: tuple[Array, Array, MaskInfo | None, Array | None] | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple[Array, Array, MaskInfo | None, Array | None]]:
         """Forward pass for Qwen3Next full attention with gated query.
 
         The q_proj outputs 2x dimension (query + gate), which is split and the gate
@@ -2783,6 +2792,11 @@ class Qwen3NextFullAttention(UnifiedAttention):
 
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
+        effective_sliding_window = (
+            int(self.config.loop_kv_sliding_window)
+            if (shared_global_kv is not None and cache_view is not None)
+            else self.sliding_window
+        )
         (
             key_states,
             value_states,
@@ -2797,31 +2811,99 @@ class Qwen3NextFullAttention(UnifiedAttention):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
-            sliding_window=self.sliding_window,
+            sliding_window=effective_sliding_window,
         )
 
-        softmax_aux = self._softmax_aux()
-
-        attentions: AttentionLayerOutput = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=self.causal,
-            sliding_window=self.sliding_window,
-            softmax_aux=softmax_aux,
-            precision=self.precision,
+        is_ragged_pages = isinstance(cache_view, RaggedPagesCacheView) or (
+            isinstance(cache_view, ParallelHybridCacheView)
+            and isinstance(cache_view.transformer, RaggedPagesCacheView)
+        )
+        is_unified_pages = isinstance(cache_view, UnifiedAttentionCacheView) or (
+            isinstance(cache_view, ParallelHybridCacheView)
+            and isinstance(cache_view.transformer, UnifiedAttentionCacheView)
         )
 
-        if attentions.cache_view is not None:
-            cache_view = attentions.cache_view
+        captured_kv = None
+        if return_shared_kv and not is_ragged_pages:
+            cache_end_pos = getattr(cache_view, "indexes", None) if cache_view is not None else None
+            captured_kv = (key_states, value_states, mask_info, cache_end_pos)
 
-        attn_output = attentions.attention_outputs
+        if shared_global_kv is not None:
+            if is_unified_pages:
+                raise NotImplementedError(
+                    "loop_kv_cache_mode='hybrid_sliding_window' supports RaggedPagesCacheView, "
+                    "TransformerCacheView / HybridCache, and cacheless training; "
+                    "UnifiedAttentionCacheView is not yet supported."
+                )
+            if is_ragged_pages:
+                _, global_cache_view, global_cache_metadata = shared_global_kv
+                dual_stream_rpa = OperationRegistry.create(
+                    "dual_stream_ragged_page_attention",
+                    self.attention_performer.metadata,
+                )
+                attentions = dual_stream_rpa(
+                    query=query_states,
+                    key=key_states,
+                    value=value_states,
+                    global_cache_view=global_cache_view,
+                    local_cache_view=cache_view,
+                    global_cache_metadata=global_cache_metadata,
+                    local_cache_metadata=cache_metadata,
+                    softmax_scale=self.head_dim**-0.5,
+                    sliding_window=int(self.config.loop_kv_sliding_window),
+                    overlap=bool(self.config.loop_kv_overlap),
+                    softmax_aux=self._softmax_aux(),
+                )
+                if attentions.cache_view is not None:
+                    cache_view = attentions.cache_view
+                attn_output = attentions.attention_outputs
+                attn_weights_out = None
+            else:
+                k_global, v_global, global_mask_info, global_end_pos = shared_global_kv
+                dual_stream_attn = OperationRegistry.create(
+                    "dual_stream_attention",
+                    self.attention_performer.metadata,
+                )
+                attn_output = dual_stream_attn(
+                    query=query_states,
+                    k_global=k_global,
+                    v_global=v_global,
+                    k_local=key_states,
+                    v_local=value_states,
+                    global_mask_info=global_mask_info,
+                    local_mask_info=mask_info,
+                    cache_end_pos=global_end_pos,
+                    softmax_scale=self.head_dim**-0.5,
+                    sliding_window=int(self.config.loop_kv_sliding_window),
+                    overlap=bool(self.config.loop_kv_overlap),
+                ).attention_outputs
+                attn_weights_out = None
+        else:
+            softmax_aux = self._softmax_aux()
+
+            attentions: AttentionLayerOutput = self.attention_performer.forward(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                mode=mode,
+                bias=None,
+                cache_metadata=cache_metadata,
+                cache_view=cache_view,
+                init_bias=init_attention_bias,
+                mask_info=mask_info,
+                causal=self.causal,
+                sliding_window=self.sliding_window,
+                softmax_aux=softmax_aux,
+                precision=self.precision,
+            )
+
+            if attentions.cache_view is not None:
+                cache_view = attentions.cache_view
+            if return_shared_kv and is_ragged_pages:
+                captured_kv = ("paged", cache_view, cache_metadata)
+
+            attn_output = attentions.attention_outputs
+            attn_weights_out = attentions.attention_weights if output_attentions else None
 
         # Re-apply QKV sharding so attn_output matches the gate's partition
         # (which retains "sp" on the sequence axis from HiddenStateSharding).
@@ -2849,11 +2931,14 @@ class Qwen3NextFullAttention(UnifiedAttention):
         attn_output = self.o_proj(attn_output)
         attn_output = self.shard_attention_prod(attn_output)
 
-        return AttentionLayerOutput(
+        layer_out = AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
+            attention_weight=attn_weights_out,
             cache_view=cache_view,
         )
+        if return_shared_kv:
+            return layer_out, captured_kv  # type: ignore[return-value]
+        return layer_out
 
 
 class Qwen3NextLinearAttention(spx.Module):
@@ -3166,27 +3251,22 @@ class Qwen3NextLinearAttention(spx.Module):
         k_size = kernel.shape[0]
         acc_dtype = jnp.promote_types(jnp.promote_types(conv_input.dtype, kernel.dtype), jnp.float32)
         w = kernel[:, 0, :].astype(acc_dtype)  # [K, conv_dim]
-        # Shift in the input dtype and widen per tap: avoids K-1 full-size fp32 copies of the stream.
+        # Left-pad once by (K-1) so every tap is a pure static slice + elementwise FMA:
+        # zero scatter-add / DynamicUpdateSlice ops, allowing XLA to fuse all K taps + SiLU
+        # into a single VPU pass across every Qwen3.5 / Qwen3-Next GDN layer.
         x = conv_input  # [B, S, C]
-        b, s, _ = x.shape
+        s = x.shape[1]
         seg = seg_ids[:, :s]
-        acc = jnp.zeros(x.shape, acc_dtype)
-        # tap j (0..K-1) reads position t - (K-1-j); j=K-1 is the current token.
-        for j in range(k_size):
-            shift = k_size - 1 - j
-            if shift >= s:
-                # This tap reads only left padding for short sequences.
-                continue
-            if shift == 0:
-                shifted_x = x
-                same_seg = jnp.ones((b, s), dtype=jnp.bool_)
-            else:
-                shifted_x = jnp.concatenate([jnp.zeros((b, shift, x.shape[2]), x.dtype), x[:, :-shift]], axis=1)
-                src_seg = jnp.concatenate(
-                    [jnp.full((b, shift), -2, seg.dtype), seg[:, :-shift]], axis=1
-                )  # segment id of the source token for this tap
-                same_seg = src_seg == seg
-            tap = shifted_x.astype(acc_dtype) * w[j][None, None, :]
+        pad_l = k_size - 1
+        x_pad = jnp.pad(x, ((0, 0), (pad_l, 0), (0, 0)))
+        seg_pad = jnp.pad(seg, ((0, 0), (pad_l, 0)), constant_values=-2)
+        pos = jnp.arange(s, dtype=jnp.int32)[None, :]
+        acc = x.astype(acc_dtype) * w[k_size - 1][None, None, :]
+        for shift in range(1, min(k_size, s)):
+            j = k_size - 1 - shift
+            start = pad_l - shift
+            same_seg = (pos >= shift) & (seg_pad[:, start : start + s] == seg)
+            tap = x_pad[:, start : start + s, :].astype(acc_dtype) * w[j][None, None, :]
             acc = acc + jnp.where(same_seg[..., None], tap, 0.0)
         return acc.astype(conv_input.dtype)
 
@@ -4004,7 +4084,9 @@ class Qwen3NextDecoderLayer(spx.Module):
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple[Array, Array, MaskInfo | None, Array | None] | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple[Array, Array, MaskInfo | None, Array | None] | None]:
         """Forward pass through the decoder layer.
 
         Applies pre-normalization architecture with either full or linear attention,
@@ -4029,8 +4111,9 @@ class Qwen3NextDecoderLayer(spx.Module):
         """
         normed_hidden = self.input_layernorm(hidden_states)
 
+        captured_kv = None
         if self.is_full_attention:
-            attn_outputs = self.self_attn(
+            attn_res = self.self_attn(
                 normed_hidden,
                 mask_info,
                 position_ids,
@@ -4039,7 +4122,13 @@ class Qwen3NextDecoderLayer(spx.Module):
                 cache_metadata,
                 output_attentions,
                 frequencies,
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
             )
+            if return_shared_kv:
+                attn_outputs, captured_kv = attn_res
+            else:
+                attn_outputs = attn_res
         else:
             attn_outputs = self.linear_attn(
                 normed_hidden,
@@ -4076,12 +4165,151 @@ class Qwen3NextDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_weight if output_attentions else None,
             router_logits=router_logits if output_router_logits else None,
             cache_view=cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
+
+
+class Qwen3NextLoopGate(spx.Module):
+    """Per-token Gated Progressive Update block for GLM-5.4-style looped execution.
+
+    Computes a bounded convex interpolation between the hidden state entering a
+    loop iteration (``x_prev``) and the candidate state produced by the shared
+    loop block (``h_cand``)::
+
+        delta = h_cand - x_prev
+        beta  = sigmoid(proj([RMSNorm(x_prev), RMSNorm(delta)]))
+        x_out = x_prev + beta * delta
+
+    Zero-initializing ``proj.weight`` and setting ``proj.bias`` to ``init_bias``
+    (default ``-5.0`` on Pass 1, ``+5.0`` on the final pass) makes step-0
+    continued training from a pure checkpoint nearly identity-preserving while
+    maintaining healthy gradients into Pass 1 from the first optimization step.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        init_bias: float,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: spx.Rngs,
+    ):
+        self.config = config
+        self.init_bias = float(init_bias)
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        self.x_norm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.delta_norm = Qwen3NextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+        out_dim = 1 if config.loop_gate_type == "scalar" else config.hidden_size
+        linear_cls = ParallelLinear if out_dim == 1 else ColumnParallelLinear
+        self.proj = linear_cls(
+            2 * config.hidden_size,
+            out_dim,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.constant(self.init_bias),
+            rngs=rngs,
+        )
+
+    def compute_beta(
+        self,
+        x_prev: Float[Array, "batch seq_len hidden_dim"],
+        h_cand: Float[Array, "batch seq_len hidden_dim"],
+    ) -> Float[Array, "batch seq_len gate_dim"]:
+        """Compute per-token sigmoid gate values ``beta`` in float32."""
+        delta = h_cand - x_prev
+        gate_input = jnp.concatenate([self.x_norm(x_prev), self.delta_norm(delta)], axis=-1)
+        return jax.nn.sigmoid(self.proj(gate_input).astype(jnp.float32))
+
+    def forward(
+        self,
+        x_prev: Float[Array, "batch seq_len hidden_dim"],
+        h_cand: Float[Array, "batch seq_len hidden_dim"],
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Blend ``x_prev`` and ``h_cand`` via a per-token sigmoid gate."""
+        delta = h_cand - x_prev
+        beta = self.compute_beta(x_prev, h_cand)
+        updated = x_prev.astype(jnp.float32) + beta * delta.astype(jnp.float32)
+        return checkpoint_name(updated.astype(x_prev.dtype), "loop_gate_output")
+
+
+def materialize_missing_loop_state(
+    config: typing.Any,
+    state: dict[tuple[typing.Any, ...], typing.Any],
+    expected_leaves: dict[tuple[typing.Any, ...], typing.Any],
+) -> dict[tuple[typing.Any, ...], typing.Any]:
+    """Initialize missing Loop Transformer leaves when loading a pure checkpoint.
+
+    Used as the ``_upgrade_legacy_native_state`` hook on Qwen3Next / Qwen3.5
+    models so a standard EasyDeL checkpoint (e.g. ``qwen3.8-27b-spx``) can be
+    loaded directly into a looped config with zero weight remapping: every base
+    weight loads verbatim, while absent ``loop_gates.*`` and
+    ``loop_iter_embeddings`` leaves receive their exact identity-preserving
+    initialization. Already-trained looped checkpoints that include those keys
+    are returned untouched.
+    """
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    if not getattr(text_config, "is_looped", False):
+        return state
+
+    init_biases = text_config.resolved_loop_gate_init_biases
+    added = 0
+    for key, leaf in expected_leaves.items():
+        if key in state or not hasattr(leaf, "shape"):
+            continue
+        str_parts = tuple(str(p) for p in key)
+        if "loop_gates" in str_parts:
+            gate_pos = str_parts.index("loop_gates")
+            if gate_pos + 1 >= len(str_parts):
+                continue
+            gate_idx = int(str_parts[gate_pos + 1])
+            if len(str_parts) >= 2 and str_parts[-2:] == ("proj", "bias"):
+                bias_val = float(init_biases[gate_idx])
+                state[key] = np.full(leaf.shape, bias_val, dtype=np.float32)
+            else:
+                state[key] = np.zeros(leaf.shape, dtype=np.float32)
+            added += 1
+        elif "loop_iter_embeddings" in str_parts:
+            state[key] = np.zeros(leaf.shape, dtype=np.float32)
+            added += 1
+
+    if added:
+        logger.info(
+            "Initialized %d missing Loop Transformer leaf/leaves for layers [%d, %d) x %d (init_biases=%s).",
+            added,
+            int(text_config.loop_start_layer),
+            int(text_config.loop_end_layer),
+            int(text_config.num_loop_iterations),
+            init_biases,
+        )
+    return state
 
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3NextConfig, model_type="qwen3_next")
@@ -4123,6 +4351,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
+        config.validate_loop_config()
 
         with self.assign_layer_stage(0, total_layers=config.num_hidden_layers):
             self.embed_tokens = Embed(
@@ -4152,6 +4381,33 @@ class Qwen3NextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        if config.is_looped:
+            init_biases = config.resolved_loop_gate_init_biases
+            self.loop_gates = nn.ModuleList(
+                [
+                    Qwen3NextLoopGate(
+                        config=config,
+                        init_bias=init_biases[it],
+                        dtype=dtype,
+                        param_dtype=param_dtype,
+                        precision=precision,
+                        rngs=rngs,
+                    )
+                    for it in range(config.num_loop_iterations)
+                ]
+            )
+            if config.loop_use_iteration_embedding:
+                self.loop_iter_embeddings = ArrayParam.bound(
+                    shape=(config.num_loop_iterations, config.hidden_size),
+                    dtype=param_dtype,
+                    init_method="zeros",
+                    key=rngs.param,
+                )
+            else:
+                self.loop_iter_embeddings = None
+        else:
+            self.loop_gates = None
+            self.loop_iter_embeddings = None
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
             self.norm = Qwen3NextRMSNorm(
@@ -4161,6 +4417,10 @@ class Qwen3NextModel(EasyDeLBaseModule):
                 param_dtype=param_dtype,
                 rngs=rngs,
             )
+
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Auto-initialize missing loop gate leaves when loading a pure checkpoint."""
+        return materialize_missing_loop_state(self.config, state, expected_leaves)
 
     def forward(
         self,
@@ -4252,7 +4512,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = HybridCache.init_empty(len(self.layers))
+            past_key_values = HybridCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -4268,59 +4528,334 @@ class Qwen3NextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or output_router_logits,
+            extra=needs_trace_cache or output_router_logits or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
 
         frequencies = self.frequencies
 
-        def _layer_loop(block, carry):
-            """Apply a single Qwen3Next decoder layer inside the layer-stack scan.
-
-            Body of ``self.layers.scan``; runs ``block`` on the current
-            hidden states (alternating full-attention and linear-attention
-            layers), optionally accumulates per-layer hidden states,
-            attention weights, and MoE router logits, and returns the
-            updated carry tuple.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
-                    mask_info=mask_info,
-                    position_ids=position_ids,
-                    mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                    cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                    output_router_logits=output_router_logits,
-                    frequencies=frequencies,
+        if self.config.is_looped:
+            if self._pipeline_stage_count() > 1:
+                raise ValueError(
+                    "Looped Qwen3Next execution requires pp=1 (pipeline_stage_count == 1) because "
+                    "re-entering the shared loop core creates a cycle across pipeline stages."
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            loop_start = int(self.config.loop_start_layer)  # type: ignore[arg-type]
+            loop_end = int(self.config.loop_end_layer)  # type: ignore[arg-type]
+            num_loops = int(self.config.num_loop_iterations)
+            use_hybrid_kv = getattr(self.config, "loop_kv_cache_mode", "separate") == "hybrid_sliding_window"
+            can_scan_loop = (
+                bool(self.config.scan_layers)
+                and not trace
+                and not output_hidden_states
+                and not output_attentions
+                and not output_router_logits
+                and not needs_trace_cache
             )
-            if output_router_logits and layer_outputs.router_logits is not None:
-                all_router_logits += (layer_outputs.router_logits,)
+            if can_scan_loop:
+                scan_kwargs = self._layer_scan_kwargs("text")
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+                def _plain_scan_step(block, h):
+                    return block(
+                        hidden_states=h,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=None,
+                        cache_metadata=cache_metadata,
+                        output_attentions=False,
+                        output_router_logits=False,
+                        frequencies=frequencies,
+                    ).hidden_states
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                # 1. Scanned Prelude: layers [0, loop_start)
+                if loop_start > 0:
+                    hidden_states = nn.ModuleList(list(self.layers[:loop_start])).scan(
+                        _plain_scan_step,
+                        hidden_states,
+                        trace=False,
+                        **scan_kwargs,
+                    )
+
+                # 2. Scanned Shared Loop Core: layers [loop_start, loop_end) x num_loops
+                core_list = nn.ModuleList(list(self.layers[loop_start:loop_end]))
+                n_core_full = sum(1 for i in range(loop_start, loop_end) if self.config.is_full_attention_layer(i))
+                pass1_k_buf = None
+                pass1_v_buf = None
+                if use_hybrid_kv and n_core_full > 0:
+                    kv_shape = (
+                        hidden_states.shape[0],
+                        hidden_states.shape[1],
+                        int(self.config.num_key_value_heads),
+                        int(self.config.head_dim),
+                    )
+                    kv_spec = self.config.runtime_sharding_resolver.resolve(
+                        dynamic_axes=common_types.AttnKVSharding,
+                        shape=kv_shape,
+                    )
+                    buf_spec = PartitionSpec(None, *tuple(kv_spec))
+                    stage_mesh = resolve_stage_mesh(self.config.mesh, arr=hidden_states) or self.config.mesh
+                    pass1_k_buf = jnp.zeros((n_core_full, *kv_shape), dtype=hidden_states.dtype)
+                    pass1_v_buf = jnp.zeros((n_core_full, *kv_shape), dtype=hidden_states.dtype)
+                    if stage_mesh is not None:
+                        pass1_k_buf = with_sharding_constraint(pass1_k_buf, buf_spec, mesh=stage_mesh)
+                        pass1_v_buf = with_sharding_constraint(pass1_v_buf, buf_spec, mesh=stage_mesh)
+
+                for loop_it in range(num_loops):
+                    x_prev = hidden_states
+                    if self.loop_iter_embeddings is not None:
+                        hidden_states = hidden_states + self.loop_iter_embeddings.value[loop_it].astype(
+                            hidden_states.dtype
+                        )
+                    if use_hybrid_kv and n_core_full > 0 and loop_it == 0:
+                        assert pass1_k_buf is not None and pass1_v_buf is not None
+
+                        def _pass1_scan_step(block, carry):
+                            h_in, k_arr, v_arr, f_idx = carry
+                            if block.is_full_attention:
+                                layer_out, captured = block(
+                                    hidden_states=h_in,
+                                    mask_info=mask_info,
+                                    position_ids=position_ids,
+                                    mode=mode,
+                                    cache_view=None,
+                                    cache_metadata=cache_metadata,
+                                    output_attentions=False,
+                                    output_router_logits=False,
+                                    frequencies=frequencies,
+                                    return_shared_kv=True,
+                                )
+                                k_g, v_g, _, _ = captured
+                                k_arr = jax.lax.dynamic_update_index_in_dim(
+                                    k_arr, k_g.astype(k_arr.dtype), f_idx, axis=0
+                                )
+                                v_arr = jax.lax.dynamic_update_index_in_dim(
+                                    v_arr, v_g.astype(v_arr.dtype), f_idx, axis=0
+                                )
+                                return layer_out.hidden_states, k_arr, v_arr, f_idx + jnp.asarray(1, dtype=jnp.int32)
+                            layer_out = block(
+                                hidden_states=h_in,
+                                mask_info=mask_info,
+                                position_ids=position_ids,
+                                mode=mode,
+                                cache_view=None,
+                                cache_metadata=cache_metadata,
+                                output_attentions=False,
+                                output_router_logits=False,
+                                frequencies=frequencies,
+                            )
+                            return layer_out.hidden_states, k_arr, v_arr, f_idx
+
+                        hidden_states, pass1_k_buf, pass1_v_buf, _ = core_list.scan(
+                            _pass1_scan_step,
+                            (hidden_states, pass1_k_buf, pass1_v_buf, jnp.asarray(0, dtype=jnp.int32)),
+                            trace=False,
+                            **scan_kwargs,
+                        )
+                    elif use_hybrid_kv and n_core_full > 0 and loop_it > 0:
+                        assert pass1_k_buf is not None and pass1_v_buf is not None
+                        k_ref = pass1_k_buf
+                        v_ref = pass1_v_buf
+
+                        def _pass2_scan_step(block, carry, *, _k_ref=k_ref, _v_ref=v_ref):
+                            h_in, f_idx = carry
+                            if block.is_full_attention:
+                                k_g = jax.lax.dynamic_index_in_dim(_k_ref, f_idx, axis=0, keepdims=False)
+                                v_g = jax.lax.dynamic_index_in_dim(_v_ref, f_idx, axis=0, keepdims=False)
+                                layer_out = block(
+                                    hidden_states=h_in,
+                                    mask_info=mask_info,
+                                    position_ids=position_ids,
+                                    mode=mode,
+                                    cache_view=None,
+                                    cache_metadata=cache_metadata,
+                                    output_attentions=False,
+                                    output_router_logits=False,
+                                    frequencies=frequencies,
+                                    shared_global_kv=(k_g, v_g, mask_info, None),
+                                )
+                                return layer_out.hidden_states, f_idx + jnp.asarray(1, dtype=jnp.int32)
+                            layer_out = block(
+                                hidden_states=h_in,
+                                mask_info=mask_info,
+                                position_ids=position_ids,
+                                mode=mode,
+                                cache_view=None,
+                                cache_metadata=cache_metadata,
+                                output_attentions=False,
+                                output_router_logits=False,
+                                frequencies=frequencies,
+                            )
+                            return layer_out.hidden_states, f_idx
+
+                        hidden_states, _ = core_list.scan(
+                            _pass2_scan_step,
+                            (hidden_states, jnp.asarray(0, dtype=jnp.int32)),
+                            trace=False,
+                            **scan_kwargs,
+                        )
+                    else:
+                        hidden_states = core_list.scan(
+                            _plain_scan_step,
+                            hidden_states,
+                            trace=False,
+                            **scan_kwargs,
+                        )
+
+                    assert self.loop_gates is not None
+                    hidden_states = self.loop_gates[loop_it](x_prev, hidden_states)
+                    hidden_states = apply_logical_sharding(
+                        hidden_states,
+                        dynamic_axes=common_types.HiddenStateSharding,
+                        partition_manager=self.config.runtime_sharding_resolver,
+                    )
+
+                # 3. Scanned Coda: layers [loop_end, num_hidden_layers)
+                if loop_end < len(self.layers):
+                    hidden_states = nn.ModuleList(list(self.layers[loop_end:])).scan(
+                        _plain_scan_step,
+                        hidden_states,
+                        trace=False,
+                        **scan_kwargs,
+                    )
+            else:
+                pass1_kv_streams: dict[int, tuple] = {}
+                cv = cache_views
+                cache_slot = 0
+
+                def _run_layer(
+                    phys_idx: int,
+                    slot: int,
+                    h: Array,
+                    cv_in,
+                    *,
+                    shared_global_kv=None,
+                    return_shared_kv: bool = False,
+                ):
+                    nonlocal all_hidden_states, all_attentions, all_router_logits
+                    if output_hidden_states:
+                        all_hidden_states += (h,)
+                    layer_res = self.layers[phys_idx](
+                        hidden_states=h,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv_in, slot, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        frequencies=frequencies,
+                        shared_global_kv=shared_global_kv,
+                        return_shared_kv=return_shared_kv,
+                    )
+                    if return_shared_kv:
+                        layer_outputs, captured_kv = layer_res
+                    else:
+                        layer_outputs, captured_kv = layer_res, None
+                    if output_attentions:
+                        all_attentions += (layer_outputs.attention_weight,)
+                    cv_out = self._layer_cache_view_update(
+                        cv_in,
+                        slot,
+                        layer_outputs.cache_view,
+                        enabled=trace_layers,
+                        cache=past_key_values,
+                    )
+                    if output_router_logits and layer_outputs.router_logits is not None:
+                        all_router_logits += (layer_outputs.router_logits,)
+                    return layer_outputs.hidden_states, cv_out, captured_kv
+
+                # 1. Prelude: layers [0, loop_start)
+                for phys_idx in range(0, loop_start):
+                    hidden_states, cv, _ = _run_layer(phys_idx, cache_slot, hidden_states, cv)
+                    cache_slot += 1
+
+                # 2. Shared Loop Core: layers [loop_start, loop_end) x num_loops with Gated Progressive Updates
+                for loop_it in range(num_loops):
+                    x_prev = hidden_states
+                    if self.loop_iter_embeddings is not None:
+                        hidden_states = hidden_states + self.loop_iter_embeddings.value[loop_it].astype(
+                            hidden_states.dtype
+                        )
+                    for phys_idx in range(loop_start, loop_end):
+                        is_full_attn = self.config.is_full_attention_layer(phys_idx)
+                        capture_kv = use_hybrid_kv and is_full_attn and loop_it == 0
+                        shared_kv = (
+                            pass1_kv_streams.get(phys_idx)
+                            if (use_hybrid_kv and is_full_attn and loop_it > 0)
+                            else None
+                        )
+                        hidden_states, cv, captured_kv = _run_layer(
+                            phys_idx,
+                            cache_slot,
+                            hidden_states,
+                            cv,
+                            shared_global_kv=shared_kv,
+                            return_shared_kv=capture_kv,
+                        )
+                        if capture_kv and captured_kv is not None:
+                            pass1_kv_streams[phys_idx] = captured_kv
+                        cache_slot += 1
+                    assert self.loop_gates is not None
+                    hidden_states = self.loop_gates[loop_it](x_prev, hidden_states)
+                    hidden_states = apply_logical_sharding(
+                        hidden_states,
+                        dynamic_axes=common_types.HiddenStateSharding,
+                        partition_manager=self.config.runtime_sharding_resolver,
+                    )
+
+                # 3. Coda: layers [loop_end, num_hidden_layers)
+                for phys_idx in range(loop_end, len(self.layers)):
+                    hidden_states, cv, _ = _run_layer(phys_idx, cache_slot, hidden_states, cv)
+                    cache_slot += 1
+        else:
+            def _layer_loop(block, carry):
+                """Apply a single Qwen3Next decoder layer inside the layer-stack scan.
+
+                Body of ``self.layers.scan``; runs ``block`` on the current
+                hidden states (alternating full-attention and linear-attention
+                layers), optionally accumulates per-layer hidden states,
+                attention weights, and MoE router logits, and returns the
+                updated carry tuple.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        frequencies=frequencies,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_router_logits and layer_outputs.router_logits is not None:
+                    all_router_logits += (layer_outputs.router_logits,)
+
+                return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
         if output_hidden_states:
@@ -4413,6 +4948,10 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
             router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Auto-initialize missing loop gate leaves when loading a pure checkpoint."""
+        return materialize_missing_loop_state(self.config, state, expected_leaves)
+
     def forward(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -4476,8 +5015,289 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
         )
 
 
+def compute_loop_gate_stats(
+    model: typing.Any,
+    input_ids: Int[Array, "batch seq_len"],
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    *,
+    assistant_mask: Bool[Array, "batch seq_len"] | None = None,
+    include_knockout: bool = False,
+) -> dict[str, typing.Any]:
+    """Run a diagnostic forward pass and collect GLM-5.4 loop-gate & knockout telemetry.
+
+    Supports :class:`Qwen3NextModel`, :class:`Qwen3NextForCausalLM`, and Qwen3.5
+    text/VLM wrappers (``Qwen3_5ForCausalLM``, ``Qwen3_5ForConditionalGeneration``).
+
+    Args:
+        model: Looped Qwen3Next / Qwen3.5 module.
+        input_ids: Token IDs ``[batch, seq_len]``.
+        attention_mask: Optional boolean valid-token mask ``[batch, seq_len]``.
+        assistant_mask: Optional boolean assistant-token mask ``[batch, seq_len]``
+            used for assistant-only NLL in knockout comparisons.
+        include_knockout: If ``True``, also runs two loop-knockout ablations
+            reusing the Prelude representation ``x_0``:
+            - ``knockout_gate_zero``: forces Pass-1 gate ``beta_1 = 0`` (skips
+              Pass-1's hidden-state write while keeping Pass-1 shared KV and Pass 2).
+            - ``knockout_single_pass``: runs ``layers[loop_start:loop_end]`` once
+              without looping (exact 64-layer non-looped trunk with the same weights).
+            Positive ``delta_nll = knockout_nll - full_nll`` measures how much the
+            recurrent loop directly improves predictions beyond trunk fine-tuning.
+
+    Returns:
+        Dictionary with ``per_pass``, ``pass1_loss_corr``, ``mean_nll``, and
+        (when ``include_knockout=True``) ``knockout`` metrics.
+    """
+    text_model = model
+    if hasattr(text_model, "model"):
+        text_model = text_model.model
+    if hasattr(text_model, "language_model"):
+        text_model = text_model.language_model
+
+    cfg = text_model.config
+    if not getattr(cfg, "is_looped", False) or getattr(text_model, "loop_gates", None) is None:
+        raise ValueError("compute_loop_gate_stats requires a looped Qwen3Next / Qwen3.5 model.")
+
+    @spx.jit
+    def _run_telemetry(m, ids, attn_mask, asst_mask):
+        lm_head = getattr(m, "lm_head", None)
+        tm = m
+        if hasattr(tm, "model"):
+            tm = tm.model
+        if hasattr(tm, "language_model"):
+            tm = tm.language_model
+
+        tcfg = tm.config
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=None,
+            input_ids=ids,
+            attention_mask=attn_mask,
+        )
+        position_ids = mask_info.q_position_ids
+        hidden_states = tm.embed_tokens(ids.astype("i4"))
+        frequencies = tm.frequencies
+        mode = common_types.MODE_TRAIN
+
+        loop_start = int(tcfg.loop_start_layer)
+        loop_end = int(tcfg.loop_end_layer)
+        num_loops = int(tcfg.num_loop_iterations)
+        use_hybrid_kv = getattr(tcfg, "loop_kv_cache_mode", "separate") == "hybrid_sliding_window"
+        pass1_kv_streams: dict[int, tuple] = {}
+
+        def _run_coda(h_in):
+            h = h_in
+            for phys_idx in range(loop_end, len(tm.layers)):
+                h = tm.layers[phys_idx](
+                    hidden_states=h,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    frequencies=frequencies,
+                ).hidden_states
+            return tm.norm(h)
+
+        def _score_hidden_nll(h_normed):
+            if hasattr(m, "compute_lm_logits"):
+                logits = m.compute_lm_logits(h_normed[:, :-1, :]).astype(jnp.float32)
+            else:
+                logits = lm_head(h_normed[:, :-1, :]).astype(jnp.float32)
+            targets = ids[:, 1:].astype(jnp.int32)
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            return -jnp.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
+
+        def _run_loop_core(h_in, *, loop_it: int, capture_pass1_kv: bool, use_shared_kv: bool):
+            h_cur = h_in
+            if tm.loop_iter_embeddings is not None:
+                h_cur = h_cur + tm.loop_iter_embeddings.value[loop_it].astype(h_cur.dtype)
+            for phys_idx in range(loop_start, loop_end):
+                is_full_attn = tcfg.is_full_attention_layer(phys_idx)
+                capture_kv = capture_pass1_kv and is_full_attn
+                shared_kv = pass1_kv_streams.get(phys_idx) if (use_shared_kv and is_full_attn) else None
+                layer_res = tm.layers[phys_idx](
+                    hidden_states=h_cur,
+                    mask_info=mask_info,
+                    position_ids=position_ids,
+                    mode=mode,
+                    frequencies=frequencies,
+                    shared_global_kv=shared_kv,
+                    return_shared_kv=capture_kv,
+                )
+                if capture_kv:
+                    layer_out, captured_kv = layer_res
+                    if captured_kv is not None:
+                        pass1_kv_streams[phys_idx] = captured_kv
+                else:
+                    layer_out = layer_res
+                h_cur = layer_out.hidden_states
+            return h_cur
+
+        # 1. Prelude (shared across full forward and knockout ablations)
+        for phys_idx in range(0, loop_start):
+            hidden_states = tm.layers[phys_idx](
+                hidden_states=hidden_states,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                frequencies=frequencies,
+            ).hidden_states
+        x0_prelude = hidden_states
+
+        # 2. Loop core with gate capture
+        per_pass_arrays: list[tuple[Array, ...]] = []
+        per_pass_token_betas: list[Array] = []
+        valid_mask = (
+            jnp.asarray(attn_mask, dtype=jnp.bool_) if attn_mask is not None else jnp.ones(ids.shape, dtype=jnp.bool_)
+        )
+        vm = valid_mask.astype(jnp.float32)
+        denom = jnp.maximum(jnp.sum(vm), 1.0)
+        eps = 1e-8
+
+        for loop_it in range(num_loops):
+            x_prev = hidden_states
+            h_cand = _run_loop_core(
+                x_prev,
+                loop_it=loop_it,
+                capture_pass1_kv=use_hybrid_kv and loop_it == 0,
+                use_shared_kv=use_hybrid_kv and loop_it > 0,
+            )
+
+            gate = tm.loop_gates[loop_it]
+            beta = gate.compute_beta(x_prev, h_cand)  # [B, S, 1 or H] in fp32
+            delta_f32 = h_cand.astype(jnp.float32) - x_prev.astype(jnp.float32)
+            x_prev_f32 = x_prev.astype(jnp.float32)
+            x_out_f32 = x_prev_f32 + beta * delta_f32
+            hidden_states = x_out_f32.astype(x_prev.dtype)
+
+            token_beta = jnp.mean(beta, axis=-1)  # [B, S]
+            per_pass_token_betas.append(token_beta)
+
+            b_mean = jnp.sum(token_beta * vm) / denom
+            b_var = jnp.sum(((token_beta - b_mean) ** 2) * vm) / denom
+            b_std = jnp.sqrt(jnp.maximum(b_var, 0.0))
+            b_min = jnp.min(jnp.where(valid_mask, token_beta, jnp.inf))
+            b_max = jnp.max(jnp.where(valid_mask, token_beta, -jnp.inf))
+
+            rms_prev = jnp.sqrt(jnp.mean(x_prev_f32**2, axis=-1) + eps)
+            rms_out = jnp.sqrt(jnp.mean(x_out_f32**2, axis=-1) + eps)
+            rms_delta = jnp.sqrt(jnp.mean(delta_f32**2, axis=-1) + eps)
+            norm_ratio = jnp.sum((rms_out / rms_prev) * vm) / denom
+            delta_ratio = jnp.sum((rms_delta / rms_prev) * vm) / denom
+            per_pass_arrays.append((b_mean, b_std, b_min, b_max, norm_ratio, delta_ratio))
+
+        # 3. Coda + final norm
+        hidden_states = _run_coda(hidden_states)
+
+        can_score_logits = hasattr(m, "compute_lm_logits") or lm_head is not None
+        if can_score_logits and ids.shape[1] >= 2 and per_pass_token_betas:
+            nll = _score_hidden_nll(hidden_states)
+            pair_valid = valid_mask[:, :-1] & valid_mask[:, 1:]
+            pv = pair_valid.astype(jnp.float32)
+            p_denom = jnp.maximum(jnp.sum(pv), 1.0)
+            mean_nll_val = jnp.sum(nll * pv) / p_denom
+
+            has_asst = asst_mask is not None
+            av = (
+                (jnp.asarray(asst_mask, dtype=jnp.bool_)[:, 1:] & pair_valid).astype(jnp.float32)
+                if has_asst
+                else pv
+            )
+            a_denom = jnp.maximum(jnp.sum(av), 1.0)
+            full_asst_nll = jnp.sum(nll * av) / a_denom
+
+            nll_c = (nll - mean_nll_val) * pv
+            nll_ss = jnp.sum(nll_c**2)
+            per_pass_corrs: list[Array] = []
+            for tb in per_pass_token_betas:
+                b_i = tb[:, :-1]
+                b_mean_i = jnp.sum(b_i * pv) / p_denom
+                b_c = (b_i - b_mean_i) * pv
+                cov = jnp.sum(b_c * nll_c)
+                std_prod = jnp.sqrt(jnp.sum(b_c**2) * nll_ss)
+                per_pass_corrs.append(jnp.where(std_prod > 1e-12, cov / jnp.maximum(std_prod, 1e-12), 0.0))
+            corr_val = per_pass_corrs[0]
+
+            knockout_arrays = None
+            if include_knockout:
+                # Ablation A: gate_zero (clamp all early refinement gates beta_1..beta_{K-1} = 0,
+                # running only the final pass from x0_prelude while keeping Pass-1 shared KV).
+                final_it = num_loops - 1
+                h_cand_gz = _run_loop_core(
+                    x0_prelude,
+                    loop_it=final_it,
+                    capture_pass1_kv=False,
+                    use_shared_kv=use_hybrid_kv,
+                )
+                h_gz = tm.loop_gates[final_it](x0_prelude, h_cand_gz)
+                nll_gz = _score_hidden_nll(_run_coda(h_gz))
+                gz_all = jnp.sum(nll_gz * pv) / p_denom
+                gz_asst = jnp.sum(nll_gz * av) / a_denom
+
+                # Ablation B: single_pass (exact 64-layer non-looped pass over layers[loop_start:loop_end] once)
+                h_sp = x0_prelude
+                for phys_idx in range(loop_start, loop_end):
+                    h_sp = tm.layers[phys_idx](
+                        hidden_states=h_sp,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        frequencies=frequencies,
+                    ).hidden_states
+                nll_sp = _score_hidden_nll(_run_coda(h_sp))
+                sp_all = jnp.sum(nll_sp * pv) / p_denom
+                sp_asst = jnp.sum(nll_sp * av) / a_denom
+
+                knockout_arrays = (full_asst_nll, gz_all, gz_asst, sp_all, sp_asst)
+
+            return per_pass_arrays, mean_nll_val, corr_val, per_pass_corrs, knockout_arrays
+        return per_pass_arrays, None, None, None, None
+
+    per_pass_arrays, mean_nll_arr, corr_arr, per_pass_corr_arrs, knockout_arrs = _run_telemetry(
+        model, input_ids, attention_mask, assistant_mask
+    )
+    per_pass = [
+        {
+            "pass_index": idx + 1,
+            "gate_mean": float(vals[0]),
+            "gate_std": float(vals[1]),
+            "gate_min": float(vals[2]),
+            "gate_max": float(vals[3]),
+            "norm_ratio": float(vals[4]),
+            "delta_ratio": float(vals[5]),
+            "loss_corr": float(per_pass_corr_arrs[idx]) if per_pass_corr_arrs is not None else None,
+        }
+        for idx, vals in enumerate(per_pass_arrays)
+    ]
+    out: dict[str, typing.Any] = {
+        "per_pass": per_pass,
+        "pass1_loss_corr": float(corr_arr) if corr_arr is not None else None,
+        "mean_nll": float(mean_nll_arr) if mean_nll_arr is not None else None,
+    }
+    if include_knockout and knockout_arrs is not None and mean_nll_arr is not None:
+        full_all = float(mean_nll_arr)
+        full_asst, gz_all, gz_asst, sp_all, sp_asst = [float(x) for x in knockout_arrs]
+        out["knockout"] = {
+            "full_all_nll": full_all,
+            "full_asst_nll": full_asst if assistant_mask is not None else None,
+            "gate_zero": {
+                "all_nll": gz_all,
+                "all_delta_nll": gz_all - full_all,
+                "asst_nll": gz_asst if assistant_mask is not None else None,
+                "asst_delta_nll": (gz_asst - full_asst) if assistant_mask is not None else None,
+            },
+            "single_pass": {
+                "all_nll": sp_all,
+                "all_delta_nll": sp_all - full_all,
+                "asst_nll": sp_asst if assistant_mask is not None else None,
+                "asst_delta_nll": (sp_asst - full_asst) if assistant_mask is not None else None,
+            },
+        }
+    return out
+
+
 __all__ = [
     "Qwen3NextConfig",
     "Qwen3NextForCausalLM",
+    "Qwen3NextLoopGate",
     "Qwen3NextModel",
+    "compute_loop_gate_stats",
+    "materialize_missing_loop_state",
 ]

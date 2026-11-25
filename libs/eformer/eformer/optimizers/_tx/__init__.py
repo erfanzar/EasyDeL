@@ -37,20 +37,24 @@ Key Components:
 from .mars import mars, scale_by_mars
 from .utils import (
     OptaxScheduledWeightDecayState,
+    build_path_exclusion_mask,
     create_cosine_scheduler,
     create_linear_scheduler,
     get_base_optimizer,
     optax_add_scheduled_weight_decay,
+    optax_scale_by_path_multipliers,
 )
 from .white_kron import quad, scale_by_quad, scale_by_skew, skew
 
 __all__ = (
     "OptaxScheduledWeightDecayState",
+    "build_path_exclusion_mask",
     "create_cosine_scheduler",
     "create_linear_scheduler",
     "get_base_optimizer",
     "mars",
     "optax_add_scheduled_weight_decay",
+    "optax_scale_by_path_multipliers",
     "quad",
     "scale_by_mars",
     "scale_by_quad",

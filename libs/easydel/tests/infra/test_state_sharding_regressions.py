@@ -175,3 +175,36 @@ def test_init_tx_skips_redundant_device_put_for_already_sharded_slots(monkeypatc
     # Already-sharded slots need no re-placement; replicated setup scalars are now
     # pre-placed before place_setup_tree_with_shardings, so nothing reaches it here.
     assert calls["placed"] == 0
+
+
+def test_resolve_sharding_for_tree_fast_path_matches_regex_scan_and_priority(monkeypatch, tiny_sharded_llama):
+    """O(1) literal-rule lookup must match brute-force re.search including mixed-rule priority."""
+    from easydel.infra.utils import jax_path_to_string
+
+    state = EasyDeLState.create(model=tiny_sharded_llama).init_tx(optax.adam(1e-3))
+    mesh = tiny_sharded_llama.mesh
+    base_rules = list(tiny_sharded_llama.resolve_shardings_regex(mesh=mesh))
+    # Insert a higher-priority non-literal regex ahead of a literal rule to verify priority ordering.
+    custom_spec = NamedSharding(mesh=mesh.jax_mesh, spec=PartitionSpec())
+    mixed_rules = [(r"0/mu/.*norm/kernel", custom_spec), *base_rules]
+    monkeypatch.setattr(tiny_sharded_llama, "resolve_shardings_regex", lambda *, mesh=None: mixed_rules)
+
+    fast_shardings = tiny_sharded_llama.resolve_sharding_for_tree(state.opt_state, mesh=mesh)
+
+    def _ref_for(path, leaf):
+        path_str = jax_path_to_string(path)
+        for pat, sh in mixed_rules:
+            if re.search(pat, path_str):
+                out = sh if isinstance(sh, NamedSharding) else NamedSharding(mesh=mesh.jax_mesh, spec=PartitionSpec(*sh))
+                if hasattr(leaf, "ndim") and len(out.spec) > leaf.ndim:
+                    out = NamedSharding(mesh=out.mesh, spec=PartitionSpec(*tuple(out.spec)[: leaf.ndim]))
+                return out
+        return NamedSharding(mesh=mesh.jax_mesh, spec=PartitionSpec())
+
+    ref_shardings = jax.tree_util.tree_map_with_path(_ref_for, state.opt_state)
+    for fast_s, ref_s in zip(
+        jax.tree_util.tree_leaves(fast_shardings, is_leaf=lambda x: isinstance(x, NamedSharding)),
+        jax.tree_util.tree_leaves(ref_shardings, is_leaf=lambda x: isinstance(x, NamedSharding)),
+        strict=True,
+    ):
+        assert fast_s == ref_s

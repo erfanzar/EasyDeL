@@ -1165,6 +1165,7 @@ def _scan_segment_with_explicit_unroll(
     constraint_specs = _scan_state_constraint_specs(gdef)
     shared = shared or {}
     shared_init = {key: var._raw_get() for key, var in shared.items()}
+    written_shared: set[tuple[str, str]] = set()
 
     def body(loop_carry, xs, *, gdef=gdef):
         """``lax.scan`` body: bind a layer's state to the segment graphdef and apply ``fn``.
@@ -1185,7 +1186,13 @@ def _scan_segment_with_explicit_unroll(
         snapshot = _layer_write_snapshot(live)
         new_carry = fn(index, live, user_carry) if indexed else fn(live, user_carry)
         writes = _layer_writes(snapshot)
-        new_shared = {key: writes.pop(key, value) for key, value in shared_values.items()}
+        new_shared = {}
+        for key, value in shared_values.items():
+            if key in writes:
+                written_shared.add(key)
+                new_shared[key] = writes.pop(key)
+            else:
+                new_shared[key] = value
         return (new_carry, new_shared), writes
 
     xs = (jnp.arange(segment.start, segment.stop), segment.stacked) if indexed else segment.stacked
@@ -1195,7 +1202,8 @@ def _scan_segment_with_explicit_unroll(
         xs,
         unroll=effective_unroll,
     )
-    return carry, shared_final, writes
+    shared_written_final = {key: shared_final[key] for key in written_shared}
+    return carry, shared_written_final, writes
 
 
 @dataclass(frozen=True)
@@ -1289,10 +1297,39 @@ def _group_periodic_segments(
     return out
 
 
-def _scan_block_with_explicit_unroll(block: _ScanBlock, fn, carry, bind, unroll: int | None, *, barrier: bool = False):
+def _block_position_shared(
+    block: _ScanBlock,
+    shared_of: dict[int, dict[tuple[str, str], Variable]],
+) -> tuple[dict[tuple[str, str], Variable], ...] | None:
+    """Return per-position shared RNG maps when every repeat references the same objects."""
+    pos_shared: list[dict[tuple[str, str], Variable]] = []
+    for members in block.members:
+        first = shared_of[members[0].start]
+        first_ids = {key: id(var) for key, var in first.items()}
+        for member in members[1:]:
+            if {key: id(var) for key, var in shared_of[member.start].items()} != first_ids:
+                return None
+        pos_shared.append(first)
+    return tuple(pos_shared)
+
+
+def _scan_block_with_explicit_unroll(
+    block: _ScanBlock,
+    fn,
+    carry,
+    bind,
+    unroll: int | None,
+    *,
+    position_shared: tuple[dict[tuple[str, str], Variable], ...] | None = None,
+    barrier: bool = False,
+):
     """Lower a :class:`_ScanBlock` as an outer ``lax.scan`` over blocks whose body runs every position.
 
     A length-1 position runs inline; a longer one runs its own inner ``lax.scan``.
+    Shared RNG streams present across positions are deduplicated by object identity
+    and threaded sequentially through the outer and inner carries so every layer
+    observes its predecessor's draw. Only streams actually written by ``fn`` are
+    returned for write-back.
 
     Args:
         block: The block to lower.
@@ -1300,41 +1337,80 @@ def _scan_block_with_explicit_unroll(block: _ScanBlock, fn, carry, bind, unroll:
         carry: Initial carry.
         bind: :func:`spectrax.bind`.
         unroll: Inner-scan unroll factor (``None`` selects the default).
+        position_shared: Optional per-position ``{(collection, path): Variable}`` maps.
         barrier: Apply :func:`barrier_array_leaves` to each layer's ``(carry, layer state)``.
 
     Returns:
-        ``(final_carry, writes)`` where ``writes[j]`` maps each written ``(collection, path)`` of position ``j`` to
-        values stacked on leading ``[blocks, length]`` axes.
+        ``(final_carry, shared_written, writes)`` where ``shared_written`` is a list
+        of ``(Variable, final_value)`` pairs for shared streams mutated by ``fn``, and
+        ``writes[j]`` maps each other written ``(collection, path)`` of position ``j``
+        to values stacked on leading ``[blocks, length]`` axes.
     """
+    shared_vars: dict[int, Variable] = {}
+    pos_key_to_vid: list[dict[tuple[str, str], int]] = []
+    for pos_s in position_shared or ({},) * len(block.positions):
+        mapping: dict[tuple[str, str], int] = {}
+        for key, var in pos_s.items():
+            vid = id(var)
+            shared_vars[vid] = var
+            mapping[key] = vid
+        pos_key_to_vid.append(mapping)
 
-    def make_step(pos: _ScanSegment):
+    shared_init = {vid: var._raw_get() for vid, var in shared_vars.items()}
+    written_vids: set[int] = set()
+
+    def make_step(pos: _ScanSegment, key_to_vid: dict[tuple[str, str], int]):
         specs = _scan_state_constraint_specs(pos.gdef)
 
-        def step(c, layer_state):
+        def step(loop_carry, layer_state):
+            c, shared_vals = loop_carry
             layer_state = _apply_scan_state_constraints(layer_state, specs)
             if barrier:
                 c, layer_state = barrier_array_leaves((c, layer_state))
+            if key_to_vid:
+                layer_state = layer_state.overlay(
+                    _keyed_values_to_state({k: shared_vals[vid] for k, vid in key_to_vid.items()})
+                )
             live = bind(pos.gdef, layer_state)
             snapshot = _layer_write_snapshot(live)
             c = fn(live, c)
-            return c, _layer_writes(snapshot)
+            writes = _layer_writes(snapshot)
+            if key_to_vid:
+                next_shared = dict(shared_vals)
+                for k, vid in key_to_vid.items():
+                    if k in writes:
+                        written_vids.add(vid)
+                        next_shared[vid] = writes.pop(k)
+            else:
+                next_shared = shared_vals
+            return (c, next_shared), writes
 
         return step
 
-    steps = tuple(make_step(pos) for pos in block.positions)
+    steps = tuple(make_step(pos, k2v) for pos, k2v in zip(block.positions, pos_key_to_vid, strict=True))
 
-    def body(c, block_states):
+    def body(loop_carry, block_states):
+        c, shared_vals = loop_carry
         writes = []
         for pos, step, pos_state in zip(block.positions, steps, block_states, strict=True):
             if pos.length == 1:
-                c, w = step(c, jax.tree.map(lambda x: x[0], pos_state))
+                (c, shared_vals), w = step((c, shared_vals), jax.tree.map(lambda x: x[0], pos_state))
                 w = jax.tree.map(lambda x: x[None], w)
             else:
-                c, w = jax.lax.scan(step, c, pos_state, unroll=_scan_effective_unroll(unroll, pos.length))
+                (c, shared_vals), w = jax.lax.scan(
+                    step,
+                    (c, shared_vals),
+                    pos_state,
+                    unroll=_scan_effective_unroll(unroll, pos.length),
+                )
             writes.append(w)
-        return c, tuple(writes)
+        return (c, shared_vals), tuple(writes)
 
-    return jax.lax.scan(body, carry, tuple(pos.stacked for pos in block.positions))
+    (carry, shared_final), writes = jax.lax.scan(
+        body, (carry, shared_init), tuple(pos.stacked for pos in block.positions)
+    )
+    shared_written = [(shared_vars[vid], shared_final[vid]) for vid in written_vids]
+    return carry, shared_written, writes
 
 
 def _scan_with_weight_prefetch(
@@ -1448,9 +1524,24 @@ def _lower_scan_plan(
     exclude = (prefetch_exclude,) if isinstance(prefetch_exclude, str) else tuple(prefetch_exclude or ())
     shared_of = {seg.start: s for seg, s in zip(segments, shared, strict=True)}
     if block_scan:
-        items = _group_periodic_segments(segments, tuple(not s for s in shared))
+        raw_items = _group_periodic_segments(segments)
+        items: list[_ScanSegment | _ScanBlock] = []
+        block_shared_map: dict[int, tuple[dict[tuple[str, str], Variable], ...]] = {}
+        for item in raw_items:
+            if isinstance(item, _ScanBlock):
+                pos_shared = _block_position_shared(item, shared_of)
+                if pos_shared is not None:
+                    block_shared_map[id(item)] = pos_shared
+                    items.append(item)
+                else:
+                    for k in range(item.blocks):
+                        for j in range(len(item.positions)):
+                            items.append(item.members[j][k])
+            else:
+                items.append(item)
     else:
         items = list(segments)
+        block_shared_map = {}
     for item in items:
         if isinstance(item, _ScanBlock):
             out = None
@@ -1469,13 +1560,23 @@ def _lower_scan_plan(
             if out is not None:
                 carry = out
                 continue
-            carry, writes = _scan_block_with_explicit_unroll(item, fn, carry, bind, unroll, barrier=barrier)
+            carry, shared_written, writes = _scan_block_with_explicit_unroll(
+                item,
+                fn,
+                carry,
+                bind,
+                unroll,
+                position_shared=block_shared_map.get(id(item)),
+                barrier=barrier,
+            )
+            for var, value in shared_written:
+                var.value = value
             for members, pos_writes in zip(item.members, writes, strict=True):
                 for k, member in enumerate(members):
                     write_back(member, {}, {}, {key: value[k] for key, value in pos_writes.items()})
             continue
         seg_shared = shared_of[item.start]
-        if axes and not seg_shared:
+        if axes:
             out = _scan_with_weight_prefetch(
                 (item,),
                 1,
@@ -1510,11 +1611,11 @@ def _write_back_item_writes(
         tables: Per-item variable tables.
         segment: The segment that produced the values.
         shared: Carried shared variables.
-        shared_final: Their values after the segment.
+        shared_final: Final values for shared variables actually mutated by ``fn``.
         writes: Per-layer stacked values of the other written variables.
     """
-    for key, var in shared.items():
-        var.value = shared_final[key]
+    for key, value in shared_final.items():
+        shared[key].value = value
     for key, stacked_value in writes.items():
         for offset, item_index in enumerate(range(segment.start, segment.stop)):
             var = tables[item_index].get(key)

@@ -65,6 +65,8 @@ from .executor import OperationExecutor
 from .kernels import (
     AutoRegressiveDecodeAttn,
     BlockSparseAttn,
+    DualStreamAttn,
+    DualStreamRaggedPageAttn,
     FlashAttn,
     FusedMlpOp,
     GlmMoeDsaIndexerOp,
@@ -99,6 +101,8 @@ __all__ = (
     "BlockSparseAttn",
     "CacheRequirements",
     "CacheType",
+    "DualStreamAttn",
+    "DualStreamRaggedPageAttn",
     "ExecutionMode",
     "FlashAttentionConfig",
     "FlashAttn",

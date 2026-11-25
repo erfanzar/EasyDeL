@@ -4416,6 +4416,37 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         return {}
 
+    @property
+    def is_looped(self) -> bool:
+        """Whether this model executes a shared block of decoder layers for multiple loop iterations."""
+        return False
+
+    @property
+    def loop_layer_schedule(self) -> tuple[tuple[int, int], ...]:
+        """Ordered ``(physical_layer_idx, loop_iteration)`` execution schedule.
+
+        For standard (non-looped) models this is simply ``((0, 0), ..., (L - 1, 0))``.
+        Looped models override this to expand the shared loop core across iterations
+        so each pass gets its own cache slot while reusing the same physical layer weights.
+        """
+        num_layers = int(getattr(self, "num_hidden_layers", 0) or 0)
+        return tuple((idx, 0) for idx in range(num_layers))
+
+    @property
+    def num_cache_layers(self) -> int:
+        """Number of cache view slots required during inference (equals ``len(loop_layer_schedule)``)."""
+        if self.is_looped:
+            return len(self.loop_layer_schedule)
+        return int(getattr(self, "num_hidden_layers", 0) or 0)
+
+    @property
+    def effective_layer_types(self) -> list[str] | None:
+        """Per-cache-slot attention type schedule expanded over any looped layers."""
+        layer_types = getattr(self, "layer_types", None)
+        if layer_types is None or not self.is_looped:
+            return layer_types
+        return [layer_types[phys_idx] for phys_idx, _ in self.loop_layer_schedule]
+
     @staticmethod
     def _fix_parent_kws(kw1, kw2):
         """Merge two keyword argument dictionaries, with kw1 taking precedence.

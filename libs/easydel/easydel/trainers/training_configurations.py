@@ -832,6 +832,25 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The final learning rate for linear decay schedulers."},
     )
+    param_lr_multipliers: dict[str, float] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional mapping of regex/substring parameter path patterns to learning-rate "
+                "multipliers (e.g. {'loop_gates': 10.0, 'loop_iter_embeddings': 10.0}). "
+                "Applied statelessly at the end of the optimizer chain (zero extra optimizer state)."
+            )
+        },
+    )
+    no_weight_decay_patterns: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional list of regex/substring parameter path patterns excluded from weight decay "
+                "(e.g. ['loop_gates', 'loop_iter_embeddings'])."
+            )
+        },
+    )
     log_all_workers: bool = field(
         default=False,
         metadata={"help": "Whether to log metrics from all workers in a distributed setup."},
@@ -1976,6 +1995,20 @@ class TrainingArguments:
                 f"{type(self.learning_rate_end).__name__}: {self.learning_rate_end!r}"
             )
 
+        if self.param_lr_multipliers is not None:
+            if not isinstance(self.param_lr_multipliers, dict):
+                raise TypeError(
+                    "`param_lr_multipliers` must be a dict[str, float] when provided, got "
+                    f"{type(self.param_lr_multipliers).__name__}."
+                )
+            self.param_lr_multipliers = {str(k): float(v) for k, v in self.param_lr_multipliers.items()}
+
+        if self.no_weight_decay_patterns is not None:
+            if isinstance(self.no_weight_decay_patterns, str):
+                self.no_weight_decay_patterns = [self.no_weight_decay_patterns]
+            else:
+                self.no_weight_decay_patterns = [str(p) for p in self.no_weight_decay_patterns]
+
         if self.clip_grad is not None and not _is_real_number(self.clip_grad):
             raise TypeError(
                 f"`clip_grad` must be a number when provided, got {type(self.clip_grad).__name__}: {self.clip_grad!r}"
@@ -2274,6 +2307,8 @@ class TrainingArguments:
             scheduler_config=scheduler_config,
             clip_grad=optimizer_kwargs.pop("clip_grad"),
             weight_decay=optimizer_kwargs.pop("weight_decay"),
+            no_weight_decay_patterns=self.no_weight_decay_patterns,
+            param_lr_multipliers=self.param_lr_multipliers,
             custom_scheduler=self.custom_scheduler,
             **optimizer_kwargs,
         )

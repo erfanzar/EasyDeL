@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import re
 import typing as tp
 import warnings
 
@@ -20,6 +21,102 @@ import chex
 import jax
 import optax
 from jax import numpy as jnp
+
+
+def _pytree_path_to_str(path: tuple[tp.Any, ...]) -> str:
+    """Format a JAX pytree KeyPath into a canonical dot-separated string."""
+    parts: list[str] = []
+    for entry in path:
+        if hasattr(entry, "key"):
+            parts.append(str(entry.key))
+        elif hasattr(entry, "name"):
+            parts.append(str(entry.name))
+        elif hasattr(entry, "idx"):
+            parts.append(str(entry.idx))
+        else:
+            parts.append(str(entry))
+    return ".".join(parts)
+
+
+def build_path_exclusion_mask(
+    patterns: tp.Sequence[str],
+    base_mask: chex.ArrayTree | tp.Callable[[chex.ArrayTree], chex.ArrayTree] | None = None,
+) -> tp.Callable[[chex.ArrayTree], chex.ArrayTree]:
+    """Build an optax-compatible mask function excluding leaves matching regex ``patterns``.
+
+    Args:
+        patterns: Sequence of regular expressions matched via ``re.search`` against
+            each leaf's dot-joined pytree path (e.g. ``["loop_gates", "loop_iter_embeddings"]``).
+        base_mask: Optional existing boolean pytree or callable mask to combine via logical AND.
+
+    Returns:
+        Callable ``mask_fn(params) -> bool_pytree`` returning ``False`` on excluded
+        leaves and ``True`` otherwise.
+    """
+    compiled = tuple(re.compile(str(p)) for p in patterns if str(p))
+
+    def _mask_fn(params: chex.ArrayTree) -> chex.ArrayTree:
+        excl_tree = jax.tree_util.tree_map_with_path(
+            lambda path, _leaf: not any(pat.search(_pytree_path_to_str(path)) for pat in compiled),
+            params,
+        )
+        if base_mask is None:
+            return excl_tree
+        resolved_base = base_mask(params) if callable(base_mask) else base_mask
+        return jax.tree_util.tree_map(lambda a, b: bool(a) and bool(b), resolved_base, excl_tree)
+
+    return _mask_fn
+
+
+def optax_scale_by_path_multipliers(
+    lr_multipliers: tp.Mapping[str, float],
+) -> optax.GradientTransformation:
+    """Scale optimizer updates per parameter leaf based on regex/substring path rules.
+
+    Stateless (``optax.EmptyState``) transformation intended to sit at the end of an
+    optimizer chain (after base adaptive scaling and weight decay). First matching
+    pattern in ``lr_multipliers`` insertion order wins; unmatched leaves keep ``1.0``.
+
+    Args:
+        lr_multipliers: Mapping ``{pattern: multiplier}`` with finite multipliers >= 0.
+
+    Returns:
+        An ``optax.GradientTransformation`` with zero optimizer state overhead.
+    """
+    compiled: list[tuple[re.Pattern[str], float]] = []
+    for pat, raw_mult in lr_multipliers.items():
+        mult = float(raw_mult)
+        if mult < 0.0 or mult != mult or mult == float("inf"):
+            raise ValueError(f"LR multiplier for pattern {pat!r} must be finite and >= 0, got {raw_mult!r}.")
+        compiled.append((re.compile(str(pat)), mult))
+    rules = tuple(compiled)
+
+    def init_fn(params: chex.ArrayTree) -> optax.EmptyState:
+        del params
+        return optax.EmptyState()
+
+    def update_fn(
+        updates: chex.ArrayTree,
+        state: optax.EmptyState,
+        params: chex.ArrayTree | None = None,
+    ) -> tuple[chex.ArrayTree, optax.EmptyState]:
+        del params
+
+        def _scale_leaf(path: tuple[tp.Any, ...], upd: tp.Any) -> tp.Any:
+            if upd is None:
+                return None
+            path_str = _pytree_path_to_str(path)
+            for pat, mult in rules:
+                if pat.search(path_str):
+                    if mult == 1.0:
+                        return upd
+                    return upd * jnp.asarray(mult, dtype=upd.dtype)
+            return upd
+
+        scaled = jax.tree_util.tree_map_with_path(_scale_leaf, updates)
+        return scaled, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 class OptaxScheduledWeightDecayState(tp.NamedTuple):

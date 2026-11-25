@@ -302,13 +302,226 @@ def _install_cpu_gdr_step_mocks(monkeypatch):
 
         return jax.vmap(jax.vmap(_one))(query, key, value, beta, decay, recurrent_state, d_out, d_state_next)
 
-    monkeypatch.setattr(gdr_fwd_mod, "_run_dense_fwd_step", _dense_step)
-    monkeypatch.setattr(gdr_fwd_mod, "_run_grouped_dense_fwd_step", _grouped_dense_step)
-    monkeypatch.setattr(gdr_fwd_mod, "_run_segmented_fwd_step", _seg_step)
-    monkeypatch.setattr(gdr_fwd_mod, "_run_grouped_segmented_fwd_step", _grouped_seg_step)
+    def _grouped_seg_vmem_scan(
+        initial_state,
+        state_seg0,
+        query_c,
+        key_c,
+        value_c,
+        beta_c,
+        g_cumsum_c,
+        seg_c,
+        chunk_has_valid,
+        seg_last,
+        g_end_c,
+        *,
+        expand_ratio: int,
+        output_dtype,
+        save_pre_states: bool,
+    ):
+        def _body(carry, xs):
+            st, st_seg = carry
+            q_i, k_i, v_i, b_i, g_i, s_i, hv_i, sl_i, ge_i = xs
+            next_st, next_seg, core_out = _grouped_seg_step(
+                st,
+                st_seg,
+                q_i,
+                k_i,
+                v_i,
+                b_i,
+                g_i,
+                s_i,
+                hv_i,
+                sl_i,
+                ge_i,
+                expand_ratio=expand_ratio,
+                output_dtype=output_dtype,
+            )
+            return (next_st, next_seg), (core_out, st, st_seg)
+
+        xs = (
+            query_c.transpose(2, 0, 1, 3, 4),
+            key_c.transpose(2, 0, 1, 3, 4),
+            value_c.transpose(2, 0, 1, 3, 4),
+            beta_c.transpose(2, 0, 1, 3),
+            g_cumsum_c.transpose(2, 0, 1, 3),
+            seg_c.transpose(2, 0, 1, 3),
+            chunk_has_valid.transpose(2, 0, 1),
+            seg_last.transpose(2, 0, 1),
+            g_end_c.transpose(2, 0, 1),
+        )
+        (final_st, _), (out_tm, st_pre_tm, seg_pre_tm) = jax.lax.scan(_body, (initial_state, state_seg0), xs)
+        out_c = out_tm.transpose(1, 2, 0, 3, 4)
+        if save_pre_states:
+            return final_st, out_c, st_pre_tm.transpose(1, 2, 0, 3, 4), seg_pre_tm.transpose(1, 2, 0)
+        return final_st, out_c, None, None
+
+    def _grouped_bwd_vmem_scan(
+        state_pre,
+        state_seg_pre,
+        query_c,
+        key_c,
+        value_c,
+        beta_c,
+        decay_c,
+        g_cumsum_c,
+        d_out_c,
+        seg_c,
+        chunk_has_valid,
+        seg_last,
+        g_end_c,
+        d_final_state,
+        *,
+        expand_ratio: int,
+        grad_dtype=jnp.float32,
+    ):
+        def _body(d_st_next, xs):
+            sp, ss, q_i, k_i, v_i, b_i, dc_i, gc_i, do_i, seg_i, has_i, last_i, ge_i = xs
+            q_rep = jnp.repeat(q_i, expand_ratio, axis=1)
+            k_rep = jnp.repeat(k_i, expand_ratio, axis=1)
+            d_st, dq, dk, dv, db, dd = _bwd_seg_step(
+                sp,
+                ss,
+                q_rep[:, :, None],
+                k_rep[:, :, None],
+                v_i[:, :, None],
+                b_i[:, :, None, None],
+                dc_i[:, :, None, None],
+                gc_i[:, :, None],
+                do_i[:, :, None],
+                seg_i[:, :, None],
+                has_i[:, :, None],
+                last_i[:, :, None],
+                ge_i[:, :, None],
+                d_st_next,
+                grad_dtype=grad_dtype,
+            )
+            return d_st, (dq[:, :, 0], dk[:, :, 0], dv[:, :, 0], db[:, :, 0, :, 0], dd[:, :, 0, :, 0])
+
+        xs = (
+            state_pre.transpose(2, 0, 1, 3, 4),
+            state_seg_pre.transpose(2, 0, 1),
+            query_c.transpose(2, 0, 1, 3, 4),
+            key_c.transpose(2, 0, 1, 3, 4),
+            value_c.transpose(2, 0, 1, 3, 4),
+            beta_c.transpose(2, 0, 1, 3),
+            decay_c.transpose(2, 0, 1, 3),
+            g_cumsum_c.transpose(2, 0, 1, 3),
+            d_out_c.transpose(2, 0, 1, 3, 4),
+            seg_c.transpose(2, 0, 1, 3),
+            chunk_has_valid.transpose(2, 0, 1),
+            seg_last.transpose(2, 0, 1),
+            g_end_c.transpose(2, 0, 1),
+        )
+        d_init, (dq_tm, dk_tm, dv_tm, db_tm, dd_tm) = jax.lax.scan(
+            _body, d_final_state.astype(jnp.float32), xs, reverse=True
+        )
+        return (
+            d_init,
+            dq_tm.transpose(1, 2, 0, 3, 4),
+            dk_tm.transpose(1, 2, 0, 3, 4),
+            dv_tm.transpose(1, 2, 0, 3, 4),
+            db_tm.transpose(1, 2, 0, 3),
+            dd_tm.transpose(1, 2, 0, 3),
+        )
+
+    def _grouped_dense_vmem_scan(
+        initial_state,
+        query_c,
+        key_c,
+        value_c,
+        beta_c,
+        g_cumsum_c,
+        *,
+        expand_ratio: int,
+        output_dtype,
+        state_dtype,
+        save_pre_states: bool,
+    ):
+        def _body(st, xs):
+            q_i, k_i, v_i, b_i, g_i = xs
+            next_st, core_out = _grouped_dense_step(
+                st,
+                q_i,
+                k_i,
+                v_i,
+                b_i,
+                g_i,
+                expand_ratio=expand_ratio,
+                output_dtype=output_dtype,
+                state_dtype=state_dtype,
+            )
+            return next_st, (core_out, st)
+
+        xs = (
+            query_c.transpose(2, 0, 1, 3, 4),
+            key_c.transpose(2, 0, 1, 3, 4),
+            value_c.transpose(2, 0, 1, 3, 4),
+            beta_c.transpose(2, 0, 1, 3),
+            g_cumsum_c.transpose(2, 0, 1, 3),
+        )
+        final_st, (out_tm, st_pre_tm) = jax.lax.scan(_body, initial_state, xs)
+        out_c = out_tm.transpose(1, 2, 0, 3, 4)
+        if save_pre_states:
+            return final_st, out_c, st_pre_tm.transpose(1, 2, 0, 3, 4)
+        return final_st, out_c, None
+
+    def _grouped_dense_bwd_vmem_scan(
+        state_pre,
+        query_c,
+        key_c,
+        value_c,
+        beta_c,
+        decay_c,
+        d_out_c,
+        d_final_state,
+        *,
+        expand_ratio: int,
+        grad_dtype=jnp.float32,
+    ):
+        def _body(d_st_next, xs):
+            sp, q_i, k_i, v_i, b_i, dc_i, do_i = xs
+            q_rep = jnp.repeat(q_i, expand_ratio, axis=1)
+            k_rep = jnp.repeat(k_i, expand_ratio, axis=1)
+            d_st, dq, dk, dv, db, dd = _bwd_dense_step(
+                sp,
+                q_rep[:, :, None],
+                k_rep[:, :, None],
+                v_i[:, :, None],
+                b_i[:, :, None, None],
+                dc_i[:, :, None, None],
+                do_i[:, :, None],
+                d_st_next,
+                grad_dtype=grad_dtype,
+            )
+            return d_st, (dq[:, :, 0], dk[:, :, 0], dv[:, :, 0], db[:, :, 0, :, 0], dd[:, :, 0, :, 0])
+
+        xs = (
+            state_pre.transpose(2, 0, 1, 3, 4),
+            query_c.transpose(2, 0, 1, 3, 4),
+            key_c.transpose(2, 0, 1, 3, 4),
+            value_c.transpose(2, 0, 1, 3, 4),
+            beta_c.transpose(2, 0, 1, 3),
+            decay_c.transpose(2, 0, 1, 3),
+            d_out_c.transpose(2, 0, 1, 3, 4),
+        )
+        d_init, (dq_tm, dk_tm, dv_tm, db_tm, dd_tm) = jax.lax.scan(
+            _body, d_final_state.astype(jnp.float32), xs, reverse=True
+        )
+        return (
+            d_init,
+            dq_tm.transpose(1, 2, 0, 3, 4),
+            dk_tm.transpose(1, 2, 0, 3, 4),
+            dv_tm.transpose(1, 2, 0, 3, 4),
+            db_tm.transpose(1, 2, 0, 3),
+            dd_tm.transpose(1, 2, 0, 3),
+        )
+
+    monkeypatch.setattr(gdr_fwd_mod, "_run_grouped_dense_fwd_vmem_scan", _grouped_dense_vmem_scan)
+    monkeypatch.setattr(gdr_fwd_mod, "_run_grouped_segmented_fwd_vmem_scan", _grouped_seg_vmem_scan)
     monkeypatch.setattr(gdr_fwd_mod, "_run_single_step_forward", _single_step_fwd)
-    monkeypatch.setattr(gdr_bwd_mod, "_run_bwd_grad_step", _bwd_dense_step)
-    monkeypatch.setattr(gdr_bwd_mod, "_run_bwd_grad_step_segmented", _bwd_seg_step)
+    monkeypatch.setattr(gdr_bwd_mod, "_run_grouped_dense_bwd_vmem_scan", _grouped_dense_bwd_vmem_scan)
+    monkeypatch.setattr(gdr_bwd_mod, "_run_grouped_segmented_bwd_vmem_scan", _grouped_bwd_vmem_scan)
     monkeypatch.setattr(gdr_bwd_mod, "_run_single_step_backward", _single_step_bwd)
 
 
