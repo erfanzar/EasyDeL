@@ -16,6 +16,7 @@
 
 from collections.abc import Callable, Iterable, Sequence
 
+import numpy as np
 from jax import Array
 from jax import numpy as jnp
 
@@ -163,3 +164,109 @@ def vision_grid_rotary_embeddings(
     inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     freq_table = jnp.outer(jnp.arange(max_grid_size, dtype=jnp.float32), inv_freq)
     return freq_table[pos_ids].reshape(pos_ids.shape[0], -1)
+
+
+def vision_grid_position_ids(
+    grid_thw: Iterable[Sequence[int]] | np.ndarray,
+    spatial_merge_size: int,
+) -> np.ndarray:
+    """Compute block-major 2-D ``(row, col)`` patch position ids for packed vision grids.
+
+    Tokens within each frame are ordered by merge-block row, merge-block column,
+    intra-block row, then intra-block column, and repeated ``temporal`` times.
+
+    Args:
+        grid_thw: Concrete/static ``(temporal, height, width)`` rows per sample.
+        spatial_merge_size: Number of adjacent patches merged along each axis.
+
+    Returns:
+        NumPy ``int64`` array of shape ``[sum(t * h * w), 2]`` holding
+        ``(row, col)`` patch coordinates.
+    """
+    grids = _vision_grid_shapes(grid_thw, spatial_merge_size)
+    merge = int(spatial_merge_size)
+    pos_list: list[np.ndarray] = []
+    for temporal, height, width in grids:
+        h_grid, w_grid = np.meshgrid(np.arange(height, dtype=np.int64), np.arange(width, dtype=np.int64), indexing="ij")
+        block_shape = (height // merge, merge, width // merge, merge)
+        h_flat = h_grid.reshape(block_shape).transpose(0, 2, 1, 3).reshape(-1)
+        w_flat = w_grid.reshape(block_shape).transpose(0, 2, 1, 3).reshape(-1)
+        frame_pos = np.stack([h_flat, w_flat], axis=-1)
+        pos_list.append(np.tile(frame_pos, (temporal, 1)))
+    return np.concatenate(pos_list, axis=0)
+
+
+def _bilinear_axis_taps_and_weights(
+    index: np.ndarray,
+    size: np.ndarray,
+    side: int,
+    *,
+    align_corners: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute 1-D bilinear interpolation indices and weights matching ``F.interpolate``."""
+    idx = index.astype(np.float32)
+    sz = size.astype(np.float32)
+    if align_corners:
+        src = idx * (side - 1) / np.maximum(sz - 1.0, 1.0)
+    else:
+        src = (idx + 0.5) * side / sz - 0.5
+    floor = np.floor(src)
+    offsets = np.array([0, 1], dtype=np.int64)
+    raw_taps = floor.astype(np.int64)[:, None] + offsets[None, :]
+    taps = np.clip(raw_taps, 0, side - 1)
+    distance = np.abs(src[:, None] - floor[:, None] - offsets[None, :].astype(np.float32))
+    weights = np.maximum(1.0 - distance, 0.0).astype(np.float32)
+    return taps, weights
+
+
+def vision_grid_pos_embed_interpolation_indices_and_weights(
+    grid_thw: Iterable[Sequence[int]] | np.ndarray,
+    num_grid_per_side: int,
+    *,
+    spatial_merge_size: int = 2,
+    align_corners: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute 4-tap bilinear lookup indices and weights for a square learned position grid.
+
+    Supports both ``align_corners=False`` (pixel-center resampling matching
+    PyTorch's default ``F.interpolate(..., mode="bilinear", align_corners=False)``,
+    used by Inkling 2) and ``align_corners=True``.
+
+    Args:
+        grid_thw: Concrete/static ``(temporal, height, width)`` rows per sample.
+        num_grid_per_side: Side length of the learned square position grid.
+        spatial_merge_size: Number of patches per spatial axis in each merge block.
+        align_corners: Whether grid corners align with endpoints.
+
+    Returns:
+        Tuple ``(indices, weights)`` where ``indices`` is ``int64`` of shape
+        ``[sum(t * h * w), 4]`` into the flattened ``side * side`` table and
+        ``weights`` is ``float32`` of shape ``[sum(t * h * w), 4]``.
+    """
+    grids = _vision_grid_shapes(grid_thw, spatial_merge_size)
+    side = int(num_grid_per_side)
+    if side < 1:
+        raise ValueError("num_grid_per_side must be positive")
+    merge = int(spatial_merge_size)
+    grid_np = np.asarray(grids, dtype=np.int64)
+
+    counts = grid_np[:, 0] * grid_np[:, 1] * grid_np[:, 2]
+    heights = np.repeat(grid_np[:, 1], counts)
+    widths = np.repeat(grid_np[:, 2], counts)
+    starts_per_img = np.concatenate([np.zeros((1,), dtype=np.int64), np.cumsum(counts)[:-1]])
+    starts = np.repeat(starts_per_img, counts)
+
+    within = (np.arange(int(counts.sum()), dtype=np.int64) - starts) % (heights * widths)
+    blocks_w = widths // merge
+    in_col = within % merge
+    in_row = (within // merge) % merge
+    block_col = (within // (merge * merge)) % blocks_w
+    block_row = within // (merge * merge * blocks_w)
+    row = block_row * merge + in_row
+    col = block_col * merge + in_col
+
+    h_taps, h_weights = _bilinear_axis_taps_and_weights(row, heights, side, align_corners=align_corners)
+    w_taps, w_weights = _bilinear_axis_taps_and_weights(col, widths, side, align_corners=align_corners)
+    indices = (h_taps[:, :, None] * side + w_taps[:, None, :]).reshape(-1, 4)
+    weights = (h_weights[:, :, None] * w_weights[:, None, :]).reshape(-1, 4)
+    return indices, weights

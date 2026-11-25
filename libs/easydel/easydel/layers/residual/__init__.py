@@ -38,6 +38,7 @@ mixing laws and stream layouts remain distinct rather than forced into one
 parameterization.
 """
 
+from ._attention import BlockAttentionResidual, LoopMessageAttentionResidual, LoopMessageGate
 from ._gated import GatedResidual, expand_streams, inject_streams
 from ._manifold import (
     HyperStreamSharding,
@@ -51,8 +52,11 @@ from ._manifold import (
 )
 
 __all__ = (
+    "BlockAttentionResidual",
     "GatedResidual",
     "HyperStreamSharding",
+    "LoopMessageAttentionResidual",
+    "LoopMessageGate",
     "ManifoldHyperConnection",
     "ManifoldHyperConnectionConfig",
     "ManifoldHyperHead",

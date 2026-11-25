@@ -55,7 +55,6 @@ See Also:
     - BaseSequenceClassificationModule: For sequence classification tasks
 """
 
-import typing
 from collections.abc import Callable
 
 import jax
@@ -63,7 +62,7 @@ import spectrax as spx
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
-from spectrax import apply_logical_sharding, common_types
+from spectrax import common_types
 
 from easydel.caching import (
     HybridCache,
@@ -74,7 +73,6 @@ from easydel.caching import (
     TransformerMetadata,
 )
 from easydel.infra.modeling_outputs import CausalLMOutput, MoeCausalLMOutput
-from easydel.infra.sharding import is_mpmd_mesh
 from easydel.infra.utils import auto_remat as auto_remat
 from easydel.layers import ColumnParallelLinear
 
@@ -474,7 +472,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        aux_loss_fn: typing.Callable | None = None,
+        aux_loss_fn: Callable | None = None,
     ) -> MoeCausalLMOutput:
         """Forward pass for MoE models with router auxiliary loss handling.
 
@@ -581,42 +579,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             router_logits=getattr(outputs, "router_logits", None),
             past_key_values=outputs.past_key_values,
             indexer_aux_loss=getattr(outputs, "indexer_aux_loss", None),
-        )
-
-    def prepare_lm_head_inputs(self, hidden_states: Array) -> Array:
-        """Apply the shared pre-LM-head hidden-state transform.
-
-        Resolves the configured ``HiddenStateSharding`` partitioning so the
-        hidden states arrive at the LM head with the correct sharding for
-        tensor-parallel vocab projection. Subclasses may override to insert
-        additional pre-projection ops (e.g., final norm) before the head.
-
-        Args:
-            hidden_states: Hidden states with shape
-                ``(batch_size, sequence_length, hidden_size)``.
-
-        Returns:
-            Array: ``hidden_states`` with logical sharding applied; same shape
-            as the input.
-        """
-        mesh = getattr(self.config, "_hidden_mesh", None)
-        if mesh is None:
-            mesh = getattr(self.config, "mesh", None)
-        axis_names = tuple(getattr(self.config, "sharding_axis_names", ()))
-        axis_dims = tuple(getattr(self.config, "sharding_axis_dims", ()))
-        config_has_pp = False
-        if "pp" in axis_names:
-            pp_index = axis_names.index("pp")
-            config_has_pp = pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
-        if is_mpmd_mesh(mesh) or int(getattr(mesh, "shape", {}).get("pp", 1)) > 1 or config_has_pp:
-            return hidden_states
-        return typing.cast(
-            Array,
-            apply_logical_sharding(
-                hidden_states,
-                dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.runtime_sharding_resolver,
-            ),
         )
 
     def get_task_head(self):

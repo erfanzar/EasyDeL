@@ -102,7 +102,12 @@ from ._utils import (
     rotate_half,
     yarn_get_mscale,
 )
-from ._vision import vision_grid_pos_embed_interpolate, vision_grid_rotary_embeddings
+from ._vision import (
+    vision_grid_pos_embed_interpolate,
+    vision_grid_pos_embed_interpolation_indices_and_weights,
+    vision_grid_position_ids,
+    vision_grid_rotary_embeddings,
+)
 
 __all__ = (
     "DeepseekScalingRotaryEmbedding",
@@ -141,6 +146,8 @@ __all__ = (
     "rope_scaling_from_rope_parameters",
     "rotate_half",
     "vision_grid_pos_embed_interpolate",
+    "vision_grid_pos_embed_interpolation_indices_and_weights",
+    "vision_grid_position_ids",
     "vision_grid_rotary_embeddings",
     "yarn_get_mscale",
 )

@@ -83,6 +83,7 @@ from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.sharding import is_mpmd_mesh
 
 from ._features import (
     GradientCheckpointingFeature,
@@ -651,6 +652,44 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         if seq_len is None:
             return chunk_size
         return max(1, min(chunk_size, int(seq_len)))
+
+    def prepare_lm_head_inputs(self, hidden_states: Array) -> Array:
+        """Apply the shared pre-LM-head hidden-state transform.
+
+        Resolves the configured ``HiddenStateSharding`` partitioning so the
+        hidden states arrive at the LM head with the correct sharding for
+        tensor-parallel vocab projection. Under MPMD pipeline parallelism
+        (``pp > 1``), stage-local sharding is already authoritative so the
+        global sharding constraint is skipped. Subclasses may override to
+        insert additional pre-projection ops (e.g., final norm) before the head.
+
+        Args:
+            hidden_states: Hidden states with shape
+                ``(batch_size, sequence_length, hidden_size)``.
+
+        Returns:
+            Array: ``hidden_states`` with logical sharding applied when not
+            running under MPMD; same shape as the input.
+        """
+        mesh = getattr(self.config, "_hidden_mesh", None)
+        if mesh is None:
+            mesh = getattr(self.config, "mesh", None)
+        axis_names = tuple(getattr(self.config, "sharding_axis_names", ()))
+        axis_dims = tuple(getattr(self.config, "sharding_axis_dims", ()))
+        config_has_pp = False
+        if "pp" in axis_names:
+            pp_index = axis_names.index("pp")
+            config_has_pp = pp_index < len(axis_dims) and int(axis_dims[pp_index]) > 1
+        if is_mpmd_mesh(mesh) or int(getattr(mesh, "shape", {}).get("pp", 1)) > 1 or config_has_pp:
+            return hidden_states
+        return cast(
+            Array,
+            apply_logical_sharding(
+                hidden_states,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.runtime_sharding_resolver,
+            ),
+        )
 
     def _constrain_lm_logits(self, logits: Array) -> Array:
         """Apply logical-axis sharding constraints to full-rank LM logits.

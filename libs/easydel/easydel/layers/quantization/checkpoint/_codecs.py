@@ -66,15 +66,17 @@ def decode_scaled_elements(
     transpose: bool = True,
     dtype: jnp.dtype = jnp.float32,
     block_shape: tp.Sequence[int] | None = None,
+    scale_fmt: str | None = None,
 ) -> Array:
-    """Decode any element-wise-scaled weight (fp8, int8, and their block forms).
+    """Decode any element-wise-scaled weight (fp8, mxfp8, int8, and their block forms).
 
     Covers per-tensor, per-channel and 2-D block scales uniformly, because
     :func:`~._decode.expand_scale` treats all three as a scale grid coarser
     than the weight. This is the decoder for ``fp8`` checkpoints
-    (``float8_e4m3fn`` elements with ``weight_scale`` or ``weight_scale_inv``)
-    and for compressed-tensors ``int8`` schemes alike — the element dtype
-    differs, the arithmetic does not.
+    (``float8_e4m3fn`` elements with ``weight_scale`` or ``weight_scale_inv``,
+    including MXFP8 checkpoints declaring ``scale_fmt="ue8m0"`` with ``uint8``
+    or ``float8_e8m0fnu`` shared exponents) and for compressed-tensors ``int8``
+    schemes alike — the element dtype differs, the arithmetic does not.
 
     Args:
         weight: Quantized elements, ``[out, in]`` in HF layout (or
@@ -84,13 +86,21 @@ def decode_scaled_elements(
             to EasyDeL's ``[in, out]``.
         dtype: Output dtype.
         block_shape: The checkpoint's declared block sizes (e.g. DeepSeek's
-            ``weight_block_size=[128, 128]``), aligned to the ``[out, in]``
-            axes as stored. Required for correct scale expansion whenever a
-            dimension is not a multiple of its block size.
+            ``weight_block_size=[128, 128]`` or MXFP8 ``[1, 32]``), aligned to
+            the ``[out, in]`` axes as stored. Required for correct scale
+            expansion whenever a dimension is not a multiple of its block size.
+        scale_fmt: Optional scale encoding tag from ``quantization_config``
+            (e.g. ``"ue8m0"`` or ``"e8m0"``). When E8M0 is declared — or when
+            ``scale`` already carries dtype ``float8_e8m0fnu`` — scales are
+            decoded via :func:`~._decode.decode_e8m0_scale` instead of raw
+            integer casting.
 
     Returns:
         Dense weight in ``[in, out]`` layout.
     """
+    fmt = str(scale_fmt or "").lower()
+    if fmt in {"ue8m0", "e8m0"} or scale.dtype == jnp.float8_e8m0fnu:
+        scale = decode_e8m0_scale(scale, dtype=jnp.float32)
     # HF layout puts output channels on axis -2, so that is where a 1-D
     # per-channel `weight_scale` indexes — including for a square weight,
     # where length alone cannot tell the two axes apart.

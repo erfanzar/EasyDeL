@@ -45,11 +45,14 @@ from ._kda import (
     unnest_legacy_kda_forget_gate,
 )
 from ._masking import apply_mask_to_padding_states
+from ._short_conv import DynamicResidualShortConvolution, ResidualShortConvolution
 
 __all__ = (
     "ChannelMajorConv1D",
+    "DynamicResidualShortConvolution",
     "KDALayerSpec",
     "KernelDeltaAttention",
+    "ResidualShortConvolution",
     "apply_conv_with_state",
     "apply_manual_depthwise_conv",
     "apply_mask_to_padding_states",

@@ -86,7 +86,7 @@ from .linears import (
     RowParallelMoELinear,
     eLoRA,
 )
-from .mlp import clamped_swiglu, gated_mlp_forward, moe_gated_expert_forward, swiglu_oai
+from .mlp import clamped_swiglu, gated_mlp_forward, moe_gated_expert_forward, softcapped_swiglu, swiglu_oai
 from .moe import (
     BaseMoeModule,
     MoeFusedHooks,
@@ -118,7 +118,10 @@ from .quantization import (
     straight_through_nvfp8,
 )
 from .residual import (
+    BlockAttentionResidual,
     GatedResidual,
+    LoopMessageAttentionResidual,
+    LoopMessageGate,
     ManifoldHyperConnection,
     ManifoldHyperConnectionConfig,
     ManifoldHyperHead,
@@ -226,6 +229,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "BaseIndexer",
     "BaseMoeModule",
+    "BlockAttentionResidual",
     "BlockMaxIndexer",
     "BlockMaxIndexerConfig",
     "BlockTopKIndexer",
@@ -250,6 +254,8 @@ __all__ = [
     "IndexerSelection",
     "LinearScalingRotaryEmbedding",
     "Llama3RotaryEmbedding",
+    "LoopMessageAttentionResidual",
+    "LoopMessageGate",
     "ManifoldHyperConnection",
     "ManifoldHyperConnectionConfig",
     "ManifoldHyperHead",
@@ -325,6 +331,7 @@ __all__ = [
     "normalize_segment_sizes",
     "qkv_fusion_reform_param",
     "quantize",
+    "softcapped_swiglu",
     "split_contiguous_segments_last_axis",
     "split_fused_gate_up_projection",
     "split_fused_qkv_projection",

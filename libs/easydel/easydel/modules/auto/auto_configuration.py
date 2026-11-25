@@ -119,6 +119,8 @@ IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
         "hunyuan_vl",
         "idefics",
         "idefics2",
+        "inkling2",
+        "inkling2_loop",
         "internvl",
         "kimi_vl",
         "llava",

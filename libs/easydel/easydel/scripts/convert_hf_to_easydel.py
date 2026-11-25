@@ -135,11 +135,14 @@ def _infer_task_from_hf_config(config) -> TaskType:
 
 
 def _import_easydel_family(meta_source: str) -> None:
-    """Import ``easydel.modules.<model_type>`` for a local ``config.json`` so its AutoConfig registration runs.
+    """Import the EasyDeL model family package for a local ``config.json`` so its AutoConfig registration runs.
 
     ``import easydel`` loads model families lazily. Families that transformers does not ship (``deepseek_v41``,
-    ``glm5_next``) register their config with ``transformers.AutoConfig`` when their package is imported, so the
-    package must be imported before ``AutoConfig.from_pretrained``. Hub ids, missing files and unknown model types are
+    ``glm5_next``, ``inkling2``, ``inkling2_loop``) register their config with ``transformers.AutoConfig`` when their
+    package is imported, so the package must be imported before ``AutoConfig.from_pretrained``. When ``model_type`` is
+    a variant housed inside a parent family package (e.g. ``inkling2_loop`` -> ``easydel.modules.inkling2``,
+    ``gemma4_text`` -> ``easydel.modules.gemma4``), progressively shorter underscore-separated prefixes are tried so
+    multi-variant families resolve without hardcoded aliases. Hub ids, missing files and unknown model types are
     ignored (transformers then resolves or reports the config itself).
 
     Args:
@@ -155,10 +158,16 @@ def _import_easydel_family(meta_source: str) -> None:
         return
     if not isinstance(model_type, str) or not model_type.isidentifier():
         return
-    try:
-        importlib.import_module(f"easydel.modules.{model_type}")
-    except ModuleNotFoundError:
-        return
+    parts = model_type.split("_")
+    for length in range(len(parts), 0, -1):
+        candidate = "_".join(parts[:length])
+        try:
+            importlib.import_module(f"easydel.modules.{candidate}")
+            return
+        except ModuleNotFoundError as exc:
+            if exc.name == f"easydel.modules.{candidate}":
+                continue
+            raise
 
 
 def _parse_dtype(value: str):

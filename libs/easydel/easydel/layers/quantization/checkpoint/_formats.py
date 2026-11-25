@@ -305,7 +305,12 @@ class ScaledElementsAdapter(CheckpointQuantAdapter):
                     tensors["weight"] = jax.lax.bitcast_convert_type(weight, jnp.uint8)
                 return Mxfp4Adapter.to_canonical(tensors, source=source, target=target)
         scale_name = "weight_scale_inv" if source.is_block_scaled else "weight_scale"
-        dense = decode_scaled_elements(tensors["weight"], tensors[scale_name], block_shape=source.block_shape)
+        dense = decode_scaled_elements(
+            tensors["weight"],
+            tensors[scale_name],
+            block_shape=source.block_shape,
+            scale_fmt=source.raw.get("scale_fmt"),
+        )
         return CanonicalQuantizedWeight.from_dense(
             dense,
             spec=target,

@@ -73,6 +73,7 @@ from .compressed_window import (
     CompressedWindowCacheView,
     CompressedWindowMetadata,
 )
+from .conv_kv import ConvKVCache, ConvKVCacheConfig, ConvKVCacheView
 from .hybrid import (
     HybridCache,
     HybridCacheConfig,
@@ -112,6 +113,9 @@ __all__ = (
     "CompressedWindowCacheConfig",
     "CompressedWindowCacheView",
     "CompressedWindowMetadata",
+    "ConvKVCache",
+    "ConvKVCacheConfig",
+    "ConvKVCacheView",
     "HybridCache",
     "HybridCacheConfig",
     "HybridCacheView",

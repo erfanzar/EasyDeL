@@ -77,7 +77,7 @@ from easydel.utils.inference_mode import is_inference_mode
 if tp.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
-__all__ = ["GatedMLP", "gated_mlp_forward", "moe_gated_expert_forward"]
+__all__ = ["GatedMLP", "clamped_swiglu", "gated_mlp_forward", "moe_gated_expert_forward", "softcapped_swiglu", "swiglu_oai"]
 
 
 def moe_gated_expert_forward(
@@ -693,3 +693,27 @@ def swiglu_oai(gate, up, *, alpha: float, limit: float):
     gate = jnp.clip(gate, max=limit)
     up = jnp.clip(up, min=-limit, max=limit)
     return (up + 1) * (gate * jax.nn.sigmoid(gate * alpha))
+
+
+def softcapped_swiglu(gate, up, *, gate_cap: float, up_cap: float):
+    """SwiGLU with tanh softcaps on the linear gate and up branches (Inkling 2).
+
+    Computes ``(tanh(g / gate_cap) * gate_cap) * sigmoid(g) * (tanh(u / up_cap) * up_cap)``
+    in float32 and casts back to ``gate.dtype``. Notably, ``sigmoid`` receives the
+    *uncapped* gate ``g``, while tanh softcaps bound both linear factors.
+
+    Args:
+        gate: Gate projection output.
+        up: Up projection output.
+        gate_cap: Tanh softcap applied to the linear gate factor.
+        up_cap: Tanh softcap applied to the up branch.
+
+    Returns:
+        Activated intermediate tensor, same shape and dtype as ``gate``.
+    """
+    input_dtype = gate.dtype
+    g = gate.astype(jnp.float32)
+    u = up.astype(jnp.float32)
+    g_capped = jnp.tanh(g / gate_cap) * gate_cap
+    u_capped = jnp.tanh(u / up_cap) * up_cap
+    return (g_capped * jax.nn.sigmoid(g) * u_capped).astype(input_dtype)
