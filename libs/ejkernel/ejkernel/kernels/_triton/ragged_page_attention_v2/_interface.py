@@ -78,6 +78,7 @@ from beartype import beartype
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..._sinks import reduce_sinks_to_per_head
 from ._triton_impl_fwd import ragged_paged_attention_triton_call, ragged_paged_attention_triton_call_qblock
 
 DEFAULT_MASK_VALUE = -2.381976426469702e38
@@ -193,18 +194,34 @@ def ragged_page_attention_v2(
         >>> print(output.shape)
     """
 
+    del mask_value, vmem_limit_bytes
+    _ = compute_dtype
+
+    if softmax_aux is not None:
+        softmax_aux = reduce_sinks_to_per_head(
+            softmax_aux,
+            num_q_heads=int(queries.shape[1]),
+            num_kv_heads=int(kv_pages.shape[2]) // 2,
+        )
+
     if optimized:
+        block_q = 64 if num_queries_per_block is None else int(num_queries_per_block)
+        tile_size = 32 if num_kv_pages_per_block is None else int(num_kv_pages_per_block) * int(kv_pages.shape[1])
+        tile_size = min(128, max(16, tile_size))
         return ragged_paged_attention_triton_call_qblock(
             queries=queries,
             kv_pages=kv_pages,
             context_lens=context_lens,
             block_tables=block_tables,
             query_start_loc=query_start_loc,
+            num_seqs=num_seqs,
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
+            sliding_window=sliding_window,
+            softmax_aux=softmax_aux,
             causal=True,
-            block_q=num_queries_per_block or 64,
-            tile_size=32,
+            block_q=block_q,
+            tile_size=tile_size,
             num_warps=num_warps,
             num_stages=num_stages,
         ).astype(queries.dtype)
@@ -217,11 +234,13 @@ def ragged_page_attention_v2(
             context_lens=context_lens,
             block_tables=block_tables,
             query_start_loc=query_start_loc,
+            num_seqs=num_seqs,
             block_m=block_m,
             block_npages=block_npages,
             causal=True,
             logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
+            softmax_aux=softmax_aux,
             softmax_scale=softmax_scale,
             num_warps=num_warps,
             num_stages=num_stages,

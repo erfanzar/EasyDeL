@@ -267,12 +267,46 @@ class Executor(Generic[Cfg, Out]):
             return cfg
         return cfg
 
+    def _is_pinned_triton_selection(self, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> bool:
+        """Return True when the selected config came from autotuning, persistent cache, or overlay.
+
+        Concrete ``platform="triton"`` winners selected by autotuning, loaded
+        from the trusted persistent autotune cache, or supplied via an active
+        cache overlay must not be overwritten to ``"cute"``/``"cuda"`` by
+        :meth:`_prefer_cuda_cfg`.
+        """
+        dev = device_fingerprint()
+        op_id_v = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"
+        call_key = inv.make_key(kernel.key_builder)
+        key = (dev, op_id_v, call_key)
+
+        for overlay in reversed(_cache_overlay.get()):
+            if overlay.get(key) is not None:
+                return True
+
+        autotuned_keys = getattr(self.chooser, "_autotuned_keys", None)
+        if autotuned_keys is not None and key in autotuned_keys:
+            return True
+
+        persistent = getattr(self.chooser, "persistent", None)
+        if persistent is not None:
+            try:
+                if persistent.get(dev, op_id_v, call_key) is not None:
+                    return True
+            except Exception:
+                pass
+
+        return False
+
     def _prefer_cuda_cfg(self, cfg: Cfg, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> Cfg:
-        """Upgrade configuration to prefer CUTE/CUDA when conditions are met.
+        """Upgrade heuristic/auto configurations to prefer CUTE/CUDA when conditions are met.
 
         Automatically switches the platform field in a configuration from 'auto'
-        or 'triton' to 'cute'/'cuda' when all of the following conditions are satisfied:
-        - The current configuration platform is 'auto' or 'triton'
+        (or heuristic-fallback 'triton') to 'cute'/'cuda' when all of the
+        following conditions are satisfied:
+        - The current configuration platform is 'auto', or is a heuristic-fallback
+          'triton' config (concrete 'triton' winners from autotuning, the
+          persistent autotune cache, or an active cache overlay are preserved)
         - No explicit override configuration was provided
         - No explicit platform was specified in invocation kwargs
         - The current device is a GPU
@@ -280,8 +314,9 @@ class Executor(Generic[Cfg, Out]):
         - A CuTe or CUDA implementation exists in the kernel registry
 
         This enables transparent use of optimized CUTE/CUDA kernels when
-        available, while gracefully falling back to Triton implementations
-        on unsupported platforms.
+        available, while preserving autotuned/cached Triton selections and
+        gracefully falling back to Triton implementations on unsupported
+        platforms.
 
         Args:
             cfg: Current configuration object (may have 'platform' and/or
@@ -290,8 +325,8 @@ class Executor(Generic[Cfg, Out]):
             inv: Current invocation with arguments and metadata.
 
         Returns:
-            Modified configuration with platform set to 'cuda' and backend
-            set to 'gpu' if upgrade conditions are met, otherwise the
+            Modified configuration with platform set to 'cute' or 'cuda' and
+            backend set to 'gpu' if upgrade conditions are met, otherwise the
             original configuration unchanged.
         """
         platform_val = self._platform_value(getattr(cfg, "platform", None))
@@ -313,6 +348,8 @@ class Executor(Generic[Cfg, Out]):
         has_cute = self._has_cute_impl(kernel.op_id)
         has_cuda = self._has_cuda_impl(kernel.op_id)
         if not has_cute and not has_cuda:
+            return cfg
+        if platform_val == "triton" and self._is_pinned_triton_selection(kernel, inv):
             return cfg
 
         if dataclasses.is_dataclass(cfg):

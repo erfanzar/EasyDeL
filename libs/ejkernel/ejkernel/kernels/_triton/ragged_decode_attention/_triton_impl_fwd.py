@@ -12,43 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ragged decode attention with multi-query attention (MQA) support.
+"""Ragged decode attention with multi-query / grouped-query attention support.
 
 This module implements decode attention for variable-length sequences
 using a ragged tensor layout. Each sequence can have different context
 lengths, specified by (start, end) indices into a shared KV buffer.
 
-Core Algorithm (ragged_decode_mqa_fwd_kernel):
----------------------------------------------
-For each query position in a batch:
-1. Load query vector and determine valid KV range from (starts, ends)
-2. Iterate over KV blocks, applying sliding window constraints
-3. Compute QK^T scores with optional soft-capping
-4. Accumulate attention output using streaming softmax
-5. Optionally incorporate attention sink logits
-
-Key Features:
-- Variable-length sequence support via start/end indices
-- Sliding window attention with configurable left/right bounds
-- Attention sink support for persistent token importance
-- Logit soft-capping via stable tanh implementation
-- Multi-query attention (MQA) and grouped-query attention (GQA)
+Core Algorithm (ragged_decode_fwd_kernel):
+------------------------------------------
+Each program instance computes streaming decode attention for a single
+``(batch, kv_head, group_member)`` tuple directly from strided ``[B, HQ, D]``
+queries and ``[B, S, HKV, D]`` keys/values without transposing or splitting
+KV tensors on the host:
+1. Compute effective valid KV range from ``(starts, ends)`` and optional sliding window.
+2. Stream KV blocks over the active range with runtime loop bounds and int64 offsets.
+3. Compute QK^T scores with optional overflow-safe tanh logit soft-capping.
+4. Accumulate unnormalized attention output using streaming online softmax.
+5. Fold optional attention sink logits ONCE after the KV loop completes.
 
 Memory Layout:
--------------
-- Queries: [batch, num_groups, head_dim]
-- Keys/Values: [batch, max_seq_len, head_dim] (ragged)
+--------------
+- Queries: [batch, num_q_heads, head_dim]
+- Keys/Values: [batch, seq_len, num_kv_heads, head_dim]
 - Starts/Ends: [batch] indices marking valid KV ranges
-- Auxiliary sinks: Optional [num_groups, num_sinks] for attention sinks
-
-The streaming softmax maintains running (max, sum, output) accumulators
-for numerically stable computation without materializing full attention
-matrices.
-
-Functions:
-- ragged_decode_mqa_fwd_kernel: Triton kernel for MQA decode
-- ragged_decode_mqa_triton: Python wrapper launching the kernel
-- inner_decode_triton: High-level interface handling GQA reshaping
+- Auxiliary sinks: Optional [num_sinks], [num_kv_heads, num_sinks], or [num_q_heads, num_sinks]
 """
 
 import jax
@@ -57,242 +44,152 @@ import triton
 import triton.language as tl
 from jax import Array
 
-from ejkernel.callib import next_power_of_2, triton_call
+from ejkernel.callib import next_power_of_2, strides_from_shape, triton_call
 from ejkernel.ops import FwdParams
 
 
 @triton.jit
-def ragged_decode_mqa_fwd_kernel(
+def ragged_decode_fwd_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
     s_ptr,
     e_ptr,
     aux_ptr,
-    o_ptr,
-    m_ptr,
-    l_ptr,
     softmax_scale,
     logits_soft_cap,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_vb,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    o_ptr,
     NSINKS: tl.constexpr,
     HAS_AUX: tl.constexpr,
+    AUX_MODE: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
     SL_LEFT: tl.constexpr,
     SL_RIGHT: tl.constexpr,
-    B: tl.constexpr,
     S: tl.constexpr,
     G: tl.constexpr,
     D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    NBLOCKS: tl.constexpr,
     NS_PAD: tl.constexpr,
 ):
-    """
-    One kernel instance computes the streamed decode for a single (b,g) pair:
-    - q: [D]
-    - K/V streamed across S in tiles of BLOCK_SIZE
-    - streaming softmax (m,l accumulation)
-    - sinks contribute to normalization (not masked) but are not tied to V
-    """
-    pid = tl.program_id(0)
-    b = pid // G
-    g = pid % G
+    """Compute streamed ragged decode attention for one (batch, kv_head, g) head.
 
-    q_off = b * (G * D) + g * D
-    o_off = q_off
-    m_off = b * G + g
-    l_off = m_off
+    Grid: ``(B, HKV, G)`` where ``hq = hkv * G + g``.
+    - Full head dimension is covered by ``BLOCK_D = next_power_of_2(D)`` with masking.
+    - KV blocks outside ``[eff_start, eff_end)`` are skipped via runtime loop bounds.
+    - Attention sinks (``softmax_aux``) are folded once after the KV loop completes.
+    """
+    b = tl.program_id(0)
+    hkv = tl.program_id(1)
+    g = tl.program_id(2)
+    hq = hkv * G + g
+
+    b64 = b.to(tl.int64)
+    hkv64 = hkv.to(tl.int64)
+    hq64 = hq.to(tl.int64)
+
+    q_off = b64 * stride_qb + hq64 * stride_qh
+    o_off = b64 * stride_ob + hq64 * stride_oh
+    k_head_base = b64 * stride_kb + hkv64 * stride_kh
+    v_head_base = b64 * stride_vb + hkv64 * stride_vh
 
     s_b = tl.load(s_ptr + b).to(tl.int32)
     e_b = tl.load(e_ptr + b).to(tl.int32)
     qpos = e_b - 1
 
+    eff_start = tl.maximum(s_b, 0)
+    if SL_LEFT >= 0:
+        eff_start = tl.maximum(eff_start, qpos - SL_LEFT)
+    eff_end = tl.minimum(e_b, S)
+    if SL_RIGHT >= 0:
+        eff_end = tl.minimum(eff_end, qpos + SL_RIGHT + 1)
+
+    has_range = eff_end > eff_start
+    start_block = tl.where(has_range, eff_start // BLOCK_SIZE, 0)
+    end_block = tl.where(has_range, (eff_end + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
+
     d_idx = tl.arange(0, BLOCK_D)
     q_mask = d_idx < D
-    q_vec = tl.load(q_ptr + q_off + d_idx, mask=q_mask, other=0.0).to(tl.float32)
+    d_idx64 = d_idx.to(tl.int64)
 
-    m_prev = tl.full((), float("-inf"), dtype=tl.float32)
-    l_prev = tl.zeros((), dtype=tl.float32)
-    o_vec = tl.zeros([BLOCK_D], dtype=tl.float32)
+    q_vec = tl.load(q_ptr + q_off + d_idx64 * stride_qd, mask=q_mask, other=0.0).to(tl.float32)
 
-    for i in tl.static_range(0, NBLOCKS):
-        t_idx = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        in_bounds = t_idx < S
+    m_i = tl.full((), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((), dtype=tl.float32)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-        valid = (t_idx >= s_b) & (t_idx < e_b)
+    t_offs = tl.arange(0, BLOCK_SIZE)
 
-        if SL_LEFT >= 0:
-            valid = valid & (t_idx >= (qpos - SL_LEFT))
-        if SL_RIGHT >= 0:
-            valid = valid & (t_idx <= (qpos + SL_RIGHT))
+    for blk in range(start_block, end_block):
+        t_idx = blk * BLOCK_SIZE + t_offs
+        valid = (t_idx >= eff_start) & (t_idx < eff_end)
+        t_idx64 = t_idx.to(tl.int64)
 
-        k_base = b * (S * D) + (i * BLOCK_SIZE) * D
-        acc_qk = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        k_ptrs = k_ptr + k_head_base + t_idx64[:, None] * stride_ks + d_idx64[None, :] * stride_kd
+        v_ptrs = v_ptr + v_head_base + t_idx64[:, None] * stride_vs + d_idx64[None, :] * stride_vd
+        kv_mask = valid[:, None] & q_mask[None, :]
 
-        for kd in tl.static_range(0, D, BLOCK_D):
-            d_col = kd + d_idx
-            d_m = d_col < D
+        k_block = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        acc_qk = tl.sum(k_block * q_vec[None, :], axis=1) * softmax_scale
 
-            k_block = tl.load(
-                k_ptr + k_base + d_col[None, :] + (tl.arange(0, BLOCK_SIZE)[:, None] * D),
-                mask=in_bounds[:, None] & d_m[None, :],
-                other=0.0,
-            ).to(tl.float32)
-
-            acc_qk += tl.sum(k_block * q_vec[None, :], axis=1)
-
-        acc_qk = acc_qk * softmax_scale
-        if logits_soft_cap > 0:
+        if HAS_SOFTCAP:
             x = acc_qk / logits_soft_cap
-
-            ax = tl.where(x >= 0, x, -x)
+            ax = tl.abs(x)
             z = tl.exp(-2.0 * ax)
-            tanh_x = tl.where(x >= 0, (1 - z) / (1 + z), -(1 - z) / (1 + z))
+            tanh_x = tl.where(x >= 0.0, (1.0 - z) / (1.0 + z), -(1.0 - z) / (1.0 + z))
             acc_qk = logits_soft_cap * tanh_x
 
-        if HAS_AUX and NSINKS > 0:
-            aux_off = g * NSINKS if G > 1 else 0
-            idx = tl.arange(0, NS_PAD)
-            m_aux = idx < NSINKS
-            aux_logits = tl.load(
-                aux_ptr + aux_off + idx,
-                mask=m_aux,
-                other=tl.full((), float("-inf"), dtype=tl.float32),
-            ).to(tl.float32)
+        acc_qk_masked = tl.where(valid, acc_qk, float("-inf"))
+        m_blk = tl.max(acc_qk_masked, axis=0)
+        m_new = tl.maximum(m_i, m_blk)
+
+        alpha = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_new))
+        p = tl.where(valid, tl.exp(tl.where(valid, acc_qk - m_new, float("-inf"))), 0.0)
+
+        v_block = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(v_block * p[:, None], axis=0)
+        m_i = m_new
+
+    if HAS_AUX and NSINKS > 0:
+        if AUX_MODE == 1:
+            aux_off = hkv64 * NSINKS
+        elif AUX_MODE == 2:
+            aux_off = hq64 * NSINKS
         else:
-            aux_logits = tl.zeros([0], dtype=tl.float32)
+            aux_off = tl.zeros((), dtype=tl.int64)
+        s_idx = tl.arange(0, NS_PAD)
+        s_mask = s_idx < NSINKS
+        aux_logits = tl.load(
+            aux_ptr + aux_off + s_idx.to(tl.int64),
+            mask=s_mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        m_aux = tl.max(aux_logits, axis=0)
+        m_final = tl.maximum(m_i, m_aux)
+        alpha_seq = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_final))
+        p_aux = tl.where(s_mask, tl.exp(tl.where(s_mask, aux_logits - m_final, float("-inf"))), 0.0)
+        l_i = l_i * alpha_seq + tl.sum(p_aux, axis=0)
+        acc = acc * alpha_seq
+        m_i = m_final
 
-        neg_inf = tl.full([BLOCK_SIZE], float("-inf"), dtype=tl.float32)
-        acc_qk_masked = tl.where(valid, acc_qk, neg_inf)
-
-        sum_valid = tl.sum(valid.to(tl.int32), axis=0)
-        any_seq = sum_valid > 0
-
-        if HAS_AUX and NSINKS > 0:
-            m_seq = tl.where(any_seq, tl.max(acc_qk_masked), tl.full((), float("-inf"), dtype=tl.float32))
-            m_aux = tl.max(aux_logits)
-            m_curr = tl.maximum(m_seq, m_aux)
-            s_seq = tl.where(any_seq, tl.exp(acc_qk_masked - m_curr), tl.zeros([BLOCK_SIZE], dtype=tl.float32))
-            s_sink = tl.exp(aux_logits - m_curr)
-        else:
-            m_curr = tl.where(any_seq, tl.max(acc_qk_masked), m_prev)
-            s_seq = tl.where(any_seq, tl.exp(acc_qk_masked - m_curr), tl.zeros([BLOCK_SIZE], dtype=tl.float32))
-            s_sink = tl.zeros([0], dtype=tl.float32)
-
-        o_blk = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for vd in tl.static_range(0, D, BLOCK_D):
-            d_col = vd + d_idx
-            d_m = d_col < D
-            v_block = tl.load(
-                v_ptr + k_base + d_col[None, :] + (tl.arange(0, BLOCK_SIZE)[:, None] * D),
-                mask=in_bounds[:, None] & d_m[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            o_blk += tl.sum(v_block * s_seq[:, None], axis=0)
-
-        sum_s = tl.sum(s_seq)
-        if HAS_AUX and NSINKS > 0:
-            sum_s += tl.sum(s_sink)
-
-        has_update = (sum_s > 0) | (l_prev > 0)
-        m_next = tl.where(has_update, tl.maximum(m_prev, m_curr), m_prev)
-        alpha = tl.where(has_update, tl.exp(m_prev - m_next), 0.0)
-        beta = tl.where(has_update, tl.exp(m_curr - m_next), 0.0)
-        l_next = tl.where(has_update, alpha * l_prev + beta * sum_s, l_prev)
-        l_safe = tl.where(l_next == 0.0, 1.0, l_next)
-        o_new = tl.where(has_update, (alpha * l_prev * o_vec + beta * o_blk) / l_safe, o_vec)
-
-        o_vec = o_new
-        m_prev = m_next
-        l_prev = l_next
-
-    tl.store(o_ptr + o_off + d_idx, o_vec, mask=q_mask)
-    tl.store(m_ptr + m_off, m_prev)
-    tl.store(l_ptr + l_off, l_prev)
-
-
-def ragged_decode_mqa_triton(
-    q: Array,
-    k: Array,
-    v: Array,
-    starts: Array,
-    ends: Array,
-    softmax_scale: float,
-    block_size: int,
-    sliding_window: tuple[int, int] | None,
-    logits_soft_cap: float,
-    aux: Array | None,
-    num_warps: int,
-    num_stages: int,
-) -> Array:
-    """Launch the ragged decode MQA Triton kernel.
-
-    Prepares kernel parameters and launches the Triton kernel for
-    multi-query ragged decode attention. Handles a single KV head
-    with G query groups attending to the same KV context.
-
-    Args:
-        q: Query tensor of shape (B, G, D) where G is the query group size.
-        k: Key tensor of shape (B, S, D) for one KV head.
-        v: Value tensor of shape (B, S, D) for one KV head.
-        starts: Per-sequence start indices, shape (B,).
-        ends: Per-sequence end indices, shape (B,).
-        softmax_scale: Attention scaling factor.
-        block_size: KV block size for tiled processing.
-        sliding_window: Optional (left, right) sliding window bounds.
-        logits_soft_cap: Soft capping value for attention logits (0.0 to disable).
-        aux: Optional attention sink logits of shape (G, num_sinks).
-
-    Returns:
-        Attention output of shape (B, G, D).
-    """
-    B, G, D = q.shape
-    S = k.shape[1]
-    BLOCK_SIZE = int(block_size)
-    BLOCK_D = min(128, next_power_of_2(D))
-
-    HAS_AUX = aux is not None
-    NS = int(aux.shape[-1]) if HAS_AUX else 0
-
-    aux_arg = aux if HAS_AUX else jnp.zeros((1,), dtype=q.dtype)
-
-    NBLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
-
-    NS_PAD = max(1, int(next_power_of_2(NS)))
-
-    out = triton_call(
-        q,
-        k,
-        v,
-        starts.astype(jnp.int32),
-        ends.astype(jnp.int32),
-        aux_arg,
-        kernel=ragged_decode_mqa_fwd_kernel,
-        grid=lambda META: (B * G,),
-        out_shape=[
-            jax.ShapeDtypeStruct((B, G, D), dtype=q.dtype),
-            jax.ShapeDtypeStruct((B, G), dtype=jnp.float32),
-            jax.ShapeDtypeStruct((B, G), dtype=jnp.float32),
-        ],
-        softmax_scale=float(softmax_scale),
-        logits_soft_cap=float(logits_soft_cap),
-        NSINKS=NS,
-        HAS_AUX=HAS_AUX,
-        SL_LEFT=int(sliding_window[0]) if sliding_window is not None else -1,
-        SL_RIGHT=int(sliding_window[1]) if sliding_window is not None else -1,
-        B=B,
-        S=S,
-        G=G,
-        D=D,
-        BLOCK_SIZE=BLOCK_SIZE,
-        BLOCK_D=BLOCK_D,
-        NBLOCKS=NBLOCKS,
-        NS_PAD=NS_PAD,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        name="ejkernel::triton::ragged_decode_mqa_fwd",
-    )[0]
-    return out
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    o_vec = acc / l_safe
+    tl.store(o_ptr + o_off + d_idx64 * stride_od, o_vec.to(o_ptr.dtype.element_ty), mask=q_mask)
 
 
 def inner_decode_triton(
@@ -309,15 +206,9 @@ def inner_decode_triton(
 ) -> Array:
     """High-level GPU/Triton ragged decode attention with GQA support.
 
-    Reshapes queries for grouped-query attention, dispatches per-KV-head
-    MQA decode kernels, and reassembles the output. This mirrors the
-    TPU inner_decode_tpu implementation for cross-platform consistency.
-
-    The processing pipeline:
-        1. Group queries into (B, HKV, G, D) where G = HQ // HKV
-        2. Transpose K/V to (B, HKV, S, D) for per-head processing
-        3. Run MQA ragged decode kernel for each KV head
-        4. Stack and reshape results back to (B, HQ, D)
+    Dispatches a single Triton kernel over grid ``(B, HKV, G)`` directly on the
+    strided ``[B, HQ, D]`` and ``[B, S, HKV, D]`` tensors without transposing
+    the KV cache or looping over KV heads in Python.
 
     Args:
         query_tensor: Query tensor of shape (B, HQ, D).
@@ -331,64 +222,118 @@ def inner_decode_triton(
         sliding_window: Optional (left, right) sliding window bounds.
         logits_soft_cap: Optional soft capping value for logits.
         softmax_aux: Optional attention sink logits of shape
-            (HKV, num_sinks) or (num_sinks,).
+            (num_sinks,), (1, num_sinks), (HKV, num_sinks), or (HQ, num_sinks).
 
     Returns:
         Attention output of shape (B, HQ, D).
 
     Raises:
         AssertionError: If HQ is not divisible by HKV.
+        ValueError: If softmax_aux has an unsupported rank or head dimension.
     """
-    B, HQ, D = query_tensor.shape
-
-    if softmax_scale is None:
-        softmax_scale = query_tensor.shape[-1] ** -0.5
-
-    if fwd_params is None:
-        fwd_params = FwdParams(kv_blocksize=256)
-    elif fwd_params.kv_blocksize is None:
-        fwd_params.kv_blocksize = 256
-
-    _S, HKV = key_tensor.shape[1], key_tensor.shape[2]
+    B, HQ, D = map(int, query_tensor.shape)
+    S, HKV = int(key_tensor.shape[1]), int(key_tensor.shape[2])
     assert HQ % HKV == 0, "GQA requires HQ divisible by HKV"
     G = HQ // HKV
 
-    q_grouped = query_tensor.reshape(B, HKV, G, D)
+    if softmax_scale is None:
+        softmax_scale = D**-0.5
 
-    k_per = jnp.swapaxes(key_tensor, 1, 2)
-    v_per = jnp.swapaxes(value_tensor, 1, 2)
+    kv_blocksize = 256 if (fwd_params is None or fwd_params.kv_blocksize is None) else int(fwd_params.kv_blocksize)
+    num_warps = int(fwd_params.num_warps) if (fwd_params is not None and fwd_params.num_warps is not None) else 4
+    num_stages = int(fwd_params.num_stages) if (fwd_params is not None and fwd_params.num_stages is not None) else 2
 
-    def _aux_for_head(h: int):
-        if softmax_aux is None:
-            return None
-        if softmax_aux.ndim == 2:
-            a = softmax_aux[h]
-            return jnp.broadcast_to(a[None, :], (G, a.shape[0]))
+    block_d = max(16, int(next_power_of_2(D)))
+    raw_block_size = max(16, int(next_power_of_2(kv_blocksize)))
+    max_block_size = max(16, 16384 // block_d)
+    block_size = min(raw_block_size, max_block_size)
+
+    has_aux = False
+    aux_mode = 0
+    nsinks = 0
+    aux_arg = jnp.zeros((1,), dtype=jnp.float32)
+
+    if softmax_aux is not None:
+        aux_arr = jnp.asarray(softmax_aux, dtype=jnp.float32)
+        if aux_arr.ndim == 1:
+            nsinks = int(aux_arr.shape[0])
+            aux_mode = 0
+            aux_arg = aux_arr
+        elif aux_arr.ndim == 2:
+            nsinks = int(aux_arr.shape[1])
+            if int(aux_arr.shape[0]) == 1:
+                aux_mode = 0
+                aux_arg = aux_arr[0]
+            elif int(aux_arr.shape[0]) == HKV:
+                aux_mode = 1
+                aux_arg = aux_arr
+            elif int(aux_arr.shape[0]) == HQ:
+                aux_mode = 2
+                aux_arg = aux_arr
+            else:
+                raise ValueError(
+                    "softmax_aux must have shape (num_sinks,), (num_kv_heads, num_sinks), "
+                    f"or (num_q_heads, num_sinks); got {aux_arr.shape} for HQ={HQ}, HKV={HKV}."
+                )
         else:
-            return jnp.broadcast_to(softmax_aux[None, :], (G, softmax_aux.shape[0]))
+            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux_arr.shape}.")
+        if nsinks > 0:
+            has_aux = True
+        else:
+            aux_arg = jnp.zeros((1,), dtype=jnp.float32)
 
-    outs = []
-    for h in range(HKV):
-        q_h = q_grouped[:, h, :, :]
-        k_h = k_per[:, h, :, :]
-        v_h = v_per[:, h, :, :]
-        aux_h = _aux_for_head(h)
+    ns_pad = max(1, int(next_power_of_2(nsinks))) if has_aux else 1
+    has_softcap = logits_soft_cap is not None and float(logits_soft_cap) > 0.0
+    softcap_val = float(logits_soft_cap) if has_softcap else 0.0
 
-        out_h = ragged_decode_mqa_triton(
-            q=q_h,
-            k=k_h,
-            v=v_h,
-            starts=sequence_start,
-            ends=sequence_end,
-            softmax_scale=(1.0 if softmax_scale is None else float(softmax_scale)),
-            block_size=int(fwd_params.kv_blocksize),
-            sliding_window=sliding_window,
-            logits_soft_cap=(0.0 if logits_soft_cap is None else float(logits_soft_cap)),
-            aux=aux_h,
-            num_warps=int(fwd_params.num_warps or 4),
-            num_stages=int(fwd_params.num_stages or 2),
-        )
-        outs.append(out_h)
+    sl_left = int(sliding_window[0]) if sliding_window is not None else -1
+    sl_right = int(sliding_window[1]) if sliding_window is not None else -1
 
-    out = jnp.stack(outs, axis=1).reshape(B, HQ, D)
+    stride_qb, stride_qh, stride_qd = strides_from_shape(query_tensor.shape)
+    stride_kb, stride_ks, stride_kh, stride_kd = strides_from_shape(key_tensor.shape)
+    stride_vb, stride_vs, stride_vh, stride_vd = strides_from_shape(value_tensor.shape)
+    stride_ob, stride_oh, stride_od = strides_from_shape(query_tensor.shape)
+
+    (out,) = triton_call(
+        query_tensor,
+        key_tensor,
+        value_tensor,
+        sequence_start.astype(jnp.int32),
+        sequence_end.astype(jnp.int32),
+        aux_arg,
+        float(softmax_scale),
+        float(softcap_val),
+        int(stride_qb),
+        int(stride_qh),
+        int(stride_qd),
+        int(stride_kb),
+        int(stride_ks),
+        int(stride_kh),
+        int(stride_kd),
+        int(stride_vb),
+        int(stride_vs),
+        int(stride_vh),
+        int(stride_vd),
+        int(stride_ob),
+        int(stride_oh),
+        int(stride_od),
+        kernel=ragged_decode_fwd_kernel,
+        grid=lambda META: (B, HKV, G),
+        out_shape=[jax.ShapeDtypeStruct((B, HQ, D), dtype=query_tensor.dtype)],
+        NSINKS=nsinks,
+        HAS_AUX=has_aux,
+        AUX_MODE=aux_mode,
+        HAS_SOFTCAP=has_softcap,
+        SL_LEFT=sl_left,
+        SL_RIGHT=sl_right,
+        S=S,
+        G=G,
+        D=D,
+        BLOCK_SIZE=block_size,
+        BLOCK_D=block_d,
+        NS_PAD=ns_pad,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        name="ejkernel::triton::ragged_decode_fwd",
+    )
     return out

@@ -24,7 +24,6 @@ Available kernels:
 - chunked_prefill_paged_decode: Hybrid prefill + paged decode for KV-cache inference
 - decode_attention: Paged decode-time attention (vLLM-style)
 - flash_attention: Memory-efficient exact attention with O(N) memory complexity
-- flash_mla: Flash Multi-head Latent Attention stub (not yet implemented)
 - recurrent: Linear-time recurrent attention mechanisms
 - recurrent_gla: Gated Linear Attention implementation
 - lightning_attn: Lightning Attention with layer-adaptive decay

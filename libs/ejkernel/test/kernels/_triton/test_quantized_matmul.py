@@ -562,3 +562,97 @@ def test_quantized_matmul_triton_nested_vmap_grad_over_x_matches_xla(mode: str, 
         rtol=9e-2,
         atol=9e-2,
     )
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("m", [1, 16])
+@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp4", 4)])
+def test_quantized_matmul_triton_preserves_input_dtype(dtype, m: int, mode: str, bits: int):
+    key = jax.random.PRNGKey(71 + m)
+    kx, kw = jax.random.split(key, 2)
+    k, n = 256, 256
+
+    x = jax.random.normal(kx, (m, k), dtype=dtype)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, zeros = packed
+    else:
+        w_q, scales = packed
+        zeros = None
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales = _device_put_all(dev, x, w_q, scales)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
+
+    out_triton = jax.block_until_ready(
+        triton_quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+            gemv_mode="auto",
+            revsplit_k="auto",
+        )
+    )
+    out_xla = jax.block_until_ready(
+        xla_quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+            gemv_mode="auto",
+            revsplit_k="auto",
+        )
+    )
+
+    assert out_triton.dtype == x.dtype
+    rtol = 1.5e-1 if mode == "affine" else 8e-2
+    atol = 1.5e-1 if mode == "affine" else 8e-2
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+def test_quantized_matmul_triton_jit_distinct_weights_no_cache_leak():
+    dev = jax.devices("gpu")[0]
+    m, k, n = 16, 128, 128
+    x = jax.device_put(jax.random.normal(jax.random.PRNGKey(81), (m, k), dtype=jnp.float16), dev)
+
+    @jax.jit
+    def _run_jit(x_in, w_q_in, scales_in):
+        return triton_quantized_matmul(
+            x_in,
+            w_q_in,
+            scales_in,
+            None,
+            transpose=False,
+            mode="nf4",
+            bits=4,
+        )
+
+    for step in range(4):
+        w = jax.random.normal(jax.random.PRNGKey(90 + step), (n, k), dtype=jnp.float16)
+        w_q, scales = prepack_quantized_weights(w, mode="nf4", bits=4)
+        w_q, scales = _device_put_all(dev, w_q, scales)
+        out_triton = jax.block_until_ready(_run_jit(x, w_q, scales))
+        out_xla = jax.block_until_ready(
+            xla_quantized_matmul(x, w_q, scales, None, transpose=False, mode="nf4", bits=4)
+        )
+        np.testing.assert_allclose(
+            np.asarray(out_triton, dtype=np.float32),
+            np.asarray(out_xla, dtype=np.float32),
+            rtol=7e-2,
+            atol=7e-2,
+        )

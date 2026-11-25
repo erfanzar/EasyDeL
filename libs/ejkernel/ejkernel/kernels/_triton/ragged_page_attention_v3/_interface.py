@@ -108,6 +108,8 @@ def ragged_page_attention_v3(
     vmem_limit_bytes: int | None = None,
     chunk_size: int | None = None,
     alibi_slopes: Float[Array, "num_q_heads"] | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
@@ -212,4 +214,6 @@ def ragged_page_attention_v3(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

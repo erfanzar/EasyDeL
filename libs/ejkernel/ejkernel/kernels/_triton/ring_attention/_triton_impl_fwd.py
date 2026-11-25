@@ -198,13 +198,32 @@ def ring_attention(
         softmax_scale = query.shape[-1] ** -0.5
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=128, kv_blocksize=128, num_stages=2, num_warps=4)
+    else:
+        fwd_params = FwdParams(
+            q_blocksize=128 if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize),
+            kv_blocksize=128 if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize),
+            num_stages=2 if fwd_params.num_stages is None else int(fwd_params.num_stages),
+            num_warps=4 if fwd_params.num_warps is None else int(fwd_params.num_warps),
+        )
     if bwd_params is None:
-        bwd_params = BwdParams(q_blocksize=128, kv_blocksize=128, num_stages=2, num_warps=4)
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize,
+            kv_blocksize=fwd_params.kv_blocksize,
+            num_stages=2,
+            num_warps=4,
+        )
+    else:
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize if bwd_params.q_blocksize is None else int(bwd_params.q_blocksize),
+            kv_blocksize=fwd_params.kv_blocksize if bwd_params.kv_blocksize is None else int(bwd_params.kv_blocksize),
+            num_stages=2 if bwd_params.num_stages is None else int(bwd_params.num_stages),
+            num_warps=4 if bwd_params.num_warps is None else int(bwd_params.num_warps),
+        )
 
     if bias is not None:
         raise NotImplementedError("Triton ring_attention does not currently support `bias` when using blocksparse.")
 
-    del mask_builder, fused_backward
+    _ = mask_builder, chunk_size, fused_backward
 
     return ring_blocksparse_attention_call(
         query=query,

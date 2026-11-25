@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from ejkernel.kernels._triton.mean_pooling import mean_pooling as triton_mean_pooling
+from ejkernel.kernels._xla.mean_pooling import mean_pooling as xla_mean_pooling
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -163,6 +164,150 @@ def test_mean_pooling_varlen_2d_grad_matches_reference():
 
     np.testing.assert_allclose(
         np.asarray(grad_triton, dtype=np.float32),
+        np.asarray(grad_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def _block_varlen_mean_pooling_ref(x: jax.Array, cu_seqlens: jax.Array, chunk_size: int) -> jax.Array:
+    chunks = []
+    for seq_idx in range(int(cu_seqlens.shape[0]) - 1):
+        bos = int(cu_seqlens[seq_idx])
+        eos = int(cu_seqlens[seq_idx + 1])
+        for start in range(bos, eos, chunk_size):
+            end = min(start + chunk_size, eos)
+            chunks.append(jnp.mean(x[0, start:end], axis=0))
+    return jnp.stack(chunks, axis=0)[None, ...]
+
+
+def test_mean_pooling_fixed_3d_matches_xla_fwd_bwd_and_jit():
+    kx, kw = jax.random.split(jax.random.PRNGKey(10), 2)
+    x = jax.random.normal(kx, (3, 67, 48), dtype=jnp.float16)
+    weights = jax.random.normal(kw, (3, 48), dtype=jnp.float32)
+
+    out_tri = jax.block_until_ready(jax.jit(lambda inp: triton_mean_pooling(inp, block_size=32))(x))
+    out_xla = jax.block_until_ready(jax.jit(lambda inp: xla_mean_pooling(inp))(x))
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    def _loss_tri(inp):
+        return jnp.sum(triton_mean_pooling(inp, block_size=32).astype(jnp.float32) * weights)
+
+    def _loss_xla(inp):
+        return jnp.sum(xla_mean_pooling(inp).astype(jnp.float32) * weights)
+
+    grad_tri = jax.block_until_ready(jax.jit(jax.grad(_loss_tri))(x))
+    grad_xla = jax.block_until_ready(jax.jit(jax.grad(_loss_xla))(x))
+    np.testing.assert_allclose(
+        np.asarray(grad_tri, dtype=np.float32),
+        np.asarray(grad_xla, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_mean_pooling_varlen_2d_matches_xla_fwd_bwd_and_jit():
+    kx, kw = jax.random.split(jax.random.PRNGKey(11), 2)
+    # Include trailing padding tokens beyond cu_seqlens[-1] to verify zeroed padding grads.
+    cu_seqlens = jnp.array([0, 5, 22, 31], dtype=jnp.int32)
+    x = jax.random.normal(kx, (36, 40), dtype=jnp.float16)
+    weights = jax.random.normal(kw, (3, 40), dtype=jnp.float32)
+
+    out_tri = jax.block_until_ready(
+        jax.jit(lambda inp, cu: triton_mean_pooling(inp, cu_seqlens=cu, block_size=16))(x, cu_seqlens)
+    )
+    out_xla = jax.block_until_ready(
+        jax.jit(lambda inp, cu: xla_mean_pooling(inp, cu_seqlens=cu))(x, cu_seqlens)
+    )
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    def _loss_tri(inp, cu):
+        return jnp.sum(triton_mean_pooling(inp, cu_seqlens=cu, block_size=16).astype(jnp.float32) * weights)
+
+    def _loss_xla(inp, cu):
+        return jnp.sum(xla_mean_pooling(inp, cu_seqlens=cu).astype(jnp.float32) * weights)
+
+    grad_tri = jax.block_until_ready(jax.jit(jax.grad(_loss_tri, argnums=0))(x, cu_seqlens))
+    grad_xla = jax.block_until_ready(jax.jit(jax.grad(_loss_xla, argnums=0))(x, cu_seqlens))
+    np.testing.assert_allclose(
+        np.asarray(grad_tri, dtype=np.float32),
+        np.asarray(grad_xla, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    np.testing.assert_array_equal(np.asarray(grad_tri[31:], dtype=np.float32), 0.0)
+
+
+@pytest.mark.parametrize("chunk_size", [16, 12])
+def test_mean_pooling_4d_varlen_fwd_and_bwd_matches_reference(chunk_size: int):
+    kx, kw = jax.random.split(jax.random.PRNGKey(12 + chunk_size), 2)
+    cu_seqlens = jnp.array([0, 5, 23, 35], dtype=jnp.int32)
+    x = jax.random.normal(kx, (1, 38, 4, 24), dtype=jnp.float16)
+
+    out_tri = jax.block_until_ready(triton_mean_pooling(x, chunk_size=chunk_size, cu_seqlens=cu_seqlens))
+    out_ref = jax.block_until_ready(_block_varlen_mean_pooling_ref(x, cu_seqlens, chunk_size))
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    weights = jax.random.normal(kw, out_ref.shape, dtype=jnp.float32)
+
+    def _loss_tri(inp):
+        out = triton_mean_pooling(inp, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+        return jnp.sum(out.astype(jnp.float32) * weights)
+
+    def _loss_ref(inp):
+        return jnp.sum(_block_varlen_mean_pooling_ref(inp, cu_seqlens, chunk_size).astype(jnp.float32) * weights)
+
+    grad_tri = jax.block_until_ready(jax.grad(_loss_tri)(x))
+    grad_ref = jax.block_until_ready(jax.grad(_loss_ref)(x))
+    np.testing.assert_allclose(
+        np.asarray(grad_tri, dtype=np.float32),
+        np.asarray(grad_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    np.testing.assert_array_equal(np.asarray(grad_tri[:, 35:], dtype=np.float32), 0.0)
+
+
+def test_mean_pooling_4d_jit_fwd_and_bwd():
+    kx, kw = jax.random.split(jax.random.PRNGKey(30), 2)
+    x = jax.random.normal(kx, (2, 35, 3, 24), dtype=jnp.float16)
+    chunk_size = 12
+    out_ref = jax.block_until_ready(_block_mean_pooling_ref(x, chunk_size))
+    weights = jax.random.normal(kw, out_ref.shape, dtype=jnp.float32)
+
+    out_tri = jax.block_until_ready(jax.jit(lambda inp: triton_mean_pooling(inp, chunk_size=chunk_size))(x))
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    def _loss_tri(inp):
+        return jnp.sum(triton_mean_pooling(inp, chunk_size=chunk_size).astype(jnp.float32) * weights)
+
+    def _loss_ref(inp):
+        return jnp.sum(_block_mean_pooling_ref(inp, chunk_size).astype(jnp.float32) * weights)
+
+    grad_tri = jax.block_until_ready(jax.jit(jax.grad(_loss_tri))(x))
+    grad_ref = jax.block_until_ready(jax.jit(jax.grad(_loss_ref))(x))
+    np.testing.assert_allclose(
+        np.asarray(grad_tri, dtype=np.float32),
         np.asarray(grad_ref, dtype=np.float32),
         rtol=1e-2,
         atol=1e-2,

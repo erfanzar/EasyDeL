@@ -1,0 +1,7 @@
+ejkernel.kernels._pallas.tpu.fused_mlp._bf16
+============================================
+
+.. automodule:: ejkernel.kernels._pallas.tpu.fused_mlp._bf16
+   :members:
+   :undoc-members:
+   :show-inheritance:

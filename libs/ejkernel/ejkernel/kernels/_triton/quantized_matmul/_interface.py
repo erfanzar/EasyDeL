@@ -249,7 +249,7 @@ def _operate(
         revsplit_k_parts: Reverse split-K parts.
 
     Returns:
-        Output of shape (M, N) in bfloat16.
+        Output of shape (M, N) matching ``x.dtype``.
     """
     static_args = (
         transpose,
@@ -351,7 +351,7 @@ def _operate_bwd(
         revsplit_k_parts,
     )
     grad_x = _get_bwd_vmap_wrapper(static_args)(grad_out, w, scales, biases)
-    return grad_x, None, None, None
+    return grad_x.astype(grad_out.dtype), None, None, None
 
 
 _operate.defvjp(_operate_fwd, _operate_bwd)
@@ -387,8 +387,7 @@ def quantized_matmul(
 
     Computes ``x @ dequant(w)`` (or ``x @ dequant(w).T`` when
     ``transpose=True``), where the dequantization is fused into the matmul
-    kernel.  The output is always returned in **bfloat16** regardless of
-    ``x``'s dtype.
+    kernel.  The output preserves ``x.dtype``.
 
     Args:
         x: Activation matrix of shape (M, K). Must be a 2-D float array.
@@ -435,7 +434,7 @@ def quantized_matmul(
             decide.
 
     Returns:
-        Output tensor of shape (M, N) in bfloat16.
+        Output tensor of shape (M, N) with the same dtype as ``x``.
 
     Raises:
         ValueError: If ``mode="affine"`` and ``zeros`` is ``None``, or if

@@ -84,8 +84,11 @@ from ejkernel.callib import next_power_of_2, strides_from_shape, triton_call
 
 @triton.jit
 def _tanh(x):
-    """Compute numerically stable tanh using sigmoid identity: tanh(x) = 2*sigmoid(2x) - 1."""
-    return 2 * tl.sigmoid(2 * x) - 1
+    """Compute overflow-safe tanh(x) via exp(-2|x|)."""
+    ax = tl.abs(x)
+    z = tl.exp(-2.0 * ax)
+    t = (1.0 - z) / (1.0 + z)
+    return tl.where(x >= 0.0, t, -t)
 
 
 @triton.jit
@@ -98,6 +101,7 @@ def _decode_stage1(
     partial_out_ptr,
     partial_lse_ptr,
     softmax_scale,
+    softmax_scale_log2,
     stride_q0: tl.constexpr,
     stride_q1: tl.constexpr,
     stride_q2: tl.constexpr,
@@ -124,41 +128,10 @@ def _decode_stage1(
     HEAD_DIM: tl.constexpr,
     LOGIT_CAP: tl.constexpr,
 ):
-    """Stage 1 Triton kernel: compute partial attention outputs per KV split.
+    """Stage 1 Triton kernel: compute partial attention outputs per KV split."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    LN2: tl.constexpr = 0.6931471805599453
 
-    Each thread block processes one (batch, head, kv_split) combination. It loads
-    the query, iterates over the assigned portion of the KV context using paged
-    addressing via ``req_to_tokens``, and writes partial attention output and
-    log-sum-exp values.
-
-    Grid shape: ``(batch, num_q_heads, NUM_KV_SPLITS)``.
-
-    Args:
-        q_ptr: Query tensor pointer [batch, num_q_heads, head_dim]
-        k_ptr: Key buffer pointer [total_tokens, num_kv_heads, head_dim]
-        v_ptr: Value buffer pointer [total_tokens, num_kv_heads, head_dim]
-        req_to_tokens_ptr: Page table pointer [batch, max_pages]
-        seq_lens_ptr: Context lengths pointer [batch]
-        partial_out_ptr: Output pointer for partial results
-            [batch, num_q_heads, NUM_KV_SPLITS, head_dim]
-        partial_lse_ptr: Output pointer for partial LSE values
-            [batch, num_q_heads, NUM_KV_SPLITS]
-        softmax_scale: Attention logit scaling factor
-        stride_q0..q2: Query tensor strides (batch, head, head_dim)
-        stride_k0..k2: Key buffer strides (token, head, head_dim)
-        stride_v0..v2: Value buffer strides (token, head, head_dim)
-        stride_req0..req1: Page table strides (batch, page)
-        stride_po0..po3: Partial output strides
-        stride_pl0..pl2: Partial LSE strides
-        kv_group_num: Number of query heads per KV head (GQA ratio) (constexpr)
-        BLOCK_DMODEL: Padded head dim (next power of 2 >= HEAD_DIM) (constexpr)
-        BLOCK_N: KV tokens processed per inner loop iteration (constexpr)
-        NUM_KV_SPLITS: Number of KV splits per sequence (constexpr)
-        PAGE_SIZE: Tokens per memory page (constexpr)
-        HEAD_DIM: Actual head dimension (constexpr)
-        LOGIT_CAP: If > 0, applies tanh soft-cap: ``LOGIT_CAP * tanh(qk / LOGIT_CAP)``
-            (constexpr)
-    """
     b = tl.program_id(0)
     h = tl.program_id(1)
     split = tl.program_id(2)
@@ -204,26 +177,29 @@ def _decode_stage1(
             k_off = kv_loc_i64[:, None] * stride_k0 + kv_head_i64 * stride_k1 + offs_d_i64[None, :] * stride_k2
             k = tl.load(k_ptr + k_off, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
-            qk = tl.sum(q[None, :] * k, axis=1) * softmax_scale
             if LOGIT_CAP > 0:
-                qk = LOGIT_CAP * _tanh(qk / LOGIT_CAP)
-            qk = tl.where(mask_n, qk, float("-inf"))
+                qk_nat = tl.sum(q[None, :] * k, axis=1) * softmax_scale
+                qk_log2 = (LOGIT_CAP * _tanh(qk_nat / LOGIT_CAP)) * LOG2E
+            else:
+                qk_log2 = tl.sum(q[None, :] * k, axis=1) * softmax_scale_log2
+            qk_masked = tl.where(mask_n, qk_log2, float("-inf"))
 
             v_off = kv_loc_i64[:, None] * stride_v0 + kv_head_i64 * stride_v1 + offs_d_i64[None, :] * stride_v2
             v = tl.load(v_ptr + v_off, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
-            m_new = tl.maximum(m, tl.max(qk, axis=0))
-            m_new = tl.where(m_new > float("-inf"), m_new, m)
+            m_blk = tl.max(qk_masked, axis=0)
+            has_any = m_blk > float("-inf")
+            m_new = tl.where(has_any, tl.maximum(m, m_blk), m)
 
-            alpha = tl.exp(m - m_new)
-            p = tl.exp(qk - m_new)
+            alpha = tl.where(has_any & (m > float("-inf")), tl.math.exp2(m - m_new), tl.where(has_any, 0.0, 1.0))
+            p = tl.where(mask_n, tl.math.exp2(tl.where(mask_n, qk_log2 - m_new, float("-inf"))), 0.0)
 
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l = l * alpha + tl.sum(p, axis=0)
             m = m_new
 
-    out = tl.where(l > 0.0, acc / l, 0.0)
-    lse = tl.where(l > 0.0, m + tl.log(l), float("-inf"))
+    out = tl.where(l > 0.0, acc / tl.where(l > 0.0, l, 1.0), 0.0)
+    lse = tl.where(l > 0.0, m * LN2 + tl.log(tl.where(l > 0.0, l, 1.0)), float("-inf"))
 
     split_i64 = split.to(tl.int64)
     po_off = b_i64 * stride_po0 + h_i64 * stride_po1 + split_i64 * stride_po2 + offs_d_i64 * stride_po3
@@ -255,28 +231,9 @@ def _decode_stage2(
     NUM_KV_SPLITS_PADDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Stage 2 Triton kernel: combine partial results from all KV splits.
+    """Stage 2 Triton kernel: combine partial results from all KV splits."""
+    LOG2E: tl.constexpr = 1.4426950408889634
 
-    Each thread block processes one (batch, head) combination. It loads the partial
-    outputs and LSE values produced by Stage 1, performs numerically stable
-    log-sum-exp reduction across all KV splits, and writes the final attention
-    output and combined LSE.
-
-    Grid shape: ``(batch, num_q_heads)``.
-
-    Args:
-        partial_out_ptr: Partial output pointer [batch, num_q_heads, NUM_KV_SPLITS, head_dim]
-        partial_lse_ptr: Partial LSE pointer [batch, num_q_heads, NUM_KV_SPLITS]
-        out_ptr: Final output pointer [batch, num_q_heads, head_dim]
-        lse_ptr: Final LSE pointer [batch, num_q_heads]
-        stride_po0..po3: Partial output strides (batch, head, split, head_dim)
-        stride_pl0..pl2: Partial LSE strides (batch, head, split)
-        stride_o0..o2: Output strides (batch, head, head_dim)
-        stride_lse0..lse1: LSE strides (batch, head)
-        BLOCK_DMODEL: Padded head dim (next power of 2 >= HEAD_DIM) (constexpr)
-        NUM_KV_SPLITS: Number of KV splits to combine (constexpr)
-        HEAD_DIM: Actual head dimension (constexpr)
-    """
     b = tl.program_id(0)
     h = tl.program_id(1)
 
@@ -287,11 +244,13 @@ def _decode_stage2(
     # int, so iterate over the padded bound and mask down to the real count.
     offs_s = tl.arange(0, NUM_KV_SPLITS_PADDED).to(tl.int64)
     lse_off = b_i64 * stride_pl0 + h_i64 * stride_pl1 + offs_s * stride_pl2
-    lse_s = tl.load(partial_lse_ptr + lse_off, mask=offs_s < NUM_KV_SPLITS, other=float("-inf")).to(tl.float32)
+    s_mask = offs_s < NUM_KV_SPLITS
+    lse_s = tl.load(partial_lse_ptr + lse_off, mask=s_mask, other=float("-inf")).to(tl.float32)
 
     m = tl.max(lse_s, axis=0)
     has_any = m > float("-inf")
-    w = tl.where(has_any, tl.exp(lse_s - m), 0.0)
+    valid_s = s_mask & (lse_s > float("-inf")) & has_any
+    w = tl.where(valid_s, tl.math.exp2(tl.where(valid_s, (lse_s - m) * LOG2E, float("-inf"))), 0.0)
     sum_w = tl.sum(w, axis=0)
     sum_w_safe = tl.where(sum_w > 0.0, sum_w, 1.0)
     lse_total = tl.where(has_any, m + tl.log(sum_w_safe), float("-inf"))
@@ -304,13 +263,13 @@ def _decode_stage2(
         + offs_s[:, None] * stride_po2
         + offs_d[None, :].to(tl.int64) * stride_po3
     )
-    mask_po = (offs_s[:, None] < NUM_KV_SPLITS) & mask_d[None, :]
+    mask_po = s_mask[:, None] & mask_d[None, :]
     out_s = tl.load(partial_out_ptr + po_off, mask=mask_po, other=0.0).to(tl.float32)
     acc = tl.sum(out_s * w[:, None], axis=0)
     out = acc / sum_w_safe
 
     o_off = b_i64 * stride_o0 + h_i64 * stride_o1 + offs_d.to(tl.int64) * stride_o2
-    tl.store(out_ptr + o_off, out, mask=mask_d)
+    tl.store(out_ptr + o_off, out.to(out_ptr.dtype.element_ty), mask=mask_d)
 
     lse_store_off = b_i64 * stride_lse0 + h_i64 * stride_lse1
     tl.store(lse_ptr + lse_store_off, lse_total.to(tl.float32))
@@ -327,6 +286,7 @@ def decode_attention_triton(
     num_kv_splits: int,
     page_size: int,
     logits_soft_cap: float | None,
+    block_n: int = 64,
     num_warps: int | None,
     num_stages: int | None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -405,7 +365,8 @@ def decode_attention_triton(
     block_d = int(next_power_of_2(head_dim))
     if block_d > 256:
         raise NotImplementedError("decode_attention only supports head_dim <= 256")
-    block_n = 64
+    block_n_val = max(16, int(next_power_of_2(int(block_n))))
+    softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
     stride_q0, stride_q1, stride_q2 = strides_from_shape(query.shape)
     stride_k0, stride_k1, stride_k2 = strides_from_shape(key_buffer.shape)
@@ -434,6 +395,7 @@ def decode_attention_triton(
         num_warps=num_warps,
         num_stages=num_stages,
         softmax_scale=softmax_scale,
+        softmax_scale_log2=softmax_scale_log2,
         stride_q0=stride_q0,
         stride_q1=stride_q1,
         stride_q2=stride_q2,
@@ -454,7 +416,7 @@ def decode_attention_triton(
         stride_pl2=stride_pl2,
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=block_d,
-        BLOCK_N=block_n,
+        BLOCK_N=block_n_val,
         NUM_KV_SPLITS=num_kv_splits,
         PAGE_SIZE=page_size,
         HEAD_DIM=head_dim,

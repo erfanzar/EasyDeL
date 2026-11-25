@@ -103,14 +103,14 @@ def nsa_kernel_mask(
 
     b_i = tl.load(block_indices + i_b * SEQUENCE * HEAD * SIZE + i_t * HEAD * SIZE + i_h * SIZE + i_s)
     if USE_BLOCK_COUNTS:
-        b_m = b_i * BLOCKSIZE <= i_t and i_s < tl.load(block_counts + i_b * SEQUENCE * HEAD + i_t * HEAD + i_h)
+        b_m = (b_i * BLOCKSIZE <= i_t) & (i_s < tl.load(block_counts + i_b * SEQUENCE * HEAD + i_t * HEAD + i_h))
     else:
         b_m = b_i * BLOCKSIZE <= i_t
 
-    if b_i < NUM_SEQS and b_i >= 0:
+    if b_m and (b_i < NUM_SEQS) and (b_i >= 0):
         tl.store(
             block_mask + i_b * SEQUENCE * HEAD * NUM_SEQS + i_t * HEAD * NUM_SEQS + i_h * NUM_SEQS + b_i,
-            b_m.to(block_mask.dtype.element_ty),
+            tl.full((), 1, dtype=block_mask.dtype.element_ty),
         )
 
 
@@ -152,22 +152,25 @@ def nsa_block_mask(
 
     outputs = [jax.ShapeDtypeStruct((B, SEQUENCE, HEAD, NUM_SEQS), dtype="b1")]
 
+    use_block_counts = isinstance(block_counts, jax.Array | jax.core.ShapedArray) and block_counts.ndim > 0
+
     metaparams = dict(
         SEQUENCE=SEQUENCE,
         HEAD=HEAD,
         SIZE=SIZE,
         BLOCKSIZE=BLOCKSIZE,
         NUM_SEQS=NUM_SEQS,
-        USE_BLOCK_COUNTS=isinstance(block_counts, jax.Array),
+        USE_BLOCK_COUNTS=use_block_counts,
     )
 
     (block_mask,) = triton_call(
         block_indices,
-        block_counts,
+        block_counts if block_counts is not None else 1,
         kernel=nsa_kernel_mask,
         grid=lambda META: (SEQUENCE, B, HEAD * SIZE),
         out_shape=outputs,
         name="ejkernel::triton::sparse_attn_mask",
+        zeroed_outputs=(0,),
         **metaparams,
     )
 

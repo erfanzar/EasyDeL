@@ -148,12 +148,12 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
             computation, ensuring accurate pooling for variable-length sequences.
         """
 
-        block_size = getattr(cfg, "block_size", chunk_size)
-        block_dim = getattr(cfg, "block_dim", 64)
+        block_size = getattr(cfg, "block_size", 256)
+        block_dim = getattr(cfg, "block_dim", 128)
         num_warps = getattr(cfg, "num_warps", 4)
         num_stages = getattr(cfg, "num_stages", 1)
         cfg_backend = getattr(cfg, "backend", Backend.ANY)
-        effective_chunk_size = chunk_size if chunk_size != 32 else block_size
+        effective_chunk_size = chunk_size
 
         if platform is not None:
             cfg = MeanPoolingConfig(
@@ -196,6 +196,22 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
             num_stages=1,
             platform="auto",
             backend="any",
+        )
+
+    def heuristic_cfg_gpu(self, inv: Invocation[MeanPoolingConfig, Array]) -> MeanPoolingConfig:
+        """Provide GPU-optimized default configuration for mean pooling."""
+        x = inv.kwargs.get("x")
+        if x is None and len(inv.args) >= 1:
+            x = inv.args[0]
+        dim = int(x.shape[-1]) if getattr(x, "shape", None) else 128
+        block_dim = 256 if dim >= 512 else 128 if dim >= 128 else 64
+        return MeanPoolingConfig(
+            block_size=256,
+            block_dim=block_dim,
+            num_warps=8 if block_dim >= 128 else 4,
+            num_stages=2 if block_dim >= 128 else 1,
+            platform="triton",
+            backend="gpu",
         )
 
     def candidate_cfgs(self, inv: Invocation[MeanPoolingConfig, Array]):
@@ -241,29 +257,34 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         """Generate GPU candidates for mean pooling across registered GPU backends.
 
         Mean pooling is bandwidth-bound: each token is read once and
-        accumulated. The two tiles are:
-
-        * ``block_size`` — sequence-axis tile (how many tokens per CTA).
-        * ``block_dim`` — hidden-axis tile (how many features per CTA).
-
-        On H100:
-
-        * Small ``block_size`` (32, 64) is wasteful for long sequences.
-        * ``block_size=256, block_dim=128`` covers most cases.
-        * For wide hidden_dim (>=1024) try ``block_dim=256``.
+        accumulated. ``block_size`` tunes the sequence-axis tile for 2-D/3-D
+        global pooling (never mutating the semantic ``chunk_size`` window of
+        4-D block pooling), and ``block_dim`` tunes the feature-axis tile.
         """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        triton_configs = [
-            (32, 32, 2, 1),
-            (64, 64, 4, 1),
-            (128, 64, 4, 2),
-            (128, 128, 8, 2),
-            (256, 64, 4, 2),
-            (256, 128, 8, 2),
-            (256, 256, 8, 2),
-            (512, 128, 8, 2),
-        ]
+        x = inv.kwargs.get("x")
+        if x is None and len(inv.args) >= 1:
+            x = inv.args[0]
+        is_block_4d = getattr(x, "ndim", None) == 4
+        if is_block_4d:
+            triton_configs = [
+                (64, 32, 2, 1),
+                (64, 64, 4, 1),
+                (64, 128, 4, 2),
+                (64, 256, 8, 2),
+            ]
+        else:
+            triton_configs = [
+                (32, 32, 2, 1),
+                (64, 64, 4, 1),
+                (128, 64, 4, 2),
+                (128, 128, 8, 2),
+                (256, 64, 4, 2),
+                (256, 128, 8, 2),
+                (256, 256, 8, 2),
+                (512, 128, 8, 2),
+            ]
         tilelang_configs = [
             (128, 64, 4, 1),
             (128, 128, 4, 2),

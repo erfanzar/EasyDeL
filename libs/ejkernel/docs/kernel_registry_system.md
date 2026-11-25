@@ -2,27 +2,36 @@
 
 ## Overview
 
-The kernel registry system is the heart of ejKernel's multi-backend architecture, providing a centralized mechanism for managing multiple implementations of the same algorithm across different platforms and backends. It enables automatic platform-specific kernel selection and ensures consistency across implementations.
+The kernel registry system (`ejkernel/kernels/_registry.py`) is the backbone of ejKernel's multi-platform architecture. It provides centralized decorator-based registration, priority-sorted lookup, runtime unsupported-feature guards, and cross-implementation signature validation across all implementation platforms and hardware backends.
 
 ## Core Components
 
-### 1. Platform and Backend Enumerations
+### 1. `Platform` and `Backend` Enumerations
+
+Both enums inherit from `enum.StrEnum`:
 
 ```python
-class Platform(str, Enum):
-    TRITON = "triton"  # GPU kernels via Triton
-    PALLAS = "pallas"  # TPU/GPU kernels via Pallas
-    CUDA = "cuda"      # Direct CUDA implementations
-    XLA = "xla"        # XLA compiler-based
+from enum import StrEnum
 
-class Backend(str, Enum):
-    GPU = "gpu"
-    TPU = "tpu"
-    CPU = "cpu"
-    ANY = "any"        # Platform-agnostic
+
+class Platform(StrEnum):
+    TRITON = "triton"      # OpenAI Triton GPU kernels
+    PALLAS = "pallas"      # JAX Pallas kernels (TPU and GPU)
+    CUDA = "cuda"          # Native ahead-of-time CUDA C/C++ FFI kernels
+    CUTE = "cute"          # CUTLASS CuTe DSL kernels
+    TILELANG = "tilelang"  # TileLang DSL kernels (TVM-FFI backed)
+    XLA = "xla"            # Portable XLA / JAX primitive implementations
+
+
+class Backend(StrEnum):
+    GPU = "gpu"  # GPU backend (CUDA / ROCm)
+    MPS = "mps"  # Apple Silicon Metal/MPS backend (jax.default_backend() == "mps")
+    TPU = "tpu"  # Google TPU backend
+    CPU = "cpu"  # CPU-only backend
+    ANY = "any"  # Wildcard backend matching any hardware query
 ```
 
-### 2. KernelSpec Dataclass
+### 2. `KernelSpec` Dataclass
 
 ```python
 @dataclass(frozen=True)
@@ -31,419 +40,328 @@ class KernelSpec:
     backend: Backend
     algorithm: str
     implementation: Callable
-    priority: int = 0  # Higher values are preferred
+    priority: int = 0  # Higher values are preferred during lookup
 ```
 
-The KernelSpec encapsulates all metadata about a kernel implementation, including its priority for selection when multiple implementations are available.
+Each `KernelSpec` binds a wrapped kernel callable to its algorithm name, platform, backend, and selection priority.
 
-### 3. KernelRegistry Class
+### 3. `KernelRegistry` Class and `kernel_registry` Singleton
 
-The central registry managing all kernel implementations with sophisticated selection logic.
+`KernelRegistry` stores `self._registry: dict[str, list[KernelSpec]]` keyed by lower-cased algorithm name. Built-in kernels register against the global singleton `kernel_registry` (re-exported from `ejkernel`, `ejkernel.kernels`, and `ejkernel.kernels._registry`) at import time.
 
-## Key Methods
+---
 
-### 1. Registration
+## Key Methods and Semantics
+
+### 1. Registration and Priority-Sorted Multiple-Registration Semantics
 
 ```python
 @kernel_registry.register("flash_attention", Platform.TRITON, Backend.GPU, priority=10)
-def flash_attention_triton(q, k, v, **kwargs):
-    # Triton implementation
-    pass
+def flash_attention_triton(query, key, value, **kwargs):
+    ...
 ```
 
-**Features:**
+**Actual registration behavior:**
 
-- Decorator-based registration for clean syntax
-- Priority-based ordering (higher values preferred)
-- Automatic sorting of implementations by priority
-- Prevents duplicate registrations for same (algorithm, platform, backend) tuple
+- **Case-insensitive algorithm keys**: stored under `algorithm.lower()`.
+- **String-to-enum coercion**: `platform` and `backend` accept either enum members or their lowercase string values (raising `ValueError` on invalid enum strings).
+- **Multiple registrations coexist (no duplicate error)**: `register()` does **not** reject duplicate `(algorithm, platform, backend)` tuples. Every registration appends a `KernelSpec` to `self._registry[key]` and sorts the list in descending `priority` order:
+  ```python
+  self._registry[key].append(spec)
+  self._registry[key].sort(key=lambda x: x.priority, reverse=True)
+  ```
+- **Tie-breaking**: Because Python's `list.sort()` is stable, higher `priority` values always win during lookup; when multiple registrations share the same `(algorithm, platform, backend, priority)`, the earliest-registered spec comes first.
+- **Validation wrapper**: `register()` wraps the function in `_wrapped`, preserving metadata (`@functools.wraps`) and signature (`_wrapped.__signature__ = inspect.signature(func)`), and enforces runtime unsupported-feature checks before invoking the underlying implementation.
 
-### 2. Kernel Retrieval
+### 2. Runtime Unsupported-Feature Guards
+
+Every call to a registered kernel passes through `_wrapped(*args, **kwargs)`, which runs `_collect_unsupported_reasons(func, args, kwargs)` before calling `func`. If any unsupported reason is found, it raises `EjkernelRuntimeError(f"{algorithm} (platform={plat.value}): " + "; ".join(reasons))`.
+
+Two mechanisms feed into `_collect_unsupported_reasons`:
+
+#### A. AST-Based `del <param>` Detection (`_get_ignored_params`)
+
+The registry parses the source of `func` with `inspect.getsource` + `ast.parse` (cached per function in `_IGNORED_PARAM_CACHE`) and collects every bare `ast.Name` target in a `del` statement (`_DelVisitor.visit_Delete`).
+
+- If a parameter name appears in `del <param>` inside `func`, is **not** in `_TUNING_PARAM_NAMES`, and the caller supplied a **non-default** value (checked via `_is_non_default`), the wrapper records `f"{name} is not supported"` and raises `EjkernelRuntimeError`.
+- Passing the parameter's default value (e.g., `dropout_prob=0.0` or `bias=None`) is allowed.
+- Deleting a dict entry such as `del kwargs["foo"]` is an `ast.Subscript`, not an `ast.Name`, so it does not trigger this guard.
 
 ```python
-def get(self, algorithm: str, platform: Platform | str | None = None,
-        backend: Backend | str | None = None) -> Callable:
-    """
-    Retrieves the best matching kernel implementation.
-
-    Selection hierarchy:
-    1. Exact match: (algorithm, platform, backend)
-    2. Platform match with Backend.ANY
-    3. Auto-detection based on JAX backend
-    4. Raise ValueError if no match found
-    """
+@kernel_registry.register("my_attention", Platform.TRITON, Backend.GPU)
+def my_attention_triton(query, key, value, dropout_prob: float = 0.0, block_q: int = 64):
+    del dropout_prob  # Non-default dropout_prob != 0.0 -> raises EjkernelRuntimeError!
+    del block_q       # In _TUNING_PARAM_NAMES -> safely ignored without error
+    return run_triton(query, key, value)
 ```
 
-**Selection Logic:**
+#### B. `_TUNING_PARAM_NAMES` Exemption
 
-1. **Explicit Request**: If platform and backend specified, find exact match
-2. **Platform-Only**: If only platform specified, match platform with any backend
-3. **Auto-Detection**: If platform="auto" or None, detect from JAX backend:
-   - JAX backend "gpu" → prefer Triton, fallback to Pallas/XLA
-   - JAX backend "tpu" → prefer Pallas, fallback to XLA
-   - JAX backend "cpu" → use XLA
-4. **Priority Resolution**: When multiple matches exist, select highest priority
-
-### 3. Signature Validation
+The following 31 tuning/tiling parameter names in `_TUNING_PARAM_NAMES` are exempt from **both** the AST `del <param>` guard and cross-backend `validate_signatures()` comparisons:
 
 ```python
-def validate_signatures(self, algorithm: str | None = None, verbose: bool = False):
-    """
-    Validates parameter consistency across all implementations of an algorithm.
-
-    Checks:
-    - Parameter names match
-    - Parameter order matches
-    - Parameter kinds match (positional, keyword-only, etc.)
-    - Default values match
-    - Type annotations are compatible
-    """
+_TUNING_PARAM_NAMES: set[str] = {
+    "block_m",
+    "block_n",
+    "block_k",
+    "tile_m",
+    "tile_n",
+    "tile_i",
+    "chunk",
+    "block_q",
+    "block_kv",
+    "block_size",
+    "block_v",
+    "block_d",
+    "block_e",
+    "block_dim",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "num_waves",
+    "num_sms",
+    "num_splits",
+    "split_k",
+    "use_bf16",
+    "seq_threshold_3d",
+    "num_par_softmax_segments",
+    "max_warps",
+    "num_queries_per_block",
+    "num_kv_pages_per_block",
+    "num_kv_splits",
+    "gemm_block",
+    "fwd_params",
+    "bwd_params",
+}
 ```
 
-**Validation Process:**
+This allows backends to accept backend-specific tiling/launch kwargs (or `del` unused tuning hints passed by a shared caller) without breaking signature parity or tripping the unsupported-feature guard.
 
-1. Groups all implementations by algorithm
-2. For each algorithm with multiple implementations:
-   - Extract signatures using `inspect.signature`
-   - Normalize type annotations (handles different import paths)
-   - Compare parameter names, order, kinds, defaults
-   - Report discrepancies if verbose=True
-   - Raise ValueError on mismatch
+#### C. Explicit `__ejkernel_unsupported__` Hook
 
-### 4. Type Normalization
+A kernel function may attach an `__ejkernel_unsupported__` attribute for conditional or dynamic feature checks that cannot be expressed with `del <param>` alone. `_collect_unsupported_reasons` handles three forms:
+
+- **Callable**: invoked as `extra(**bound.arguments)` (falling back to `extra(bound.arguments)` on `TypeError`); may return a `str`, an `Iterable` of truthy reason strings, or `None`/empty if supported.
+- **String (`str`)**: appended unconditionally as a reason.
+- **Iterable**: every truthy element is converted via `str(...)` and appended.
 
 ```python
-def _normalize_type_string(type_annotation: Any) -> str:
-    """
-    Normalizes type annotation strings for comparison.
+def _check_unsupported(**bound):
+    reasons = []
+    if bound.get("causal") and bound.get("bias") is not None:
+        reasons.append("combining causal=True with additive bias is not supported")
+    return reasons
 
-    Examples:
-    - 'jaxtyping.Float[Array, "..."]' → 'Float[Array, "..."]'
-    - 'ejkernel.ops.utils.datacarrier.FwdParams' → 'FwdParams'
-    - 'typing.Union[X, None]' → 'Optional[X]'
-    """
+
+@kernel_registry.register("my_attention", Platform.CUDA, Backend.GPU)
+def my_attention_cuda(query, key, value, causal: bool = False, bias=None):
+    ...
+
+
+my_attention_cuda.__ejkernel_unsupported__ = _check_unsupported
 ```
 
-This enables signature validation even when implementations use different import styles for the same types.
+#### D. Exception Normalization
 
-## Platform Detection
+During execution of `func(*args, **kwargs)`, `_wrapped` lets `EjkernelRuntimeError` propagate as-is and wraps any `NotImplementedError` or `ValueError` whose message contains `"not supported"` or `"unsupported"` (case-insensitive) into an `EjkernelRuntimeError` annotated with `f"{algorithm} (platform={plat.value}): ..."`.
+
+### 3. Kernel Retrieval (`get`)
 
 ```python
-def detect_platform(algorithm: str, platform: str = "auto",
-                    maybe_pallas: bool = False) -> Platform:
-    """
-    Intelligently detects the best platform for the current hardware.
-
-    Detection logic:
-    1. If explicit platform requested, return it
-    2. Get JAX backend (GPU/TPU/CPU)
-    3. Check available implementations in registry
-    4. Apply platform preferences:
-       - GPU: Triton > Pallas > XLA
-       - TPU: Pallas > XLA
-       - CPU: XLA only
-    """
+def get(
+    self,
+    algorithm: str,
+    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
+    backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"] | None = None,
+) -> Callable:
 ```
 
-## Registration Patterns
+**Matching rules (in order):**
 
-### Basic Registration
+1. Look up `candidates = self._registry[algorithm.lower()]` (already sorted by descending `priority`). Raises `ValueError` if the algorithm is not registered.
+2. Convert string `platform` / `backend` arguments via `Platform(platform)` / `Backend(backend)`.
+   - **Important:** `"auto"` is **not** a member of `Platform`; passing `platform="auto"` directly to `kernel_registry.get()` raises `ValueError`. Use `ejkernel.modules.base.detect_platform(algorithm, "auto")` first to resolve `"auto"` to a concrete `Platform`.
+3. **Primary scan (priority order):** Return the first `spec.implementation` where:
+   - `platform is None` or `spec.platform == platform`, AND
+   - `backend is None` or `spec.backend == backend` or `spec.backend == Backend.ANY`.
+4. **Iterative fallbacks** (non-recursive):
+   - If `platform == Platform.XLA` and `backend != Backend.ANY`, retry scanning for `(Platform.XLA, Backend.ANY)`.
+   - If `backend == Backend.ANY`, resolve `default_backend = Backend(jax.default_backend())` and scan for a matching `platform` with `spec.backend in (default_backend, Backend.ANY)`.
+5. If no match is found, raise `ValueError`.
+
+### 4. Inspection (`list_algorithms` and `list_implementations`)
 
 ```python
-@kernel_registry.register("my_kernel", Platform.TRITON, Backend.GPU)
-def my_kernel_gpu(x, y, z):
-    return triton_implementation(x, y, z)
+# Sorted list of all registered lowercase algorithm names
+algos: list[str] = kernel_registry.list_algorithms()
+
+# Shallow copy of KernelSpec entries for an algorithm, sorted by descending priority
+specs: list[KernelSpec] = kernel_registry.list_implementations("flash_attention")
 ```
 
-### Multi-Backend Registration
+### 5. Signature Validation (`validate_signatures`)
 
 ```python
-# GPU implementation
-@kernel_registry.register("my_kernel", Platform.TRITON, Backend.GPU, priority=100)
-def my_kernel_gpu(x, y, z):
-    return gpu_optimized(x, y, z)
-
-# TPU implementation
-@kernel_registry.register("my_kernel", Platform.PALLAS, Backend.TPU, priority=100)
-def my_kernel_tpu(x, y, z):
-    return tpu_optimized(x, y, z)
-
-# Universal fallback
-@kernel_registry.register("my_kernel", Platform.XLA, Backend.ANY, priority=50)
-def my_kernel_xla(x, y, z):
-    return xla_generic(x, y, z)
+def validate_signatures(self, algorithm: str | None, verbose: bool = False) -> bool:
 ```
 
-### Platform-Specific Features
+**Validation process:**
+
+1. When `algorithm is None`, validates every algorithm in `self.list_algorithms()` (returning `None`).
+2. For a given algorithm with fewer than 2 implementations, returns `True`.
+3. Uses `specs[0]` (the highest-priority registration) as the reference and compares every `spec` in `specs[1:]` against it.
+4. **Filters out `_TUNING_PARAM_NAMES`** from both reference and candidate parameter lists before comparing.
+5. Compares parameter count, parameter names in order, parameter kinds (`POSITIONAL_OR_KEYWORD`, `KEYWORD_ONLY`, etc.), default values, and type annotations via `_types_are_equivalent()`.
+6. Emits a `UserWarning` for each mismatch (does **not** raise `ValueError` on signature mismatch; only raises `ValueError` if `algorithm` is not registered) and returns `True` if all matched, `False` otherwise.
+7. `ejkernel/__init__.py` automatically calls `kernel_registry.validate_signatures(None)` at package import time.
+
+### 6. Type Normalization (`_normalize_type_string`)
+
+`_normalize_type_string` normalizes annotation strings so implementations using different import paths compare equal:
+
+- Strips `<class '...'>` wrappers
+- Strips `jaxtyping.`, `jax._src.lax.lax.`, `jax._src.typing.`, `jax.typing.`, and `ejkernel.<subpkg>.` prefixes
+- Normalizes `jaxlib._jax.Array`, `jax.jaxlib._jax.Array`, and `jax.Array` to `Array`
+- Normalizes `jax.lax.` to `lax.`
+- Maps any annotation containing `PrecisionLike`, `DotAlgorithm`, or `DotAlgorithmPreset` to `"PrecisionLike"`
+- Maps any annotation containing `DTypeLike` or `SupportsDType` to `"DTypeLike"`
+
+---
+
+## Automatic Platform Detection (`detect_platform`)
+
+Hardware-aware platform selection lives in `ejkernel/modules/base.py`, separate from `KernelRegistry.get()`:
 
 ```python
-@kernel_registry.register("attention", Platform.PALLAS, Backend.TPU)
-def attention_tpu(query, key, value, **kwargs):
-    # TPU-specific: use segment IDs instead of attention masks
-    if "attention_mask" in kwargs:
-        segment_ids = mask_to_segment_ids(kwargs["attention_mask"])
-        kwargs["segment_ids"] = segment_ids
-        del kwargs["attention_mask"]
-    return pallas_attention(query, key, value, **kwargs)
+from ejkernel.modules.base import detect_platform
+
+platform = detect_platform(
+    algorithm="flash_attention",
+    platform="auto",          # "triton" | "pallas" | "cuda" | "cute" | "tilelang" | "xla" | "auto" | None
+    prefer_pallas=False,
+    prefer_cuda=False,
+    prefer_triton=False,
+    prefer_cute=False,
+    prefer_tilelang=False,
+)
 ```
+
+**Resolution order when `platform in ("auto", None)`:**
+
+1. If `prefer_pallas=True`: `Platform.PALLAS` when a matching TPU (on `"tpu"`) or GPU (on `"gpu"`) Pallas spec exists.
+2. TPU backend + Pallas TPU available → `Platform.PALLAS`.
+3. Explicit GPU preference flags (checked in order on `"gpu"` / `"cuda"`):
+   - `prefer_cute=True` (NVIDIA GPU + CuTe registered) → `Platform.CUTE`
+   - `prefer_cuda=True` (NVIDIA GPU + CUDA registered) → `Platform.CUDA`
+   - `prefer_triton=True` (GPU + Triton registered) → `Platform.TRITON`
+   - `prefer_tilelang=True` (GPU + TileLang registered) → `Platform.TILELANG`
+4. Default GPU auto-selection (when no `prefer_*` flag matched):
+   - NVIDIA GPU + CuTe available → `Platform.CUTE`
+   - NVIDIA GPU + CUDA available → `Platform.CUDA`
+   - GPU + Triton available → `Platform.TRITON`
+   - *(Note: `Platform.TILELANG` and GPU `Platform.PALLAS` are not auto-selected unless explicitly requested or enabled via `prefer_tilelang=True` / `prefer_pallas=True`.)*
+5. Fallback on any backend (CPU, MPS, or GPU/TPU without a specialized kernel) → `Platform.XLA`.
+
+---
 
 ## Usage Examples
 
 ### Direct Registry Usage
 
 ```python
-from ejkernel import kernel_registry, Platform, Backend
+from ejkernel import Backend, Platform, kernel_registry
+from ejkernel.modules.base import detect_platform
 
-# Get specific implementation
-flash_attn_gpu = kernel_registry.get(
+# Retrieve a specific backend implementation
+flash_attn_triton = kernel_registry.get(
     algorithm="flash_attention",
     platform=Platform.TRITON,
-    backend=Backend.GPU
+    backend=Backend.GPU,
 )
 
-# Auto-detect platform
-flash_attn_auto = kernel_registry.get("flash_attention")
+# Resolve platform automatically first, then look up in the registry
+plat = detect_platform("flash_attention", platform="auto")
+backend = Backend.ANY if plat == Platform.XLA else None
+flash_attn_auto = kernel_registry.get("flash_attention", platform=plat, backend=backend)
 
-# Use the kernel
-output = flash_attn_gpu(query, key, value, causal=True)
+output = flash_attn_auto(query, key, value, causal=True)
 ```
 
-### Module Integration
+### Multi-Platform Registration Pattern
 
 ```python
-class FlashAttention(Kernel):
-    def get_impl(self, cfg: FlashAttentionConfig):
-        """Get implementation from registry based on config"""
-        return kernel_registry.get(
-            algorithm="flash_attention",
-            platform=detect_platform("flash_attention", cfg.platform),
-            backend=cfg.backend,
-        )
+@kernel_registry.register("my_kernel", Platform.CUTE, Backend.GPU, priority=20)
+def my_kernel_cute(x, y, *, block_m: int = 128):
+    return cute_impl(x, y, block_m=block_m)
+
+
+@kernel_registry.register("my_kernel", Platform.TRITON, Backend.GPU, priority=10)
+def my_kernel_triton(x, y, *, block_m: int = 128, num_warps: int = 4):
+    return triton_impl(x, y, block_m=block_m, num_warps=num_warps)
+
+
+@kernel_registry.register("my_kernel", Platform.PALLAS, Backend.TPU, priority=10)
+def my_kernel_pallas(x, y, *, block_m: int = 128):
+    return pallas_impl(x, y, block_m=block_m)
+
+
+@kernel_registry.register("my_kernel", Platform.XLA, Backend.ANY, priority=0)
+def my_kernel_xla(x, y):
+    # Tuning parameters (block_m, num_warps) are in _TUNING_PARAM_NAMES, so
+    # XLA does not need to declare them to pass validate_signatures().
+    return xla_impl(x, y)
 ```
 
-## Design Decisions
+### Dynamic Runtime Registration
 
-### 1. Priority-Based Selection
-
-**Rationale**: Different implementations may have different performance characteristics. Priority allows expressing preferences while maintaining flexibility.
-
-**Example**: Triton implementations typically have priority=100 on GPU, while XLA fallbacks have priority=50.
-
-### 2. Signature Validation
-
-**Rationale**: Ensures that different implementations of the same algorithm are drop-in replacements for each other.
-
-**Benefits**:
-
-- Catches API mismatches early
-- Enforces consistency across backends
-- Simplifies testing and maintenance
-
-### 3. Type Normalization
-
-**Rationale**: Different files may import the same type differently (e.g., absolute vs relative imports).
-
-**Solution**: Strip module paths and normalize common patterns to enable comparison.
-
-### 4. Backend.ANY
-
-**Rationale**: Some implementations are platform-specific but work across backends (e.g., XLA works on CPU/GPU/TPU).
-
-**Usage**: Typically for fallback implementations that prioritize correctness over performance.
-
-## Thread Safety
-
-The registry implementation uses thread-safe operations:
-
-- Registration uses list operations which are thread-safe in Python
-- Retrieval only reads from immutable data structures
-- No mutable shared state after initialization
-
-## Error Handling
-
-### Registration Errors
+Use `kernel_registry.register(...)` directly rather than mutating internal attributes:
 
 ```python
-# Duplicate registration attempt
-@kernel_registry.register("my_kernel", Platform.TRITON, Backend.GPU)
-def impl1(): pass
-
-@kernel_registry.register("my_kernel", Platform.TRITON, Backend.GPU)
-def impl2(): pass  # Raises ValueError
+def register_dynamic_kernel(algorithm: str, impl, platform: Platform, backend: Backend, priority: int = 0):
+    return kernel_registry.register(algorithm, platform, backend, priority=priority)(impl)
 ```
 
-### Retrieval Errors
+---
+
+## Error Handling Summary
+
+| Condition | Exception / Signal |
+|---|---|
+| Invalid `platform` or `backend` string (including `"auto"` passed directly to `get()`) | `ValueError` |
+| Algorithm not found, or no matching `(platform, backend)` implementation in `get()` | `ValueError` |
+| Non-default value passed to a `del <param>` parameter (not in `_TUNING_PARAM_NAMES`) | `EjkernelRuntimeError` |
+| `__ejkernel_unsupported__` returns/yields one or more reasons | `EjkernelRuntimeError` |
+| Underlying kernel raises `NotImplementedError`/`ValueError` containing `"not supported"` / `"unsupported"` | Wrapped as `EjkernelRuntimeError` |
+| Cross-backend signature mismatch in `validate_signatures()` | `UserWarning` (returns `False`) |
+
+---
+
+## Testing Patterns
+
+### Signature Consistency Check
 
 ```python
-# No matching implementation
-kernel = kernel_registry.get("nonexistent_kernel")  # Raises ValueError
+from ejkernel import kernel_registry
 
-# No implementation for requested platform
-kernel = kernel_registry.get("cpu_only_kernel", platform=Platform.TRITON)  # Raises ValueError
-```
 
-## Performance Considerations
-
-### Registration (One-time)
-
-- O(n log n) sorting after each registration
-- Happens at module import time
-- No runtime overhead
-
-### Retrieval (Runtime)
-
-- O(n) search through implementations
-- Typically n < 10 per algorithm
-- Result can be cached by caller
-
-## Extension Points
-
-### Custom Platform
-
-```python
-class Platform(str, Enum):
-    TRITON = "triton"
-    PALLAS = "pallas"
-    CUDA = "cuda"
-    XLA = "xla"
-    CUSTOM = "custom"  # Add new platform
-```
-
-### Custom Selection Logic
-
-```python
-class CustomRegistry(KernelRegistry):
-    def get(self, algorithm, platform=None, backend=None):
-        # Add custom selection logic
-        if should_use_custom_logic():
-            return self.get_custom_impl(algorithm)
-        return super().get(algorithm, platform, backend)
-```
-
-### Dynamic Registration
-
-```python
-def register_dynamic_kernel(algorithm, impl, platform, backend):
-    """Register kernel at runtime"""
-    kernel_registry._implementations[algorithm].append(
-        KernelSpec(platform, backend, algorithm, impl, priority=0)
-    )
-    kernel_registry._implementations[algorithm].sort(
-        key=lambda x: x.priority, reverse=True
-    )
-```
-
-## Best Practices
-
-### 1. Consistent Signatures
-
-Always ensure all implementations of an algorithm have identical signatures:
-
-```python
-# Good - consistent signatures
-@kernel_registry.register("matmul", Platform.TRITON, Backend.GPU)
-def matmul_gpu(a: Array, b: Array, transpose_a: bool = False, transpose_b: bool = False):
-    pass
-
-@kernel_registry.register("matmul", Platform.XLA, Backend.ANY)
-def matmul_xla(a: Array, b: Array, transpose_a: bool = False, transpose_b: bool = False):
-    pass
-```
-
-### 2. Platform-Specific Optimizations
-
-Use platform-specific features when beneficial:
-
-```python
-@kernel_registry.register("attention", Platform.TRITON, Backend.GPU)
-def attention_gpu(q, k, v, **kwargs):
-    # Use Triton's shared memory optimizations
-    return triton_attention_kernel(q, k, v, **kwargs)
-
-@kernel_registry.register("attention", Platform.PALLAS, Backend.TPU)
-def attention_tpu(q, k, v, **kwargs):
-    # Use TPU's matrix units
-    return pallas_attention_kernel(q, k, v, **kwargs)
-```
-
-### 3. Graceful Degradation
-
-Always provide a fallback implementation:
-
-```python
-@kernel_registry.register("my_operation", Platform.XLA, Backend.ANY, priority=0)
-def my_operation_fallback(x, y):
-    """Basic implementation that works everywhere"""
-    return jnp.dot(x, y)
-```
-
-### 4. Documentation
-
-Document platform-specific limitations:
-
-```python
-@kernel_registry.register("sparse_attention", Platform.PALLAS, Backend.TPU)
-def sparse_attention_tpu(q, k, v, sparsity_mask):
-    """
-    TPU implementation of sparse attention.
-
-    Note: TPU version requires sparsity_mask to be block-aligned
-    with blocks of size 128x128.
-    """
-    pass
-```
-
-## Testing Strategies
-
-### 1. Cross-Backend Validation
-
-```python
-def test_kernel_consistency():
-    """Test that all backends produce identical results"""
-    algorithms = ["flash_attention", "page_attention"]
-
-    for algo in algorithms:
-        impls = kernel_registry.get_all_implementations(algo)
-
-        # Test with same inputs
-        inputs = generate_test_inputs(algo)
-        outputs = [impl(*inputs) for impl in impls]
-
-        # Verify all outputs are equivalent
-        for out in outputs[1:]:
-            assert_allclose(outputs[0], out, rtol=1e-5)
-```
-
-### 2. Signature Validation Fn
-
-```python
 def test_signature_consistency():
-    """Ensure all implementations have consistent signatures"""
-    kernel_registry.validate_signatures(verbose=True)
+    for algo in kernel_registry.list_algorithms():
+        assert kernel_registry.validate_signatures(algo, verbose=True)
 ```
 
-### 3. Platform Detection
+### Cross-Backend Parity Against XLA Reference
 
 ```python
-def test_platform_detection():
-    """Test automatic platform detection"""
-    with mock_jax_backend("gpu"):
-        platform = detect_platform("flash_attention")
-        assert platform == Platform.TRITON
+from ejkernel import Backend, Platform, kernel_registry
 
-    with mock_jax_backend("tpu"):
-        platform = detect_platform("flash_attention")
-        assert platform == Platform.PALLAS
+
+def test_kernel_parity(algorithm: str, inputs):
+    xla_impl = kernel_registry.get(algorithm, platform=Platform.XLA, backend=Backend.ANY)
+    ref = xla_impl(*inputs)
+
+    for spec in kernel_registry.list_implementations(algorithm):
+        if spec.platform == Platform.XLA:
+            continue
+        out = spec.implementation(*inputs)
+        # Compare numerically against the XLA reference on the target accelerator
 ```
-
-## Conclusion
-
-The kernel registry system provides a robust, extensible foundation for multi-backend kernel management in ejKernel. Its key strengths include:
-
-1. **Flexibility**: Easy to add new implementations and platforms
-2. **Consistency**: Signature validation ensures API compatibility
-3. **Intelligence**: Automatic platform detection and priority-based selection
-4. **Simplicity**: Clean decorator-based registration API
-5. **Reliability**: Multiple fallback mechanisms ensure availability
-
-This design enables ejKernel to provide optimal performance across diverse hardware platforms while maintaining a consistent API for users.

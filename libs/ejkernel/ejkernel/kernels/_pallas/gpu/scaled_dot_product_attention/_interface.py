@@ -13,9 +13,9 @@
 # limitations under the License.
 """Public interface and kernel-registry registration for GPU SDPA.
 
-Registers ``scaled_dot_product_attention`` under both ``Platform.PALLAS`` and
-``Platform.TRITON`` (both with ``Backend.GPU``) so the kernel registry can
-dispatch to this cuDNN implementation from either platform selector.
+Registers ``scaled_dot_product_attention`` under ``Platform.PALLAS`` with
+``Backend.GPU`` so the kernel registry dispatches to this cuDNN-backed
+implementation on GPU.
 
 The function signature is type-checked at call time via ``beartype`` +
 ``jaxtyping``.  The actual computation delegates to
@@ -35,7 +35,6 @@ from ._pallas_impl_fwd import scaled_dot_product_attention as _scaled_dot_produc
 
 
 @kernel_registry.register("scaled_dot_product_attention", Platform.PALLAS, Backend.GPU)
-@kernel_registry.register("scaled_dot_product_attention", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def scaled_dot_product_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
@@ -55,8 +54,8 @@ def scaled_dot_product_attention(
     """Registered entry point for GPU scaled dot-product attention via cuDNN.
 
     Thin wrapper that adds ``beartype``/``jaxtyping`` runtime type-checking
-    and registers the function in the kernel registry under both
-    ``Platform.PALLAS / Backend.GPU`` and ``Platform.TRITON / Backend.GPU``.
+    and registers the function in the kernel registry under
+    ``Platform.PALLAS / Backend.GPU``.
     All arguments and semantics are identical to
     :func:`._pallas_impl_fwd.scaled_dot_product_attention`; refer to that
     function for full parameter documentation.

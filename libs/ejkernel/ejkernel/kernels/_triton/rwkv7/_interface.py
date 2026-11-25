@@ -276,6 +276,24 @@ def _normalize_rwkv7_varlen_state(
     return state.astype(jnp.float32), False
 
 
+def _varlen_reverse_permutation(
+    cu_seqlens: Int[Array, "num_seqs_plus_one"],
+    total_tokens: int,
+) -> Int[Array, "total_tokens"]:
+    """Build a JIT-traceable permutation that reverses each packed sequence."""
+    idx = jnp.arange(total_tokens, dtype=jnp.int32)
+    num_seqs = int(cu_seqlens.shape[0] - 1)
+
+    def _body(seq_idx: int, perm: Int[Array, "total_tokens"]) -> Int[Array, "total_tokens"]:
+        start = jnp.asarray(cu_seqlens[seq_idx], dtype=jnp.int32)
+        end = jnp.asarray(cu_seqlens[seq_idx + 1], dtype=jnp.int32)
+        in_seq = (idx >= start) & (idx < end)
+        rev_idx = start + end - 1 - idx
+        return jnp.where(in_seq, rev_idx, perm)
+
+    return jax.lax.fori_loop(0, num_seqs, _body, idx)
+
+
 def _fwd_call(
     r: Float[Array, "batch seq_len num_heads qk_head_dim"],
     w: Float[Array, "batch seq_len num_heads qk_head_dim"],
@@ -331,14 +349,13 @@ def _fwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    residual = (r, w, k, v, a, b, softmax_scale, initial_state, reverse, cu_seqlens)
+    residual = (r, w, k, v, a, b, initial_state, cu_seqlens)
     return (out, final_state), residual
 
 
 def _bwd_call(
     softmax_scale: float | None,
     reverse: bool,
-    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
     block_v: int,
     num_warps: int,
     num_stages: int,
@@ -350,14 +367,14 @@ def _bwd_call(
     Args:
         softmax_scale: Non-differentiable scaling factor.
         reverse: Non-differentiable reverse flag.
-        cu_seqlens: Non-differentiable cumulative sequence lengths.
         block_v: Forward value tile size.
         num_warps: Forward Triton warp count.
         num_stages: Forward Triton pipeline stage count.
         residual: Tensors saved from the forward pass.
         grads: A tuple containing gradients (do, dht) of output and final state.
     """
-    r, w, k, v, a, b, _, initial_state, _, _ = residual
+    del block_v, num_warps, num_stages
+    r, w, k, v, a, b, initial_state, cu_seqlens = residual
     do, dht = grads
 
     do = ad.instantiate_zeros(do)
@@ -430,68 +447,93 @@ def _bwd_call(
             qk_dim=r_tok.shape[2],
             v_dim=v_tok.shape[2],
         )
-        if dht is None:
-            dht_all = jnp.zeros_like(h0_all)
-        else:
-            dht_all = dht.astype(jnp.float32)
+        dht_all = jnp.zeros_like(h0_all) if dht is None else dht.astype(jnp.float32)
 
-        dr_tok = jnp.zeros_like(r_tok, dtype=jnp.float32)
-        dw_tok = jnp.zeros_like(w_tok, dtype=jnp.float32)
-        dk_tok = jnp.zeros_like(k_tok, dtype=jnp.float32)
-        dv_tok = jnp.zeros_like(v_tok, dtype=jnp.float32)
-        da_tok = jnp.zeros_like(a_tok, dtype=jnp.float32)
-        db_tok = jnp.zeros_like(b_tok, dtype=jnp.float32)
-        dh0_all = jnp.zeros_like(h0_all, dtype=jnp.float32)
+        total_tokens = int(r_tok.shape[0])
+        cu_i32 = cu_seqlens.astype(jnp.int32)
+        idx = jnp.arange(total_tokens, dtype=jnp.int32)
+        seq_ids = jnp.clip(jnp.searchsorted(cu_i32[1:], idx, side="right"), 0, max(num_seqs - 1, 0))
+        valid = (idx >= cu_i32[0]) & (idx < cu_i32[-1])
+        perm = _varlen_reverse_permutation(cu_i32, total_tokens) if reverse else idx
 
-        for seq_idx in range(num_seqs):
-            start = int(cu_seqlens[seq_idx])
-            end = int(cu_seqlens[seq_idx + 1])
+        r_proc = r_tok[perm].astype(jnp.float32)
+        w_proc = w_tok[perm].astype(jnp.float32)
+        k_proc = k_tok[perm].astype(jnp.float32)
+        v_proc = v_tok[perm].astype(jnp.float32)
+        a_proc = a_tok[perm].astype(jnp.float32)
+        b_proc = b_tok[perm].astype(jnp.float32)
+        do_proc = do_tok[perm].astype(jnp.float32)
+        seq_proc = seq_ids[perm]
+        valid_proc = valid[perm]
+        scale_f = float(softmax_scale)
 
-            r_seq = r_tok[start:end]
-            w_seq = w_tok[start:end]
-            k_seq = k_tok[start:end]
-            v_seq = v_tok[start:end]
-            a_seq = a_tok[start:end]
-            b_seq = b_tok[start:end]
-            do_seq = do_tok[start:end]
+        def _hist_step(h_all, xs):
+            w_t, k_t, v_t, a_t, b_t, seq_t, is_val = xs
+            h_prev = h_all[seq_t]
+            hb_t = jnp.sum(b_t[:, :, None] * h_prev, axis=1)
+            decay = jnp.exp(w_t)[:, :, None]
+            h_mid = decay * h_prev + a_t[:, :, None] * hb_t[:, None, :]
+            h_next = jnp.where(is_val, h_mid + k_t[:, :, None] * v_t[:, None, :], h_prev)
+            h_all = h_all.at[seq_t].set(h_next)
+            return h_all, h_prev
 
-            if reverse:
-                r_seq = jnp.flip(r_seq, axis=0)
-                w_seq = jnp.flip(w_seq, axis=0)
-                k_seq = jnp.flip(k_seq, axis=0)
-                v_seq = jnp.flip(v_seq, axis=0)
-                a_seq = jnp.flip(a_seq, axis=0)
-                b_seq = jnp.flip(b_seq, axis=0)
-                do_seq = jnp.flip(do_seq, axis=0)
+        _, h_prev_hist = jax.lax.scan(
+            _hist_step, h0_all, (w_proc, k_proc, v_proc, a_proc, b_proc, seq_proc, valid_proc)
+        )
 
-            dr_seq, dw_seq, dk_seq, dv_seq, da_seq, db_seq, dh0_seq = _rwkv7_bwd_sequence(
-                r_seq,
-                w_seq,
-                k_seq,
-                v_seq,
-                a_seq,
-                b_seq,
-                do_seq,
-                dht_all[seq_idx],
-                h0_all[seq_idx],
-                float(softmax_scale),
-            )
+        def _bwd_step(dh_all, xs):
+            h_prev, r_t, w_t, k_t, v_t, a_t, b_t, do_t, seq_t, is_val = xs
+            dh_next = dh_all[seq_t]
+            do_eff = jnp.where(is_val, do_t, 0.0)
 
-            if reverse:
-                dr_seq = jnp.flip(dr_seq, axis=0)
-                dw_seq = jnp.flip(dw_seq, axis=0)
-                dk_seq = jnp.flip(dk_seq, axis=0)
-                dv_seq = jnp.flip(dv_seq, axis=0)
-                da_seq = jnp.flip(da_seq, axis=0)
-                db_seq = jnp.flip(db_seq, axis=0)
+            q_t = r_t * scale_f
+            hb_t = jnp.sum(b_t[:, :, None] * h_prev, axis=1)
+            decay = jnp.exp(w_t)[:, :, None]
+            h_mid = decay * h_prev + a_t[:, :, None] * hb_t[:, None, :]
+            h_t = h_mid + k_t[:, :, None] * v_t[:, None, :]
 
-            dr_tok = dr_tok.at[start:end].set(dr_seq)
-            dw_tok = dw_tok.at[start:end].set(dw_seq)
-            dk_tok = dk_tok.at[start:end].set(dk_seq)
-            dv_tok = dv_tok.at[start:end].set(dv_seq)
-            da_tok = da_tok.at[start:end].set(da_seq)
-            db_tok = db_tok.at[start:end].set(db_seq)
-            dh0_all = dh0_all.at[seq_idx].set(dh0_seq)
+            dq_t = jnp.sum(h_t * do_eff[:, None, :], axis=-1)
+            dr_t = dq_t * scale_f
+            dh_t = dh_next + q_t[:, :, None] * do_eff[:, None, :]
+
+            dk_t = jnp.sum(dh_t * v_t[:, None, :], axis=-1)
+            dv_t = jnp.sum(dh_t * k_t[:, :, None], axis=-2)
+
+            dh_mid = dh_t
+            dw_t = jnp.sum(dh_mid * (h_prev * decay), axis=-1)
+            dh_prev = dh_mid * decay
+
+            da_t = jnp.sum(dh_mid * hb_t[:, None, :], axis=-1)
+            dhb_t = jnp.sum(dh_mid * a_t[:, :, None], axis=-2)
+            db_t = jnp.sum(dhb_t[:, None, :] * h_prev, axis=-1)
+            dh_prev = dh_prev + b_t[:, :, None] * dhb_t[:, None, :]
+
+            dr_t = jnp.where(is_val, dr_t, 0.0)
+            dw_t = jnp.where(is_val, dw_t, 0.0)
+            dk_t = jnp.where(is_val, dk_t, 0.0)
+            dv_t = jnp.where(is_val, dv_t, 0.0)
+            da_t = jnp.where(is_val, da_t, 0.0)
+            db_t = jnp.where(is_val, db_t, 0.0)
+            dh_prev = jnp.where(is_val, dh_prev, dh_next)
+
+            dh_all = dh_all.at[seq_t].set(dh_prev)
+            return dh_all, (dr_t, dw_t, dk_t, dv_t, da_t, db_t)
+
+        xs_rev = jax.tree_util.tree_map(
+            lambda arr: jnp.flip(arr, axis=0),
+            (h_prev_hist, r_proc, w_proc, k_proc, v_proc, a_proc, b_proc, do_proc, seq_proc, valid_proc),
+        )
+        dh0_all, grads_rev = jax.lax.scan(_bwd_step, dht_all, xs_rev)
+        dr_proc, dw_proc, dk_proc, dv_proc, da_proc, db_proc = jax.tree_util.tree_map(
+            lambda arr: jnp.flip(arr, axis=0), grads_rev
+        )
+
+        dr_tok = jnp.zeros_like(r_tok, dtype=jnp.float32).at[perm].set(dr_proc)
+        dw_tok = jnp.zeros_like(w_tok, dtype=jnp.float32).at[perm].set(dw_proc)
+        dk_tok = jnp.zeros_like(k_tok, dtype=jnp.float32).at[perm].set(dk_proc)
+        dv_tok = jnp.zeros_like(v_tok, dtype=jnp.float32).at[perm].set(dv_proc)
+        da_tok = jnp.zeros_like(a_tok, dtype=jnp.float32).at[perm].set(da_proc)
+        db_tok = jnp.zeros_like(b_tok, dtype=jnp.float32).at[perm].set(db_proc)
 
         if add_batch_dim:
             dr = dr_tok[None, ...]
@@ -513,10 +555,11 @@ def _bwd_call(
         da.astype(a.dtype),
         db.astype(b.dtype),
         dinitial_state,
+        None,
     )
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(6, 8, 9, 10, 11, 12))
+@partial(jax.custom_vjp, nondiff_argnums=(6, 8, 10, 11, 12))
 @partial(jax.jit, static_argnums=(6, 8, 10, 11, 12))
 def _rwkv7(
     r: Float[Array, "batch seq_len num_heads qk_head_dim"],

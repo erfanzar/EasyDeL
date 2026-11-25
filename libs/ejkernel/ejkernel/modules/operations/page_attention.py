@@ -242,6 +242,19 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             backend="any",
         )
 
+    def heuristic_cfg_gpu(self, inv: Invocation[PageAttentionConfig, Array]) -> PageAttentionConfig:
+        """Provide GPU-optimized default configuration for paged attention."""
+        query = inv.kwargs.get("query", inv.args[0] if len(inv.args) > 0 else None) if inv is not None else None
+        head_dim = int(query.shape[-1]) if query is not None and len(query.shape) >= 1 else 64
+        return PageAttentionConfig(
+            num_splits=0,
+            pages_per_compute_block=None,
+            num_warps=8 if head_dim >= 256 else 4,
+            num_stages=2,
+            platform="auto",
+            backend="any",
+        )
+
     def candidate_cfgs(self, inv: Invocation[PageAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
@@ -268,7 +281,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
                 backend="any",
             )
             for num_splits in (0, 1, 2, 4)
-            for num_warps, num_stages in ((2, 4), (4, 3), (4, 4), (8, 2), (8, 3), (8, 4), (16, 2), (16, 3), (16, 4))
+            for num_warps, num_stages in ((2, 2), (4, 2), (4, 3), (8, 2))
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[PageAttentionConfig, Array]):
@@ -279,15 +292,10 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         if "triton" in platforms:
             for num_splits in (0, 1, 2, 4):
                 for num_warps, num_stages in (
-                    (2, 4),
+                    (2, 2),
+                    (4, 2),
                     (4, 3),
-                    (4, 4),
                     (8, 2),
-                    (8, 3),
-                    (8, 4),
-                    (16, 2),
-                    (16, 3),
-                    (16, 4),
                 ):
                     candidates.append(
                         PageAttentionConfig(

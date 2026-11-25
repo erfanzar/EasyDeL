@@ -297,3 +297,154 @@ def test_unified_attention_matches_xla_smoke():
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+@pytest.mark.parametrize("seq_threshold_3d", [0, 8])
+def test_unified_attention_large_logits_softcap_no_nan(seq_threshold_3d: int):
+    """Overflow-safe softcap must match XLA with zero NaNs when |logits / cap| > 89."""
+    batch = _make_inputs(
+        rng_seed=7,
+        num_seqs=4,
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_lens=[48, 33, 25, 64],
+        q_lens=[1, 1, 1, 1],
+        dtype=jnp.float32,
+    )
+    large_queries = batch["queries"] * 100.0
+    scale = 1.0 / math.sqrt(batch["queries"].shape[-1])
+
+    out_tri = unified_attention(
+        large_queries,
+        batch["key_cache"],
+        batch["value_cache"],
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        softmax_scale=scale,
+        sliding_window=32,
+        logits_soft_cap=10.0,
+        seq_threshold_3d=seq_threshold_3d,
+        num_par_softmax_segments=6,  # also test non-pow2 segments in 3D mode
+    )
+    out_xla = xla_unified_attention(
+        large_queries,
+        batch["key_cache"],
+        batch["value_cache"],
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        softmax_scale=scale,
+        sliding_window=32,
+        logits_soft_cap=10.0,
+    )
+
+    out_tri = jax.block_until_ready(out_tri)
+    out_xla = jax.block_until_ready(out_xla)
+    assert jnp.all(jnp.isfinite(out_tri))
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+@pytest.mark.parametrize("seq_threshold_3d", [0, 8])
+def test_unified_attention_zero_seq_len_safe(seq_threshold_3d: int):
+    """Sequences with kv_len == 0 must not divide by zero or emit NaNs."""
+    batch = _make_inputs(
+        rng_seed=11,
+        num_seqs=3,
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_lens=[32, 16, 48],
+        q_lens=[1, 1, 1],
+        dtype=jnp.float16,
+    )
+    kv_lens_with_zero = jnp.array([32, 0, 48], dtype=jnp.int32)
+    scale = 1.0 / math.sqrt(batch["queries"].shape[-1])
+
+    out_tri = jax.block_until_ready(
+        unified_attention(
+            batch["queries"],
+            batch["key_cache"],
+            batch["value_cache"],
+            kv_lens_with_zero,
+            batch["block_tables"],
+            batch["query_start_loc"],
+            softmax_scale=scale,
+            seq_threshold_3d=seq_threshold_3d,
+            num_par_softmax_segments=4,
+        )
+    )
+    assert jnp.all(jnp.isfinite(out_tri))
+    np.testing.assert_allclose(np.asarray(out_tri[1], dtype=np.float32), 0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("seq_threshold_3d", [0, 8])
+def test_unified_attention_jit_matches_xla(seq_threshold_3d: int):
+    """Verify jax.jit tracing and parity against XLA in 2D and 3D modes."""
+    batch = _make_inputs(
+        rng_seed=19,
+        num_seqs=3,
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_lens=[48, 31, 64],
+        q_lens=[1, 1, 1] if seq_threshold_3d > 0 else [5, 1, 8],
+        dtype=jnp.bfloat16,
+    )
+    scale = 1.0 / math.sqrt(batch["queries"].shape[-1])
+    sinks = jax.random.normal(jax.random.PRNGKey(3), (8,), dtype=jnp.float32)
+
+    @jax.jit
+    def run_tri(q, kc, vc, kvl, bt, qsl, aux):
+        return unified_attention(
+            q,
+            kc,
+            vc,
+            kvl,
+            bt,
+            qsl,
+            softmax_aux=aux,
+            softmax_scale=scale,
+            sliding_window=32,
+            logits_soft_cap=20.0,
+            seq_threshold_3d=seq_threshold_3d,
+            num_par_softmax_segments=6,
+        )
+
+    out_tri = jax.block_until_ready(
+        run_tri(
+            batch["queries"],
+            batch["key_cache"],
+            batch["value_cache"],
+            batch["kv_lens"],
+            batch["block_tables"],
+            batch["query_start_loc"],
+            sinks,
+        )
+    )
+    out_xla = jax.block_until_ready(
+        xla_unified_attention(
+            batch["queries"],
+            batch["key_cache"],
+            batch["value_cache"],
+            batch["kv_lens"],
+            batch["block_tables"],
+            batch["query_start_loc"],
+            softmax_aux=sinks,
+            softmax_scale=scale,
+            sliding_window=32,
+            logits_soft_cap=20.0,
+        )
+    )
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )

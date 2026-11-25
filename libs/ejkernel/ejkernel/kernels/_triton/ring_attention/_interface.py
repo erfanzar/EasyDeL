@@ -25,15 +25,18 @@ Public symbols:
 
 from __future__ import annotations
 
+import typing
+
 import jaxtyping
 from beartype import beartype
 from jax import lax
 
-from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
-
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_fwd import Array, BwdParams, Callable, Float, FwdParams, Int
 from ._triton_impl_fwd import ring_attention as _ring_attention_impl
+
+if typing.TYPE_CHECKING:
+    from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
 @kernel_registry.register("ring_attention", Platform.TRITON, Backend.GPU)
@@ -144,6 +147,7 @@ def ring_attention(
         ...     axis_name="sp",
         ... )
     """
+    del mask_builder, fused_backward
     if precision not in (lax.Precision.DEFAULT, "default"):
         return kernel_registry.get("ring_attention", platform=Platform.XLA, backend=Backend.ANY)(
             query=query,
@@ -155,7 +159,7 @@ def ring_attention(
             kv_position_ids=kv_position_ids,
             softmax_aux=softmax_aux,
             bias=bias,
-            mask_builder=mask_builder,
+            mask_builder=None,
             sliding_window=sliding_window,
             chunk_size=chunk_size,
             causal=causal,
@@ -164,7 +168,7 @@ def ring_attention(
             axis_name=axis_name,
             fwd_params=fwd_params,
             bwd_params=bwd_params,
-            fused_backward=fused_backward,
+            fused_backward=False,
             precision=precision,
         )
     return _ring_attention_impl(
@@ -177,7 +181,7 @@ def ring_attention(
         kv_position_ids,
         softmax_aux,
         bias,
-        mask_builder,
+        None,
         sliding_window,
         chunk_size,
         causal,
@@ -186,7 +190,7 @@ def ring_attention(
         axis_name,
         fwd_params,
         bwd_params,
-        fused_backward,
+        False,
     )
 
 

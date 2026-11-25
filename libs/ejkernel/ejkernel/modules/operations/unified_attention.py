@@ -414,6 +414,21 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
             backend="any",
         )
 
+    def heuristic_cfg_gpu(self, inv: Invocation[UnifiedAttentionConfig, Array]) -> UnifiedAttentionConfig:
+        """Generate GPU-optimized default configuration for unified attention."""
+        base = self.heuristic_cfg(inv)
+        queries = _resolve_inv_arg(inv, "queries")
+        head_dim = int(queries.shape[-1])
+        return UnifiedAttentionConfig(
+            seq_threshold_3d=base.seq_threshold_3d,
+            num_par_softmax_segments=base.num_par_softmax_segments,
+            block_dim=base.block_dim,
+            num_warps=8 if head_dim >= 128 else 4,
+            num_stages=2,
+            platform="auto",
+            backend="any",
+        )
+
     def candidate_cfgs(self, inv: Invocation[UnifiedAttentionConfig, Array]):
         """Return candidate configurations for autotuning.
 
@@ -431,7 +446,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
     def candidate_cfgs_gpu(self, inv: Invocation[UnifiedAttentionConfig, Array]):
         """Return GPU candidates for every registered unified-attention backend.
 
-        The three knobs:
+        The tuning knobs:
 
         * ``seq_threshold_3d`` — sequence count below which the 2D grid
           launches (lower decode overhead); above, the 3D segmented
@@ -440,10 +455,12 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
           and × 2 to bracket it.
         * ``num_par_softmax_segments`` — segments for the 3D kernel's
           parallel softmax reduction; powers of two near the heuristic.
+        * ``num_warps`` / ``num_stages`` — Triton launch occupancy and
+          pipelining knobs.
         * ``block_dim`` — CUDA thread-block dim; {64, 128, 256}, with 128
           a strong default for most head_dims.
         """
-        base = self.heuristic_cfg(inv)
+        base = self.heuristic_cfg_gpu(inv)
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "cuda", "cute", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         thr = max(1, int(base.seq_threshold_3d or 1))
@@ -452,15 +469,36 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         seg_choices = sorted({max(1, seg // 2), seg, min(seg * 2, 64)})
         candidates: list[UnifiedAttentionConfig] = []
         if "triton" in platforms:
+            triton_seen: set[tuple[int, int, int, int]] = set()
             for t in thr_choices:
                 for s in seg_choices:
+                    for num_warps, num_stages in ((4, 2), (8, 2)):
+                        key = (t, s, num_warps, num_stages)
+                        if key in triton_seen:
+                            continue
+                        triton_seen.add(key)
+                        candidates.append(
+                            UnifiedAttentionConfig(
+                                seq_threshold_3d=t,
+                                num_par_softmax_segments=s,
+                                block_dim=base.block_dim,
+                                num_warps=num_warps,
+                                num_stages=num_stages,
+                                platform="triton",
+                                backend="gpu",
+                            )
+                        )
+            for num_warps, num_stages in ((2, 2), (4, 3)):
+                key = (thr, seg, num_warps, num_stages)
+                if key not in triton_seen:
+                    triton_seen.add(key)
                     candidates.append(
                         UnifiedAttentionConfig(
-                            seq_threshold_3d=t,
-                            num_par_softmax_segments=s,
+                            seq_threshold_3d=thr,
+                            num_par_softmax_segments=seg,
                             block_dim=base.block_dim,
-                            num_warps=None,
-                            num_stages=None,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
                             platform="triton",
                             backend="gpu",
                         )

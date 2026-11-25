@@ -12,48 +12,129 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked prefill with paged decode attention implementation.
+"""Chunked prefill with paged decode attention implementation for Triton.
 
-This module implements a hybrid attention strategy that combines chunked prefill
-for initial token processing with paged decode for efficient autoregressive generation.
-
-Algorithm Overview:
-------------------
-The algorithm operates in two phases:
-
-1. **Prefill Phase (Chunked)**: For new sequences, tokens are processed in chunks
-   using unified attention. This amortizes the cost of computing attention over
-   multiple tokens at once.
-
-2. **Decode Phase (Paged)**: For autoregressive generation, single tokens attend
-   to the block-tabled KV cache using paged attention patterns.
-
-Memory Layout:
--------------
-- KV Cache: Block-tabled format [num_blocks, block_size, num_kv_heads, head_dim]
-- Block Tables: Logical-to-physical mapping [num_seqs, max_blocks_per_seq]
-- Queries/Keys/Values: Packed format [total_tokens, num_heads, head_dim]
-
-Key Features:
-------------
-- Efficient block-tabled KV cache updates with scatter operations
-- Support for grouped-query attention (GQA) configurations
-- Variable-length sequence support via cumulative position indices
-- Seamless integration of prefill and decode phases
-
-Functions:
----------
-- _update_block_tabled_kv_cache: Update KV cache with new key/value pairs
-- chunked_prefill_paged_decode_attention: Main entry point for hybrid attention
+Updates the block-tabled KV cache with a single fused Triton scatter kernel
+(1 program per ``(token, kv_head)`` using ``input_output_aliases`` to preserve
+existing prefix cache slots), then computes causal attention using
+``unified_attention``.
 """
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax import lax
+import triton
+import triton.language as tl
 
+from ejkernel.callib import next_power_of_2, strides_from_shape, triton_call
 from ejkernel.kernels._triton.unified_attention import unified_attention as triton_unified_attention
+
+
+@triton.jit
+def _scatter_kv_cache_kernel(
+    keys_ptr,
+    values_ptr,
+    in_k_cache_ptr,
+    in_v_cache_ptr,
+    kv_lens_ptr,
+    block_tables_ptr,
+    query_start_loc_ptr,
+    out_k_cache_ptr,
+    out_v_cache_ptr,
+    stride_k0: tl.constexpr,
+    stride_k1: tl.constexpr,
+    stride_k2: tl.constexpr,
+    stride_v0: tl.constexpr,
+    stride_v1: tl.constexpr,
+    stride_v2: tl.constexpr,
+    stride_kc0: tl.constexpr,
+    stride_kc1: tl.constexpr,
+    stride_kc2: tl.constexpr,
+    stride_kc3: tl.constexpr,
+    stride_vc0: tl.constexpr,
+    stride_vc1: tl.constexpr,
+    stride_vc2: tl.constexpr,
+    stride_vc3: tl.constexpr,
+    stride_bt0: tl.constexpr,
+    stride_bt1: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+    NUM_SEQS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_BLOCKS_PER_SEQ: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fused KV-cache scatter kernel: 1 program per ``(tok, kv_head)``.
+
+    ``in_k_cache_ptr`` / ``in_v_cache_ptr`` are aliased to ``out_k_cache_ptr`` /
+    ``out_v_cache_ptr`` via ``input_output_aliases`` so untouched prefix slots
+    remain intact while new tokens are written in parallel across GPU SMs.
+    """
+    tok = tl.program_id(0)
+    kv_head = tl.program_id(1)
+
+    if tok >= NUM_TOKENS:
+        return
+
+    total_active = tl.load(query_start_loc_ptr + NUM_SEQS).to(tl.int32)
+    if tok >= total_active:
+        return
+
+    left = 0
+    right = NUM_SEQS
+    while left < right:
+        mid = (left + right) // 2
+        val = tl.load(query_start_loc_ptr + mid).to(tl.int32)
+        if val <= tok:
+            left = mid + 1
+        else:
+            right = mid
+    seq_idx = left - 1
+    if (seq_idx < 0) | (seq_idx >= NUM_SEQS):
+        return
+
+    q_start = tl.load(query_start_loc_ptr + seq_idx).to(tl.int32)
+    q_end = tl.load(query_start_loc_ptr + seq_idx + 1).to(tl.int32)
+    q_len = q_end - q_start
+    kv_len = tl.load(kv_lens_ptr + seq_idx).to(tl.int32)
+    ctx_len = kv_len - q_len
+
+    pos = ctx_len + (tok - q_start)
+    if (pos < 0) | (pos >= kv_len):
+        return
+
+    block_idx = pos // BLOCK_SIZE
+    if block_idx >= MAX_BLOCKS_PER_SEQ:
+        return
+
+    within = pos - block_idx * BLOCK_SIZE
+    phys_block = tl.load(
+        block_tables_ptr + seq_idx.to(tl.int64) * stride_bt0 + block_idx.to(tl.int64) * stride_bt1
+    ).to(tl.int32)
+    if (phys_block < 0) | (phys_block >= NUM_BLOCKS):
+        return
+
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < HEAD_DIM
+    offs_d64 = offs_d.to(tl.int64)
+
+    tok64 = tok.to(tl.int64)
+    kv_head64 = kv_head.to(tl.int64)
+    phys64 = phys_block.to(tl.int64)
+    within64 = within.to(tl.int64)
+
+    src_k_off = tok64 * stride_k0 + kv_head64 * stride_k1 + offs_d64 * stride_k2
+    src_v_off = tok64 * stride_v0 + kv_head64 * stride_v1 + offs_d64 * stride_v2
+    dst_k_off = phys64 * stride_kc0 + within64 * stride_kc1 + kv_head64 * stride_kc2 + offs_d64 * stride_kc3
+    dst_v_off = phys64 * stride_vc0 + within64 * stride_vc1 + kv_head64 * stride_vc2 + offs_d64 * stride_vc3
+
+    k_vec = tl.load(keys_ptr + src_k_off, mask=d_mask, other=0.0)
+    v_vec = tl.load(values_ptr + src_v_off, mask=d_mask, other=0.0)
+
+    tl.store(out_k_cache_ptr + dst_k_off, k_vec.to(out_k_cache_ptr.dtype.element_ty), mask=d_mask)
+    tl.store(out_v_cache_ptr + dst_v_off, v_vec.to(out_v_cache_ptr.dtype.element_ty), mask=d_mask)
 
 
 def _update_block_tabled_kv_cache(
@@ -65,76 +146,71 @@ def _update_block_tabled_kv_cache(
     kv_lens: jax.Array,
     block_tables: jax.Array,
     query_start_loc: jax.Array,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Update block-tabled KV cache with new key/value pairs.
+    """Update block-tabled KV cache with a fused Triton scatter kernel."""
+    total_tokens = int(keys.shape[0])
+    if total_tokens == 0:
+        return key_cache, value_cache
 
-    Inserts packed keys and values into their corresponding positions in the block-tabled
-    KV cache, using block_tables to map logical blocks to physical memory locations.
-
-    Args:
-        keys: Packed key vectors [total_tokens, num_kv_heads, head_dim]
-        values: Packed value vectors [total_tokens, num_kv_heads, head_dim]
-        key_cache: Block-tabled key cache [num_blocks, block_size, num_kv_heads, head_dim]
-        value_cache: Block-tabled value cache [num_blocks, block_size, num_kv_heads, head_dim]
-        kv_lens: Current KV lengths per sequence [num_seqs]
-        block_tables: Logical-to-physical block mapping [num_seqs, max_blocks_per_seq]
-        query_start_loc: Cumulative query positions [num_seqs + 1]
-
-    Returns:
-        Tuple of (updated_key_cache, updated_value_cache)
-    """
     num_blocks, block_size, num_kv_heads, head_dim = map(int, key_cache.shape)
-    key_cache_flat = key_cache.reshape(num_blocks * block_size, num_kv_heads, head_dim)
-    value_cache_flat = value_cache.reshape(num_blocks * block_size, num_kv_heads, head_dim)
+    num_seqs, max_blocks_per_seq = map(int, block_tables.shape)
+    block_d = max(16, int(next_power_of_2(head_dim)))
 
-    num_seqs = int(block_tables.shape[0])
+    stride_k0, stride_k1, stride_k2 = strides_from_shape(keys.shape)
+    stride_v0, stride_v1, stride_v2 = strides_from_shape(values.shape)
+    stride_kc0, stride_kc1, stride_kc2, stride_kc3 = strides_from_shape(key_cache.shape)
+    stride_vc0, stride_vc1, stride_vc2, stride_vc3 = strides_from_shape(value_cache.shape)
+    stride_bt0, stride_bt1 = strides_from_shape(block_tables.shape)
 
-    def _seq_body(seq_idx, carry):
-        """Process all new tokens for a single sequence and insert into the KV cache.
+    scatter_warps = 2 if head_dim <= 64 else 4
+    if num_warps is not None:
+        scatter_warps = min(int(num_warps), 4)
 
-        Args:
-            seq_idx: Index of the sequence being processed.
-            carry: Tuple of (flattened_key_cache, flattened_value_cache).
-
-        Returns:
-            Updated (flattened_key_cache, flattened_value_cache) with all
-            new tokens for this sequence written to their paged positions.
-        """
-        k_flat, v_flat = carry
-        q_start = query_start_loc[seq_idx]
-        q_end = query_start_loc[seq_idx + 1]
-        q_len = q_end - q_start
-        ctx_len = kv_lens[seq_idx] - q_len
-
-        def _tok_body(t, carry_tok):
-            """Insert a single token's key and value into the paged KV cache.
-
-            Args:
-                t: Token offset within the current sequence's new tokens.
-                carry_tok: Tuple of (flattened_key_cache, flattened_value_cache).
-
-            Returns:
-                Updated caches with the token at position (ctx_len + t) written
-                to its physical block location determined by the block table.
-            """
-            k_flat_tok, v_flat_tok = carry_tok
-            pos = ctx_len + t
-            block_idx = pos // jnp.int32(block_size)
-            within = pos - block_idx * jnp.int32(block_size)
-            phys_block = block_tables[seq_idx, block_idx]
-            linear = phys_block * jnp.int32(block_size) + within
-            tok = q_start + t
-            k_flat_tok = k_flat_tok.at[linear].set(keys[tok])
-            v_flat_tok = v_flat_tok.at[linear].set(values[tok])
-            return k_flat_tok, v_flat_tok
-
-        return lax.fori_loop(0, q_len, _tok_body, (k_flat, v_flat))
-
-    key_cache_flat, value_cache_flat = lax.fori_loop(0, num_seqs, _seq_body, (key_cache_flat, value_cache_flat))
-    return (
-        key_cache_flat.reshape(num_blocks, block_size, num_kv_heads, head_dim),
-        value_cache_flat.reshape(num_blocks, block_size, num_kv_heads, head_dim),
+    new_key_cache, new_value_cache = triton_call(
+        keys,
+        values,
+        key_cache,
+        value_cache,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        kernel=_scatter_kv_cache_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct(key_cache.shape, key_cache.dtype),
+            jax.ShapeDtypeStruct(value_cache.shape, value_cache.dtype),
+        ),
+        input_output_aliases={2: 0, 3: 1},
+        grid=lambda META: (total_tokens, num_kv_heads),
+        name="ejkernel::triton::chunked_prefill_kv_scatter",
+        num_warps=scatter_warps,
+        num_stages=1 if num_stages is None else min(int(num_stages), 2),
+        stride_k0=stride_k0,
+        stride_k1=stride_k1,
+        stride_k2=stride_k2,
+        stride_v0=stride_v0,
+        stride_v1=stride_v1,
+        stride_v2=stride_v2,
+        stride_kc0=stride_kc0,
+        stride_kc1=stride_kc1,
+        stride_kc2=stride_kc2,
+        stride_kc3=stride_kc3,
+        stride_vc0=stride_vc0,
+        stride_vc1=stride_vc1,
+        stride_vc2=stride_vc2,
+        stride_vc3=stride_vc3,
+        stride_bt0=stride_bt0,
+        stride_bt1=stride_bt1,
+        NUM_TOKENS=total_tokens,
+        NUM_SEQS=num_seqs,
+        NUM_BLOCKS=num_blocks,
+        BLOCK_SIZE=block_size,
+        MAX_BLOCKS_PER_SEQ=max_blocks_per_seq,
+        HEAD_DIM=head_dim,
+        BLOCK_D=block_d,
     )
+    return new_key_cache, new_value_cache
 
 
 def chunked_prefill_paged_decode_triton(
@@ -158,38 +234,7 @@ def chunked_prefill_paged_decode_triton(
     num_warps: int | None,
     num_stages: int | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Triton implementation of chunked prefill + paged decode attention.
-
-    First updates the block-tabled KV cache with new keys/values, then computes
-    causal attention outputs using the unified attention kernel.
-
-    Args:
-        queries: Packed query vectors [total_tokens, num_q_heads, head_dim]
-        keys: Packed keys to insert [total_tokens, num_kv_heads, head_dim]
-        values: Packed values to insert [total_tokens, num_kv_heads, head_dim]
-        key_cache: Block-tabled key cache [num_blocks, block_size, num_kv_heads, head_dim]
-        value_cache: Block-tabled value cache [num_blocks, block_size, num_kv_heads, head_dim]
-        kv_lens: KV lengths per sequence [num_seqs]
-        block_tables: Logical-to-physical block mapping [num_seqs, max_blocks_per_seq]
-        query_start_loc: Cumulative query positions [num_seqs + 1]
-        alibi_slopes: Optional ALiBi slopes [num_q_heads]
-        softmax_aux: Optional auxiliary softmax parameters [num_q_heads]
-        softmax_scale: Attention scaling factor
-        causal: Whether to apply causal masking
-        sliding_window: Optional local attention window size
-        logits_soft_cap: Optional logit capping value
-        seq_threshold_3d: Sequence threshold for 3D kernel
-        num_par_softmax_segments: Parallel softmax segments
-        num_warps: Number of Triton warps
-        num_stages: Number of pipeline stages
-
-    Returns:
-        Tuple of (attention_output, updated_key_cache, updated_value_cache)
-
-    Raises:
-        NotImplementedError: If causal=False
-        ValueError: If input shapes are invalid or inconsistent
-    """
+    """Triton implementation of chunked prefill + paged decode attention."""
     if not causal:
         raise NotImplementedError("chunked_prefill_paged_decode only supports causal attention.")
     if queries.ndim != 3:
@@ -218,6 +263,8 @@ def chunked_prefill_paged_decode_triton(
         kv_lens=kv_lens,
         block_tables=block_tables,
         query_start_loc=query_start_loc,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     out = triton_unified_attention(

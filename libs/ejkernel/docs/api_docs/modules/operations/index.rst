@@ -4,19 +4,47 @@ ejkernel.modules.operations package
 .. toctree::
    :maxdepth: 2
 
+   _pooled_bias
+   _row_loss_shard_map
+   all_gather
    all_gather_matmul
+   all_reduce
+   all_to_all
    attention
    blocksparse_attention
    chunked_prefill_paged_decode
+   compressed_window_attention
+   compressed_window_decode
    configs
    decode_attention
    deepseek_attn
+   dsa_gather_attention
+   dsa_sparse_attention
+   dual_stream_attention
+   dual_stream_ragged_page_attention
    flash_attention
+   fused_cakld_tv
+   fused_conv_decode
+   fused_cross_entropy
+   fused_kl_divergence
+   fused_mlp
+   fused_renyi_entropy
    gated_delta_rule
+   gated_delta_rule_grouped_decode
    gated_linear_attention
+   gdn_compute_schedule_v2
+   gdn_spec_window
    grouped_matmul
+   indexer_scores
+   kda_chunk
    kernel_delta_attention
    lightning_attention
+   mhc
+   mhc_coefficients
+   mhc_decode_fused
+   mhc_prefill_fused
+   moe_decode_fused_w8a8
+   moe_row_gather
    multi_head_latent_attention
    multi_latent_ragged_page_attention
    multi_latent_ragged_page_attention_v2
@@ -25,21 +53,32 @@ ejkernel.modules.operations package
    pooling
    prefill_page_attention
    quantized_matmul
+   ragged_causal_conv1d
    ragged_decode_attention
    ragged_gated_delta_rule
+   ragged_gated_delta_rule_v2
+   ragged_gather
+   ragged_gather_reduce
    ragged_kda
+   ragged_kda_conv_decode
    ragged_kda_decode
    ragged_page_attention_v2
    ragged_page_attention_v2_turboquant
    ragged_page_attention_v3
    ragged_page_attention_v3_turboquant
    recurrent
+   reduce_scatter
    reduce_scatter_matmul
    ring_attention
+   row_permute
    rwkv4
    rwkv6
    rwkv7
    scaled_dot_product_attention
+   shared_expert_w8a8
+   sinkhorn_knopp
+   sparse_multi_latent_ragged_page_attention
    state_space_v1
    state_space_v2
+   topk
    unified_attention

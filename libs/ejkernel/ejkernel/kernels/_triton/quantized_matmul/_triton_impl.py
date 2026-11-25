@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import math
 import os
-from functools import lru_cache
 from typing import Literal
 
 import jax
@@ -332,134 +331,6 @@ def qmm_dequant_affine4_kernel(
             other=0,
         )
         q = _unpack_packed_codes(w_word0, w_word1, shifts[None, :], BITS)
-        group_idx = offs_c // GROUP_SIZE
-        group_mask = group_idx < tl.cdiv(N, GROUP_SIZE)
-        ws = tl.load(
-            Wscale + offs_r[:, None] * stride_ws0 + group_idx[None, :] * stride_ws1,
-            mask=r_mask[:, None] & group_mask[None, :],
-            other=0.0,
-        )
-        wb = tl.load(
-            Wbias + offs_r[:, None] * stride_wb0 + group_idx[None, :] * stride_wb1,
-            mask=r_mask[:, None] & group_mask[None, :],
-            other=0.0,
-        )
-        out = q.to(ws.dtype) * ws + wb
-        out_ty = tl.bfloat16 if OUT_BF16 else tl.float16
-        tl.store(
-            O + offs_r[:, None] * stride_or + offs_c[None, :] * stride_oc,
-            out.to(out_ty),
-            mask=r_mask[:, None] & c_mask[None, :],
-        )
-
-
-@triton.jit
-def qmm_dequant_affine8_kernel(
-    Wq,
-    Wscale,
-    Wbias,
-    N,
-    K,
-    O,
-    stride_wq0: tl.constexpr,
-    stride_wq1: tl.constexpr,
-    stride_ws0: tl.constexpr,
-    stride_ws1: tl.constexpr,
-    stride_wb0: tl.constexpr,
-    stride_wb1: tl.constexpr,
-    stride_or: tl.constexpr,
-    stride_oc: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    VALUES_PER_WORD: tl.constexpr,
-    BR: tl.constexpr,
-    BC: tl.constexpr,
-    TRANSPOSE: tl.constexpr,
-    OUT_BF16: tl.constexpr,
-):
-    """Dequantize a packed 8-bit affine-quantized weight tile to fp16/bf16.
-
-    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
-
-    Unpacks ``VALUES_PER_WORD = 4`` 8-bit codes from each int32 word using an
-    8-bit right-shift-and-mask pattern, then applies the per-group affine
-    transform ``out = code * scale + bias``.  The output is cast to bfloat16
-    if ``OUT_BF16=True``, otherwise float16.
-
-    Args:
-        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
-            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
-            the shape is ``(N // VALUES_PER_WORD, K)``.
-        Wscale: Per-group scale pointer, shape ``(rows, groups)`` where
-            ``groups = cols // GROUP_SIZE``.
-        Wbias: Per-group zero-point / bias pointer, same shape as ``Wscale``.
-        N: Output column count (output feature dimension).
-        K: Output row count (input feature / reduction dimension).
-        O: Output buffer pointer in dequantised layout.
-        stride_wq0: Row stride of ``Wq``.
-        stride_wq1: Column stride of ``Wq``.
-        stride_ws0: Row stride of ``Wscale``.
-        stride_ws1: Column stride of ``Wscale``.
-        stride_wb0: Row stride of ``Wbias``.
-        stride_wb1: Column stride of ``Wbias``.
-        stride_or: Row stride of ``O``.
-        stride_oc: Column stride of ``O``.
-        GROUP_SIZE: Number of values sharing one (scale, bias) pair (constexpr).
-        VALUES_PER_WORD: Packed values per int32 word; equals 4 for 8-bit
-            codes (constexpr).
-        BR: Tile rows per CTA (constexpr).
-        BC: Tile columns per CTA (constexpr).
-        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
-        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
-    """
-    pid_r = tl.program_id(0)
-    pid_c = tl.program_id(1)
-
-    offs_r = pid_r * BR + tl.arange(0, BR)
-    offs_c = pid_c * BC + tl.arange(0, BC)
-
-    if TRANSPOSE:
-        r_mask = offs_r < N
-        c_mask = offs_c < K
-        word_offsets = offs_c // VALUES_PER_WORD
-        word_mask = word_offsets < tl.cdiv(K, VALUES_PER_WORD)
-        shifts = (offs_c % VALUES_PER_WORD) * 8
-        w_word = tl.load(
-            Wq + offs_r[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
-            mask=r_mask[:, None] & word_mask[None, :],
-            other=0,
-        )
-        q = (w_word >> shifts[None, :]) & 0xFF
-        group_idx = offs_c // GROUP_SIZE
-        group_mask = group_idx < tl.cdiv(K, GROUP_SIZE)
-        ws = tl.load(
-            Wscale + offs_r[:, None] * stride_ws0 + group_idx[None, :] * stride_ws1,
-            mask=r_mask[:, None] & group_mask[None, :],
-            other=0.0,
-        )
-        wb = tl.load(
-            Wbias + offs_r[:, None] * stride_wb0 + group_idx[None, :] * stride_wb1,
-            mask=r_mask[:, None] & group_mask[None, :],
-            other=0.0,
-        )
-        out = q.to(ws.dtype) * ws + wb
-        out_ty = tl.bfloat16 if OUT_BF16 else tl.float16
-        tl.store(
-            O + offs_r[:, None] * stride_or + offs_c[None, :] * stride_oc,
-            out.to(out_ty),
-            mask=r_mask[:, None] & c_mask[None, :],
-        )
-    else:
-        r_mask = offs_r < K
-        c_mask = offs_c < N
-        word_offsets = offs_c // VALUES_PER_WORD
-        word_mask = word_offsets < tl.cdiv(N, VALUES_PER_WORD)
-        shifts = (offs_c % VALUES_PER_WORD) * 8
-        w_word = tl.load(
-            Wq + offs_r[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
-            mask=r_mask[:, None] & word_mask[None, :],
-            other=0,
-        )
-        q = (w_word >> shifts[None, :]) & 0xFF
         group_idx = offs_c // GROUP_SIZE
         group_mask = group_idx < tl.cdiv(N, GROUP_SIZE)
         ws = tl.load(
@@ -980,30 +851,6 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return value.lower() in {"1", "true", "yes", "y"}
 
 
-def _parse_positive_int_env(name: str, default: int) -> int:
-    """Parse a positive integer env var with a safe fallback."""
-    raw = os.getenv(name)
-    if raw is None:
-        return int(default)
-    try:
-        value = int(raw)
-    except ValueError:
-        return int(default)
-    return max(1, value)
-
-
-def _parse_nonnegative_int_env(name: str, default: int) -> int:
-    """Parse a non-negative integer env var with a safe fallback."""
-    raw = os.getenv(name)
-    if raw is None:
-        return int(default)
-    try:
-        value = int(raw)
-    except ValueError:
-        return int(default)
-    return max(0, value)
-
-
 def _parse_matmul_precision(value: str):
     """Map an ``EJKERNEL_QMM_MATMUL_PRECISION`` string to a ``jax.lax.Precision``.
 
@@ -1018,101 +865,6 @@ def _parse_matmul_precision(value: str):
     if value == "fastest":
         return jax.lax.Precision.FASTEST
     return jax.lax.Precision.DEFAULT
-
-
-def _parse_output_dtype(value: str):
-    """Map a dtype string to a ``jnp`` dtype, or ``None`` for unrecognised values.
-
-    Accepted strings (case-insensitive): ``"bf16"``/``"bfloat16"``,
-    ``"fp16"``/``"float16"``, ``"fp32"``/``"float32"``.
-    """
-    value = value.lower()
-    if value in {"bf16", "bfloat16"}:
-        return jnp.bfloat16
-    if value in {"fp16", "float16"}:
-        return jnp.float16
-    if value in {"fp32", "float32"}:
-        return jnp.float32
-    return None
-
-
-@lru_cache(maxsize=1)
-def _cuda_max_shared_mem_per_block_bytes() -> int | None:
-    """Best-effort query of CUDA's max shared memory per block (opt-in limit).
-
-    JAX's Triton runtime will attempt to launch autotune candidates as-is; when
-    a config requires more shared memory than the device allows by default,
-    JAX logs messages like "Unable to launch autotune config on device".
-
-    Prefer querying `cudaDevAttrMaxSharedMemoryPerBlockOptin` (attribute 97) so
-    we do not over-prune on GPUs where the Triton launcher opts-in to the larger
-    shared-memory limit. Fall back to `cudaDevAttrMaxSharedMemoryPerBlock`
-    (attribute 8) when the opt-in attribute isn't available.
-    """
-    try:
-        import ctypes
-    except Exception:
-        return None
-
-    lib = None
-    for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
-        try:
-            lib = ctypes.CDLL(name)
-            break
-        except OSError:
-            continue
-    if lib is None:
-        return None
-
-    cudaGetDevice = getattr(lib, "cudaGetDevice", None)
-    cudaDeviceGetAttribute = getattr(lib, "cudaDeviceGetAttribute", None)
-    if cudaGetDevice is None or cudaDeviceGetAttribute is None:
-        return None
-
-    cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    cudaGetDevice.restype = ctypes.c_int
-    cudaDeviceGetAttribute.argtypes = [
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    cudaDeviceGetAttribute.restype = ctypes.c_int
-
-    dev = ctypes.c_int()
-    if int(cudaGetDevice(ctypes.byref(dev))) != 0:
-        return None
-
-    def _get_attr(attr_id: int) -> int | None:
-        val = ctypes.c_int()
-        if int(cudaDeviceGetAttribute(ctypes.byref(val), attr_id, int(dev.value))) != 0:
-            return None
-        out = int(val.value)
-        return out if out > 0 else None
-
-    cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
-    cudaDevAttrMaxSharedMemoryPerBlock = 8
-    return _get_attr(cudaDevAttrMaxSharedMemoryPerBlockOptin) or _get_attr(cudaDevAttrMaxSharedMemoryPerBlock)
-
-
-@lru_cache(maxsize=1)
-def _qmm_smem_limit_bytes() -> int:
-    """Return an estimate of usable shared memory per CTA for QMM kernels.
-
-    This helper is used while constructing module-level autotune config lists,
-    so it must not query JAX runtime backend state (which would eagerly
-    initialize backends at import time).
-    """
-    default = 96 * 1024
-
-    limit = _cuda_max_shared_mem_per_block_bytes()
-    if limit is None:
-        return default
-
-    return min(default, int(limit))
-
-
-def _qmm_estimated_smem_bytes(*, bm: int, bn: int, bk: int, num_stages: int) -> int:
-    return int((bm * bk + bk * bn) * 2 * num_stages)
 
 
 @triton.jit
@@ -1139,6 +891,7 @@ def qmm_nf4_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr = 8,
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
 ):
@@ -1148,27 +901,20 @@ def qmm_nf4_kernel(
     Each 32-bit word contains 8 NF4 codes that are decoded via table lookup,
     scaled by per-group scale factors, and multiplied with the activation tile.
 
-    Supports both transposed (NxK) and non-transposed (KxN) weight layouts.
-    Uses split-K parallelism with atomic accumulation when SPLIT_K > 1.
-
-    Args:
-        X: Input activation matrix pointer, shape (M, K).
-        Wq: Packed NF4 weights pointer (uint32, 8 values per word).
-        Wscale: Per-group scale factors pointer.
-        NF4_TABLE: NF4 codebook lookup table pointer (16 float32 entries).
-        M, N, K: Matrix dimensions.
-        O: Output matrix pointer, shape (M, N).
-        stride_*: Tensor stride parameters.
-        GROUP_SIZE: Number of elements per quantization group.
-        VALUES_PER_WORD: Number of quantized values per uint32 word (8 for NF4).
-        BM, BK, BN: Block tile sizes for M, K, N dimensions.
-        SPLIT_K: Split-K parallelism factor.
-        USE_BF16: If True, use BF16 for dot product tiles; otherwise FP16.
-        TRANSPOSE: If True, weights are in NxK layout; otherwise KxN.
+    Uses L2-friendly grouped program swizzling (``GROUP_SIZE_M``) and split-K
+    parallelism with atomic accumulation when ``SPLIT_K > 1``.
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
 
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -1248,134 +994,6 @@ qmm_nf4_kernel_large = qmm_nf4_kernel
 
 
 @triton.jit
-def qmm_affine8_kernel(
-    X,
-    Wq,
-    Wscale,
-    Wbias,
-    M,
-    N,
-    K,
-    O,
-    stride_xm: tl.constexpr,
-    stride_xk: tl.constexpr,
-    stride_wq0: tl.constexpr,
-    stride_wq1: tl.constexpr,
-    stride_ws0: tl.constexpr,
-    stride_ws1: tl.constexpr,
-    stride_wb0: tl.constexpr,
-    stride_wb1: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_on: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    VALUES_PER_WORD: tl.constexpr,
-    BM: tl.constexpr,
-    BK: tl.constexpr,
-    BN: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    USE_BF16: tl.constexpr = True,
-    TRANSPOSE: tl.constexpr = True,
-    HAS_BIAS: tl.constexpr = True,
-):
-    """Fused affine dequantization and matrix multiplication Triton kernel (8-bit)."""
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
-
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
-
-    m_mask = offs_m < M
-    n_mask = offs_n < N
-
-    acc = tl.zeros((BM, BN), tl.float32)
-    dot_ty = tl.bfloat16 if USE_BF16 else tl.float16
-
-    mask_bits = 0xFF
-    shifts = tl.arange(0, VALUES_PER_WORD) * 8
-    if not TRANSPOSE:
-        word_offsets_n = (pid_n * BN) // VALUES_PER_WORD + tl.arange(0, BN // VALUES_PER_WORD)
-        word_mask_n = word_offsets_n < tl.cdiv(N, VALUES_PER_WORD)
-        group_idx_n = offs_n // GROUP_SIZE
-
-    for k0 in tl.range(0, K, BK * SPLIT_K, loop_unroll_factor=1):
-        offs_k = k0 + pid_k * BK + tl.arange(0, BK)
-        k_mask = offs_k < K
-
-        x = tl.load(
-            X + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=m_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        ).to(dot_ty)
-
-        if TRANSPOSE:
-            word_offsets = (k0 + pid_k * BK) // VALUES_PER_WORD + tl.arange(0, BK // VALUES_PER_WORD)
-            word_mask = word_offsets < tl.cdiv(K, VALUES_PER_WORD)
-            w_word = tl.load(
-                Wq + offs_n[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
-                mask=n_mask[:, None] & word_mask[None, :],
-                other=0,
-            )
-            q = (w_word[:, :, None] >> shifts[None, None, :]) & mask_bits
-            q = tl.reshape(q, (BN, BK))
-            q = tl.trans(q)
-            group_idx_k = offs_k // GROUP_SIZE
-            ws = tl.load(
-                Wscale + offs_n[None, :] * stride_ws0 + group_idx_k[:, None] * stride_ws1,
-                mask=k_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-            if HAS_BIAS:
-                wb = tl.load(
-                    Wbias + offs_n[None, :] * stride_wb0 + group_idx_k[:, None] * stride_wb1,
-                    mask=k_mask[:, None] & n_mask[None, :],
-                    other=0.0,
-                )
-        else:
-            w_word = tl.load(
-                Wq + offs_k[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
-                mask=k_mask[:, None] & word_mask_n[None, :],
-                other=0,
-            )
-            q = (w_word[:, :, None] >> shifts[None, None, :]) & mask_bits
-            q = tl.reshape(q, (BK, BN))
-            ws = tl.load(
-                Wscale + offs_k[:, None] * stride_ws0 + group_idx_n[None, :] * stride_ws1,
-                mask=k_mask[:, None] & n_mask[None, :],
-                other=0.0,
-            )
-            if HAS_BIAS:
-                wb = tl.load(
-                    Wbias + offs_k[:, None] * stride_wb0 + group_idx_n[None, :] * stride_wb1,
-                    mask=k_mask[:, None] & n_mask[None, :],
-                    other=0.0,
-                )
-
-        w = q.to(dot_ty) * ws.to(dot_ty)
-        if HAS_BIAS:
-            w = w + wb.to(dot_ty)
-
-        acc = tl.dot(x, w, acc)
-
-    if SPLIT_K == 1:
-        tl.store(
-            O + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-            acc,
-            mask=m_mask[:, None] & n_mask[None, :],
-        )
-    else:
-        tl.atomic_add(
-            O + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-            acc,
-            mask=m_mask[:, None] & n_mask[None, :],
-        )
-
-
-qmm_affine8_kernel_large = qmm_affine8_kernel
-
-
-@triton.jit
 def qmm_affine4_kernel(
     X,
     Wq,
@@ -1402,42 +1020,29 @@ def qmm_affine4_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr = 8,
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
     HAS_BIAS: tl.constexpr = True,
 ):
     """Fused affine dequantization and matrix multiplication Triton kernel.
 
-    Performs x @ dequant(w) where w is packed in affine quantization format.
-    Dequantization applies: w_float = w_int * scale + bias (when HAS_BIAS)
-    or w_float = w_int * scale (when not HAS_BIAS).
-
-    Supports affine bit-widths from 1 through 8 with per-group scale and bias
-    factors. Quantized values are packed into a contiguous uint32 bitstream.
-
-    Uses split-K parallelism with atomic accumulation when SPLIT_K > 1.
-
-    Args:
-        X: Input activation matrix pointer, shape (M, K).
-        Wq: Packed quantized weights pointer (uint32).
-        Wscale: Per-group scale factors pointer.
-        Wbias: Per-group bias factors pointer (ignored if HAS_BIAS=False).
-        M, N, K: Matrix dimensions.
-        O: Output matrix pointer, shape (M, N).
-        stride_*: Tensor stride parameters.
-        GROUP_SIZE: Number of elements per quantization group.
-        VALUES_PER_WORD: Legacy packed values-per-word hint.
-        BITS: Bits per affine code, from 1 through 8.
-        BM, BK, BN: Block tile sizes for M, K, N dimensions.
-        SPLIT_K: Split-K parallelism factor.
-        USE_BF16: If True, use BF16 for dot product tiles; otherwise FP16.
-        TRANSPOSE: If True, weights are in NxK layout; otherwise KxN.
-        HAS_BIAS: If True, apply per-group bias during dequantization.
+    Performs x @ dequant(w) where w is packed in affine quantization format
+    (1 through 8 bits per element). Uses L2-friendly grouped program swizzling
+    (``GROUP_SIZE_M``) and split-K parallelism with atomic accumulation when
+    ``SPLIT_K > 1``.
     """
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
 
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -1599,14 +1204,22 @@ def qmm_mxfp4_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr = 8,
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
 ):
     """Fused MXFP4 dequantization and matrix multiplication Triton kernel."""
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
 
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -1712,14 +1325,22 @@ def qmm_mxfp8_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr = 8,
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
 ):
     """Fused MXFP8 dequantization and matrix multiplication Triton kernel."""
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
 
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -1825,14 +1446,22 @@ def qmm_nvfp4_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr = 8,
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
 ):
     """Fused NVFP4 dequantization and matrix multiplication Triton kernel."""
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
 
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -1937,14 +1566,22 @@ def qmm_nvfp8_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr = 8,
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
 ):
     """Fused NVFP8 dequantization and matrix multiplication Triton kernel."""
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
 
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -2472,6 +2109,8 @@ def quantized_matmul_triton(
             split_k=split_k_selected,
             revsplit_parts=family_revsplit_parts,
             block_n=block_n,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
 
     nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table = _get_decode_tables()
@@ -2488,8 +2127,7 @@ def quantized_matmul_triton(
     use_two_stage = _env_flag("EJKERNEL_QMM_TWO_STAGE", "1") and use_large_kernel
 
     if use_two_stage:
-        out_dtype = jnp.bfloat16 if use_bf16 else jnp.float16
-        output_dtype = jnp.bfloat16
+        deq_dtype = jnp.bfloat16 if use_bf16 else jnp.float16
         precision_env = os.getenv("EJKERNEL_QMM_MATMUL_PRECISION", "")
         if precision_env:
             matmul_precision = _parse_matmul_precision(precision_env)
@@ -2502,170 +2140,17 @@ def quantized_matmul_triton(
             else:
                 matmul_precision = jax.lax.Precision.DEFAULT
 
-        if transpose:
-            deq_shape = (N, K)
-            stride_or, stride_oc = strides_from_shape(deq_shape)
-            r_dim, c_dim = N, K
-        else:
-            deq_shape = (K, N)
-            stride_or, stride_oc = strides_from_shape(deq_shape)
-            r_dim, c_dim = K, N
-
-        br = 128
-        bc = 128
-
-        def grid(META):
-            return (cdiv(r_dim, META["BR"]), cdiv(c_dim, META["BC"]))
-
-        if mode == "nf4":
-            (w_deq,) = triton_call(
-                w,
-                scales,
-                nf4_table,
-                N,
-                K,
-                out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
-                grid=grid,
-                kernel=qmm_dequant_nf4_kernel,
-                stride_wq0=stride_wq0,
-                stride_wq1=stride_wq1,
-                stride_ws0=stride_ws0,
-                stride_ws1=stride_ws1,
-                stride_or=stride_or,
-                stride_oc=stride_oc,
-                GROUP_SIZE=group_size,
-                VALUES_PER_WORD=8,
-                BR=br,
-                BC=bc,
-                TRANSPOSE=transpose,
-                OUT_BF16=use_bf16,
-            )
-        elif mode == "affine":
-            stride_wb0, stride_wb1 = strides_from_shape(biases.shape) if biases is not None else (0, 0)
-            (w_deq,) = triton_call(
-                w,
-                scales,
-                biases,
-                N,
-                K,
-                out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
-                grid=grid,
-                kernel=qmm_dequant_affine4_kernel,
-                stride_wq0=stride_wq0,
-                stride_wq1=stride_wq1,
-                stride_ws0=stride_ws0,
-                stride_ws1=stride_ws1,
-                stride_wb0=stride_wb0,
-                stride_wb1=stride_wb1,
-                stride_or=stride_or,
-                stride_oc=stride_oc,
-                GROUP_SIZE=group_size,
-                VALUES_PER_WORD=max(1, 32 // bits),
-                BITS=bits,
-                BR=br,
-                BC=bc,
-                TRANSPOSE=transpose,
-                OUT_BF16=use_bf16,
-            )
-        elif mode == "mxfp4":
-            (w_deq,) = triton_call(
-                w,
-                scales,
-                e2m1_table,
-                e8m0_exp2_table,
-                N,
-                K,
-                out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
-                grid=grid,
-                kernel=qmm_dequant_mxfp4_kernel,
-                stride_wq0=stride_wq0,
-                stride_wq1=stride_wq1,
-                stride_ws0=stride_ws0,
-                stride_ws1=stride_ws1,
-                stride_or=stride_or,
-                stride_oc=stride_oc,
-                GROUP_SIZE=group_size,
-                VALUES_PER_WORD=8,
-                BR=br,
-                BC=bc,
-                TRANSPOSE=transpose,
-                OUT_BF16=use_bf16,
-            )
-        elif mode == "mxfp8":
-            (w_deq,) = triton_call(
-                w,
-                scales,
-                e4m3_table,
-                e8m0_exp2_table,
-                N,
-                K,
-                out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
-                grid=grid,
-                kernel=qmm_dequant_mxfp8_kernel,
-                stride_wq0=stride_wq0,
-                stride_wq1=stride_wq1,
-                stride_ws0=stride_ws0,
-                stride_ws1=stride_ws1,
-                stride_or=stride_or,
-                stride_oc=stride_oc,
-                GROUP_SIZE=group_size,
-                VALUES_PER_WORD=4,
-                BR=br,
-                BC=bc,
-                TRANSPOSE=transpose,
-                OUT_BF16=use_bf16,
-            )
-        elif mode == "nvfp4":
-            (w_deq,) = triton_call(
-                w,
-                scales,
-                e2m1_table,
-                e4m3_table,
-                N,
-                K,
-                out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
-                grid=grid,
-                kernel=qmm_dequant_nvfp4_kernel,
-                stride_wq0=stride_wq0,
-                stride_wq1=stride_wq1,
-                stride_ws0=stride_ws0,
-                stride_ws1=stride_ws1,
-                stride_or=stride_or,
-                stride_oc=stride_oc,
-                GROUP_SIZE=group_size,
-                VALUES_PER_WORD=8,
-                BR=br,
-                BC=bc,
-                TRANSPOSE=transpose,
-                OUT_BF16=use_bf16,
-            )
-        elif mode == "nvfp8":
-            (w_deq,) = triton_call(
-                w,
-                scales,
-                e4m3_table,
-                N,
-                K,
-                out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
-                grid=grid,
-                kernel=qmm_dequant_nvfp8_kernel,
-                stride_wq0=stride_wq0,
-                stride_wq1=stride_wq1,
-                stride_ws0=stride_ws0,
-                stride_ws1=stride_ws1,
-                stride_or=stride_or,
-                stride_oc=stride_oc,
-                GROUP_SIZE=group_size,
-                VALUES_PER_WORD=4,
-                BR=br,
-                BC=bc,
-                TRANSPOSE=transpose,
-                OUT_BF16=use_bf16,
-            )
-        else:
-            raise ValueError(f"Unsupported mode for two-stage path: {mode}")
-
-        x_cast = x.astype(out_dtype)
+        w_deq = quantized_matmul_dequant_triton(
+            w,
+            scales,
+            biases,
+            transpose=transpose,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,  # type: ignore[arg-type]
+            use_bf16=use_bf16,
+        )
+        x_cast = x.astype(deq_dtype)
         if transpose:
             dimension_numbers = (((1,), (1,)), ((), ()))
         else:
@@ -2675,9 +2160,12 @@ def quantized_matmul_triton(
             w_deq,
             dimension_numbers=dimension_numbers,
             precision=matmul_precision,
-            preferred_element_type=output_dtype,
+            preferred_element_type=jnp.float32,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
+
+    def _gemm_grid(META):
+        return (cdiv(M, META["BM"]) * cdiv(N, META["BN"]), META["SPLIT_K"])
 
     if mode == "nf4":
         kernel = qmm_nf4_kernel_large if use_large_kernel else qmm_nf4_kernel
@@ -2690,11 +2178,7 @@ def quantized_matmul_triton(
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=(M, N), dtype=jnp.float32)],
-            grid=lambda META: (
-                cdiv(M, META["BM"]),
-                cdiv(N, META["BN"]),
-                META["SPLIT_K"],
-            ),
+            grid=_gemm_grid,
             kernel=kernel,
             zeroed_outputs=_zeroed_outputs_for_splitk,
             num_warps=num_warps,
@@ -2715,8 +2199,9 @@ def quantized_matmul_triton(
             BN=block_n,
             BK=block_k,
             SPLIT_K=split_k_selected,
+            GROUP_SIZE_M=8,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
     if mode == "affine":
         stride_wb0, stride_wb1 = strides_from_shape(biases.shape) if biases is not None else (0, 0)
         bias_arg = biases if biases is not None else scales
@@ -2731,7 +2216,7 @@ def quantized_matmul_triton(
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=(M, N), dtype=jnp.float32)],
-            grid=lambda META: (cdiv(M, META["BM"]), cdiv(N, META["BN"]), META["SPLIT_K"]),
+            grid=_gemm_grid,
             kernel=kernel,
             zeroed_outputs=_zeroed_outputs_for_splitk,
             num_warps=num_warps,
@@ -2756,8 +2241,9 @@ def quantized_matmul_triton(
             BN=block_n,
             BK=block_k,
             SPLIT_K=split_k_selected,
+            GROUP_SIZE_M=8,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
 
     if mode == "mxfp4":
         kernel = qmm_mxfp4_kernel_large if use_large_kernel else qmm_mxfp4_kernel
@@ -2771,7 +2257,7 @@ def quantized_matmul_triton(
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=(M, N), dtype=jnp.float32)],
-            grid=lambda META: (cdiv(M, META["BM"]), cdiv(N, META["BN"]), META["SPLIT_K"]),
+            grid=_gemm_grid,
             kernel=kernel,
             zeroed_outputs=_zeroed_outputs_for_splitk,
             num_warps=num_warps,
@@ -2792,8 +2278,9 @@ def quantized_matmul_triton(
             BN=block_n,
             BK=block_k,
             SPLIT_K=split_k_selected,
+            GROUP_SIZE_M=8,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
 
     if mode == "mxfp8":
         kernel = qmm_mxfp8_kernel_large if use_large_kernel else qmm_mxfp8_kernel
@@ -2807,7 +2294,7 @@ def quantized_matmul_triton(
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=(M, N), dtype=jnp.float32)],
-            grid=lambda META: (cdiv(M, META["BM"]), cdiv(N, META["BN"]), META["SPLIT_K"]),
+            grid=_gemm_grid,
             kernel=kernel,
             zeroed_outputs=_zeroed_outputs_for_splitk,
             num_warps=num_warps,
@@ -2828,8 +2315,9 @@ def quantized_matmul_triton(
             BN=block_n,
             BK=block_k,
             SPLIT_K=split_k_selected,
+            GROUP_SIZE_M=8,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
 
     if mode == "nvfp4":
         kernel = qmm_nvfp4_kernel_large if use_large_kernel else qmm_nvfp4_kernel
@@ -2843,7 +2331,7 @@ def quantized_matmul_triton(
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=(M, N), dtype=jnp.float32)],
-            grid=lambda META: (cdiv(M, META["BM"]), cdiv(N, META["BN"]), META["SPLIT_K"]),
+            grid=_gemm_grid,
             kernel=kernel,
             zeroed_outputs=_zeroed_outputs_for_splitk,
             num_warps=num_warps,
@@ -2864,8 +2352,9 @@ def quantized_matmul_triton(
             BN=block_n,
             BK=block_k,
             SPLIT_K=split_k_selected,
+            GROUP_SIZE_M=8,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
 
     if mode == "nvfp8":
         kernel = qmm_nvfp8_kernel_large if use_large_kernel else qmm_nvfp8_kernel
@@ -2878,7 +2367,7 @@ def quantized_matmul_triton(
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=(M, N), dtype=jnp.float32)],
-            grid=lambda META: (cdiv(M, META["BM"]), cdiv(N, META["BN"]), META["SPLIT_K"]),
+            grid=_gemm_grid,
             kernel=kernel,
             zeroed_outputs=_zeroed_outputs_for_splitk,
             num_warps=num_warps,
@@ -2899,7 +2388,8 @@ def quantized_matmul_triton(
             BN=block_n,
             BK=block_k,
             SPLIT_K=split_k_selected,
+            GROUP_SIZE_M=8,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
 
     raise ValueError(f"Unsupported quantization mode for Triton: {mode}")

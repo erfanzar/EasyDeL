@@ -62,16 +62,21 @@ def _fwd_call(
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     block_dim: int = 64,
+    block_size: int = 256,
     num_warps: int = 4,
     num_stages: int = 1,
-) -> tuple[Float[Array, "batch hidden_dim"], tuple[tuple[int, ...], Int[Array, "num_seqs_plus_one"] | None]]:
+) -> tuple[Float[Array, "... hidden_dim"], tuple[tuple[int, ...], Int[Array, "num_seqs_plus_one"] | None]]:
     """
     Forward pass for mean pooling with custom VJP.
 
     Args:
         x: The input tensor.
-        chunk_size: The chunk size for processing.
+        chunk_size: Semantic block-pooling window for 4-D inputs.
         cu_seqlens: Optional cumulative sequence lengths for variable-length sequences.
+        block_dim: Hidden-dimension tile width.
+        block_size: Sequence-axis tile size for 2-D/3-D global pooling.
+        num_warps: Number of Triton warps per block.
+        num_stages: Number of Triton software pipeline stages.
 
     Returns:
         A tuple containing the output of the forward pass and the residuals
@@ -82,6 +87,7 @@ def _fwd_call(
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_dim=block_dim,
+        block_size=block_size,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -92,46 +98,52 @@ def _fwd_call(
 def _bwd_call(
     chunk_size: int,
     block_dim: int,
+    block_size: int,
     num_warps: int,
     num_stages: int,
     residual: tuple[tuple[int, ...], Int[Array, "num_seqs_plus_one"] | None],
-    do: Float[Array, "batch hidden_dim"],
-) -> tuple[Float[Array, "batch seq_len hidden_dim"], None]:
+    do: Float[Array, "... hidden_dim"],
+) -> tuple[Float[Array, "... hidden_dim"], None]:
     """
     Backward pass for mean pooling with custom VJP.
 
     Args:
-        chunk_size: The chunk size used in the forward pass.
+        chunk_size: Semantic block-pooling window used in the forward pass.
+        block_dim: Hidden-dimension tile width.
+        block_size: Sequence-axis tile size for 2-D/3-D global pooling.
+        num_warps: Number of Triton warps per block.
+        num_stages: Number of Triton software pipeline stages.
         residual: Residuals saved from the forward pass.
         do: The gradient of the output tensor.
 
     Returns:
-        The gradient with respect to the input tensor `x`.
+        The gradient with respect to the input tensor `x` and `None` for `cu_seqlens`.
     """
     x_shape, cu_seqlens = residual
     dEo = bwd_triton_impl(
         do=do,
-        batch_size=x_shape[0],
-        seq_len=x_shape[1],
+        batch_size=int(x_shape[0]),
+        seq_len=int(x_shape[1]),
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_dim=block_dim,
+        block_size=block_size,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     return dEo, None
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(1, 3, 4, 5))
-@partial(jax.jit, static_argnums=(1, 3, 4, 5))
+@partial(jax.custom_vjp, nondiff_argnums=(1, 3, 4, 5, 6))
 def _mean_pooling(
     x: Float[Array, "... hidden_dim"],
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     block_dim: int = 64,
+    block_size: int = 256,
     num_warps: int = 4,
     num_stages: int = 1,
-) -> Float[Array, "batch hidden_dim"]:
+) -> Float[Array, "... hidden_dim"]:
     """
     Core JIT-compiled mean pooling function with a custom VJP.
 
@@ -141,8 +153,12 @@ def _mean_pooling(
 
     Args:
         x: The input tensor.
-        chunk_size: The chunk size for processing, a static argument for JIT.
+        chunk_size: Semantic block-pooling window for 4-D inputs (static argument).
         cu_seqlens: Optional cumulative sequence lengths for variable-length sequences.
+        block_dim: Hidden-dimension tile width (static argument).
+        block_size: Sequence-axis tile size for 2-D/3-D global pooling (static argument).
+        num_warps: Number of Triton warps per block (static argument).
+        num_stages: Number of Triton software pipeline stages (static argument).
 
     Returns:
         The mean-pooled output tensor.
@@ -152,6 +168,7 @@ def _mean_pooling(
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_dim=block_dim,
+        block_size=block_size,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -176,32 +193,34 @@ def mean_pooling(
     Performs mean pooling over the sequence dimension using a Triton kernel.
 
     This function calculates the mean of token embeddings for each sequence in a
-    batch. It is optimized for GPUs using a custom Triton kernel and supports
-    both standard (padded) and variable-length sequences.
+    batch (2-D varlen or 3-D fixed) or per block (4-D block pooling). It is
+    optimized for GPUs using a custom Triton kernel and supports both standard
+    and variable-length sequences.
 
     Args:
-        x: The input tensor of shape `(batch_size, sequence_length, hidden_dim)`.
-            If `cu_seqlens` is provided for variable-length inputs, the shape
-            should be `(total_tokens, hidden_dim)`.
-        chunk_size: A performance-tuning parameter for the Triton kernel that
-            determines how the input is chunked for processing.
+        x: The input tensor of shape `(batch_size, sequence_length, hidden_dim)`
+            for fixed global pooling, `(total_tokens, hidden_dim)` with
+            `cu_seqlens` for packed varlen global pooling, or
+            `(batch_size, sequence_length, num_heads, hidden_dim)` for 4-D
+            block pooling.
+        chunk_size: Semantic block pooling window for 4-D inputs.
         cu_seqlens: An optional 1D tensor of cumulative sequence lengths for
             handling variable-length sequences in a packed format.
-            Example: `[0, len_seq1, len_seq1+len_seq2, ...]`. If provided, the
-            function will compute the mean pooling for each of the packed
-            sequences.
+            Example: `[0, len_seq1, len_seq1+len_seq2, ...]`.
+        block_dim: Hidden-dimension tile width for Triton kernels.
+        block_size: Sequence-axis tile size for 2-D/3-D global pooling kernels.
+        num_warps: Number of Triton warps per block.
+        num_stages: Number of Triton pipeline stages.
 
     Returns:
-        A tensor of shape `(batch_size, hidden_dim)` containing the mean-pooled
-        embeddings for each sequence. If `cu_seqlens` is used, the batch size in
-        the output shape will correspond to the number of sequences defined by
-        `cu_seqlens` (i.e., `len(cu_seqlens) - 1`).
+        Mean-pooled tensor matching the input pooling mode.
     """
     return _mean_pooling(
         x=x,
         chunk_size=int(chunk_size),
         cu_seqlens=cu_seqlens,
         block_dim=int(block_dim),
+        block_size=int(block_size),
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -37,14 +37,12 @@ Features handled by these kernels:
 """
 
 import math
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import triton
 import triton.language as tl
 from jaxtyping import Array, Bool, Float, Int
-from triton import Config
 
 from ejkernel.callib import triton_call
 from ejkernel.kernels._xla.attention._xla_impl_fwd import _normalize_softmax_aux
@@ -53,48 +51,10 @@ from ejkernel.utils import dtype_index, get_strides
 
 from ._utilities import (
     attention_pack_from_cu_static,
-    attention_pack_with_static_shape,
     attention_unpack_with_static_shape,
     calc_bias_strides,
     padded_load,
 )
-
-
-def config_prune_kernel(
-    configs: list[Config],
-    named_args: dict[str, Any],
-    **kwargs: Any,
-) -> list[Config]:
-    """Prune autotuning configurations for forward pass kernel.
-
-    Filters out configurations where block dimensions exceed sequence lengths.
-    Falls back to small default configs if all configs are pruned.
-
-    Args:
-        configs: List of triton autotuning configurations
-        named_args: Dictionary with kernel arguments including QSeq and KSeq
-        **kwargs: Additional unused arguments
-
-    Returns:
-        list[Config]: Valid configurations for the given problem size
-    """
-    kept_configs = []
-    for config in configs:
-        largerst_m = config.kwargs["BLOCK_M"] > named_args["QSeq"]
-        largerst_n = config.kwargs["BLOCK_N"] > named_args["KSeq"]
-        if largerst_m or largerst_n:
-            pass
-        else:
-            kept_configs.append(config)
-    if kept_configs:
-        return kept_configs
-    return [
-        Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=4),
-        Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=2, num_stages=4),
-        Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=4),
-        Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=2, num_stages=3),
-        Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=3),
-    ]
 
 
 @triton.jit
@@ -121,6 +81,7 @@ def _attn_fwd_inner(
     stride_kn,
     stride_vn,
     index_start_n,
+    first_start_n,
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
@@ -283,7 +244,7 @@ def _attn_fwd_inner(
     if USE_SINKS:
         sink_offs = tl.arange(0, 16)
         # Sink logits contribute to the denominator once per query, not once per KV tile.
-        sink_mask = (sink_offs < num_sinks) & (index_start_n == 0)
+        sink_mask = (sink_offs < num_sinks) & (index_start_n == first_start_n)
         aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.float32)
 
         if SOFTCAP:
@@ -571,28 +532,38 @@ def _attn_fwd(
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
 
-    pad_rows = (not EVEN_M) or (VARLEN and (i_start_m * BLOCK_M > actual_seqlen_q))
+    pad_rows = (not EVEN_M) or (VARLEN and ((i_start_m + 1) * BLOCK_M > actual_seqlen_q))
     q = padded_load(q_ptrs, offs_m, offs_d, PA0=pad_rows, PA1=PADDED_HEADS, LA0=actual_seqlen_q, LA1=headdim)
 
+    shift = actual_seqlen_k - actual_seqlen_q
     if IS_CAUSAL:
-        end_n = tl.minimum(actual_seqlen_k - actual_seqlen_q + (i_start_m + 1) * BLOCK_M, actual_seqlen_k)
+        end_n = tl.minimum(shift + (i_start_m + 1) * BLOCK_M, actual_seqlen_k)
         if end_n < 0:
             return
     else:
         end_n = actual_seqlen_k
 
+    if SLIDING:
+        min_k = tl.maximum(i_start_m * BLOCK_M + shift - window_left, 0)
+        start_n = (min_k // BLOCK_N) * BLOCK_N
+        max_k_end = tl.minimum((i_start_m + 1) * BLOCK_M + shift + window_right, actual_seqlen_k)
+        end_n = tl.maximum(tl.minimum(end_n, max_k_end), start_n)
+    else:
+        start_n = 0
+
     uneven_n = actual_seqlen_k % BLOCK_N != 0
     attention_padding = VARLEN & uneven_n
 
     if IS_CAUSAL:
-        first_masked_col = i_start_m * BLOCK_M + 1 + actual_seqlen_k - actual_seqlen_q
+        first_masked_col = i_start_m * BLOCK_M + 1 + shift
     elif attention_padding:
         first_masked_col = actual_seqlen_k
     else:
         first_masked_col = end_n
-    nb_full_blocks = first_masked_col // BLOCK_N
+    full_end_n = tl.minimum(first_masked_col, end_n)
+    nb_full_blocks = tl.maximum((full_end_n // BLOCK_N) - (start_n // BLOCK_N), 0)
 
-    next_start_n = 0
+    next_start_n = start_n
     if nb_full_blocks > 0:
         for _ in range(0, nb_full_blocks):
             m_i, me_i, acc_o = _attn_fwd_inner(
@@ -618,6 +589,7 @@ def _attn_fwd(
                 stride_kn,
                 stride_vn,
                 next_start_n,
+                start_n,
                 actual_seqlen_q,
                 actual_seqlen_k,
                 headdim,
@@ -667,6 +639,7 @@ def _attn_fwd(
                 stride_kn,
                 stride_vn,
                 index_start_n,
+                start_n,
                 actual_seqlen_q,
                 actual_seqlen_k,
                 headdim,
@@ -836,10 +809,18 @@ def _fwd_attention_kernel_call(
     if fwd_params is None:
         fwd_params = FwdParams()
 
-    default_block_m = max(16, min(128, int(q.shape[1])))
-    default_block_n = max(16, min(128, int(k.shape[1])))
-    block_m = default_block_m if fwd_params.q_blocksize is None else max(16, int(fwd_params.q_blocksize))
-    block_n = default_block_n if fwd_params.kv_blocksize is None else max(16, int(fwd_params.kv_blocksize))
+    default_block_m = max(16, min(128, triton.next_power_of_2(int(q.shape[1]))))
+    default_block_n = max(16, min(128, triton.next_power_of_2(int(k.shape[1]))))
+    block_m = (
+        default_block_m
+        if fwd_params.q_blocksize is None
+        else max(16, triton.next_power_of_2(int(fwd_params.q_blocksize)))
+    )
+    block_n = (
+        default_block_n
+        if fwd_params.kv_blocksize is None
+        else max(16, triton.next_power_of_2(int(fwd_params.kv_blocksize)))
+    )
     num_warps = 4 if fwd_params.num_warps is None else int(fwd_params.num_warps)
     num_stages = 2 if fwd_params.num_stages is None else int(fwd_params.num_stages)
 
@@ -962,13 +943,6 @@ def _fwd_attention_kernel_call(
         out_unpacked = attention_unpack_with_static_shape(out, cum_seqlens_q, batch, QSeq_max)
         return out_unpacked, lse
 
-    if attention_mask is not None and varlen_from_cu:
-        varlen_mode = attention_mask.shape[0] > 1
-        assert bias is None, "Attention mask is not supported along with attention bias. Just use bias instead."
-        assert q.shape[1] == k.shape[1], "Attention mask is not supported with QSeq != KSeq"
-    else:
-        varlen_mode = False
-
     batch, QSeq, nheads_q, head_dim = q.shape
     _, KSeq, nheads_kv, _ = k.shape
     expected_kv_shape = (batch, KSeq, nheads_kv, head_dim)
@@ -980,25 +954,13 @@ def _fwd_attention_kernel_call(
 
     softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
     BOOL_BIAS = False
-    varlen_mode = varlen_mode and (batch > 1)
-    if not varlen_mode and attention_mask is not None:
+    if attention_mask is not None:
         assert bias is None, "when using attention mask (bool) you can't use bias"
         BOOL_BIAS = True
         bias = attention_mask.astype(jnp.bool_)
 
-    if varlen_mode:
-        cum_seqlens_q = jnp.zeros(shape=(attention_mask.shape[0] + 1,), dtype=jnp.int32)
-        cum_seqlens_q = cum_seqlens_q.at[1:].set(jnp.cumsum(attention_mask.sum(axis=1, dtype="i4"), axis=0, dtype="i4"))
-        max_seqlen_q = attention_mask.shape[1]
-        max_seqlen_k = attention_mask.shape[1]
-        q = attention_pack_with_static_shape(q, attention_mask)
-        k = attention_pack_with_static_shape(k, attention_mask)
-        v = attention_pack_with_static_shape(v, attention_mask)
-        QSeq = q.shape[1]
-    else:
-        cum_seqlens_q = None
-        max_seqlen_q = QSeq
-        max_seqlen_k = KSeq
+    max_seqlen_q = QSeq
+    max_seqlen_k = KSeq
 
     bz, bh, bm = calc_bias_strides(bias, batch, nheads_q, QSeq, KSeq)
 
@@ -1015,7 +977,7 @@ def _fwd_attention_kernel_call(
     vz, vn, vh, _ = get_strides(v.shape)
 
     metaparams = dict(
-        VARLEN=varlen_mode,
+        VARLEN=False,
         USE_DROPOUT=(dropout_prob > 0),
         IS_CAUSAL=causal,
         BIAS_ON=(bias is not None),
@@ -1074,7 +1036,7 @@ def _fwd_attention_kernel_call(
         window_left,
         window_right,
         QSeq,
-        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
         KSeq,
         jnp.zeros((1,), jnp.int32),
         max_seqlen_q_rounded,
@@ -1089,6 +1051,4 @@ def _fwd_attention_kernel_call(
         **metaparams,
     )
 
-    if varlen_mode:
-        out = attention_unpack_with_static_shape(out, cum_seqlens_q, *attention_mask.shape)
     return out, lse

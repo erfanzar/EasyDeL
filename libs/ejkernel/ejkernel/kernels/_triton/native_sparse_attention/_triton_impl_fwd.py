@@ -294,7 +294,9 @@ def nsa_kernel_topk(
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
-        "USE_BLOCK_COUNTS": lambda args: isinstance(args["block_counts"], jax.Array),
+        "USE_BLOCK_COUNTS": lambda args: (
+            isinstance(args["block_counts"], jax.core.ShapedArray | jax.Array) and args["block_counts"].ndim > 0
+        ),
     }
 )
 @triton.jit

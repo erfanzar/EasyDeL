@@ -62,11 +62,11 @@ def _fwd_call(
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     softmax_scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    initial_state: Float[Array, "... num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     block_k: int = 64,
@@ -74,8 +74,8 @@ def _fwd_call(
     num_warps: int = 4,
     num_stages: int = 1,
 ) -> tuple[
-    tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
-    tuple[Float[Array, "..."], ...],
+    tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "... num_heads head_dim head_dim"]],
+    tuple,
 ]:
     """
     Forward pass for recurrent linear attention in a custom VJP.
@@ -101,6 +101,8 @@ def _fwd_call(
         A tuple containing the output and final state, and another tuple of
         residuals for the backward pass.
     """
+    if softmax_scale is None:
+        softmax_scale = key.shape[-1] ** -0.5
     o, ht = fwd_triton_impl(
         q=query,
         k=key,
@@ -118,38 +120,36 @@ def _fwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    residual = query, key, value, g, gk, gv, o, initial_state
+    residual = (query, key, value, g, g_gamma, gk, gv, o, initial_state, cu_seqlens)
     return (o, ht), residual
 
 
 def _bwd_call(
-    g_gamma: Float[Array, "batch num_heads"] | None,
     softmax_scale: float | None,
     reverse: bool,
-    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
     block_k: int,
     block_v: int,
     num_warps: int,
     num_stages: int,
-    residual: tuple[Float[Array, "..."], ...],
-    dout: tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
+    residual: tuple,
+    dout: tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "... num_heads head_dim head_dim"]],
 ) -> tuple[
     Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_kv_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_kv_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    None,
     Float[Array, "batch seq_len num_heads head_dim"] | None,
     Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch num_heads head_dim head_dim"] | None,
+    Float[Array, "... num_heads head_dim head_dim"] | None,
+    None,
 ]:
     """
     Backward pass for recurrent linear attention in a custom VJP.
 
     Args:
-        g_gamma: Non-differentiable decay factor.
         softmax_scale: Non-differentiable scaling factor.
         reverse: Non-differentiable reverse flag.
-        cu_seqlens: Non-differentiable cumulative sequence lengths.
         block_k: Non-differentiable key tile size.
         block_v: Non-differentiable value tile size.
         num_warps: Non-differentiable Triton warp count.
@@ -159,11 +159,14 @@ def _bwd_call(
             final hidden state (`dht`).
 
     Returns:
-        A tuple of gradients corresponding to the differentiable inputs
-        (query, key, value, g, gk, gv, initial_state).
+        A tuple of gradients corresponding to the array inputs
+        ``(query, key, value, g, g_gamma, gk, gv, initial_state, cu_seqlens)``
+        where ``g_gamma`` and ``cu_seqlens`` return ``None``.
     """
     do, dht = dout
-    query, key, value, g, gk, gv, o, initial_state = residual
+    query, key, value, g, g_gamma, gk, gv, o, initial_state, cu_seqlens = residual
+    if softmax_scale is None:
+        softmax_scale = key.shape[-1] ** -0.5
     dq, dk, dv, dg, dgk, dgv, dh0 = bwd_triton_impl(
         q=query,
         k=key,
@@ -184,10 +187,10 @@ def _bwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return dq, dk, dv, dg, dgk, dgv, dh0
+    return dq, dk, dv, dg, None, dgk, dgv, dh0, None
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 7, 9, 10, 11, 12, 13, 14))
+@partial(jax.custom_vjp, nondiff_argnums=(7, 9, 11, 12, 13, 14))
 @partial(jax.jit, static_argnums=(7, 9, 11, 12, 13, 14))
 def _recurrent(
     query: Float[Array, "batch seq_len num_heads head_dim"],

@@ -8,7 +8,6 @@ ejkernel.kernels._triton package
    chunked_prefill_paged_decode/index
    decode_attention/index
    flash_attention/index
-   flash_mla/index
    gla/index
    lightning_attn/index
    mean_pooling/index

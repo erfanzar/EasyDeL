@@ -91,6 +91,7 @@ from ejkernel.ops import BwdParams, FwdParams
 from ._mask import SparseMask, create_sparsity_mask
 from ._triton_impl_bwd import _bwd_blocksparse_attn_call
 from ._triton_impl_fwd import _fwd_blocksparse_attn_call
+from ._utilities import pad_to_block_size
 
 if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
@@ -405,8 +406,27 @@ def blocksparse_attention(
 
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=64, kv_blocksize=64, num_stages=2, num_warps=4)
+    else:
+        fwd_params = FwdParams(
+            q_blocksize=64 if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize),
+            kv_blocksize=64 if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize),
+            num_stages=2 if fwd_params.num_stages is None else int(fwd_params.num_stages),
+            num_warps=4 if fwd_params.num_warps is None else int(fwd_params.num_warps),
+        )
     if bwd_params is None:
-        bwd_params = BwdParams(q_blocksize=32, kv_blocksize=32, num_stages=2, num_warps=4)
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize,
+            kv_blocksize=fwd_params.kv_blocksize,
+            num_stages=2,
+            num_warps=4,
+        )
+    else:
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize if bwd_params.q_blocksize is None else int(bwd_params.q_blocksize),
+            kv_blocksize=fwd_params.kv_blocksize if bwd_params.kv_blocksize is None else int(bwd_params.kv_blocksize),
+            num_stages=2 if bwd_params.num_stages is None else int(bwd_params.num_stages),
+            num_warps=4 if bwd_params.num_warps is None else int(bwd_params.num_warps),
+        )
 
     if sliding_window is None:
         window_left = window_right = -1
@@ -436,17 +456,59 @@ def blocksparse_attention(
     if kv_segment_ids is None:
         kv_segment_ids = jax.numpy.ones_like(kv_positions)
     if qkv_layouts is None:
-        qkv_layouts = create_sparsity_mask(
-            q_blocksize=fwd_params.q_blocksize,
-            kv_blocksize=fwd_params.kv_blocksize,
-            kv_positions=kv_positions,
-            kv_segment_ids=kv_segment_ids,
-            q_positions=q_positions,
-            q_segment_ids=q_segment_ids,
-            causal=causal,
-            window_left=window_left,
-            window_right=window_right,
-        )
+        if (
+            bwd_params.q_blocksize == fwd_params.q_blocksize
+            and bwd_params.kv_blocksize == fwd_params.kv_blocksize
+        ):
+            qkv_layouts = create_sparsity_mask(
+                q_blocksize=fwd_params.q_blocksize,
+                kv_blocksize=fwd_params.kv_blocksize,
+                kv_positions=kv_positions,
+                kv_segment_ids=kv_segment_ids,
+                q_positions=q_positions,
+                q_segment_ids=q_segment_ids,
+                causal=causal,
+                window_left=window_left,
+                window_right=window_right,
+            )
+        else:
+            _, q_pos_pad, q_seg_pad = pad_to_block_size(
+                inputs=None,
+                indexs=q_positions,
+                segment_ids=q_segment_ids,
+                block_size=fwd_params.q_blocksize,
+                pos_fill_value=-1,
+            )
+            _, kv_pos_pad, kv_seg_pad = pad_to_block_size(
+                inputs=None,
+                indexs=kv_positions,
+                segment_ids=kv_segment_ids,
+                block_size=fwd_params.kv_blocksize,
+                pos_fill_value=jax.numpy.iinfo(jax.numpy.int32).max,
+            )
+            mask_fwd = SparseMask.from_inputs(
+                q_positions=q_pos_pad,
+                q_segment_ids=q_seg_pad,
+                kv_positions=kv_pos_pad,
+                kv_segment_ids=kv_seg_pad,
+                q_blocksize=fwd_params.q_blocksize,
+                kv_blocksize=fwd_params.kv_blocksize,
+                causal=causal,
+                window_left=window_left,
+                window_right=window_right,
+            )
+            _, mask_dq, mask_dkdv = create_sparsity_mask(
+                q_blocksize=bwd_params.q_blocksize,
+                kv_blocksize=bwd_params.kv_blocksize,
+                kv_positions=kv_pos_pad,
+                kv_segment_ids=kv_seg_pad,
+                q_positions=q_pos_pad,
+                q_segment_ids=q_seg_pad,
+                causal=causal,
+                window_left=window_left,
+                window_right=window_right,
+            )
+            qkv_layouts = (mask_fwd, mask_dq, mask_dkdv)
     if softmax_aux is not None:
         from ejkernel.kernels._sinks import reduce_sinks_to_per_head
 

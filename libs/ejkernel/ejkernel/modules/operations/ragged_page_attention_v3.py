@@ -884,12 +884,16 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                     platform="xla",
                     backend=Backend.ANY,
                 )
-        impl = self.get_impl(cfg)
+        resolved_platform = detect_platform("ragged_page_attention_v3", cfg.platform, prefer_cuda=True)
+        impl = kernel_registry.get("ragged_page_attention_v3", platform=resolved_platform, backend=cfg.backend)
         extra_kwargs = {}
         if chunk_size is not None:
             extra_kwargs["chunk_size"] = chunk_size
         if alibi_slopes is not None:
             extra_kwargs["alibi_slopes"] = alibi_slopes
+        if resolved_platform == Platform.TRITON:
+            extra_kwargs["num_warps"] = cfg.num_warps
+            extra_kwargs["num_stages"] = cfg.num_stages
         return impl(
             queries=queries,
             keys=keys,

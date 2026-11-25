@@ -68,6 +68,7 @@ def _blocksparse_attn_fwd_inner(
     query_span: tl.constexpr,
     kv_span: tl.constexpr,
     EVEN_QK_HEAD_DIMS: tl.constexpr,
+    EVEN_V_HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CAUSAL: tl.constexpr,
@@ -185,7 +186,10 @@ def _blocksparse_attn_fwd_inner(
         alpha = tl.math.exp2(m_safe - m_new_safe)
         l = l * alpha + l_new
         acc *= alpha[:, None]
-        value = tl.load(value_block_ptr)
+        if EVEN_V_HEAD_DIM:
+            value = tl.load(value_block_ptr)
+        else:
+            value = tl.load(value_block_ptr, boundary_check=(1,), padding_option="zero")
         acc += tl.dot(p.to(value_block_ptr.type.element_ty), value)
         m = m_new
         value_block_ptr = tl.advance(value_block_ptr, (BLOCK_N, 0))
@@ -237,6 +241,8 @@ def blocksparse_attn_fwd(
     QK_HEAD_DIM_PAD: tl.constexpr,
     EVEN_QK_HEAD_DIMS: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM_PAD: tl.constexpr,
+    EVEN_V_HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
@@ -344,7 +350,7 @@ def blocksparse_attn_fwd(
         shape=(KV_SEQ_LEN, V_HEAD_DIM),
         strides=(stride_vn, stride_vk),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, V_HEAD_DIM),
+        block_shape=(BLOCK_N, V_HEAD_DIM_PAD),
         order=(1, 0),
     )
     out_block_ptr = tl.make_block_ptr(
@@ -352,7 +358,7 @@ def blocksparse_attn_fwd(
         shape=(Q_SEQ_LEN, V_HEAD_DIM),
         strides=(stride_om, stride_ok),
         offsets=(query_block_id * BLOCK_M, 0),
-        block_shape=(BLOCK_M, V_HEAD_DIM),
+        block_shape=(BLOCK_M, V_HEAD_DIM_PAD),
         order=(1, 0),
     )
 
@@ -369,15 +375,18 @@ def blocksparse_attn_fwd(
 
     m = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, V_HEAD_DIM], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, V_HEAD_DIM_PAD], dtype=tl.float32)
 
     num_blocks_to_attend = upper_bound - lower_bound
     if num_blocks_to_attend == 0:
-        tl.store(out_block_ptr, acc.to(Po.type.element_ty))
+        if EVEN_V_HEAD_DIM:
+            tl.store(out_block_ptr, acc.to(Po.type.element_ty))
+        else:
+            tl.store(out_block_ptr, acc.to(Po.type.element_ty), boundary_check=(1,))
         tl.store(M + logsumexp_offset, l)
         return
 
-    q_scale = (softmax_scale * LOG2_CONST).to(tl.float32)
+    q_scale = softmax_scale * LOG2_CONST
 
     if EVEN_QK_HEAD_DIMS:
         query_block = tl.load(query_block_ptr)
@@ -429,6 +438,7 @@ def blocksparse_attn_fwd(
         query_global_span,
         kv_span,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         USE_CAUSAL=False,
@@ -460,6 +470,7 @@ def blocksparse_attn_fwd(
         query_global_span,
         kv_span,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         USE_CAUSAL=False,
@@ -491,6 +502,7 @@ def blocksparse_attn_fwd(
         query_global_span,
         kv_span,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         USE_CAUSAL=CAUSAL,
@@ -511,7 +523,10 @@ def blocksparse_attn_fwd(
     acc = tl.where(invalid[:, None], 0.0, acc)
 
     tl.store(M + logsumexp_offset, m)
-    tl.store(out_block_ptr, acc.to(Po.type.element_ty))
+    if EVEN_V_HEAD_DIM:
+        tl.store(out_block_ptr, acc.to(Po.type.element_ty))
+    else:
+        tl.store(out_block_ptr, acc.to(Po.type.element_ty), boundary_check=(1,))
 
 
 def _fwd_blocksparse_attn_call(
@@ -668,7 +683,8 @@ def _fwd_blocksparse_attn_call(
 
     num_groups = num_heads // num_kv_heads
 
-    qk_head_dim_pad = next_power_of_2(qk_head_dim)
+    qk_head_dim_pad = max(16, next_power_of_2(qk_head_dim))
+    v_head_dim_pad = max(16, next_power_of_2(value_head_dim))
 
     if logits_soft_cap is None:
         logits_soft_cap_val = 0.0
@@ -685,6 +701,8 @@ def _fwd_blocksparse_attn_call(
         QK_HEAD_DIM_PAD=qk_head_dim_pad,
         EVEN_QK_HEAD_DIMS=qk_head_dim_pad == qk_head_dim,
         V_HEAD_DIM=value_head_dim,
+        V_HEAD_DIM_PAD=v_head_dim_pad,
+        EVEN_V_HEAD_DIM=v_head_dim_pad == value_head_dim,
         BLOCK_M=fwd_params.q_blocksize,
         BLOCK_N=fwd_params.kv_blocksize,
         IS_CONTEXT_PARALLELISM=using_sequence_parallelism,

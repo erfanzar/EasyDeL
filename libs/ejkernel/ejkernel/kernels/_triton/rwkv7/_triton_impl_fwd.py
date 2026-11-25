@@ -30,12 +30,6 @@ from jaxtyping import Array, Float, Int
 from ejkernel.callib import cdiv, triton_call
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] != 1,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
-    }
-)
 @triton.jit
 def _rwkv7_fwd_kernel(
     r,
@@ -104,8 +98,6 @@ def _rwkv7_fwd_kernel(
     else:
         bos = i_n * T
         eos = i_n * T + T
-        tl.multiple_of(bos, 1)
-        tl.multiple_of(eos, 1)
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -198,7 +190,7 @@ def fwd_triton_impl(
     N = B if cu_seqlens is None else int(cu_seqlens.shape[0] - 1)
 
     BK = triton.next_power_of_2(K)
-    BV = min(V, int(block_v))
+    BV = triton.next_power_of_2(min(V, int(block_v)))
 
     out_shape = jax.ShapeDtypeStruct(v.shape, v.dtype)
     ht_shape = jax.ShapeDtypeStruct((N, H, K, V), jnp.float32)
@@ -215,6 +207,8 @@ def fwd_triton_impl(
         BK=BK,
         BV=BV,
         REVERSE=reverse,
+        USE_INITIAL_STATE=initial_state is not None,
+        IS_VARLEN=cu_seqlens is not None,
     )
 
     out, ht = triton_call(

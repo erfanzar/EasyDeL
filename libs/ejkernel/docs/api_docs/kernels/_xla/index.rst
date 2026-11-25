@@ -4,30 +4,65 @@ ejkernel.kernels._xla package
 .. toctree::
    :maxdepth: 2
 
+   all_gather/index
    all_gather_matmul/index
+   all_reduce/index
+   all_to_all/index
    attention/index
    blocksparse_attention/index
    chunked_prefill_paged_decode/index
+   compressed_window_attention/index
+   compressed_window_decode/index
    decode_attention/index
    deepseek_attn/index
+   dsa_gather_attention/index
+   dsa_sparse_attention/index
+   dual_stream_attention/index
+   dual_stream_ragged_page_attention/index
    flash_attention/index
    flash_mla/index
+   fused_cakld_tv/index
+   fused_conv_decode/index
+   fused_cross_entropy/index
+   fused_kl_divergence/index
+   fused_mlp/index
+   fused_renyi_entropy/index
    gated_delta_rule/index
+   gated_delta_rule_grouped_decode/index
+   gdn_compute_schedule_v2/index
+   gdn_spec_window/index
    gla/index
    grouped_matmul/index
+   grouped_matmul_quant/index
    grouped_matmulv3/index
+   indexer_scores/index
+   kda_chunk/index
+   kda_chunk_local/index
    kernel_delta_attention/index
    lightning_attn/index
    mean_pooling/index
+   mhc_coefficients/index
+   mhc_decode_fused/index
+   mhc_fused/index
+   mhc_prefill_fused/index
+   moe_decode_fused_w8a8/index
+   moe_local_ffn/index
+   moe_row_gather/index
    multi_latent_ragged_page_attention/index
    multi_latent_ragged_page_attention_v2/index
    native_sparse_attention/index
    page_attention/index
+   paged_pool_topk/index
    prefill_page_attention/index
    quantized_matmul/index
+   ragged_causal_conv1d/index
    ragged_decode_attention/index
    ragged_gated_delta_rule/index
+   ragged_gated_delta_rule_v2/index
+   ragged_gather/index
+   ragged_gather_reduce/index
    ragged_kda/index
+   ragged_kda_conv_decode/index
    ragged_kda_decode/index
    ragged_kda_short/index
    ragged_page_attention_v2/index
@@ -35,12 +70,20 @@ ejkernel.kernels._xla package
    ragged_page_attention_v3/index
    ragged_page_attention_v3_turboquant/index
    recurrent/index
+   reduce_scatter/index
    reduce_scatter_matmul/index
    ring_attention/index
+   row_permute/index
    rwkv4/index
    rwkv6/index
    rwkv7/index
    scaled_dot_product_attention/index
+   shared_expert_w8a8/index
+   sinkhorn_knopp/index
+   sparse_multi_latent_ragged_page_attention/index
+   sparse_selected_attention/index
    state_space_v1/index
    state_space_v2/index
+   topk/index
    unified_attention/index
+   _row_loss

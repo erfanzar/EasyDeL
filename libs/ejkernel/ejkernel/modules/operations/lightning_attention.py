@@ -269,6 +269,29 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
             backend="any",
         )
 
+    def heuristic_cfg_gpu(self, inv: Invocation[LightningAttentionConfig, Array]) -> LightningAttentionConfig:
+        """Provide GPU-optimized default configuration for Lightning Attention."""
+        q = inv.kwargs.get("query")
+        if q is None and len(inv.args) >= 1:
+            q = inv.args[0]
+        v = inv.kwargs.get("value")
+        if v is None and len(inv.args) >= 3:
+            v = inv.args[2]
+        head_k = int(q.shape[-1]) if getattr(q, "shape", None) else 64
+        head_v = int(v.shape[-1]) if getattr(v, "shape", None) else head_k
+        block_k = 128 if head_k >= 128 else 64
+        block_d = 128 if head_v >= 128 else 64
+        num_warps = 8 if (block_k >= 128 and block_d >= 128) else 4
+        return LightningAttentionConfig(
+            block_q=64,
+            block_k=block_k,
+            block_d=block_d,
+            num_warps=num_warps,
+            num_stages=2 if (block_k >= 128 or block_d >= 128) else 1,
+            platform="triton",
+            backend="gpu",
+        )
+
     def candidate_cfgs(self, inv: Invocation[LightningAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
@@ -307,22 +330,19 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
     def candidate_cfgs_gpu(self, inv: Invocation[LightningAttentionConfig, Array]):
         """Generate GPU candidates for Lightning Attention.
 
-        Lightning attention is a linear-attention variant; ``block_d``
-        (head_dim tile) drives most of the GPU performance. Sweep:
-
-        * ``block_d`` ∈ {32, 64, 128}; 128 for wide heads.
-        * ``block_q`` / ``block_k`` ∈ {64, 128}.
-        * ``num_warps`` ∈ {4, 8}; 8 only when blocks are big.
+        The sequential Triton recurrent kernel tiles ``(block_k, block_v)``
+        (``block_q`` is unused on Triton), so Triton candidates sweep distinct
+        ``(block_k, block_d, num_warps, num_stages)`` combinations.
         """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        block_configs = [
-            (64, 64, 32, 4, 1),
-            (64, 64, 64, 4, 1),
-            (128, 64, 64, 4, 2),
-            (64, 128, 64, 4, 2),
-            (128, 128, 64, 8, 2),
-            (128, 128, 128, 8, 2),
+        triton_configs = [
+            (64, 32, 4, 1),
+            (64, 64, 4, 1),
+            (64, 64, 4, 2),
+            (128, 64, 4, 2),
+            (64, 128, 4, 2),
+            (128, 128, 8, 2),
         ]
         tilelang_configs = [
             (64, 64, 64, 4, 1),
@@ -331,10 +351,10 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
         ]
         candidates: list[LightningAttentionConfig] = []
         if "triton" in platforms:
-            for block_q, block_k, block_d, num_warps, num_stages in block_configs:
+            for block_k, block_d, num_warps, num_stages in triton_configs:
                 candidates.append(
                     LightningAttentionConfig(
-                        block_q=block_q,
+                        block_q=64,
                         block_k=block_k,
                         block_d=block_d,
                         num_warps=num_warps,

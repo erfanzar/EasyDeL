@@ -97,7 +97,7 @@ def _raise_triton_unavailable(err: Exception) -> None:
     """
     raise ValueError(
         "`triton_call` is only available when GPU Triton support is installed "
-        "(install `ejkernel[gpu]` and use a CUDA/ROCm-enabled `jaxlib`)."
+        "(install `ejkernel[cuda]` or `ejkernel[triton]` and use a CUDA/ROCm-enabled `jaxlib`)."
     ) from err
 
 
@@ -115,7 +115,7 @@ def _raise_cute_unavailable(err: Exception) -> None:
     """
     raise ValueError(
         "`cute_call` is only available when CUTLASS CuTe is installed "
-        "(install `ejkernel[gpu]` and use a CUDA-enabled `jaxlib`)."
+        "(install `ejkernel[cuda]` and use a CUDA-enabled `jaxlib`)."
     ) from err
 
 

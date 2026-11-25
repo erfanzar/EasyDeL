@@ -379,6 +379,26 @@ class RingBlocksparseResiduals(NamedTuple):
     kv_segment_ids: jax.Array
     o: jax.Array
     lse: jax.Array
+    softmax_aux: jax.Array | None = None
+
+
+def _normalize_ring_sinks(aux_in: jax.Array, *, num_heads: int, num_kv_heads: int) -> jax.Array:
+    """Normalize 1-D or 2-D attention sink logits to shape ``(num_heads, num_sinks)`` in float32."""
+    aux = jnp.asarray(aux_in, dtype=jnp.float32)
+    if aux.ndim == 1:
+        return jnp.broadcast_to(aux[None, :], (num_heads, aux.shape[0]))
+    if aux.ndim == 2:
+        if aux.shape[0] == 1:
+            return jnp.broadcast_to(aux, (num_heads, aux.shape[1]))
+        if aux.shape[0] == num_heads:
+            return aux
+        if aux.shape[0] == num_kv_heads and num_heads % num_kv_heads == 0:
+            return jnp.repeat(aux, num_heads // num_kv_heads, axis=0)
+        raise ValueError(
+            f"softmax_aux first dim must be 1, num_kv_heads ({num_kv_heads}), or num_heads ({num_heads}); "
+            f"got {aux.shape[0]}"
+        )
+    raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
 
 
 def _window_to_bounds(sliding_window: int | tuple[int, int] | None) -> tuple[int, int]:
@@ -454,7 +474,7 @@ def _build_positions(
     return positions
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))
+@partial(jax.custom_vjp, nondiff_argnums=(8, 9, 10, 11, 12, 13, 14))
 def ring_blocksparse_attention_call(
     query: jax.Array,
     key: jax.Array,
@@ -560,8 +580,27 @@ def _ring_blocksparse_attention_fwd(
 
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=128, kv_blocksize=128, num_stages=2, num_warps=4)
+    else:
+        fwd_params = FwdParams(
+            q_blocksize=128 if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize),
+            kv_blocksize=128 if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize),
+            num_stages=2 if fwd_params.num_stages is None else int(fwd_params.num_stages),
+            num_warps=4 if fwd_params.num_warps is None else int(fwd_params.num_warps),
+        )
     if bwd_params is None:
-        bwd_params = BwdParams(q_blocksize=fwd_params.q_blocksize, kv_blocksize=fwd_params.kv_blocksize)
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize,
+            kv_blocksize=fwd_params.kv_blocksize,
+            num_stages=2,
+            num_warps=4,
+        )
+    else:
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize if bwd_params.q_blocksize is None else int(bwd_params.q_blocksize),
+            kv_blocksize=fwd_params.kv_blocksize if bwd_params.kv_blocksize is None else int(bwd_params.kv_blocksize),
+            num_stages=2 if bwd_params.num_stages is None else int(bwd_params.num_stages),
+            num_warps=4 if bwd_params.num_warps is None else int(bwd_params.num_warps),
+        )
 
     if q_segment_ids is None:
         q_segment_ids = jnp.zeros((batch, q_seq_len), dtype=jnp.int32)
@@ -617,19 +656,8 @@ def _ring_blocksparse_attention_fwd(
     lse_acc = jnp.full((batch, num_heads, q_seq_len), -jnp.inf, dtype=jnp.float32)
 
     if softmax_aux is not None:
-        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
-        if aux.ndim == 1:
-            sink_lse = jax.nn.logsumexp(aux)
-            sink_lse = jnp.broadcast_to(sink_lse, (num_heads,))
-        elif aux.ndim == 2:
-            sink_lse = jax.nn.logsumexp(aux, axis=-1)
-            if sink_lse.shape[0] == 1:
-                sink_lse = jnp.broadcast_to(sink_lse[0], (num_heads,))
-            elif sink_lse.shape[0] != num_heads:
-                raise ValueError(f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}")
-        else:
-            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
-
+        sink_logits_2d = _normalize_ring_sinks(softmax_aux, num_heads=num_heads, num_kv_heads=key.shape[2])
+        sink_lse = jax.nn.logsumexp(sink_logits_2d, axis=-1)
         sink_lse = jnp.broadcast_to(sink_lse[None, :, None], (batch, num_heads, q_seq_len))
         lse_acc = jnp.where(jnp.isfinite(sink_lse), sink_lse, lse_acc)
 
@@ -712,16 +740,12 @@ def _ring_blocksparse_attention_fwd(
         kv_segment_ids=kv_segment_ids,
         o=o_out,
         lse=lse_acc,
+        softmax_aux=softmax_aux,
     )
     return jnp.transpose(o_out, (0, 2, 1, 3)), res
 
 
 def _ring_blocksparse_attention_bwd(
-    q_segment_ids: jax.Array | None,
-    kv_segment_ids: jax.Array | None,
-    q_position_ids: jax.Array | None,
-    kv_position_ids: jax.Array | None,
-    softmax_aux: jax.Array | None,
     softmax_scale: float | None,
     causal: bool,
     sliding_window: int | tuple[int, int] | None,
@@ -731,25 +755,25 @@ def _ring_blocksparse_attention_bwd(
     bwd_params: BwdParams | None,
     res: RingBlocksparseResiduals,
     do: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, None, None, None, None, jax.Array | None]:
     """Backward pass of ring block-sparse attention.
 
-    Computes gradients for query, key, and value tensors by running the
-    block-sparse attention backward kernel at each ring step. KV gradients
-    are accumulated and rotated through the ring along with the KV blocks.
+    Computes gradients for query, key, value, and optional attention sinks by
+    running the block-sparse attention backward kernel at each ring step. KV
+    gradients are accumulated and rotated through the ring along with the KV
+    blocks.
 
     Uses the same ring scan pattern as the forward pass, recomputing
     block-sparse masks at each step from the stored positions and segment IDs.
 
     Args:
-        q_segment_ids..bwd_params: Non-differentiable arguments (from nondiff_argnums).
+        softmax_scale..bwd_params: Non-differentiable arguments (from nondiff_argnums).
         res: Residuals saved from the forward pass.
         do: Output gradient tensor.
 
     Returns:
-        Tuple of (dq, dk, dv) gradient tensors.
+        Tuple of ``(dq, dk, dv, None, None, None, None, d_softmax_aux)``.
     """
-    del q_segment_ids, kv_segment_ids, q_position_ids, kv_position_ids, softmax_aux
     (
         q,
         k,
@@ -760,6 +784,7 @@ def _ring_blocksparse_attention_bwd(
         kv_segment_ids,
         o,
         lse,
+        softmax_aux,
     ) = res
 
     if softmax_scale is None:
@@ -767,8 +792,27 @@ def _ring_blocksparse_attention_bwd(
 
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=128, kv_blocksize=128, num_stages=2, num_warps=4)
+    else:
+        fwd_params = FwdParams(
+            q_blocksize=128 if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize),
+            kv_blocksize=128 if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize),
+            num_stages=2 if fwd_params.num_stages is None else int(fwd_params.num_stages),
+            num_warps=4 if fwd_params.num_warps is None else int(fwd_params.num_warps),
+        )
     if bwd_params is None:
-        bwd_params = BwdParams(q_blocksize=fwd_params.q_blocksize, kv_blocksize=fwd_params.kv_blocksize)
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize,
+            kv_blocksize=fwd_params.kv_blocksize,
+            num_stages=2,
+            num_warps=4,
+        )
+    else:
+        bwd_params = BwdParams(
+            q_blocksize=fwd_params.q_blocksize if bwd_params.q_blocksize is None else int(bwd_params.q_blocksize),
+            kv_blocksize=fwd_params.kv_blocksize if bwd_params.kv_blocksize is None else int(bwd_params.kv_blocksize),
+            num_stages=2 if bwd_params.num_stages is None else int(bwd_params.num_stages),
+            num_warps=4 if bwd_params.num_warps is None else int(bwd_params.num_warps),
+        )
 
     if axis_name is not None:
         axis_size = lax.psum(1, axis_name)
@@ -857,7 +901,26 @@ def _ring_blocksparse_attention_bwd(
     dk = jnp.transpose(dk.astype(k.dtype), (0, 2, 1, 3))
     dv = jnp.transpose(dv.astype(v.dtype), (0, 2, 1, 3))
 
-    return dq, dk, dv
+    d_softmax_aux: jax.Array | None = None
+    if softmax_aux is not None and jnp.issubdtype(softmax_aux.dtype, jnp.floating):
+        num_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+        sink_logits_2d, pullback = jax.vjp(
+            lambda aux_in: _normalize_ring_sinks(aux_in, num_heads=num_heads, num_kv_heads=num_kv_heads),
+            softmax_aux,
+        )
+        delta = jnp.sum(o.astype(jnp.float32) * do_bhtd.astype(jnp.float32), axis=-1)
+        p_sink = jnp.where(
+            jnp.isfinite(lse[..., None]),
+            jnp.exp(jnp.minimum(sink_logits_2d[None, :, None, :] - lse[..., None], 0.0)),
+            0.0,
+        )
+        d_logits = -jnp.sum(p_sink * delta[..., None], axis=(0, 2))
+        if axis_name is not None:
+            d_logits = lax.psum(d_logits, axis_name)
+        (d_softmax_aux,) = pullback(d_logits)
+
+    return dq, dk, dv, None, None, None, None, d_softmax_aux
 
 
 ring_blocksparse_attention_call.defvjp(_ring_blocksparse_attention_fwd, _ring_blocksparse_attention_bwd)

@@ -313,5 +313,169 @@ def test_native_sparse_attention_matches_xla_smoke():
     )
 
 
+def test_native_sparse_attention_backward_and_jit_match_xla():
+    """Verify jax.jit forward and backward (dq, dk, dv) numerical parity vs XLA."""
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(19), 4)
+    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 2, 128, 16, 1, 64
+    block_size = 64
+    num_blocks = 2
+
+    q = jax.random.normal(kq, (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float16) * 0.5
+    k = jax.random.normal(kk, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16) * 0.5
+    v = jax.random.normal(kv, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16) * 0.5
+    w = jax.random.normal(kw, (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float32)
+
+    block_indices = jnp.broadcast_to(
+        jnp.arange(num_blocks, dtype=jnp.int32)[None, None, None, :],
+        (batch_size, seq_len, num_kv_heads, num_blocks),
+    )
+
+    out_triton = jax.jit(
+        lambda q_, k_, v_, bi_: native_sparse_attention(
+            query=q_,
+            key=k_,
+            value=v_,
+            block_indices=bi_,
+            block_counts=num_blocks,
+            block_size=block_size,
+        )
+    )(q, k, v, block_indices)
+    out_xla = xla_native_sparse_attention(
+        query=q,
+        key=k,
+        value=v,
+        block_indices=block_indices,
+        block_counts=num_blocks,
+        block_size=block_size,
+    )
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    def loss_triton(q_, k_, v_, bi_):
+        out = native_sparse_attention(
+            query=q_,
+            key=k_,
+            value=v_,
+            block_indices=bi_,
+            block_counts=num_blocks,
+            block_size=block_size,
+        )
+        return jnp.sum(out.astype(jnp.float32) * w)
+
+    def loss_xla(q_, k_, v_, bi_):
+        out = xla_native_sparse_attention(
+            query=q_,
+            key=k_,
+            value=v_,
+            block_indices=bi_,
+            block_counts=num_blocks,
+            block_size=block_size,
+        )
+        return jnp.sum(out.astype(jnp.float32) * w)
+
+    grads_triton = jax.jit(jax.grad(loss_triton, argnums=(0, 1, 2)))(q, k, v, block_indices)
+    grads_xla = jax.grad(loss_xla, argnums=(0, 1, 2))(q, k, v, block_indices)
+    for name, got, want in zip(("dq", "dk", "dv"), grads_triton, grads_xla, strict=True):
+        got_f32 = np.asarray(got, dtype=np.float32)
+        want_f32 = np.asarray(want, dtype=np.float32)
+        assert np.all(np.isfinite(got_f32)), f"NSA {name} has non-finite values"
+        assert np.linalg.norm(want_f32) > 1e-2, f"NSA {name} reference gradient is degenerate"
+        np.testing.assert_allclose(got_f32, want_f32, rtol=6e-2, atol=6e-2, err_msg=f"NSA {name} mismatch")
+
+
+def test_native_sparse_attention_block_counts_array_fwd_and_bwd_match_xla():
+    """Per-token array block_counts must activate USE_BLOCK_COUNTS under jit+grad and match XLA."""
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(31), 4)
+    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 1, 192, 16, 1, 64
+    block_size = 64
+    max_selected = 3
+
+    q = jax.random.normal(kq, (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float16) * 0.5
+    k = jax.random.normal(kk, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16) * 0.5
+    v = jax.random.normal(kv, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16) * 0.5
+    w = jax.random.normal(kw, (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float32)
+
+    # All 3 blocks listed in block_indices, but block_counts varies per token (1 vs 2) so
+    # ignoring USE_BLOCK_COUNTS would attend to all 3 blocks and fail parity immediately.
+    block_indices = jnp.broadcast_to(
+        jnp.array([0, 1, 2], dtype=jnp.int32)[None, None, None, :],
+        (batch_size, seq_len, num_kv_heads, max_selected),
+    )
+    token_counts = jnp.where(jnp.arange(seq_len) < 128, 1, 2).astype(jnp.int32)
+    block_counts = jnp.broadcast_to(token_counts[None, :, None], (batch_size, seq_len, num_kv_heads))
+
+    out_triton = jax.jit(
+        lambda q_, k_, v_, bi_, bc_: native_sparse_attention(
+            query=q_,
+            key=k_,
+            value=v_,
+            block_indices=bi_,
+            block_counts=bc_,
+            block_size=block_size,
+        )
+    )(q, k, v, block_indices, block_counts)
+    out_xla = xla_native_sparse_attention(
+        query=q,
+        key=k,
+        value=v,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        block_size=block_size,
+    )
+    out_all_blocks = xla_native_sparse_attention(
+        query=q,
+        key=k,
+        value=v,
+        block_indices=block_indices,
+        block_counts=max_selected,
+        block_size=block_size,
+    )
+    # Negative control: block_counts array must actually change output vs attending to all 3 blocks.
+    assert np.abs(np.asarray(out_xla, dtype=np.float32) - np.asarray(out_all_blocks, dtype=np.float32)).max() > 1e-2
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    def loss_triton(q_, k_, v_, bi_, bc_):
+        out = native_sparse_attention(
+            query=q_,
+            key=k_,
+            value=v_,
+            block_indices=bi_,
+            block_counts=bc_,
+            block_size=block_size,
+        )
+        return jnp.sum(out.astype(jnp.float32) * w)
+
+    def loss_xla(q_, k_, v_, bi_, bc_):
+        out = xla_native_sparse_attention(
+            query=q_,
+            key=k_,
+            value=v_,
+            block_indices=bi_,
+            block_counts=bc_,
+            block_size=block_size,
+        )
+        return jnp.sum(out.astype(jnp.float32) * w)
+
+    grads_triton = jax.jit(jax.grad(loss_triton, argnums=(0, 1, 2)))(q, k, v, block_indices, block_counts)
+    grads_xla = jax.grad(loss_xla, argnums=(0, 1, 2))(q, k, v, block_indices, block_counts)
+    for name, got, want in zip(("dq", "dk", "dv"), grads_triton, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float32),
+            np.asarray(want, dtype=np.float32),
+            rtol=6e-2,
+            atol=6e-2,
+            err_msg=f"NSA block_counts array {name} mismatch",
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

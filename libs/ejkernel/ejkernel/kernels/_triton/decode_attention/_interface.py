@@ -51,6 +51,7 @@ def decode_attention(
     num_kv_splits: int = 16,
     page_size: int = 1,
     logits_soft_cap: float | None = None,
+    block_n: int = 64,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> tuple[
@@ -91,6 +92,7 @@ def decode_attention(
         num_kv_splits=num_kv_splits,
         page_size=page_size,
         logits_soft_cap=logits_soft_cap,
+        block_n=block_n,
         num_warps=num_warps,
         num_stages=num_stages,
     )

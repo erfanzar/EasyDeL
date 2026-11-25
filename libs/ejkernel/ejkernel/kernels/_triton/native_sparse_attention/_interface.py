@@ -109,7 +109,7 @@ def _fwd_call(
     key: Float[Array, "batch seq_len num_heads head_dim"],
     value: Float[Array, "batch seq_len num_heads head_dim"],
     block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int,
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int | None,
     block_size: int,
     softmax_scale: float,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -120,7 +120,7 @@ def _fwd_call(
     num_stages: int = 1,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads head_dim"],
-    tuple[Float[Array, "..."], ...],
+    tuple[Array | int | None, ...],
 ]:
     """
     Forward pass for NSA in a custom VJP.
@@ -158,33 +158,26 @@ def _fwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    residual = query, key, value, block_indices, o, lse
+    residual = query, key, value, block_indices, block_counts, cu_seqlens, token_indices, o, lse
     return o, residual
 
 
 def _bwd_call(
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int,
     block_size: int,
     softmax_scale: float,
-    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
-    token_indices: Int[Array, "total_tokens"] | None,
     block_k: int,
     block_v: int,
     num_warps: int,
     num_stages: int,
-    residual: tuple[Float[Array, "..."], ...],
+    residual: tuple[Array | int | None, ...],
     do: Float[Array, "batch seq_len num_heads head_dim"],
 ):
     """
     Backward pass for NSA in a custom VJP.
 
     Args:
-        block_indices: Sparsity pattern used in the forward pass.
-        block_counts: Number of blocks attended to per query.
         block_size: Size of each block.
         softmax_scale: Attention scaling factor.
-        cu_seqlens: Cumulative sequence lengths for variable-length sequences.
-        token_indices: Token indices for variable-length sequences.
         block_k: Key-dimension tile size selected by the operation config.
         block_v: Value-dimension tile size selected by the operation config.
         num_warps: Number of Triton warps selected by the operation config.
@@ -193,9 +186,9 @@ def _bwd_call(
         do: Gradient of the output tensor.
 
     Returns:
-        A tuple of gradients (dq, dk, dv).
+        A tuple of gradients ``(dq, dk, dv, None, None, None, None)``.
     """
-    query, key, value, block_indices, o, lse = residual
+    query, key, value, block_indices, block_counts, cu_seqlens, token_indices, o, lse = residual
     dq, dk, dv = bwd_triton_impl(
         q=query,
         k=key,
@@ -214,17 +207,17 @@ def _bwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return dq, dk, dv, None
+    return dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(value.dtype), None, None, None, None
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12))
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 9, 10, 11, 12))
 @partial(jax.jit, static_argnums=(5, 6, 9, 10, 11, 12))
 def _apply_nsa(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_heads head_dim"],
     value: Float[Array, "batch seq_len num_heads head_dim"],
     block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int,
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int | None,
     block_size: int,
     softmax_scale: float,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -333,12 +326,45 @@ def apply_native_sparse_attention(
     if token_indices is None and cu_seqlens is not None:
         token_indices = prepare_token_indices(cu_seqlens)
 
+    batch, seq_len = query.shape[0], query.shape[1]
+    num_kv_heads = key.shape[2]
+    num_blocks = (seq_len + block_size - 1) // block_size
+
+    block_indices = jnp.asarray(block_indices, dtype=jnp.int32)
+    if (
+        cu_seqlens is None
+        and block_indices.shape[1] != seq_len
+        and block_indices.shape[1] == num_kv_heads
+        and block_indices.shape[2] == num_blocks
+    ):
+        qb = jnp.arange(seq_len, dtype=jnp.int32) // block_size
+        block_indices = jnp.transpose(block_indices, (0, 2, 1, 3))[:, qb, :, :]
+
+    block_counts_arg: Array | None
+    if isinstance(block_counts, int):
+        if block_counts < block_indices.shape[-1]:
+            block_indices = block_indices[..., : max(int(block_counts), 0)]
+        block_counts_arg = None
+    else:
+        block_counts_arr = jnp.asarray(block_counts, dtype=jnp.int32)
+        if block_counts_arr.ndim == 0:
+            block_counts_arg = jnp.broadcast_to(block_counts_arr, (batch, seq_len, num_kv_heads))
+        elif (
+            cu_seqlens is None
+            and block_counts_arr.shape != (batch, seq_len, num_kv_heads)
+            and block_counts_arr.shape == (batch, num_kv_heads, num_blocks)
+        ):
+            qb = jnp.arange(seq_len, dtype=jnp.int32) // block_size
+            block_counts_arg = jnp.transpose(block_counts_arr, (0, 2, 1))[:, qb, :]
+        else:
+            block_counts_arg = block_counts_arr
+
     return _apply_nsa(
         query=query,
         key=key,
         value=value,
         block_indices=block_indices,
-        block_counts=block_counts,
+        block_counts=block_counts_arg,
         block_size=block_size,
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,

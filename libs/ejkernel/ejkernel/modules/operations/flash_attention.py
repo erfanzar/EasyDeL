@@ -240,7 +240,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         return shard_map_fn, call_args
 
-    def get_impl(self, cfg: FlashAttentionConfig, *, prefer_cuda: bool = True):
+    def get_impl(self, cfg: FlashAttentionConfig, *, prefer_cuda: bool = True, prefer_cute: bool = True):
         """Get kernel implementation from registry based on configuration.
 
         Args:
@@ -248,6 +248,9 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             prefer_cuda: Prefer the CUDA backend when auto-detecting on NVIDIA
                 GPUs. Set ``False`` when an additive 4-D bias is supplied, since
                 the native CUDA kernel only supports ALiBi slopes.
+            prefer_cute: Allow auto-selecting the CuTe backend on NVIDIA GPUs.
+                Set ``False`` when an unsupported broadcast or boolean 4-D bias
+                is supplied.
 
         Returns:
             Callable kernel implementation
@@ -259,10 +262,13 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             "flash_attention",
             cfg.platform,
             prefer_cuda=prefer_cuda,
-            prefer_triton=not prefer_cuda,
+            prefer_triton=not prefer_cuda or not prefer_cute,
         )
         backend = cfg.backend
-        if not prefer_cuda and cfg.platform in ("auto", None) and resolved_platform == Platform.CUDA:
+        if cfg.platform in ("auto", None) and (
+            (not prefer_cuda and resolved_platform == Platform.CUDA)
+            or (not prefer_cute and resolved_platform == Platform.CUTE)
+        ):
             resolved_platform = Platform.XLA
         if resolved_platform == Platform.XLA:
             backend = Backend.ANY
@@ -331,6 +337,11 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """
 
         has_additive_bias = bias is not None and getattr(bias, "ndim", 0) > 2
+        cute_bias_unsupported = has_additive_bias and (
+            tuple(getattr(bias, "shape", ()))
+            != (int(query.shape[0]), int(query.shape[2]), int(query.shape[1]), int(key.shape[1]))
+            or getattr(bias, "dtype", None) == jnp.bool_
+        )
         cfg_platform_val = getattr(cfg.platform, "value", str(cfg.platform))
         if platform is not None:
             cfg = FlashAttentionConfig(
@@ -339,17 +350,20 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        elif has_additive_bias and cfg_platform_val == "cuda":
+        elif (has_additive_bias and cfg_platform_val == "cuda") or (
+            cute_bias_unsupported and cfg_platform_val == "cute"
+        ):
             # Executor._prefer_cuda_cfg upgrades heuristic/autotuned "auto"/"triton" configs
-            # to platform="cuda" on NVIDIA GPUs when platform is None/"auto", but the native
-            # CUDA flash kernel only accepts ALiBi slopes, never 4-D additive bias.
+            # to platform="cute"/"cuda" on NVIDIA GPUs when platform is None/"auto". The native
+            # CUDA flash kernel only accepts ALiBi slopes (never 4-D additive bias), and CuTe
+            # requires exact (batch, num_heads, q_len, k_len) float bias (no broadcasting/bool).
             cfg = FlashAttentionConfig(
                 fwd_params=cfg.fwd_params,
                 bwd_params=cfg.bwd_params,
                 platform="auto",
                 backend=cfg.backend,
             )
-        impl = self.get_impl(cfg, prefer_cuda=not has_additive_bias)
+        impl = self.get_impl(cfg, prefer_cuda=not has_additive_bias, prefer_cute=not cute_bias_unsupported)
         out = impl(
             query=query,
             key=key,
@@ -528,14 +542,24 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         requested = inv.kwargs.get("platform", None)
         bias = inv.kwargs.get("bias", None)
         has_additive_bias = bias is not None and getattr(bias, "ndim", 0) > 2
+        cute_bias_unsupported = has_additive_bias and (
+            tuple(getattr(bias, "shape", ()))
+            != (int(q.shape[0]), int(q.shape[2]), q_len, k_len)
+            or getattr(bias, "dtype", None) == jnp.bool_
+        )
         if requested in (None, "auto"):
-            platforms = ("triton", "cute", "tilelang", "xla") if has_additive_bias else (
-                "triton",
-                "cuda",
-                "cute",
-                "tilelang",
-                "xla",
-            )
+            if cute_bias_unsupported:
+                platforms = ("triton", "tilelang", "xla")
+            elif has_additive_bias:
+                platforms = ("triton", "cute", "tilelang", "xla")
+            else:
+                platforms = (
+                    "triton",
+                    "cuda",
+                    "cute",
+                    "tilelang",
+                    "xla",
+                )
         else:
             platforms = (str(requested),)
 

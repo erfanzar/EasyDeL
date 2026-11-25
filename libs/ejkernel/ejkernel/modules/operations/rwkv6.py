@@ -233,6 +233,10 @@ class RWKV6(Kernel[RWKV6Config, Array]):
         """
         return RWKV6Config(platform="auto", backend="any")
 
+    def heuristic_cfg_gpu(self, inv: Invocation[RWKV6Config, Array]) -> RWKV6Config:
+        """Provide GPU-optimized default configuration for RWKV-6."""
+        return RWKV6Config(platform="triton", backend="gpu")
+
     def candidate_cfgs(self, inv: Invocation[RWKV6Config, Array]):
         """Generate candidate configurations for autotuning.
 

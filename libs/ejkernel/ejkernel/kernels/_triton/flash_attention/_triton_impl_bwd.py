@@ -45,7 +45,12 @@ from ejkernel.kernels._xla.attention._xla_impl_fwd import _normalize_softmax_aux
 from ejkernel.ops import BwdParams, FwdParams
 from ejkernel.utils import dtype_index, get_sharding, get_strides
 
-from ._utilities import attention_pack_with_static_shape, calc_bias_strides, padded_load
+from ._utilities import (
+    attention_pack_from_cu_static,
+    attention_unpack_with_static_shape,
+    calc_bias_strides,
+    padded_load,
+)
 
 
 @triton.jit
@@ -156,8 +161,8 @@ def _attn_bwd_dkdv(
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
-    PAD_ROWS: tl.constexpr,
-    PAD_COLS: tl.constexpr,
+    PAD_ROWS,
+    PAD_COLS,
     HEADS_PADDED: tl.constexpr,
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
@@ -298,8 +303,6 @@ def _attn_bwd_dkdv(
         qk_after = qk * (softmax_scale * LN2)
         jac = softmax_scale
 
-    tl.debug_barrier()
-
     p = tl.exp2(qk_after - me_i[:, None])
 
     if MASKED and (fully_masked_lines > 0):
@@ -315,13 +318,13 @@ def _attn_bwd_dkdv(
         PA1=HEADS_PADDED,
         LA0=actual_seqlen_q,
         LA1=headdim,
-    ).to(tl.float32)
+    ).to(q.dtype)
 
-    dv += tl.dot(tl.trans(p), do)
-    dp = tl.dot(do, tl.trans(v.to(tl.float32)))
+    dv += tl.dot(tl.trans(p.to(q.dtype)), do, out_dtype=tl.float32)
+    dp = tl.dot(do, tl.trans(v.to(q.dtype)), out_dtype=tl.float32)
     Di = tl.load(D + offs_m_curr)
-    ds = (p * (dp - Di[:, None]) * jac).to(tl.float32)
-    dk += tl.dot(tl.trans(ds), q.to(tl.float32))
+    ds = (p * (dp - Di[:, None]) * jac).to(q.dtype)
+    dk += tl.dot(tl.trans(ds), q, out_dtype=tl.float32)
 
     return dk, dv
 
@@ -363,7 +366,7 @@ def _attn_bwd_block_dkdv(
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
-    PAD_COLS: tl.constexpr,
+    PAD_COLS,
     HEADS_PADDED: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -382,13 +385,20 @@ def _attn_bwd_block_dkdv(
     This is the main workhorse for K/V gradient computation, called for
     each K/V block position in the sequence.
     """
-    index_begin_m = max(index_start_n + actual_seqlen_q - actual_seqlen_k, 0) if IS_CAUSAL else 0
-    index_begin_m = (index_begin_m // BLOCK_M) * BLOCK_M
+    if index_start_n >= actual_seqlen_k:
+        return
+
+    shift = actual_seqlen_k - actual_seqlen_q
+    index_begin_m = tl.maximum(index_start_n - shift, 0) if IS_CAUSAL else 0
     index_end_m = actual_seqlen_q
+    if SLIDING:
+        min_m = index_start_n - shift - window_right
+        index_begin_m = tl.maximum(index_begin_m, min_m)
+        max_m_end = index_start_n + BLOCK_N - shift + window_left
+        index_end_m = tl.minimum(index_end_m, tl.maximum(0, max_m_end))
+    index_begin_m = (index_begin_m // BLOCK_M) * BLOCK_M
 
     fully_masked_lines = (actual_seqlen_q - actual_seqlen_k) if IS_CAUSAL else 0
-    if (index_begin_m >= actual_seqlen_q) or (index_start_n >= actual_seqlen_k):
-        return
 
     offs_n = index_start_n + tl.arange(0, BLOCK_N)
     offs_m = tl.arange(0, BLOCK_M)
@@ -405,110 +415,111 @@ def _attn_bwd_block_dkdv(
 
     dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    k = padded_load(k_ptrs, offs_n, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
-    v = padded_load(v_ptrs, offs_n, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
+    if index_begin_m < index_end_m:
+        k = padded_load(k_ptrs, offs_n, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
+        v = padded_load(v_ptrs, offs_n, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
 
-    fr = max(0, index_start_n + BLOCK_N - 1 + actual_seqlen_q - actual_seqlen_k)
-    fb = BLOCK_M * ((min(fr, actual_seqlen_q) + BLOCK_M - 1) // BLOCK_M)
-    num_masked_blocks = (fb - index_begin_m) // BLOCK_M if IS_CAUSAL else 0
-    index_next_start_m = index_begin_m
+        fr = tl.maximum(0, index_start_n + BLOCK_N - 1 - shift)
+        fb = BLOCK_M * ((tl.minimum(fr, index_end_m) + BLOCK_M - 1) // BLOCK_M)
+        num_masked_blocks = tl.maximum(0, (fb - index_begin_m) // BLOCK_M) if IS_CAUSAL else 0
+        index_next_start_m = index_begin_m
 
-    if num_masked_blocks > 0:
-        for _ in range(0, num_masked_blocks):
-            dk, dv = _attn_bwd_dkdv(
-                index_next_start_m,
-                k,
-                v,
-                dk,
-                dv,
-                M,
-                D,
-                offs_m,
-                offs_n,
-                offs_d,
-                q_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                do_ptrs,
-                softmax_scale,
-                stride_qm,
-                stride_bm,
-                stride_dom,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                fully_masked_lines,
-                headdim,
-                QSeg,
-                KSeg,
-                stride_qsm,
-                stride_ksn,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                MASKED=True,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=True,
-                PAD_COLS=PAD_COLS,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-                USE_SEGMENTS=USE_SEGMENTS,
-            )
-            index_next_start_m += BLOCK_M
+        if num_masked_blocks > 0:
+            for _ in range(0, num_masked_blocks):
+                dk, dv = _attn_bwd_dkdv(
+                    index_next_start_m,
+                    k,
+                    v,
+                    dk,
+                    dv,
+                    M,
+                    D,
+                    offs_m,
+                    offs_n,
+                    offs_d,
+                    q_ptrs,
+                    bias_ptrs,
+                    dropout_offs,
+                    do_ptrs,
+                    softmax_scale,
+                    stride_qm,
+                    stride_bm,
+                    stride_dom,
+                    actual_seqlen_q,
+                    actual_seqlen_k,
+                    fully_masked_lines,
+                    headdim,
+                    QSeg,
+                    KSeg,
+                    stride_qsm,
+                    stride_ksn,
+                    window_left,
+                    window_right,
+                    logits_soft_cap,
+                    softmax_aux_ptrs,
+                    num_sinks,
+                    MASKED=True,
+                    IS_CAUSAL=IS_CAUSAL,
+                    BIAS_ON=BIAS_ON,
+                    BOOL_BIAS=BOOL_BIAS,
+                    USE_DROPOUT=USE_DROPOUT,
+                    PAD_ROWS=True,
+                    PAD_COLS=PAD_COLS,
+                    HEADS_PADDED=HEADS_PADDED,
+                    SLIDING=SLIDING,
+                    SOFTCAP=SOFTCAP,
+                    USE_SINKS=USE_SINKS,
+                    USE_SEGMENTS=USE_SEGMENTS,
+                )
+                index_next_start_m += BLOCK_M
 
-    if index_next_start_m < index_end_m:
-        for index_start_m in range(index_next_start_m, index_end_m, BLOCK_M):
-            dk, dv = _attn_bwd_dkdv(
-                index_start_m,
-                k,
-                v,
-                dk,
-                dv,
-                M,
-                D,
-                offs_m,
-                offs_n,
-                offs_d,
-                q_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                do_ptrs,
-                softmax_scale,
-                stride_qm,
-                stride_bm,
-                stride_dom,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                fully_masked_lines,
-                headdim,
-                QSeg,
-                KSeg,
-                stride_qsm,
-                stride_ksn,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                MASKED=False,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=True,
-                PAD_COLS=PAD_COLS,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-                USE_SEGMENTS=USE_SEGMENTS,
-            )
+        if index_next_start_m < index_end_m:
+            for index_start_m in range(index_next_start_m, index_end_m, BLOCK_M):
+                dk, dv = _attn_bwd_dkdv(
+                    index_start_m,
+                    k,
+                    v,
+                    dk,
+                    dv,
+                    M,
+                    D,
+                    offs_m,
+                    offs_n,
+                    offs_d,
+                    q_ptrs,
+                    bias_ptrs,
+                    dropout_offs,
+                    do_ptrs,
+                    softmax_scale,
+                    stride_qm,
+                    stride_bm,
+                    stride_dom,
+                    actual_seqlen_q,
+                    actual_seqlen_k,
+                    fully_masked_lines,
+                    headdim,
+                    QSeg,
+                    KSeg,
+                    stride_qsm,
+                    stride_ksn,
+                    window_left,
+                    window_right,
+                    logits_soft_cap,
+                    softmax_aux_ptrs,
+                    num_sinks,
+                    MASKED=False,
+                    IS_CAUSAL=IS_CAUSAL,
+                    BIAS_ON=BIAS_ON,
+                    BOOL_BIAS=BOOL_BIAS,
+                    USE_DROPOUT=USE_DROPOUT,
+                    PAD_ROWS=True,
+                    PAD_COLS=PAD_COLS,
+                    HEADS_PADDED=HEADS_PADDED,
+                    SLIDING=SLIDING,
+                    SOFTCAP=SOFTCAP,
+                    USE_SINKS=USE_SINKS,
+                    USE_SEGMENTS=USE_SEGMENTS,
+                )
 
     if HEADS_PADDED:
         if PAD_COLS:
@@ -563,7 +574,7 @@ def _attn_bwd_dq(
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
-    PAD_COLS: tl.constexpr,
+    PAD_COLS,
     HEADS_PADDED: tl.constexpr,
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
@@ -688,13 +699,11 @@ def _attn_bwd_dq(
         qk_after = qk * (softmax_scale * LN2)
         jac = softmax_scale
 
-    tl.debug_barrier()
-
     p = tl.exp2(qk_after - me_i[:, None])
     p = tl.where(attn_mask, p, 0.0)
-    dp = tl.dot(do, tl.trans(v.to(tl.float32)))
-    ds = (p * (dp - de_i[:, None]) * jac).to(tl.float32)
-    dq += tl.dot(ds, k.to(tl.float32))
+    dp = tl.dot(do, tl.trans(v.to(q.dtype)), out_dtype=tl.float32)
+    ds = (p * (dp - de_i[:, None]) * jac).to(q.dtype)
+    dq += tl.dot(ds, k.to(q.dtype), out_dtype=tl.float32)
     return dq
 
 
@@ -736,7 +745,7 @@ def _attn_bwd_block_dq(
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
-    PAD_ROWS: tl.constexpr,
+    PAD_ROWS,
     HEADS_PADDED: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -756,20 +765,28 @@ def _attn_bwd_block_dq(
     This is the main workhorse for query gradient computation, called for
     each query block position in the sequence.
     """
+    if index_start_m >= actual_seqlen_q:
+        return
+
+    shift = actual_seqlen_k - actual_seqlen_q
     if IS_CAUSAL:
-        index_end_n = min(
-            actual_seqlen_k - actual_seqlen_q + index_start_m + BLOCK_M,
+        index_end_n = tl.minimum(
+            shift + index_start_m + BLOCK_M,
             actual_seqlen_k,
         )
-        if index_end_n < 0:
-            return
     else:
         index_end_n = actual_seqlen_k
 
+    if SLIDING:
+        min_k = tl.maximum(index_start_m + shift - window_left, 0)
+        start_n = (min_k // BLOCK_N) * BLOCK_N
+        max_k_end = tl.minimum(index_start_m + BLOCK_M + shift + window_right, actual_seqlen_k)
+        index_end_n = tl.maximum(tl.minimum(index_end_n, max_k_end), start_n)
+    else:
+        start_n = 0
+
     fully_masked_lines = actual_seqlen_q - actual_seqlen_k if IS_CAUSAL else 0
     mask_reached = fully_masked_lines >= index_start_m + BLOCK_M
-    if (index_start_m >= actual_seqlen_q) or mask_reached:
-        return
 
     offs_m = tl.arange(0, BLOCK_M) + index_start_m
     offs_n = tl.arange(0, BLOCK_N)
@@ -793,121 +810,123 @@ def _attn_bwd_block_dq(
         dropout_offs = None
 
     dq = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
-    q = padded_load(q_ptrs, offs_m, offs_d, PA0=PAD_ROWS, PA1=HEADS_PADDED, LA0=actual_seqlen_q, LA1=headdim)
-    do = padded_load(do_ptrs, offs_m, offs_d, PA0=PAD_ROWS, PA1=HEADS_PADDED, LA0=actual_seqlen_q, LA1=headdim).to(
-        tl.float32
-    )
-    me_i = tl.load(M + offs_m)
-    de_i = tl.load(D + offs_m)
+    if (not mask_reached) and (start_n < index_end_n):
+        q = padded_load(q_ptrs, offs_m, offs_d, PA0=PAD_ROWS, PA1=HEADS_PADDED, LA0=actual_seqlen_q, LA1=headdim)
+        do = padded_load(do_ptrs, offs_m, offs_d, PA0=PAD_ROWS, PA1=HEADS_PADDED, LA0=actual_seqlen_q, LA1=headdim).to(
+            q.dtype
+        )
+        me_i = tl.load(M + offs_m)
+        de_i = tl.load(D + offs_m)
 
-    uneven_n = actual_seqlen_k % BLOCK_N != 0
-    attention_padding = VARLEN & uneven_n
-    if IS_CAUSAL:
-        first_masked_col = index_start_m + 1 + actual_seqlen_k - actual_seqlen_q
-    elif attention_padding:
-        first_masked_col = actual_seqlen_k
-    else:
-        first_masked_col = index_end_n
-    nb_full_blocks = first_masked_col // BLOCK_N
+        uneven_n = actual_seqlen_k % BLOCK_N != 0
+        attention_padding = VARLEN & uneven_n
+        if IS_CAUSAL:
+            first_masked_col = index_start_m + 1 + shift
+        elif attention_padding:
+            first_masked_col = actual_seqlen_k
+        else:
+            first_masked_col = index_end_n
+        full_end_n = tl.minimum(first_masked_col, index_end_n)
+        nb_full_blocks = tl.maximum((full_end_n // BLOCK_N) - (start_n // BLOCK_N), 0)
 
-    index_next_start_n = 0
-    if nb_full_blocks > 0:
-        for _ in range(0, nb_full_blocks):
-            index_next_start_n = tl.multiple_of(index_next_start_n, BLOCK_N)
-            dq = _attn_bwd_dq(
-                index_next_start_n,
-                q,
-                dq,
-                do,
-                me_i,
-                de_i,
-                offs_m,
-                offs_n,
-                offs_d,
-                k_ptrs,
-                v_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_kn,
-                stride_vn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                QSeg,
-                KSeg,
-                stride_qsm,
-                stride_ksn,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                MASKED=False,
-                PAD_COLS=False,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-                USE_SEGMENTS=USE_SEGMENTS,
-            )
-            index_next_start_n += BLOCK_N
+        index_next_start_n = start_n
+        if nb_full_blocks > 0:
+            for _ in range(0, nb_full_blocks):
+                index_next_start_n = tl.multiple_of(index_next_start_n, BLOCK_N)
+                dq = _attn_bwd_dq(
+                    index_next_start_n,
+                    q,
+                    dq,
+                    do,
+                    me_i,
+                    de_i,
+                    offs_m,
+                    offs_n,
+                    offs_d,
+                    k_ptrs,
+                    v_ptrs,
+                    bias_ptrs,
+                    dropout_offs,
+                    softmax_scale,
+                    dropout_prob,
+                    dropout_seed,
+                    stride_kn,
+                    stride_vn,
+                    actual_seqlen_q,
+                    actual_seqlen_k,
+                    headdim,
+                    QSeg,
+                    KSeg,
+                    stride_qsm,
+                    stride_ksn,
+                    window_left,
+                    window_right,
+                    logits_soft_cap,
+                    softmax_aux_ptrs,
+                    num_sinks,
+                    IS_CAUSAL=IS_CAUSAL,
+                    BIAS_ON=BIAS_ON,
+                    BOOL_BIAS=BOOL_BIAS,
+                    USE_DROPOUT=USE_DROPOUT,
+                    MASKED=False,
+                    PAD_COLS=False,
+                    HEADS_PADDED=HEADS_PADDED,
+                    SLIDING=SLIDING,
+                    SOFTCAP=SOFTCAP,
+                    USE_SINKS=USE_SINKS,
+                    USE_SEGMENTS=USE_SEGMENTS,
+                )
+                index_next_start_n += BLOCK_N
 
-    if index_next_start_n < index_end_n:
-        for index_start_n in range(index_next_start_n, index_end_n, BLOCK_N):
-            pad_cols = (not EVEN_N) or (VARLEN and (index_start_n + BLOCK_N > actual_seqlen_k))
-            dq = _attn_bwd_dq(
-                index_start_n,
-                q,
-                dq,
-                do,
-                me_i,
-                de_i,
-                offs_m,
-                offs_n,
-                offs_d,
-                k_ptrs,
-                v_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_kn,
-                stride_vn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                QSeg,
-                KSeg,
-                stride_qsm,
-                stride_ksn,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                MASKED=True,
-                PAD_COLS=pad_cols,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-                USE_SEGMENTS=USE_SEGMENTS,
-            )
+        if index_next_start_n < index_end_n:
+            for index_start_n in range(index_next_start_n, index_end_n, BLOCK_N):
+                pad_cols = (not EVEN_N) or (VARLEN and (index_start_n + BLOCK_N > actual_seqlen_k))
+                dq = _attn_bwd_dq(
+                    index_start_n,
+                    q,
+                    dq,
+                    do,
+                    me_i,
+                    de_i,
+                    offs_m,
+                    offs_n,
+                    offs_d,
+                    k_ptrs,
+                    v_ptrs,
+                    bias_ptrs,
+                    dropout_offs,
+                    softmax_scale,
+                    dropout_prob,
+                    dropout_seed,
+                    stride_kn,
+                    stride_vn,
+                    actual_seqlen_q,
+                    actual_seqlen_k,
+                    headdim,
+                    QSeg,
+                    KSeg,
+                    stride_qsm,
+                    stride_ksn,
+                    window_left,
+                    window_right,
+                    logits_soft_cap,
+                    softmax_aux_ptrs,
+                    num_sinks,
+                    IS_CAUSAL=IS_CAUSAL,
+                    BIAS_ON=BIAS_ON,
+                    BOOL_BIAS=BOOL_BIAS,
+                    USE_DROPOUT=USE_DROPOUT,
+                    MASKED=True,
+                    PAD_COLS=pad_cols,
+                    HEADS_PADDED=HEADS_PADDED,
+                    SLIDING=SLIDING,
+                    SOFTCAP=SOFTCAP,
+                    USE_SINKS=USE_SINKS,
+                    USE_SEGMENTS=USE_SEGMENTS,
+                )
 
-    if fully_masked_lines > 0:
-        dq = tl.where(offs_m[:, None] < fully_masked_lines, 0, dq)
+        if fully_masked_lines > 0:
+            dq = tl.where(offs_m[:, None] < fully_masked_lines, 0, dq)
 
     if HEADS_PADDED:
         if PAD_ROWS:
@@ -1290,8 +1309,8 @@ def _bwd_attention_kernel_call(
     """
     if bwd_params is None:
         bwd_params = BwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=0)
-    block_m = int(bwd_params.q_blocksize or 32)
-    block_n = int(bwd_params.kv_blocksize or 32)
+    block_m = max(16, triton.next_power_of_2(int(bwd_params.q_blocksize or 32)))
+    block_n = max(16, triton.next_power_of_2(int(bwd_params.kv_blocksize or 32)))
     num_warps = int(bwd_params.num_warps or 4)
     num_stages = int(bwd_params.num_stages or 0)
 
@@ -1388,8 +1407,6 @@ def _bwd_attention_kernel_call(
         max_seqlen_k = KSeq_max
         max_seqlen_q_rounded = M.shape[-1]
         BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
-
-        from ._utilities import attention_pack_from_cu_static, attention_unpack_with_static_shape
 
         q_p = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch_size * QSeq_max)
         k_p = attention_pack_from_cu_static(k, cum_seqlens_k, max_tokens=batch_size * KSeq_max)
@@ -1529,23 +1546,7 @@ def _bwd_attention_kernel_call(
         dq = attention_unpack_with_static_shape(dq, cum_seqlens_q, batch_size, QSeq_max)
         dk = attention_unpack_with_static_shape(dk, cum_seqlens_k, batch_size, KSeq_max)
         dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, KSeq_max)
-        return dq, dk, dv
-
-    if attention_mask is not None and varlen_from_cu:
-        assert bias is None, "mask + bias not supported; use bias alone or pack bias."
-        assert q.shape[1] == k.shape[1], "mask varlen path supports QSeq == KSeq only."
-        varlen_mode = attention_mask.shape[0] > 1
-        useless_padding = attention_mask.shape[1] - attention_mask.sum(-1).max().item()
-        if useless_padding > 0:
-            dO = dO[:, :-useless_padding]
-            q = q[:, :-useless_padding]
-            k = k[:, :-useless_padding]
-            v = v[:, :-useless_padding]
-            attention_mask = attention_mask[:, :-useless_padding]
-            o = o[:, :-useless_padding]
-    else:
-        varlen_mode = False
-        useless_padding = 0
+        return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
 
     batch_size, QSeq, nheads_q, head_dim = q.shape
     _, KSeq, nheads_kv, _ = k.shape
@@ -1554,32 +1555,13 @@ def _bwd_attention_kernel_call(
     assert nheads_q % nheads_kv == 0
     assert M.shape == (batch_size, nheads_q, max_seqlen_q_rounded)
     BOOL_BIAS = False
-    if not varlen_mode and attention_mask is not None:
+    if attention_mask is not None:
         assert bias is None, "mask + bias not supported"
         BOOL_BIAS = True
         bias = attention_mask.astype(jnp.bool_)
 
-    if varlen_mode:
-        cum_seqlens_q = jnp.zeros((attention_mask.shape[0] + 1,), dtype=jnp.int32)
-        cum_seqlens_k = jnp.zeros((attention_mask.shape[0] + 1,), dtype=jnp.int32)
-        lengths = attention_mask.sum(axis=1, dtype="i4")
-        cum_seqlens_q = cum_seqlens_q.at[1:].set(jnp.cumsum(lengths, axis=0, dtype="i4"))
-        cum_seqlens_k = cum_seqlens_k.at[1:].set(jnp.cumsum(lengths, axis=0, dtype="i4"))
-        max_seqlen_q = attention_mask.shape[1]
-        max_seqlen_k = attention_mask.shape[1]
-
-        dO = attention_pack_with_static_shape(dO, attention_mask)
-        q = attention_pack_with_static_shape(q, attention_mask)
-        k = attention_pack_with_static_shape(k, attention_mask)
-        v = attention_pack_with_static_shape(v, attention_mask)
-        o = attention_pack_with_static_shape(o, attention_mask)
-        QSeq = q.shape[1]
-        KSeq = k.shape[1]
-    else:
-        cum_seqlens_q = None
-        cum_seqlens_k = None
-        max_seqlen_q = QSeq
-        max_seqlen_k = KSeq
+    max_seqlen_q = QSeq
+    max_seqlen_k = KSeq
 
     bz, bh, bm = calc_bias_strides(bias, batch_size, nheads_q, QSeq, KSeq)
     num_repeats = nheads_q // nheads_kv
@@ -1607,11 +1589,11 @@ def _bwd_attention_kernel_call(
         nheads_q,
         QSeq,
         max_seqlen_q_rounded,
-        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
         head_dim,
         max_seqlen_q // 32,
         dtype_index(q),
-        VARLEN=varlen_mode,
+        VARLEN=False,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         out_shape=[jax.ShapeDtypeStruct(shape=M.shape, dtype="f4", sharding=get_sharding(M))],
         grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch_size * nheads_q),
@@ -1668,9 +1650,9 @@ def _bwd_attention_kernel_call(
         window_left,
         window_right,
         QSeq,
-        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
         KSeq,
-        cum_seqlens_k if cum_seqlens_k is not None else jnp.zeros((1,), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
         max_seqlen_q_rounded,
         head_dim,
         max_seqlen_q // 32,
@@ -1680,7 +1662,7 @@ def _bwd_attention_kernel_call(
         softmax_aux_tensor,
         num_sinks_val,
         BIAS_ON=(bias is not None),
-        VARLEN=varlen_mode,
+        VARLEN=False,
         IS_CAUSAL=causal,
         USE_DROPOUT=(dropout_prob > 0),
         BLOCK_HEADDIM=BLOCK_HEADDIM,
@@ -1712,14 +1694,4 @@ def _bwd_attention_kernel_call(
         dk = dk.reshape(dk.shape[0], dk.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
         dv = dv.reshape(dv.shape[0], dv.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
 
-    if varlen_mode:
-        dq = attention_unpack_with_static_shape(dq, cum_seqlens_q, batch_size, max_seqlen_q)
-        dk = attention_unpack_with_static_shape(dk, cum_seqlens_k, batch_size, max_seqlen_k)
-        dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, max_seqlen_k)
-
-    if useless_padding > 0:
-        dq = jnp.pad(dq, ((0, useless_padding), (0, 0), (0, 0)))
-        dk = jnp.pad(dk, ((0, useless_padding), (0, 0), (0, 0)))
-        dv = jnp.pad(dv, ((0, useless_padding), (0, 0), (0, 0)))
-
-    return dq, dk, dv
+    return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)

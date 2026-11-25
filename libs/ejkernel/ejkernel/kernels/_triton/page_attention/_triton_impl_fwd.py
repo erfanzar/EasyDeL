@@ -15,43 +15,20 @@
 """Paged attention kernels with optional partitioning for Triton.
 
 This module provides Triton kernels for paged attention computation, supporting
-both single-pass and partitioned attention modes. The partitioned mode splits
-large context windows across multiple partitions for improved parallelism.
-
-Kernel Components:
------------------
-_paged_attn_kernel:
-    Main attention kernel with explicit launch configuration. Computes attention
-    over block-tabled KV cache with optional partitioning for long contexts.
-    Uses log2-based softmax for numerical stability.
-
-_paged_attn_v2_reduce_kernel:
-    Reduction kernel for partitioned attention. Combines partial results
-    from multiple partitions using log-sum-exp weighted averaging.
-
-Memory Layout:
--------------
-KV caches use a block-tabled layout where:
-- Physical blocks are indexed via block_tables
-- Each block contains KV_BLOCK_SIZE tokens
-- Supports grouped-query attention (GQA) with QUERY_GROUP_SIZE
-
-Partitioning Strategy:
----------------------
-For contexts exceeding PARTITION_SIZE tokens:
-1. Context is divided into ceil(context_len / PARTITION_SIZE) partitions
-2. Each partition computes local attention and stores (output, max, sum)
-3. Reduce kernel combines partitions using numerically stable reduction
-
-Key Features:
-- Deterministic launch configuration supplied by the caller
-- Supports GQA/MQA with flexible query group sizes
-- Efficient block-tabled memory access
-- Optional partitioning for very long sequences
+both single-pass and partitioned attention modes.
 """
 
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _tanh_safe(x):
+    """Overflow-safe tanh(x) computed via exp(-2|x|)."""
+    ax = tl.abs(x)
+    z = tl.exp(-2.0 * ax)
+    t = (1.0 - z) / (1.0 + z)
+    return tl.where(x >= 0.0, t, -t)
 
 
 @triton.jit
@@ -65,6 +42,7 @@ def _paged_attn_kernel(
     l_i_ptr,
     out_ptr,
     attn_scale,
+    softcap,
     stride_bt0,
     stride_bt1,
     stride_q0,
@@ -85,40 +63,19 @@ def _paged_attn_kernel(
     NUM_KV_HEADS: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
+    USE_FP32_IEEE: tl.constexpr,
 ):
-    """Paged attention Triton kernel with optional context partitioning.
-
-    Computes attention over block-tabled KV caches using log2-based softmax
-    for numerical stability. Supports both single-pass and partitioned modes
-    for handling long context windows efficiently.
-
-    Each program instance handles one (sequence, kv_head, partition) tuple.
-    In single-pass mode (PARTITION_SIZE=0), each instance processes the full
-    context. In partitioned mode, each instance processes a partition and
-    stores partial (max, sum) statistics for later reduction.
-
-    Args:
-        q_ptr: Query tensor pointer, shape (num_seqs, num_heads, head_dim).
-        k_cache_ptr: Key cache pointer, shape (num_blocks, num_kv_heads, block_size, head_dim).
-        v_cache_ptr: Value cache pointer, same shape as key cache.
-        context_lens_ptr: Per-sequence context lengths pointer, shape (num_seqs,).
-        block_tables_ptr: Block table pointer mapping logical to physical blocks.
-        m_i_ptr: Output pointer for per-partition max logits (partitioned mode).
-        l_i_ptr: Output pointer for per-partition sum of exp (partitioned mode).
-        out_ptr: Output attention tensor pointer.
-        attn_scale: Attention scaling factor (typically 1/sqrt(head_dim)).
-        stride_bt0..stride_o4: Tensor stride parameters for indexing.
-        HEAD_SIZE: Head dimension size (compile-time constant).
-        QUERY_GROUP_SIZE: Number of query heads per KV head for GQA.
-        PADDED_QUERY_GROUP_SIZE: Power-of-2 padded group size for alignment.
-        NUM_KV_HEADS: Number of key-value heads.
-        KV_BLOCK_SIZE: Number of tokens per KV cache block.
-        PARTITION_SIZE: Context partition size (0 for single-pass mode).
-    """
+    """Paged attention Triton kernel with optional context partitioning."""
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     part_idx = tl.program_id(2)
     max_num_partitions = tl.num_programs(2)
+
+    seq_idx64 = seq_idx.to(tl.int64)
+    kv_head_idx64 = kv_head_idx.to(tl.int64)
+    part_idx64 = part_idx.to(tl.int64)
+    max_num_partitions64 = max_num_partitions.to(tl.int64)
 
     log2e: tl.constexpr = 1.4426950408889634
 
@@ -132,25 +89,33 @@ def _paged_attn_kernel(
         context_range = context_end_idx - context_start_idx
         num_blocks = (context_range + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
     else:
-        context_end_idx = context_len
-        num_blocks = (context_len + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
+        context_end_idx = tl.maximum(context_len, 0)
+        num_blocks = (context_end_idx + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
 
     block_offset = tl.arange(0, KV_BLOCK_SIZE)
     head_offset = tl.arange(0, HEAD_SIZE)
     padding_group_offset = tl.arange(0, PADDED_QUERY_GROUP_SIZE)
 
-    kv_offset = kv_head_idx * stride_kv1 + block_offset[:, None] * stride_kv2 + head_offset[None, :] * stride_kv3
+    block_offset64 = block_offset.to(tl.int64)
+    head_offset64 = head_offset.to(tl.int64)
+    padding_group_offset64 = padding_group_offset.to(tl.int64)
+
+    kv_offset = (
+        kv_head_idx64 * stride_kv1
+        + block_offset64[:, None] * stride_kv2
+        + head_offset64[None, :] * stride_kv3
+    )
 
     q_offset = (
-        seq_idx * stride_q0
-        + (kv_head_idx * QUERY_GROUP_SIZE + padding_group_offset[:, None]) * stride_q1
-        + head_offset[None, :] * stride_q2
+        seq_idx64 * stride_q0
+        + (kv_head_idx64 * QUERY_GROUP_SIZE + padding_group_offset64[:, None]) * stride_q1
+        + head_offset64[None, :] * stride_q2
     )
     group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
 
     q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
 
-    m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
+    m_i = tl.full([PADDED_QUERY_GROUP_SIZE], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
     acc = tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
 
@@ -158,64 +123,87 @@ def _paged_attn_kernel(
         num_prev_blocks = part_idx * (PARTITION_SIZE // KV_BLOCK_SIZE)
     else:
         num_prev_blocks = 0
+
+    bt_row_base = seq_idx64 * stride_bt0
     for i in range(num_blocks):
         block_idx = num_prev_blocks + i
-        block_number = tl.load(block_tables_ptr + seq_idx * stride_bt0 + block_idx * stride_bt1)
+        block_number = tl.load(block_tables_ptr + bt_row_base + block_idx.to(tl.int64) * stride_bt1).to(tl.int64)
 
         kv_block_offset = block_number * stride_kv0 + kv_offset
         mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
         # Mask against this partition's end, not the full context length, so a
         # tail block that straddles the partition boundary is not also counted
         # by the next partition (which would double-weight those positions).
-        kv_mask = mask_offset[:, None] < context_end_idx
+        valid_k = mask_offset < context_end_idx
+        kv_mask = valid_k[:, None]
 
         k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
 
         if PADDED_QUERY_GROUP_SIZE == 1:
-            qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
+            qk = tl.sum(q.to(tl.float32)[:, None, :] * k.to(tl.float32)[None, :, :], axis=2)
+        elif USE_FP32_IEEE:
+            qk = tl.dot(q, tl.trans(k), input_precision="ieee", out_dtype=tl.float32)
         else:
-            qk = tl.dot(q, k.T, out_dtype=tl.float32)
+            qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
 
         qk *= attn_scale
-        qk = tl.where(mask_offset < context_end_idx, qk, float("-inf"))
+        if HAS_SOFTCAP:
+            qk = softcap * _tanh_safe(qk / softcap)
+        qk_masked = tl.where(valid_k[None, :], qk, float("-inf"))
 
-        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_blk = tl.max(qk_masked, axis=1)
+        has_any = m_blk > float("-inf")
+        m_i_new = tl.where(has_any, tl.maximum(m_i, m_blk), m_i)
 
-        p = tl.math.exp2((qk - m_i_new[:, None]) * log2e)
-        alpha = tl.math.exp2((m_i - m_i_new) * log2e)
+        alpha = tl.where(
+            has_any & (m_i > float("-inf")),
+            tl.math.exp2((m_i - m_i_new) * log2e),
+            tl.where(has_any, 0.0, 1.0),
+        )
+        p = tl.where(
+            valid_k[None, :],
+            tl.math.exp2(tl.where(valid_k[None, :], (qk - m_i_new[:, None]) * log2e, float("-inf"))),
+            0.0,
+        )
         acc *= alpha[:, None]
 
         v = tl.load(v_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
 
         if PADDED_QUERY_GROUP_SIZE == 1:
-            acc += tl.sum(p.T[:, :, None] * v[:, None, :], axis=0)
+            acc += tl.sum(tl.trans(p)[:, :, None] * v.to(tl.float32)[:, None, :], axis=0)
+        elif USE_FP32_IEEE:
+            acc += tl.dot(p.to(v.dtype), v, input_precision="ieee", out_dtype=tl.float32)
         else:
-            p = p.to(v.dtype)
-            acc += tl.dot(p, v, out_dtype=tl.float32)
+            acc += tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
-    acc = acc / l_i[:, None]
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc / l_safe[:, None]
 
     if USE_PARTITIONING:
         part_offset = (
-            (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE
-            + part_idx * QUERY_GROUP_SIZE
-            + padding_group_offset
+            (seq_idx64 * NUM_KV_HEADS + kv_head_idx64) * max_num_partitions64 * QUERY_GROUP_SIZE
+            + part_idx64 * QUERY_GROUP_SIZE
+            + padding_group_offset64
         )
         mask = padding_group_offset < QUERY_GROUP_SIZE
         tl.store(m_i_ptr + part_offset, m_i, mask=mask)
         tl.store(l_i_ptr + part_offset, l_i, mask=mask)
 
-    out_offset = seq_idx * stride_o0
+    out_offset = seq_idx64 * stride_o0
     if USE_PARTITIONING:
-        out_offset += kv_head_idx * stride_o1
+        out_offset += kv_head_idx64 * stride_o1
     else:
-        out_offset += kv_head_idx * QUERY_GROUP_SIZE * stride_o1
-    out_offset += part_idx * stride_o2 + padding_group_offset[:, None] * stride_o3 + head_offset[None, :] * stride_o4
+        out_offset += kv_head_idx64 * QUERY_GROUP_SIZE * stride_o1
+    out_offset += (
+        part_idx64 * stride_o2
+        + padding_group_offset64[:, None] * stride_o3
+        + head_offset64[None, :] * stride_o4
+    )
 
-    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
-    tl.store(out_ptr + out_offset, acc, mask=group_mask)
+    tl.store(out_ptr + out_offset, acc.to(out_ptr.dtype.element_ty), mask=group_mask)
 
 
 @triton.jit
@@ -231,82 +219,87 @@ def _paged_attn_v2_reduce_kernel(
     stride_o2,
     HEAD_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
     NUM_PARTITIONS: tl.constexpr,
 ):
     """Reduction kernel for partitioned paged attention.
 
-    Combines partial attention outputs from multiple context partitions using
-    numerically stable log-sum-exp weighted averaging. Each partition stores
-    its local (max_logit, sum_exp, output) which are combined here.
-
-    For single-partition cases (num_partitions == 1), the kernel simply copies
-    the temporary output to the final output buffer. For multi-partition cases,
-    it reweights each partition's output by its relative contribution to the
-    global softmax normalization.
-
-    Args:
-        m_i_ptr: Per-partition max logits, shape (num_seqs, num_kv_heads, num_splits, group_size).
-        l_i_ptr: Per-partition sum of exp, same shape as m_i_ptr.
-        tmp_out_ptr: Per-partition attention outputs.
-        context_lens_ptr: Per-sequence context lengths, shape (num_seqs,).
-        out_ptr: Final output attention tensor pointer.
-        max_num_partitions: Maximum number of partitions across all sequences.
-        stride_o0..stride_o2: Output tensor strides.
-        HEAD_SIZE: Head dimension size (compile-time constant).
-        QUERY_GROUP_SIZE: Number of query heads per KV head.
-        NUM_KV_HEADS: Number of key-value heads.
-        PARTITION_SIZE: Size of each context partition.
-        NUM_PARTITIONS: Power-of-2 padded number of partitions.
+    Supports non-power-of-2 ``QUERY_GROUP_SIZE`` via ``PADDED_QUERY_GROUP_SIZE``
+    masking and guards ``context_len <= 0`` without division by zero.
     """
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    context_len = tl.load(context_lens_ptr + seq_idx)
+    seq_idx64 = seq_idx.to(tl.int64)
+    kv_head_idx64 = kv_head_idx.to(tl.int64)
+    max_num_partitions64 = max_num_partitions.to(tl.int64)
 
-    num_partitions = (context_len + PARTITION_SIZE - 1) // PARTITION_SIZE
-    group_head_offset = tl.arange(0, QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
-    if num_partitions == 1:
-        tmp_out_offset = (
-            seq_idx * NUM_KV_HEADS + kv_head_idx
-        ) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE + group_head_offset
-        tmp_out = tl.load(tmp_out_ptr + tmp_out_offset)
+    offs_g = tl.arange(0, PADDED_QUERY_GROUP_SIZE)
+    offs_d = tl.arange(0, HEAD_SIZE)
+    offs_g64 = offs_g.to(tl.int64)
+    offs_d64 = offs_d.to(tl.int64)
+    g_mask = offs_g < QUERY_GROUP_SIZE
 
-        out_offset = seq_idx * stride_o0 + kv_head_idx * QUERY_GROUP_SIZE * stride_o1 + group_head_offset * stride_o2
-        tl.store(out_ptr + out_offset, tmp_out)
-        return
-
-    ml_offset = (
-        (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE
-        + tl.arange(0, NUM_PARTITIONS)[:, None] * QUERY_GROUP_SIZE
-        + tl.arange(0, QUERY_GROUP_SIZE)[None, :]
+    out_offset = (
+        seq_idx64 * stride_o0
+        + (kv_head_idx64 * QUERY_GROUP_SIZE + offs_g64[:, None]) * stride_o1
+        + offs_d64[None, :] * stride_o2
     )
 
-    mask = tl.arange(0, NUM_PARTITIONS)[:, None] < num_partitions
+    context_len = tl.load(context_lens_ptr + seq_idx).to(tl.int32)
+    if context_len <= 0:
+        tl.store(
+            out_ptr + out_offset,
+            tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32).to(out_ptr.dtype.element_ty),
+            mask=g_mask[:, None],
+        )
+        return
+
+    num_partitions = (context_len + PARTITION_SIZE - 1) // PARTITION_SIZE
+    group_head_offset = offs_g64[:, None] * HEAD_SIZE + offs_d64[None, :]
+
+    if num_partitions == 1:
+        tmp_out_offset = (
+            (seq_idx64 * NUM_KV_HEADS + kv_head_idx64) * max_num_partitions64 * QUERY_GROUP_SIZE * HEAD_SIZE
+            + group_head_offset
+        )
+        tmp_out = tl.load(tmp_out_ptr + tmp_out_offset, mask=g_mask[:, None], other=0.0)
+        tl.store(out_ptr + out_offset, tmp_out.to(out_ptr.dtype.element_ty), mask=g_mask[:, None])
+        return
+
+    offs_p = tl.arange(0, NUM_PARTITIONS)
+    offs_p64 = offs_p.to(tl.int64)
+    mask = (offs_p[:, None] < num_partitions) & g_mask[None, :]
+
+    ml_offset = (
+        (seq_idx64 * NUM_KV_HEADS + kv_head_idx64) * max_num_partitions64 * QUERY_GROUP_SIZE
+        + offs_p64[:, None] * QUERY_GROUP_SIZE
+        + offs_g64[None, :]
+    )
 
     m_i = tl.load(m_i_ptr + ml_offset, mask=mask, other=float("-inf"))
-
     m = tl.max(m_i, axis=0)
 
-    l_i = tl.load(l_i_ptr + ml_offset, mask=mask, other=0.0)
-    l_i *= tl.exp(m_i - m[None, :])
+    valid_m = mask & (m_i > float("-inf")) & (m[None, :] > float("-inf"))
+    scale = tl.where(valid_m, tl.exp(tl.where(valid_m, m_i - m[None, :], float("-inf"))), 0.0)
 
+    l_i = tl.load(l_i_ptr + ml_offset, mask=mask, other=0.0) * scale
     l = tl.sum(l_i, axis=0)
+    l_safe = tl.where(l > 0.0, l, 1.0)
 
-    r = l_i / l[None, :]
-    r = tl.reshape(r, (NUM_PARTITIONS, QUERY_GROUP_SIZE, 1))
+    r = l_i / l_safe[None, :]
+    r = tl.reshape(r, (NUM_PARTITIONS, PADDED_QUERY_GROUP_SIZE, 1))
 
     tmp_out_offset = (
-        (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE
-        + tl.arange(0, NUM_PARTITIONS)[:, None, None] * QUERY_GROUP_SIZE * HEAD_SIZE
-        + tl.arange(0, QUERY_GROUP_SIZE)[None, :, None] * HEAD_SIZE
-        + tl.arange(0, HEAD_SIZE)[None, None, :]
+        (seq_idx64 * NUM_KV_HEADS + kv_head_idx64) * max_num_partitions64 * QUERY_GROUP_SIZE * HEAD_SIZE
+        + offs_p64[:, None, None] * (QUERY_GROUP_SIZE * HEAD_SIZE)
+        + offs_g64[None, :, None] * HEAD_SIZE
+        + offs_d64[None, None, :]
     )
 
     tmp_out = tl.load(tmp_out_ptr + tmp_out_offset, mask=mask[:, :, None], other=0.0)
+    out = tl.sum((tmp_out.to(tl.float32) * r), axis=0)
 
-    out = tl.sum((tmp_out * r).to(tl.float32), axis=0)
-
-    out_offset = seq_idx * stride_o0 + kv_head_idx * QUERY_GROUP_SIZE * stride_o1 + group_head_offset * stride_o2
-    tl.store(out_ptr + out_offset, out)
+    tl.store(out_ptr + out_offset, out.to(out_ptr.dtype.element_ty), mask=g_mask[:, None])

@@ -106,5 +106,115 @@ def test_recurrent_gla_matches_xla_smoke():
     np.testing.assert_allclose(state_tri, state_xla, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_recurrent_gla_matches_xla_with_4d_gate_and_gamma(reverse: bool):
+    rng = jax.random.PRNGKey(10 + int(reverse))
+    kq, kk, kv, kg, kgg, ks = jax.random.split(rng, 6)
+
+    batch_size, seq_len, num_heads, key_dim, value_dim = 2, 32, 4, 64, 64
+    query = jax.random.normal(kq, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * 0.5
+    key = jax.random.normal(kk, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * 0.5
+    value = jax.random.normal(kv, (batch_size, seq_len, num_heads, value_dim), dtype=jnp.float32) * 0.5
+    gate = jax.nn.log_sigmoid(jax.random.normal(kg, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32))
+    g_gamma = -jnp.abs(jax.random.normal(kgg, (num_heads,), dtype=jnp.float32)) * 0.1
+    init_state = jax.random.normal(ks, (batch_size, num_heads, key_dim, value_dim), dtype=jnp.float32) * 0.2
+
+    out_tri, state_tri = recurrent_gla(
+        query,
+        key,
+        value,
+        g=gate,
+        g_gamma=g_gamma,
+        initial_state=init_state,
+        reverse=reverse,
+    )
+    out_xla, state_xla = xla_recurrent_gla(
+        query,
+        key,
+        value,
+        g=gate,
+        g_gamma=g_gamma,
+        initial_state=init_state,
+        reverse=reverse,
+    )
+
+    out_tri, state_tri = jax.block_until_ready((out_tri, state_tri))
+    out_xla, state_xla = jax.block_until_ready((out_xla, state_xla))
+
+    np.testing.assert_allclose(out_tri, out_xla, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(state_tri, state_xla, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("with_initial_state", [True, False])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_recurrent_gla_grad_matches_xla(with_initial_state: bool, reverse: bool):
+    rng = jax.random.PRNGKey(20 + 2 * int(with_initial_state) + int(reverse))
+    kq, kk, kv, kg, ks = jax.random.split(rng, 5)
+
+    batch_size, seq_len, num_heads, key_dim, value_dim = 2, 16, 2, 32, 32
+    query = jax.random.normal(kq, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * 0.5
+    key = jax.random.normal(kk, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * 0.5
+    value = jax.random.normal(kv, (batch_size, seq_len, num_heads, value_dim), dtype=jnp.float32) * 0.5
+    gate = jax.nn.log_sigmoid(jax.random.normal(kg, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32))
+    init_state = (
+        jax.random.normal(ks, (batch_size, num_heads, key_dim, value_dim), dtype=jnp.float32) * 0.2
+        if with_initial_state
+        else None
+    )
+
+    def _loss(fn, q_, k_, v_, g_, h0_):
+        out, st = fn(q_, k_, v_, g=g_, initial_state=h0_, reverse=reverse)
+        return jnp.mean(out) + 0.25 * jnp.mean(st)
+
+    argnums = (0, 1, 2, 3, 4) if with_initial_state else (0, 1, 2, 3)
+    grads_tri = jax.grad(lambda q_, k_, v_, g_, h0_: _loss(recurrent_gla, q_, k_, v_, g_, h0_), argnums=argnums)(
+        query, key, value, gate, init_state
+    )
+    grads_xla = jax.grad(lambda q_, k_, v_, g_, h0_: _loss(xla_recurrent_gla, q_, k_, v_, g_, h0_), argnums=argnums)(
+        query, key, value, gate, init_state
+    )
+
+    grads_tri = jax.tree_util.tree_map(jax.block_until_ready, grads_tri)
+    grads_xla = jax.tree_util.tree_map(jax.block_until_ready, grads_xla)
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(g_tri, g_xla, rtol=2e-3, atol=2e-3)
+
+
+def test_recurrent_gla_jit_forward_and_grad():
+    rng = jax.random.PRNGKey(42)
+    kq, kk, kv, kg, kgg = jax.random.split(rng, 5)
+
+    batch_size, seq_len, num_heads, key_dim, value_dim = 2, 16, 2, 32, 32
+    query = jax.random.normal(kq, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * 0.5
+    key = jax.random.normal(kk, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32) * 0.5
+    value = jax.random.normal(kv, (batch_size, seq_len, num_heads, value_dim), dtype=jnp.float32) * 0.5
+    gate = jax.nn.log_sigmoid(jax.random.normal(kg, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32))
+    g_gamma = -jnp.abs(jax.random.normal(kgg, (num_heads,), dtype=jnp.float32)) * 0.1
+
+    @jax.jit
+    def _fwd_jit(q_, k_, v_, g_, gg_):
+        return recurrent_gla(q_, k_, v_, g=g_, g_gamma=gg_)
+
+    out_tri, state_tri = jax.block_until_ready(_fwd_jit(query, key, value, gate, g_gamma))
+    out_xla, state_xla = jax.block_until_ready(xla_recurrent_gla(query, key, value, g=gate, g_gamma=g_gamma))
+    np.testing.assert_allclose(out_tri, out_xla, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(state_tri, state_xla, rtol=1e-3, atol=1e-3)
+
+    def _loss_tri(q_, k_, v_, g_, gg_):
+        out, st = recurrent_gla(q_, k_, v_, g=g_, g_gamma=gg_)
+        return jnp.mean(out) + 0.2 * jnp.mean(st)
+
+    def _loss_xla(q_, k_, v_, g_, gg_):
+        out, st = xla_recurrent_gla(q_, k_, v_, g=g_, g_gamma=gg_)
+        return jnp.mean(out) + 0.2 * jnp.mean(st)
+
+    grads_tri = jax.jit(jax.grad(_loss_tri, argnums=(0, 1, 2, 3)))(query, key, value, gate, g_gamma)
+    grads_xla = jax.grad(_loss_xla, argnums=(0, 1, 2, 3))(query, key, value, gate, g_gamma)
+    grads_tri = jax.tree_util.tree_map(jax.block_until_ready, grads_tri)
+    grads_xla = jax.tree_util.tree_map(jax.block_until_ready, grads_xla)
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(g_tri, g_xla, rtol=2e-3, atol=2e-3)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

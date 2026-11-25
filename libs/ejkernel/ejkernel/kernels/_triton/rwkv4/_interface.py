@@ -83,11 +83,14 @@ def _fwd_call(
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None,
+    block_c: int,
 ):
     """Forward pass for RWKV-4 time-mix in a custom VJP.
 
     Computes the RWKV-4 recurrence and saves residuals for backward pass.
-    Initializes state if not provided.
+    Initializes state if not provided. Note that ``state_input`` is kept in the
+    residual pytree directly (without a Python bool flag) because ``None`` is
+    tracked statically in JAX's pytree structure and never becomes a tracer.
 
     Args:
         w: Time decay parameter in log-space of shape `[C]`.
@@ -95,12 +98,12 @@ def _fwd_call(
         k: Key tensor of shape `[B, T, C]`.
         v: Value tensor of shape `[B, T, C]`.
         state: Optional initial state `[B, 3, C]` containing (alpha, beta, eps).
+        block_c: Non-differentiable channel block size for Triton forward kernel.
 
     Returns:
         A tuple containing (output, final_state) and residuals for backward.
     """
     state_input = state
-    state_was_none = state is None
     if state is None:
         bsz, _, chans = k.shape
         alpha0 = jnp.zeros((bsz, chans), dtype=jnp.float32)
@@ -110,23 +113,31 @@ def _fwd_call(
 
     w_neg = -jnp.exp(w.astype(jnp.float32))
     o, final_state, state_hist = fwd_triton_impl_with_history(
-        w_neg, u.astype(jnp.float32), k, v, state.astype(jnp.float32)
+        w_neg,
+        u.astype(jnp.float32),
+        k,
+        v,
+        state.astype(jnp.float32),
+        block_c=block_c,
     )
-    residual = (w, u, k, v, w_neg, state_hist, state_was_none, state_input)
+    residual = (w, u, k, v, w_neg, state_hist, state_input)
     return (o, final_state), residual
 
 
 def _bwd_call(
+    block_c: int,
     residual,
     grads,
 ):
     """Backward pass for RWKV-4 time-mix in a custom VJP.
 
     Args:
-        residual: Tensors saved from the forward pass (w, u, k, v, state).
+        block_c: Non-differentiable channel block size from forward.
+        residual: Tensors saved from the forward pass.
         grads: A tuple containing gradients (do, dstate) of output and final state.
     """
-    w, u, k, v, w_neg, state_hist, state_was_none, state_input = residual
+    del block_c
+    w, u, k, v, w_neg, state_hist, state_input = residual
     do, dstate = grads
 
     do = ad.instantiate_zeros(do)
@@ -150,20 +161,21 @@ def _bwd_call(
     dk = dk.astype(k.dtype)
     dv = dv.astype(v.dtype)
 
-    if state_was_none:
+    if state_input is None:
         state_cotangent = None
     else:
         state_cotangent = dstate0.astype(state_input.dtype)
     return dw, du, dk, dv, state_cotangent
 
 
-@partial(jax.custom_vjp)
+@partial(jax.custom_vjp, nondiff_argnums=(5,))
 def _rwkv4(
     w: Float[Array, "chans"],
     u: Float[Array, "chans"],
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None = None,
+    block_c: int = 64,
 ) -> tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
     """Core RWKV-4 function with custom VJP.
 
@@ -177,6 +189,7 @@ def _rwkv4(
         k: Key tensor of shape `[B, T, C]`.
         v: Value tensor of shape `[B, T, C]`.
         state: Optional initial state `[B, 3, C]` containing (alpha, beta, eps).
+        block_c: Channel block size for the Triton forward kernel.
 
     Returns:
         A tuple containing:
@@ -191,7 +204,7 @@ def _rwkv4(
         state = jnp.stack([alpha0, beta0, eps0], axis=1)
 
     w_neg = -jnp.exp(w.astype(jnp.float32))
-    return fwd_triton_impl(w_neg, u.astype(jnp.float32), k, v, state.astype(jnp.float32))
+    return fwd_triton_impl(w_neg, u.astype(jnp.float32), k, v, state.astype(jnp.float32), block_c=block_c)
 
 
 _rwkv4.defvjp(_fwd_call, _bwd_call)
@@ -216,11 +229,9 @@ def rwkv4(
         k: Key tensor `[B, T, C]`.
         v: Value tensor `[B, T, C]`.
         state: Optional initial state `[B, 3, C]` (alpha, beta, eps).
-        block_c: Accepted for signature parity with the tilelang backend;
-            the Triton implementation chooses its own meta-parameters.
+        block_c: Channel-axis tile width for the Triton forward kernel.
 
     Returns:
         Tuple of (output `[B, T, C]`, final_state `[B, 3, C]`).
     """
-    del block_c
-    return _rwkv4(w, u, k, v, state)
+    return _rwkv4(w, u, k, v, state, int(block_c))

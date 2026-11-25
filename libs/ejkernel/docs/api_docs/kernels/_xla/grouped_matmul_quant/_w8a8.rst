@@ -1,0 +1,7 @@
+ejkernel.kernels._xla.grouped_matmul_quant._w8a8
+================================================
+
+.. automodule:: ejkernel.kernels._xla.grouped_matmul_quant._w8a8
+   :members:
+   :undoc-members:
+   :show-inheritance:

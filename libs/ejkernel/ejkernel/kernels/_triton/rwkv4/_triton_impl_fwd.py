@@ -68,7 +68,7 @@ def _rwkv4_fwd_kernel(
         C: Number of channels (compile-time constant).
         BLOCK_C: Channel block size (compile-time constant).
     """
-    b = tl.program_id(0)
+    b = tl.program_id(0).to(tl.int64)
     c_blk = tl.program_id(1)
 
     cs = c_blk * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -176,12 +176,21 @@ def _rwkv4_fwd_kernel_with_hist(
     tl.store(state_out_ptr + base_state_out + 2 * C + cs, eps.to(tl.float32), mask=cmask)
 
 
+def _resolve_block_c(channels: int, block_c: int | None) -> int:
+    """Resolve a power-of-2 channel tile size for RWKV-4 Triton kernels."""
+    if block_c is None:
+        return 128 if channels >= 128 else 64 if channels >= 64 else 32
+    return triton.next_power_of_2(max(1, int(block_c)))
+
+
 def fwd_triton_impl(
     w: Float[Array, "chans"],
     u: Float[Array, "chans"],
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"],
+    *,
+    block_c: int | None = None,
 ) -> tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
     """Execute RWKV-4 forward pass on GPU via Triton.
 
@@ -191,6 +200,7 @@ def fwd_triton_impl(
         k: Key tensor `[B, T, C]`.
         v: Value tensor `[B, T, C]`.
         state: Initial state `[B, 3, C]` (alpha, beta, eps).
+        block_c: Optional channel tile size (rounded up to power of 2).
 
     Returns:
         Tuple of (output `[B, T, C]`, final_state `[B, 3, C]`).
@@ -199,7 +209,7 @@ def fwd_triton_impl(
     out_shape = jax.ShapeDtypeStruct(k.shape, v.dtype)
     state_shape = jax.ShapeDtypeStruct((B, 3, C), jnp.float32)
 
-    BLOCK_C = 128 if C >= 128 else 64 if C >= 64 else 32
+    BLOCK_C = _resolve_block_c(C, block_c)
     grid = (B, cdiv(C, BLOCK_C))
 
     o, state_out = triton_call(
@@ -225,6 +235,8 @@ def fwd_triton_impl_with_history(
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"],
+    *,
+    block_c: int | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len chans"],
     Float[Array, "batch three chans"],
@@ -247,6 +259,7 @@ def fwd_triton_impl_with_history(
         v: Value tensor, shape ``(B, T, C)``.
         state: Initial recurrent state ``(alpha, beta, eps)``, shape ``(B, 3, C)``.
             Must be float32.
+        block_c: Optional channel tile size (rounded up to power of 2).
 
     Returns:
         Tuple ``(output, final_state, state_hist)`` where:
@@ -261,7 +274,7 @@ def fwd_triton_impl_with_history(
     state_shape = jax.ShapeDtypeStruct((B, 3, C), jnp.float32)
     state_hist_shape = jax.ShapeDtypeStruct((B, T + 1, 3, C), jnp.float32)
 
-    BLOCK_C = 128 if C >= 128 else 64 if C >= 64 else 32
+    BLOCK_C = _resolve_block_c(C, block_c)
     grid = (B, cdiv(C, BLOCK_C))
 
     o, state_out, state_hist = triton_call(

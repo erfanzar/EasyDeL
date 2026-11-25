@@ -4,26 +4,61 @@ ejkernel.kernels._pallas.tpu package
 .. toctree::
    :maxdepth: 2
 
+   all_gather/index
    all_gather_matmul/index
+   all_reduce/index
    blocksparse_attention/index
+   compressed_window_attention/index
+   compressed_window_decode/index
    deepseek_attn/index
+   dsa_gather_attention/index
+   dsa_sparse_attention/index
+   dual_stream_attention/index
+   dual_stream_ragged_page_attention/index
    flash_attention/index
    flash_mla/index
+   fused_conv_decode/index
+   fused_cross_entropy/index
+   fused_kl_divergence/index
+   fused_mlp/index
    gated_delta_rule/index
+   gated_delta_rule_grouped_decode/index
+   gdn_spec_window/index
    grouped_matmul/index
+   grouped_matmul_channelwise/index
    grouped_matmulv2/index
    grouped_matmulv3/index
+   indexer_scores/index
+   kda_chunk/index
+   kda_chunk_local/index
+   mhc_coefficients/index
+   mhc_decode_fused/index
+   mhc_fused/index
+   mhc_prefill_fused/index
+   moe_decode_fused_w8a8/index
+   moe_local_ffn/index
+   moe_row_gather/index
    multi_latent_ragged_page_attention/index
    multi_latent_ragged_page_attention_v2/index
    page_attention/index
+   paged_pool_topk/index
    prefill_page_attention/index
    quantized_matmul/index
    ragged_decode_attention/index
    ragged_gated_delta_rule/index
+   ragged_gated_delta_rule_v2/index
    ragged_kda/index
+   ragged_kda_conv_decode/index
    ragged_kda_decode/index
    ragged_kda_short/index
    ragged_page_attention_v2/index
    ragged_page_attention_v3/index
+   reduce_scatter/index
    reduce_scatter_matmul/index
    ring_attention/index
+   row_permute/index
+   shared_expert_w8a8/index
+   sinkhorn_knopp/index
+   sparse_multi_latent_ragged_page_attention/index
+   sparse_selected_attention/index
+   topk/index

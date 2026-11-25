@@ -194,17 +194,25 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             >>> out = ragged_decode_attention(q, k, v, sequence_start, sequence_end)
         """
 
+        cfg_backend = getattr(cfg, "backend", Backend.ANY)
+        effective_platform = platform if platform is not None else cfg.platform
+        resolved_platform = detect_platform("ragged_decode_attention", effective_platform, prefer_pallas=True)
+
         fwd_params = getattr(cfg, "fwd_params", None)
         if fwd_params is None:
-            fwd_params = self._fwd_params_for_seq_len(key.shape[1])
-        else:
-            num_key_splits = getattr(fwd_params, "num_key_splits", 1)
-            kv_blocksize = getattr(fwd_params, "kv_blocksize", 16)
+            if resolved_platform == Platform.TRITON:
+                head_dim = int(query.shape[-1])
+                seq_len = int(key.shape[1])
+                kv_blocksize = 64 if head_dim > 128 else (128 if seq_len >= 128 else 64)
+                fwd_params = FwdParams(kv_blocksize=kv_blocksize, num_key_splits=1, num_warps=4, num_stages=2)
+            else:
+                fwd_params = self._fwd_params_for_seq_len(key.shape[1])
+        elif resolved_platform != Platform.TRITON:
+            num_key_splits = getattr(fwd_params, "num_key_splits", 1) or 1
+            kv_blocksize = getattr(fwd_params, "kv_blocksize", 16) or 16
             split_len = key.shape[1] // num_key_splits if key.shape[1] % num_key_splits == 0 else 0
             if split_len < 16 or kv_blocksize > split_len or split_len % kv_blocksize != 0:
                 fwd_params = self._fwd_params_for_seq_len(key.shape[1])
-
-        cfg_backend = getattr(cfg, "backend", Backend.ANY)
 
         if platform is not None:
             cfg = RaggedDecodeAttentionConfig(
@@ -238,43 +246,58 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         """
         return RaggedDecodeAttentionConfig(fwd_params=self._default_fwd_params(inv), platform="auto", backend="any")
 
+    def heuristic_cfg_gpu(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]) -> RaggedDecodeAttentionConfig:
+        """Provide GPU-specific heuristic configuration for ragged decode attention.
+
+        Selects Triton-friendly block sizing without dead split-K sweeps when
+        Triton is targeted, and valid split-divisible defaults for Pallas/XLA.
+        """
+        requested = inv.kwargs.get("platform", None) if inv is not None else None
+        query = inv.kwargs.get("query", inv.args[0] if len(inv.args) > 0 else None) if inv is not None else None
+        key = inv.kwargs.get("key", inv.args[1] if len(inv.args) > 1 else None) if inv is not None else None
+        seq_len = int(key.shape[1]) if key is not None and len(key.shape) >= 2 else 128
+        head_dim = int(query.shape[-1]) if query is not None and len(query.shape) >= 1 else 64
+
+        resolved = detect_platform(
+            "ragged_decode_attention",
+            "auto" if requested in (None, "auto") else str(requested),
+            prefer_pallas=True,
+        )
+        if resolved == Platform.TRITON:
+            kv_blocksize = 64 if head_dim > 128 else (128 if seq_len >= 128 else 64)
+            return RaggedDecodeAttentionConfig(
+                fwd_params=FwdParams(
+                    kv_blocksize=kv_blocksize,
+                    num_key_splits=1,
+                    num_warps=4,
+                    num_stages=2,
+                ),
+                platform="triton",
+                backend="gpu",
+            )
+        return RaggedDecodeAttentionConfig(
+            fwd_params=self._fwd_params_for_seq_len(seq_len),
+            platform=str(requested) if requested not in (None, "auto") else "auto",
+            backend="any",
+        )
+
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]):
-        """Generate candidate configurations for autotuning on GPU (Pallas backend).
+        """Generate candidate configurations for autotuning on GPU.
 
-        Produces GPU-optimized configurations for ragged decode attention with
-        larger block sizes and higher warp counts. The heuristics balance shared
-        memory usage with parallelism for efficient GPU execution.
-
-        Configuration Space:
-            - kv_blocksize: Up to 256 (when split_len allows)
-            - blocksize_heads: {4, 8, 16} if grouped-heads permit
-            - num_warps: Up to 8 (depending on kv_block/head_dim)
-            - num_stages: {1, 2, 3} (kept low; smem-guarded)
-            - split_len: Prefers {128, 256, 512}; ensures split_len % kv_blocksize == 0
-
-        Args:
-            inv: Invocation object containing input tensors (query, key, value)
-                and metadata. Used to determine optimal block sizes based on
-                sequence length, head dimensions, and grouped query attention ratio.
-
-        Returns:
-            List of RaggedDecodeAttentionConfig objects optimized for GPU execution.
-            Each configuration specifies blocksize_heads, num_key_splits, kv_blocksize,
-            num_warps, and num_stages parameters.
-
-        Note:
-            Shared memory usage is estimated and configurations exceeding the limit
-            (default 99KB, configurable via EJKERNEL_TRITON_SMEM_LIMIT) are filtered.
-            Maximum candidates controlled by EJKERNEL_RDA_MAX_CANDIDATES (default 32).
+        Produces backend-aware GPU candidates:
+        - Triton: sweeps only ``(kv_blocksize, num_warps, num_stages)`` with
+          ``num_key_splits=1`` (avoids dead split-K and head-block duplicates).
+        - Pallas / TileLang / XLA: generates split-divisible candidates with
+          conservative shared-memory filtering.
         """
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
         v = inv.kwargs["value"]
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "pallas", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        platform_backends = tuple(
+        non_triton_platform_backends = tuple(
             (platform, "any" if platform == "xla" else "gpu")
-            for platform in ("triton", "pallas", "tilelang", "xla")
+            for platform in ("pallas", "tilelang", "xla")
             if platform in platforms
         )
 
@@ -289,35 +312,6 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         assert num_q_heads % num_kv_heads == 0, "q_heads must be divisible by kv_heads"
 
         grouped_heads = num_q_heads // num_kv_heads
-
-        preferred_split_lens = (64, 128, 256, 512)
-
-        def best_splits(n: int, targets=preferred_split_lens, min_len=32, max_len=8192):
-            """Find divisor-based split candidates ranked by proximity to preferred lengths."""
-            divs = set()
-            r = int(math.sqrt(n))
-            for d in range(1, r + 1):
-                if n % d == 0:
-                    divs.add(d)
-                    divs.add(n // d)
-            valid = []
-            for s in sorted(divs):
-                sl = n // s
-                if min_len <= sl <= max_len:
-                    valid.append((s, sl))
-
-            def score(sl):
-                """Score a split length by minimum distance to any preferred target."""
-                return min(abs(sl - t) for t in targets)
-
-            valid.sort(key=lambda x: (score(x[1]), -x[1]))
-            return valid
-
-        split_candidates = best_splits(seq_len)
-
-        head_opts = [h for h in (4, 8) if h <= grouped_heads] or [min(grouped_heads, 4)]
-
-        kv_block_opts = [64, 128]
 
         smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))
         elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
@@ -347,6 +341,69 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             """Return valid pipeline stage counts based on block_k size."""
             return [1] if block_k <= 64 else [1, 2]
 
+        max_candidates = int(os.getenv("EJKERNEL_RDA_MAX_CANDIDATES", "32"))
+        configs: list[RaggedDecodeAttentionConfig] = []
+
+        if "triton" in platforms:
+            max_triton_block = max(16, 16384 // block_headdim)
+            triton_kv_blocks = [b for b in (32, 64, 128, 256) if b <= max_triton_block]
+            if not triton_kv_blocks:
+                triton_kv_blocks = [min(32, max_triton_block)]
+            triton_seen = set()
+            for K in triton_kv_blocks:
+                for W in warp_options(1, K):
+                    for S in (1, 2):
+                        if smem_est_bytes(1, K, S) > smem_limit:
+                            continue
+                        tkey = (K, W, S)
+                        if tkey in triton_seen:
+                            continue
+                        triton_seen.add(tkey)
+                        configs.append(
+                            RaggedDecodeAttentionConfig(
+                                fwd_params=FwdParams(
+                                    kv_blocksize=K,
+                                    num_key_splits=1,
+                                    num_warps=W,
+                                    num_stages=S,
+                                ),
+                                platform="triton",
+                                backend="gpu",
+                            )
+                        )
+                        if len(configs) >= max_candidates:
+                            return configs
+
+        if not non_triton_platform_backends:
+            return configs or [self.heuristic_cfg_gpu(inv)]
+
+        preferred_split_lens = (64, 128, 256, 512)
+
+        def best_splits(n: int, targets=preferred_split_lens, min_len=32, max_len=8192):
+            """Find divisor-based split candidates ranked by proximity to preferred lengths."""
+            divs = set()
+            r = int(math.sqrt(n))
+            for d in range(1, r + 1):
+                if n % d == 0:
+                    divs.add(d)
+                    divs.add(n // d)
+            valid = []
+            for s in sorted(divs):
+                sl = n // s
+                if min_len <= sl <= max_len:
+                    valid.append((s, sl))
+
+            def score(sl):
+                """Score a split length by minimum distance to any preferred target."""
+                return min(abs(sl - t) for t in targets)
+
+            valid.sort(key=lambda x: (score(x[1]), -x[1]))
+            return valid
+
+        split_candidates = best_splits(seq_len)
+        head_opts = [h for h in (4, 8) if h <= grouped_heads] or [min(grouped_heads, 4)]
+        kv_block_opts = [64, 128]
+
         seeds = []
         if seq_len % 64 == 0:
             seeds.append((seq_len // 64, 64))
@@ -354,12 +411,10 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             if (s, sl) not in seeds:
                 seeds.append((s, sl))
 
-        max_candidates = int(os.getenv("EJKERNEL_RDA_MAX_CANDIDATES", "32"))
-        configs: list[RaggedDecodeAttentionConfig] = []
         seen = set()
 
         def try_add(H, K, s, sl):
-            """Try adding configs for the given block_heads, block_k, splits, and split_len."""
+            """Try adding configs for non-Triton GPU platforms."""
             if K > sl or sl % K != 0:
                 return False
             for W in warp_options(H, K):
@@ -370,7 +425,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
                     if key in seen:
                         continue
                     seen.add(key)
-                    for platform, backend in platform_backends:
+                    for platform, backend in non_triton_platform_backends:
                         configs.append(
                             RaggedDecodeAttentionConfig(
                                 fwd_params=FwdParams(

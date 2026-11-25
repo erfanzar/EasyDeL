@@ -189,11 +189,11 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             constraint).
         """
 
-        if (platform is None or platform == "auto") and cfg.platform in (None, "auto"):
+        if (platform is None or platform == "auto") and cfg.platform in (None, "auto", "triton"):
             num_q_heads = int(query.shape[2])
             num_kv_heads = int(key.shape[2])
             group_size = num_q_heads // num_kv_heads if (num_kv_heads > 0 and num_q_heads % num_kv_heads == 0) else 0
-            if group_size % 16 != 0:
+            if group_size == 0 or group_size % 16 != 0:
                 cfg = NativeSparseAttentionConfig(
                     block_q=cfg.block_q,
                     block_k=cfg.block_k,
@@ -240,23 +240,34 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             **impl_kwargs,
         )
 
+    def _fixed_block_size(self, inv: Invocation[NativeSparseAttentionConfig, Array]) -> int:
+        """Resolve the semantic ``block_size`` without letting autotuning alter it."""
+        explicit_bs = inv.kwargs.get("block_size", None)
+        if explicit_bs is not None:
+            return int(explicit_bs)
+        override_cfg = getattr(inv, "override_cfg", None)
+        if override_cfg is not None and getattr(override_cfg, "block_size", None) is not None:
+            return int(override_cfg.block_size)
+        return 64
+
     def heuristic_cfg(self, inv: Invocation[NativeSparseAttentionConfig, Array]) -> NativeSparseAttentionConfig:
         """Provide default configuration with block sizes.
 
         Selects balanced block sizes that work well for typical sparse patterns.
-        The default configuration uses uniform block sizes for simplicity.
+        The default configuration preserves the caller's semantic ``block_size``.
 
         Args:
             inv: Invocation object containing arguments and metadata
 
         Returns:
-            Default configuration with block_size=64 for balanced performance
+            Default configuration with semantic ``block_size`` preserved
         """
+        block_size = self._fixed_block_size(inv)
         return NativeSparseAttentionConfig(
-            block_q=64,
+            block_q=block_size,
             block_k=64,
             block_d=64,
-            block_size=64,
+            block_size=block_size,
             num_warps=4,
             num_stages=1,
             platform="auto",
@@ -266,16 +277,17 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
     def candidate_cfgs(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
-        Creates a basic set of candidates for platform-agnostic tuning.
-        Sparse attention benefits from consistent block sizes across dimensions.
+        Creates a basic set of candidates for platform-agnostic tuning while
+        keeping the semantic ``block_size`` fixed.
 
         Args:
             inv: Invocation object containing arguments and metadata
 
         Returns:
-            List with single configuration using block_size=64 as baseline
+            List with baseline configuration preserving ``block_size``
         """
-        block_configs = [(64, 64, 64)]
+        block_size = self._fixed_block_size(inv)
+        block_configs = [(block_size, 64, 64)]
 
         candidates = []
         for block_q, block_k, block_d in block_configs:
@@ -284,7 +296,7 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
-                    block_size=64,
+                    block_size=block_size,
                     num_warps=4,
                     num_stages=1,
                     platform="auto",
@@ -297,37 +309,41 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
     def candidate_cfgs_gpu(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
         """Generate GPU-optimized candidate configurations for NSA.
 
-        NSA's selected-block sparse attention has four interacting tiles:
-
-        * ``block_q`` / ``block_k`` — inner attention tile (within a
-          selected KV block).
-        * ``block_d`` — head_dim tile (clamped by actual head_dim below).
-        * ``block_size`` — granularity of KV block selection; smaller
-          values mean finer-grained sparsity but more bookkeeping.
-
-        On H100:
-        * ``block_size`` ∈ {32, 64, 128}; 32 for short prompts, 128
-          amortises selection cost for long prompts.
-        * ``num_warps`` ∈ {2, 4, 8}; 8 only when tile area is large.
-        * ``num_stages`` ∈ {1, 2}; 2 helps memory-bound long-context.
+        Sweeps only kernel tiling/launch parameters (``block_k``, ``block_d``,
+        ``num_warps``, ``num_stages``) while keeping the semantic
+        ``block_size`` untouched so ``block_indices`` meaning never changes
+        across candidates. Respects the Triton GQA ``group_size % 16 == 0``
+        constraint by falling back to XLA when violated.
         """
         requested = inv.kwargs.get("platform", None)
-        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        q = inv.kwargs.get("query")
+        q = inv.kwargs.get("query", inv.args[0] if len(inv.args) > 0 else None)
+        k = inv.kwargs.get("key", inv.args[1] if len(inv.args) > 1 else None)
         head_dim = int(q.shape[-1]) if getattr(q, "shape", None) else 64
+        num_q_heads = int(q.shape[2]) if getattr(q, "shape", None) and len(q.shape) >= 3 else 0
+        num_kv_heads = int(k.shape[2]) if getattr(k, "shape", None) and len(k.shape) >= 3 else 0
+        group_size = num_q_heads // num_kv_heads if (num_kv_heads > 0 and num_q_heads % num_kv_heads == 0) else 0
+        triton_supported = group_size > 0 and group_size % 16 == 0
+
+        if requested in (None, "auto"):
+            platforms = ("triton", "tilelang", "xla") if triton_supported else ("xla",)
+        else:
+            platforms = (str(requested),)
+
+        fixed_block_size = self._fixed_block_size(inv)
         bd_choices = [d for d in (32, 64, 128) if d <= max(head_dim, 32)] or [64]
+        bk_choices = [d for d in (64, 128) if d <= max(head_dim, 64)] or [64]
         configs: list[NativeSparseAttentionConfig] = []
 
-        if "triton" in platforms:
-            for block_size in (32, 64, 128):
+        if "triton" in platforms and triton_supported:
+            for bk in bk_choices:
                 for bd in bd_choices:
                     for num_warps, num_stages in ((2, 1), (4, 1), (4, 2), (8, 2)):
                         configs.append(
                             NativeSparseAttentionConfig(
-                                block_q=block_size,
-                                block_k=block_size,
+                                block_q=fixed_block_size,
+                                block_k=bk,
                                 block_d=bd,
-                                block_size=block_size,
+                                block_size=fixed_block_size,
                                 num_warps=num_warps,
                                 num_stages=num_stages,
                                 platform="triton",
@@ -335,22 +351,21 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
                             )
                         )
         if "tilelang" in platforms:
-            for block_size in (64, 128):
-                for bk in (64, 128) if block_size == 128 else (64,):
-                    for bv in (64, 128):
-                        configs.append(
-                            NativeSparseAttentionConfig(
-                                block_q=block_size,
-                                block_k=bk,
-                                block_d=min(bv, max(head_dim, 32)),
-                                block_size=block_size,
-                                num_warps=8 if max(block_size, bk) >= 128 else 4,
-                                num_stages=2,
-                                platform="tilelang",
-                                backend="gpu",
-                            )
+            for bk in (64, 128):
+                for bv in (64, 128):
+                    configs.append(
+                        NativeSparseAttentionConfig(
+                            block_q=fixed_block_size,
+                            block_k=bk,
+                            block_d=min(bv, max(head_dim, 32)),
+                            block_size=fixed_block_size,
+                            num_warps=8 if max(fixed_block_size, bk) >= 128 else 4,
+                            num_stages=2,
+                            platform="tilelang",
+                            backend="gpu",
                         )
-        if "xla" in platforms:
+                    )
+        if "xla" in platforms or not configs:
             configs.extend(self.candidate_cfgs_xla(inv))
         return configs
 
@@ -371,31 +386,28 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
     def candidate_cfgs_xla(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
         """Generate XLA-optimized candidate configurations for autotuning.
 
-        Creates configurations for XLA compiler backend. XLA handles optimization
-        internally, so we provide conservative block sizes that work well across
-        different hardware targets.
+        Creates configurations for XLA compiler backend while preserving the
+        caller's semantic ``block_size``.
 
         Args:
             inv: Invocation object containing arguments and metadata
 
         Returns:
-            List of XLA-compatible configurations with standard block sizes
+            List of XLA-compatible configurations preserving ``block_size``
         """
-        configs = []
-        for block_size in [64, 128]:
-            configs.append(
-                NativeSparseAttentionConfig(
-                    block_q=block_size,
-                    block_k=block_size,
-                    block_d=block_size,
-                    block_size=block_size,
-                    num_warps=4,
-                    num_stages=1,
-                    platform="xla",
-                    backend="any",
-                )
+        fixed_block_size = self._fixed_block_size(inv)
+        return [
+            NativeSparseAttentionConfig(
+                block_q=fixed_block_size,
+                block_k=fixed_block_size,
+                block_d=fixed_block_size,
+                block_size=fixed_block_size,
+                num_warps=4,
+                num_stages=1,
+                platform="xla",
+                backend="any",
             )
-        return configs
+        ]
 
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu

@@ -157,7 +157,14 @@ def ragged_decode_attention(
     if fwd_params is None:
         fwd_params = FwdParams(kv_blocksize=256)
     elif fwd_params.kv_blocksize is None:
-        fwd_params.kv_blocksize = 256
+        fwd_params = FwdParams(
+            kv_blocksize=256,
+            q_blocksize=fwd_params.q_blocksize,
+            blocksize_heads=fwd_params.blocksize_heads,
+            num_key_splits=fwd_params.num_key_splits,
+            num_warps=fwd_params.num_warps,
+            num_stages=fwd_params.num_stages,
+        )
 
     return inner_decode_triton(
         query_tensor=query,

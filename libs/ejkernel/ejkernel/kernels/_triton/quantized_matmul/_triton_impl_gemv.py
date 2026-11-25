@@ -614,12 +614,13 @@ def quantized_matmul_triton_gemv(
     split_k: int,
     revsplit_parts: int | None,
     block_n: int,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> jax.Array:
     """Run dedicated Triton GEMV family kernels for M==1 quantized matmul.
 
     Selects between the split-K and reverse-split-K kernel families and
-    launches the appropriate Triton kernel.  The output is always cast to
-    **bfloat16** before returning.
+    launches the appropriate Triton kernel.  The output preserves ``x.dtype``.
 
     Args:
         x: Activation vector of shape (1, K).
@@ -635,9 +636,11 @@ def quantized_matmul_triton_gemv(
         revsplit_parts: Number of reverse-split-K partitions (``gemv_revsplitk``
             only); must be in {2, 4, 8, 16}, defaults to 2.
         block_n: Output tile width hint.
+        num_warps: Optional Triton warp count override.
+        num_stages: Optional Triton pipeline stage count override.
 
     Returns:
-        Output tensor of shape (1, N) in bfloat16.
+        Output tensor of shape (1, N) with the same dtype as ``x``.
 
     Raises:
         ValueError: If ``x.shape[0] != 1``, or if ``revsplit_parts`` is not
@@ -671,7 +674,13 @@ def quantized_matmul_triton_gemv(
     bias_arg = biases if biases is not None else scales
 
     requested = int(block_n)
-    bn = min(_GEMV_BLOCK_N_CAP, requested) if requested > 0 else _GEMV_BLOCK_N_DEFAULT
+    bn = triton.next_power_of_2(min(_GEMV_BLOCK_N_CAP, requested)) if requested > 0 else _GEMV_BLOCK_N_DEFAULT
+
+    launch_kwargs: dict[str, int] = {}
+    if num_warps is not None:
+        launch_kwargs["num_warps"] = int(num_warps)
+    if num_stages is not None:
+        launch_kwargs["num_stages"] = int(num_stages)
 
     if kernel_family == "gemv_splitk":
         split_k = max(1, int(split_k))
@@ -689,7 +698,8 @@ def quantized_matmul_triton_gemv(
             out_shape=[jax.ShapeDtypeStruct(shape=out_shape, dtype=jnp.float32)],
             grid=lambda META: (cdiv(N, META["BN"]), META["SPLIT_K"]),
             kernel=_qmm_gemv_splitk_kernel,
-            zeroed_outputs=(0,),
+            zeroed_outputs=(0,) if split_k > 1 else (),
+            **launch_kwargs,
             stride_xk=stride_xk,
             stride_wq0=stride_wq0,
             stride_wq1=stride_wq1,
@@ -708,7 +718,7 @@ def quantized_matmul_triton_gemv(
             TRANSPOSE=transpose,
             HAS_BIAS=biases is not None,
         )
-        return out.astype(jnp.bfloat16)
+        return out.astype(x.dtype)
 
     rev_parts = 2 if revsplit_parts is None else int(revsplit_parts)
     rev_parts = max(2, rev_parts)
@@ -729,7 +739,8 @@ def quantized_matmul_triton_gemv(
         out_shape=[jax.ShapeDtypeStruct(shape=out_shape, dtype=jnp.float32)],
         grid=lambda META: (cdiv(N, META["BN"]), cdiv(META["REV_PARTS"], 2)),
         kernel=_qmm_gemv_revsplitk_kernel,
-        zeroed_outputs=(0,),
+        zeroed_outputs=(0,) if rev_parts > 2 else (),
+        **launch_kwargs,
         stride_xk=stride_xk,
         stride_wq0=stride_wq0,
         stride_wq1=stride_wq1,
@@ -748,7 +759,7 @@ def quantized_matmul_triton_gemv(
         TRANSPOSE=transpose,
         HAS_BIAS=biases is not None,
     )
-    return out.astype(jnp.bfloat16)
+    return out.astype(x.dtype)
 
 
 __all__ = ("quantized_matmul_triton_gemv",)

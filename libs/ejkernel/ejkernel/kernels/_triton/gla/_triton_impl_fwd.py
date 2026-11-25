@@ -113,7 +113,7 @@ def recurrent_gla(
         query=query,
         key=key,
         value=value,
-        g=g,
+        gk=g,
         g_gamma=g_gamma,
         softmax_scale=softmax_scale,
         initial_state=initial_state,

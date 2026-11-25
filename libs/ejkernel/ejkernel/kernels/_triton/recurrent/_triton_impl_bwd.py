@@ -53,14 +53,6 @@ from ejkernel.callib import cdiv, triton_call
 from ejkernel.xla_utils.cumsum import chunk_global_cumsum
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] != 1,
-        "STORE_FINAL_STATE": lambda args: args["ht"] != 1,
-        "USE_FINAL_STATE_GRADIENT": lambda args: args["dht"] != 1,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
-    }
-)
 @triton.jit
 def bwd_kernel(
     q,
@@ -83,13 +75,17 @@ def bwd_kernel(
     SEQUENCE: tl.constexpr,
     Z: tl.constexpr,
     HEAD: tl.constexpr,
+    HEAD_KV: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
     DIM_K: tl.constexpr,
     DIM_V: tl.constexpr,
     BLOCKSIZE_K: tl.constexpr,
     BLOCKSIZE_V: tl.constexpr,
     REVERSE: tl.constexpr,
     USE_G: tl.constexpr,
+    G_IS_4D: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
+    G_GAMMA_PER_SEQ: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_GV: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -101,33 +97,34 @@ def bwd_kernel(
     """Triton kernel for backward pass of recurrent linear attention.
 
     Computes gradients for queries, keys, values, and optional gating
-    parameters by processing the sequence in reverse order from the
-    forward pass.
+    parameters by replaying the forward recurrence for ``dq`` and sweeping
+    in reverse for ``dk``/``dv``/``dh0``.
 
     Args:
-        q, k, v: Input tensor pointers from forward pass
-        g, g_gamma, gk, gv: Optional gating tensor pointers
-        h0: Initial hidden state pointer
-        do: Gradient of output tensor
-        dht: Gradient of final hidden state
-        cu_seqlens: Cumulative sequence lengths for variable-length mode
-        softmax_scale: Query scaling factor
-        ht: Final hidden state from forward pass
-        dq, dk, dv: Output gradient pointers for q, k, v
-        dh0: Output gradient pointer for initial state
-        SEQUENCE, Z, HEAD: Dimensions (sequence, batch, heads)
-        DIM_K, DIM_V: Key and value dimensions
-        BLOCKSIZE_K, BLOCKSIZE_V: Block sizes for tiling
-        REVERSE: Whether forward pass was reversed
-        USE_G, USE_G_GAMMA, USE_GK, USE_GV: Gating configuration
-        USE_INITIAL_STATE: Whether initial state was used
-        STORE_FINAL_STATE: Whether to store final state gradient
-        STORE_INITIAL_STATE_GRADIENT: Whether to compute initial state gradient
-        USE_FINAL_STATE_GRADIENT: Whether final state gradient is provided
-        IS_VARLEN: Variable-length sequence mode
+        q, k, v: Input tensor pointers from forward pass.
+        g, g_gamma, gk, gv: Optional gating tensor pointers.
+        h0: Initial hidden state pointer.
+        do: Gradient of output tensor.
+        dht: Gradient of final hidden state.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode.
+        softmax_scale: Query scaling factor.
+        ht: Final hidden state output buffer (written only when ``STORE_FINAL_STATE``).
+        dq, dk, dv: Output gradient pointers for q, k, v (per query head).
+        dh0: Output gradient pointer for initial state.
+        SEQUENCE, Z, HEAD, HEAD_KV, GROUP_SIZE: Batch, sequence, and head dims.
+        DIM_K, DIM_V: Key and value dimensions.
+        BLOCKSIZE_K, BLOCKSIZE_V: Power-of-2 block sizes for tiling.
+        REVERSE: Whether forward pass was reversed.
+        USE_G, G_IS_4D, USE_G_GAMMA, G_GAMMA_PER_SEQ, USE_GK, USE_GV: Gating flags.
+        USE_INITIAL_STATE: Whether initial state was used.
+        STORE_FINAL_STATE: Whether to store final state into ``ht``.
+        STORE_INITIAL_STATE_GRADIENT: Whether to store initial state gradient.
+        USE_FINAL_STATE_GRADIENT: Whether final state gradient is provided.
+        IS_VARLEN: Variable-length sequence mode.
     """
     i_v, i_k, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_n, i_h = i_nh // HEAD, i_nh % HEAD
+    i_kv_h = i_h // GROUP_SIZE
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         scope = SEQUENCE
@@ -138,18 +135,23 @@ def bwd_kernel(
     o_k = i_k * BLOCKSIZE_K + tl.arange(0, BLOCKSIZE_K)
     o_v = i_v * BLOCKSIZE_V + tl.arange(0, BLOCKSIZE_V)
 
-    p_k = k + (bos + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
-    p_v = v + (bos + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
-    p_do = do + (bos + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
+    t_fwd_start = bos + ((SEQUENCE - 1) if REVERSE else 0)
+    p_k = k + t_fwd_start * HEAD_KV * DIM_K + i_kv_h * DIM_K + o_k
+    p_v = v + t_fwd_start * HEAD_KV * DIM_V + i_kv_h * DIM_V + o_v
+    p_do = do + t_fwd_start * HEAD * DIM_V + i_h * DIM_V + o_v
     p_dq = dq + ((i_v * scope + bos) + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
     if USE_G:
-        p_g = g + (bos + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD + i_h
+        if G_IS_4D:
+            p_g = g + t_fwd_start * HEAD * DIM_K + i_h * DIM_K + o_k
+        else:
+            p_g = g + t_fwd_start * HEAD + i_h
     if USE_GK:
-        p_gk = gk + (bos + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
+        p_gk = gk + t_fwd_start * HEAD * DIM_K + i_h * DIM_K + o_k
     if USE_GV:
-        p_gv = gv + (bos + ((SEQUENCE - 1) if REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
+        p_gv = gv + t_fwd_start * HEAD * DIM_V + i_h * DIM_V + o_v
     if USE_G_GAMMA:
-        b_g_gamma = tl.load(g_gamma + i_h)
+        g_gamma_offset = i_nh if G_GAMMA_PER_SEQ else i_h
+        b_g_gamma_decay = tl.exp(tl.load(g_gamma + g_gamma_offset).to(tl.float32))
 
     mask_k = o_k < DIM_K
     mask_v = o_v < DIM_V
@@ -160,15 +162,20 @@ def bwd_kernel(
         p_h0 = h0 + i_nh * DIM_K * DIM_V + o_k[:, None] * DIM_V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    fwd_step = -1 if REVERSE else 1
     for _ in range(0, SEQUENCE):
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_do = tl.load(p_do, mask=mask_v, other=0).to(tl.float32)
         if USE_G:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h = b_h * tl.exp(b_g)
+            if G_IS_4D:
+                b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
+                b_h = b_h * tl.exp(b_g[:, None])
+            else:
+                b_g = tl.load(p_g).to(tl.float32)
+                b_h = b_h * tl.exp(b_g)
         if USE_G_GAMMA:
-            b_h = b_h * tl.exp(b_g_gamma)
+            b_h = b_h * b_g_gamma_decay
         if USE_GK:
             b_gk = tl.load(p_gk, mask=mask_k, other=0).to(tl.float32)
             b_h = b_h * tl.exp(b_gk[:, None])
@@ -182,41 +189,44 @@ def bwd_kernel(
 
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=mask_k)
 
-        p_k += (-1 if REVERSE else 1) * HEAD * DIM_K
-        p_v += (-1 if REVERSE else 1) * HEAD * DIM_V
-        p_do += (-1 if REVERSE else 1) * HEAD * DIM_V
-        p_dq += (-1 if REVERSE else 1) * HEAD * DIM_K
+        p_k += fwd_step * HEAD_KV * DIM_K
+        p_v += fwd_step * HEAD_KV * DIM_V
+        p_do += fwd_step * HEAD * DIM_V
+        p_dq += fwd_step * HEAD * DIM_K
         if USE_G:
-            p_g += (-1 if REVERSE else 1) * HEAD
+            p_g += fwd_step * (HEAD * DIM_K if G_IS_4D else HEAD)
         if USE_GK:
-            p_gk += (-1 if REVERSE else 1) * HEAD * DIM_K
+            p_gk += fwd_step * HEAD * DIM_K
         if USE_GV:
-            p_gv += (-1 if REVERSE else 1) * HEAD * DIM_V
+            p_gv += fwd_step * HEAD * DIM_V
 
     if STORE_FINAL_STATE:
         p_ht = ht + i_nh * DIM_K * DIM_V + o_k[:, None] * DIM_V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
-    tl.debug_barrier()
-
-    p_q = q + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
-    p_k = k + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
-    p_v = v + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
-    p_do = do + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
+    t_bwd_start = bos + ((SEQUENCE - 1) if not REVERSE else 0)
+    p_q = q + t_bwd_start * HEAD * DIM_K + i_h * DIM_K + o_k
+    p_k = k + t_bwd_start * HEAD_KV * DIM_K + i_kv_h * DIM_K + o_k
+    p_v = v + t_bwd_start * HEAD_KV * DIM_V + i_kv_h * DIM_V + o_v
+    p_do = do + t_bwd_start * HEAD * DIM_V + i_h * DIM_V + o_v
     p_dk = dk + ((i_v * scope + bos) + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
     p_dv = dv + ((i_k * scope + bos) + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
     if USE_G:
-        p_g = g + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD + i_h
+        if G_IS_4D:
+            p_g = g + t_bwd_start * HEAD * DIM_K + i_h * DIM_K + o_k
+        else:
+            p_g = g + t_bwd_start * HEAD + i_h
     if USE_GK:
-        p_gk = gk + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
+        p_gk = gk + t_bwd_start * HEAD * DIM_K + i_h * DIM_K + o_k
     if USE_GV:
-        p_gv = gv + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_V + i_h * DIM_V + o_v
+        p_gv = gv + t_bwd_start * HEAD * DIM_V + i_h * DIM_V + o_v
 
     b_dh = tl.zeros([BLOCKSIZE_K, BLOCKSIZE_V], dtype=tl.float32)
     if USE_FINAL_STATE_GRADIENT:
         p_dht = dht + i_nh * DIM_K * DIM_V + o_k[:, None] * DIM_V + o_v[None, :]
         b_dh += tl.load(p_dht, mask=mask_h, other=0).to(tl.float32)
 
+    bwd_step = 1 if REVERSE else -1
     for _ in range(SEQUENCE):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) * softmax_scale
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -226,10 +236,14 @@ def bwd_kernel(
         b_dk = tl.sum(b_dh * b_v[None, :], axis=1)
         b_dv = tl.sum(b_dh * b_k[:, None], axis=0)
         if USE_G:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_dh *= tl.exp(b_g)
+            if G_IS_4D:
+                b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
+                b_dh *= tl.exp(b_g)[:, None]
+            else:
+                b_g = tl.load(p_g).to(tl.float32)
+                b_dh *= tl.exp(b_g)
         if USE_G_GAMMA:
-            b_dh *= tl.exp(b_g_gamma)
+            b_dh *= b_g_gamma_decay
         if USE_GK:
             b_gk = tl.load(p_gk, mask=mask_k, other=0).to(tl.float32)
             b_dh *= tl.exp(b_gk)[:, None]
@@ -239,37 +253,56 @@ def bwd_kernel(
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=mask_k)
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=mask_v)
 
-        p_q += (1 if REVERSE else -1) * HEAD * DIM_K
-        p_k += (1 if REVERSE else -1) * HEAD * DIM_K
-        p_v += (1 if REVERSE else -1) * HEAD * DIM_V
-        p_do += (1 if REVERSE else -1) * HEAD * DIM_V
-        p_dk += (1 if REVERSE else -1) * HEAD * DIM_K
-        p_dv += (1 if REVERSE else -1) * HEAD * DIM_V
+        p_q += bwd_step * HEAD * DIM_K
+        p_k += bwd_step * HEAD_KV * DIM_K
+        p_v += bwd_step * HEAD_KV * DIM_V
+        p_do += bwd_step * HEAD * DIM_V
+        p_dk += bwd_step * HEAD * DIM_K
+        p_dv += bwd_step * HEAD * DIM_V
         if USE_G:
-            p_g += (1 if REVERSE else -1) * HEAD
+            p_g += bwd_step * (HEAD * DIM_K if G_IS_4D else HEAD)
         if USE_GK:
-            p_gk += (1 if REVERSE else -1) * HEAD * DIM_K
+            p_gk += bwd_step * HEAD * DIM_K
         if USE_GV:
-            p_gv += (1 if REVERSE else -1) * HEAD * DIM_V
+            p_gv += bwd_step * HEAD * DIM_V
 
     if STORE_INITIAL_STATE_GRADIENT:
         p_dh0 = dh0 + i_nh * DIM_K * DIM_V + o_k[:, None] * DIM_V + o_v[None, :]
         tl.store(p_dh0, b_dh.to(p_dh0.dtype.element_ty), mask=mask_h)
 
 
+def _resolve_g_gamma_per_seq(g_gamma: Array | None, num_seqs: int, num_heads: int) -> bool:
+    """Validate ``g_gamma`` shape and return True when indexed per sequence ``[N, H]``."""
+    if g_gamma is None:
+        return False
+    if g_gamma.ndim == 1:
+        if g_gamma.shape != (num_heads,):
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({num_seqs}, {num_heads}).")
+        return False
+    if g_gamma.ndim == 2:
+        if g_gamma.shape[1] != num_heads:
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({num_seqs}, {num_heads}).")
+        if g_gamma.shape[0] == 1:
+            return False
+        if g_gamma.shape[0] == num_seqs:
+            return True
+        raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({num_seqs}, {num_heads}).")
+    raise ValueError(f"g_gamma.ndim={g_gamma.ndim} must be 1 or 2.")
+
+
 def bwd_triton_impl(
     q: Float[Array, "batch seq_len num_heads head_dim"],
-    k: Float[Array, "batch seq_len num_heads head_dim"],
-    v: Float[Array, "batch seq_len num_heads head_dim"],
-    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    k: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    v: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
+    g: Float[Array, "batch seq_len num_heads ..."] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    o: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    do: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    dht: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads v_head_dim"] | None = None,
+    o: Float[Array, "batch seq_len num_heads v_head_dim"] | None = None,
+    do: Float[Array, "batch seq_len num_heads v_head_dim"] | None = None,
+    dht: Float[Array, "... num_heads head_dim v_head_dim"] | None = None,
     softmax_scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    initial_state: Float[Array, "... num_heads head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     block_k: int = 64,
@@ -278,12 +311,12 @@ def bwd_triton_impl(
     num_stages: int = 1,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_kv_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_kv_heads v_head_dim"] | None,
+    Float[Array, "batch seq_len num_heads ..."] | None,
     Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch seq_len num_heads head_dim"] | None,
-    Float[Array, "batch num_heads head_dim head_dim"] | None,
+    Float[Array, "batch seq_len num_heads v_head_dim"] | None,
+    Float[Array, "... num_heads head_dim v_head_dim"] | None,
 ]:
     """Execute recurrent linear attention backward pass using Triton kernel.
 
@@ -292,74 +325,86 @@ def bwd_triton_impl(
     applicable. Processes sequence in reverse order from forward pass.
 
     Args:
-        q: Query tensor [batch, seq_len, num_heads, head_dim]
-        k: Key tensor [batch, seq_len, num_heads, head_dim]
-        v: Value tensor [batch, seq_len, num_heads, head_dim]
-        g: Optional GLA-style scalar gate per head. The kernel accesses this as
-            ``[batch, seq_len, num_heads]`` (stride H per timestep). See note in
-            ``fwd_triton_impl`` regarding the type-annotation discrepancy.
-        g_gamma: Optional Lightning-style decay factor [batch, num_heads]
-        gk: Optional per-key gate [batch, seq_len, num_heads, head_dim]
-        gv: Optional per-value gate [batch, seq_len, num_heads, head_dim]
-        o: Output from forward pass (needed for gv gradient computation)
-        do: Gradient of output tensor
-        dht: Optional gradient of final hidden state
-        softmax_scale: Query scaling factor (default: 1.0)
-        initial_state: Initial hidden state from forward pass
-        reverse: Whether forward pass was reversed
-        cu_seqlens: Cumulative sequence lengths for variable-length mode
+        q: Query tensor [batch, seq_len, num_heads, head_dim].
+        k: Key tensor [batch, seq_len, num_kv_heads, head_dim].
+        v: Value tensor [batch, seq_len, num_kv_heads, v_head_dim].
+        g: Optional gate tensor, either 3-D ``[batch, seq_len, num_heads]`` or
+            4-D ``[batch, seq_len, num_heads, head_dim]``.
+        g_gamma: Optional Lightning-style decay factor of shape ``[num_heads]``,
+            ``[1, num_heads]``, or ``[batch_or_num_seqs, num_heads]``.
+        gk: Optional per-key gate [batch, seq_len, num_heads, head_dim].
+        gv: Optional per-value gate [batch, seq_len, num_heads, v_head_dim].
+        o: Output from forward pass (needed for gv gradient computation).
+        do: Gradient of output tensor.
+        dht: Optional gradient of final hidden state.
+        softmax_scale: Query scaling factor (defaults to ``1 / sqrt(head_dim)``).
+        initial_state: Initial hidden state from forward pass.
+        reverse: Whether forward pass was reversed.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode.
         block_k: Key-dimension tile size selected by the operation config.
         block_v: Value-dimension tile size selected by the operation config.
         num_warps: Number of Triton warps selected by the operation config.
         num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
-        tuple: (dq, dk, dv, dg, dgk, dgv, dh0) gradients for each input.
-            Gate gradients (dg, dgk, dgv) are computed using cumulative sums
-            over the sequence. dh0 is the initial state gradient.
+        tuple: (dq, dk, dv, dg, dgk, dgv, dh0) gradients cast to their input
+        dtypes, with ``dh0=None`` when ``initial_state is None``.
     """
-    Z, SEQUENCE, HEAD, DIM_K, DIM_V = *k.shape, v.shape[-1]
-    N = Z if cu_seqlens is None else len(cu_seqlens) - 1
+    Z, SEQUENCE, HEAD, DIM_K = q.shape
+    HEAD_KV = k.shape[2]
+    DIM_V = v.shape[-1]
+    if HEAD % HEAD_KV != 0 or v.shape[2] != HEAD_KV:
+        raise ValueError(
+            f"Incompatible GQA head counts: query has {HEAD} heads, key has {HEAD_KV}, value has {v.shape[2]}."
+        )
+    group_size = HEAD // HEAD_KV
+    N = Z if cu_seqlens is None else int(cu_seqlens.shape[0]) - 1
+    if g is not None and g.ndim not in (3, 4):
+        raise ValueError(f"g must be 3-D [B, T, H] or 4-D [B, T, H, K], got shape {g.shape}.")
+    g_is_4d = (g is not None) and (g.ndim == 4)
+    g_gamma_per_seq = _resolve_g_gamma_per_seq(g_gamma, N, HEAD)
+    if softmax_scale is None:
+        softmax_scale = float(DIM_K**-0.5)
 
-    BLOCKSIZE_K, BLOCKSIZE_V = min(DIM_K, int(block_k)), min(DIM_V, int(block_v))
+    BLOCKSIZE_K = triton.next_power_of_2(min(DIM_K, int(block_k)))
+    BLOCKSIZE_V = triton.next_power_of_2(min(DIM_V, int(block_v)))
     NumKBlocks, NumVBlocks = cdiv(DIM_K, BLOCKSIZE_K), cdiv(DIM_V, BLOCKSIZE_V)
 
     h0 = initial_state
-    ht_shape = (N, HEAD, DIM_K, DIM_V) if (g is not None or gk is not None or gv is not None) else None
-    dq_shape = (NumVBlocks, *q.shape)
-    dk_shape = (NumVBlocks, *k.shape)
-    dv_shape = (NumKBlocks, *v.shape)
+    store_final_state = (dht is not None) and (g is not None or gk is not None or gv is not None)
+    use_initial_state = h0 is not None
+    store_initial_state_gradient = h0 is not None
+    ht_shape = (N, HEAD, DIM_K, DIM_V) if store_final_state else (1,)
+    dq_shape = (NumVBlocks, Z, SEQUENCE, HEAD, DIM_K)
+    dk_shape = (NumVBlocks, Z, SEQUENCE, HEAD, DIM_K)
+    dv_shape = (NumKBlocks, Z, SEQUENCE, HEAD, DIM_V)
     dh0_shape = h0.shape if h0 is not None else (1,)
 
-    USE_INITIAL_STATE = ht_shape is not None
-    STORE_INITIAL_STATE_GRADIENT = h0 is not None
-    if ht_shape is None:
-        ht_shape = (1,)
     dg, dgk, dgv = None, None, None
-
-    if g is not None:
-        dg = jnp.empty((NumKBlocks * NumVBlocks, *g.shape), dtype=jnp.float32)
-    if gk is not None:
-        dgk = jnp.empty((NumVBlocks, *gk.shape), dtype=jnp.float32)
-    if gv is not None:
-        dgv = jnp.empty((NumKBlocks, *gv.shape), dtype=jnp.float32)
 
     grid = (NumVBlocks, NumKBlocks, N * HEAD)
     metaparams = dict(
         Z=Z,
         SEQUENCE=SEQUENCE,
         HEAD=HEAD,
+        HEAD_KV=HEAD_KV,
+        GROUP_SIZE=group_size,
         DIM_K=DIM_K,
         DIM_V=DIM_V,
         BLOCKSIZE_K=BLOCKSIZE_K,
         BLOCKSIZE_V=BLOCKSIZE_V,
         USE_G=g is not None,
+        G_IS_4D=g_is_4d,
         USE_G_GAMMA=g_gamma is not None,
+        G_GAMMA_PER_SEQ=g_gamma_per_seq,
         USE_GK=gk is not None,
         USE_GV=gv is not None,
         REVERSE=reverse,
-        STORE_INITIAL_STATE_GRADIENT=STORE_INITIAL_STATE_GRADIENT,
-        USE_INITIAL_STATE=USE_INITIAL_STATE,
+        USE_INITIAL_STATE=use_initial_state,
+        STORE_FINAL_STATE=store_final_state,
+        STORE_INITIAL_STATE_GRADIENT=store_initial_state_gradient,
+        USE_FINAL_STATE_GRADIENT=dht is not None,
+        IS_VARLEN=cu_seqlens is not None,
     )
     ht, dq, dk, dv, dh0 = triton_call(
         q,
@@ -373,7 +418,7 @@ def bwd_triton_impl(
         do if do is not None else 1,
         dht if dht is not None else 1,
         cu_seqlens if cu_seqlens is not None else 1,
-        softmax_scale if softmax_scale is not None else 1,
+        float(softmax_scale),
         kernel=bwd_kernel,
         out_shape=[
             jax.ShapeDtypeStruct(ht_shape, jnp.float32),
@@ -389,31 +434,70 @@ def bwd_triton_impl(
         **metaparams,
     )
 
-    dq = jnp.sum(dq, axis=0)
-    dk = jnp.sum(dk, axis=0)
-    dv = jnp.sum(dv, axis=0)
+    dq_f32 = jnp.sum(dq, axis=0)
+    dk_per_head = jnp.sum(dk, axis=0)
+    dv_per_head = jnp.sum(dv, axis=0)
+
+    def _broadcast_ht_dht_term(term: Array) -> Array:
+        if cu_seqlens is None:
+            return jnp.expand_dims(term, 1)
+        pos = jnp.arange(SEQUENCE, dtype=cu_seqlens.dtype)
+        seq_ids = jnp.clip(jnp.searchsorted(cu_seqlens[1:], pos, side="right"), 0, max(N - 1, 0))
+        valid = (pos >= cu_seqlens[0]) & (pos < cu_seqlens[-1])
+        gathered = term[seq_ids]
+        valid_mask = valid.reshape((SEQUENCE,) + (1,) * (gathered.ndim - 1))
+        return jnp.expand_dims(jnp.where(valid_mask, gathered, 0), 0)
+
+    k_for_gate = jnp.repeat(k, group_size, axis=2) if group_size > 1 else k
+    v_for_gate = jnp.repeat(v, group_size, axis=2) if group_size > 1 else v
+    dht_f32 = dht.astype(jnp.float32) if dht is not None else None
+
     if g is not None:
-        dg = chunk_global_cumsum(
-            (dq * q.astype("f4") - dk * k.astype("f4")).sum(-1),
-            reverse=not reverse,
-            cu_seqlens=cu_seqlens,
-        )
-        if dht is not None:
-            dg += jnp.expand_dims((ht * dht).sum((2, 3)), 1)
+        if g_is_4d:
+            dg_f32 = chunk_global_cumsum(
+                dq_f32 * q.astype(jnp.float32) - dk_per_head * k_for_gate.astype(jnp.float32),
+                reverse=not reverse,
+                cu_seqlens=cu_seqlens,
+            )
+            if dht_f32 is not None:
+                dg_f32 = dg_f32 + _broadcast_ht_dht_term((ht * dht_f32).sum(3))
+        else:
+            dg_f32 = chunk_global_cumsum(
+                (dq_f32 * q.astype(jnp.float32) - dk_per_head * k_for_gate.astype(jnp.float32)).sum(-1),
+                reverse=not reverse,
+                cu_seqlens=cu_seqlens,
+            )
+            if dht_f32 is not None:
+                dg_f32 = dg_f32 + _broadcast_ht_dht_term((ht * dht_f32).sum((2, 3)))
+        dg = dg_f32.astype(g.dtype)
     if gk is not None:
-        dgk = chunk_global_cumsum(
-            dq * q.astype("f4") - dk * k.astype("f4"),
+        dgk_f32 = chunk_global_cumsum(
+            dq_f32 * q.astype(jnp.float32) - dk_per_head * k_for_gate.astype(jnp.float32),
             reverse=not reverse,
             cu_seqlens=cu_seqlens,
         )
-        if dht is not None:
-            dgk += jnp.expand_dims((ht * dht).sum(3), 1)
+        if dht_f32 is not None:
+            dgk_f32 = dgk_f32 + _broadcast_ht_dht_term((ht * dht_f32).sum(3))
+        dgk = dgk_f32.astype(gk.dtype)
     if gv is not None:
-        dgv = chunk_global_cumsum(
-            do.astype("f4") * o.astype("f4") - dv * v.astype("f4"),
+        dgv_f32 = chunk_global_cumsum(
+            do.astype(jnp.float32) * o.astype(jnp.float32) - dv_per_head * v_for_gate.astype(jnp.float32),
             reverse=not reverse,
             cu_seqlens=cu_seqlens,
         )
-        if dht is not None:
-            dgv += jnp.expand_dims((ht * dht).sum(2), 1)
-    return dq, dk, dv, dg, dgk, dgv, dh0
+        if dht_f32 is not None:
+            dgv_f32 = dgv_f32 + _broadcast_ht_dht_term((ht * dht_f32).sum(2))
+        dgv = dgv_f32.astype(gv.dtype)
+
+    if group_size > 1:
+        dk_f32 = dk_per_head.reshape(Z, SEQUENCE, HEAD_KV, group_size, DIM_K).sum(axis=3)
+        dv_f32 = dv_per_head.reshape(Z, SEQUENCE, HEAD_KV, group_size, DIM_V).sum(axis=3)
+    else:
+        dk_f32 = dk_per_head
+        dv_f32 = dv_per_head
+
+    dq_out = dq_f32.astype(q.dtype)
+    dk_out = dk_f32.astype(k.dtype)
+    dv_out = dv_f32.astype(v.dtype)
+    dh0_out = dh0.astype(h0.dtype) if h0 is not None else None
+    return dq_out, dk_out, dv_out, dg, dgk, dgv, dh0_out

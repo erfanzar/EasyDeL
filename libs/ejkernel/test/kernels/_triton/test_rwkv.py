@@ -258,3 +258,111 @@ def test_rwkv7_and_rwkv7_mul_grad_match_xla_and_vjp():
     vjp_grads_mul = vjp_eval_mul(r, w, k, v, kk_mul, a, h0)
     for grad in vjp_grads_mul:
         assert jnp.all(jnp.isfinite(grad))
+
+
+def test_rwkv4_jit_grad_with_state_none_matches_xla():
+    B, T, C = 2, 16, 48
+    w = jax.random.normal(jax.random.PRNGKey(21), (C,), dtype=jnp.float16)
+    u = jax.random.normal(jax.random.PRNGKey(22), (C,), dtype=jnp.float16)
+    k = jax.random.normal(jax.random.PRNGKey(23), (B, T, C), dtype=jnp.float16)
+    v = jax.random.normal(jax.random.PRNGKey(24), (B, T, C), dtype=jnp.float16)
+
+    def loss_tri(w_, u_, k_, v_):
+        o, st = triton_rwkv4(w_, u_, k_, v_, state=None, block_c=32)
+        return jnp.sum(o) + 0.5 * jnp.sum(st)
+
+    def loss_xla(w_, u_, k_, v_):
+        o, st = xla_rwkv4(w_, u_, k_, v_, state=None)
+        return jnp.sum(o) + 0.5 * jnp.sum(st)
+
+    grads_tri = jax.jit(jax.grad(loss_tri, argnums=(0, 1, 2, 3)))(w, u, k, v)
+    grads_xla = jax.jit(jax.grad(loss_xla, argnums=(0, 1, 2, 3)))(w, u, k, v)
+    grads_tri = jax.tree_util.tree_map(jax.block_until_ready, grads_tri)
+    grads_xla = jax.tree_util.tree_map(jax.block_until_ready, grads_xla)
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_rwkv6_jit_grad_varlen_matches_xla(reverse: bool):
+    total_tokens, H, K, V = 19, 2, 16, 16
+    cu = jnp.array([0, 5, 11, 19], dtype=jnp.int32)
+    num_seqs = cu.shape[0] - 1
+    kr, kk, kv, kw, ku, kh = jax.random.split(jax.random.PRNGKey(31 + int(reverse)), 6)
+
+    r = jax.random.normal(kr, (1, total_tokens, H, K), dtype=jnp.float16)
+    k = jax.random.normal(kk, (1, total_tokens, H, K), dtype=jnp.float16)
+    v = jax.random.normal(kv, (1, total_tokens, H, V), dtype=jnp.float16)
+    w = jax.random.normal(kw, (1, total_tokens, H, K), dtype=jnp.float16) * -0.01
+    u = jax.random.normal(ku, (H, K), dtype=jnp.float16)
+    h0 = jax.random.normal(kh, (num_seqs, H, K, V), dtype=jnp.float32)
+
+    def loss_tri(r_, k_, v_, w_, u_, h0_, cu_):
+        o, st = triton_rwkv6(r_, k_, v_, w_, u_, initial_state=h0_, reverse=reverse, cu_seqlens=cu_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    def loss_xla(r_, k_, v_, w_, u_, h0_, cu_):
+        o, st = xla_rwkv6(r_, k_, v_, w_, u_, initial_state=h0_, reverse=reverse, cu_seqlens=cu_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    grads_tri = jax.jit(jax.grad(loss_tri, argnums=(0, 1, 2, 3, 4, 5)))(r, k, v, w, u, h0, cu)
+    grads_xla = jax.jit(jax.grad(loss_xla, argnums=(0, 1, 2, 3, 4, 5)))(r, k, v, w, u, h0, cu)
+    grads_tri = jax.tree_util.tree_map(jax.block_until_ready, grads_tri)
+    grads_xla = jax.tree_util.tree_map(jax.block_until_ready, grads_xla)
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_rwkv7_jit_grad_varlen_and_non_pow2_v_match_xla(reverse: bool):
+    total_tokens, H, K, V = 17, 2, 16, 24
+    cu = jnp.array([0, 4, 10, 17], dtype=jnp.int32)
+    num_seqs = cu.shape[0] - 1
+    kr, kw, kk, kv, ka, kb, kh = jax.random.split(jax.random.PRNGKey(41 + int(reverse)), 7)
+
+    r = jax.random.normal(kr, (1, total_tokens, H, K), dtype=jnp.float16)
+    w = jax.random.normal(kw, (1, total_tokens, H, K), dtype=jnp.float16) * -0.01
+    k = jax.random.normal(kk, (1, total_tokens, H, K), dtype=jnp.float16)
+    v = jax.random.normal(kv, (1, total_tokens, H, V), dtype=jnp.float16)
+    a = jax.random.normal(ka, (1, total_tokens, H, K), dtype=jnp.float16) * 0.01
+    b = jax.random.normal(kb, (1, total_tokens, H, K), dtype=jnp.float16) * 0.01
+    h0 = jax.random.normal(kh, (num_seqs, H, K, V), dtype=jnp.float32)
+
+    out_tri, st_tri = jax.block_until_ready(
+        triton_rwkv7(r, w, k, v, a, b, initial_state=h0, reverse=reverse, cu_seqlens=cu, block_v=64)
+    )
+    out_xla, st_xla = jax.block_until_ready(
+        xla_rwkv7(r, w, k, v, a, b, initial_state=h0, reverse=reverse, cu_seqlens=cu)
+    )
+    np.testing.assert_allclose(np.asarray(out_tri, np.float32), np.asarray(out_xla, np.float32), rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(np.asarray(st_tri, np.float32), np.asarray(st_xla, np.float32), rtol=2e-2, atol=2e-2)
+
+    def loss_tri(r_, w_, k_, v_, a_, b_, h0_, cu_):
+        o, st = triton_rwkv7(r_, w_, k_, v_, a_, b_, initial_state=h0_, reverse=reverse, cu_seqlens=cu_, block_v=64)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    def loss_xla(r_, w_, k_, v_, a_, b_, h0_, cu_):
+        o, st = xla_rwkv7(r_, w_, k_, v_, a_, b_, initial_state=h0_, reverse=reverse, cu_seqlens=cu_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    grads_tri = jax.jit(jax.grad(loss_tri, argnums=(0, 1, 2, 3, 4, 5, 6)))(r, w, k, v, a, b, h0, cu)
+    grads_xla = jax.jit(jax.grad(loss_xla, argnums=(0, 1, 2, 3, 4, 5, 6)))(r, w, k, v, a, b, h0, cu)
+    grads_tri = jax.tree_util.tree_map(jax.block_until_ready, grads_tri)
+    grads_xla = jax.tree_util.tree_map(jax.block_until_ready, grads_xla)
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )

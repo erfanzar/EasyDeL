@@ -41,7 +41,7 @@ from ejkernel.callib import cdiv, next_power_of_2, strides_from_shape, triton_ca
 from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
 from ejkernel.ops import BwdParams, FwdParams
 
-from ._utilities import make_causal_mask, make_segment_mask
+from ._utilities import make_causal_mask, make_segment_mask, make_sliding_window_mask
 
 
 @triton.jit
@@ -57,6 +57,7 @@ def blocksparse_attn_bwd_preprocess(
     SEQ_LEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_PAD: tl.constexpr,
 ):
     """Preprocessing kernel for block-sparse attention backward pass.
 
@@ -72,6 +73,7 @@ def blocksparse_attn_bwd_preprocess(
         SEQ_LEN: Sequence length (constexpr)
         BLOCK_SIZE: Block size for computation (constexpr)
         HEAD_DIM: Head dimension (constexpr)
+        HEAD_DIM_PAD: Power-of-2 padded head dimension (constexpr)
     """
     block_id = tl.program_id(0).to(tl.int64)
     batch_size_id = tl.program_id(1).to(tl.int64)
@@ -80,13 +82,18 @@ def blocksparse_attn_bwd_preprocess(
     init_offset = batch_size_id * stride_oz + num_heads_id * stride_oh
 
     block_arange = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    head_dim_arange = tl.arange(0, HEAD_DIM)
+    head_dim_arange = tl.arange(0, HEAD_DIM_PAD)
+    EVEN_HEAD_DIM: tl.constexpr = HEAD_DIM_PAD == HEAD_DIM
 
     offsets = init_offset + block_arange[:, None] * stride_om + head_dim_arange[None, :] * stride_ok
 
     valid = block_arange < SEQ_LEN
-    out = tl.load(Po + offsets, mask=valid[:, None], other=0.0)
-    dout = tl.load(Do + offsets, mask=valid[:, None], other=0.0).to(tl.float32)
+    if EVEN_HEAD_DIM:
+        load_mask = valid[:, None]
+    else:
+        load_mask = valid[:, None] & (head_dim_arange[None, :] < HEAD_DIM)
+    out = tl.load(Po + offsets, mask=load_mask, other=0.0).to(tl.float32)
+    dout = tl.load(Do + offsets, mask=load_mask, other=0.0).to(tl.float32)
 
     delta_val = tl.sum(out * dout, axis=1)
 
@@ -124,11 +131,16 @@ def _blocksparse_attn_bwd_dkdv_inner(
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM_PAD: tl.constexpr,
     EVEN_QK_HEAD_DIMS: tl.constexpr,
+    EVEN_V_HEAD_DIM: tl.constexpr,
     query_global_offset: tl.constexpr,
     kv_span: tl.constexpr,
     USE_CAUSAL: tl.constexpr,
     USE_SEGMENT_MASK: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
     """Inner loop for computing dK and dV gradients in backward pass.
@@ -138,8 +150,8 @@ def _blocksparse_attn_bwd_dkdv_inner(
     to ensure correct gradients.
 
     Args:
-        dk: Accumulated key gradients [BLOCK_N, QK_HEAD_DIM]
-        dv: Accumulated value gradients [BLOCK_N, V_HEAD_DIM]
+        dk: Accumulated key gradients [BLOCK_N, QK_HEAD_DIM_PAD]
+        dv: Accumulated value gradients [BLOCK_N, V_HEAD_DIM_PAD]
         kv_segment_ids: KV segment IDs [BLOCK_N]
         kv_positions_block: KV positions [BLOCK_N]
         query: Query tensor pointer
@@ -150,7 +162,7 @@ def _blocksparse_attn_bwd_dkdv_inner(
         delta: Delta values for softmax gradients pointer
         key: Key tensor pointer
         value: Value tensor pointer
-        qk_scale: QK scaling factor
+        qk_scale: QK scaling factor (softmax_scale * log2(e))
         logits_soft_cap: Soft cap value. When SOFTCAP is True, Jacobian
             (1 - tanh²(x)) is applied to gradients for proper backpropagation
         softmax_scale: Softmax scaling factor
@@ -161,20 +173,25 @@ def _blocksparse_attn_bwd_dkdv_inner(
         upper_bound: Upper query block index
         BLOCK_M: Query block size (constexpr)
         QK_HEAD_DIM: Query/key head dimension (constexpr)
-        QK_HEAD_DIM_PAD: Padded head dimension (constexpr)
+        QK_HEAD_DIM_PAD: Padded QK head dimension (constexpr)
         V_HEAD_DIM: Value head dimension (constexpr)
-        EVEN_QK_HEAD_DIMS: Whether head dims are power of 2 (constexpr)
+        V_HEAD_DIM_PAD: Padded value head dimension (constexpr)
+        EVEN_QK_HEAD_DIMS: Whether QK head dim is power of 2 (constexpr)
+        EVEN_V_HEAD_DIM: Whether V head dim is power of 2 (constexpr)
         query_global_offset: Global query offset (constexpr)
         kv_span: KV indices in block (constexpr)
         USE_CAUSAL: Enable causal masking (constexpr)
         USE_SEGMENT_MASK: Enable segment masking (constexpr)
+        USE_SLIDING_WINDOW: Enable sliding window masking (constexpr)
+        WINDOW_LEFT: Left window size (constexpr)
+        WINDOW_RIGHT: Right window size (constexpr)
         SOFTCAP: Enable logit soft capping (constexpr)
 
     Returns:
         Updated (dk, dv) tuple
     """
     query_arange = lower_bound * BLOCK_M + tl.arange(0, BLOCK_M)
-    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM_PAD)
     qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
 
     query_transpose_ptr = query + query_arange[None, :] * stride_qm + qk_head_dim_pad_arange[:, None] * stride_qk
@@ -205,6 +222,16 @@ def _blocksparse_attn_bwd_dkdv_inner(
                 mask = causal_mask & mask
             else:
                 mask = causal_mask
+        if USE_SLIDING_WINDOW:
+            if not USE_CAUSAL:
+                query_positions_block = tl.load(q_positions + query_seq_len_offset)
+            window_mask = make_sliding_window_mask(
+                query_positions_block, kv_positions_block, WINDOW_LEFT, WINDOW_RIGHT, True
+            )
+            if USE_SEGMENT_MASK or USE_CAUSAL:
+                mask = window_mask & mask
+            else:
+                mask = window_mask
 
         if SOFTCAP:
             LOG2_CONST: tl.constexpr = 1.4426950408889634
@@ -215,18 +242,21 @@ def _blocksparse_attn_bwd_dkdv_inner(
             tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
             tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
             qk_after = (logits_soft_cap * tanh_x) * LOG2_CONST
-            jac = (softmax_scale * LOG2_CONST) * (1.0 - tanh_x * tanh_x)
+            jac = 1.0 - tanh_x * tanh_x
         else:
             qk_after = (attn_weights_transpose * qk_scale).to(tl.float32)
-            jac = qk_scale
 
         lse_val = tl.load(lse + lse_offset)
         pT = tl.math.exp2(qk_after - lse_val[None, :])
 
-        if USE_SEGMENT_MASK or USE_CAUSAL:
+        if USE_SEGMENT_MASK or USE_CAUSAL or USE_SLIDING_WINDOW:
             pT = tl.where(mask, pT, 0.0)
 
-        dout_val = tl.load(dout + output_offset)
+        if EVEN_V_HEAD_DIM:
+            dout_val = tl.load(dout + output_offset)
+        else:
+            v_head_dim_mask = value_head_dim_arange[None, :] < V_HEAD_DIM
+            dout_val = tl.load(dout + output_offset, mask=v_head_dim_mask, other=0.0)
 
         dv += tl.dot(pT.to(dout_val.type.element_ty), dout_val)
 
@@ -234,7 +264,9 @@ def _blocksparse_attn_bwd_dkdv_inner(
 
         dpT = tl.dot(value, tl.trans(dout_val))
         dsT = pT * (dpT - delta_val[None, :])
-        dsT = (dsT * jac).to(query.type.element_ty)
+        if SOFTCAP:
+            dsT = dsT * jac
+        dsT = dsT.to(query.type.element_ty)
 
         dk += tl.dot(dsT, tl.trans(query_transpose))
 
@@ -270,11 +302,16 @@ def _blocksparse_attn_bwd_dq_inner(
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM_PAD: tl.constexpr,
     EVEN_QK_HEAD_DIMS: tl.constexpr,
+    EVEN_V_HEAD_DIM: tl.constexpr,
     kv_global_offset: tl.constexpr,
     query_span: tl.constexpr,
     USE_CAUSAL: tl.constexpr,
     USE_SEGMENT_MASK: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
     """Inner loop for computing dQ gradients in backward pass.
@@ -284,7 +321,7 @@ def _blocksparse_attn_bwd_dq_inner(
     to ensure correct gradients.
 
     Args:
-        dq: Accumulated query gradients [BLOCK_M, QK_HEAD_DIM]
+        dq: Accumulated query gradients [BLOCK_M, QK_HEAD_DIM_PAD]
         q_segment_ids: Query segment IDs [BLOCK_M]
         q_positions: Query positions [BLOCK_M]
         key: Key tensor pointer
@@ -304,13 +341,18 @@ def _blocksparse_attn_bwd_dq_inner(
         upper_bound: Upper KV block index
         BLOCK_N: KV block size (constexpr)
         QK_HEAD_DIM: Query/key head dimension (constexpr)
-        QK_HEAD_DIM_PAD: Padded head dimension (constexpr)
+        QK_HEAD_DIM_PAD: Padded QK head dimension (constexpr)
         V_HEAD_DIM: Value head dimension (constexpr)
-        EVEN_QK_HEAD_DIMS: Whether head dims are power of 2 (constexpr)
+        V_HEAD_DIM_PAD: Padded value head dimension (constexpr)
+        EVEN_QK_HEAD_DIMS: Whether QK head dim is power of 2 (constexpr)
+        EVEN_V_HEAD_DIM: Whether V head dim is power of 2 (constexpr)
         kv_global_offset: Global KV offset (constexpr)
         query_span: Query indices in block (constexpr)
         USE_CAUSAL: Enable causal masking (constexpr)
         USE_SEGMENT_MASK: Enable segment masking (constexpr)
+        USE_SLIDING_WINDOW: Enable sliding window masking (constexpr)
+        WINDOW_LEFT: Left window size (constexpr)
+        WINDOW_RIGHT: Right window size (constexpr)
         SOFTCAP: Enable logit soft capping (constexpr)
 
     Returns:
@@ -318,7 +360,7 @@ def _blocksparse_attn_bwd_dq_inner(
     """
     kv_arange = lower_bound * BLOCK_N + tl.arange(0, BLOCK_N)
     qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
-    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM_PAD)
 
     k_offsets = (kv_arange[None, :] * stride_kn + qk_head_dim_pad_arange[:, None] * stride_kk).to(tl.int64)
     v_offsets = (kv_arange[None, :] * stride_vn + value_head_dim_arange[:, None] * stride_vk).to(tl.int64)
@@ -335,7 +377,14 @@ def _blocksparse_attn_bwd_dq_inner(
                 mask=qk_head_dim_pad_arange[:, None] < QK_HEAD_DIM,
                 other=0.0,
             )
-        value_transpose = tl.load(value_transpose_ptr)
+        if EVEN_V_HEAD_DIM:
+            value_transpose = tl.load(value_transpose_ptr)
+        else:
+            value_transpose = tl.load(
+                value_transpose_ptr,
+                mask=value_head_dim_arange[:, None] < V_HEAD_DIM,
+                other=0.0,
+            )
         attention_weights = tl.dot(query, key_transpose)
 
         kv_leq_len_offset = kv_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -350,6 +399,16 @@ def _blocksparse_attn_bwd_dq_inner(
                 mask = causal_mask & mask
             else:
                 mask = causal_mask
+        if USE_SLIDING_WINDOW:
+            if not USE_CAUSAL:
+                kv_positions_block = tl.load(kv_positions + kv_leq_len_offset)
+            window_mask = make_sliding_window_mask(
+                q_positions, kv_positions_block, WINDOW_LEFT, WINDOW_RIGHT, False
+            )
+            if USE_SEGMENT_MASK or USE_CAUSAL:
+                mask = window_mask & mask
+            else:
+                mask = window_mask
 
         if SOFTCAP:
             LOG2_CONST: tl.constexpr = 1.4426950408889634
@@ -360,19 +419,20 @@ def _blocksparse_attn_bwd_dq_inner(
             tanh_abs = (1.0 - exp_neg) / (1.0 + exp_neg)
             tanh_x = tl.where(x >= 0, tanh_abs, -tanh_abs)
             qk_after = (logits_soft_cap * tanh_x) * LOG2_CONST
-            jac = (softmax_scale * LOG2_CONST) * (1.0 - tanh_x * tanh_x)
+            jac = 1.0 - tanh_x * tanh_x
         else:
             qk_after = attention_weights
-            jac = 1.0
 
         p = tl.math.exp2(qk_after - lse)
 
-        if USE_SEGMENT_MASK or USE_CAUSAL:
+        if USE_SEGMENT_MASK or USE_CAUSAL or USE_SLIDING_WINDOW:
             p = tl.where(mask, p, 0.0)
 
         dp = tl.dot(dout, value_transpose).to(tl.float32)
         ds = p * (dp - delta[:, None])
-        ds = (ds * jac).to(key_transpose.type.element_ty)
+        if SOFTCAP:
+            ds = ds * jac
+        ds = ds.to(key_transpose.type.element_ty)
 
         dq += tl.dot(ds, tl.trans(key_transpose))
 
@@ -425,10 +485,14 @@ def blocksparse_attn_bwd_dq(
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     IS_CONTEXT_PARALLELISM: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    CAUSAL: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
     """Triton kernel for computing dQ gradients in block-sparse backward pass.
@@ -473,6 +537,8 @@ def blocksparse_attn_bwd_dq(
     num_blocks_to_attend = upper_bound - lower_bound
 
     EVEN_QK_HEAD_DIMS_LOCAL: tl.constexpr = QK_HEAD_DIM_PAD == QK_HEAD_DIM
+    EVEN_V_HEAD_DIM_LOCAL: tl.constexpr = V_HEAD_DIM_PAD == V_HEAD_DIM
+    USE_SLIDING_WINDOW_LOCAL: tl.constexpr = WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0
 
     query_init_offset = (batch_size_id * stride_qz + num_heads_id * stride_qh).to(tl.int64)
 
@@ -485,7 +551,7 @@ def blocksparse_attn_bwd_dq(
     lse_init_offset = (batch_size_id * stride_lz + num_heads_id * stride_lh).to(tl.int64)
 
     qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
-    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM_PAD)
 
     if not EVEN_QK_HEAD_DIMS_LOCAL:
         qk_head_dim_mask = qk_head_dim_pad_arange[None, :] < QK_HEAD_DIM
@@ -523,9 +589,12 @@ def blocksparse_attn_bwd_dq(
             tl.store(dq + query_offsets, dq_zero.to(dq.type.element_ty), mask=qk_head_dim_mask)
         return
 
-    dout_val = tl.load(dout + out_offsets)
+    if EVEN_V_HEAD_DIM_LOCAL:
+        dout_val = tl.load(dout + out_offsets)
+    else:
+        dout_val = tl.load(dout + out_offsets, mask=value_head_dim_arange[None, :] < V_HEAD_DIM, other=0.0)
     dq_val = tl.zeros([BLOCK_M, QK_HEAD_DIM_PAD], dtype=tl.float32)
-    qk_scale = (softmax_scale * LOG2_CONST).to(tl.float32)
+    qk_scale = softmax_scale * LOG2_CONST
 
     if EVEN_QK_HEAD_DIMS_LOCAL:
         query_val = tl.load(q + query_offsets)
@@ -566,11 +635,16 @@ def blocksparse_attn_bwd_dq(
         QK_HEAD_DIM=QK_HEAD_DIM,
         QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
         V_HEAD_DIM=V_HEAD_DIM,
+        V_HEAD_DIM_PAD=V_HEAD_DIM_PAD,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM_LOCAL,
         kv_global_offset=0,
         query_span=query_global_offs + query_block_offset,
-        USE_CAUSAL=False,
+        USE_CAUSAL=CAUSAL,
         USE_SEGMENT_MASK=True,
+        USE_SLIDING_WINDOW=USE_SLIDING_WINDOW_LOCAL,
+        WINDOW_LEFT=WINDOW_LEFT,
+        WINDOW_RIGHT=WINDOW_RIGHT,
         SOFTCAP=SOFTCAP,
     )
 
@@ -598,11 +672,16 @@ def blocksparse_attn_bwd_dq(
         QK_HEAD_DIM=QK_HEAD_DIM,
         QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
         V_HEAD_DIM=V_HEAD_DIM,
+        V_HEAD_DIM_PAD=V_HEAD_DIM_PAD,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM_LOCAL,
         kv_global_offset=0,
         query_span=query_global_offs + query_block_offset,
         USE_CAUSAL=False,
         USE_SEGMENT_MASK=False,
+        USE_SLIDING_WINDOW=USE_SLIDING_WINDOW_LOCAL,
+        WINDOW_LEFT=WINDOW_LEFT,
+        WINDOW_RIGHT=WINDOW_RIGHT,
         SOFTCAP=SOFTCAP,
     )
 
@@ -630,15 +709,20 @@ def blocksparse_attn_bwd_dq(
         QK_HEAD_DIM=QK_HEAD_DIM,
         QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
         V_HEAD_DIM=V_HEAD_DIM,
+        V_HEAD_DIM_PAD=V_HEAD_DIM_PAD,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM_LOCAL,
         kv_global_offset=0,
         query_span=query_global_offs + query_block_offset,
-        USE_CAUSAL=True,
+        USE_CAUSAL=CAUSAL,
         USE_SEGMENT_MASK=True,
+        USE_SLIDING_WINDOW=USE_SLIDING_WINDOW_LOCAL,
+        WINDOW_LEFT=WINDOW_LEFT,
+        WINDOW_RIGHT=WINDOW_RIGHT,
         SOFTCAP=SOFTCAP,
     )
 
-    dq_val *= softmax_scale.to(tl.float32)
+    dq_val *= softmax_scale
 
     if EVEN_QK_HEAD_DIMS_LOCAL:
         tl.store(dq + query_offsets, dq_val.to(dq.type.element_ty))
@@ -703,11 +787,15 @@ def blocksparse_attn_bwd_dkdv(
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LOAD_SECOND_OFFSET: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     IS_CONTEXT_PARALLELISM: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    CAUSAL: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
     """Triton kernel for computing dK and dV gradients in block-sparse backward pass.
@@ -758,6 +846,8 @@ def blocksparse_attn_bwd_dkdv(
     upper_bound = tl.load(upper_blocks + mask_offset)
 
     EVEN_QK_HEAD_DIMS_LOCAL: tl.constexpr = QK_HEAD_DIM_PAD == QK_HEAD_DIM
+    EVEN_V_HEAD_DIM_LOCAL: tl.constexpr = V_HEAD_DIM_PAD == V_HEAD_DIM
+    USE_SLIDING_WINDOW_LOCAL: tl.constexpr = WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0
 
     query_init_offset = (batch_size_id * stride_qz + num_heads_id * stride_qh).to(tl.int64)
 
@@ -790,12 +880,12 @@ def blocksparse_attn_bwd_dkdv(
     kv_positions += batch_size_id * KV_SEQ_LEN
 
     qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
-    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
-    qk_scale = (softmax_scale * LOG2_CONST).to(tl.float32)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM_PAD)
+    qk_scale = softmax_scale * LOG2_CONST
 
     kv_block_offset = kv_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    dv_val = tl.zeros([BLOCK_N, V_HEAD_DIM], dtype=tl.float32)
+    dv_val = tl.zeros([BLOCK_N, V_HEAD_DIM_PAD], dtype=tl.float32)
     dk_val = tl.zeros([BLOCK_N, QK_HEAD_DIM_PAD], dtype=tl.float32)
 
     k_offsets = kv_block_offset[:, None] * stride_kn + qk_head_dim_pad_arange[None, :] * stride_kk
@@ -812,7 +902,11 @@ def blocksparse_attn_bwd_dkdv(
         qk_head_dim_mask = qk_head_dim_pad_arange[None, :] < QK_HEAD_DIM
         key_val = tl.load(k + k_offsets, mask=qk_head_dim_mask, other=0.0)
 
-    value_val = tl.load(v + v_offsets)
+    if EVEN_V_HEAD_DIM_LOCAL:
+        value_val = tl.load(v + v_offsets)
+    else:
+        v_head_dim_mask = value_head_dim_arange[None, :] < V_HEAD_DIM
+        value_val = tl.load(v + v_offsets, mask=v_head_dim_mask, other=0.0)
 
     kv_segment_ids_block = tl.load(kv_segment_ids + kv_block_offset)
     kv_positions_block = tl.load(kv_positions + kv_block_offset)
@@ -844,11 +938,16 @@ def blocksparse_attn_bwd_dkdv(
         QK_HEAD_DIM=QK_HEAD_DIM,
         QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
         V_HEAD_DIM=V_HEAD_DIM,
+        V_HEAD_DIM_PAD=V_HEAD_DIM_PAD,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM_LOCAL,
         query_global_offset=query_global_offs,
         kv_span=kv_block_offset,
-        USE_CAUSAL=True,
+        USE_CAUSAL=CAUSAL,
         USE_SEGMENT_MASK=True,
+        USE_SLIDING_WINDOW=USE_SLIDING_WINDOW_LOCAL,
+        WINDOW_LEFT=WINDOW_LEFT,
+        WINDOW_RIGHT=WINDOW_RIGHT,
         SOFTCAP=SOFTCAP,
     )
 
@@ -879,11 +978,16 @@ def blocksparse_attn_bwd_dkdv(
         QK_HEAD_DIM=QK_HEAD_DIM,
         QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
         V_HEAD_DIM=V_HEAD_DIM,
+        V_HEAD_DIM_PAD=V_HEAD_DIM_PAD,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM_LOCAL,
         query_global_offset=query_global_offs,
         kv_span=kv_block_offset,
         USE_CAUSAL=False,
         USE_SEGMENT_MASK=False,
+        USE_SLIDING_WINDOW=USE_SLIDING_WINDOW_LOCAL,
+        WINDOW_LEFT=WINDOW_LEFT,
+        WINDOW_RIGHT=WINDOW_RIGHT,
         SOFTCAP=SOFTCAP,
     )
 
@@ -914,25 +1018,43 @@ def blocksparse_attn_bwd_dkdv(
         QK_HEAD_DIM=QK_HEAD_DIM,
         QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
         V_HEAD_DIM=V_HEAD_DIM,
+        V_HEAD_DIM_PAD=V_HEAD_DIM_PAD,
         EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        EVEN_V_HEAD_DIM=EVEN_V_HEAD_DIM_LOCAL,
         query_global_offset=query_global_offs,
         kv_span=kv_block_offset,
-        USE_CAUSAL=False,
+        USE_CAUSAL=CAUSAL,
         USE_SEGMENT_MASK=True,
+        USE_SLIDING_WINDOW=USE_SLIDING_WINDOW_LOCAL,
+        WINDOW_LEFT=WINDOW_LEFT,
+        WINDOW_RIGHT=WINDOW_RIGHT,
         SOFTCAP=SOFTCAP,
     )
 
-    dk_val *= softmax_scale.to(tl.float32)
+    dk_val *= softmax_scale
 
-    tl.atomic_add(dv + dv_offsets, dv_val.to(dv.type.element_ty))
-    if EVEN_QK_HEAD_DIMS_LOCAL:
-        tl.atomic_add(dk + dk_offsets, dk_val.to(dk.type.element_ty))
+    if NUM_GROUPS == 1:
+        if EVEN_V_HEAD_DIM_LOCAL:
+            tl.store(dv + dv_offsets, dv_val.to(dv.type.element_ty))
+        else:
+            tl.store(dv + dv_offsets, dv_val.to(dv.type.element_ty), mask=v_head_dim_mask)
+        if EVEN_QK_HEAD_DIMS_LOCAL:
+            tl.store(dk + dk_offsets, dk_val.to(dk.type.element_ty))
+        else:
+            tl.store(dk + dk_offsets, dk_val.to(dk.type.element_ty), mask=qk_head_dim_mask)
     else:
-        tl.atomic_add(
-            dk + dk_offsets,
-            dk_val.to(dk.type.element_ty),
-            mask=qk_head_dim_mask,
-        )
+        if EVEN_V_HEAD_DIM_LOCAL:
+            tl.atomic_add(dv + dv_offsets, dv_val.to(dv.type.element_ty))
+        else:
+            tl.atomic_add(dv + dv_offsets, dv_val.to(dv.type.element_ty), mask=v_head_dim_mask)
+        if EVEN_QK_HEAD_DIMS_LOCAL:
+            tl.atomic_add(dk + dk_offsets, dk_val.to(dk.type.element_ty))
+        else:
+            tl.atomic_add(
+                dk + dk_offsets,
+                dk_val.to(dk.type.element_ty),
+                mask=qk_head_dim_mask,
+            )
 
 
 @triton.jit
@@ -993,11 +1115,15 @@ def blocksparse_attn_bwd(
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M_DKDV: tl.constexpr,
     BLOCK_N_DKDV: tl.constexpr,
     BLOCK_M_DQ: tl.constexpr,
     BLOCK_N_DQ: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    CAUSAL: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
     """Main Triton kernel wrapper for block-sparse attention backward pass.
@@ -1093,11 +1219,15 @@ def blocksparse_attn_bwd(
         QK_HEAD_DIM,
         QK_HEAD_DIM_PAD,
         V_HEAD_DIM,
+        V_HEAD_DIM_PAD,
         BLOCK_M_DKDV,
         BLOCK_N_DKDV,
         False,
         NUM_GROUPS,
         False,
+        WINDOW_LEFT,
+        WINDOW_RIGHT,
+        CAUSAL,
         SOFTCAP,
     )
 
@@ -1144,10 +1274,14 @@ def blocksparse_attn_bwd(
         QK_HEAD_DIM,
         QK_HEAD_DIM_PAD,
         V_HEAD_DIM,
+        V_HEAD_DIM_PAD,
         BLOCK_M_DQ,
         BLOCK_N_DQ,
         NUM_GROUPS,
         False,
+        WINDOW_LEFT,
+        WINDOW_RIGHT,
+        CAUSAL,
         SOFTCAP,
     )
 
@@ -1213,12 +1347,12 @@ def _bwd_blocksparse_attn_call(
 
     batch_size, num_heads, query_seq_len, qk_head_dim = query.shape
     _, num_kv_heads, kv_seq_len, value_head_dim = value.shape
-    qk_head_dim_pad = next_power_of_2(qk_head_dim)
+    qk_head_dim_pad = max(16, next_power_of_2(qk_head_dim))
+    v_head_dim_pad = max(16, next_power_of_2(value_head_dim))
 
     num_groups = num_heads // num_kv_heads
 
     chex.assert_is_divisible(query_seq_len, bwd_params.q_blocksize)
-    chex.assert_is_divisible(kv_seq_len, bwd_params.kv_blocksize)
     chex.assert_is_divisible(kv_seq_len, bwd_params.kv_blocksize)
 
     num_query_blocks = query_seq_len // BLOCK_M_DQ
@@ -1287,6 +1421,7 @@ def _bwd_blocksparse_attn_call(
         name="ejkernel::triton::blocksparse_attn_bwd_preprocess",
         BLOCK_SIZE=preprocess_block_size,
         HEAD_DIM=value_head_dim,
+        HEAD_DIM_PAD=v_head_dim_pad,
         num_warps=bwd_params.num_warps,
         num_stages=bwd_params.num_stages,
         zeroed_outputs=(0,),
@@ -1316,7 +1451,11 @@ def _bwd_blocksparse_attn_call(
         QK_HEAD_DIM=qk_head_dim,
         QK_HEAD_DIM_PAD=qk_head_dim_pad,
         V_HEAD_DIM=value_head_dim,
+        V_HEAD_DIM_PAD=v_head_dim_pad,
         NUM_GROUPS=num_groups,
+        WINDOW_LEFT=window_left,
+        WINDOW_RIGHT=window_right,
+        CAUSAL=causal,
         SOFTCAP=softcap_flag,
         num_stages=bwd_params.num_stages,
         num_warps=bwd_params.num_warps,
@@ -1324,11 +1463,18 @@ def _bwd_blocksparse_attn_call(
 
     dk_shape = (batch_size, num_kv_heads, kv_seq_len, qk_head_dim)
     dv_shape = (batch_size, num_kv_heads, kv_seq_len, value_head_dim)
-    zeroed_outputs = (0, 1) if use_separate_kernel_impl else (1, 2)
+    if num_groups == 1:
+        zeroed_outputs = ()
+        dk_out_dtype = key.dtype
+        dv_out_dtype = value.dtype
+    else:
+        zeroed_outputs = (0, 1) if use_separate_kernel_impl else (1, 2)
+        dk_out_dtype = jnp.float32
+        dv_out_dtype = jnp.float32
 
     dq_shape_dtype = jax.ShapeDtypeStruct(shape=query.shape, dtype=query.dtype)
-    dk_shape_dtype = jax.ShapeDtypeStruct(shape=dk_shape, dtype=jnp.float32)
-    dv_shape_dtype = jax.ShapeDtypeStruct(shape=dv_shape, dtype=jnp.float32)
+    dk_shape_dtype = jax.ShapeDtypeStruct(shape=dk_shape, dtype=dk_out_dtype)
+    dv_shape_dtype = jax.ShapeDtypeStruct(shape=dv_shape, dtype=dv_out_dtype)
 
     if use_separate_kernel_impl:
         out_shape = [dq_shape_dtype]
@@ -1454,6 +1600,9 @@ def _bwd_blocksparse_attn_call(
             **metaparams,
             zeroed_outputs=zeroed_outputs,
         )
+
+    if seq_len_eff != query_seq_len:
+        dq = dq[:, :, :seq_len_eff, :]
 
     return (
         dq.astype(query.dtype),

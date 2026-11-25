@@ -7,5 +7,6 @@ ejkernel.ops package
    config/index
    core/index
    execution/index
+   tuned/index
    utils/index
    registry

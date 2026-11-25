@@ -43,10 +43,10 @@ def padded_load(
     ptrs,
     offs_a,
     offs_b,
-    PA0: tl.constexpr,
-    PA1: tl.constexpr,
-    LA0: tl.constexpr,
-    LA1: tl.constexpr,
+    PA0,
+    PA1,
+    LA0,
+    LA1,
 ):
     """Load data from memory with optional padding for boundary conditions.
 
@@ -187,43 +187,12 @@ def attention_pack_with_static_shape(
     seqlens = jnp.sum(attention_mask, axis=1).astype(jnp.int32)
     offsets = jnp.zeros((batch_size,), dtype=jnp.int32)
     offsets = offsets.at[1:].set(jnp.cumsum(seqlens[:-1]))
-    packed = jnp.zeros((1, max_tokens, num_heads, head_dim), dtype=x.dtype)
-    batch_idx, pos_idx = jnp.meshgrid(jnp.arange(batch_size), jnp.arange(seqlen), indexing="ij")
-
-    batch_idx_flat = batch_idx.reshape(-1)
-    pos_idx_flat = pos_idx.reshape(-1)
-
-    valid_mask = pos_idx < seqlens[:, None]
-    target_idx = jnp.where(
-        valid_mask,
-        offsets[:, None] + pos_idx,
-        jnp.zeros_like(pos_idx),
-    )
-    target_idx_flat = target_idx.reshape(-1)
-    valid_mask_flat = valid_mask.reshape(-1)
-
-    def process_token(i, packed_acc):
-        """Copy a single token from the padded input to its packed position.
-
-        Args:
-            i: Flat index into the (batch * seq_len) token grid.
-            packed_acc: Running packed output accumulator
-                [1, max_tokens, num_heads, head_dim].
-
-        Returns:
-            Updated packed accumulator with token i placed at its target
-            position if valid, otherwise unchanged.
-        """
-        b = batch_idx_flat[i]
-        p = pos_idx_flat[i]
-        t = target_idx_flat[i]
-        valid = valid_mask_flat[i]
-        packed_acc = jnp.where(valid, packed_acc.at[0, t].set(x[b, p]), packed_acc)
-
-        return packed_acc
-
-    packed = jax.lax.fori_loop(0, batch_size * seqlen, process_token, packed)
-    return packed
+    pos = jnp.arange(seqlen, dtype=jnp.int32)[None, :]
+    valid = pos < seqlens[:, None]
+    dst = jnp.where(valid, offsets[:, None] + pos, max_tokens).reshape(-1)
+    x_flat = x.reshape(batch_size * seqlen, num_heads, head_dim)
+    packed_flat = jnp.zeros((max_tokens, num_heads, head_dim), dtype=x.dtype).at[dst].set(x_flat, mode="drop")
+    return packed_flat[None, :, :, :]
 
 
 def basic_attention_refrence(
@@ -360,45 +329,14 @@ def attention_pack_from_cu_static(
     if max_tokens is None:
         max_tokens = B * S_max
 
-    out = jnp.zeros((1, max_tokens, H, D), dtype=x.dtype)
-
-    def body_b(b, out_acc):
-        """Pack tokens for a single batch element into the output buffer.
-
-        Args:
-            b: Batch index being processed.
-            out_acc: Running packed output accumulator
-                [1, max_tokens, num_heads, head_dim].
-
-        Returns:
-            Updated accumulator with batch element b's valid tokens
-            copied to contiguous positions starting at cum_seqlens[b].
-        """
-        start = cum_seqlens[b]
-        end = cum_seqlens[b + 1]
-        L = end - start
-
-        def body_p(p, acc):
-            """Copy position p from batch element b if within sequence length.
-
-            Args:
-                p: Position index within the padded sequence.
-                acc: Running packed output accumulator.
-
-            Returns:
-                Updated accumulator with token at position p written to
-                its destination if p < sequence length, otherwise unchanged.
-            """
-            valid = p < L
-            dst = start + p
-            acc = jnp.where(valid, acc.at[0, dst].set(x[b, p]), acc)
-            return acc
-
-        out_acc = jax.lax.fori_loop(0, S_max, body_p, out_acc)
-        return out_acc
-
-    out = jax.lax.fori_loop(0, B, body_b, out)
-    return out
+    starts = cum_seqlens[:-1]
+    lengths = cum_seqlens[1:] - starts
+    pos = jnp.arange(S_max, dtype=jnp.int32)[None, :]
+    valid = pos < lengths[:, None]
+    dst = jnp.where(valid, starts[:, None] + pos, max_tokens).reshape(-1)
+    x_flat = x.reshape(B * S_max, H, D)
+    out_flat = jnp.zeros((max_tokens, H, D), dtype=x.dtype).at[dst].set(x_flat, mode="drop")
+    return out_flat[None, :, :, :]
 
 
 @ejit(static_argnames=["seqlen", "batch_size"])
@@ -430,43 +368,13 @@ def attention_unpack_with_static_shape(
         are left as zeros (padding).
     """
     H, D = x.shape[2], x.shape[3]
-    out = jnp.zeros((batch_size, seqlen, H, D), dtype=x.dtype)
+    if x.shape[1] == 0:
+        return jnp.zeros((batch_size, seqlen, H, D), dtype=x.dtype)
 
-    def body_b(b, out_acc):
-        """Unpack tokens for a single batch element from the packed buffer.
-
-        Args:
-            b: Batch index being processed.
-            out_acc: Running unpacked output accumulator
-                [batch_size, seqlen, num_heads, head_dim].
-
-        Returns:
-            Updated accumulator with batch element b's tokens copied from
-            their contiguous packed positions back to the padded layout.
-        """
-        start = cum_seqlens[b]
-        end = cum_seqlens[b + 1]
-        L = end - start
-
-        def body_p(p, acc):
-            """Copy position p from packed buffer to batch element b if valid.
-
-            Args:
-                p: Position index within the padded output sequence.
-                acc: Running unpacked output accumulator.
-
-            Returns:
-                Updated accumulator with the token at packed position
-                (start + p) written to (b, p) if p < sequence length,
-                otherwise unchanged.
-            """
-            valid = p < L
-            src = start + p
-            acc = jnp.where(valid, acc.at[b, p].set(x[0, src]), acc)
-            return acc
-
-        out_acc = jax.lax.fori_loop(0, seqlen, body_p, out_acc)
-        return out_acc
-
-    out = jax.lax.fori_loop(0, batch_size, body_b, out)
-    return out
+    starts = cum_seqlens[:-1]
+    lengths = cum_seqlens[1:] - starts
+    pos = jnp.arange(seqlen, dtype=jnp.int32)[None, :]
+    valid = pos < lengths[:, None]
+    src = jnp.where(valid, starts[:, None] + pos, 0)
+    gathered = jnp.take(x[0], src, axis=0)
+    return jnp.where(valid[:, :, None, None], gathered, jnp.zeros((), dtype=x.dtype))

@@ -50,7 +50,7 @@ def recurrent_gla(
 
     This is the kernel-registry entry point for GLA on the Triton/GPU platform.
     It delegates to :func:`ejkernel.kernels._triton.recurrent.recurrent` with
-    the gate tensor ``g`` applied.
+    the 4-D per-key gate tensor passed as ``gk=g``.
 
     Supports both padded-batch mode and variable-length (packed) mode via
     ``cu_seqlens``.

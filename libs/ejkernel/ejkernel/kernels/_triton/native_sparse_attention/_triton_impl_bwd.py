@@ -60,6 +60,8 @@ Functions:
 - bwd_triton_impl: Main backward pass orchestrator
 """
 
+import math
+
 import jax
 import triton
 import triton.language as tl
@@ -74,7 +76,9 @@ from ._utilities import nsa_block_mask
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
-        "USE_BLOCK_COUNTS": lambda args: isinstance(args["block_counts"], jax.Array),
+        "USE_BLOCK_COUNTS": lambda args: (
+            isinstance(args["block_counts"], jax.core.ShapedArray | jax.Array) and args["block_counts"].ndim > 0
+        ),
     }
 )
 @triton.jit
@@ -490,7 +494,7 @@ def bwd_triton_impl(
     NumVBlocks = cdiv(BLOCK_DIMV, BLOCKSIZE_V)
 
     delta_shape = o.shape[:-1]
-    delta_numel = jnp.prod(jnp.array(delta_shape))
+    delta_numel = math.prod(delta_shape)
     (delta,) = triton_call(
         o,
         do,

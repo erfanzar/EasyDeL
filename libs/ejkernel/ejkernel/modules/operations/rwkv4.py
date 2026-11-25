@@ -64,7 +64,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -193,7 +193,7 @@ class RWKV4(Kernel[RWKV4Config, Array]):
 
         impl = self.get_impl(cfg)
         resolved = detect_platform("rwkv4", cfg.platform)
-        if resolved == "tilelang":
+        if resolved in (Platform.TILELANG, Platform.TRITON):
             out, final_state = impl(w=w, u=u, k=k, v=v, state=state, block_c=int(cfg.block_c))
         else:
             out, final_state = impl(w=w, u=u, k=k, v=v, state=state)
@@ -228,6 +228,14 @@ class RWKV4(Kernel[RWKV4Config, Array]):
             block_c=self._heuristic_block_c(self._channels_from_inv(inv)),
             platform="auto",
             backend="any",
+        )
+
+    def heuristic_cfg_gpu(self, inv: Invocation[RWKV4Config, Array]) -> RWKV4Config:
+        """Provide GPU-optimized default configuration for RWKV-4."""
+        return RWKV4Config(
+            block_c=self._heuristic_block_c(self._channels_from_inv(inv)),
+            platform="triton",
+            backend="gpu",
         )
 
     def candidate_cfgs(self, inv: Invocation[RWKV4Config, Array]):
@@ -266,7 +274,8 @@ class RWKV4(Kernel[RWKV4Config, Array]):
             for bc in bc_choices:
                 candidates.append(RWKV4Config(block_c=bc, platform="tilelang", backend="gpu"))
         if "triton" in platforms:
-            candidates.append(RWKV4Config(block_c=64, platform="triton", backend="gpu"))
+            for bc in bc_choices:
+                candidates.append(RWKV4Config(block_c=bc, platform="triton", backend="gpu"))
         if "xla" in platforms:
             candidates.append(RWKV4Config(block_c=64, platform="xla", backend="any"))
         return candidates or [self.heuristic_cfg(inv)]

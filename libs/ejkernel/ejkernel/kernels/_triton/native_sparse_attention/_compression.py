@@ -68,6 +68,7 @@ Example:
     ... )
 """
 
+import math
 from functools import partial
 
 import jax
@@ -440,6 +441,7 @@ def nsa_compression_bwd_kernel_dkv(
     dv,
     SEQUENCE: tl.constexpr,
     Z: tl.constexpr,
+    K_TOTAL_CHUNKS: tl.constexpr,
     KV_HEADS: tl.constexpr,
     Q_HEADS: tl.constexpr,
     QK_GROUPS: tl.constexpr,
@@ -493,6 +495,8 @@ def nsa_compression_bwd_kernel_dkv(
             (NumVBlocks, TC_total, KV_HEADS, BLOCK_DIMV).
         SEQUENCE: Uniform sequence length (constexpr).
         Z: Batch size (constexpr).
+        K_TOTAL_CHUNKS: Total number of compressed key chunks across the batch
+            or packed sequences (constexpr).
         KV_HEADS: Number of KV attention heads (constexpr).
         Q_HEADS: Total number of query heads (constexpr).
         QK_GROUPS: GQA group size ``Q_HEADS // KV_HEADS`` (constexpr).
@@ -507,7 +511,6 @@ def nsa_compression_bwd_kernel_dkv(
     i_v, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
-    scope = Z * SEQUENCE
     if IS_VARLEN:
         i_n, i_c = tl.load(chunk_indices + i_c * 2).to(tl.int32), tl.load(chunk_indices + i_c * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -536,7 +539,7 @@ def nsa_compression_bwd_kernel_dkv(
         (1, 0),
     )
     p_dk = tl.make_block_ptr(
-        dk + (i_v * scope * KV_HEADS + boc * KV_HEADS + i_h) * BLOCK_DIMK,
+        dk + (i_v * K_TOTAL_CHUNKS * KV_HEADS + boc * KV_HEADS + i_h) * BLOCK_DIMK,
         (TC, BLOCK_DIMK),
         (KV_HEADS * BLOCK_DIMK, 1),
         (i_c * BLOCK_SEQ, 0),
@@ -544,7 +547,7 @@ def nsa_compression_bwd_kernel_dkv(
         (1, 0),
     )
     p_dv = tl.make_block_ptr(
-        dv + (i_v * scope * KV_HEADS + boc * KV_HEADS + i_h) * BLOCK_DIMV,
+        dv + (boc * KV_HEADS + i_h) * BLOCK_DIMV,
         (TC, BLOCK_DIMV),
         (KV_HEADS * BLOCK_DIMV, 1),
         (i_c * BLOCK_SEQ, i_v * BLOCKSIZE_V),
@@ -586,7 +589,7 @@ def nsa_compression_bwd_kernel_dkv(
         b_delta = tl.load(p_delta)
         b_s = tl.dot(b_k, tl.trans(b_q))
         b_p = tl.exp(b_s - b_lse[None, :])
-        b_p = tl.where((i >= max(0, (o_c + 1) * BLOCKSIZE - 1))[:, None], b_p, 0)
+        b_p = tl.where((i >= tl.maximum(0, (o_c + 1) * BLOCKSIZE - 1))[:, None], b_p, 0)
         b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
         b_dp = tl.dot(b_v, tl.trans(b_do))
         b_ds = b_p * (b_dp - b_delta[None, :])
@@ -743,12 +746,14 @@ def nsa_compression_bwd(
         chunk_indices, chunk_offsets = None, None
         NC = cdiv(cdiv(SEQUENCE, BLOCKSIZE), BLOCK_SEQ)
 
+    delta_shape = o.shape[:-1]
+    delta_numel = math.prod(delta_shape)
     (delta,) = triton_call(
         o,
         do,
         kernel=bwd_kernel_preprocess,
-        grid=lambda META: (delta.numel(),),
-        out_shape=[jax.ShapeDtypeStruct(o.shape[:-1], dtype="f4")],
+        grid=lambda META: (delta_numel,),
+        out_shape=[jax.ShapeDtypeStruct(delta_shape, dtype="f4")],
         name="ejkernel::triton::sparse_attn_compression_bwd_preprocess",
         Z=next_power_of_2(o.shape[-1]),
         BLOCK_DIMV=o.shape[-1],
@@ -795,6 +800,10 @@ def nsa_compression_bwd(
         jax.ShapeDtypeStruct((NumVBlocks, *k.shape), dtype=k.dtype if NumVBlocks == 1 else "f4"),
         jax.ShapeDtypeStruct(v.shape, dtype=v.dtype),
     ]
+    dkv_metaparams = dict(
+        **metaparams,
+        K_TOTAL_CHUNKS=k.shape[0] * k.shape[1],
+    )
     dk, dv = triton_call(
         q,
         k,
@@ -812,10 +821,10 @@ def nsa_compression_bwd(
         out_shape=outputs,
         num_warps=num_warps,
         num_stages=num_stages,
-        **metaparams,
+        **dkv_metaparams,
     )
     dk = jnp.sum(dk, 0)
-    return dq, dk, dv
+    return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
 
 
 def _fwd_call(
@@ -845,24 +854,23 @@ def _fwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    residual = q, k, v, o, lse
+    residual = q, k, v, cu_seqlens, token_indices, o, lse
     return (o, lse), residual
 
 
 def _bwd_call(
     block_size: int,
     softmax_scale: float,
-    cu_seqlens: jax.Array | None,
-    token_indices: jax.Array | None,
     block_k: int,
     block_v: int,
     num_warps: int,
     num_stages: int,
-    residual: tuple[jax.Array],
-    do: jax.Array,
+    residual: tuple[jax.Array | None, ...],
+    cotangent: tuple[jax.Array, jax.Array],
 ):
     """VJP backward pass: delegates to ``nsa_compression_bwd``."""
-    q, k, v, o, lse = residual
+    q, k, v, cu_seqlens, token_indices, o, lse = residual
+    do = cotangent[0] if isinstance(cotangent, tuple) else cotangent
     dq, dk, dv = nsa_compression_bwd(
         q=q,
         k=k,
@@ -879,10 +887,10 @@ def _bwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return dq, dk, dv
+    return dq, dk, dv, None, None
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8, 9, 10))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 7, 8, 9, 10))
 @partial(jax.jit, static_argnums=(3, 4, 7, 8, 9, 10))
 def _nsa_compression(
     q: jax.Array,

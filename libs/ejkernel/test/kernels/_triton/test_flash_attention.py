@@ -45,23 +45,33 @@ class TestLogitsSoftCap:
         assert not jnp.allclose(out_capped, out_uncapped, rtol=1e-2)
 
     def test_soft_cap_gradient(self):
-        """Test that gradients work with soft cap."""
-        batch, seq_len, num_heads, head_dim = 2, 16, 2, 32
-        key = jax.random.PRNGKey(0)
+        """Test that soft-cap backward (dq, dk, dv) matches XLA and preserves input dtypes."""
+        batch, seq_len, num_heads, head_dim = 2, 48, 4, 32
+        kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(0), 4)
 
-        q = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16) * 0.5
+        k = jax.random.normal(kk, (batch, seq_len, 2, head_dim), dtype=jnp.float16) * 0.5
+        v = jax.random.normal(kv, (batch, seq_len, 2, head_dim), dtype=jnp.float16) * 0.5
+        w = jax.random.normal(kw, (batch, seq_len, num_heads, head_dim), dtype=jnp.float32)
 
-        def loss_fn(q, k, v):
-            out = flash_attention(q, k, v, logits_soft_cap=20.0)
-            return jnp.sum(out.astype(jnp.float32) ** 2)
+        def loss_fn(fn, q_, k_, v_):
+            out = fn(q_, k_, v_, causal=True, logits_soft_cap=20.0)
+            return jnp.sum(out.astype(jnp.float32) * w)
 
-        grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grads_triton = jax.jit(jax.grad(lambda q_, k_, v_: loss_fn(flash_attention, q_, k_, v_), argnums=(0, 1, 2)))(
+            q, k, v
+        )
+        grads_xla = jax.grad(lambda q_, k_, v_: loss_fn(xla_flash_attention, q_, k_, v_), argnums=(0, 1, 2))(q, k, v)
 
-        assert jnp.all(jnp.isfinite(grads[0]))
-        assert jnp.all(jnp.isfinite(grads[1]))
-        assert jnp.all(jnp.isfinite(grads[2]))
+        for name, got, want, expected_dtype in zip(
+            ("dq", "dk", "dv"), grads_triton, grads_xla, (q.dtype, k.dtype, v.dtype), strict=True
+        ):
+            assert got.dtype == expected_dtype, f"{name} dtype {got.dtype} != {expected_dtype}"
+            got_f32 = np.asarray(got, dtype=np.float32)
+            want_f32 = np.asarray(want, dtype=np.float32)
+            assert np.all(np.isfinite(got_f32)), f"{name} contains non-finite values"
+            assert np.linalg.norm(want_f32) > 1e-2, f"{name} reference is degenerate"
+            np.testing.assert_allclose(got_f32, want_f32, rtol=5e-2, atol=5e-2, err_msg=f"softcap {name} mismatch")
 
     def test_soft_cap_values(self):
         """Test different soft cap values."""
@@ -409,6 +419,166 @@ def test_flash_attention_large_sink_gradient_finite_on_fully_masked_causal_rows(
 
     g = np.asarray(jax.grad(loss)(jnp.asarray([100.0], jnp.float32)), dtype=np.float32)
     assert np.all(np.isfinite(g)), g
+
+
+def test_flash_attention_jit_non_pow2_seqlen_and_grad_parity():
+    """Verify jax.jit forward + backward with non-pow2 seq_len=48 and default fwd_params=None."""
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(71), 4)
+    q = jax.random.normal(kq, (2, 48, 4, 64), dtype=jnp.bfloat16) * 0.5
+    k = jax.random.normal(kk, (2, 48, 2, 64), dtype=jnp.bfloat16) * 0.5
+    v = jax.random.normal(kv, (2, 48, 2, 64), dtype=jnp.bfloat16) * 0.5
+    w = jax.random.normal(kw, (2, 48, 4, 64), dtype=jnp.float32)
+
+    jit_fwd = jax.jit(lambda q_, k_, v_: flash_attention(q_, k_, v_, causal=True))
+    out_triton = jit_fwd(q, k, v)
+    out_xla = xla_flash_attention(q, k, v, causal=True)
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    grads_triton = jax.jit(
+        jax.grad(lambda q_, k_, v_: jnp.sum(flash_attention(q_, k_, v_, causal=True).astype(jnp.float32) * w), (0, 1, 2))
+    )(q, k, v)
+    grads_xla = jax.grad(
+        lambda q_, k_, v_: jnp.sum(xla_flash_attention(q_, k_, v_, causal=True).astype(jnp.float32) * w), (0, 1, 2)
+    )(q, k, v)
+    for got, want, dtype in zip(grads_triton, grads_xla, (q.dtype, k.dtype, v.dtype), strict=True):
+        assert got.dtype == dtype
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float32), np.asarray(want, dtype=np.float32), rtol=6e-2, atol=6e-2
+        )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("use_sinks", [False, True])
+def test_flash_attention_sliding_window_matches_xla_fwd_and_bwd(causal, use_sinks):
+    """Multi-block sliding_window exercises KV block skipping (with and without sinks) in fwd & bwd."""
+    from ejkernel.ops import BwdParams, FwdParams
+
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(83), 4)
+    batch, seq_len, nheads_q, nheads_kv, head_dim = 1, 192, 4, 2, 32
+    q = jax.random.normal(kq, (batch, seq_len, nheads_q, head_dim), dtype=jnp.float16) * 0.5
+    k = jax.random.normal(kk, (batch, seq_len, nheads_kv, head_dim), dtype=jnp.float16) * 0.5
+    v = jax.random.normal(kv, (batch, seq_len, nheads_kv, head_dim), dtype=jnp.float16) * 0.5
+    w = jax.random.normal(kw, (batch, seq_len, nheads_q, head_dim), dtype=jnp.float32)
+    sinks = jnp.array([0.5, -0.3, 1.1, 0.2], dtype=jnp.float32) if use_sinks else None
+    window = (48, 0) if causal else (48, 32)
+    fwd = FwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=2)
+    bwd = BwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=2)
+
+    out_triton = jax.jit(
+        lambda q_, k_, v_: flash_attention(
+            q_, k_, v_, causal=causal, sliding_window=window, softmax_aux=sinks, fwd_params=fwd, bwd_params=bwd
+        )
+    )(q, k, v)
+    out_xla = xla_flash_attention(q, k, v, causal=causal, sliding_window=window, softmax_aux=sinks)
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    grads_triton = jax.jit(
+        jax.grad(
+            lambda q_, k_, v_: jnp.sum(
+                flash_attention(
+                    q_,
+                    k_,
+                    v_,
+                    causal=causal,
+                    sliding_window=window,
+                    softmax_aux=sinks,
+                    fwd_params=fwd,
+                    bwd_params=bwd,
+                ).astype(jnp.float32)
+                * w
+            ),
+            argnums=(0, 1, 2),
+        )
+    )(q, k, v)
+    grads_xla = jax.grad(
+        lambda q_, k_, v_: jnp.sum(
+            xla_flash_attention(q_, k_, v_, causal=causal, sliding_window=window, softmax_aux=sinks).astype(jnp.float32)
+            * w
+        ),
+        argnums=(0, 1, 2),
+    )(q, k, v)
+    for name, got, want in zip(("dq", "dk", "dv"), grads_triton, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float32),
+            np.asarray(want, dtype=np.float32),
+            rtol=6e-2,
+            atol=6e-2,
+            err_msg=f"sliding_window {name} mismatch",
+        )
+
+
+def test_flash_attention_varlen_cum_seqlens_matches_xla_fwd_and_bwd():
+    """Varlen cum_seqlens with partial tail blocks matches per-sequence XLA reference in fwd & bwd."""
+    from ejkernel.ops import BwdParams, FwdParams
+
+    kq, kk, kv, kw = jax.random.split(jax.random.PRNGKey(97), 4)
+    batch, max_len, nheads_q, nheads_kv, head_dim = 2, 64, 4, 2, 32
+    lens = [45, 29]  # deliberately non-multiples of BLOCK_M=32 to exercise varlen tail pad_rows
+    cum_seqlens = jnp.array([0, lens[0], lens[0] + lens[1]], dtype=jnp.int32)
+
+    q = jax.random.normal(kq, (batch, max_len, nheads_q, head_dim), dtype=jnp.float16) * 0.5
+    k = jax.random.normal(kk, (batch, max_len, nheads_kv, head_dim), dtype=jnp.float16) * 0.5
+    v = jax.random.normal(kv, (batch, max_len, nheads_kv, head_dim), dtype=jnp.float16) * 0.5
+    w = jax.random.normal(kw, (batch, max_len, nheads_q, head_dim), dtype=jnp.float32)
+
+    fwd = FwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=2)
+    bwd = BwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=2)
+
+    out_triton = jax.jit(
+        lambda q_, k_, v_, cu: flash_attention(
+            q_, k_, v_, causal=True, cum_seqlens_q=cu, cum_seqlens_k=cu, fwd_params=fwd, bwd_params=bwd
+        )
+    )(q, k, v, cum_seqlens)
+
+    for b, seq_l in enumerate(lens):
+        ref_b = xla_flash_attention(q[b : b + 1, :seq_l], k[b : b + 1, :seq_l], v[b : b + 1, :seq_l], causal=True)
+        np.testing.assert_allclose(
+            np.asarray(out_triton[b : b + 1, :seq_l], dtype=np.float32),
+            np.asarray(ref_b, dtype=np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+        assert np.all(np.asarray(out_triton[b, seq_l:], dtype=np.float32) == 0.0)
+
+    def loss_varlen(q_, k_, v_):
+        out = flash_attention(
+            q_, k_, v_, causal=True, cum_seqlens_q=cum_seqlens, cum_seqlens_k=cum_seqlens, fwd_params=fwd, bwd_params=bwd
+        )
+        return jnp.sum(out.astype(jnp.float32) * w)
+
+    dq_t, dk_t, dv_t = jax.jit(jax.grad(loss_varlen, argnums=(0, 1, 2)))(q, k, v)
+    assert dq_t.dtype == q.dtype and dk_t.dtype == k.dtype and dv_t.dtype == v.dtype
+    for b, seq_l in enumerate(lens):
+        w_b = w[b : b + 1, :seq_l]
+        dq_r, dk_r, dv_r = jax.grad(
+            lambda q_, k_, v_, w_b=w_b: jnp.sum(
+                xla_flash_attention(q_, k_, v_, causal=True).astype(jnp.float32) * w_b
+            ),
+            argnums=(0, 1, 2),
+        )(q[b : b + 1, :seq_l], k[b : b + 1, :seq_l], v[b : b + 1, :seq_l])
+        for name, got, want in zip(
+            ("dq", "dk", "dv"),
+            (dq_t[b : b + 1, :seq_l], dk_t[b : b + 1, :seq_l], dv_t[b : b + 1, :seq_l]),
+            (dq_r, dk_r, dv_r),
+            strict=True,
+        ):
+            np.testing.assert_allclose(
+                np.asarray(got, dtype=np.float32),
+                np.asarray(want, dtype=np.float32),
+                rtol=6e-2,
+                atol=6e-2,
+                err_msg=f"varlen batch={b} {name} mismatch",
+            )
 
 
 if __name__ == "__main__":

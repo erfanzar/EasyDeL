@@ -71,6 +71,7 @@ Note:
 
 from __future__ import annotations
 
+import atexit
 import copy
 import dataclasses
 import functools
@@ -142,6 +143,13 @@ def _load_triton_kernel_call_lib(module: Any) -> Any:
 triton_kernel_call_lib = _load_triton_kernel_call_lib(triton_kernel_call_lib)
 
 CAN_USE_TRITON = False
+triton: Any = None
+_triton: Any = None
+cb: Any = None
+tl: Any = None
+code_gen: Any = None
+tc: Any = None
+autotuner: Any = None
 try:
     import triton
     import triton._C.libtriton as _triton
@@ -159,7 +167,6 @@ try:
     import triton.backends.amd.compiler as hb
 except ImportError:
     hb = None
-    pass
 
 
 safe_map, unsafe_map = util.safe_map, map
@@ -248,18 +255,6 @@ def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
     elif len(grid) > 3:
         raise ValueError("`grid` should have three or fewer dimensions.")
     return tuple(grid) + (1,) * (3 - len(grid))
-
-
-def avals_to_layouts(avals):
-    """Convert abstract values to layout specifications.
-
-    Args:
-        avals: List of abstract values with ndim attribute.
-
-    Returns:
-        List of layout specifications as reversed dimension ranges.
-    """
-    return [list(reversed(range(aval.ndim))) for aval in avals]
 
 
 def _device_set_from_sharding(sharding) -> set | None:
@@ -387,29 +382,55 @@ def _assert_single_device_args(
     try:
         platform = getattr(first_device, "platform", None)
         devices = jax.devices(platform) if platform else jax.devices()
-        if 0 <= device_index < len(devices) and devices[device_index] != first_device:
-            raise AssertionError(
-                "triton_call received inputs on a different device than the requested "
-                f"`device={device_index}`. Place inputs on the target device or adjust "
-                "the `device` argument."
-            )
     except Exception:
         return
 
+    if 0 <= device_index < len(devices) and devices[device_index] != first_device:
+        raise AssertionError(
+            "triton_call received inputs on a different device than the requested "
+            f"`device={device_index}`. Place inputs on the target device or adjust "
+            "the `device` argument."
+        )
 
-def _has_multi_accelerators() -> bool:
-    """Check whether more than one non-CPU accelerator is available.
+
+def _infer_device_index(array_args: Sequence[Any], device: int | None) -> int:
+    """Infer the local accelerator index from input array placement.
+
+    When ``device`` is explicitly provided, it is returned unchanged. Otherwise,
+    inspects ``array_args`` for a single concrete device and resolves its local
+    device index, falling back to ``0`` if no concrete device is available.
+
+    Args:
+        array_args: Array or tracer arguments passed to ``triton_call``.
+        device: Optional explicit device index.
 
     Returns:
-        ``True`` if more than one non-CPU device is visible to JAX,
-        ``False`` otherwise (including when device enumeration fails).
+        Integer device index to pass to the Triton compilation backend.
     """
-    try:
-        devices = jax.devices()
-    except Exception:
-        return False
-    accelerator_devices = [device for device in devices if getattr(device, "platform", None) not in (None, "cpu")]
-    return len(accelerator_devices) > 1
+    if device is not None:
+        return int(device)
+
+    for arg in array_args:
+        devs = _array_device_set(arg)
+        if devs is None or len(devs) != 1:
+            continue
+        first_device = next(iter(devs))
+        platform = getattr(first_device, "platform", None)
+        for getter in (jax.local_devices, jax.devices):
+            try:
+                devices = getter(platform) if platform else getter()
+            except Exception:
+                continue
+            for idx, dev in enumerate(devices):
+                if dev == first_device:
+                    return idx
+        for attr_name in ("local_hardware_id", "id"):
+            dev_id = getattr(first_device, attr_name, None)
+            if isinstance(dev_id, int) and dev_id >= 0:
+                return dev_id
+        break
+
+    return 0
 
 
 def _in_shard_map_context() -> bool:
@@ -448,7 +469,7 @@ def get_triton_type(obj: Any) -> str:
     """Get Triton type string representation for a given object.
 
     Args:
-        obj: Object to get type for (ShapedArray, AbstractRef, constexpr, or scalar).
+        obj: Object to get type for (ShapedArray, AbstractRef, constexpr, None, or scalar).
 
     Returns:
         String representation of the Triton type.
@@ -459,23 +480,26 @@ def get_triton_type(obj: Any) -> str:
     """
     if isinstance(obj, jax.core.ShapedArray | state.AbstractRef):
         return f"*{_JAX_TO_TRITON_TYPE_MAP[obj.dtype]}"
-    if isinstance(obj, tl.constexpr):
+    if CAN_USE_TRITON and isinstance(obj, tl.constexpr):
         obj = obj.value
-    if isinstance(obj, int):
-        if -(2**31) <= obj < 2**31:
+    if obj is None:
+        return "constexpr"
+    if isinstance(obj, bool | np.bool_):
+        return "B"
+    if isinstance(obj, int | np.integer):
+        val = int(obj)
+        if -(2**31) <= val < 2**31:
             return "i32"
-        elif 2**31 <= obj < 2**32:
+        elif 2**31 <= val < 2**32:
             return "u32"
-        elif -(2**63) <= obj < 2**63:
+        elif -(2**63) <= val < 2**63:
             return "i64"
-        elif 2**63 <= obj < 2**64:
+        elif 2**63 <= val < 2**64:
             return "u64"
         else:
             raise ValueError(f"integer overflow representing {obj}")
-    if isinstance(obj, np.float32 | float):
+    if isinstance(obj, np.floating | float):
         return "fp32"
-    if isinstance(obj, bool):
-        return "B"
     if isinstance(obj, str):
         return "str"
     raise NotImplementedError(f"could not compute type name for {obj}: {type(obj)}")
@@ -591,7 +615,7 @@ class CompilationResult:
     """Result of Triton kernel compilation containing binary and metadata.
 
     Attributes:
-        binary: Compiled binary code (PTX for CUDA, HSACO path for ROCm).
+        binary: Compiled binary code (PTX string for CUDA, HSACO bytes or path for ROCm).
         name: Name of the compiled kernel function.
         shared_mem_bytes: Amount of shared memory required in bytes.
         cluster_dims: Cluster dimensions for the kernel launch.
@@ -599,7 +623,7 @@ class CompilationResult:
         llir: LLVM IR representation (optional).
     """
 
-    binary: str
+    binary: str | bytes
     name: str
     shared_mem_bytes: int
     cluster_dims: tuple
@@ -609,8 +633,8 @@ class CompilationResult:
 
 def compile_ttir_inplace(
     ttir,
-    backend: [cb.CUDABackend | hb.HIPBackend],  # type: ignore
-    options: [cb.CUDAOptions | hb.HIPOptions],  # type: ignore
+    backend: cb.CUDABackend | hb.HIPBackend,  # type: ignore
+    options: cb.CUDAOptions | hb.HIPOptions,  # type: ignore
     compute_capability,
     platform,
 ):
@@ -732,7 +756,7 @@ def compile_ttir_to_hsaco_inplace(
         compute_capability: GPU architecture specification.
 
     Returns:
-        CompilationResult with HSACO binary path and metadata.
+        CompilationResult with raw HSACO binary bytes and metadata.
 
     Raises:
         ValueError: If compilation passes fail.
@@ -762,11 +786,8 @@ def compile_ttir_to_hsaco_inplace(
 
     name = metadata["name"]
     cluster_dims = (0, 0, 0)
-    fd, hsaco_path = tempfile.mkstemp()
-    with os.fdopen(fd, "wb") as f:
-        f.write(hsaco)
     return CompilationResult(
-        binary=hsaco_path,
+        binary=bytes(hsaco),
         name=name,
         shared_mem_bytes=shared_mem_bytes,
         cluster_dims=cluster_dims,
@@ -920,6 +941,8 @@ def _load_triton_kernel_cache(
             raise ValueError("invalid binary payload")
         if platform == "cuda":
             binary = binary.decode("utf-8")
+        else:
+            binary = bytes(binary)
         return CompilationResult(
             binary=binary,
             name=data["name"],
@@ -959,7 +982,9 @@ def _save_triton_kernel_cache(
     cache_path = cache_dir / "kernel.pkl"
     tmp_path = cache_dir / "kernel.pkl.tmp"
 
-    if platform == "rocm":
+    if isinstance(compilation_result.binary, (bytes, bytearray)):
+        binary = bytes(compilation_result.binary)
+    elif platform == "rocm" and os.path.exists(compilation_result.binary):
         with open(compilation_result.binary, "rb") as f:
             binary = f.read()
     else:
@@ -977,6 +1002,245 @@ def _save_triton_kernel_cache(
     with tmp_path.open("wb") as f:
         pickle.dump(payload, f)
     os.replace(tmp_path, cache_path)
+
+
+_ROCM_HSACO_TEMP_DIR: Path | None = None
+
+
+def _get_rocm_hsaco_temp_dir() -> Path:
+    """Return a process-scoped temporary directory for ROCm HSACO files.
+
+    ``jaxlib``'s ROCm ``TritonKernel`` serializes the HSACO file path into the
+    XLA custom-call proto and loads it lazily via ``hipModuleLoad`` at kernel
+    launch time, so the file must remain on disk while compiled executables are
+    alive. Placing non-cached HSACO files in a single content-addressed temp
+    directory cleaned up via ``atexit`` avoids leaking a fresh ``mkstemp`` file
+    on every compile or cache hit.
+    """
+    global _ROCM_HSACO_TEMP_DIR
+    if _ROCM_HSACO_TEMP_DIR is None or not _ROCM_HSACO_TEMP_DIR.exists():
+        temp_dir = Path(tempfile.mkdtemp(prefix="ejkernel_rocm_hsaco_"))
+        atexit.register(shutil.rmtree, temp_dir, ignore_errors=True)
+        _ROCM_HSACO_TEMP_DIR = temp_dir
+    return _ROCM_HSACO_TEMP_DIR
+
+
+def _materialize_rocm_hsaco_path(cache_key: str, binary: str | bytes) -> str:
+    """Ensure ROCm HSACO bytes exist at a deterministic, leak-free path on disk.
+
+    When disk caching is enabled, the HSACO is stored inside the kernel's cache
+    directory (reused across runs and removed on invalidation). Otherwise it is
+    stored inside the process-scoped temp directory cleaned up at exit.
+
+    Args:
+        cache_key: Deterministic SHA-256 compilation cache key.
+        binary: Raw HSACO bytes, or an existing file path string.
+
+    Returns:
+        Filesystem path to the materialized HSACO binary.
+    """
+    if isinstance(binary, str):
+        return binary
+
+    if TRITON_CACHE_ENABLED:
+        target_dir = _get_triton_cache_dir() / cache_key
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "kernel.hsaco"
+    else:
+        target_dir = _get_rocm_hsaco_temp_dir()
+        target_path = target_dir / f"{cache_key}.hsaco"
+
+    if not target_path.exists():
+        fd, tmp_name = tempfile.mkstemp(dir=target_dir, prefix=f".{target_path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(binary)
+            os.replace(tmp_name, target_path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    return str(target_path)
+
+
+def _partition_triton_args(args: Sequence[Any]) -> tuple[list[Any], list[tuple[int, str, Any]]]:
+    """Partition flattened ``triton_call`` positional arguments into arrays and scalars.
+
+    Preserves ``None`` as a scalar leaf (instead of letting ``tree_flatten`` drop
+    it) so optional pointer arguments map cleanly to Triton ``constexpr`` ``None``
+    while keeping full compatibility with ``arg if arg is not None else 1``
+    callers. NumPy scalar types (``np.bool_``, ``np.integer``, ``np.floating``)
+    are converted to native Python scalars before type resolution.
+
+    Args:
+        args: Positional arguments passed to ``triton_call``.
+
+    Returns:
+        Tuple of ``(array_args, scalar_args)``, where each ``scalar_args`` entry
+        is ``(flat_index, triton_type_str, python_value)``.
+    """
+    flat_args, _ = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
+    array_args: list[Any] = []
+    scalar_args: list[tuple[int, str, Any]] = []
+    for i, arg in enumerate(flat_args):
+        if arg is None:
+            scalar_args.append((i, get_triton_type(arg), None))
+        elif isinstance(arg, bool | np.bool_):
+            val = bool(arg)
+            scalar_args.append((i, get_triton_type(val), val))
+        elif isinstance(arg, int | np.integer):
+            val = int(arg)
+            scalar_args.append((i, get_triton_type(val), val))
+        elif isinstance(arg, float | np.floating):
+            val = float(arg)
+            scalar_args.append((i, get_triton_type(val), val))
+        else:
+            array_args.append(arg)
+    return array_args, scalar_args
+
+
+def _extract_scalar_constexprs(
+    arg_names: Sequence[str],
+    scalar_args: Sequence[tuple[int, str, Any]],
+) -> dict[str, Any]:
+    """Return Triton constexpr substitutions for ``None`` and exact ``int`` ``1`` scalars.
+
+    Uses ``type(v) is int and v == 1`` rather than ``v == 1`` so ``bool``
+    ``True`` and ``float`` ``1.0`` (for example ``softmax_scale=1.0`` or
+    ``logits_soft_cap=1.0``) are never silently coerced into integer constexpr
+    ``1`` and stripped from runtime kernel parameters.
+    """
+    constants: dict[str, Any] = {}
+    for idx, _, value in scalar_args:
+        if value is None:
+            constants[arg_names[idx]] = None
+        elif type(value) is int and value == 1:
+            constants[arg_names[idx]] = 1
+    return constants
+
+
+def _constexpr_scalar_indices(scalar_args: Sequence[tuple[int, str, Any]]) -> set[int]:
+    """Return positional indices of scalars specialized as Triton constexprs.
+
+    Matches :func:`_extract_scalar_constexprs` so runtime ``kernel_params``
+    omits only ``None`` and exact ``int`` ``1`` scalars, never ``True`` or
+    ``1.0``.
+    """
+    return {idx for idx, _, value in scalar_args if value is None or (type(value) is int and value == 1)}
+
+
+_MISSING = object()
+
+
+def _invoke_early_config_prune(
+    prune_fn: Callable[..., list[Any]],
+    configs: list[Any],
+    named_args: dict[str, Any],
+    kwargs: dict[str, Any],
+) -> list[Any]:
+    """Invoke a Triton ``early_config_prune`` callback across Triton 2.x and 3.x signatures."""
+    try:
+        sig = inspect.signature(prune_fn)
+    except (TypeError, ValueError):
+        try:
+            return prune_fn(configs, named_args, **kwargs)
+        except TypeError:
+            return prune_fn(configs, named_args)
+
+    params = list(sig.parameters.values())
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+        return prune_fn(configs, named_args, **kwargs)
+
+    accepted_kw_names = {
+        p.name
+        for p in params[2:]
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in accepted_kw_names}
+    return prune_fn(configs, named_args, **filtered_kwargs)
+
+
+def _unwrap_triton_kernel(
+    kernel: Any,
+    configs: list[Any],
+    *,
+    named_args: dict[str, Any],
+    metaparams: dict[str, Any],
+) -> tuple[Any, list[Any]]:
+    """Recursively unwrap Triton kernel wrappers to the underlying JIT function.
+
+    Handles the Triton decorator stack (``Autotuner``, ``Heuristics``, and
+    ``JITFunction``), extracting the base JIT function and accumulating the
+    resolved configuration list without permanently mutating global
+    ``Autotuner`` attributes across lowerings.
+
+    Args:
+        kernel: A Triton kernel which may be an ``Autotuner``, ``Heuristics``
+            wrapper, or a base ``JITFunction``.
+        configs: List of ``triton.Config`` objects accumulated so far.
+        named_args: Mapping of kernel parameter names to abstract values or scalars.
+        metaparams: Caller-supplied compile-time metaparameters.
+
+    Returns:
+        Tuple of ``(jit_function, resolved_configs)``.
+
+    Raises:
+        NotImplementedError: If any config uses a ``pre_hook``, which is not
+            supported in the JAX-Triton bridge.
+    """
+    autotuner_cls = getattr(autotuner, "Autotuner", None)
+    heuristics_cls = getattr(autotuner, "Heuristics", None)
+
+    if autotuner_cls is not None and isinstance(kernel, autotuner_cls):
+        prev_early_config_prune_fn = kernel.early_config_prune
+        prev_nargs = getattr(kernel, "nargs", _MISSING)
+
+        def prune_configs(candidate_configs, current_named_args, **kwargs):
+            pruned_configs = []
+            for config in candidate_configs:
+                if config.pre_hook is not None:
+                    raise NotImplementedError("`pre_hook` is not supported")
+
+                if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
+                    pruned_configs.append(config)
+            if prev_early_config_prune_fn is not None:
+                pruned_configs = _invoke_early_config_prune(
+                    prev_early_config_prune_fn,
+                    pruned_configs,
+                    current_named_args,
+                    kwargs,
+                )
+            return pruned_configs
+
+        try:
+            kernel.early_config_prune = prune_configs
+            kernel.nargs = named_args
+            tuned_configs = kernel.prune_configs(metaparams)
+        finally:
+            kernel.early_config_prune = prev_early_config_prune_fn
+            if prev_nargs is _MISSING:
+                if hasattr(kernel, "nargs"):
+                    delattr(kernel, "nargs")
+            else:
+                kernel.nargs = prev_nargs
+
+        return _unwrap_triton_kernel(kernel.fn, tuned_configs, named_args=named_args, metaparams=metaparams)
+
+    if heuristics_cls is not None and isinstance(kernel, heuristics_cls):
+        inner_fn, configs = _unwrap_triton_kernel(kernel.fn, configs, named_args=named_args, metaparams=metaparams)
+        updated_configs = []
+        for config in configs:
+            kwargs = config.kwargs.copy()
+            for heuristic_name, heuristic in kernel.values.items():
+                kwargs[heuristic_name] = heuristic({**named_args, **metaparams, **kwargs})
+            updated_config = copy.copy(config)
+            updated_config.kwargs = kwargs
+            updated_configs.append(updated_config)
+        return inner_fn, updated_configs
+
+    return kernel, configs
 
 
 _COMPILED_KERNEL_CACHE: OrderedDict[str, triton_kernel_call_lib.TritonKernel] = OrderedDict()  # type: ignore
@@ -1085,17 +1349,22 @@ def get_or_create_triton_kernel(
             else:
                 specialize_impl = create_specialize_impl(specialize_extra)
         specialization = [
-            specialize_impl(
+            ("constexpr", "")
+            if i in scalar_values and scalar_values[i] is None
+            else specialize_impl(
                 types.SimpleNamespace(data_ptr=lambda alignment=alignment: alignment, dtype=arg_dtype.removeprefix("*")),
             )
-            for arg_dtype, alignment in safe_zip(arg_dtypes, alignments)
+            for i, (arg_dtype, alignment) in enumerate(safe_zip(arg_dtypes, alignments))
         ]
     else:
         specialize_impl = triton.runtime.jit.native_specialize_impl
         specialization = []
         for i, (arg_dtype, alignment) in enumerate(safe_zip(arg_dtypes, alignments)):
             if i in scalar_values:
-                specialization.append(specialize_impl(backend, scalar_values[i], False, True, True))
+                if scalar_values[i] is None:
+                    specialization.append(("constexpr", ""))
+                else:
+                    specialization.append(specialize_impl(backend, scalar_values[i], False, True, True))
             else:
                 arg = types.SimpleNamespace(
                     data_ptr=lambda alignment=alignment: alignment,
@@ -1108,8 +1377,7 @@ def get_or_create_triton_kernel(
             attr = ""
         attrs[(i,)] = backend.parse_attr(attr)
     constants = dict(metaparams)
-    constants.update({k: None for _, k, v in scalar_args if v is None})
-    constants.update({fn.arg_names[i]: 1 for i, _, v in scalar_args if v == 1})
+    constants.update(_extract_scalar_constexprs(fn.arg_names, scalar_args))
     for constant in constants:
         signature[constant] = "constexpr"
 
@@ -1142,10 +1410,7 @@ def get_or_create_triton_kernel(
         if cached is not None:
             _log_triton_cache(f"[triton-cache] hit (disk) key={cache_key}")
             if platform == "rocm":
-                fd, hsaco_path = tempfile.mkstemp()
-                with os.fdopen(fd, "wb") as f:
-                    f.write(cached.binary)
-                cached_binary = hsaco_path
+                cached_binary = _materialize_rocm_hsaco_path(cache_key, cached.binary)
             else:
                 cached_binary = cached.binary
             try:
@@ -1201,13 +1466,18 @@ def get_or_create_triton_kernel(
         compilation_result = compile_ttir_inplace(module, backend, options, compute_capability, platform)
 
         kernel_name = compilation_result.name
+        kernel_binary = (
+            _materialize_rocm_hsaco_path(cache_key, compilation_result.binary)
+            if platform == "rocm"
+            else compilation_result.binary
+        )
         try:
             kernel = triton_kernel_call_lib.TritonKernel(
                 kernel_name,
                 num_warps,
                 num_ctas,
                 compilation_result.shared_mem_bytes,
-                compilation_result.binary,
+                kernel_binary,
                 ttir,
                 compute_capability,
             )
@@ -1216,7 +1486,7 @@ def get_or_create_triton_kernel(
                 kernel_name,
                 num_warps,
                 compilation_result.shared_mem_bytes,
-                compilation_result.binary,
+                kernel_binary,
                 ttir,
                 compute_capability,
                 *compilation_result.cluster_dims,
@@ -1308,82 +1578,7 @@ def triton_kernel_call_lowering(
         num_ctas=num_ctas,
     )
 
-    def unwrap_triton_kernel(kernel, configs):
-        """Recursively unwrap Triton kernel wrappers to the underlying JIT function.
-
-        Handles the Triton decorator stack (``Autotuner``, ``Heuristics``, and
-        ``JITFunction``), extracting the base JIT function and accumulating
-        the resolved configuration list. Supports both ``@autotune @heuristics @jit``
-        and ``@heuristics @autotune @jit`` decorator orderings.
-
-        Args:
-            kernel: A Triton kernel which may be an ``Autotuner``, ``Heuristics``
-                wrapper, or a base ``JITFunction``.
-            configs: List of ``triton.Config`` objects accumulated so far.
-
-        Returns:
-            Tuple of (jit_function, resolved_configs) where ``jit_function`` is
-            the underlying ``triton.JITFunction`` and ``resolved_configs`` is the
-            list of configurations after pruning and heuristic evaluation.
-
-        Raises:
-            NotImplementedError: If any config uses a ``pre_hook``, which is
-                not supported in the JAX-Triton bridge.
-        """
-
-        if isinstance(kernel, autotuner.Autotuner):
-            prev_early_config_prune_fn = kernel.early_config_prune
-
-            def prune_configs(configs, named_args, **kwargs):
-                """Filter autotuner configs to those compatible with the current metaparams.
-
-                Removes configs whose ``pre_hook`` is set (unsupported) and
-                retains only those whose keyword arguments are consistent with
-                the caller-supplied ``metaparams``. Delegates to any previously
-                registered ``early_config_prune`` function afterwards.
-
-                Args:
-                    configs: List of ``triton.Config`` candidates.
-                    named_args: Dictionary of named arguments for the kernel.
-                    **kwargs: Additional keyword arguments (unused).
-
-                Returns:
-                    Pruned list of ``triton.Config`` objects.
-
-                Raises:
-                    NotImplementedError: If any config has a ``pre_hook``.
-                """
-                pruned_configs = []
-                for config in configs:
-                    if config.pre_hook is not None:
-                        raise NotImplementedError("`pre_hook` is not supported")
-
-                    if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
-                        pruned_configs.append(config)
-                if prev_early_config_prune_fn is not None:
-                    pruned_configs = prev_early_config_prune_fn(pruned_configs, named_args)
-                return pruned_configs
-
-            kernel.early_config_prune = prune_configs
-            kernel.nargs = named_args
-            tuned_configs = kernel.prune_configs(metaparams)
-            return unwrap_triton_kernel(kernel.fn, tuned_configs)
-
-        if isinstance(kernel, autotuner.Heuristics):
-            inner_fn, configs = unwrap_triton_kernel(kernel.fn, configs)
-            updated_configs = []
-            for config in configs:
-                kwargs = config.kwargs.copy()
-                for name, heuristic in kernel.values.items():
-                    kwargs[name] = heuristic({**named_args, **metaparams, **kwargs})
-                updated_config = copy.copy(config)
-                updated_config.kwargs = kwargs
-                updated_configs.append(updated_config)
-            return inner_fn, updated_configs
-
-        return kernel, configs
-
-    fn, configs = unwrap_triton_kernel(fn, [default_config])
+    fn, configs = _unwrap_triton_kernel(fn, [default_config], named_args=named_args, metaparams=metaparams)
 
     if not isinstance(fn, triton.JITFunction):
         raise ValueError("`kernel` must be a Triton `JITFunction`, `Heuristics` or `Autotuner`.")
@@ -1414,6 +1609,7 @@ def triton_kernel_call_lowering(
         )
 
     kernel_calls = []
+    constexpr_scalars = _constexpr_scalar_indices(scalar_args)
     for params in config_params:
         kernel, specialization_attr = get_or_create_triton_kernel(
             backend_init_func,
@@ -1433,7 +1629,6 @@ def triton_kernel_call_lowering(
 
         kernel_params = []
         zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
-        equal_to_1 = {i for i, _, v in scalar_args if v == 1}
         for i, (arg, dtype) in enumerate(safe_zip(args, arg_dtypes)):
             if isinstance(arg, core.ShapedArray):
                 arg_attrs = specialization_attr[(i,)]
@@ -1443,7 +1638,7 @@ def triton_kernel_call_lowering(
                         16 if (["tt.divisibility", 16] in arg_attrs) else 0,
                     )
                 )
-            elif i not in equal_to_1:
+            elif i not in constexpr_scalars:
                 kernel_params.append(triton_kernel_call_lib.create_scalar_parameter(arg, dtype))
 
         kernel_calls.append(
@@ -1505,7 +1700,7 @@ def triton_kernel_call_raise_on_jvp(*args, **kwargs):
     """
     del args, kwargs
     raise NotImplementedError(
-        "jax_triton.triton_call does not support automatic differentiation. Use "
+        "ejkernel.callib.triton_call does not support automatic differentiation. Use "
         "jax.custom_jvp or jax.custom_vjp to implement a custom automatic "
         "differentiation rule for your kernel."
     )
@@ -1526,7 +1721,7 @@ def triton_kernel_call_raise_on_vmap(*args, **kwargs):
     """
     del args, kwargs
     raise NotImplementedError(
-        "jax_triton.triton_call does not support batching with jax.vmap. Use "
+        "ejkernel.callib.triton_call does not support batching with jax.vmap. Use "
         "jax.custom_batching.custom_vmap to implement a custom batching rule for "
         "your kernel."
     )
@@ -1536,7 +1731,7 @@ batching.primitive_batchers[triton_kernel_call_p] = triton_kernel_call_raise_on_
 
 
 def triton_call(
-    *args: jax.Array | bool | int | float | np.float32,
+    *args: jax.Array | bool | int | float | np.bool_ | np.integer | np.floating | None,
     kernel: triton.JITFunction | triton.runtime.Heuristics | triton.runtime.Autotuner,
     out_shape: ShapeDtype | Sequence[ShapeDtype],
     grid: GridOrLambda,
@@ -1545,7 +1740,7 @@ def triton_call(
     num_warps: int | None = None,
     num_stages: int | None = None,
     num_ctas: int = 1,
-    device: int = 0,
+    device: int | None = None,
     compute_capability: int | None = None,
     enable_fp_fusion: bool = True,
     input_output_aliases: dict[int, int] | None = None,
@@ -1561,7 +1756,7 @@ def triton_call(
     GPU kernels written in Triton.
 
     Args:
-        *args: Input arguments to the kernel (arrays and scalars).
+        *args: Input arguments to the kernel (arrays, scalars, and optional ``None``).
         kernel: Triton kernel function, heuristics, or autotuner to execute.
         out_shape: Expected output shape(s) and dtype(s).
         grid: Kernel launch grid specification or callable returning grid.
@@ -1570,7 +1765,8 @@ def triton_call(
         num_warps: Number of warps per thread block (default: 4).
         num_stages: Number of pipeline stages (default: 3).
         num_ctas: Number of cooperative thread arrays.
-        device: Target device identifier.
+        device: Optional target device index. When ``None`` (default), inferred
+            from the input arrays' single device placement with fallback to ``0``.
         compute_capability: Target compute capability (auto-detected if None).
         enable_fp_fusion: Whether to enable floating point fusion.
         input_output_aliases: Mapping of input indices to output indices for aliasing.
@@ -1584,33 +1780,20 @@ def triton_call(
 
     Raises:
         ValueError: If Triton is not installed or for invalid configurations.
-        AssertionError: If array arguments are not on a single device, or if
-            multiple accelerators are available and the call is not under
-            ``jax.shard_map``.
+        AssertionError: If array arguments span multiple devices outside
+            ``jax.shard_map``, live on different devices, or conflict with an
+            explicitly requested ``device`` index.
     """
     if not CAN_USE_TRITON:
         raise ValueError("`triton_call` is only available when `triton` is installed.")
     out_shape = tree_util.tree_map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape)
-    flat_args, _ = tree_util.tree_flatten(args)
     flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
 
-    array_args = []
-    scalar_args = []
-    for i, arg in enumerate(flat_args):
-        if isinstance(arg, bool | int | float):
-            scalar_args.append((i, get_triton_type(arg), arg))
-        elif isinstance(arg, np.float32):
-            scalar_args.append((i, get_triton_type(arg), float(arg)))
-        else:
-            array_args.append(arg)
+    array_args, scalar_args = _partition_triton_args(args)
 
     in_shard_map_context = _in_shard_map_context()
     _assert_single_device_args(array_args, device, allow_sharded_tracers=in_shard_map_context)
-    if _has_multi_accelerators() and not in_shard_map_context:
-        raise AssertionError(
-            "Multiple accelerator devices detected. "
-            "triton_call must be invoked under `jax.shard_map` in multi-accelerator setups."
-        )
+    resolved_device = _infer_device_index(array_args, device)
 
     if input_output_aliases is None:
         input_output_aliases = {}
@@ -1626,7 +1809,7 @@ def triton_call(
         num_warps=num_warps,
         num_stages=num_stages,
         num_ctas=num_ctas,
-        device=device,
+        device=resolved_device,
         compute_capability=compute_capability,
         enable_fp_fusion=enable_fp_fusion,
         input_output_aliases=tuple(input_output_aliases.items()),

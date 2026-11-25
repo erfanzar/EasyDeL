@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.kernels._triton import page_attention
 from ejkernel.kernels._xla.page_attention import page_attention as xla_page_attention
 
@@ -335,6 +336,197 @@ def test_page_attention_partitioned_matches_single_pass():
         rtol=1e-4,
         atol=1e-5,
     )
+
+
+def _dense_page_attention_ref(
+    query: jax.Array,
+    key_cache: jax.Array,
+    value_cache: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
+    attn_scale: float,
+    attn_logits_soft_cap: float | None = None,
+) -> jax.Array:
+    num_seqs, num_heads, head_dim = query.shape
+    _num_blocks, num_kv_heads, block_size, _ = key_cache.shape
+    group_size = num_heads // num_kv_heads
+    outs = []
+    for s in range(num_seqs):
+        ctx_len = int(context_lens[s])
+        if ctx_len <= 0:
+            outs.append(jnp.zeros((num_heads, head_dim), dtype=jnp.float32))
+            continue
+        num_blks = (ctx_len + block_size - 1) // block_size
+        blks = block_tables[s, :num_blks]
+        k = key_cache[blks].transpose(1, 0, 2, 3).reshape(num_kv_heads, num_blks * block_size, head_dim)
+        v = value_cache[blks].transpose(1, 0, 2, 3).reshape(num_kv_heads, num_blks * block_size, head_dim)
+        k = k[:, :ctx_len, :]
+        v = v[:, :ctx_len, :]
+        k = jnp.repeat(k, group_size, axis=0).astype(jnp.float32)
+        v = jnp.repeat(v, group_size, axis=0).astype(jnp.float32)
+        q = query[s].astype(jnp.float32)
+        logits = jnp.einsum("hd,htd->ht", q, k) * float(attn_scale)
+        if attn_logits_soft_cap is not None:
+            cap = float(attn_logits_soft_cap)
+            logits = cap * jnp.tanh(logits / cap)
+        weights = jax.nn.softmax(logits, axis=-1)
+        outs.append(jnp.einsum("ht,htd->hd", weights, v))
+    return jnp.stack(outs, axis=0).astype(query.dtype)
+
+
+@pytest.mark.parametrize("num_splits", [1, 4])
+def test_page_attention_jit_no_host_sync_matches_xla(num_splits):
+    """jax.jit must trace cleanly when max_context_len=None (no host-sync device_get)."""
+    key = jax.random.PRNGKey(2025)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    num_seqs, num_kv_heads, q_group, head_dim, block_size = 3, 2, 2, 64, 16
+    num_heads = num_kv_heads * q_group
+    blocks_per_seq = 8
+    num_blocks = num_seqs * blocks_per_seq
+
+    query = jax.random.normal(kq, (num_seqs, num_heads, head_dim), dtype=jnp.bfloat16)
+    key_cache = jax.random.normal(kk, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.bfloat16)
+    value_cache = jax.random.normal(kv, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.bfloat16)
+    context_lens = jnp.array([100, 0, 64], dtype=jnp.int32)  # include context_len == 0
+    block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, blocks_per_seq)
+
+    @jax.jit
+    def run_tri(q, kc, vc, cl, bt):
+        return page_attention(
+            query=q,
+            key_cache=kc,
+            value_cache=vc,
+            context_lens=cl,
+            block_tables=bt,
+            max_context_len=None,
+            num_splits=num_splits,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    out_tri = jax.block_until_ready(run_tri(query, key_cache, value_cache, context_lens, block_tables))
+    out_ref = _dense_page_attention_ref(
+        query, key_cache, value_cache, context_lens, block_tables, attn_scale=head_dim**-0.5
+    )
+
+    assert jnp.all(jnp.isfinite(out_tri))
+    np.testing.assert_allclose(np.asarray(out_tri[1], dtype=np.float32), 0.0, atol=0.0)
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_ref, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("query_group_size", [3, 6])
+@pytest.mark.parametrize("num_splits", [1, 4])
+def test_page_attention_nonpow2_gqa_matches_xla(query_group_size, num_splits):
+    """Non-power-of-2 GQA ratios (3, 6) must work in both single-pass and split-reduce kernels."""
+    key = jax.random.PRNGKey(30 + query_group_size)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    num_seqs, num_kv_heads, head_dim, block_size = 2, 2, 64, 16
+    num_heads = num_kv_heads * query_group_size
+    blocks_per_seq = 10
+    num_blocks = num_seqs * blocks_per_seq
+
+    query = jax.random.normal(kq, (num_seqs, num_heads, head_dim), dtype=jnp.float16)
+    key_cache = jax.random.normal(kk, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.float16)
+    value_cache = jax.random.normal(kv, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.float16)
+    context_lens = jnp.array([150, 72], dtype=jnp.int32)
+    block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, blocks_per_seq)
+
+    out_tri = jax.block_until_ready(
+        page_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            num_splits=num_splits,
+        )
+    )
+    out_xla = jax.block_until_ready(
+        xla_page_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+    )
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("num_splits", [1, 4])
+def test_page_attention_logits_soft_cap_matches_ref(num_splits):
+    """Verify overflow-safe attn_logits_soft_cap in both single-pass and split modes."""
+    key = jax.random.PRNGKey(91)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    num_seqs, num_kv_heads, q_group, head_dim, block_size = 2, 2, 3, 64, 16
+    num_heads = num_kv_heads * q_group
+    blocks_per_seq = 8
+    num_blocks = num_seqs * blocks_per_seq
+
+    # Large queries verify overflow-safe tanh (|logits / cap| > 89).
+    query = jax.random.normal(kq, (num_seqs, num_heads, head_dim), dtype=jnp.float32) * 50.0
+    key_cache = jax.random.normal(kk, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.float32)
+    value_cache = jax.random.normal(kv, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.float32)
+    context_lens = jnp.array([120, 65], dtype=jnp.int32)
+    block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, blocks_per_seq)
+    scale = head_dim**-0.5
+
+    out_tri = jax.block_until_ready(
+        page_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            attn_scale=scale,
+            num_splits=num_splits,
+            attn_logits_soft_cap=15.0,
+        )
+    )
+    out_ref = _dense_page_attention_ref(
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        attn_scale=scale,
+        attn_logits_soft_cap=15.0,
+    )
+    assert jnp.all(jnp.isfinite(out_tri))
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_ref, dtype=np.float32),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+def test_page_attention_rejects_unsupported_sliding_window_and_mask_value():
+    """Passing unsupported sliding_window or custom mask_value must raise EjkernelRuntimeError."""
+    query = jnp.ones((1, 4, 64), dtype=jnp.float16)
+    key_cache = jnp.ones((2, 2, 16, 64), dtype=jnp.float16)
+    value_cache = jnp.ones((2, 2, 16, 64), dtype=jnp.float16)
+    context_lens = jnp.array([16], dtype=jnp.int32)
+    block_tables = jnp.array([[0, 1]], dtype=jnp.int32)
+
+    with pytest.raises(EjkernelRuntimeError):
+        page_attention(query, key_cache, value_cache, context_lens, block_tables, sliding_window=16)
+
+    with pytest.raises(EjkernelRuntimeError):
+        page_attention(query, key_cache, value_cache, context_lens, block_tables, mask_value=-1e9)
 
 
 if __name__ == "__main__":

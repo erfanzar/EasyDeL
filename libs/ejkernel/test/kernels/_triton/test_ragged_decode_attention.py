@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 from ejkernel.kernels._triton.ragged_decode_attention import ragged_decode_attention as ragged_decode_triton
 from ejkernel.kernels._xla.ragged_decode_attention import ragged_decode_attention as ragged_decode_xla
+from ejkernel.ops import FwdParams
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -319,6 +320,152 @@ def test_ragged_decode_attention_matches_xla_smoke():
     out_xla = jax.block_until_ready(out_xla)
 
     np.testing.assert_allclose(out_triton, out_xla, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("head_dim", [192, 256])
+def test_ragged_decode_large_head_dim_matches_xla(head_dim):
+    key = jax.random.PRNGKey(100 + head_dim)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    B, S, HQ, HKV = 2, 320, 8, 2
+    q = jax.random.normal(kq, (B, HQ, head_dim), dtype=jnp.float32)
+    k = jax.random.normal(kk, (B, S, HKV, head_dim), dtype=jnp.float32)
+    v = jax.random.normal(kv, (B, S, HKV, head_dim), dtype=jnp.float32)
+    starts = jnp.array([0, 40], dtype=jnp.int32)
+    ends = jnp.array([300, 290], dtype=jnp.int32)
+
+    out_tri = ragged_decode_triton(
+        q,
+        k,
+        v,
+        sequence_start=starts,
+        sequence_end=ends,
+        softmax_scale=head_dim**-0.5,
+        logits_soft_cap=20.0,
+    )
+    out_xla = ragged_decode_xla(
+        q,
+        k,
+        v,
+        sequence_start=starts,
+        sequence_end=ends,
+        softmax_scale=head_dim**-0.5,
+        logits_soft_cap=20.0,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(jax.block_until_ready(out_tri)),
+        np.asarray(jax.block_until_ready(out_xla)),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+
+
+@pytest.mark.parametrize("aux_kind", ["shared_1d", "per_kv_2d", "per_q_2d"])
+def test_ragged_decode_multiblock_sinks_matches_xla(aux_kind):
+    """Verify softmax_aux is folded once across multiple KV blocks (S > kv_blocksize)."""
+    key = jax.random.PRNGKey(77)
+    kq, kk, kv, ka = jax.random.split(key, 4)
+
+    B, S, HQ, HKV, D = 2, 512, 8, 2, 64
+    q = jax.random.normal(kq, (B, HQ, D), dtype=jnp.float32)
+    k = jax.random.normal(kk, (B, S, HKV, D), dtype=jnp.float32)
+    v = jax.random.normal(kv, (B, S, HKV, D), dtype=jnp.float32)
+    starts = jnp.array([0, 64], dtype=jnp.int32)
+    ends = jnp.array([480, 500], dtype=jnp.int32)
+
+    if aux_kind == "shared_1d":
+        sinks = jax.random.normal(ka, (3,), dtype=jnp.float32)
+    elif aux_kind == "per_kv_2d":
+        sinks = jax.random.normal(ka, (HKV, 3), dtype=jnp.float32)
+    else:
+        sinks = jax.random.normal(ka, (HQ, 3), dtype=jnp.float32)
+
+    fwd_params = FwdParams(kv_blocksize=64)
+    out_tri = ragged_decode_triton(
+        q,
+        k,
+        v,
+        sequence_start=starts,
+        sequence_end=ends,
+        softmax_scale=D**-0.5,
+        fwd_params=fwd_params,
+        sliding_window=(256, 0),
+        logits_soft_cap=30.0,
+        softmax_aux=sinks,
+    )
+    out_xla = ragged_decode_xla(
+        q,
+        k,
+        v,
+        sequence_start=starts,
+        sequence_end=ends,
+        softmax_scale=D**-0.5,
+        fwd_params=fwd_params,
+        sliding_window=(256, 0),
+        logits_soft_cap=30.0,
+        softmax_aux=sinks,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(jax.block_until_ready(out_tri)),
+        np.asarray(jax.block_until_ready(out_xla)),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+
+
+def test_ragged_decode_jit_matches_xla():
+    key = jax.random.PRNGKey(2026)
+    kq, kk, kv, ka = jax.random.split(key, 4)
+
+    B, S, HQ, HKV, D = 2, 384, 8, 2, 192
+    q = jax.random.normal(kq, (B, HQ, D), dtype=jnp.bfloat16)
+    k = jax.random.normal(kk, (B, S, HKV, D), dtype=jnp.bfloat16)
+    v = jax.random.normal(kv, (B, S, HKV, D), dtype=jnp.bfloat16)
+    starts = jnp.array([16, 0], dtype=jnp.int32)
+    ends = jnp.array([350, 0], dtype=jnp.int32)  # include empty sequence edge case
+    sinks = jax.random.normal(ka, (HKV, 2), dtype=jnp.float32)
+
+    @jax.jit
+    def run_tri(q_, k_, v_, s_, e_, aux_):
+        return ragged_decode_triton(
+            q_,
+            k_,
+            v_,
+            sequence_start=s_,
+            sequence_end=e_,
+            softmax_scale=D**-0.5,
+            fwd_params=FwdParams(kv_blocksize=64),
+            sliding_window=(128, 0),
+            logits_soft_cap=25.0,
+            softmax_aux=aux_,
+        )
+
+    out_tri = jax.block_until_ready(run_tri(q, k, v, starts, ends, sinks))
+    out_xla = jax.block_until_ready(
+        ragged_decode_xla(
+            q,
+            k,
+            v,
+            sequence_start=starts,
+            sequence_end=ends,
+            softmax_scale=D**-0.5,
+            fwd_params=FwdParams(kv_blocksize=64),
+            sliding_window=(128, 0),
+            logits_soft_cap=25.0,
+            softmax_aux=sinks,
+        )
+    )
+
+    assert out_tri.dtype == q.dtype
+    assert jnp.all(jnp.isfinite(out_tri))
+    np.testing.assert_allclose(
+        np.asarray(out_tri, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 if __name__ == "__main__":
