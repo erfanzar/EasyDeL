@@ -1,0 +1,177 @@
+[build-system]
+requires = ["uv_build==0.7.19"]
+build-backend = "uv_build"
+
+[project]
+name = "eyvan"
+version = "0.0.3"
+description = "A policy-aware global fleet control plane with native GCP CPU, GPU, and TPU capacity"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Erfan Zare Chavoshi", email = "59269023+erfanzar@users.noreply.github.com" }]
+dependencies = [
+    "alembic>=1.14.0",
+    "asyncpg>=0.30.0",
+    "click>=8.4.2",
+    "cloudpickle>=3.1.0",
+    "cryptography>=50.0.0",
+    "fastapi>=0.141.1",
+    "httpx>=0.27.0",
+    "idna>=3.18",
+    "opentelemetry-api>=1.28.0",
+    "prometheus-client>=0.21.0",
+    "pydantic>=2.11.0",
+    "pygments>=2.20.0",
+    "pyjwt[crypto]>=2.9.0",
+    "pyyaml>=6.0",
+    "rich>=13.9",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "starlette>=1.5.0",
+    "typing-extensions>=4.12.0",
+    "uvicorn[standard]>=0.48.0",
+]
+
+[project.scripts]
+eyvan = "eyvan.sdk.cli:main"
+eyvan-server = "eyvan.server.api.app:main"
+eyvan-agent = "eyvan.worker.agent.cli:main"
+eyvan-native-worker = "eyvan.worker.runtime.native_worker:main"
+eyvan-migrate = "eyvan.server.persistence.migrate:console_main"
+eyvan-tracker = "eyvan.track.tracker.cli:main"
+
+[project.optional-dependencies]
+# aiosqlite gives the SQLAlchemy repository a real database to run against.
+# Without it that backend -- the one production uses -- had no direct test at
+# all, and a retention prune that could never make forward progress on it
+# looked green because only the in-memory store was exercised.
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "aiosqlite>=0.20.0",
+    # property-based invariants for scheduler and packing decisions.
+    "hypothesis>=6.100.0",
+    # coverage ratchet: CI fails when total coverage drops below the recorded
+    # baseline (see .github/workflows/ci.yaml and docs/roadmap.md).
+    "pytest-cov>=6.0.0",
+    # CI secret scan against a committed baseline; hash-pinnable via the same
+    # requirements export mechanism as everything else.
+    "detect-secrets>=1.5.0",
+    # Audit the fully hashed runtime export with --disable-pip: dependency
+    # resolution and its temporary ensurepip environment are not needed.
+    "mypy>=1.15",
+    "pytest-xdist>=3.6",
+    "ruff==0.15.16",
+    "import-linter>=2.1",
+    "pip-audit==2.10.1",
+    "opentelemetry-sdk==1.45.1",
+]
+oci = ["google-cloud-storage>=2.18.0"]
+
+[tool.uv.build-backend]
+module-name = "eyvan"
+module-root = "."
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["eyvan"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    # Integration-scale tests: they spawn host processes, boot real servers
+    # and agents, or hold wall-clock thresholds. `pytest tests -m "not slow"`
+    # is the documented iteration subset; the full suite (no -m filter) stays
+    # the PR and nightly gate.
+    "slow: host-process, wall-clock, or long-loop tests excluded from the reduced subset",
+    "fast: bounded smoke coverage selected in tests/conftest.py for quick iteration",
+    "quarantine(issue, owner, until): tracked flaky test; still blocking, with a nightly isolated diagnostic run",
+]
+
+[dependency-groups]
+eyvan-build = [
+    "uv-build==0.7.19",
+]
+
+[tool.mypy]
+# Static-typing ratchet: the scope below must stay mypy-clean, and the scope
+# may only grow. Whole-tree strict mypy on a codebase this size is its own
+# migration; gating the pure, protocol-heavy core (domain models, settings,
+# records, and the security-critical API policy modules) is what stops new
+# untyped code from landing there. Modules graduate into `files` when they
+# are made clean, never out.
+# Match the supported runtime floor, including stdlib UTC and StrEnum.
+python_version = "3.11"
+files = [
+    "eyvan/domain",
+    "eyvan/config.py",
+    "eyvan/records.py",
+    "eyvan/server/api/dashboard_sessions.py",
+    "eyvan/server/api/server_bind.py",
+    "eyvan/server/api/server_startup.py",
+    "eyvan/sdk/commands/team.py",
+    "eyvan/sdk/commands/assistant.py",
+    "eyvan/server/api/assistant.py",
+    "eyvan/server/api/team_routes.py",
+    "eyvan/server/api/bootstrap_admin.py",
+    "eyvan/server/service/_control_plane/accounts.py",
+    "eyvan/server/service/_control_plane/team_requests.py",
+]
+# Analyze imported modules for types, but report errors only in the declared
+# ratchet. Editable installs implicitly suppressed these imported-module errors;
+# non-editable CI installs did not. "silent" is not "skip": imported types are
+# still checked when used by the explicitly listed source files.
+follow_imports = "silent"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.mutmut]
+# Optional local campaign; use the pinned, isolated command in
+# docs/reference/scheduler-mutations.md. This is not a zero-survivor CI gate.
+source_paths = ["eyvan"]
+only_mutate = ["eyvan/domain/*.py"]
+pytest_add_cli_args = ["-q", "--disable-warnings", "--hypothesis-seed=20260910"]
+pytest_add_cli_args_test_selection = [
+    "tests/test_accelerator_type_ordering.py",
+    "tests/test_availability.py",
+    "tests/test_availability_contracts.py",
+    "tests/test_carbon_contract.py",
+    "tests/test_carbon_numeric_contracts.py",
+    "tests/test_costing.py",
+    "tests/test_domain.py",
+    "tests/test_domain_boundary_contracts.py",
+    "tests/test_elastic_packing_preserves_feasible_subsets.py",
+    "tests/test_elastic_resource_materialization.py",
+    "tests/test_gang_preemption_is_atomic.py",
+    "tests/test_generic_resource_surface.py",
+    "tests/test_prediction_budget_precision.py",
+    "tests/test_predictive_scale_up.py",
+    "tests/test_pricing.py",
+    "tests/test_pricing_contracts.py",
+    "tests/test_pricing_has_no_global_fallback.py",
+    "tests/test_pricing_resolver.py",
+    "tests/test_resource_vector_contracts.py",
+    "tests/test_run_cost.py",
+    "tests/test_scheduler.py",
+    "tests/test_scheduler_budget_properties.py",
+    "tests/test_scheduler_candidate_materialization.py",
+    "tests/test_scheduler_properties.py",
+    "tests/test_declared_backoff.py",
+    "tests/test_preemption_eligibility.py",
+    "tests/test_gang_rendezvous_collision.py",
+]

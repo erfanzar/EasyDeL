@@ -1,0 +1,151 @@
+# Every value here has a default that is either safe or absent. Nothing defaults
+# to a credential, and nothing defaults to a permissive setting -- an operator
+# who installs this chart with no values gets a control plane that refuses to
+# serve rather than one that serves insecurely.
+
+nameOverride: ""
+
+# Tags remain a development fallback so `helm lint` works without a registry.
+# Production qualification sets each digest to a registry-reported sha256 value;
+# when present, the templates render repository@digest and ignore the tag.
+image:
+  repository: eyvan
+  tag: "0.1.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The agent has a different entrypoint and release artifact from the control
+# plane. It must never inherit `image` by accident.
+agentImage:
+  repository: eyvan-agent
+  tag: "0.1.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Used only by the Kubernetes capacity backend. There is deliberately no tag
+# fallback: every worker Job must use the qualified Dockerfile.worker artifact
+# by its registry-reported digest.
+workerImage:
+  repository: eyvan-native-worker
+  digest: ""
+
+serviceAccounts:
+  controlPlane:
+    annotations: {}
+  # For example, set iam.gke.io/gcp-service-account here for GKE Workload Identity.
+  cellAgent:
+    annotations: {}
+  worker:
+    annotations: {}
+
+platform:
+  # Empty uses this release's in-cluster cell-agent Service when enabled. When
+  # cellAgent.enabled=false, set the HTTPS endpoint for the external agent.
+  defaultAgentEndpoint: ""
+
+controlPlane:
+  replicas: 2
+  # Refused on a non-loopback bind, so this is the production value and the
+  # chart does not offer the alternative.
+  repositoryBackend: postgres
+  autoCreateSchema: false
+  publicUrl: ""
+  # Empty means every submitter is refused a pickled callable, which executes
+  # arbitrary code on your accelerators. That is the correct default.
+  trustedCallableProjects: ""
+  artifactStoreUri: ""
+  tls:
+    # Secret (in the release namespace) holding tls.crt and tls.key for the API
+    # listener. The server refuses a network bind without TLS material or an
+    # explicit plaintext opt-in, so with neither this set nor
+    # insecurePlaintextBind accepted below, the rendered Deployment refuses to
+    # start -- the same fail-closed posture as the rest of these defaults.
+    existingSecret: ""
+  # Reviewed exception equivalent to EYVAN_INSECURE_PLAINTEXT_BIND=1. Accept
+  # only when something in front of the Service terminates TLS. The chart does
+  # not default this on; if both are set, TLS material wins.
+  insecurePlaintextBind: false
+  oidc:
+    issuer: ""
+    audience: eyvan
+    # The browser's public OAuth client. Served at runtime by the control plane
+    # so one image can front more than one identity provider.
+    dashboardClientId: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+cellAgent:
+  # Disabled until an operator explicitly supplies durable shared state. An
+  # unconfigured in-cluster agent would otherwise persist ownership in its pod.
+  enabled: false
+  # Fixed by template validation: more than one owner can mutate the same fleet.
+  replicas: 1
+  # Explicit rather than inherited from the Python default. Supported production
+  # examples below are gcp and kubernetes.
+  capacityBackend: gcp
+  executionBackend: eyvan-native
+  # Enabling the agent requires a canonical gs://bucket/non-empty-object URI.
+  fleetStateUri: ""
+  nativeWorkerPackage: ""
+  nativeWorkerPackageSha256: ""
+  # Decimal GCS object generation. Set it with the digest for a gs:// package.
+  nativeWorkerPackageGeneration: ""
+  nativeWorkerWheelhouse: ""
+  nativeWorkerWheelhouseSha256: ""
+  nativeWorkerWheelhouseGeneration: ""
+  kubernetes:
+    # Empty safely resolves to the Helm release namespace. A different namespace
+    # must already exist; the chart creates namespaced RBAC there, not a Namespace.
+    workerNamespace: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+
+migration:
+  # The hook always checks database state. Fresh installs and same-head releases
+  # proceed; a non-empty schema behind the packaged head is refused unless the
+  # operator explicitly acknowledges a quiesced maintenance window.
+  enabled: true
+  maintenanceAcknowledged: false
+  backoffLimit: 1
+
+# The name of a Secret you create separately. Nothing in this chart generates
+# credentials: a chart that mints an artifact signing key would mint a different
+# one on every upgrade, and every capability token already issued would stop
+# verifying.
+existingSecret: eyvan-secrets
+
+networkPolicy:
+  enabled: true
+  # Reaching the API requires this label. More friction than allowing the
+  # namespace, and the friction is the point: an unlabelled workload reaching
+  # the control plane by accident is how a cluster-wide compromise becomes a
+  # fleet-wide one.
+  apiClientLabel: eyvan.dev/api-client
+  metricsScraperLabel: eyvan.dev/metrics-scraper
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceMonitor:
+  # Off by default: it needs the Prometheus Operator's CRDs, and a chart that
+  # installs an object whose kind does not exist fails the whole release.
+  enabled: false
+  interval: 30s
+  tls:
+    # Required only for an enabled monitor targeting the TLS listener. The CA
+    # Secret must be in the release namespace and contain public CA certificates,
+    # never a private key. serverName must match the serving certificate's SAN.
+    caSecretName: ""
+    caSecretKey: ""
+    serverName: ""

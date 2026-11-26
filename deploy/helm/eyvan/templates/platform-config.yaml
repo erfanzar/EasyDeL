@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eyvan-platform
+  namespace: {{ include "eyvan.namespace" . }}
+  labels:
+    {{- include "eyvan.controlPlaneLabels" . | nindent 4 }}
+data:
+  platform.yaml: |
+    version: 1
+    agents:
+{{ if .Values.platform.defaultAgentEndpoint }}
+      default:
+        endpoint: {{ .Values.platform.defaultAgentEndpoint | quote }}
+{{ else if .Values.cellAgent.enabled }}
+      default:
+        endpoint: {{ printf "http://eyvan-cell-agent.%s.svc.cluster.local:8090" .Release.Namespace | quote }}
+{{ else }}
+      {}
+{{ end }}

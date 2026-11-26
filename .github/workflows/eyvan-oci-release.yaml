@@ -1,0 +1,903 @@
+name: Eyvan OCI release
+
+# The immutable-image release policy documented in oci/README.md and enforced
+# mechanically by scripts/verify_eyvan_oci_release.py. Two strictly separated
+# lanes:
+#
+#   * pull_request: read-only qualification. Builds the three images locally
+#     (never pushed), smoke-tests their entrypoints, generates SPDX SBOMs, and
+#     gates on the High/Critical scan policy. No registry credential, no OIDC
+#     identity, no signing material exists in this lane.
+#   * workflow_dispatch: the release. Runs only inside the reviewer-gated
+#     `eyvan-oci-release` environment, proves repository governance (protected
+#     main, immutable releases, recorded approval) before any candidate logic
+#     or registry write, then builds, qualifies, signs, receipts, and promotes
+#     exactly the qualified digests. Nothing is ever tagged `latest`.
+#
+# Every GitHub Action here is pinned to the full commit SHA recorded in
+# oci/release-lock.json; validate-policy rejects any other action or pin.
+
+on:
+  pull_request:
+    paths:
+      # The standalone repository is the eyvan subtree itself, so the
+      # monorepo's "libs/eyvan/**" trigger degenerates to the whole tree.
+      - "**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Eyvan version to release (must match pyproject.toml)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eyvan-oci-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ------------------------------------------------------------------ PR lane
+  # Static, hosted, and read-only: local image builds, entrypoint smoke, SBOM
+  # generation, and the scan gate. A pull request never talks to a registry.
+  pull-request-qualification:
+    if: github.event_name == 'pull_request'
+    name: Read-only pull request qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      LOCK: oci/release-lock.json
+      ALLOWLIST: oci/high-critical-allowlist.json
+      VERIFIER: scripts/verify_eyvan_oci_release.py
+      PR_TAG: pr-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out the pull request merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # release-lock pin (checkout)
+        with:
+          persist-credentials: false
+
+      - name: Validate the checked-in policy against itself
+        run: |
+          set -euo pipefail
+          python3 "${VERIFIER}" validate-policy \
+            --lock "${LOCK}" \
+            --allowlist "${ALLOWLIST}" \
+            --repository-root .
+
+      - name: Resolve the locked base images for each role
+        id: bases
+        run: |
+          set -euo pipefail
+          # Base images are read from the lock at run time so the policy
+          # verifier remains the only place a digest can change.
+          python3 - "${LOCK}" >> "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              lock = json.load(handle)
+          for role, key in (("control-plane", "control_plane"), ("agent", "agent"), ("worker", "worker")):
+              print(f"{key}<<LOCKED")
+              for name, value in sorted(lock["images"][role]["buildArgs"].items()):
+                  print(f"{name}={value}")
+              print("LOCKED")
+          PY
+
+      - name: Install the locked host tools
+        env:
+          TOOL_DIR: ${{ runner.temp }}/eyvan-pr-tools
+        run: |
+          set -euo pipefail
+          echo "TOOL_DIR=${TOOL_DIR}" >> "${GITHUB_ENV}"
+          python3 oci/install_locked_tools.py \
+            --lock "${LOCK}" \
+            --destination "${TOOL_DIR}" \
+            trivy syft crane
+          echo "${TOOL_DIR}" >> "${GITHUB_PATH}"
+
+      - name: Set up Buildx for local-only builds
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # release-lock pin (setup-buildx)
+
+      - name: Build the control-plane image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # release-lock pin (build-push)
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: eyvan-control-plane:${{ env.PR_TAG }}
+          build-args: |
+            ${{ steps.bases.outputs.control_plane }}
+            EYVAN_VERSION=0.0.0-pr.${{ github.run_number }}
+            EYVAN_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            EYVAN_REVISION=${{ github.sha }}
+
+      - name: Build the cell-agent image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # release-lock pin (build-push)
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: eyvan-agent:${{ env.PR_TAG }}
+          build-args: |
+            ${{ steps.bases.outputs.agent }}
+            EYVAN_VERSION=0.0.0-pr.${{ github.run_number }}
+            EYVAN_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            EYVAN_REVISION=${{ github.sha }}
+
+      - name: Build the native-worker image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # release-lock pin (build-push)
+        with:
+          context: .
+          file: Dockerfile.worker
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: eyvan-native-worker:${{ env.PR_TAG }}
+          build-args: |
+            ${{ steps.bases.outputs.worker }}
+            EYVAN_VERSION=0.0.0-pr.${{ github.run_number }}
+            EYVAN_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            EYVAN_REVISION=${{ github.sha }}
+
+      - name: Smoke every image entrypoint with --help
+        run: |
+          set -euo pipefail
+          # The only runtime surface a pull request exercises: each locked
+          # entrypoint must answer --help with no cluster and no credential.
+          docker run --rm "eyvan-control-plane:${PR_TAG}" --help > /dev/null
+          docker run --rm "eyvan-agent:${PR_TAG}" --help > /dev/null
+          docker run --rm "eyvan-native-worker:${PR_TAG}" --help > /dev/null
+
+      - name: Generate SPDX SBOMs for the local images
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          syft "eyvan-control-plane:${PR_TAG}" --output spdx-json=evidence/control-plane.spdx.json
+          syft "eyvan-agent:${PR_TAG}" --output spdx-json=evidence/agent.spdx.json
+          syft "eyvan-native-worker:${PR_TAG}" --output spdx-json=evidence/worker.spdx.json
+
+      - name: Scan the local images and gate on the High/Critical policy
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          trivy image --download-db-only --db-repository ghcr.io/aquasecurity/trivy-db:2
+          db_digest="$(crane digest ghcr.io/aquasecurity/trivy-db:2)"
+          python3 "${VERIFIER}" capture-scanner-metadata \
+            --lock "${LOCK}" \
+            --binary "${TOOL_DIR}/trivy" \
+            --output evidence/scanner-metadata.json
+          python3 "${VERIFIER}" capture-db-metadata \
+            --trivy-metadata "${HOME}/.cache/trivy/db/metadata.json" \
+            --digest "${db_digest}" \
+            --output evidence/database-metadata.json
+          scan_role() {
+            local role="$1" image="$2"
+            trivy image --scanners vuln --format json --output "evidence/${role}.trivy.json" "${image}"
+            python3 "${VERIFIER}" gate-scan \
+              --lock "${LOCK}" \
+              --allowlist "${ALLOWLIST}" \
+              --role "${role}" \
+              --scan "evidence/${role}.trivy.json" \
+              --scanner-metadata evidence/scanner-metadata.json \
+              --database-metadata evidence/database-metadata.json \
+              --image-ref "${image}" \
+              --output "evidence/${role}.scan-disposition.json"
+          }
+          scan_role control-plane "eyvan-control-plane:${PR_TAG}"
+          scan_role agent "eyvan-agent:${PR_TAG}"
+          scan_role worker "eyvan-native-worker:${PR_TAG}"
+
+  # ------------------------------------------------------------- release lane
+  # Manual dispatch only, on protected main, into the reviewer-gated
+  # environment. Governance is proved before any candidate verifier logic runs
+  # or anything reaches a registry; the lane fails closed.
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    name: Build, qualify, sign, and record the release
+    runs-on: ubuntu-latest
+    environment: eyvan-oci-release
+    timeout-minutes: 120
+    permissions:
+      actions: read # read environment approvals for the receipt
+      contents: write # create the draft-then-final immutable GitHub release
+      id-token: write # cosign keyless signing identity
+      packages: write # push the three images to GHCR
+    env:
+      LOCK: oci/release-lock.json
+      ALLOWLIST: oci/high-critical-allowlist.json
+      VERIFIER: scripts/verify_eyvan_oci_release.py
+      ISSUER: https://token.actions.githubusercontent.com
+      WORKFLOW_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/eyvan-oci-release.yaml@refs/heads/main
+    steps:
+      - name: Check out the protected workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # release-lock pin (checkout)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prove repository governance and approved environment review
+        env:
+          GOVERNANCE_TOKEN: ${{ secrets.EYVAN_GITHUB_GOVERNANCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          api() {
+            curl --silent --show-error --fail \
+              --header "Authorization: Bearer ${GOVERNANCE_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/$1"
+          }
+          repo="${GITHUB_REPOSITORY}"
+
+          # 1. main must currently be a protected branch. The governance token
+          #    is a fine-grained, read-only token with Administration read so
+          #    this lane observes the control and can never weaken it.
+          api "repos/${repo}/branches/main" > governance-branch.json
+          python3 - <<'PY'
+          import json
+
+          with open("governance-branch.json", encoding="utf-8") as handle:
+              branch = json.load(handle)
+          if branch.get("protected") is not True:
+              raise SystemExit("main is not a protected branch; refusing to release")
+          PY
+
+          # 2. Immutable releases must be enabled at the repository level.
+          #    Probe the dedicated /immutable-releases status path first; on
+          #    API versions that do not expose it, fall back to the newest
+          #    release's provider-reported immutable flag, which is only true
+          #    when the repository-level control is on.
+          immutable="$(api "repos/${repo}/immutable-releases" 2>/dev/null || true)"
+          if [ -z "${immutable}" ]; then
+            api "repos/${repo}/releases?per_page=1" > governance-releases.json
+            immutable="$(python3 - <<'PY'
+          import json
+
+          with open("governance-releases.json", encoding="utf-8") as handle:
+              releases = json.load(handle)
+          enabled = bool(releases) and all(release.get("immutable") is True for release in releases)
+          print(json.dumps({"enabled": enabled}))
+          PY
+          )"
+          fi
+          IMMUTABLE_STATUS="${immutable}" python3 - <<'PY'
+          import json
+          import os
+
+          immutable = json.loads(os.environ["IMMUTABLE_STATUS"])
+          if immutable.get("enabled") is not True:
+              raise SystemExit("repository immutable releases are not enabled; refusing to release")
+          PY
+
+          # 3. This dispatch must carry a recorded environment approval.
+          api "repos/${repo}/actions/runs/${GITHUB_RUN_ID}/approvals" > governance-approvals.json
+          python3 - <<'PY'
+          import json
+
+          with open("governance-approvals.json", encoding="utf-8") as handle:
+              approvals = json.load(handle)
+          if not approvals:
+              raise SystemExit("no environment approval is recorded for this run")
+          PY
+          echo "governance proved: protected main, immutable releases, approved environment"
+
+      - name: Prove candidate version matches the workspace and record the candidate SHA
+        id: candidate
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          workspace_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n1)"
+          if [ "${workspace_version}" != "${DISPATCH_VERSION}" ]; then
+            echo "dispatch version ${DISPATCH_VERSION} != pyproject version ${workspace_version}" >&2
+            exit 1
+          fi
+          echo "sha=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate the checked-in policy against itself
+        run: |
+          set -euo pipefail
+          python3 "${VERIFIER}" validate-policy \
+            --lock "${LOCK}" \
+            --allowlist "${ALLOWLIST}" \
+            --repository-root .
+
+      - name: Install the locked host tools
+        env:
+          TOOL_DIR: ${{ runner.temp }}/eyvan-release-tools
+        run: |
+          set -euo pipefail
+          echo "TOOL_DIR=${TOOL_DIR}" >> "${GITHUB_ENV}"
+          python3 oci/install_locked_tools.py \
+            --lock "${LOCK}" \
+            --destination "${TOOL_DIR}" \
+            cosign crane helm syft trivy
+          echo "${TOOL_DIR}" >> "${GITHUB_PATH}"
+
+      - name: Install uv from the pinned action
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # release-lock pin (setup-uv)
+
+      - name: Build and smoke the exact wheel and sdist before OCI qualification
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          # The standalone repository is its own project root with no uv
+          # workspace or lockfile: the locked build backend comes from the
+          # hash-pinned requirements-build.txt export and the build runs from
+          # the repo-root pyproject.
+          uv venv --python 3.12 .build-venv
+          uv pip install --python .build-venv/bin/python --require-hashes -r requirements-build.txt
+          VIRTUAL_ENV=.build-venv PATH="$PWD/.build-venv/bin:$PATH" \
+            uv build --no-build-isolation --wheel --sdist --out-dir dist .
+          test "$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)" -eq 2
+          # Only hashed, locked bytes may execute during the smoke: each exact
+          # distribution is installed into a fresh interpreter outside the
+          # source tree and must expose the dispatch version plus every
+          # entrypoint (the standalone counterpart of
+          # scripts/smoke-package-artifacts.sh, on exactly these bytes).
+          root="$PWD"
+          smoke_distribution() {
+            local artifact="$1" venv="$2"
+            uv venv --python 3.12 "${venv}"
+            uv pip install --python "${venv}/bin/python" \
+              --require-hashes -r requirements-build.txt -r requirements-docker.txt
+            uv pip install --python "${venv}/bin/python" --no-build-isolation --no-deps "${artifact}"
+            uv pip uninstall --python "${venv}/bin/python" uv-build
+            mkdir -p .smoke-run
+            (
+              cd .smoke-run
+              EXPECTED_EYVAN_VERSION="${{ inputs.version }}" "${root}/${venv}/bin/python" - <<'PY'
+          import os
+
+          import eyvan
+
+          expected = os.environ["EXPECTED_EYVAN_VERSION"]
+          assert eyvan.__version__ == expected, (eyvan.__version__, expected)
+          PY
+              for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate; do
+                "${root}/${venv}/bin/${entry}" --help > /dev/null
+              done
+            )
+          }
+          smoke_distribution dist/eyvan-*.whl .smoke-wheel-venv
+          smoke_distribution dist/eyvan-*.tar.gz .smoke-sdist-venv
+
+      - name: Log in to the container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # release-lock pin (login)
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # release-lock pin (setup-buildx)
+
+      - name: Resolve the locked base images for each role
+        id: bases
+        run: |
+          set -euo pipefail
+          python3 - "${LOCK}" >> "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              lock = json.load(handle)
+          for role, key in (("control-plane", "control_plane"), ("agent", "agent"), ("worker", "worker")):
+              print(f"{key}<<LOCKED")
+              for name, value in sorted(lock["images"][role]["buildArgs"].items()):
+                  print(f"{name}={value}")
+              print("LOCKED")
+          PY
+
+      - name: Build and push the control-plane image by digest
+        id: build-control-plane
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # release-lock pin (build-push)
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/erfanzar/eyvan-control-plane:sha-${{ steps.candidate.outputs.sha }}
+          build-args: |
+            ${{ steps.bases.outputs.control_plane }}
+            EYVAN_VERSION=${{ inputs.version }}
+            EYVAN_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            EYVAN_REVISION=${{ github.sha }}
+
+      - name: Build and push the cell-agent image by digest
+        id: build-agent
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # release-lock pin (build-push)
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/erfanzar/eyvan-agent:sha-${{ steps.candidate.outputs.sha }}
+          build-args: |
+            ${{ steps.bases.outputs.agent }}
+            EYVAN_VERSION=${{ inputs.version }}
+            EYVAN_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            EYVAN_REVISION=${{ github.sha }}
+
+      - name: Build and push the native-worker image by digest
+        id: build-worker
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # release-lock pin (build-push)
+        with:
+          context: .
+          file: Dockerfile.worker
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/erfanzar/eyvan-native-worker:sha-${{ steps.candidate.outputs.sha }}
+          build-args: |
+            ${{ steps.bases.outputs.worker }}
+            EYVAN_VERSION=${{ inputs.version }}
+            EYVAN_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            EYVAN_REVISION=${{ github.sha }}
+
+      - name: Record the pushed digests and verify image metadata
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          CONTROL_PLANE_REF="ghcr.io/erfanzar/eyvan-control-plane@${{ steps.build-control-plane.outputs.digest }}"
+          AGENT_REF="ghcr.io/erfanzar/eyvan-agent@${{ steps.build-agent.outputs.digest }}"
+          WORKER_REF="ghcr.io/erfanzar/eyvan-native-worker@${{ steps.build-worker.outputs.digest }}"
+          {
+            echo "CONTROL_PLANE_REF=${CONTROL_PLANE_REF}"
+            echo "AGENT_REF=${AGENT_REF}"
+            echo "WORKER_REF=${WORKER_REF}"
+            echo "CONTROL_PLANE_PLATFORM_DIGEST=sha256:$(crane manifest --platform linux/amd64 "${CONTROL_PLANE_REF}" | sha256sum | cut -d' ' -f1)"
+            echo "AGENT_PLATFORM_DIGEST=sha256:$(crane manifest --platform linux/amd64 "${AGENT_REF}" | sha256sum | cut -d' ' -f1)"
+            echo "WORKER_PLATFORM_DIGEST=sha256:$(crane manifest --platform linux/amd64 "${WORKER_REF}" | sha256sum | cut -d' ' -f1)"
+          } >> "${GITHUB_ENV}"
+          crane config "${CONTROL_PLANE_REF}" > evidence/control-plane.metadata.json
+          crane config "${AGENT_REF}" > evidence/agent.metadata.json
+          crane config "${WORKER_REF}" > evidence/worker.metadata.json
+          python3 "${VERIFIER}" verify-image-metadata \
+            --lock "${LOCK}" --role control-plane \
+            --metadata evidence/control-plane.metadata.json \
+            --revision "${GITHUB_SHA}" --version "${{ inputs.version }}"
+          python3 "${VERIFIER}" verify-image-metadata \
+            --lock "${LOCK}" --role agent \
+            --metadata evidence/agent.metadata.json \
+            --revision "${GITHUB_SHA}" --version "${{ inputs.version }}"
+          python3 "${VERIFIER}" verify-image-metadata \
+            --lock "${LOCK}" --role worker \
+            --metadata evidence/worker.metadata.json \
+            --revision "${GITHUB_SHA}" --version "${{ inputs.version }}"
+
+      - name: Scan the pushed indexes and gate on the High/Critical policy
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          trivy image --download-db-only --db-repository ghcr.io/aquasecurity/trivy-db:2
+          db_digest="$(crane digest ghcr.io/aquasecurity/trivy-db:2)"
+          python3 "${VERIFIER}" capture-scanner-metadata \
+            --lock "${LOCK}" \
+            --binary "${TOOL_DIR}/trivy" \
+            --output evidence/scanner-metadata.json
+          python3 "${VERIFIER}" capture-db-metadata \
+            --trivy-metadata "${HOME}/.cache/trivy/db/metadata.json" \
+            --digest "${db_digest}" \
+            --output evidence/database-metadata.json
+          scan_role() {
+            local role="$1" ref="$2"
+            trivy image --scanners vuln --format json --output "evidence/${role}.trivy.json" "${ref}"
+            # Scanner and database evidence is bound per role so the receipt
+            # records exactly what the gate evaluated.
+            cp evidence/scanner-metadata.json "evidence/${role}.scanner.json"
+            cp evidence/database-metadata.json "evidence/${role}.database.json"
+            python3 "${VERIFIER}" gate-scan \
+              --lock "${LOCK}" \
+              --allowlist "${ALLOWLIST}" \
+              --role "${role}" \
+              --scan "evidence/${role}.trivy.json" \
+              --scanner-metadata "evidence/${role}.scanner.json" \
+              --database-metadata "evidence/${role}.database.json" \
+              --image-ref "${ref}" \
+              --output "evidence/${role}.scan-disposition.json"
+          }
+          scan_role control-plane "${CONTROL_PLANE_REF}"
+          scan_role agent "${AGENT_REF}"
+          scan_role worker "${WORKER_REF}"
+
+      - name: Generate SPDX SBOMs and render the SLSA provenance predicates
+        run: |
+          set -euo pipefail
+          syft "${CONTROL_PLANE_REF}" --output spdx-json=evidence/control-plane.spdx.json
+          syft "${AGENT_REF}" --output spdx-json=evidence/agent.spdx.json
+          syft "${WORKER_REF}" --output spdx-json=evidence/worker.spdx.json
+          python3 - "${LOCK}" "${GITHUB_SHA}" "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              lock = json.load(handle)
+          full_sha, run_id, run_attempt, invocation = sys.argv[2:6]
+          for role in ("control-plane", "agent", "worker"):
+              spec = lock["images"][role]
+              dependencies = [
+                  {
+                      "digest": {"sha1": full_sha},
+                      "uri": lock["sourceRepository"],
+                  }
+              ]
+              for _argument, reference in sorted(spec["buildArgs"].items()):
+                  tagged, digest = reference.split("@sha256:", 1)
+                  dependencies.append({"digest": {"sha256": digest}, "uri": tagged})
+              dependencies.sort(key=lambda item: item["uri"])
+              predicate = {
+                  "buildDefinition": {
+                      "buildType": "https://github.com/Attestations/GitHubActionsWorkflow@v1",
+                      "externalParameters": {
+                          "role": role,
+                          "source": {"digest": {"sha1": full_sha}, "uri": lock["sourceRepository"]},
+                      },
+                      "internalParameters": {
+                          "githubRunAttempt": int(run_attempt),
+                          "githubRunId": int(run_id),
+                      },
+                      "resolvedDependencies": dependencies,
+                  },
+                  "runDetails": {
+                      "builder": {"id": lock["identity"]["provenanceBuilderId"]},
+                      "metadata": {"invocationId": invocation},
+                  },
+              }
+              with open(f"evidence/{role}.provenance.json", "w", encoding="utf-8") as handle:
+                  json.dump(predicate, handle, indent=2)
+                  handle.write("\n")
+          PY
+
+      - name: Keyless-sign the indexes and attach the SBOM and provenance attestation bundles
+        run: |
+          set -euo pipefail
+          cosign sign --yes --new-bundle-format \
+            --bundle evidence/control-plane.image.bundle.json "${CONTROL_PLANE_REF}"
+          cosign sign --yes --new-bundle-format \
+            --bundle evidence/agent.image.bundle.json "${AGENT_REF}"
+          cosign sign --yes --new-bundle-format \
+            --bundle evidence/worker.image.bundle.json "${WORKER_REF}"
+          cosign attest --yes --new-bundle-format --type spdxjson \
+            --predicate evidence/control-plane.spdx.json \
+            --bundle evidence/control-plane.sbom.bundle.json "${CONTROL_PLANE_REF}"
+          cosign attest --yes --new-bundle-format --type spdxjson \
+            --predicate evidence/agent.spdx.json \
+            --bundle evidence/agent.sbom.bundle.json "${AGENT_REF}"
+          cosign attest --yes --new-bundle-format --type spdxjson \
+            --predicate evidence/worker.spdx.json \
+            --bundle evidence/worker.sbom.bundle.json "${WORKER_REF}"
+          cosign attest --yes --new-bundle-format --type slsaprovenance \
+            --predicate evidence/control-plane.provenance.json \
+            --bundle evidence/control-plane.provenance.bundle.json "${CONTROL_PLANE_REF}"
+          cosign attest --yes --new-bundle-format --type slsaprovenance \
+            --predicate evidence/agent.provenance.json \
+            --bundle evidence/agent.provenance.bundle.json "${AGENT_REF}"
+          cosign attest --yes --new-bundle-format --type slsaprovenance \
+            --predicate evidence/worker.provenance.json \
+            --bundle evidence/worker.provenance.bundle.json "${WORKER_REF}"
+          python3 "${VERIFIER}" extract-rekor \
+            --bundle evidence/control-plane.image.bundle.json \
+            --output evidence/control-plane.rekor.json
+          python3 "${VERIFIER}" extract-rekor \
+            --bundle evidence/agent.image.bundle.json \
+            --output evidence/agent.rekor.json
+          python3 "${VERIFIER}" extract-rekor \
+            --bundle evidence/worker.image.bundle.json \
+            --output evidence/worker.rekor.json
+
+      - name: Strictly verify the three keyless image signatures
+        run: |
+          set -euo pipefail
+          cosign verify --new-bundle-format \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${ISSUER}" \
+            "${CONTROL_PLANE_REF}"
+          cosign verify --new-bundle-format \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${ISSUER}" \
+            "${AGENT_REF}"
+          cosign verify --new-bundle-format \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${ISSUER}" \
+            "${WORKER_REF}"
+
+      - name: Package chart, hash digest overlay/render, and verify the M1.8 three-way split
+        run: |
+          set -euo pipefail
+          helm package deploy/helm/eyvan \
+            --version "${{ inputs.version }}" \
+            --destination evidence
+          # The digest overlay is hashed evidence: it, not a mutable values
+          # tag, is what the rendered manifests and the receipt bind. Its keys
+          # are exactly the ones the chart reads (image/agentImage/
+          # workerImage, see templates/_helpers.tpl), each split into
+          # repository + sha256 digest so every rendered reference is the
+          # immutable repository@digest form.
+          {
+            echo "image:"
+            echo "  repository: ${CONTROL_PLANE_REF%@*}"
+            echo "  digest: ${CONTROL_PLANE_REF#*@}"
+            echo "agentImage:"
+            echo "  repository: ${AGENT_REF%@*}"
+            echo "  digest: ${AGENT_REF#*@}"
+            echo "workerImage:"
+            echo "  repository: ${WORKER_REF%@*}"
+            echo "  digest: ${WORKER_REF#*@}"
+          } > evidence/eyvan-release-values.yaml
+          # The agent and its Kubernetes-capacity worker image render only
+          # when the cell agent is enabled, so the evidence render exercises
+          # the kubernetes capacity path; nothing here is applied to a cluster.
+          helm template eyvan deploy/helm/eyvan \
+            --values evidence/eyvan-release-values.yaml \
+            --set cellAgent.enabled=true \
+            --set cellAgent.capacityBackend=kubernetes \
+            --set cellAgent.fleetStateUri=gs://eyvan-release-evidence.invalid/fleet-state \
+            > evidence/eyvan-rendered.yaml
+          python3 "${VERIFIER}" verify-rendered-digest-refs \
+            --render evidence/eyvan-rendered.yaml \
+            --reference "control-plane=${CONTROL_PLANE_REF}" \
+            --reference "agent=${AGENT_REF}" \
+            --reference "worker=${WORKER_REF}"
+
+      - name: Emit and independently verify the closed canonical receipt
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp "${LOCK}" evidence/release-lock.json
+          cp "${ALLOWLIST}" evidence/high-critical-allowlist.json
+          cp dist/eyvan-*.whl dist/eyvan-*.tar.gz evidence/
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals" > evidence/approvals.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path("evidence")
+
+          def sha(name):
+              return hashlib.sha256((evidence / name).read_bytes()).hexdigest()
+
+          def artifact(name):
+              return {"name": name, "sha256": sha(name)}
+
+          with open("oci/release-lock.json", encoding="utf-8") as handle:
+              lock = json.load(handle)
+          with open(evidence / "approvals.json", encoding="utf-8") as handle:
+              approvals = json.load(handle)
+          version = os.environ["DISPATCH_VERSION"]
+          full_sha = os.environ["GITHUB_SHA"]
+          refs = {
+              "control-plane": os.environ["CONTROL_PLANE_REF"],
+              "agent": os.environ["AGENT_REF"],
+              "worker": os.environ["WORKER_REF"],
+          }
+          platform_digests = {
+              "control-plane": os.environ["CONTROL_PLANE_PLATFORM_DIGEST"],
+              "agent": os.environ["AGENT_PLATFORM_DIGEST"],
+              "worker": os.environ["WORKER_PLATFORM_DIGEST"],
+          }
+          images = []
+          for role in ("control-plane", "agent", "worker"):
+              spec = lock["images"][role]
+              repository, index_digest = refs[role].split("@", 1)
+              with open(evidence / f"{role}.rekor.json", encoding="utf-8") as handle:
+                  rekor = json.load(handle)
+              images.append(
+                  {
+                      "baseReferences": [
+                          {"argument": argument, "reference": reference}
+                          for argument, reference in sorted(spec["buildArgs"].items())
+                      ],
+                      "indexDigest": index_digest,
+                      "labels": {
+                          "description": spec["description"],
+                          "licenses": "AGPL-3.0-or-later",
+                          "revision": full_sha,
+                          "source": lock["sourceRepository"],
+                          "title": spec["title"],
+                          "version": version,
+                      },
+                      "platform": lock["platform"],
+                      "platformDigest": platform_digests[role],
+                      "provenance": {
+                          "builderId": lock["identity"]["provenanceBuilderId"],
+                          "bundle": artifact(f"{role}.provenance.bundle.json"),
+                          "issuer": lock["identity"]["issuer"],
+                          "materials": sorted(
+                              [
+                                  {"digest": full_sha, "uri": lock["sourceRepository"]},
+                                  *[
+                                      {
+                                          "digest": reference.split("@sha256:", 1)[1],
+                                          "uri": reference.split("@", 1)[0],
+                                      }
+                                      for reference in spec["buildArgs"].values()
+                                  ],
+                              ],
+                              key=lambda item: item["uri"],
+                          ),
+                          "predicate": artifact(f"{role}.provenance.json"),
+                          "predicateType": "https://slsa.dev/provenance/v1",
+                          "workflowIdentity": lock["identity"]["workflowIdentity"],
+                      },
+                      "repository": repository,
+                      "role": role,
+                      "sbom": {
+                          "attestation": {
+                              "bundle": artifact(f"{role}.sbom.bundle.json"),
+                              "issuer": lock["identity"]["issuer"],
+                              "predicateType": "https://spdx.dev/Document",
+                              "workflowIdentity": lock["identity"]["workflowIdentity"],
+                          },
+                          "document": artifact(f"{role}.spdx.json"),
+                          "format": "spdx-json",
+                      },
+                      "scan": {
+                          "allowlistSha256": sha("high-critical-allowlist.json"),
+                          "databaseMetadata": artifact(f"{role}.database.json"),
+                          "disposition": artifact(f"{role}.scan-disposition.json"),
+                          "raw": artifact(f"{role}.trivy.json"),
+                          "scannerMetadata": artifact(f"{role}.scanner.json"),
+                      },
+                      "signature": {
+                          "bundle": artifact(f"{role}.image.bundle.json"),
+                          "issuer": lock["identity"]["issuer"],
+                          "rekor": rekor,
+                          "workflowIdentity": lock["identity"]["workflowIdentity"],
+                      },
+                  }
+              )
+          wheels = sorted(path.name for path in evidence.glob("eyvan-*.whl"))
+          sdists = sorted(path.name for path in evidence.glob("eyvan-*.tar.gz"))
+          assert len(wheels) == 1 and len(sdists) == 1, (wheels, sdists)
+          receipt = {
+              "deployment": {
+                  "chart": artifact(f"eyvan-{version}.tgz"),
+                  "deploymentApplied": False,
+                  "overlay": artifact("eyvan-release-values.yaml"),
+                  "references": [
+                      {"reference": refs[role], "role": role}
+                      for role in ("control-plane", "agent", "worker")
+                  ],
+                  "render": artifact("eyvan-rendered.yaml"),
+              },
+              "images": images,
+              "packages": {"sdist": artifact(sdists[0]), "wheel": artifact(wheels[0])},
+              "policy": {
+                  "allowlist": artifact("high-critical-allowlist.json"),
+                  "releaseLock": artifact("release-lock.json"),
+              },
+              "qualification": {
+                  "deployment": {"applied": False, "evidence": "not-applied"},
+                  "hardware": {"evidence": "not-run", "validated": False},
+                  "unverifiedPlatforms": lock["unverifiedPlatforms"],
+              },
+              "schemaVersion": "eyvan.oci.release-receipt.v1",
+              "source": {
+                  "fullSha": full_sha,
+                  "ref": "refs/heads/main",
+                  "repository": lock["sourceRepository"],
+                  "version": version,
+              },
+              "workflowApproval": {
+                  "actor": os.environ["GITHUB_ACTOR"],
+                  "approved": True,
+                  "environment": "eyvan-oci-release",
+                  "event": "workflow_dispatch",
+                  "reviewers": sorted(
+                      ({"login": entry["user"]["login"]} for entry in approvals),
+                      key=lambda reviewer: reviewer["login"],
+                  ),
+                  "runAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                  "runId": int(os.environ["GITHUB_RUN_ID"]),
+                  "workflowIdentity": lock["identity"]["workflowIdentity"],
+              },
+          }
+          with open(evidence / "receipt-input.json", "w", encoding="utf-8") as handle:
+              json.dump(receipt, handle, indent=2)
+              handle.write("\n")
+          PY
+          python3 "${VERIFIER}" emit-receipt \
+            --lock "${LOCK}" \
+            --input evidence/receipt-input.json \
+            --output evidence/eyvan-oci-release-receipt-v1.json \
+            --artifact-root evidence
+          python3 "${VERIFIER}" verify-receipt \
+            --lock "${LOCK}" \
+            --receipt evidence/eyvan-oci-release-receipt-v1.json \
+            --artifact-root evidence \
+            --asset-manifest-output evidence/asset-manifest.json \
+            --expected-sha "${GITHUB_SHA}" \
+            --expected-ref refs/heads/main \
+            --expected-version "${{ inputs.version }}"
+
+      - name: Keyless-sign and strictly verify the canonical receipt blob
+        run: |
+          set -euo pipefail
+          # The receipt cannot hash its own signature, so the canonical bytes
+          # are signed as a blob and the detached bundle is verified against
+          # the exact keyless workflow identity before anything is promoted.
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle evidence/eyvan-oci-release-receipt-v1.bundle.json \
+            evidence/eyvan-oci-release-receipt-v1.json
+          cosign verify-blob --new-bundle-format \
+            --bundle evidence/eyvan-oci-release-receipt-v1.bundle.json \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${ISSUER}" \
+            evidence/eyvan-oci-release-receipt-v1.json
+
+      - name: Promote the verified and receipt-signed index digests to immutable version tags
+        run: |
+          set -euo pipefail
+          # Copy, never rebuild: the version tag names exactly the qualified,
+          # signed, and receipted digest. No moving tag is ever created.
+          crane copy "${CONTROL_PLANE_REF}" "ghcr.io/erfanzar/eyvan-control-plane:${{ inputs.version }}"
+          crane copy "${AGENT_REF}" "ghcr.io/erfanzar/eyvan-agent:${{ inputs.version }}"
+          crane copy "${WORKER_REF}" "ghcr.io/erfanzar/eyvan-native-worker:${{ inputs.version }}"
+
+      - name: Publish the draft-then-final immutable release with the closed asset set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="eyvan-v${{ inputs.version }}"
+          {
+            echo "Eyvan ${{ inputs.version }}"
+            echo
+            echo "Immutable OCI release: receipt-signed images, closed 36-asset evidence set."
+            echo "Qualification boundary: hosted linux/amd64 build and registry checks only;"
+            echo "no deployment was applied and no hardware workload was run."
+          } > evidence/release-notes.md
+          # The release is created as a draft with the complete closed asset
+          # set, then published atomically; immutability is proved afterwards.
+          # --target binds target_commitish to the exact qualified dispatch
+          # SHA; the bootstrap downloader refuses any other value.
+          gh release create "${tag}" \
+            --draft \
+            --target "${GITHUB_SHA}" \
+            --title "Eyvan ${{ inputs.version }}" \
+            --notes-file evidence/release-notes.md \
+            evidence/release-lock.json \
+            evidence/high-critical-allowlist.json \
+            evidence/control-plane.spdx.json evidence/agent.spdx.json evidence/worker.spdx.json \
+            evidence/control-plane.sbom.bundle.json evidence/agent.sbom.bundle.json evidence/worker.sbom.bundle.json \
+            evidence/control-plane.trivy.json evidence/agent.trivy.json evidence/worker.trivy.json \
+            evidence/control-plane.scanner.json evidence/agent.scanner.json evidence/worker.scanner.json \
+            evidence/control-plane.database.json evidence/agent.database.json evidence/worker.database.json \
+            evidence/control-plane.scan-disposition.json evidence/agent.scan-disposition.json evidence/worker.scan-disposition.json \
+            evidence/control-plane.image.bundle.json evidence/agent.image.bundle.json evidence/worker.image.bundle.json \
+            evidence/control-plane.provenance.json evidence/agent.provenance.json evidence/worker.provenance.json \
+            evidence/control-plane.provenance.bundle.json evidence/agent.provenance.bundle.json evidence/worker.provenance.bundle.json \
+            evidence/eyvan-*.whl evidence/eyvan-*.tar.gz \
+            "evidence/eyvan-${{ inputs.version }}.tgz" \
+            evidence/eyvan-release-values.yaml \
+            evidence/eyvan-rendered.yaml \
+            evidence/eyvan-oci-release-receipt-v1.json \
+            evidence/eyvan-oci-release-receipt-v1.bundle.json
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .id)"
+          gh release edit "${tag}" --draft=false
+          immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq .immutable)"
+          test "${immutable}" = "true"
+          echo "release ${tag} is published and provider-reported immutable"
+
+      - name: Upload the release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # release-lock pin (upload-artifact)
+        with:
+          name: eyvan-release-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30

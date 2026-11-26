@@ -1,0 +1,114 @@
+name: Publish
+
+# Tag-driven, and trusted-publishing only: no PyPI token exists in this
+# repository, so a compromised workflow has nothing to steal. The tag must name
+# the version the source declares, and the wheel is built with the locked
+# backend rather than whatever PEP 517 would resolve.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish; must equal the version in pyproject.toml
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+
+      - name: The tag and the source must agree
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          SOURCE="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CLAIMED="${GITHUB_REF_NAME#v}"
+          else
+            CLAIMED="$REQUESTED_VERSION"
+          fi
+          test "$SOURCE" = "$CLAIMED" || {
+            echo "tag claims $CLAIMED but pyproject declares $SOURCE" >&2; exit 1; }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # A published wheel must serve its UI: build the dashboard and copy it
+      # into the package before the Python build, then refuse an artifact
+      # that does not carry every file index.html loads.
+      - name: Build the dashboard and stage it into the package
+        run: |
+          set -euo pipefail
+          npm --prefix dashboard ci
+          npm --prefix dashboard run build
+          python3 scripts/stage_dashboard.py
+
+      - name: Build with the locked backend
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+          VIRTUAL_ENV=.venv PATH="$PWD/.venv/bin:$PATH" \
+            uv build --no-build-isolation --wheel --sdist --out-dir dist .
+          test "$(find dist -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)" -eq 2
+          python3 scripts/stage_dashboard.py --check dist/*.whl dist/*.tar.gz
+
+      - name: Install the built wheel and exercise every entry point
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .smoke
+          uv pip install --python .smoke/bin/python --require-hashes -r requirements-docker.txt
+          uv pip install --python .smoke/bin/python --no-deps dist/*.whl
+          for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate; do
+            .smoke/bin/"$entry" --help >/dev/null
+          done
+
+      - name: SBOM for the shipped dependency set
+        # CycloneDX from the same hashed export the smoke install used, so the
+        # inventory describes exactly what the published artifact installs
+        # against. Attached to the release by the OCI workflow family.
+        run: |
+          set -euo pipefail
+          uv tool run --from cyclonedx-bom==7.1.0 cyclonedx-py requirements \
+            requirements-docker.txt -o dist/sbom-cyclonedx.json --of JSON
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: sbom
+          path: dist/sbom-cyclonedx.json
+
+      # GitHub OIDC signs SLSA provenance for the exact build outputs. This
+      # step must succeed before publication; no long-lived signing key exists.
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/sbom-cyclonedx.json
+
+      - name: Publish
+        run: uv publish --trusted-publishing always dist/*.whl dist/*.tar.gz
