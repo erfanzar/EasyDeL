@@ -1008,6 +1008,7 @@ class FalconH1DecoderLayer(spx.Module):
         """
         self.config = config
         self.layer_idx = layer_idx
+        self.is_full_attention = config.is_full_attention_layer(layer_idx)
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -1065,7 +1066,9 @@ class FalconH1DecoderLayer(spx.Module):
         cache_metadata: OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Array | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the FalconH1 decoder layer.
 
         Processes input through parallel Mamba SSM and attention branches, combines
@@ -1093,9 +1096,11 @@ class FalconH1DecoderLayer(spx.Module):
                 Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies of
                 shape (seq_len, head_dim). Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains:
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``):
                 - hidden_states: Output tensor of shape (batch, seq_len, hidden_size)
                 - attention_weight: Attention weights if output_attentions=True, else None
                 - cache_view: Updated HybridCacheView with new states
@@ -1114,7 +1119,7 @@ class FalconH1DecoderLayer(spx.Module):
         mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
         # Pass updated_cache_view so attention can update key/value while preserving mamba's state
-        attn_output = self.self_attn(
+        attn_res = self.self_attn(
             hidden_states * self.attention_in_multiplier,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -1123,7 +1128,13 @@ class FalconH1DecoderLayer(spx.Module):
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             frequencies=frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_output, captured_kv = attn_res
+        else:
+            attn_output, captured_kv = attn_res, None
         attn_hidden_states = attn_output.attention_output * self.attn_out_multiplier
 
         # Use attention's cache_view as it contains both mamba's updates and attention's KV updates
@@ -1151,11 +1162,14 @@ class FalconH1DecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_output.attention_weight if output_attentions else None,
             cache_view=updated_cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=FalconH1Config, model_type="falcon_h1")
@@ -1245,6 +1259,7 @@ class FalconH1Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
             self.final_layernorm = RMSNorm(
@@ -1363,53 +1378,88 @@ class FalconH1Model(EasyDeLBaseModule):
             False,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
-            extra=past_key_values is not None,
+            extra=past_key_values is not None or self.config.is_looped,
         )
 
-        def _layer_loop(layer, carry):
-            """Per-layer step body for :meth:`nn.ModuleList.scan`.
-
-            Threads ``(hidden_states, all_hidden_states, all_attentions,
-            past_key_values, layer_idx)`` through one FalconH1 hybrid block
-            (parallel attention + SSM mixers + SwiGLU MLP). Updates the
-            layer's :class:`HybridCache` view in-place when caching is active
-            and accumulates hidden states / attention weights as requested.
-            """
-            hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            cache_view = None
+        if self.config.is_looped:
             if past_key_values is not None:
-                cache_view = past_key_values.get_view(layer_idx)
+                past_key_values = past_key_values.replace(views=list(past_key_values.views))
+            cache_views = past_key_values.views if (past_key_values is not None and trace_layers) else None
 
-            with self._layer_stage_context(layer_idx, layers=self.layers):
-                layer_output = layer(
-                    hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                return block(
+                    h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
                     cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
 
-            hidden_states = self._mark_layer_stage_boundary(layer_output.hidden_states, layer_idx, layers=self.layers)
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=past_key_values is None,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+            )
+        else:
 
-            if past_key_values is not None and layer_output.cache_view is not None:
-                past_key_values = past_key_values.update_view(layer_idx, layer_output.cache_view)
+            def _layer_loop(layer, carry):
+                """Per-layer step body for :meth:`nn.ModuleList.scan`.
 
-            if output_attentions and layer_output.attention_weight is not None:
-                all_attentions += (layer_output.attention_weight,)
+                Threads ``(hidden_states, all_hidden_states, all_attentions,
+                past_key_values, layer_idx)`` through one FalconH1 hybrid block
+                (parallel attention + SSM mixers + SwiGLU MLP). Updates the
+                layer's :class:`HybridCache` view in-place when caching is active
+                and accumulates hidden states / attention weights as requested.
+                """
+                hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-            return hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx + 1
+                cache_view = None
+                if past_key_values is not None:
+                    cache_view = past_key_values.get_view(layer_idx)
 
-        hidden_states, all_hidden_states, all_attentions, past_key_values, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, past_key_values, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                with self._layer_stage_context(layer_idx, layers=self.layers):
+                    layer_output = layer(
+                        hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=cache_view,
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                    )
+
+                hidden_states = self._mark_layer_stage_boundary(
+                    layer_output.hidden_states, layer_idx, layers=self.layers
+                )
+
+                if past_key_values is not None and layer_output.cache_view is not None:
+                    past_key_values = past_key_values.update_view(layer_idx, layer_output.cache_view)
+
+                if output_attentions and layer_output.attention_weight is not None:
+                    all_attentions += (layer_output.attention_weight,)
+
+                return hidden_states, all_hidden_states, all_attentions, past_key_values, layer_idx + 1
+
+            hidden_states, all_hidden_states, all_attentions, past_key_values, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, all_hidden_states, all_attentions, past_key_values, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.final_layernorm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

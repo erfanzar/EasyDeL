@@ -238,6 +238,10 @@ class MambaConfig(EasyDeLBaseConfig):
         """
         return ["linear_attention"] * self.num_hidden_layers
 
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        """Pure Mamba SSM models have no full self-attention layers."""
+        return False
+
     def get_mask_details(self):
         """Mamba blocks consume no attention mask metadata.
 
@@ -246,6 +250,7 @@ class MambaConfig(EasyDeLBaseConfig):
         :meth:`MambaMixer.forward`, not by an attention mask.
 
         Returns:
-            None: Always — there is no mask schema to advertise.
+            dict[int, AttnMaskDetail] | None: Loop mask details when hybrid
+            looping is configured, otherwise ``None``.
         """
-        return None
+        return self._apply_loop_mask_details(None)

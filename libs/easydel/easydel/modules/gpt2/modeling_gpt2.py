@@ -384,7 +384,9 @@ class GPT2Attention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
-    ) -> AttentionLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple | None]:
         """Run GPT-2 self- or cross-attention and produce a residual-ready output.
 
         Splits the fused ``c_attn`` projection into Q/K/V (or, for cross
@@ -415,11 +417,12 @@ class GPT2Attention(UnifiedAttention):
             key_value_states: Optional encoder states of shape
                 ``[batch, src_len, hidden_dim]`` enabling cross-attention.
                 When ``None`` the layer runs self-attention.
+            shared_global_kv: Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            :class:`AttentionLayerOutput` carrying the post-projection
-            attention output, the optional attention weights, and the
-            updated cache view.
+            :class:`AttentionLayerOutput` (or ``(AttentionLayerOutput, captured_kv)``
+            when ``return_shared_kv=True``).
         """
         is_cross_attention = key_value_states is not None
 
@@ -436,55 +439,77 @@ class GPT2Attention(UnifiedAttention):
         key = self._split_heads(key)
         value = self._split_heads(value)
 
-        init_attention_bias = lambda: None  # noqa
-        if self.causal:
-            (
-                key,
-                value,
-                mask_info,
-                init_attention_bias,
-                cache_view,
-                cache_metadata,
-            ) = self.concatenate(
-                query=query,
-                key=key,
-                value=value,
+        output_dtype = query.dtype
+        if shared_global_kv is not None or return_shared_kv:
+            attn_raw, attn_weights_out, cache_view, captured_kv = self._run_attention_with_shared_kv(
+                query_states=query,
+                key_states=key,
+                value_states=value,
+                mask_info=mask_info,
+                mode=mode,
                 cache_view=cache_view,
                 cache_metadata=cache_metadata,
-                mask_info=mask_info,
+                output_attentions=output_attentions,
+                causal=self.causal,
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
             )
+        else:
+            init_attention_bias = lambda: None  # noqa
+            if self.causal:
+                (
+                    key,
+                    value,
+                    mask_info,
+                    init_attention_bias,
+                    cache_view,
+                    cache_metadata,
+                ) = self.concatenate(
+                    query=query,
+                    key=key,
+                    value=value,
+                    cache_view=cache_view,
+                    cache_metadata=cache_metadata,
+                    mask_info=mask_info,
+                )
 
-        output_dtype = query.dtype
-        if getattr(self.config, "reorder_and_upcast_attn", False):
-            # HF ``reorder_and_upcast_attn``: run the score/softmax/value product in float32.
-            query = query.astype(jnp.float32)
-            key = key.astype(jnp.float32)
-            value = value.astype(jnp.float32)
+            if getattr(self.config, "reorder_and_upcast_attn", False):
+                # HF ``reorder_and_upcast_attn``: run the score/softmax/value product in float32.
+                query = query.astype(jnp.float32)
+                key = key.astype(jnp.float32)
+                value = value.astype(jnp.float32)
 
-        attn = self.attention_performer.forward(
-            query_states=query,
-            key_states=key,
-            value_states=value,
-            mode=mode,
-            init_bias=init_attention_bias,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            mask_info=mask_info,
-            causal=self.causal,
-            output_attentions=output_attentions,
-            precision=self.precision,
-            compute_dtype=jnp.float32 if getattr(self.config, "reorder_and_upcast_attn", False) else None,
-        )
-        attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs.astype(output_dtype)))
+            attn = self.attention_performer.forward(
+                query_states=query,
+                key_states=key,
+                value_states=value,
+                mode=mode,
+                init_bias=init_attention_bias,
+                cache_metadata=cache_metadata,
+                cache_view=cache_view,
+                mask_info=mask_info,
+                causal=self.causal,
+                output_attentions=output_attentions,
+                precision=self.precision,
+                compute_dtype=jnp.float32 if getattr(self.config, "reorder_and_upcast_attn", False) else None,
+            )
+            attn_raw = attn.attention_outputs
+            attn_weights_out = attn.attention_weights if output_attentions else None
+            captured_kv = None
+
+        attn_output = self.shard_attention_prod(self._merge_heads(attn_raw.astype(output_dtype)))
         attn_output = checkpoint_name(self.c_proj(attn_output), "attn_output")
         attn_output = self.shard_attention_prod(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        return AttentionLayerOutput(
+        layer_out = AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attn.attention_weights if output_attentions else None,
+            attention_weight=attn_weights_out,
             cache_view=cache_view,
         )
+        if return_shared_kv:
+            return layer_out, captured_kv
+        return layer_out
 
 
 class GPT2MLP(spx.Module):
@@ -696,7 +721,9 @@ class GPT2Block(spx.Module):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Run a single GPT-2 pre-norm transformer block.
 
         Pre-norm flow: ``x + attn(ln_1(x))`` followed (when configured)
@@ -720,12 +747,12 @@ class GPT2Block(spx.Module):
                 requires ``config.add_cross_attention=True``.
             encoder_mask_info: Optional mask info paired with
                 ``encoder_hidden_states``.
+            shared_global_kv: Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            :class:`DecoderLayerOutput` containing the residual stream
-            after this block, self-attention weights (optional),
-            cross-attention weights (optional), and the updated cache
-            view.
+            :class:`DecoderLayerOutput` (or ``(DecoderLayerOutput, captured_kv)``
+            when ``return_shared_kv=True``).
 
         Raises:
             ValueError: If ``encoder_hidden_states`` is provided but the
@@ -734,7 +761,7 @@ class GPT2Block(spx.Module):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
 
-        attn_outputs = self.attn(
+        attn_res = self.attn(
             hidden_states,
             mask_info,
             position_ids,
@@ -743,7 +770,13 @@ class GPT2Block(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
 
         hidden_states = checkpoint_name(attn_outputs.attention_output + residual, "residual")
         cross_attention = None
@@ -787,12 +820,15 @@ class GPT2Block(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             cross_attention=cross_attention,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=GPT2Config, model_type="gpt2")
@@ -881,6 +917,7 @@ class GPT2Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.ln_f = LayerNorm(
@@ -994,7 +1031,7 @@ class GPT2Model(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.h))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
@@ -1006,60 +1043,100 @@ class GPT2Model(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or encoder_hidden_states is not None,
+            extra=needs_trace_cache or encoder_hidden_states is not None or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
 
-        def _layer_loop(block, carry):
-            """Run one GPT-2 block inside ``self.h.scan``.
+        if self.config.is_looped:
+            cross_attentions_list: list = []
 
-            Threads ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, all_cross_attentions, layer_index)`` through the
-            scan and collects optional intermediate states / self-attention /
-            cross-attention weights when the outer ``forward`` enabled
-            them.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.h):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                res = block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=None,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_mask_info=encoder_mask_info,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
+                if output_attentions and encoder_hidden_states is not None:
+                    layer_out = res[0] if return_shared_kv else res
+                    cross_attentions_list.append(layer_out.cross_attention)
+                return res
 
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            if output_attentions and encoder_hidden_states is not None:
-                all_cross_attentions += (layer_outputs.cross_attention,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.h,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache and encoder_hidden_states is None,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
             )
+            if output_attentions and encoder_hidden_states is not None:
+                all_cross_attentions = tuple(cross_attentions_list)
+        else:
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, idx + 1
+            def _layer_loop(block, carry):
+                """Run one GPT-2 block inside ``self.h.scan``.
 
-        hidden_states, _, all_hidden_states, all_attentions, all_cross_attentions, _ = self.h.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_cross_attentions, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                Threads ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, all_cross_attentions, layer_index)`` through the
+                scan and collects optional intermediate states / self-attention /
+                cross-attention weights when the outer ``forward`` enabled
+                them.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                with self._layer_stage_context(idx, layers=self.h):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=None,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_mask_info=encoder_mask_info,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                if output_attentions and encoder_hidden_states is not None:
+                    all_cross_attentions += (layer_outputs.cross_attention,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_attentions, all_cross_attentions, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, all_cross_attentions, _ = self.h.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, all_cross_attentions, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,

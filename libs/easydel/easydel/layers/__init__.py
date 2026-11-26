@@ -86,6 +86,7 @@ from .linears import (
     RowParallelMoELinear,
     eLoRA,
 )
+from .loop import LoopGate
 from .mlp import clamped_swiglu, gated_mlp_forward, moe_gated_expert_forward, softcapped_swiglu, swiglu_oai
 from .moe import (
     BaseMoeModule,
@@ -254,6 +255,7 @@ __all__ = [
     "IndexerSelection",
     "LinearScalingRotaryEmbedding",
     "Llama3RotaryEmbedding",
+    "LoopGate",
     "LoopMessageAttentionResidual",
     "LoopMessageGate",
     "ManifoldHyperConnection",

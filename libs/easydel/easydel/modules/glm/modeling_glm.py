@@ -320,7 +320,9 @@ class GlmDecoderLayer(spx.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the decoder layer.
 
         Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
@@ -336,14 +338,16 @@ class GlmDecoderLayer(spx.Module):
                 Cache metadata. Defaults to None.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_outputs = self.self_attn(
+        attn_res = self.self_attn(
             hidden_states=hidden_states,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -352,7 +356,13 @@ class GlmDecoderLayer(spx.Module):
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             frequencies=frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
 
         hidden_states = residual + attn_outputs.attention_output
 
@@ -375,11 +385,14 @@ class GlmDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=GlmConfig, model_type="glm")
@@ -452,8 +465,9 @@ class GlmModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
-        if self.config.scan_layers and self._pipeline_stage_count() == 1:
+        if self.config.scan_layers and self._pipeline_stage_count() == 1 and not self.config.is_looped:
             self.layers = self.layers.stack()
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
@@ -550,7 +564,7 @@ class GlmModel(EasyDeLBaseModule):
             )
 
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -568,52 +582,83 @@ class GlmModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
 
-        def _run_layer(block, carry):
-            """Run one decoder layer inside ``self.layers.scan``.
+        if self.config.is_looped:
 
-            Captures the surrounding closure for masks/positions/mode/cache
-            metadata. The carry threads ``(hidden_states, cache_views,
-            all_hidden_states, all_attentions, layer_index)`` through the
-            scan, optionally appending intermediate hidden states and
-            attention weights when requested by the outer ``forward``.
-            """
-            hs, cv, ah, aa, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=frequencies,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            return hs, cv, ah, aa, idx + 1
 
-        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _run_layer,
-            init_carry,
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not trace and not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+            )
+        else:
+
+            def _run_layer(block, carry):
+                """Run one decoder layer inside ``self.layers.scan``.
+
+                Captures the surrounding closure for masks/positions/mode/cache
+                metadata. The carry threads ``(hidden_states, cache_views,
+                all_hidden_states, all_attentions, layer_index)`` through the
+                scan, optionally appending intermediate hidden states and
+                attention weights when requested by the outer ``forward``.
+                """
+                hs, cv, ah, aa, idx = carry
+                if output_hidden_states:
+                    ah = (*ah, hs)
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hs,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=frequencies,
+                    )
+                hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_attentions:
+                    aa = (*aa, layer_outputs.attention_weight)
+                return hs, cv, ah, aa, idx + 1
+
+            init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _run_layer,
+                init_carry,
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:

@@ -371,4 +371,4 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Return the nested text decoder's per-layer full/sliding mask schedule."""
-        return super().get_mask_details()
+        return super().get_mask_details() or {}

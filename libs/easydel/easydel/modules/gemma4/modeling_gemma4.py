@@ -1944,6 +1944,8 @@ class Gemma4Attention(UnifiedAttention):
         cache_metadata,
         output_attentions,
         frequencies,
+        shared_global_kv=None,
+        return_shared_kv=False,
     ):
         """Standard forward that also captures post-norm, post-RoPE K/V.
 
@@ -1959,10 +1961,11 @@ class Gemma4Attention(UnifiedAttention):
             cache_metadata: Cache management metadata.
             output_attentions: Whether to return attention weights.
             frequencies: Precomputed RoPE frequencies.
+            shared_global_kv: Optional Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            ``AttentionLayerOutput`` with attention output, optional weights,
-            and updated cache view.
+            ``AttentionLayerOutput`` (or ``(AttentionLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         batch_size = hidden_states.shape[0]
         sequence_length = hidden_states.shape[1]
@@ -1993,7 +1996,8 @@ class Gemma4Attention(UnifiedAttention):
         # Capture post-norm, post-RoPE K/V for potential downstream sharing.
         # Stored temporarily on the object to be harvested by the model loop.
         # Using object.__setattr__ to bypass SpecTrax pytree validation.
-        object.__setattr__(self, "_captured_kv", (key_states, value_states))
+        if not getattr(self.config, "is_looped", False):
+            object.__setattr__(self, "_captured_kv", (key_states, value_states))
 
         return self._attend_and_project(
             query_states,
@@ -2005,6 +2009,8 @@ class Gemma4Attention(UnifiedAttention):
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             use_cache=True,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
 
     def _attend_and_project(
@@ -2020,6 +2026,8 @@ class Gemma4Attention(UnifiedAttention):
         output_attentions,
         use_cache,
         shared_attention_context=None,
+        shared_global_kv=None,
+        return_shared_kv=False,
     ):
         """Shared post-QKV tail: cache concat, attention kernel, head merge, ``o_proj``, dropout.
 
@@ -2040,10 +2048,44 @@ class Gemma4Attention(UnifiedAttention):
             shared_attention_context: Optional donor-resolved keys, values, mask,
                 bias factory, metadata, causal flag and window. Reused without
                 writing the donor cache a second time.
+            shared_global_kv: Optional Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            ``AttentionLayerOutput`` with attention output, optional weights, and the cache view.
+            ``AttentionLayerOutput`` (or ``(AttentionLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
+        if shared_global_kv is not None or return_shared_kv:
+            attn_raw, attn_weights_out, cache_view, captured_kv = self._run_attention_with_shared_kv(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                mask_info=mask_info,
+                mode=mode,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                causal=self.causal,
+                sliding_window=self._kernel_sliding_window(),
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
+            )
+            attention_out = self._merge_heads(attn_raw)
+            attn_output = self.shard_attention_prod(attention_out)
+            attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+            attn_output = self.shard_attention_prod(attn_output)
+
+            if hasattr(self, "resid_dropout"):
+                attn_output = self.resid_dropout(attn_output)
+
+            layer_out = AttentionLayerOutput(
+                attention_output=attn_output,
+                attention_weight=attn_weights_out,
+                cache_view=cache_view,
+            )
+            if return_shared_kv:
+                return layer_out, captured_kv
+            return layer_out
+
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
@@ -2089,7 +2131,7 @@ class Gemma4Attention(UnifiedAttention):
                 causal_for_kernel,
                 sliding_window_for_kernel,
             ) = shared_attention_context
-        elif not self.is_kv_shared_layer:
+        elif not self.is_kv_shared_layer and not getattr(self.config, "is_looped", False):
             object.__setattr__(
                 self,
                 "_captured_attention_context",
@@ -2153,6 +2195,8 @@ class Gemma4Attention(UnifiedAttention):
         alibi=None,
         shared_key_value=None,
         shared_attention_context=None,
+        shared_global_kv=None,
+        return_shared_kv=False,
     ):
         """Gemma4 attention forward with optional KV sharing.
 
@@ -2178,10 +2222,11 @@ class Gemma4Attention(UnifiedAttention):
                 ``[batch, seq_len, num_kv_heads, head_dim]``.
             shared_attention_context: Optional donor-resolved attention history
                 and masks, passed by the text model for read-only cache sharing.
+            shared_global_kv: Optional Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            ``AttentionLayerOutput`` with attention output, optional weights,
-            and post-attention key/value states for downstream sharing.
+            ``AttentionLayerOutput`` (or ``(AttentionLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         if shared_key_value is None:
             return self._forward_with_kv_capture(
@@ -2193,7 +2238,12 @@ class Gemma4Attention(UnifiedAttention):
                 cache_metadata,
                 output_attentions,
                 frequencies,
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
             )
+
+        if shared_global_kv is not None or return_shared_kv:
+            raise ValueError("Looped hybrid_sliding_window shared_global_kv cannot be combined with KV sharing.")
 
         # KV sharing path: use shared K/V, compute only Q
         batch_size = hidden_states.shape[0]
@@ -2849,7 +2899,9 @@ class Gemma4DecoderLayer(spx.Module):
         per_layer_input: Array | None = None,
         shared_key_value: tuple[Array, Array] | None = None,
         shared_attention_context: tuple | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Execute one decoder layer forward pass.
 
         Sliding layers use ``default_frequencies`` (local RoPE) while global
@@ -2872,10 +2924,11 @@ class Gemma4DecoderLayer(spx.Module):
                 from the donor layer for KV sharing.
             shared_attention_context: Optional complete attention-time history
                 and masks resolved by the donor, avoiding a second cache append.
+            shared_global_kv: Optional Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            ``DecoderLayerOutput`` containing the transformed hidden states,
-            optional attention weights, and updated cache view.
+            ``DecoderLayerOutput`` (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         frequencies = default_frequencies if self.is_sliding else frequencies
 
@@ -2887,7 +2940,7 @@ class Gemma4DecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        attn_outputs = self.self_attn(
+        attn_res = self.self_attn(
             hidden_states,
             mask_info,
             position_ids,
@@ -2898,7 +2951,13 @@ class Gemma4DecoderLayer(spx.Module):
             frequencies,
             shared_key_value=shared_key_value,
             shared_attention_context=shared_attention_context,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
         hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = apply_logical_sharding(
@@ -2943,11 +3002,14 @@ class Gemma4DecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=Gemma4TextConfig, model_type="gemma4_text")
@@ -3045,6 +3107,9 @@ class Gemma4TextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        if self.config.is_looped and self.config.get_kv_shared_layer_mapping():
+            raise ValueError("Looped execution cannot be combined with num_kv_shared_layers > 0.")
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
             self.norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
@@ -3295,7 +3360,7 @@ class Gemma4TextModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -3305,87 +3370,149 @@ class Gemma4TextModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        # KV sharing: shared layers reuse K/V from the last non-shared layer
-        # of the same attention type instead of computing their own projections.
-        # For cached inference, shared layers also use the donor's cache view
-        # (their own views[idx] is None to avoid duplicate buffer donation).
-        shared_kv: dict[int, tuple[Array, Array]] = {}
-        shared_attention_contexts: dict[int, tuple] = {}
-        donor_cache_views: dict[int, typing.Any] = {}
+        views = past_key_values.views if past_key_values is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
+        needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=bool(output_hidden_states),
+            output_attentions=bool(output_attentions),
+            cache_views=views,
+            extra=needs_trace_cache or self.config.is_looped,
+        )
+        cache_views = views if trace_layers else None
 
-        def _layer_loop(block, carry):
-            """Per-layer step body for the Gemma 4 text decoder.
-
-            Threads ``(hidden_states, all_hidden_states, all_attentions,
-            idx)`` through one decoder layer, picking the
-            sliding-vs-full ``MaskInfo`` and the right slice of
-            ``per_layer_inputs``. Implements the KV-sharing rule by reading
-            cached K/V from the donor layer (and reusing its cache view for
-            paged inference) when the layer is in the shared tail.
-            """
-            hidden_states, all_hidden_states, all_attentions, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            layer_mask_info = (
-                mask_info_sliding if self.config.layer_types[idx] == "sliding_attention" else mask_info_full
+        if self.config.is_looped:
+            global_frequencies = self.global_frequencies
+            default_frequencies = self.default_frequencies
+            use_hybrid_kv = getattr(self.config, "loop_kv_cache_mode", "separate") == "hybrid_sliding_window"
+            global_head_dim = self.config.global_head_dim or self.config.head_dim
+            global_kv_heads = (
+                self.config.num_global_key_value_heads
+                if (self.config.attention_k_eq_v and self.config.num_global_key_value_heads is not None)
+                else self.config.num_key_value_heads
             )
-            per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
+            hybrid_scan_compatible = not use_hybrid_kv or (
+                global_head_dim == self.config.head_dim
+                and global_kv_heads == self.config.num_key_value_heads
+                and not _gemma4_needs_fp32_attention_cache(self.dtype)
+            )
 
-            attn = block.self_attn
-            shared_key_value = shared_kv.get(attn.kv_shared_layer_index) if attn.is_kv_shared_layer else None
-
-            # Shared layers use the donor's cache view; their own slot is None.
-            cache_view = self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values)
-            if cache_view is None and attn.is_kv_shared_layer:
-                cache_view = donor_cache_views.get(attn.kv_shared_layer_index)
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                layer_mask_info = mask_info_sliding if block.is_sliding else mask_info_full
+                per_layer_input = per_layer_inputs[:, :, block.layer_idx, :] if per_layer_inputs is not None else None
+                return block(
+                    hidden_states=h,
                     mask_info=layer_mask_info,
                     position_ids=position_ids,
                     mode=mode,
                     cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.global_frequencies,
-                    default_frequencies=self.default_frequencies,
+                    frequencies=global_frequencies,
+                    default_frequencies=default_frequencies,
                     per_layer_input=per_layer_input,
-                    shared_key_value=shared_key_value,
-                    shared_attention_context=shared_attention_contexts.get(attn.kv_shared_layer_index),
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            captured = getattr(attn, "_captured_kv", None)
-            if captured is not None and not attn.is_kv_shared_layer:
-                shared_kv[idx] = captured
-                object.__setattr__(attn, "_captured_kv", None)
-                context = getattr(attn, "_captured_attention_context", None)
-                if context is not None:
-                    shared_attention_contexts[idx] = context
-                    object.__setattr__(attn, "_captured_attention_context", None)
-                # Track the donor's (potentially updated) cache view.
-                self._layer_cache_view_update(donor_cache_views, idx, layer_outputs.cache_view, enabled=True)
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info_full,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache and per_layer_inputs is None and hybrid_scan_compatible,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+            )
+        else:
+            # KV sharing: shared layers reuse K/V from the last non-shared layer
+            # of the same attention type instead of computing their own projections.
+            # For cached inference, shared layers also use the donor's cache view
+            # (their own views[idx] is None to avoid duplicate buffer donation).
+            shared_kv: dict[int, tuple[Array, Array]] = {}
+            shared_attention_contexts: dict[int, tuple] = {}
+            donor_cache_views: dict[int, typing.Any] = {}
 
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-            if not attn.is_kv_shared_layer:
-                self._layer_cache_view_update(None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values)
+            def _layer_loop(block, carry):
+                """Per-layer step body for the Gemma 4 text decoder.
 
-            return hidden_states, all_hidden_states, all_attentions, idx + 1
+                Threads ``(hidden_states, all_hidden_states, all_attentions,
+                idx)`` through one decoder layer, picking the
+                sliding-vs-full ``MaskInfo`` and the right slice of
+                ``per_layer_inputs``. Implements the KV-sharing rule by reading
+                cached K/V from the donor layer (and reusing its cache view for
+                paged inference) when the layer is in the shared tail.
+                """
+                hidden_states, all_hidden_states, all_attentions, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-        # NOTE: the KV-sharing rule threads per-layer python state
-        # (``shared_kv`` / ``donor_cache_views`` dicts, ``layer_types[idx]``
-        # lookups, ``per_layer_inputs`` slicing by concrete idx) that cannot
-        # ride a ``lax.scan`` carry, so this stack always uses the
-        # python-loop path; ``scan_layers=True`` is unsupported here.
-        hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, all_hidden_states, all_attentions, 0),
-            trace=True,
-            **self._layer_scan_kwargs("text"),
-        )
+                layer_mask_info = (
+                    mask_info_sliding if self.config.layer_types[idx] == "sliding_attention" else mask_info_full
+                )
+                per_layer_input = per_layer_inputs[:, :, idx, :] if per_layer_inputs is not None else None
+
+                attn = block.self_attn
+                shared_key_value = shared_kv.get(attn.kv_shared_layer_index) if attn.is_kv_shared_layer else None
+
+                # Shared layers use the donor's cache view; their own slot is None.
+                cache_view = self._layer_cache_view_at(None, idx, enabled=True, cache=past_key_values)
+                if cache_view is None and attn.is_kv_shared_layer:
+                    cache_view = donor_cache_views.get(attn.kv_shared_layer_index)
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=layer_mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=cache_view,
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=self.global_frequencies,
+                        default_frequencies=self.default_frequencies,
+                        per_layer_input=per_layer_input,
+                        shared_key_value=shared_key_value,
+                        shared_attention_context=shared_attention_contexts.get(attn.kv_shared_layer_index),
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                captured = getattr(attn, "_captured_kv", None)
+                if captured is not None and not attn.is_kv_shared_layer:
+                    shared_kv[idx] = captured
+                    object.__setattr__(attn, "_captured_kv", None)
+                    context = getattr(attn, "_captured_attention_context", None)
+                    if context is not None:
+                        shared_attention_contexts[idx] = context
+                        object.__setattr__(attn, "_captured_attention_context", None)
+                    # Track the donor's (potentially updated) cache view.
+                    self._layer_cache_view_update(donor_cache_views, idx, layer_outputs.cache_view, enabled=True)
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+                if not attn.is_kv_shared_layer:
+                    self._layer_cache_view_update(
+                        None, idx, layer_outputs.cache_view, enabled=True, cache=past_key_values
+                    )
+
+                return hidden_states, all_hidden_states, all_attentions, idx + 1
+
+            # NOTE: the KV-sharing rule threads per-layer python state
+            # (``shared_kv`` / ``donor_cache_views`` dicts, ``layer_types[idx]``
+            # lookups, ``per_layer_inputs`` slicing by concrete idx) that cannot
+            # ride a ``lax.scan`` carry, so this stack always uses the
+            # python-loop path; ``scan_layers=True`` is unsupported here.
+            hidden_states, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, all_hidden_states, all_attentions, 0),
+                trace=True,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
         if output_hidden_states:

@@ -278,6 +278,7 @@ class Olmo3DecoderLayer(spx.Module):
         """
         self.config = config
         self.layer_idx = layer_idx
+        self.is_full_attention = config.is_full_attention_layer(layer_idx)
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -323,7 +324,9 @@ class Olmo3DecoderLayer(spx.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass of the Olmo3DecoderLayer with post-normalization architecture.
 
         This method implements the OLMo3 decoder layer with the following structure:
@@ -354,9 +357,11 @@ class Olmo3DecoderLayer(spx.Module):
                 Defaults to False.
             frequencies (Float[Array, "seq_len head_dim"], optional): Precomputed RoPE
                 frequency embeddings. Shape: (max_positions, head_dim)
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Object containing:
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``):
                 - hidden_states (Array): Output hidden states after the decoder layer.
                     Shape: (batch_size, sequence_length, hidden_size)
                 - attention_weight (Array, optional): Attention weights if output_attentions=True.
@@ -369,8 +374,10 @@ class Olmo3DecoderLayer(spx.Module):
             OLMo3 also supports per-layer attention types (sliding window or full attention).
         """
         # Post-norm architecture: residual + norm(sublayer(x))
+        if isinstance(frequencies, dict):
+            frequencies = frequencies[self.self_attn.attention_type_name]
         residual = hidden_states
-        attention_output = self.self_attn(
+        attn_res = self.self_attn(
             hidden_states,
             mask_info,
             position_ids,
@@ -379,7 +386,13 @@ class Olmo3DecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attention_output, captured_kv = attn_res
+        else:
+            attention_output, captured_kv = attn_res, None
 
         hidden_states = attention_output.attention_output
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -397,11 +410,14 @@ class Olmo3DecoderLayer(spx.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = checkpoint_name(residual + hidden_states, "layer_output")
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attention_output.attention_weight,
             cache_view=attention_output.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=Olmo3Config, model_type="olmo3")
@@ -479,6 +495,7 @@ class Olmo3Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
@@ -593,7 +610,7 @@ class Olmo3Model(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -609,63 +626,95 @@ class Olmo3Model(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
 
-        def _run_layer(block, carry):
-            """Drive one OLMo-3 decoder layer through the scanned trunk.
+        if self.config.is_looped:
+            frequencies = self.frequencies
 
-            OLMo-3's twist over OLMo-2 is interleaved sliding-window vs.
-            full-attention layers (governed by ``config.layer_types``); the
-            per-layer attention type is already baked into ``block`` at
-            construction time, so the carry / scan plumbing here is identical
-            to the OLMo-2 trunk.
-
-            Args:
-                block: The OLMo-3 decoder block to run at this step (full or
-                    sliding attention as configured).
-                carry: ``(hidden_states, cache_views, all_hidden_states,
-                    all_attentions, layer_idx)`` carried from the previous step.
-
-            Returns:
-                tuple: Updated carry with the layer's hidden state, possibly-
-                extended cache views and output collections, and an
-                incremented layer index.
-            """
-            hs, cv, ah, aa, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
-                    frequencies=self.frequencies[block.self_attn.attention_type_name],
+                    frequencies=frequencies[block.self_attn.attention_type_name],
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            return hs, cv, ah, aa, idx + 1
 
-        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _run_layer,
-            init_carry,
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not trace and not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+            )
+        else:
+
+            def _run_layer(block, carry):
+                """Drive one OLMo-3 decoder layer through the scanned trunk.
+
+                OLMo-3's twist over OLMo-2 is interleaved sliding-window vs.
+                full-attention layers (governed by ``config.layer_types``); the
+                per-layer attention type is already baked into ``block`` at
+                construction time, so the carry / scan plumbing here is identical
+                to the OLMo-2 trunk.
+
+                Args:
+                    block: The OLMo-3 decoder block to run at this step (full or
+                        sliding attention as configured).
+                    carry: ``(hidden_states, cache_views, all_hidden_states,
+                        all_attentions, layer_idx)`` carried from the previous step.
+
+                Returns:
+                    tuple: Updated carry with the layer's hidden state, possibly-
+                    extended cache views and output collections, and an
+                    incremented layer index.
+                """
+                hs, cv, ah, aa, idx = carry
+                if output_hidden_states:
+                    ah = (*ah, hs)
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hs,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=self.frequencies[block.self_attn.attention_type_name],
+                    )
+                hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_attentions:
+                    aa = (*aa, layer_outputs.attention_weight)
+                return hs, cv, ah, aa, idx + 1
+
+            init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _run_layer,
+                init_carry,
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:

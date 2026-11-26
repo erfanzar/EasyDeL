@@ -691,6 +691,7 @@ class MptModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
             self.norm_f = LayerNorm(
@@ -792,7 +793,7 @@ class MptModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.blocks))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
@@ -802,54 +803,89 @@ class MptModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         alibi = self.alibi
 
-        def _layer_loop(block, carry):
-            """Body of the MPT decoder scan with ALiBi attention bias.
+        if self.config.is_looped:
 
-            Carry: ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, layer_index)``. MPT uses no rotary embeddings —
-            positional information is injected via the ALiBi slope tensor
-            stored as ``self.alibi`` and forwarded as ``position_bias``.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
-            with self._layer_stage_context(idx, layers=self.blocks):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "MptModel does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
+                    output_attentions=bool(output_attentions),
                     frequencies=None,
                     position_bias=alibi,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.blocks)
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
 
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.blocks.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.blocks,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+            )
+        else:
+
+            def _layer_loop(block, carry):
+                """Body of the MPT decoder scan with ALiBi attention bias.
+
+                Carry: ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, layer_index)``. MPT uses no rotary embeddings —
+                positional information is injected via the ALiBi slope tensor
+                stored as ``self.alibi`` and forwarded as ``position_bias``.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+                with self._layer_stage_context(idx, layers=self.blocks):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=None,
+                        position_bias=alibi,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.blocks)
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+                return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.blocks.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm_f(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

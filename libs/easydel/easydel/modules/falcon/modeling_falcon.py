@@ -660,7 +660,9 @@ class FalconBlock(spx.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Array | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the decoder layer.
 
         Applies layer normalization, attention, and MLP with residual connections.
@@ -678,9 +680,11 @@ class FalconBlock(spx.Module):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
             alibi (Array | None, optional): Precomputed ALiBi positional biases. Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         residual = hidden_states
 
@@ -692,7 +696,7 @@ class FalconBlock(spx.Module):
             attention_layernorm_out = self.input_layernorm(hidden_states)
             mlp_layernorm_out = attention_layernorm_out
 
-        attn_outputs = self.self_attention(
+        attn_res = self.self_attention(
             attention_layernorm_out,
             mask_info,
             position_ids,
@@ -702,7 +706,13 @@ class FalconBlock(spx.Module):
             output_attentions,
             frequencies,
             alibi,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
 
         # Match HuggingFace logic for mlp_layernorm_out assignment (the dual-LN path keeps ``ln_mlp(x)``).
         if not self.config.new_decoder_architecture:
@@ -732,11 +742,14 @@ class FalconBlock(spx.Module):
             mlp_output += attn_outputs.attention_output
 
         output = dropout_add(self.dropout_mlp, mlp_output, residual)
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=output,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=FalconConfig, model_type="falcon")
@@ -810,6 +823,7 @@ class FalconModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.ln_f = LayerNorm(
@@ -893,7 +907,7 @@ class FalconModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.h))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
         hidden_states = inputs_embeds
 
         views = past_key_values.views if past_key_values is not None else None
@@ -947,57 +961,94 @@ class FalconModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _layer_loop(layer, carry):
-            """Per-layer step body for :meth:`nn.ModuleList.scan`.
+        if self.config.is_looped:
 
-            Threads ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, idx)`` through one Falcon decoder block (parallel
-            or sequential layout depending on ``config.parallel_attn``),
-            passing in the precomputed ALiBi tensor when configured, and
-            threads the layer's cache view through the carry.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            with self._layer_stage_context(idx, layers=self.h):
-                layer_outputs = layer(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if self.config.alibi and (shared_global_kv is not None or return_shared_kv):
+                    raise NotImplementedError(
+                        "FalconModel with alibi=True does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=frequencies,
                     alibi=alibi,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
 
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.h,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
             )
+        else:
 
-            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+            def _layer_loop(layer, carry):
+                """Per-layer step body for :meth:`nn.ModuleList.scan`.
 
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.h.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                Threads ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, idx)`` through one Falcon decoder block (parallel
+                or sequential layout depending on ``config.parallel_attn``),
+                passing in the precomputed ALiBi tensor when configured, and
+                threads the layer's cache view through the carry.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+                with self._layer_stage_context(idx, layers=self.h):
+                    layer_outputs = layer(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=frequencies,
+                        alibi=alibi,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.h)
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.h.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.ln_f(hidden_states)
 
         if all_hidden_states is not None:

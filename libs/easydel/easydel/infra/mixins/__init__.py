@@ -46,6 +46,11 @@ Re-exports:
 
 from .bridge import EasyBridgeMixin
 from .generation import EasyGenerationMixin
+from .looping import (
+    LoopTransformerMixin,
+    compute_loop_gate_stats,
+    materialize_missing_loop_state,
+)
 from .operation_cache import (
     LayerOperationInfo,
     OperationCacheMixin,
@@ -60,6 +65,9 @@ __all__ = (
     "EasyGenerationMixin",
     "EasyShardingMixin",
     "LayerOperationInfo",
+    "LoopTransformerMixin",
     "OperationCacheMixin",
     "OperationsCacheInfo",
+    "compute_loop_gate_stats",
+    "materialize_missing_loop_state",
 )

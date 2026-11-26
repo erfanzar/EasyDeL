@@ -486,7 +486,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Return full or chunk-local attention metadata for each text layer."""
-        return {
+        mapping = {
             layer_idx: AttnMaskDetail(
                 mask_type=AttnMaskType.from_hf(layer_type),
                 size=self.attention_chunk_size if layer_type == "chunked_attention" else self.max_position_embeddings,
@@ -494,6 +494,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
             )
             for layer_idx, layer_type in enumerate(self.layer_types)
         }
+        return self._apply_loop_mask_details(mapping) or {}
 
 
 @register_config("llama4")

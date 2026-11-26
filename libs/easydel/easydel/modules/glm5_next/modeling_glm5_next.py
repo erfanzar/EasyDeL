@@ -73,6 +73,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.mixins.looping import materialize_missing_loop_state
 from easydel.infra.modeling_outputs import (
     CausalLMOutput,
     DecoderLayerOutput,
@@ -1113,6 +1114,25 @@ class _Glm5NextIndexerCacheMixin:
         return config.replace(auxiliary_dim=2 * self.config.get_text_config().index_head_dim + 1)
 
 
+class _Glm5NextLegacyStateUpgrader:
+    """Descriptor upgrading legacy KDA forget-gate paths and missing loop leaves.
+
+    Supports both class-level ``cls._upgrade_legacy_native_state(state, expected)``
+    calls (KDA forget-gate unnesting) and instance-level calls from checkpoint
+    loading (which also materialize missing Loop Transformer state when
+    ``instance.config`` is looped).
+    """
+
+    def __get__(self, instance, owner=None):
+        def _upgrade(state: dict, expected_leaves: dict) -> dict:
+            state = unnest_legacy_kda_forget_gate(state, expected_leaves)
+            if instance is not None:
+                state = materialize_missing_loop_state(instance.config, state, expected_leaves)
+            return state
+
+        return _upgrade
+
+
 @register_module(TaskType.BASE_MODULE, config=Glm5NextTextConfig, model_type="glm5_next_text")
 class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
     """GLM-5-Next text backbone (no language-model head).
@@ -1130,8 +1150,9 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
     """
 
     fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
-    # Accepts native checkpoints that nest the forget gate under ``self_attn.forget_gate``.
-    _upgrade_legacy_native_state = staticmethod(unnest_legacy_kda_forget_gate)
+    # Accepts native checkpoints that nest the forget gate under ``self_attn.forget_gate``
+    # and auto-initializes missing Loop Transformer leaves when loading non-looped checkpoints.
+    _upgrade_legacy_native_state = _Glm5NextLegacyStateUpgrader()
 
     def __init__(
         self,
@@ -1192,6 +1213,7 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
@@ -1289,7 +1311,7 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
             )
 
         if past_key_values is None:
-            past_key_values = HybridCache.init_empty(len(self.layers))
+            past_key_values = HybridCache.init_empty(self.config.num_cache_layers)
 
         # mHC residual streams: broadcast the embedding across hc_mult slots.
         hidden_states = jnp.broadcast_to(
@@ -1316,74 +1338,16 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits) or has_shared_indexers or indexer_aux_active,
+            extra=(
+                needs_trace_cache
+                or bool(output_router_logits)
+                or has_shared_indexers
+                or indexer_aux_active
+                or self.config.is_looped
+            ),
         )
         cache_views = views if trace_layers else None
 
-        def _layer_loop(block, carry):
-            """Run one heterogeneous decoder layer inside the stack loop.
-
-            Threads streams, cache views, collected outputs, layer index,
-            the previous selection and the unscaled per-layer indexer loss sum
-            through the Python-traced loop.
-
-            Args:
-                block: The decoder layer module.
-                carry: Current loop carry.
-
-            Returns:
-                Updated carry ``(streams, cache_views, ..., idx + 1)``.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk, indexer_aux = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
-                    mask_info=mask_info,
-                    position_ids=position_ids,
-                    mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
-                    cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                    frequencies=self.frequencies,
-                    **({"previous_topk_indices": prev_topk, "return_topk_indices": True} if has_shared_indexers else {}),
-                )
-                if has_shared_indexers:
-                    layer_outputs, prev_topk = layer_outputs
-
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            if output_router_logits and layer_outputs.router_logits is not None:
-                all_router_logits += (layer_outputs.router_logits,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-
-            layer_aux = layer_outputs.indexer_aux_loss
-            if layer_aux is not None:
-                indexer_aux = layer_aux if indexer_aux is None else indexer_aux + layer_aux
-            return (
-                hidden_states,
-                cv,
-                all_hidden_states,
-                all_attentions,
-                all_router_logits,
-                idx + 1,
-                prev_topk,
-                indexer_aux,
-            )
-
-        initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0, None, None)
         precompute_dsa_layout = (
             bool(getattr(self.config, "dsa_pool_training", False))
             and not is_mpmd_mesh(self.config.mesh)
@@ -1399,8 +1363,150 @@ class Glm5NextTextModel(_Glm5NextIndexerCacheMixin, EasyDeLBaseModule):
             kpool=self.config.index_kpool,
             enabled=precompute_dsa_layout,
         ):
-            final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _, _, indexer_aux_loss = final
+            if self.config.is_looped:
+                if getattr(self.config, "loop_kv_cache_mode", "separate") == "hybrid_sliding_window":
+                    raise NotImplementedError(
+                        "Glm5NextTextModel does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                frequencies = self.frequencies
+                prev_topk = None
+                indexer_aux = None
+
+                def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                    nonlocal prev_topk, indexer_aux
+                    if shared_global_kv is not None or return_shared_kv:
+                        raise NotImplementedError(
+                            "Glm5NextTextModel does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                            "use loop_kv_cache_mode='separate'."
+                        )
+                    layer_outputs = block(
+                        hidden_states=h,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=cache_view,
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=frequencies,
+                        **(
+                            {"previous_topk_indices": prev_topk, "return_topk_indices": True}
+                            if has_shared_indexers
+                            else {}
+                        ),
+                    )
+                    if has_shared_indexers:
+                        layer_outputs, prev_topk = layer_outputs
+                    layer_aux = layer_outputs.indexer_aux_loss
+                    if layer_aux is not None:
+                        indexer_aux = layer_aux if indexer_aux is None else indexer_aux + layer_aux
+                    return layer_outputs
+
+                hidden_states, all_hidden_states, all_attentions, all_router_logits = self._run_looped_layers(
+                    layers=self.layers,
+                    hidden_states=hidden_states,
+                    step_fn=_loop_step,
+                    mask_info=mask_info,
+                    cache_views=cache_views,
+                    past_key_values=past_key_values,
+                    trace_layers=trace_layers,
+                    can_scan=not needs_trace_cache and not has_shared_indexers and not indexer_aux_active,
+                    scan_scope="text",
+                    output_hidden_states=bool(output_hidden_states),
+                    output_attentions=bool(output_attentions),
+                    output_router_logits=bool(output_router_logits),
+                )
+                indexer_aux_loss = indexer_aux
+            else:
+
+                def _layer_loop(block, carry):
+                    """Run one heterogeneous decoder layer inside the stack loop.
+
+                    Threads streams, cache views, collected outputs, layer index,
+                    the previous selection and the unscaled per-layer indexer loss sum
+                    through the Python-traced loop.
+
+                    Args:
+                        block: The decoder layer module.
+                        carry: Current loop carry.
+
+                    Returns:
+                        Updated carry ``(streams, cache_views, ..., idx + 1)``.
+                    """
+                    (
+                        hidden_states,
+                        cv,
+                        all_hidden_states,
+                        all_attentions,
+                        all_router_logits,
+                        idx,
+                        prev_topk,
+                        indexer_aux,
+                    ) = carry
+                    if output_hidden_states:
+                        all_hidden_states += (hidden_states,)
+
+                    with self._layer_stage_context(idx, layers=self.layers):
+                        layer_outputs = block(
+                            hidden_states=hidden_states,
+                            mask_info=mask_info,
+                            position_ids=position_ids,
+                            mode=mode,
+                            cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                            cache_metadata=cache_metadata,
+                            output_attentions=output_attentions,
+                            frequencies=self.frequencies,
+                            **(
+                                {"previous_topk_indices": prev_topk, "return_topk_indices": True}
+                                if has_shared_indexers
+                                else {}
+                            ),
+                        )
+                        if has_shared_indexers:
+                            layer_outputs, prev_topk = layer_outputs
+
+                    hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                    if output_attentions:
+                        all_attentions += (layer_outputs.attention_weight,)
+
+                    if output_router_logits and layer_outputs.router_logits is not None:
+                        all_router_logits += (layer_outputs.router_logits,)
+
+                    cv = self._layer_cache_view_update(
+                        cv,
+                        idx,
+                        layer_outputs.cache_view,
+                        enabled=trace_layers,
+                        cache=past_key_values,
+                    )
+
+                    layer_aux = layer_outputs.indexer_aux_loss
+                    if layer_aux is not None:
+                        indexer_aux = layer_aux if indexer_aux is None else indexer_aux + layer_aux
+                    return (
+                        hidden_states,
+                        cv,
+                        all_hidden_states,
+                        all_attentions,
+                        all_router_logits,
+                        idx + 1,
+                        prev_topk,
+                        indexer_aux,
+                    )
+
+                initial = (
+                    hidden_states,
+                    cache_views,
+                    all_hidden_states,
+                    all_attentions,
+                    all_router_logits,
+                    0,
+                    None,
+                    None,
+                )
+                final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
+                hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _, _, indexer_aux_loss = final
 
         # Unweighted mean over mHC streams, then final norm.
         hidden_states = self.norm(_hc_head_collapse(hidden_states))
@@ -1450,7 +1556,7 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm5_next_text"
     _config_class = Glm5NextTextConfig
-    _upgrade_legacy_native_state = staticmethod(unnest_legacy_kda_forget_gate)
+    _upgrade_legacy_native_state = _Glm5NextLegacyStateUpgrader()
 
     fp32_param_patterns: ClassVar[tuple[str, ...]] = ("e_score_correction_bias",)
 
@@ -1499,7 +1605,7 @@ class Glm5NextForCausalLM(_Glm5NextIndexerCacheMixin, BaseCausalLMModule[Glm5Nex
         if past_key_values is None or not hasattr(past_key_values, "views"):
             return None
         views = past_key_values.views
-        index = len(self.base_model.layers)
+        index = self.config.num_cache_layers
         if len(views) <= index or not isinstance(views[index], MLARaggedPagesCacheView):
             return None
         return views[index]

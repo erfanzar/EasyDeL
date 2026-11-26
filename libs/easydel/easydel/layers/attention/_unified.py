@@ -119,6 +119,7 @@ from spectrax import common_types, nn
 from easydel.caching import (
     MLARaggedPagesCacheView,
     OperationsMetadata,
+    ParallelHybridCacheView,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCacheView,
@@ -126,6 +127,7 @@ from easydel.caching import (
     UnifiedAttentionCacheView,
 )
 from easydel.infra.modeling_outputs import AttentionLayerOutput
+from easydel.operations import OperationRegistry
 
 from ..layouts import build_fused_qkv_projection
 from ..linears import (
@@ -1298,6 +1300,185 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         merged = hidden_states.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         return merged
 
+    def _run_attention_with_shared_kv(
+        self,
+        *,
+        query_states: Float[Array, "batch seq_len num_heads head_dim"],
+        key_states: Float[Array, "batch kvseq_len num_kv_heads head_dim"],
+        value_states: Float[Array, "batch kvseq_len num_kv_heads vhead_dim"],
+        mask_info: MaskInfo | None,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type: ignore
+        cache_view: TransformerCacheView
+        | RaggedPagesCacheView
+        | UnifiedAttentionCacheView
+        | ParallelHybridCacheView
+        | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        causal: bool | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        respect_baked_mask: bool = True,
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> tuple[
+        Float[Array, "batch seq_len num_heads vhead_dim"],
+        Float[Array, "..."] | None,
+        TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | ParallelHybridCacheView | None,
+        tuple | None,
+    ]:
+        """Run KV-cache concatenation plus standard or dual-stream shared-KV attention.
+
+        Shared by :meth:`forward_standard` and custom attention subclasses (such as
+        ``Qwen3NextFullAttention``) so GLM-5.4 hybrid sliding-window looping works
+        identically across cacheless training, ``TransformerCache``/``HybridCache``,
+        and eSurge ``RaggedPagesCache``.
+
+        When ``shared_global_kv`` is ``None`` and ``return_shared_kv`` is ``False``,
+        this executes the exact standard single-stream ``attention_performer.forward``
+        path with zero overhead.
+        """
+        effective_causal = self.causal if causal is None else causal
+        base_sw = self.sliding_window if sliding_window is None else sliding_window
+        effective_sliding_window = (
+            int(self.config.loop_kv_sliding_window)
+            if (shared_global_kv is not None and cache_view is not None)
+            else base_sw
+        )
+
+        causal_for_kernel = effective_causal
+        if respect_baked_mask and mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+            sliding_window=effective_sliding_window,
+            causal=effective_causal,
+        )
+
+        is_ragged_pages = isinstance(cache_view, RaggedPagesCacheView) or (
+            isinstance(cache_view, ParallelHybridCacheView) and isinstance(cache_view.transformer, RaggedPagesCacheView)
+        )
+        is_unified_pages = isinstance(cache_view, UnifiedAttentionCacheView) or (
+            isinstance(cache_view, ParallelHybridCacheView)
+            and isinstance(cache_view.transformer, UnifiedAttentionCacheView)
+        )
+
+        captured_kv = None
+        if return_shared_kv and not is_ragged_pages:
+            cache_end_pos = getattr(cache_view, "indexes", None) if cache_view is not None else None
+            captured_kv = (key_states, value_states, mask_info, cache_end_pos)
+
+        softmax_aux = self._softmax_aux()
+        softmax_scale = float(getattr(self.attention_performer, "softmax_scale", self.head_dim**-0.5))
+        logits_soft_cap = getattr(self.attention_performer, "logits_soft_cap", None)
+
+        if shared_global_kv is not None:
+            if logits_soft_cap:
+                raise NotImplementedError(
+                    "loop_kv_cache_mode='hybrid_sliding_window' does not support logits_soft_cap; "
+                    "use loop_kv_cache_mode='separate'."
+                )
+            if is_unified_pages:
+                raise NotImplementedError(
+                    "loop_kv_cache_mode='hybrid_sliding_window' supports RaggedPagesCacheView, "
+                    "TransformerCacheView / HybridCache, and cacheless training; "
+                    "UnifiedAttentionCacheView is not yet supported."
+                )
+            if is_ragged_pages:
+                global_cache_view, global_cache_metadata = shared_global_kv
+                dual_stream_rpa = OperationRegistry.create(
+                    "dual_stream_ragged_page_attention",
+                    self.attention_performer.metadata,
+                )
+                attentions = dual_stream_rpa(
+                    query=query_states,
+                    key=key_states,
+                    value=value_states,
+                    global_cache_view=global_cache_view,
+                    local_cache_view=cache_view,
+                    global_cache_metadata=global_cache_metadata,
+                    local_cache_metadata=cache_metadata,
+                    softmax_scale=softmax_scale,
+                    sliding_window=int(self.config.loop_kv_sliding_window),
+                    overlap=bool(self.config.loop_kv_overlap),
+                    softmax_aux=softmax_aux,
+                )
+                if attentions.cache_view is not None:
+                    cache_view = attentions.cache_view
+                attn_output = attentions.attention_outputs
+                attn_weights_out = None
+            else:
+                if softmax_aux is not None:
+                    raise NotImplementedError(
+                        "loop_kv_cache_mode='hybrid_sliding_window' with non-paged attention sinks (softmax_aux) "
+                        "is not yet supported; use loop_kv_cache_mode='separate'."
+                    )
+                k_global, v_global, global_mask_info, global_end_pos = shared_global_kv
+                dual_stream_attn = OperationRegistry.create(
+                    "dual_stream_attention",
+                    self.attention_performer.metadata,
+                )
+                attn_output = dual_stream_attn(
+                    query=query_states,
+                    k_global=k_global,
+                    v_global=v_global,
+                    k_local=key_states,
+                    v_local=value_states,
+                    global_mask_info=global_mask_info,
+                    local_mask_info=mask_info,
+                    cache_end_pos=global_end_pos,
+                    softmax_scale=softmax_scale,
+                    sliding_window=int(self.config.loop_kv_sliding_window),
+                    overlap=bool(self.config.loop_kv_overlap),
+                ).attention_outputs
+                attn_weights_out = None
+            return attn_output, attn_weights_out, cache_view, captured_kv
+
+        # A caller-baked mask may contain a different window. Concatenate must
+        # intersect it with the configured window before redundant kernel-side
+        # masking can be suppressed, using the final mask's baked-in flag.
+        sliding_window_for_kernel = base_sw
+        if respect_baked_mask and mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
+        attentions: AttentionLayerOutput = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
+            softmax_aux=softmax_aux,
+            output_attentions=output_attentions,
+            precision=self.precision,
+        )
+
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+        if return_shared_kv and is_ragged_pages:
+            captured_kv = (cache_view, cache_metadata)
+
+        attn_output = attentions.attention_outputs
+        attn_weights_out = attentions.attention_weights if output_attentions else None
+        return attn_output, attn_weights_out, cache_view, captured_kv
+
     def forward_standard(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
@@ -1309,7 +1490,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple | None]:
         """Standard RoPE-based attention forward path (Llama / Mistral / Gemma / Qwen).
 
         The default path for almost every modern decoder model. Honours
@@ -1379,58 +1562,20 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-            causal=self.causal,
-        )
-
-        # A caller-baked mask may contain a different window. Concatenate must
-        # intersect it with the configured window before redundant kernel-side
-        # masking can be suppressed, using the final mask's baked-in flag.
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        softmax_aux = self._softmax_aux()
-
-        attentions: AttentionLayerOutput = self.attention_performer.forward(
+        attn_raw, attn_weights_out, cache_view, captured_kv = self._run_attention_with_shared_kv(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
             output_attentions=output_attentions,
-            precision=self.precision,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
 
-        if attentions.cache_view is not None:
-            cache_view = attentions.cache_view
-
-        attention_out = self._merge_heads(attentions.attention_outputs)
+        attention_out = self._merge_heads(attn_raw)
         attn_output = self.shard_attention_prod(attention_out, pre_projection=True)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
         attn_output = self.shard_attention_prod(attn_output)
@@ -1438,11 +1583,14 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
 
-        return AttentionLayerOutput(
+        layer_out = AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
+            attention_weight=attn_weights_out,
             cache_view=cache_view,
         )
+        if return_shared_kv:
+            return layer_out, captured_kv
+        return layer_out
 
     def _postprocess_mla_queries(
         self,
@@ -1875,7 +2023,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple | None]:
         """Main entry point that routes to the appropriate forward method.
 
         Automatically selects the correct attention mechanism based on the
@@ -1924,6 +2074,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             >>> next_hidden = output.attention_output
         """
         if self.attention_type == "mla":
+            if shared_global_kv is not None or return_shared_kv:
+                raise NotImplementedError(
+                    "loop_kv_cache_mode='hybrid_sliding_window' is not yet supported for MLA attention; "
+                    "use loop_kv_cache_mode='separate'."
+                )
             return self.forward_mla(
                 hidden_states,
                 mask_info,
@@ -1936,6 +2091,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 alibi,
             )
         elif self.attention_type == "alibi":
+            if shared_global_kv is not None or return_shared_kv:
+                raise NotImplementedError(
+                    "loop_kv_cache_mode='hybrid_sliding_window' is not yet supported for ALiBi attention; "
+                    "use loop_kv_cache_mode='separate'."
+                )
             return self.forward_alibi(
                 hidden_states,
                 mask_info,
@@ -1957,6 +2117,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 output_attentions,
                 frequencies,
                 alibi,
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
             )
 
     # Operation access properties for dynamic discovery

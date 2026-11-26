@@ -283,6 +283,11 @@ class FalconH1Config(EasyDeLBaseConfig):
         """
         return ["hybrid" for _ in range(self.num_hidden_layers)]
 
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        """Return ``True`` because every FalconH1 layer executes parallel full self-attention."""
+        del layer_idx
+        return True
+
     @property
     def mamba_intermediate_size(self) -> int:
         """Compute the SSM mixer's intermediate width.

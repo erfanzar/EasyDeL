@@ -225,6 +225,7 @@ class Olmo2Config(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
+        self.validate_loop_config()
 
     def _rope_scaling_validation(self):
         """

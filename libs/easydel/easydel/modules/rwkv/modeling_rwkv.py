@@ -47,7 +47,7 @@ from spectrax import apply_logical_sharding, common_types, nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.modeling_outputs import DecoderLayerOutput, ModelOutput
 from easydel.infra.utils import ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.norms import LayerNorm
@@ -132,9 +132,10 @@ def init_state(hidden_size: int, batch_size: int | None = None, attention_hidden
 
 def _init_global_state(config, batch_size, dtype=jnp.float32):
     """Allocate per-layer previous-hidden states and fp32 WKV accumulators."""
+    num_layers = int(getattr(config, "num_cache_layers", config.num_hidden_layers))
     state = [
         jnp.zeros(
-            (batch_size, config.hidden_size if i < 2 else config.attention_hidden_size, config.num_hidden_layers),
+            (batch_size, config.hidden_size if i < 2 else config.attention_hidden_size, num_layers),
             dtype=dtype if i < 2 else jnp.float32,
         )
         for i in range(5)
@@ -825,6 +826,7 @@ class RwkvModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         self.layers_are_rescaled = False
         self.deterministic = True
@@ -900,54 +902,119 @@ class RwkvModel(EasyDeLBaseModule):
         all_hidden_states = ()
         all_self_attentions = ()
 
-        def _layer_loop(block, carry):
-            """Apply a single RWKV block inside the layer-stack scan.
+        trace_layers = self._layer_scan_trace(
+            False,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            extra=self.config.is_looped,
+        )
 
-            Body of ``self.blocks.scan``; runs ``block`` on the current
-            hidden states, optionally accumulates per-layer hidden states
-            / time-mix attention weights, and returns the updated carry.
-            """
-            hidden_states, layer_state, all_hidden_states, all_self_attentions, idx = carry
-            rescale_factor = 1.0
-            if self.layers_are_rescaled and self.config.rescale_every > 0:
-                rescale_factor = jnp.exp2(jnp.asarray(idx // self.config.rescale_every, dtype=hidden_states.dtype))
-            with self._layer_stage_context(idx, layers=self.blocks):
-                hidden_states, next_state, attentions = block(
-                    hidden_states,
-                    state=layer_state,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    rescale_factor=rescale_factor,
-                )
-
-            if self.layers_are_rescaled and self.config.rescale_every > 0:
-                # ``idx`` is a tracer under ``lax.scan``; select instead of branching in Python.
-                hidden_states = jnp.where((idx + 1) % self.config.rescale_every == 0, hidden_states / 2, hidden_states)
-            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
-
-            if output_hidden_states:
-                all_hidden_states = (*all_hidden_states, hidden_states)
-
-            if output_attentions:
-                all_self_attentions = (*all_self_attentions, attentions)
-
-            return (
-                hidden_states,
-                next_state if layer_state is not None else None,
-                all_hidden_states,
-                all_self_attentions,
-                idx + 1,
+        if self.config.is_looped:
+            slot_states = (
+                [
+                    (
+                        (
+                            state[1][:, :, slot],
+                            state[2][:, :, slot],
+                            state[3][:, :, slot],
+                            state[4][:, :, slot],
+                        ),
+                        state[0][:, :, slot],
+                    )
+                    for slot in range(self.config.num_cache_layers)
+                ]
+                if state is not None
+                else None
             )
 
-        hidden_states, state, all_hidden_states, all_self_attentions, _ = self.blocks.scan(
-            _layer_loop,
-            (hidden_states, state, all_hidden_states, all_self_attentions, 0),
-            trace=output_hidden_states
-            or output_attentions
-            or not self.config.scan_layers
-            or self._pipeline_stage_count() > 1,
-            **self._layer_scan_kwargs("text"),
-        )
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "RwkvModel does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                h_out, next_state, attentions = block(
+                    h,
+                    state=cache_view,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    rescale_factor=1.0,
+                )
+                return DecoderLayerOutput(
+                    hidden_states=h_out,
+                    attention_weight=attentions,
+                    cache_view=next_state if cache_view is not None else None,
+                )
+
+            hidden_states, all_hidden_states, all_self_attentions, _ = self._run_looped_layers(
+                layers=self.blocks,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                cache_views=slot_states,
+                past_key_values=None,
+                trace_layers=trace_layers,
+                can_scan=slot_states is None,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+            )
+            if slot_states is not None:
+                state = [
+                    jnp.stack([s[1] for s in slot_states], axis=-1),
+                    jnp.stack([s[0][0] for s in slot_states], axis=-1),
+                    jnp.stack([s[0][1] for s in slot_states], axis=-1),
+                    jnp.stack([s[0][2] for s in slot_states], axis=-1),
+                    jnp.stack([s[0][3] for s in slot_states], axis=-1),
+                ]
+        else:
+
+            def _layer_loop(block, carry):
+                """Apply a single RWKV block inside the layer-stack scan.
+
+                Body of ``self.blocks.scan``; runs ``block`` on the current
+                hidden states, optionally accumulates per-layer hidden states
+                / time-mix attention weights, and returns the updated carry.
+                """
+                hidden_states, layer_state, all_hidden_states, all_self_attentions, idx = carry
+                rescale_factor = 1.0
+                if self.layers_are_rescaled and self.config.rescale_every > 0:
+                    rescale_factor = jnp.exp2(jnp.asarray(idx // self.config.rescale_every, dtype=hidden_states.dtype))
+                with self._layer_stage_context(idx, layers=self.blocks):
+                    hidden_states, next_state, attentions = block(
+                        hidden_states,
+                        state=layer_state,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        rescale_factor=rescale_factor,
+                    )
+
+                if self.layers_are_rescaled and self.config.rescale_every > 0:
+                    # ``idx`` is a tracer under ``lax.scan``; select instead of branching in Python.
+                    hidden_states = jnp.where(
+                        (idx + 1) % self.config.rescale_every == 0, hidden_states / 2, hidden_states
+                    )
+                hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.blocks)
+
+                if output_hidden_states:
+                    all_hidden_states = (*all_hidden_states, hidden_states)
+
+                if output_attentions:
+                    all_self_attentions = (*all_self_attentions, attentions)
+
+                return (
+                    hidden_states,
+                    next_state if layer_state is not None else None,
+                    all_hidden_states,
+                    all_self_attentions,
+                    idx + 1,
+                )
+
+            hidden_states, state, all_hidden_states, all_self_attentions, _ = self.blocks.scan(
+                _layer_loop,
+                (hidden_states, state, all_hidden_states, all_self_attentions, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = checkpoint_name(self.ln_out(hidden_states), "model_output")
 
         if output_hidden_states:

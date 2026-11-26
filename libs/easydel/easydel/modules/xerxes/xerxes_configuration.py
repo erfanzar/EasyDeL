@@ -203,4 +203,13 @@ class XerxesConfig(EasyDeLBaseConfig):
                     mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
                     size=self.layer_sliding_window(layer_idx),
                 )
-        return mapping
+        details = self._apply_loop_mask_details(mapping) or {}
+        if self.is_looped and self.sliding_window is None:
+            for slot_idx, (phys_idx, _loop_iter) in enumerate(self.loop_layer_schedule):
+                if slot_idx in details and not self.is_full_attention_layer(phys_idx) and details[slot_idx].size is None:
+                    details[slot_idx] = AttnMaskDetail(
+                        mask_type=details[slot_idx].mask_type,
+                        size=self.layer_sliding_window(phys_idx),
+                        chunks=details[slot_idx].chunks,
+                    )
+        return details

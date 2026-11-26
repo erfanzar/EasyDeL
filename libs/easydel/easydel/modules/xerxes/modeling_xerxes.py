@@ -245,6 +245,8 @@ class XerxesAttention(UnifiedAttention):
         frequencies=None,
         alibi=None,
         key_value_states=None,
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
     ):
         """Attend to the residual stream or explicitly supplied encoder states.
 
@@ -260,9 +262,12 @@ class XerxesAttention(UnifiedAttention):
             alibi: Optional attention bias for the base attention path.
             key_value_states: Encoder states of shape ``[batch, key_length, hidden_size]``.
                 Required when constructed with ``is_cross_attention=True``.
+            shared_global_kv: Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            AttentionLayerOutput containing projected attention output and optional weights.
+            AttentionLayerOutput containing projected attention output and optional weights
+            (or ``(AttentionLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         if not self.is_cross_attention and key_value_states is None:
             return super().forward(
@@ -275,6 +280,13 @@ class XerxesAttention(UnifiedAttention):
                 output_attentions,
                 frequencies,
                 alibi,
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
+            )
+        if shared_global_kv is not None or return_shared_kv:
+            raise NotImplementedError(
+                "XerxesAttention cross-attention does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                "use loop_kv_cache_mode='separate'."
             )
         if key_value_states is None:
             raise ValueError("Cross-attention requires key_value_states.")
@@ -631,7 +643,9 @@ class XerxesDecoderLayer(spx.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         default_frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the decoder layer.
 
         Applies pre-normalization architecture with optional identity bypass for certain
@@ -650,11 +664,13 @@ class XerxesDecoderLayer(spx.Module):
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
             default_frequencies (Array | None, optional): Default RoPE frequencies for local attention.
                 Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
-        attn_outputs = self.self_attn(
+        attn_res = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
             position_ids,
@@ -663,7 +679,13 @@ class XerxesDecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             default_frequencies if self.self_attn.is_local_attn else frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
         if self.identity:
             hidden_states = hidden_states + attn_outputs.attention_output
             residual = hidden_states
@@ -695,12 +717,15 @@ class XerxesDecoderLayer(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             router_logits=router_logits,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=XerxesConfig, model_type="xerxes")
@@ -773,6 +798,7 @@ class XerxesModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
@@ -884,7 +910,7 @@ class XerxesModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             inputs_embeds,
@@ -900,7 +926,7 @@ class XerxesModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching properties must not be
@@ -908,56 +934,88 @@ class XerxesModel(EasyDeLBaseModule):
         frequencies = self.frequencies
         default_frequencies = self.default_frequencies
 
-        def _layer_loop(block, carry):
-            """Apply a single decoder layer inside the layer-stack scan.
+        if self.config.is_looped:
 
-            Body of ``self.layers.scan``; carries ``(hidden_states,
-            cache_views, all_hidden_states, all_attentions, layer_index)``,
-            optionally accumulating per-layer hidden states and attention
-            weights.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=frequencies,
                     default_frequencies=default_frequencies,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            hidden_states = apply_logical_sharding(
-                hidden_states,
-                dynamic_axes=common_types.HiddenStateSharding,
-                partition_manager=self.config.runtime_sharding_resolver,
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
             )
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
+        else:
 
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            def _layer_loop(block, carry):
+                """Apply a single decoder layer inside the layer-stack scan.
+
+                Body of ``self.layers.scan``; carries ``(hidden_states,
+                cache_views, all_hidden_states, all_attentions, layer_index)``,
+                optionally accumulating per-layer hidden states and attention
+                weights.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=frequencies,
+                        default_frequencies=default_frequencies,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                hidden_states = apply_logical_sharding(
+                    hidden_states,
+                    dynamic_axes=common_types.HiddenStateSharding,
+                    partition_manager=self.config.runtime_sharding_resolver,
+                )
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
             )
-
-            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
-
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

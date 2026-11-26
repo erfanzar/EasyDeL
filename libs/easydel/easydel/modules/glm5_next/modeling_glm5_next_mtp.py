@@ -69,6 +69,9 @@ def glm5_next_mtp_config(config: Glm5NextTextConfig, *, paged_pool: bool = False
     # shared, and every schedule below is reassigned rather than mutated.
     draft = copy.copy(config)
     draft.num_hidden_layers = 1
+    draft.loop_start_layer = None
+    draft.loop_end_layer = None
+    draft.num_loop_iterations = 1
     draft.layer_types = [DEEPSEEK_SPARSE_ATTENTION_LAYER_TYPE]
     draft.mlp_layer_types = ["sparse"]
     draft.indexer_types = ["full"]

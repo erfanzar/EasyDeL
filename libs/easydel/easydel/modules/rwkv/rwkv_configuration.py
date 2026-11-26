@@ -120,3 +120,7 @@ class RwkvConfig(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
+
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        """Pure RWKV recurrent models have no full self-attention layers."""
+        return False

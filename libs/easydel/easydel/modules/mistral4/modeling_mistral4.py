@@ -933,6 +933,7 @@ class Mistral4Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
@@ -1048,7 +1049,7 @@ class Mistral4Model(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1066,61 +1067,96 @@ class Mistral4Model(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits),
+            extra=needs_trace_cache or bool(output_router_logits) or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _layer_loop(layer, carry):
-            """Per-layer body for the Mistral4 decoder ``scan``.
+        if self.config.is_looped:
 
-            Carry layout: ``(hidden_states, cv, all_hidden_states,
-            all_attentions, all_router_logits, idx)``. Records the input
-            hidden state when requested, runs one decoder layer at the
-            assigned pipeline stage, accumulates attention weights and MoE
-            router logits when requested, updates the per-layer KV cache
-            slot, and returns the next carry.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            with self._layer_stage_context(idx, layers=self.layers):
-                output = layer(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "Mistral4Model (MLA attention) does not support "
+                        "loop_kv_cache_mode='hybrid_sliding_window'; use loop_kv_cache_mode='separate'."
+                    )
+                return block(
+                    hidden_states=h,
                     frequencies=frequencies,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                 )
-            hidden_states = self._mark_layer_stage_boundary(output.hidden_states, idx, layers=self.layers)
 
-            if output_attentions:
-                all_attentions += (output.attention_weight,)
-
-            if output_router_logits and hasattr(output, "router_logits") and output.router_logits is not None:
-                all_router_logits += (output.router_logits,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                output.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, all_router_logits = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
             )
+        else:
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            def _layer_loop(layer, carry):
+                """Per-layer body for the Mistral4 decoder ``scan``.
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                Carry layout: ``(hidden_states, cv, all_hidden_states,
+                all_attentions, all_router_logits, idx)``. Records the input
+                hidden state when requested, runs one decoder layer at the
+                assigned pipeline stage, accumulates attention weights and MoE
+                router logits when requested, updates the per-layer KV cache
+                slot, and returns the next carry.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+                with self._layer_stage_context(idx, layers=self.layers):
+                    output = layer(
+                        hidden_states=hidden_states,
+                        frequencies=frequencies,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        output_attentions=output_attentions,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(output.hidden_states, idx, layers=self.layers)
+
+                if output_attentions:
+                    all_attentions += (output.attention_weight,)
+
+                if output_router_logits and hasattr(output, "router_logits") and output.router_logits is not None:
+                    all_router_logits += (output.router_logits,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    output.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
@@ -1298,7 +1334,7 @@ class Mistral4ForCausalLM(BaseCausalLMModule[Mistral4Model, Mistral4Config]):
         v_head_dim = config.v_head_dim
 
         return TransformerCacheConfig.create(
-            num_hidden_layers=config.num_hidden_layers,
+            num_hidden_layers=config.num_cache_layers,
             batch_size=batch_size,
             sequence_length=max_length,
             num_heads=config.num_attention_heads,
@@ -1366,7 +1402,7 @@ class Mistral4ForCausalLM(BaseCausalLMModule[Mistral4Model, Mistral4Config]):
                 runtime_sharding_resolver=text_config.runtime_sharding_resolver,
                 kvdtype=dtype,
                 max_model_length=max_length,
-                num_hidden_layers=config.num_hidden_layers,
+                num_hidden_layers=config.num_cache_layers,
                 num_kv_heads=config.num_attention_heads,
                 kv_lora_rank=config.kv_lora_rank,
                 qk_rope_head_dim=config.qk_rope_head_dim,
@@ -1380,7 +1416,7 @@ class Mistral4ForCausalLM(BaseCausalLMModule[Mistral4Model, Mistral4Config]):
             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=dtype,
             max_model_length=max_length,
-            num_hidden_layers=config.num_hidden_layers,
+            num_hidden_layers=config.num_cache_layers,
             num_kv_heads=config.num_attention_heads,
             kv_head_dim_size=q_head_dim,
             k_headdim=q_head_dim,

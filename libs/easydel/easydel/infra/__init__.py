@@ -93,6 +93,7 @@ if tp.TYPE_CHECKING:  # pragma: no cover
     from .base_state import EasyDeLState
     from .elarge import BenchmarkConfig, eLargeModel
     from .loss_utils import LossConfig
+    from .mixins.looping import LoopTransformerMixin, compute_loop_gate_stats, materialize_missing_loop_state
 
 
 def init_cluster():
@@ -143,6 +144,7 @@ __all__ = (
     "EasyDeLBaseConfigDict",
     "EasyDeLBaseModule",
     "EasyDeLState",
+    "LoopTransformerMixin",
     "LossConfig",
     "PartitionAxis",
     "PyTree",
@@ -151,9 +153,11 @@ __all__ = (
     "SpecDecodeBase",
     "TensorLayout",
     "auto_pytree",
+    "compute_loop_gate_stats",
     "eLargeModel",
     "init_cluster",
     "logical_axis_rules",
+    "materialize_missing_loop_state",
     "register_drafter",
     "sharding",
     "sharding_for_layout",
@@ -201,6 +205,14 @@ def __getattr__(name: str):  # pragma: no cover
         from .elarge import BenchmarkConfig
 
         return BenchmarkConfig
+    if name in {"LoopTransformerMixin", "compute_loop_gate_stats", "materialize_missing_loop_state"}:
+        from .mixins.looping import LoopTransformerMixin, compute_loop_gate_stats, materialize_missing_loop_state
+
+        return {
+            "LoopTransformerMixin": LoopTransformerMixin,
+            "compute_loop_gate_stats": compute_loop_gate_stats,
+            "materialize_missing_loop_state": materialize_missing_loop_state,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

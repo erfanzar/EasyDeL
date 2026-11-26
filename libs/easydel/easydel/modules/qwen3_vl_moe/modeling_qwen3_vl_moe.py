@@ -572,7 +572,9 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Array | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the decoder layer.
 
         Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
@@ -590,12 +592,14 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         attn_input = self.input_layernorm(hidden_states)
-        attn_outputs = self.self_attn(
+        attn_res = self.self_attn(
             attn_input,
             mask_info,
             position_ids,
@@ -604,7 +608,13 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
         hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
@@ -629,12 +639,15 @@ class Qwen3VLMoeTextDecoderLayer(spx.Module):
             partition_manager=self.config.runtime_sharding_resolver,
         )
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             router_logits=router_logits if output_router_logits else None,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3VLMoeTextConfig, model_type="qwen3_vl_moe")
@@ -710,6 +723,7 @@ class Qwen3VLMoeTextModel(DeepStackVisualMixin, EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
@@ -837,7 +851,7 @@ class Qwen3VLMoeTextModel(DeepStackVisualMixin, EasyDeLBaseModule):
             )
 
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -848,6 +862,7 @@ class Qwen3VLMoeTextModel(DeepStackVisualMixin, EasyDeLBaseModule):
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
         needs_trace_cache = mode == common_types.MODE_DECODE or has_cache_views
+        has_deepstack = bool(deepstack_visual_embeds)
         # Router-logit aggregation grows a Python tuple per layer, which
         # lax.scan cannot carry — collecting it forces the trace path too.
         # Deepstack injection indexes a per-layer Python list, so it also
@@ -857,70 +872,124 @@ class Qwen3VLMoeTextModel(DeepStackVisualMixin, EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits) or bool(deepstack_visual_embeds),
+            extra=needs_trace_cache or bool(output_router_logits) or has_deepstack or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _layer_loop(block, carry):
-            """Apply a single language-model decoder layer inside the layer-stack scan.
+        if self.config.is_looped:
+            applied_deepstack: set[int] = set()
 
-            Body of ``self.layers.scan``; runs ``block`` on the current
-            hidden states, optionally accumulates per-layer hidden
-            states, attention weights and MoE router logits, and returns
-            the updated carry tuple ``(hidden_states, cv,
-            all_hidden_states, all_attentions, all_router_logits, idx)``.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                layer_res = block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
                     frequencies=frequencies,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                if has_deepstack:
+                    phys_idx = block.layer_idx
+                    if phys_idx < len(deepstack_visual_embeds) and phys_idx not in applied_deepstack:
+                        applied_deepstack.add(phys_idx)
+                        if return_shared_kv:
+                            layer_out, captured_kv = layer_res
+                        else:
+                            layer_out, captured_kv = layer_res, None
+                        layer_out = DecoderLayerOutput(
+                            hidden_states=self._deepstack_process(
+                                layer_out.hidden_states,
+                                visual_pos_masks,
+                                deepstack_visual_embeds[phys_idx],
+                            ),
+                            attention_weight=layer_out.attention_weight,
+                            router_logits=layer_out.router_logits,
+                            cache_view=layer_out.cache_view,
+                        )
+                        return (layer_out, captured_kv) if return_shared_kv else layer_out
+                return layer_res
 
-            # Truthiness so an empty list never compares against a traced scan index (r11 S10-2).
-            if deepstack_visual_embeds and idx < len(deepstack_visual_embeds):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[idx],
-                )
-
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            if output_router_logits and layer_outputs.router_logits is not None:
-                all_router_logits += (layer_outputs.router_logits,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, all_router_logits = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache and not has_deepstack,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+                output_router_logits=bool(output_router_logits),
             )
+        else:
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+            def _layer_loop(block, carry):
+                """Apply a single language-model decoder layer inside the layer-stack scan.
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                Body of ``self.layers.scan``; runs ``block`` on the current
+                hidden states, optionally accumulates per-layer hidden
+                states, attention weights and MoE router logits, and returns
+                the updated carry tuple ``(hidden_states, cv,
+                all_hidden_states, all_attentions, all_router_logits, idx)``.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        frequencies=frequencies,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                # Truthiness so an empty list never compares against a traced scan index (r11 S10-2).
+                if deepstack_visual_embeds and idx < len(deepstack_visual_embeds):
+                    hidden_states = self._deepstack_process(
+                        hidden_states,
+                        visual_pos_masks,
+                        deepstack_visual_embeds[idx],
+                    )
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                if output_router_logits and layer_outputs.router_logits is not None:
+                    all_router_logits += (layer_outputs.router_logits,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 

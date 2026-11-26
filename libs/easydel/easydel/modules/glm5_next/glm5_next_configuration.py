@@ -687,7 +687,7 @@ class Glm5NextTextConfig(EasyDeLBaseConfig):
         mapping: dict[int, typing.Any] = {}
         for layer_idx in range(self.num_hidden_layers):
             mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.FULL, size=None, chunks=None)
-        return mapping
+        return self._apply_loop_mask_details(mapping) or {}
 
 
 @register_config("glm5_next_vision")

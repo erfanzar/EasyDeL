@@ -299,7 +299,9 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple | None]:
         """Forward pass through the attention layer.
 
         Computes multi-head attention with rotary position embeddings and optional
@@ -317,9 +319,11 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
             alibi (Array | None, optional): ALiBi attention biases. Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
+            AttentionLayerOutput (or ``(AttentionLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
@@ -343,57 +347,31 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-
-        softmax_aux = self._softmax_aux()
-
-        attentions: AttentionLayerOutput = self.attention_performer.forward(
+        attn_raw, attn_weights_out, cache_view, captured_kv = self._run_attention_with_shared_kv(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
             output_attentions=output_attentions,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_output = self.shard_attention_prod(self._merge_heads(attn_raw))
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
-        return AttentionLayerOutput(
+        layer_out = AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
+            attention_weight=attn_weights_out,
             cache_view=cache_view,
         )
+        if return_shared_kv:
+            return layer_out, captured_kv
+        return layer_out
 
 
 class OpenELMFeedForwardNetwork(spx.Module):
@@ -630,7 +608,9 @@ class OpenELMDecoderLayer(spx.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the decoder layer.
 
         Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
@@ -646,14 +626,16 @@ class OpenELMDecoderLayer(spx.Module):
                 Metadata for cache operations. Defaults to None.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
 
-        attn_outputs = self.attn(
+        attn_res = self.attn(
             hidden_states,
             mask_info,
             position_ids,
@@ -662,7 +644,13 @@ class OpenELMDecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
         hidden_states = checkpoint_name(residual + attn_outputs.attention_output, "residual")
 
         residual = hidden_states
@@ -681,11 +669,14 @@ class OpenELMDecoderLayer(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @lru_cache(maxsize=32)
@@ -786,6 +777,7 @@ class OpenELMModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_transformer_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_transformer_layers):
             self.norm = RMSNorm(
@@ -887,7 +879,7 @@ class OpenELMModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             inputs_embeds,
@@ -903,58 +895,92 @@ class OpenELMModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _layer_loop(layer, carry):
-            """Run one OpenELM decoder block through the layer-scan loop.
+        if self.config.is_looped:
+            # OpenELM layers can have per-layer heterogeneous KV head counts, so
+            # hybrid_sliding_window uses the unrolled dict-keyed pass-1 KV stream path.
+            use_hybrid_kv = getattr(self.config, "loop_kv_cache_mode", "separate") == "hybrid_sliding_window"
 
-            OpenELM lays out a *layer-wise heterogeneous* trunk — every layer
-            can have its own ``num_query_heads``, ``num_kv_heads`` and
-            ``ffn_multiplier`` — so the per-layer ``layer`` callable already
-            owns those shapes; this closure only threads the carry tuple
-            (hidden state, cache views, optional accumulators, current index)
-            and threads the matching cache view through the carry.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = layer(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
+                    output_attentions=bool(output_attentions),
                     position_ids=position_ids,
                     frequencies=frequencies,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache and not use_hybrid_kv,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
             )
+        else:
 
-            return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+            def _layer_loop(layer, carry):
+                """Run one OpenELM decoder block through the layer-scan loop.
 
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                OpenELM lays out a *layer-wise heterogeneous* trunk — every layer
+                can have its own ``num_query_heads``, ``num_kv_heads`` and
+                ``ffn_multiplier`` — so the per-layer ``layer`` callable already
+                owns those shapes; this closure only threads the carry tuple
+                (hidden state, cache views, optional accumulators, current index)
+                and threads the matching cache view through the carry.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = layer(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        position_ids=position_ids,
+                        frequencies=frequencies,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_attentions, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:

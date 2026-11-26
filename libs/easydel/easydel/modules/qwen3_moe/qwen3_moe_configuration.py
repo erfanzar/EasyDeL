@@ -203,7 +203,7 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
         for layer_idx in range(self.num_hidden_layers):
             if self.sliding_window is not None and self.use_sliding_window:
                 mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
-        return mapping
+        return self._apply_loop_mask_details(mapping) or {}
 
 
 __all__ = ["Qwen3MoeConfig"]

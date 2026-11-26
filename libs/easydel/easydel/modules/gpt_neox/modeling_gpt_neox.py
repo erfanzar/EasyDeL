@@ -53,6 +53,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.mixins.looping import materialize_missing_loop_state
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, blockwise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear, dense_qkv_layout
@@ -416,7 +417,9 @@ class GPTNeoXBlock(spx.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass of the GPTNeoXBlock module.
 
         Supports both parallel and sequential residual connections based on config.use_parallel_residual.
@@ -433,15 +436,14 @@ class GPTNeoXBlock(spx.Module):
             output_attentions: Whether to return attention weights (default: False).
             frequencies: Optional precomputed rotary embedding frequencies with shape
                 (sequence_length, head_dim).
+            shared_global_kv: Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput containing:
-                - hidden_states: Output hidden states with shape (batch_size, sequence_length, hidden_size).
-                - attention_weight: Optional attention weights if output_attentions=True.
-                - cache_view: Updated cache view if cache is used.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
 
-        attn_outputs = self.attention(
+        attn_res = self.attention(
             self.input_layernorm(hidden_states),
             mask_info,
             position_ids,
@@ -450,7 +452,13 @@ class GPTNeoXBlock(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
         if self.use_parallel_residual:
             feed_forward_input = self.post_attention_layernorm(hidden_states)
             if self.config.use_scan_mlp:
@@ -475,11 +483,14 @@ class GPTNeoXBlock(spx.Module):
                 feed_forward_hidden_states = self.mlp(feed_forward_input)
             hidden_states = feed_forward_hidden_states + hidden_states
 
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=GPTNeoXConfig, model_type="gpt_neox")
@@ -561,6 +572,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
             self.final_layer_norm = LayerNorm(
@@ -680,7 +692,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -697,53 +709,84 @@ class GPTNeoXModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _run_layer(block, carry):
-            """Run one GPT-NeoX layer inside ``self.layers.scan``.
+        if self.config.is_looped:
 
-            Threads ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, layer_index)`` through the scan and collects
-            optional intermediate states / attention weights.
-            """
-            hs, cv, ah, aa, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     frequencies=frequencies,
                     output_attentions=output_attentions,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            return hs, cv, ah, aa, idx + 1
 
-        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _run_layer,
-            init_carry,
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not trace and not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+            )
+        else:
+
+            def _run_layer(block, carry):
+                """Run one GPT-NeoX layer inside ``self.layers.scan``.
+
+                Threads ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, layer_index)`` through the scan and collects
+                optional intermediate states / attention weights.
+                """
+                hs, cv, ah, aa, idx = carry
+                if output_hidden_states:
+                    ah = (*ah, hs)
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hs,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        frequencies=frequencies,
+                        output_attentions=output_attentions,
+                    )
+                hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_attentions:
+                    aa = (*aa, layer_outputs.attention_weight)
+                return hs, cv, ah, aa, idx + 1
+
+            init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _run_layer,
+                init_carry,
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.final_layer_norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -815,7 +858,7 @@ class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # ty
             new_key = tuple("lm_head" if str(p) == "embed_out" else p for p in key)
             if new_key in expected_leaves and new_key not in state:
                 state[new_key] = state.pop(key)
-        return state
+        return materialize_missing_loop_state(self.config, state, expected_leaves)
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gpt_neox"

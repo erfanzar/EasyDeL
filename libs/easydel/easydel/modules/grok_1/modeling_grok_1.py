@@ -713,6 +713,7 @@ class Grok1Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
@@ -823,7 +824,7 @@ class Grok1Model(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -839,54 +840,91 @@ class Grok1Model(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=output_router_logits or needs_trace_cache,
+            extra=output_router_logits or needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
+        frequencies = self.frequencies
 
-        def _run_layer(block, carry):
-            """Run one Grok-1 decoder layer inside ``self.layers.scan``.
+        if self.config.is_looped:
 
-            Threads ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, all_router_logits, layer_index)`` through
-            the scan and accumulates optional collections requested by
-            the outer ``forward``.
-            """
-            hs, cv, ah, aa, ar, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "Grok1Model does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
-                    frequencies=self.frequencies,
+                    frequencies=frequencies,
                 )
-            hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            if output_router_logits and layer_outputs.router_logits is not None:
-                ar = (*ar, layer_outputs.router_logits)
-            return hs, cv, ah, aa, ar, idx + 1
 
-        init_carry = (hidden_states, cache_views, all_hidden_states, all_self_attns, all_router_logits, 0)
-        hidden_states, _, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
-            _run_layer,
-            init_carry,
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            hidden_states, all_hidden_states, all_self_attns, all_router_logits = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not trace and not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
+            )
+        else:
+
+            def _run_layer(block, carry):
+                """Run one Grok-1 decoder layer inside ``self.layers.scan``.
+
+                Threads ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, all_router_logits, layer_index)`` through
+                the scan and accumulates optional collections requested by
+                the outer ``forward``.
+                """
+                hs, cv, ah, aa, ar, idx = carry
+                if output_hidden_states:
+                    ah = (*ah, hs)
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hs,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        frequencies=frequencies,
+                    )
+                hs = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_attentions:
+                    aa = (*aa, layer_outputs.attention_weight)
+                if output_router_logits and layer_outputs.router_logits is not None:
+                    ar = (*ar, layer_outputs.router_logits)
+                return hs, cv, ah, aa, ar, idx + 1
+
+            init_carry = (hidden_states, cache_views, all_hidden_states, all_self_attns, all_router_logits, 0)
+            hidden_states, _, all_hidden_states, all_self_attns, all_router_logits, _ = self.layers.scan(
+                _run_layer,
+                init_carry,
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 

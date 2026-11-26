@@ -254,6 +254,7 @@ class Olmo3Config(EasyDeLBaseConfig):
             if rope_theta_is_shared is None
             else rope_theta_is_shared
         )
+        self.validate_loop_config()
 
     def __setattr__(self, key, value):
         """Propagate late legacy theta overrides without overwriting explicit maps."""

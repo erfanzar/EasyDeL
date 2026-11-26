@@ -183,7 +183,12 @@ class BaseDecoderLayer:
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         checkpoint_names: tuple[str, str] = ("norm", "residual"),
         checkpoint_norm: bool = True,
-    ) -> tuple[Float[Array, "batch seq_len hidden_dim"], AttentionLayerOutput]:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> (
+        tuple[Float[Array, "batch seq_len hidden_dim"], AttentionLayerOutput]
+        | tuple[Float[Array, "batch seq_len hidden_dim"], AttentionLayerOutput, tuple | None]
+    ):
         """Run the pre-LN attention sub-block: ``h = h + attn(norm(h))``.
 
         Implements the canonical pre-norm residual pattern (Wang et al.,
@@ -246,7 +251,13 @@ class BaseDecoderLayer:
         if checkpoint_norm:
             normed = checkpoint_name(normed, norm_name)
 
-        attn_outputs: AttentionLayerOutput = attention_module(
+        attn_kwargs: dict[str, object] = {}
+        if shared_global_kv is not None:
+            attn_kwargs["shared_global_kv"] = shared_global_kv
+        if return_shared_kv:
+            attn_kwargs["return_shared_kv"] = True
+
+        attn_res = attention_module(
             normed,
             mask_info,
             position_ids,
@@ -255,13 +266,20 @@ class BaseDecoderLayer:
             cache_metadata,
             output_attentions,
             frequencies,
+            **attn_kwargs,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
 
         residual_added: Float[Array, "batch_size seq_len hidden_dim"] = hidden_states + attn_outputs.attention_output
         hidden_states_updated: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(
             residual_added, residual_name
         )
 
+        if return_shared_kv:
+            return hidden_states_updated, attn_outputs, captured_kv
         return hidden_states_updated, attn_outputs
 
     @staticmethod
@@ -376,7 +394,9 @@ class BaseDecoderLayer:
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Drive a full pre-LN transformer decoder block end-to-end.
 
         Three logical steps:
@@ -421,7 +441,8 @@ class BaseDecoderLayer:
         # Attention with pre-norm residual
         hidden_states_after_attn: Float[Array, "batch_size seq_len hidden_dim"]
         attn_outputs: AttentionLayerOutput
-        hidden_states_after_attn, attn_outputs = BaseDecoderLayer.pre_norm_residual_attn(
+        captured_kv = None
+        pre_norm_res = BaseDecoderLayer.pre_norm_residual_attn(
             hidden_states,
             attention_module,
             input_norm,
@@ -433,7 +454,13 @@ class BaseDecoderLayer:
             output_attentions,
             frequencies,
             checkpoint_names=("attn_norm", "attn_residual"),
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            hidden_states_after_attn, attn_outputs, captured_kv = pre_norm_res
+        else:
+            hidden_states_after_attn, attn_outputs = pre_norm_res
 
         hidden_states_after_mlp: Float[Array, "batch_size seq_len hidden_dim"] = BaseDecoderLayer.pre_norm_residual_mlp(
             hidden_states_after_attn,
@@ -453,6 +480,8 @@ class BaseDecoderLayer:
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return output, captured_kv
         return output
 
 

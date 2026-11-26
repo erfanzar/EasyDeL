@@ -270,17 +270,15 @@ class MiniMaxConfig(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        if self.layer_types is None:
-            return mapping
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                layer_type = self.layer_types[layer_idx]
+                if layer_type == "full_attention" and self.sliding_window is not None:
+                    mask_type = AttnMaskType.SLIDING
+                    size = int(self.sliding_window)
+                else:
+                    mask_type = AttnMaskType.FULL
+                    size = int(self.max_position_embeddings)
 
-        for layer_idx in range(self.num_hidden_layers):
-            layer_type = self.layer_types[layer_idx]
-            if layer_type == "full_attention" and self.sliding_window is not None:
-                mask_type = AttnMaskType.SLIDING
-                size = int(self.sliding_window)
-            else:
-                mask_type = AttnMaskType.FULL
-                size = int(self.max_position_embeddings)
-
-            mapping[layer_idx] = AttnMaskDetail(mask_type=mask_type, size=size)
-        return mapping
+                mapping[layer_idx] = AttnMaskDetail(mask_type=mask_type, size=size)
+        return self._apply_loop_mask_details(mapping) or {}

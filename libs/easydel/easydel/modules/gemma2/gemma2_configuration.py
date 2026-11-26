@@ -239,4 +239,4 @@ class Gemma2Config(EasyDeLBaseConfig):
                     mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
                     size=self.sliding_window,
                 )
-        return mapping
+        return self._apply_loop_mask_details(mapping) or {}

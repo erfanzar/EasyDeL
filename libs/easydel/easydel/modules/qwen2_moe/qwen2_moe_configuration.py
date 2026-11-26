@@ -266,4 +266,4 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
                 and self.layer_types[layer_idx] == "sliding_attention"
             ):
                 mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
-        return mapping
+        return self._apply_loop_mask_details(mapping) or {}

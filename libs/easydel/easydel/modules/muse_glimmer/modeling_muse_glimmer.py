@@ -569,7 +569,9 @@ class MuseGlimmerTextAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Array | None = None,
-    ):
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple | None]:
         """Run gated attention for one decoder layer.
 
         Identical to the stock standard path except that the fused projection
@@ -586,9 +588,11 @@ class MuseGlimmerTextAttention(UnifiedAttention):
             output_attentions: When True, materialize softmax weights.
             frequencies: Precomputed RoPE table; the identity table on NoPE layers.
             alibi: Unused, accepted for signature parity.
+            shared_global_kv: Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(AttentionLayerOutput, captured_kv)``.
 
         Returns:
-            AttentionLayerOutput: Attention output, optional weights, cache view.
+            AttentionLayerOutput (or ``(AttentionLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         batch_size = hidden_states.shape[0]
         sequence_length = hidden_states.shape[1]
@@ -606,51 +610,18 @@ class MuseGlimmerTextAttention(UnifiedAttention):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
-        causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
-            causal_for_kernel = False
-
-        sliding_window_for_kernel = self.sliding_window
-        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
-            sliding_window_for_kernel = None
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=sliding_window_for_kernel,
-        )
-
-        attentions = self.attention_performer.forward(
+        attn_output, attn_weights_out, cache_view, captured_kv = self._run_attention_with_shared_kv(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
             output_attentions=output_attentions,
-            precision=self.precision,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
-
-        if attentions.cache_view is not None:
-            cache_view = attentions.cache_view
-
-        attn_output = attentions.attention_outputs
         # Re-assert the query sharding so the gate (which still carries the
         # hidden-state sequence partitioning) and the attention output agree.
         attn_output = apply_logical_sharding(
@@ -672,11 +643,14 @@ class MuseGlimmerTextAttention(UnifiedAttention):
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
         attn_output = self.shard_attention_prod(attn_output)
 
-        return AttentionLayerOutput(
+        layer_out = AttentionLayerOutput(
             attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
+            attention_weight=attn_weights_out,
             cache_view=cache_view,
         )
+        if return_shared_kv:
+            return layer_out, captured_kv
+        return layer_out
 
 
 class MuseGlimmerTextDecoderLayer(spx.Module):
@@ -716,6 +690,7 @@ class MuseGlimmerTextDecoderLayer(spx.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
+        self.is_full_attention = not self.self_attn.is_sliding
         self.mlp = MuseGlimmerTextMLP(
             config=config,
             dtype=dtype,
@@ -755,7 +730,9 @@ class MuseGlimmerTextDecoderLayer(spx.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Array | None = None,
-    ) -> DecoderLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Run one decoder layer.
 
         Applies ``residual + post_norm(sublayer(pre_norm(x)))`` twice — once for
@@ -770,12 +747,14 @@ class MuseGlimmerTextDecoderLayer(spx.Module):
             cache_metadata: Optional cache metadata.
             output_attentions: Whether to return attention weights.
             frequencies: Precomputed RoPE table for RoPE layers.
+            shared_global_kv: Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv: When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Hidden states, attention weights, cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
         residual = hidden_states
-        attn_outputs = self.self_attn(
+        attn_res = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
             position_ids,
@@ -784,7 +763,13 @@ class MuseGlimmerTextDecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
         hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
@@ -806,11 +791,14 @@ class MuseGlimmerTextDecoderLayer(spx.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.runtime_sharding_resolver,
         )
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=MuseGlimmerTextConfig, model_type="muse_glimmer_text")
@@ -879,6 +867,7 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
@@ -1037,7 +1026,7 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
             )
 
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         views = past_key_values.views if past_key_values is not None else None
         has_cache_views = views is not None and any(v is not None for v in views)
@@ -1048,50 +1037,85 @@ class MuseGlimmerTextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         frequency_tables, frequency_selector = self.rope_frequency_bank
 
-        def _run_layer(block, carry):
-            """Apply one decoder layer inside the layer-stack scan."""
-            hs, cv, ah, aa, idx = carry
-            if output_hidden_states:
-                ah = (*ah, hs)
-            # Each layer's RoPE table is gathered by index, so the layer bodies
-            # stay identical and NoPE layers simply pick the identity table.
-            layer_frequencies = frequency_tables[frequency_selector[idx]]
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hs,
+        if self.config.is_looped:
+            uniform_frequencies = frequency_tables.shape[0] == 1
+
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                layer_frequencies = (
+                    frequency_tables[0] if uniform_frequencies else frequency_tables[frequency_selector[block.layer_idx]]
+                )
+                return block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=layer_frequencies,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hs = layer_outputs.hidden_states
-            hs = self._mark_layer_stage_boundary(hs, idx, layers=self.layers)
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-            if output_attentions:
-                aa = (*aa, layer_outputs.attention_weight)
-            return hs, cv, ah, aa, idx + 1
 
-        init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
-        hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
-            _run_layer,
-            init_carry,
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            hidden_states, all_hidden_states, all_attentions, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not trace and not needs_trace_cache and uniform_frequencies,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+            )
+        else:
+
+            def _run_layer(block, carry):
+                """Apply one decoder layer inside the layer-stack scan."""
+                hs, cv, ah, aa, idx = carry
+                if output_hidden_states:
+                    ah = (*ah, hs)
+                # Each layer's RoPE table is gathered by index, so the layer bodies
+                # stay identical and NoPE layers simply pick the identity table.
+                layer_frequencies = frequency_tables[frequency_selector[idx]]
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hs,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=layer_frequencies,
+                    )
+                hs = layer_outputs.hidden_states
+                hs = self._mark_layer_stage_boundary(hs, idx, layers=self.layers)
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+                if output_attentions:
+                    aa = (*aa, layer_outputs.attention_weight)
+                return hs, cv, ah, aa, idx + 1
+
+            init_carry = (hidden_states, cache_views, all_hidden_states, all_attentions, 0)
+            hidden_states, _, all_hidden_states, all_attentions, _ = self.layers.scan(
+                _run_layer,
+                init_carry,
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
 
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")

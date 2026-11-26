@@ -255,3 +255,7 @@ class Mamba2Config(EasyDeLBaseConfig):
             ``["linear_attention"]`` repeated for every hidden layer.
         """
         return ["linear_attention"] * self.num_hidden_layers
+
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        """Pure Mamba-2 SSM models have no full self-attention layers."""
+        return False

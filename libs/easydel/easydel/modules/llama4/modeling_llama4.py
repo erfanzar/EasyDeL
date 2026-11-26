@@ -867,7 +867,9 @@ class Llama4TextAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> AttentionLayerOutput | tuple[AttentionLayerOutput, tuple | None]:
         """Record the absolute token positions then delegate to the unified attention path.
 
         HF's ``Llama4TextAttention`` rescales queries on NoPE layers with a
@@ -904,6 +906,8 @@ class Llama4TextAttention(UnifiedAttention):
                 output_attentions,
                 frequencies,
                 alibi,
+                shared_global_kv=shared_global_kv,
+                return_shared_kv=return_shared_kv,
             )
         finally:
             # Do not keep a (possibly traced) array alive on a persistent layer.
@@ -1078,6 +1082,7 @@ class Llama4TextDecoderLayer(spx.Module):
             layer_idx=layer_idx,
         )
         self.use_chunked_attention = int(config.layer_types[layer_idx] == "chunked_attention")
+        self.is_full_attention = not bool(self.use_chunked_attention)
         self.is_moe_layer = layer_idx in config.moe_layers
         if self.is_moe_layer:  # the 128E model interleaves dense / sparse
             self.feed_forward = Llama4TextMoe(
@@ -1125,7 +1130,9 @@ class Llama4TextDecoderLayer(spx.Module):
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+        shared_global_kv: tuple | None = None,
+        return_shared_kv: bool = False,
+    ) -> DecoderLayerOutput | tuple[DecoderLayerOutput, tuple | None]:
         """Forward pass through the decoder layer.
 
         Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
@@ -1142,11 +1149,13 @@ class Llama4TextDecoderLayer(spx.Module):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
             frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            shared_global_kv (tuple | None, optional): Pass-1 global KV stream for dual-stream looping.
+            return_shared_kv (bool, optional): When True, return ``(DecoderLayerOutput, captured_kv)``.
 
         Returns:
-            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+            DecoderLayerOutput (or ``(DecoderLayerOutput, captured_kv)`` when ``return_shared_kv=True``).
         """
-        attn_outputs = self.self_attn(
+        attn_res = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
             position_ids,
@@ -1155,7 +1164,13 @@ class Llama4TextDecoderLayer(spx.Module):
             cache_metadata,
             output_attentions,
             frequencies,
+            shared_global_kv=shared_global_kv,
+            return_shared_kv=return_shared_kv,
         )
+        if return_shared_kv:
+            attn_outputs, captured_kv = attn_res
+        else:
+            attn_outputs, captured_kv = attn_res, None
 
         hidden_states = hidden_states + attn_outputs.attention_output
 
@@ -1175,12 +1190,15 @@ class Llama4TextDecoderLayer(spx.Module):
             router_logits = None
 
         hidden_states = hidden_states + feed_forward_hidden_states.reshape(feed_forward_input.shape)
-        return DecoderLayerOutput(
+        decoder_out = DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             router_logits=router_logits if output_router_logits else None,
             cache_view=attn_outputs.cache_view,
         )
+        if return_shared_kv:
+            return decoder_out, captured_kv
+        return decoder_out
 
 
 @register_module(TaskType.BASE_MODULE, config=Llama4TextConfig, model_type="llama4_text")
@@ -1258,6 +1276,7 @@ class Llama4TextModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = Llama4TextRMSNorm(
@@ -1350,7 +1369,7 @@ class Llama4TextModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1375,64 +1394,98 @@ class Llama4TextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or output_router_logits,
+            extra=needs_trace_cache or output_router_logits or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
 
-        def _layer_loop(block, carry):
-            """Body of the text-decoder scan over Llama4 transformer layers.
+        if self.config.is_looped:
 
-            Carry: ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, layer_index)``. Routes per-layer KV cache views
-            through the HybridCache machinery and applies the precomputed
-            (chunked or full) ``mask_info`` plus complex RoPE ``frequencies``
-            from the enclosing scope.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, router_outputs, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            # ``idx`` is a tracer on the lowered ``lax.scan`` path (training
-            # without cache views), so select via the block's static flag
-            # (same pattern as gemma3's ``block.is_sliding``) instead of
-            # indexing ``config.layer_types`` with the carry.
-            layer_mask_info = mask_info_chunked if block.use_chunked_attention else mask_info_full
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                layer_mask_info = mask_info_chunked if block.use_chunked_attention else mask_info_full
+                return block(
+                    hidden_states=h,
                     mask_info=layer_mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                    output_router_logits=output_router_logits,
+                    output_attentions=bool(output_attentions),
+                    output_router_logits=bool(output_router_logits),
                     frequencies=frequencies,
+                    shared_global_kv=shared_global_kv,
+                    return_shared_kv=return_shared_kv,
                 )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
 
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, all_router_logits = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info_full,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+                output_router_logits=bool(output_router_logits),
             )
+        else:
 
-            if output_router_logits and layer_outputs.router_logits is not None:
-                router_outputs += (layer_outputs.router_logits,)
-            return hidden_states, cv, all_hidden_states, all_attentions, router_outputs, idx + 1
+            def _layer_loop(block, carry):
+                """Body of the text-decoder scan over Llama4 transformer layers.
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                Carry: ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, layer_index)``. Routes per-layer KV cache views
+                through the HybridCache machinery and applies the precomputed
+                (chunked or full) ``mask_info`` plus complex RoPE ``frequencies``
+                from the enclosing scope.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, router_outputs, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                # ``idx`` is a tracer on the lowered ``lax.scan`` path (training
+                # without cache views), so select via the block's static flag
+                # (same pattern as gemma3's ``block.is_sliding``) instead of
+                # indexing ``config.layer_types`` with the carry.
+                layer_mask_info = mask_info_chunked if block.use_chunked_attention else mask_info_full
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=layer_mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        frequencies=frequencies,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                if output_router_logits and layer_outputs.router_logits is not None:
+                    router_outputs += (layer_outputs.router_logits,)
+                return hidden_states, cv, all_hidden_states, all_attentions, router_outputs, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:

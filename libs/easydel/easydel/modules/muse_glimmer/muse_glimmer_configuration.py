@@ -408,14 +408,13 @@ class MuseGlimmerTextConfig(EasyDeLBaseConfig):
             dict[int, AttnMaskDetail]: One entry per decoder layer.
         """
         mapping: dict[int, AttnMaskDetail] = {}
-        if self.layer_types is None:
-            return mapping
-        for layer_idx in range(self.num_hidden_layers):
-            mapping[layer_idx] = AttnMaskDetail(
-                mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
-                size=self.sliding_window,
-            )
-        return mapping
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
+        return self._apply_loop_mask_details(mapping) or {}
 
 
 @register_config("muse_glimmer")

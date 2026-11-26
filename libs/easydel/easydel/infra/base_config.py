@@ -960,6 +960,15 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
     lmhead_chunksize: NotRequired[int | None]
+    loop_start_layer: NotRequired[int | None]
+    loop_end_layer: NotRequired[int | None]
+    num_loop_iterations: NotRequired[int]
+    loop_gate_type: NotRequired[str]
+    loop_gate_init_biases: NotRequired[list[float] | tuple[float, ...] | None]
+    loop_use_iteration_embedding: NotRequired[bool]
+    loop_kv_cache_mode: NotRequired[str]
+    loop_kv_sliding_window: NotRequired[int]
+    loop_kv_overlap: NotRequired[bool]
 
 
 def _default_backend_name() -> str:
@@ -1673,6 +1682,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
         dsa_serving_ep_balance: bool = False,
         layer_scan_options: dict[str, tp.Any] | None = None,
         operation_configs: dict[str, BaseOperationConfig] | None = None,
+        loop_start_layer: int | None = None,
+        loop_end_layer: int | None = None,
+        num_loop_iterations: int = 1,
+        loop_gate_type: str = "scalar",
+        loop_gate_init_biases: list[float] | tuple[float, ...] | None = None,
+        loop_use_iteration_embedding: bool = False,
+        loop_kv_cache_mode: str = "separate",
+        loop_kv_sliding_window: int = 128,
+        loop_kv_overlap: bool = True,
         **kwargs,
     ):
         """Initialize base EasyDeL config fields and honor user overrides.
@@ -1873,6 +1891,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.operation_configs = (
             operation_configs if operation_configs is not None else getattr(self, "operation_configs", None)
         )
+        self.loop_start_layer = getattr(self, "loop_start_layer", loop_start_layer)
+        self.loop_end_layer = getattr(self, "loop_end_layer", loop_end_layer)
+        _raw_num_loops = getattr(self, "num_loop_iterations", num_loop_iterations)
+        self.num_loop_iterations = 1 if _raw_num_loops is None else int(_raw_num_loops)
+        self.loop_gate_type = str(getattr(self, "loop_gate_type", loop_gate_type))
+        _raw_loop_biases = getattr(self, "loop_gate_init_biases", loop_gate_init_biases)
+        self.loop_gate_init_biases = [float(v) for v in _raw_loop_biases] if _raw_loop_biases is not None else None
+        self.loop_use_iteration_embedding = bool(
+            getattr(self, "loop_use_iteration_embedding", loop_use_iteration_embedding)
+        )
+        self.loop_kv_cache_mode = str(getattr(self, "loop_kv_cache_mode", loop_kv_cache_mode))
+        self.loop_kv_sliding_window = int(getattr(self, "loop_kv_sliding_window", loop_kv_sliding_window))
+        self.loop_kv_overlap = bool(getattr(self, "loop_kv_overlap", loop_kv_overlap))
         self.pretraining_tp = 1  # it's for pytorch models.
 
         # Keep legacy HF-compatible config fields available even when subclasses
@@ -1893,6 +1924,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self._external_rope_config_kwargs = getattr(self, "_external_rope_config_kwargs", {})
         super().__init__(**kwargs)
         object.__setattr__(self, _ROPE_FIELDS_SYNCED_ATTR, True)
+        self.validate_loop_config()
 
     @staticmethod
     def create_mesh(
@@ -4269,31 +4301,109 @@ class EasyDeLBaseConfig(PretrainedConfig):
         causal_mask_bool = causal_mask_bool[None, None, :, :].astype("b1")
         return causal_mask_bool
 
+    def get_loop_mask_details(self) -> dict[int, AttnMaskDetail] | None:
+        """Build per-cache-slot attention mask details for hybrid sliding-window looping.
+
+        When ``is_looped`` is ``True`` and ``loop_kv_cache_mode == "hybrid_sliding_window"``,
+        Pass 2+ of looped full-attention layers receive
+        ``AttnMaskDetail(SLIDING, size=loop_kv_sliding_window)`` so cache allocators
+        (both ``TransformerCache`` and eSurge ``RaggedPagesCache``) provision only a
+        fixed ``W``-token local ring buffer instead of duplicating the full-context KV cache.
+
+        Returns:
+            Mapping from virtual cache slot index to :class:`AttnMaskDetail`, or ``None``
+            when hybrid sliding-window looping is not active.
+        """
+        config = self.get_text_config()
+        if not getattr(config, "is_looped", False):
+            return None
+        if getattr(config, "loop_kv_cache_mode", "separate") != "hybrid_sliding_window":
+            return None
+        from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+        window = int(getattr(config, "loop_kv_sliding_window", 128))
+        layer_types = getattr(config, "layer_types", None)
+        base_sw = getattr(config, "sliding_window", getattr(config, "sliding_windows", None))
+        chunks = getattr(config, "attention_chunk_size", None)
+        details: dict[int, AttnMaskDetail] = {}
+        for slot_idx, (phys_idx, loop_iter) in enumerate(config.loop_layer_schedule):
+            if not config.is_full_attention_layer(phys_idx):
+                lt = layer_types[phys_idx] if (layer_types is not None and 0 <= phys_idx < len(layer_types)) else None
+                if lt in ("sliding_attention", "sliding_window", "sliding"):
+                    details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=base_sw, chunks=chunks)
+                elif lt in ("chunked_attention", "chunk"):
+                    details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.CHUNK, size=None, chunks=chunks)
+                else:
+                    details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.LINEAR, size=None, chunks=chunks)
+            elif loop_iter > 0:
+                details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=window)
+            else:
+                details[slot_idx] = AttnMaskDetail(mask_type=AttnMaskType.FULL, size=None, chunks=chunks)
+        return details or None
+
+    def _apply_loop_mask_details(
+        self,
+        physical_mapping: dict[int, AttnMaskDetail] | None,
+    ) -> dict[int, AttnMaskDetail] | None:
+        """Apply hybrid sliding-window or separate loop schedule to a physical mask mapping.
+
+        Config subclasses that override :meth:`get_mask_details` can wrap their
+        physical per-layer mapping with ``return self._apply_loop_mask_details(mapping)``
+        so both ``hybrid_sliding_window`` and ``separate`` loop schedules map every
+        virtual cache slot accurately.
+        """
+        loop_details = self.get_loop_mask_details()
+        if loop_details is not None:
+            return loop_details
+        config = self.get_text_config()
+        if not physical_mapping or not getattr(config, "is_looped", False):
+            return physical_mapping
+        return {
+            slot_idx: physical_mapping[phys_idx]
+            for slot_idx, (phys_idx, _loop_iter) in enumerate(config.loop_layer_schedule)
+            if phys_idx in physical_mapping
+        }
+
     def get_mask_details(self) -> dict[int, AttnMaskDetail] | None:
         """Get attention mask details for each layer.
 
         Retrieves layer-specific attention mask configurations, which is
         particularly useful for models with heterogeneous attention patterns
         (e.g., models using different attention types per layer like sliding
-        window attention in some layers and full attention in others).
+        window attention in some layers and full attention in others) and for
+        looped models using ``loop_kv_cache_mode="hybrid_sliding_window"``.
 
         Returns:
-            dict[int, AttnMaskDetail] | None: A dictionary mapping layer indices
-                to their corresponding AttnMaskDetail configurations, or None
-                if the model doesn't define layer-specific mask types.
+            dict[int, AttnMaskDetail] | None: A dictionary mapping layer (or virtual
+                cache slot) indices to their corresponding AttnMaskDetail
+                configurations, or None if the model doesn't define layer-specific
+                mask types.
         """
+        loop_details = self.get_loop_mask_details()
+        if loop_details is not None:
+            return loop_details
         config = self.get_text_config()
         layer_types = getattr(config, "layer_types", None)
         if layer_types is not None:
             from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
             mapping = {}
-            for layer_idx, layer_type in enumerate(layer_types):
-                mapping[layer_idx] = AttnMaskDetail(
-                    mask_type=AttnMaskType.from_hf(layer_type),
-                    size=getattr(config, "sliding_window", getattr(config, "sliding_windows", None)),
-                    chunks=getattr(config, "attention_chunk_size", None),
-                )
+            size = getattr(config, "sliding_window", getattr(config, "sliding_windows", None))
+            chunks = getattr(config, "attention_chunk_size", None)
+            if getattr(config, "is_looped", False):
+                for slot_idx, (phys_idx, _loop_iter) in enumerate(config.loop_layer_schedule):
+                    mapping[slot_idx] = AttnMaskDetail(
+                        mask_type=AttnMaskType.from_hf(layer_types[phys_idx]),
+                        size=size,
+                        chunks=chunks,
+                    )
+            else:
+                for layer_idx, layer_type in enumerate(layer_types):
+                    mapping[layer_idx] = AttnMaskDetail(
+                        mask_type=AttnMaskType.from_hf(layer_type),
+                        size=size,
+                        chunks=chunks,
+                    )
             return mapping
         return None
 
@@ -4416,21 +4526,130 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         return {}
 
+    def validate_loop_config(self) -> None:
+        """Validate Loop Transformer parameters (safe to call again after ``config_kwargs`` mutation)."""
+        raw_num_loops = getattr(self, "num_loop_iterations", 1)
+        num_loops = 1 if raw_num_loops is None else int(raw_num_loops)
+        self.num_loop_iterations = num_loops
+        if num_loops < 1:
+            raise ValueError(f"num_loop_iterations must be >= 1, got {num_loops}.")
+
+        start = getattr(self, "loop_start_layer", None)
+        end = getattr(self, "loop_end_layer", None)
+        if num_loops == 1:
+            if (start is None) ^ (end is None):
+                raise ValueError(
+                    f"loop_start_layer ({start}) and loop_end_layer ({end}) must both be set or both be None."
+                )
+            return
+
+        if start is None or end is None:
+            raise ValueError(
+                f"num_loop_iterations={num_loops} > 1 requires both loop_start_layer and loop_end_layer to be set."
+            )
+        start = int(start)
+        end = int(end)
+        self.loop_start_layer = start
+        self.loop_end_layer = end
+
+        num_layers = getattr(self, "num_hidden_layers", None)
+        if num_layers is not None:
+            num_layers_int = int(num_layers)
+            if not (0 <= start < end <= num_layers_int):
+                raise ValueError(
+                    f"Invalid loop range [{start}, {end}) for num_hidden_layers={num_layers_int}. "
+                    "Expected 0 <= loop_start_layer < loop_end_layer <= num_hidden_layers."
+                )
+        elif not (0 <= start < end):
+            raise ValueError(f"Invalid loop range [{start}, {end}). Expected 0 <= loop_start_layer < loop_end_layer.")
+
+        gate_type = str(getattr(self, "loop_gate_type", "scalar"))
+        if gate_type not in ("scalar", "channel"):
+            raise ValueError(f"loop_gate_type must be 'scalar' or 'channel', got {gate_type!r}.")
+        self.loop_gate_type = gate_type
+
+        kv_mode = str(getattr(self, "loop_kv_cache_mode", "separate"))
+        if kv_mode not in ("separate", "hybrid_sliding_window"):
+            raise ValueError(f"loop_kv_cache_mode must be 'separate' or 'hybrid_sliding_window', got {kv_mode!r}.")
+        self.loop_kv_cache_mode = kv_mode
+        kv_sw = int(getattr(self, "loop_kv_sliding_window", 128) or 0)
+        if kv_mode == "hybrid_sliding_window" and kv_sw <= 0:
+            raise ValueError(f"loop_kv_sliding_window must be > 0 in hybrid_sliding_window mode, got {kv_sw}.")
+        self.loop_kv_sliding_window = kv_sw
+        self.loop_kv_overlap = bool(getattr(self, "loop_kv_overlap", True))
+
+        biases = getattr(self, "loop_gate_init_biases", None)
+        if biases is not None:
+            biases = [float(v) for v in biases]
+            if len(biases) != num_loops:
+                raise ValueError(
+                    f"loop_gate_init_biases length ({len(biases)}) must match num_loop_iterations ({num_loops})."
+                )
+            self.loop_gate_init_biases = biases
+
+        interval = int(getattr(self, "full_attention_interval", 1) or 1)
+        if interval > 1 and (start % interval != 0 or (end - start) % interval != 0):
+            logger.warning(
+                "Loop block [%d, %d) is not aligned to full_attention_interval=%d; "
+                "re-entering the loop will shift the hybrid linear/full attention cadence.",
+                start,
+                end,
+                interval,
+            )
+
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        """Return whether physical ``layer_idx`` uses standard full self-attention."""
+        layer_types = getattr(self, "layer_types", None)
+        if layer_types is None:
+            return True
+        if 0 <= layer_idx < len(layer_types):
+            return layer_types[layer_idx] == "full_attention"
+        return True
+
     @property
     def is_looped(self) -> bool:
         """Whether this model executes a shared block of decoder layers for multiple loop iterations."""
-        return False
+        raw_num_loops = getattr(self, "num_loop_iterations", 1)
+        num_loops = 1 if raw_num_loops is None else int(raw_num_loops)
+        return (
+            num_loops > 1
+            and getattr(self, "loop_start_layer", None) is not None
+            and getattr(self, "loop_end_layer", None) is not None
+        )
+
+    @property
+    def resolved_loop_gate_init_biases(self) -> tuple[float, ...]:
+        """Per-iteration initial sigmoid gate biases (defaults to ``(-5.0, ..., -5.0, 5.0)``)."""
+        raw_num_loops = getattr(self, "num_loop_iterations", 1)
+        num_loops = 1 if raw_num_loops is None else int(raw_num_loops)
+        biases = getattr(self, "loop_gate_init_biases", None)
+        if biases is not None:
+            return tuple(float(v) for v in biases)
+        if num_loops <= 1:
+            return ()
+        return (*([-5.0] * (num_loops - 1)), 5.0)
 
     @property
     def loop_layer_schedule(self) -> tuple[tuple[int, int], ...]:
         """Ordered ``(physical_layer_idx, loop_iteration)`` execution schedule.
 
-        For standard (non-looped) models this is simply ``((0, 0), ..., (L - 1, 0))``.
-        Looped models override this to expand the shared loop core across iterations
-        so each pass gets its own cache slot while reusing the same physical layer weights.
+        For standard (non-looped) models this is ``((0, 0), ..., (L - 1, 0))``.
+        For looped models it expands ``[0, start)``, ``[start, end) * K``, and
+        ``[end, L)`` so each loop pass gets its own cache slot while reusing the
+        same physical layer weights.
         """
         num_layers = int(getattr(self, "num_hidden_layers", 0) or 0)
-        return tuple((idx, 0) for idx in range(num_layers))
+        if not self.is_looped:
+            return tuple((idx, 0) for idx in range(num_layers))
+        self.validate_loop_config()
+        start = int(self.loop_start_layer)  # type: ignore[arg-type]
+        end = int(self.loop_end_layer)  # type: ignore[arg-type]
+        schedule: list[tuple[int, int]] = [(idx, 0) for idx in range(0, start)]
+        for it in range(int(self.num_loop_iterations)):
+            for idx in range(start, end):
+                schedule.append((idx, it))
+        schedule.extend((idx, 0) for idx in range(end, num_layers))
+        return tuple(schedule)
 
     @property
     def num_cache_layers(self) -> int:

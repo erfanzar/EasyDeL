@@ -693,6 +693,7 @@ class OPTDecoder(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
     def forward(
         self,
@@ -768,7 +769,7 @@ class OPTDecoder(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -784,77 +785,128 @@ class OPTDecoder(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache,
+            extra=needs_trace_cache or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
 
-        def _layer_loop(decoder_layer, carry):
-            """Run one OPT decoder layer inside the scanned trunk.
+        if self.config.is_looped:
 
-            OPT predates rotary embeddings — positional information was
-            already added at the input via the learned ``OPTLearnedPositionalEmbedding``
-            and per-layer biases; this closure therefore does not pass any
-            ``frequencies`` and just threads ``hidden_states`` and the per-
-            layer cache view through the carry.
-            """
-            hidden_states, cv, all_hidden_states, all_self_attns, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = decoder_layer(
-                    hidden_states=hidden_states,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "OPTDecoder does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                layer_outputs = block(
+                    hidden_states=h,
                     mask_info=mask_info,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                 )
+                if self.training and self.config.layerdrop > 0:
+                    drop_layer = jax.random.uniform(block.self_attn.rngs.key("dropout")) < self.config.layerdrop
+                    layer_outputs.hidden_states = jnp.where(drop_layer, h, layer_outputs.hidden_states)
+                    if layer_outputs.attention_weight is not None:
+                        layer_outputs.attention_weight = jnp.where(drop_layer, 0, layer_outputs.attention_weight)
+                    previous_view = cache_view
+                    if previous_view is not None and layer_outputs.cache_view is not None:
+                        if isinstance(previous_view, TransformerCacheView) and previous_view.segment_ids is None:
+                            segments = layer_outputs.cache_view.segment_ids
+                            if segments is not None:
+                                columns = jnp.arange(segments.shape[-1])[None, :]
+                                valid = (columns >= previous_view.starts[:, None]) & (
+                                    columns < previous_view.indexes[:, None]
+                                )
+                                previous_view = previous_view.replace(segment_ids=jnp.where(valid, segments, -1))
+                        layer_outputs.cache_view = jax.tree_util.tree_map(
+                            lambda old, new: jnp.where(drop_layer, old, new), previous_view, layer_outputs.cache_view
+                        )
+                return layer_outputs
 
-            if self.training and self.config.layerdrop > 0:
-                # Keep the scan/output structure stable while dropping the entire
-                # block's residual update (no inverted-dropout rescaling). Draw
-                # through the bound layer: only its RNG writes are scan-carried.
-                drop_layer = jax.random.uniform(decoder_layer.self_attn.rngs.key("dropout")) < self.config.layerdrop
-                layer_outputs.hidden_states = jnp.where(drop_layer, hidden_states, layer_outputs.hidden_states)
-                if layer_outputs.attention_weight is not None:
-                    layer_outputs.attention_weight = jnp.where(drop_layer, 0, layer_outputs.attention_weight)
-                previous_view = self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values)
-                if previous_view is not None and layer_outputs.cache_view is not None:
-                    if isinstance(previous_view, TransformerCacheView) and previous_view.segment_ids is None:
-                        # A legacy view acquires segment history on its first append.
-                        # Recover its *old* labels from that update, but invalidate
-                        # every newly appended slot before selecting a dropped layer.
-                        segments = layer_outputs.cache_view.segment_ids
-                        if segments is not None:
-                            columns = jnp.arange(segments.shape[-1])[None, :]
-                            valid = (columns >= previous_view.starts[:, None]) & (
-                                columns < previous_view.indexes[:, None]
-                            )
-                            previous_view = previous_view.replace(segment_ids=jnp.where(valid, segments, -1))
-                    layer_outputs.cache_view = jax.tree_util.tree_map(
-                        lambda old, new: jnp.where(drop_layer, old, new), previous_view, layer_outputs.cache_view
-                    )
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-            if output_attentions:
-                all_self_attns += (layer_outputs.attention_weight,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_self_attns, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
             )
+        else:
 
-            return hidden_states, cv, all_hidden_states, all_self_attns, idx + 1
+            def _layer_loop(decoder_layer, carry):
+                """Run one OPT decoder layer inside the scanned trunk.
 
-        hidden_states, _, all_hidden_states, all_self_attns, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_self_attns, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                OPT predates rotary embeddings — positional information was
+                already added at the input via the learned ``OPTLearnedPositionalEmbedding``
+                and per-layer biases; this closure therefore does not pass any
+                ``frequencies`` and just threads ``hidden_states`` and the per-
+                layer cache view through the carry.
+                """
+                hidden_states, cv, all_hidden_states, all_self_attns, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = decoder_layer(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                    )
+
+                if self.training and self.config.layerdrop > 0:
+                    # Keep the scan/output structure stable while dropping the entire
+                    # block's residual update (no inverted-dropout rescaling). Draw
+                    # through the bound layer: only its RNG writes are scan-carried.
+                    drop_layer = jax.random.uniform(decoder_layer.self_attn.rngs.key("dropout")) < self.config.layerdrop
+                    layer_outputs.hidden_states = jnp.where(drop_layer, hidden_states, layer_outputs.hidden_states)
+                    if layer_outputs.attention_weight is not None:
+                        layer_outputs.attention_weight = jnp.where(drop_layer, 0, layer_outputs.attention_weight)
+                    previous_view = self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values)
+                    if previous_view is not None and layer_outputs.cache_view is not None:
+                        if isinstance(previous_view, TransformerCacheView) and previous_view.segment_ids is None:
+                            # A legacy view acquires segment history on its first append.
+                            # Recover its *old* labels from that update, but invalidate
+                            # every newly appended slot before selecting a dropped layer.
+                            segments = layer_outputs.cache_view.segment_ids
+                            if segments is not None:
+                                columns = jnp.arange(segments.shape[-1])[None, :]
+                                valid = (columns >= previous_view.starts[:, None]) & (
+                                    columns < previous_view.indexes[:, None]
+                                )
+                                previous_view = previous_view.replace(segment_ids=jnp.where(valid, segments, -1))
+                        layer_outputs.cache_view = jax.tree_util.tree_map(
+                            lambda old, new: jnp.where(drop_layer, old, new), previous_view, layer_outputs.cache_view
+                        )
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+                if output_attentions:
+                    all_self_attns += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                return hidden_states, cv, all_hidden_states, all_self_attns, idx + 1
+
+            hidden_states, _, all_hidden_states, all_self_attns, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_self_attns, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         if self.final_layer_norm is not None:
             hidden_state = checkpoint_name(self.final_layer_norm(hidden_states), "model_output")
         else:

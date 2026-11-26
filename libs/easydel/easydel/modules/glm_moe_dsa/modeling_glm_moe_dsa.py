@@ -835,6 +835,7 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
         final_layer_idx = max(0, self.config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=self.config.num_hidden_layers):
             self.norm = RMSNorm(
@@ -944,7 +945,7 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
             )
 
         if past_key_values is None:
-            past_key_values = TransformerCache.init_empty(len(self.layers))
+            past_key_values = TransformerCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -964,37 +965,35 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits),
+            extra=needs_trace_cache or bool(output_router_logits) or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _layer_loop(block, carry):
-            """Run one MLA + DSA decoder layer inside ``self.layers.scan``.
+        if self.config.is_looped:
+            if getattr(self.config, "loop_kv_cache_mode", "separate") == "hybrid_sliding_window":
+                raise NotImplementedError(
+                    "GlmMoeDsaModel (MLA+DSA) does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                    "use loop_kv_cache_mode='separate'."
+                )
+            prev_topk = None
+            indexer_aux = jnp.zeros((), dtype=jnp.float32) if aux_active else None
 
-            Threads ``(hidden_states, cache_views, all_hidden_states,
-            all_attentions, all_router_logits, layer_index)`` through the
-            scan and collects optional outputs requested by the outer
-            ``forward``.
-            """
-            if aux_active:
-                carry, indexer_aux = carry[:-1], carry[-1]
-            if has_shared_indexers:
-                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk = carry
-            else:
-                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            with self._layer_stage_context(idx, layers=self.layers):
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                nonlocal prev_topk, indexer_aux
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "GlmMoeDsaModel (MLA+DSA) does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
                 layer_outputs = block(
-                    hidden_states=hidden_states,
+                    hidden_states=h,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
                     output_attentions=output_attentions,
                     frequencies=frequencies,
@@ -1002,39 +1001,96 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
                 )
                 if has_shared_indexers:
                     layer_outputs, prev_topk = layer_outputs
-
-            hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            if output_router_logits and layer_outputs.router_logits is not None:
-                all_router_logits += (layer_outputs.router_logits,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
-            )
-
-            result = (hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1)
-            if has_shared_indexers:
-                result = (*result, prev_topk)
-            if aux_active:
-                if layer_outputs.indexer_aux_loss is not None:
+                if aux_active and layer_outputs.indexer_aux_loss is not None:
                     indexer_aux = indexer_aux + layer_outputs.indexer_aux_loss
-                result = (*result, indexer_aux)
-            return result
+                return layer_outputs
 
-        initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0)
-        if has_shared_indexers:
-            initial = (*initial, None)
-        if aux_active:
-            initial = (*initial, jnp.zeros((), dtype=jnp.float32))
-        final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
+            hidden_states, all_hidden_states, all_attentions, all_router_logits = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache and not has_shared_indexers and not aux_active,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+                output_router_logits=bool(output_router_logits),
+            )
+            indexer_aux_loss = indexer_aux if aux_active else None
+        else:
+
+            def _layer_loop(block, carry):
+                """Run one MLA + DSA decoder layer inside ``self.layers.scan``.
+
+                Threads ``(hidden_states, cache_views, all_hidden_states,
+                all_attentions, all_router_logits, layer_index)`` through the
+                scan and collects optional outputs requested by the outer
+                ``forward``.
+                """
+                if aux_active:
+                    carry, indexer_aux = carry[:-1], carry[-1]
+                if has_shared_indexers:
+                    hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx, prev_topk = carry
+                else:
+                    hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        frequencies=frequencies,
+                        **(
+                            {"previous_topk_indices": prev_topk, "return_topk_indices": True}
+                            if has_shared_indexers
+                            else {}
+                        ),
+                    )
+                    if has_shared_indexers:
+                        layer_outputs, prev_topk = layer_outputs
+
+                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                if output_router_logits and layer_outputs.router_logits is not None:
+                    all_router_logits += (layer_outputs.router_logits,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                result = (hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1)
+                if has_shared_indexers:
+                    result = (*result, prev_topk)
+                if aux_active:
+                    if layer_outputs.indexer_aux_loss is not None:
+                        indexer_aux = indexer_aux + layer_outputs.indexer_aux_loss
+                    result = (*result, indexer_aux)
+                return result
+
+            initial = (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0)
+            if has_shared_indexers:
+                initial = (*initial, None)
+            if aux_active:
+                initial = (*initial, jnp.zeros((), dtype=jnp.float32))
+            final = self.layers.scan(_layer_loop, initial, trace=trace_layers, **self._layer_scan_kwargs("text"))
+            hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = final[:6]
+            indexer_aux_loss = final[-1] if aux_active else None
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -1046,7 +1102,7 @@ class GlmMoeDsaModel(_GlmMoeDsaIndexerCacheMixin, EasyDeLBaseModule):
             attentions=all_attentions,
             router_logits=all_router_logits,
             past_key_values=past_key_values,
-            indexer_aux_loss=final[-1] if aux_active else None,
+            indexer_aux_loss=indexer_aux_loss,
         )
 
 
@@ -1173,7 +1229,7 @@ class GlmMoeDsaForCausalLM(_GlmMoeDsaIndexerCacheMixin, BaseCausalLMModule[GlmMo
             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=text_config.kvdtype if dtype is None else dtype,
             max_model_length=max_length,
-            num_hidden_layers=self.config.num_hidden_layers,
+            num_hidden_layers=self.config.num_cache_layers,
             num_kv_heads=self.config.num_attention_heads,
             kv_head_dim_size=q_head_dim,
             k_headdim=q_head_dim,
@@ -1222,7 +1278,7 @@ class GlmMoeDsaForCausalLM(_GlmMoeDsaIndexerCacheMixin, BaseCausalLMModule[GlmMo
             mesh=self.mesh,
             runtime_sharding_resolver=text_config.runtime_sharding_resolver,
             kvdtype=dtype,
-            num_hidden_layers=self.config.num_hidden_layers,
+            num_hidden_layers=self.config.num_cache_layers,
             num_kv_heads=self.config.num_attention_heads,
             max_model_length=max_length,
             head_dim=q_head_dim,

@@ -54,6 +54,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.mixins.looping import materialize_missing_loop_state
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     DecoderLayerOutput,
@@ -1303,7 +1304,7 @@ def _upgrade_legacy_kda_gate_state(self, state: dict, expected_leaves: dict) -> 
             "output gate; those now match Moonshot's model, so this checkpoint's outputs change -- fine-tune or "
             "re-convert it from the Hugging Face weights."
         )
-    return state
+    return materialize_missing_loop_state(self.config, state, expected_leaves)
 
 
 @register_module(TaskType.BASE_MODULE, config=KimiLinearConfig, model_type="kimi_linear")
@@ -1388,6 +1389,9 @@ class KimiLinearModel(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        if self.config.is_looped and self.config.attn_res_block_size is not None:
+            raise ValueError("Looped execution cannot be combined with attn_res_block_size (Attention Residuals).")
+        self._init_loop_modules(rngs=rngs)
 
         final_layer_idx = max(0, config.num_hidden_layers - 1)
         with self.assign_layer_stage(final_layer_idx, total_layers=config.num_hidden_layers):
@@ -1504,7 +1508,7 @@ class KimiLinearModel(EasyDeLBaseModule):
             )
 
         if past_key_values is None:
-            past_key_values = HybridCache.init_empty(len(self.layers))
+            past_key_values = HybridCache.init_empty(self.config.num_cache_layers)
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1525,92 +1529,131 @@ class KimiLinearModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             cache_views=views,
-            extra=needs_trace_cache or bool(output_router_logits) or use_attn_res,
+            extra=needs_trace_cache or bool(output_router_logits) or use_attn_res or self.config.is_looped,
         )
         cache_views = views if trace_layers else None
-        if use_attn_res:
-            # Keep every live candidate in the leading activation carry. ModuleList.scan moves only that
-            # array onto each layer's stage mesh in eager MPMD; a separate residual tuple would stay behind.
-            # Block 0 is the embedding output. The layer index identifies whether the last candidate is
-            # an open partial block, so no placeholder array is needed at block boundaries.
-            hidden_states = hidden_states[None, ...]
         # Hoisted out of the loop body: the caching property must not be
         # first materialized inside the lax.scan trace (tracer leak).
         frequencies = self.frequencies
 
-        def _layer_loop(block, carry):
-            """Body of the hybrid attention scan over Kimi-Linear layers.
-
-            Each ``block`` may be either an MLA full-attention or a KDA
-            linear-attention decoder layer; the per-layer cache view returned
-            by :meth:`_layer_cache_view_at` adapts to the layer kind via
-            :class:`HybridCache`. The leading carry array contains hidden states, or every live residual
-            candidate stacked along a new leading axis when Attention Residuals are enabled. This keeps eager
-            stage placement and compiled stage transfers aligned. The other carry items are the cache
-            view ``cv``, optional ``all_hidden_states`` / ``all_attentions``
-            tuples, MoE router logits (when ``output_router_logits`` is
-            set), and the layer index. Returns the updated carry for the
-            next iteration.
-            """
-            hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
-            block_residuals = None
+        if self.config.is_looped:
             if use_attn_res:
-                candidates = tuple(hidden_states[i] for i in range(hidden_states.shape[0]))
-                if int(idx) % attn_res_block_size == 0:
-                    block_residuals, hidden_states = candidates, None
-                else:
-                    block_residuals, hidden_states = candidates[:-1], candidates[-1]
-            if output_hidden_states:
-                all_hidden_states += (
-                    _attn_res_stream(block_residuals, hidden_states) if use_attn_res else hidden_states,
-                )
+                raise ValueError("Looped execution cannot be combined with attn_res_block_size (Attention Residuals).")
 
-            with self._layer_stage_context(idx, layers=self.layers):
-                layer_outputs = block(
-                    hidden_states=hidden_states,
-                    block_residuals=block_residuals,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "KimiLinearModel does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                return block(
+                    hidden_states=h,
+                    block_residuals=None,
                     mask_info=mask_info,
                     position_ids=position_ids,
                     mode=mode,
-                    cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                    cache_view=cache_view,
                     cache_metadata=cache_metadata,
-                    output_attentions=output_attentions,
-                    output_router_logits=output_router_logits,
+                    output_attentions=bool(output_attentions),
+                    output_router_logits=bool(output_router_logits),
                     frequencies=frequencies,
                 )
 
-            if use_attn_res:
-                # Freeze the partial block implicitly at a block boundary: the next layer then treats every
-                # entry as completed. Otherwise it splits off the last entry as the still-open partial block.
-                hidden_states = jnp.stack((*block_residuals, layer_outputs.hidden_states), axis=0)
-                # Transfer the entire packed state in compiled MPMD too. Wrap it so the boundary helper does
-                # not apply a rank-three hidden-state sharding contract to this rank-four candidate stack.
-                hidden_states = self._mark_layer_stage_boundary((hidden_states,), idx, layers=self.layers)[0]
-            else:
-                hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
-
-            if output_attentions:
-                all_attentions += (layer_outputs.attention_weight,)
-
-            cv = self._layer_cache_view_update(
-                cv,
-                idx,
-                layer_outputs.cache_view,
-                enabled=trace_layers,
-                cache=past_key_values,
+            hidden_states, all_hidden_states, all_attentions, all_router_logits = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=past_key_values,
+                trace_layers=trace_layers,
+                can_scan=not needs_trace_cache,
+                scan_scope="text",
+                output_hidden_states=bool(output_hidden_states),
+                output_attentions=bool(output_attentions),
+                output_router_logits=bool(output_router_logits),
             )
+        else:
+            if use_attn_res:
+                # Keep every live candidate in the leading activation carry. ModuleList.scan moves only that
+                # array onto each layer's stage mesh in eager MPMD; a separate residual tuple would stay behind.
+                # Block 0 is the embedding output. The layer index identifies whether the last candidate is
+                # an open partial block, so no placeholder array is needed at block boundaries.
+                hidden_states = hidden_states[None, ...]
 
-            if output_router_logits and layer_outputs.router_logits is not None:
-                all_router_logits += (layer_outputs.router_logits,)
+            def _layer_loop(block, carry):
+                """Body of the hybrid attention scan over Kimi-Linear layers.
 
-            return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+                Each ``block`` may be either an MLA full-attention or a KDA
+                linear-attention decoder layer; the per-layer cache view returned
+                by :meth:`_layer_cache_view_at` adapts to the layer kind via
+                :class:`HybridCache`. The leading carry array contains hidden states, or every live residual
+                candidate stacked along a new leading axis when Attention Residuals are enabled. This keeps eager
+                stage placement and compiled stage transfers aligned. The other carry items are the cache
+                view ``cv``, optional ``all_hidden_states`` / ``all_attentions``
+                tuples, MoE router logits (when ``output_router_logits`` is
+                set), and the layer index. Returns the updated carry for the
+                next iteration.
+                """
+                hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx = carry
+                block_residuals = None
+                if use_attn_res:
+                    candidates = tuple(hidden_states[i] for i in range(hidden_states.shape[0]))
+                    if int(idx) % attn_res_block_size == 0:
+                        block_residuals, hidden_states = candidates, None
+                    else:
+                        block_residuals, hidden_states = candidates[:-1], candidates[-1]
+                if output_hidden_states:
+                    all_hidden_states += (
+                        _attn_res_stream(block_residuals, hidden_states) if use_attn_res else hidden_states,
+                    )
 
-        hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+                with self._layer_stage_context(idx, layers=self.layers):
+                    layer_outputs = block(
+                        hidden_states=hidden_states,
+                        block_residuals=block_residuals,
+                        mask_info=mask_info,
+                        position_ids=position_ids,
+                        mode=mode,
+                        cache_view=self._layer_cache_view_at(cv, idx, enabled=trace_layers, cache=past_key_values),
+                        cache_metadata=cache_metadata,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        frequencies=frequencies,
+                    )
+
+                if use_attn_res:
+                    # Freeze the partial block implicitly at a block boundary: the next layer then treats every
+                    # entry as completed. Otherwise it splits off the last entry as the still-open partial block.
+                    hidden_states = jnp.stack((*block_residuals, layer_outputs.hidden_states), axis=0)
+                    # Transfer the entire packed state in compiled MPMD too. Wrap it so the boundary helper does
+                    # not apply a rank-three hidden-state sharding contract to this rank-four candidate stack.
+                    hidden_states = self._mark_layer_stage_boundary((hidden_states,), idx, layers=self.layers)[0]
+                else:
+                    hidden_states = self._mark_layer_stage_boundary(layer_outputs.hidden_states, idx, layers=self.layers)
+
+                if output_attentions:
+                    all_attentions += (layer_outputs.attention_weight,)
+
+                cv = self._layer_cache_view_update(
+                    cv,
+                    idx,
+                    layer_outputs.cache_view,
+                    enabled=trace_layers,
+                    cache=past_key_values,
+                )
+
+                if output_router_logits and layer_outputs.router_logits is not None:
+                    all_router_logits += (layer_outputs.router_logits,)
+
+                return hidden_states, cv, all_hidden_states, all_attentions, all_router_logits, idx + 1
+
+            hidden_states, _, all_hidden_states, all_attentions, all_router_logits, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, cache_views, all_hidden_states, all_attentions, all_router_logits, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         if use_attn_res:
             # The model output is the full residual stream: every frozen block plus the open partial block.
             hidden_states = _attn_res_stream(tuple(hidden_states[i] for i in range(hidden_states.shape[0])), None)

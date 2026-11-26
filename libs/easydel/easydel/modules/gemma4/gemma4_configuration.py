@@ -365,7 +365,7 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
                     mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
                     size=self.sliding_window,
                 )
-        return mapping
+        return self._apply_loop_mask_details(mapping) or {}
 
     def to_dict(self) -> dict:
         """Serialize with the checkpoint's ``sliding_window``.

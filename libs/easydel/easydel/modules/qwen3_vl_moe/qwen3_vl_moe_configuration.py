@@ -259,7 +259,7 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
                         mask_type=AttnMaskType.SLIDING,
                         size=self.sliding_window,
                     )
-        return mapping
+        return self._apply_loop_mask_details(mapping) or {}
 
 
 @register_config("qwen3_vl_moe")

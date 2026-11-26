@@ -36,7 +36,7 @@ from spectrax import apply_logical_sharding, common_types, nn
 from easydel.caching import RecurrentCache, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.sequence_packing import packed_segment_ids_from_mask_info, segmented_depthwise_causal_conv1d
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
@@ -802,6 +802,7 @@ class Mamba2Model(EasyDeLBaseModule):
                         rngs=rngs,
                     )
                 )
+        self._init_loop_modules(rngs=rngs)
 
         with self.assign_layer_stage(config.num_hidden_layers - 1, total_layers=config.num_hidden_layers):
             self.norm_f = Mamba2RMSNorm(
@@ -861,7 +862,7 @@ class Mamba2Model(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
         if cache_params is None:
-            cache_params = RecurrentCache.init_empty(len(self.layers))
+            cache_params = RecurrentCache.init_empty(self.config.num_cache_layers)
         if attention_mask is None:
             attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
         mask_info = MaskInfo.dynamic_init(
@@ -877,44 +878,80 @@ class Mamba2Model(EasyDeLBaseModule):
         # allocated cache forces the trace path; the fresh ``init_empty``
         # placeholder (all-``None`` views) can ride the lax.scan path.
         views = cache_params.views if cache_params is not None else None
+        has_cache_views = views is not None and any(v is not None for v in views)
         trace_layers = self._layer_scan_trace(
             False,
             output_hidden_states=output_hidden_states,
             cache_views=views,
+            extra=self.config.is_looped,
         )
+        cache_views = views if trace_layers else None
 
-        def _layer_loop(block, carry):
-            """Run a single Mamba-2 SSD block and update its recurrent cache.
+        if self.config.is_looped:
 
-            Carry: ``(hidden_states, all_hidden_states, layer_index)``. The
-            per-layer :class:`RecurrentCacheView` is read from
-            ``cache_params.views[idx]`` and the updated view is written back
-            into ``cache_params[idx]`` on the trace path.
-            """
-            hidden_states, all_hidden_states, idx = carry
-            with self._layer_stage_context(idx, layers=self.layers):
-                hidden_states, cache_view = block(
-                    hidden_states=hidden_states,
-                    cache_params=cache_params.views[idx] if trace_layers else None,
+            def _loop_step(block, h, cache_view, shared_global_kv=None, return_shared_kv=False):
+                if shared_global_kv is not None or return_shared_kv:
+                    raise NotImplementedError(
+                        "Mamba2Model does not support loop_kv_cache_mode='hybrid_sliding_window'; "
+                        "use loop_kv_cache_mode='separate'."
+                    )
+                h_out, updated_view = block(
+                    hidden_states=h,
+                    cache_params=cache_view,
                     cache_position=cache_position,
                     attention_mask=attention_mask,
                     segment_ids=segment_ids,
                 )
-            hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
-            if trace_layers:
-                cache_params[idx] = cache_view
-            if output_hidden_states:
-                assert all_hidden_states is not None
-                all_hidden_states = (*all_hidden_states, hidden_states)
+                return DecoderLayerOutput(hidden_states=h_out, cache_view=updated_view)
 
-            return hidden_states, all_hidden_states, idx + 1
+            hidden_states, all_hidden_states, _, _ = self._run_looped_layers(
+                layers=self.layers,
+                hidden_states=hidden_states,
+                step_fn=_loop_step,
+                mask_info=mask_info,
+                cache_views=cache_views,
+                past_key_values=cache_params,
+                trace_layers=trace_layers,
+                can_scan=(
+                    not has_cache_views and not (self.config.residual_in_fp32 and hidden_states.dtype != jnp.float32)
+                ),
+                scan_scope="text",
+                output_hidden_states=output_hidden_states,
+            )
+        else:
 
-        hidden_states, all_hidden_states, _ = self.layers.scan(
-            _layer_loop,
-            (hidden_states, all_hidden_states, 0),
-            trace=trace_layers,
-            **self._layer_scan_kwargs("text"),
-        )
+            def _layer_loop(block, carry):
+                """Run a single Mamba-2 SSD block and update its recurrent cache.
+
+                Carry: ``(hidden_states, all_hidden_states, layer_index)``. The
+                per-layer :class:`RecurrentCacheView` is read from
+                ``cache_params.views[idx]`` and the updated view is written back
+                into ``cache_params[idx]`` on the trace path.
+                """
+                hidden_states, all_hidden_states, idx = carry
+                with self._layer_stage_context(idx, layers=self.layers):
+                    hidden_states, cache_view = block(
+                        hidden_states=hidden_states,
+                        cache_params=cache_params.views[idx] if trace_layers else None,
+                        cache_position=cache_position,
+                        attention_mask=attention_mask,
+                        segment_ids=segment_ids,
+                    )
+                hidden_states = self._mark_layer_stage_boundary(hidden_states, idx, layers=self.layers)
+                if trace_layers:
+                    cache_params[idx] = cache_view
+                if output_hidden_states:
+                    assert all_hidden_states is not None
+                    all_hidden_states = (*all_hidden_states, hidden_states)
+
+                return hidden_states, all_hidden_states, idx + 1
+
+            hidden_states, all_hidden_states, _ = self.layers.scan(
+                _layer_loop,
+                (hidden_states, all_hidden_states, 0),
+                trace=trace_layers,
+                **self._layer_scan_kwargs("text"),
+            )
         hidden_states = self.norm_f(hidden_states)
 
         if output_hidden_states:
@@ -1101,7 +1138,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
         if cache_params is None:
             partition_axis = getattr(self.config, "partition_axis", None) or PartitionAxis()
             cache_config = RecurrentCacheConfig.create_for_mamba2(
-                num_hidden_layers=int(self.config.num_hidden_layers),
+                num_hidden_layers=int(self.config.num_cache_layers),
                 partition_axis=partition_axis,
                 batch_size=int(input_ids.shape[0]),
                 intermediate_size=int(self.config.intermediate_size),

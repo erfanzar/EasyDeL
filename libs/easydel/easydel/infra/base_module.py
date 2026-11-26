@@ -110,7 +110,14 @@ from .loss_utils import (
     LossMetrics,
     resolve_loss_strategy,
 )
-from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, EasyShardingMixin, OperationCacheMixin
+from .mixins import (
+    BaseModuleProtocol,
+    EasyBridgeMixin,
+    EasyGenerationMixin,
+    EasyShardingMixin,
+    LoopTransformerMixin,
+    OperationCacheMixin,
+)
 from .modeling_outputs import EmbeddingInfo
 from .sequence_packing import fold_sequence_packing_segments
 
@@ -881,6 +888,7 @@ class EasyDeLBaseModule(
     EasyBridgeMixin,
     EasyGenerationMixin,
     EasyShardingMixin,
+    LoopTransformerMixin,
     OperationCacheMixin,
     BaseModuleProtocol,
 ):
