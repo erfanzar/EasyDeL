@@ -41,7 +41,7 @@ from spectrax._internal.logging import LazyLogger, get_logger
 from spectrax._version import __version__
 from spectrax.serialization.serialization import leaf_key_paths
 
-from . import _fs, _ocdbt, fsspec_utils
+from . import _fs, _io_utils, _ocdbt, fsspec_utils
 from ._compat import PyTree
 from .serialization import tree_serialize_leaves
 
@@ -372,7 +372,9 @@ def _tensorstore_context(
     if copy_concurrency is not None:
         cfg["data_copy_concurrency"] = {"limit": max(1, int(copy_concurrency))}
     if cache_gb is not None:
-        cfg["cache_pool"] = {"total_bytes_limit": max(1, int(cache_gb)) * 1024**3}
+        limit_bytes = max(0, int(cache_gb)) * 1024**3
+        cfg["cache_pool"] = {"total_bytes_limit": limit_bytes}
+        cfg["cache_pool#remote"] = {"total_bytes_limit": limit_bytes}
     return ts.Context(cfg) if cfg else None
 
 
@@ -761,48 +763,14 @@ class AsyncCheckpointManager:
         if not paths:
             return []
 
-        use_custom_path = (
-            tensorstore_io_concurrency is not None
-            or tensorstore_copy_concurrency is not None
-            or tensorstore_cache_gb is not None
-            or tensorstore_assume_metadata
-            or show_progress
-            or specs is not None
-        )
         per_path_dtypes = target_dtype if isinstance(target_dtype, list) else [target_dtype] * len(paths)
-        if not use_custom_path:
-            target_dtypes = None
-            if any(leaf_target is not None for leaf_target in per_path_dtypes):
-                # Same per-leaf guard the custom path applies through
-                # ``_leaf_target_dtype``: the requested dtype only casts
-                # floating leaves. Integer leaves (packed quantized codes,
-                # scales, token ids) read back as their stored dtype — passed
-                # explicitly rather than as ``None`` entries, because the JAX
-                # manager tree-maps over the dtypes list and a ``None`` entry
-                # would change its pytree structure.
-                target_dtypes = []
-                for leaf_target, storage_dtype in zip(
-                    per_path_dtypes, storage_dtypes or [None] * len(paths), strict=True
-                ):
-                    leaf_dtype = _leaf_target_dtype(leaf_target, storage_dtype)
-                    target_dtypes.append(storage_dtype if leaf_dtype is None else leaf_dtype)
-                if any(entry is None for entry in target_dtypes):
-                    # Unknown stored dtype for a keep-stored leaf: read as stored, the caller casts afterwards.
-                    target_dtypes = None
-            return list(
-                self.global_manager.deserialize_with_paths(
-                    shardings=shardings,  # pyright: ignore[reportArgumentType]
-                    paths=paths,
-                    global_shapes=shapes if shapes and all(shape is not None for shape in shapes) else None,
-                    dtypes=target_dtypes,
-                    concurrent_gb=int(concurrent_gb),
-                )
-            )
-
+        # Default to a zero-byte TensorStore cache pool for one-shot checkpoint reads so
+        # loaded tensors are never pinned indefinitely in JAX's module-global 10 GB cache.
+        effective_cache_gb = 0 if tensorstore_cache_gb is None else int(tensorstore_cache_gb)
         context = _tensorstore_context(
             io_concurrency=tensorstore_io_concurrency,
             copy_concurrency=tensorstore_copy_concurrency,
-            cache_gb=tensorstore_cache_gb,
+            cache_gb=effective_cache_gb,
         )
         shapes = shapes or [None] * len(paths)
         storage_dtypes = storage_dtypes or [None] * len(paths)
@@ -859,11 +827,18 @@ class AsyncCheckpointManager:
                         assume_metadata=assume_metadata,
                         metadata=metadata,
                     )
+                # Only cast at read time when storage_dtype is known so integer leaves are never
+                # mis-cast; unknown storage_dtype falls through to _cast_floating_leaves afterwards.
+                read_dtype = (
+                    _leaf_target_dtype(per_path_dtypes[index], storage_dtype)
+                    if storage_dtype is not None
+                    else None
+                )
                 array = await array_serialization.async_deserialize(
                     shardings[index],  # pyright: ignore[reportArgumentType]
                     spec,
                     global_shape=shape,
-                    dtype=_leaf_target_dtype(per_path_dtypes[index], storage_dtype),
+                    dtype=read_dtype,
                     byte_limiter=byte_limiter,
                     context=context if context is not None else array_serialization.TS_CONTEXT,
                     assume_metadata=assume_metadata,
@@ -891,7 +866,9 @@ class AsyncCheckpointManager:
 
             return [array for array in results if array is not None]
 
-        return _ocdbt.run_sync(_run)
+        loaded = _ocdbt.run_sync(_run)
+        _io_utils.release_host_memory()
+        return loaded
 
     def save_pytree(
         self,
@@ -905,6 +882,8 @@ class AsyncCheckpointManager:
         write_index: bool = True,
         ocdbt: bool = False,
         ocdbt_options: _ocdbt.OcdbtSaveOptions | None = None,
+        concurrent_gb: float | None = None,
+        balance_replicas: bool = True,
     ) -> str:
         """Save a PyTree with exact structure and prefix via TensorStore.
 
@@ -923,8 +902,9 @@ class AsyncCheckpointManager:
             mesh: Optional compatibility argument accepted by older call sites.
                 Save preserves each array's existing sharding, so the mesh is
                 only needed on load and is intentionally ignored here.
-            dtype: Optional dtype to cast floating-point arrays to before
-                saving. If ``None``, the original dtypes are preserved.
+            dtype: Optional dtype to cast floating-point arrays to during
+                saving (streamed in bounded batches without duplicating the full
+                tree). If ``None``, the original dtypes are preserved.
             extras: Optional dictionary of extra metadata stored inside the
                 structure JSON file.
             write_index: Whether to write/update ``tensorstore_index.json``.
@@ -933,6 +913,11 @@ class AsyncCheckpointManager:
                 zarr store per array. Loads detect the layout from the checkpoint.
             ocdbt_options: OCDBT write tuning (data-file size, TensorStore
                 concurrency). Ignored unless *ocdbt* is ``True``.
+            concurrent_gb: Optional per-process in-flight write budget in GiB
+                (defaults to ``SPECTRAX_SAVE_CONCURRENT_GB``, ``4.0`` GiB).
+            balance_replicas: When ``True`` (default), load-balance replicated
+                leaves across all replicas instead of writing only from
+                ``replica_id=0``.
 
         Returns:
             The checkpoint directory path (same as *path* but normalized to a
@@ -952,12 +937,6 @@ class AsyncCheckpointManager:
         if write_shared_files:
             _fs.mkdir(root, exist_ok=True)
 
-        if dtype is not None:
-            pytree = jax.tree_util.tree_map(
-                lambda x: x.astype(dtype) if _is_array_like(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
-                pytree,
-            )
-
         leaves, treedef = jax.tree_util.tree_flatten(pytree, is_leaf=_is_none)
 
         leaf_keys_tree = leaf_key_paths(pytree, prefix=prefix, is_leaf=_is_none)
@@ -976,17 +955,22 @@ class AsyncCheckpointManager:
         backend = "ocdbt" if ocdbt else "tensorstore"
         array_relpaths: list[str] = []
 
+        use_bounded = concurrent_gb is None or float(concurrent_gb) > 0
         tree_serialize_leaves(
             checkpoint_dir=root,
             pytree=pytree,
-            manager=self.global_manager,
+            manager=self._global_manager if (use_bounded or ocdbt) else self.global_manager,
             prefix=prefix,
             write_index=write_index and write_shared_files,
             ocdbt=ocdbt,
             ocdbt_options=ocdbt_options,
+            dtype=dtype,
+            concurrent_gb=concurrent_gb,
+            balance_replicas=balance_replicas,
         )
 
-        self.global_manager.wait_until_finished()
+        if self._global_manager is not None:
+            self._global_manager.wait_until_finished()
         if not write_shared_files:
             return root
 
@@ -1040,7 +1024,11 @@ class AsyncCheckpointManager:
             "array_relpaths": array_relpaths,
             # Stored dtypes, so loads without a tensorstore index (``write_index=False``) can still
             # keep integer / quantized leaves out of a requested floating ``dtype`` cast.
-            "array_dtypes": [_dtype_name(x.dtype) for x, m in zip(leaves, arr_mask, strict=False) if m],
+            "array_dtypes": [
+                _dtype_name(_io_utils.effective_save_dtype(x, dtype))
+                for x, m in zip(leaves, arr_mask, strict=False)
+                if m
+            ],
             "nonarray_payload": nonarray_payload,
             "safetensors_file": None,
             "extras": extras or {},

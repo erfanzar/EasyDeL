@@ -26,7 +26,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding, SingleDev
 from spectrax._internal.logging import get_logger
 from spectrax._version import __version__
 
-from . import _fs, _ocdbt, fsspec_utils
+from . import _fs, _io_utils, _ocdbt, fsspec_utils
 
 logger = get_logger(__name__)
 
@@ -172,17 +172,24 @@ def tree_serialize_leaves(
     write_index: bool = True,
     ocdbt: bool = False,
     ocdbt_options: _ocdbt.OcdbtSaveOptions | None = None,
+    dtype: typing.Any = None,
+    concurrent_gb: float | None = None,
+    balance_replicas: bool = True,
+    release_memory: bool = True,
 ):
     """Serialize a pytree's leaves to TensorStore format.
 
     Serializes arrays in a pytree to TensorStore format with optional prefixing
-    for organizing multiple trees in the same checkpoint directory.
+    for organizing multiple trees in the same checkpoint directory. By default,
+    writes run with bounded per-process in-flight host memory, a zero-cache
+    TensorStore context, replica-balanced writes across replicated axes,
+    leak-free shard transfers, and OS heap reclamation after commit.
 
     Args:
         checkpoint_dir: Directory to save the checkpoint.
         pytree: PyTree structure containing arrays to serialize.
         manager: Optional :class:`GlobalAsyncCheckpointManager`. If ``None``,
-            creates a new one.
+            creates a new one when needed.
         prefix: Optional prefix for organizing arrays (e.g., ``"model"``,
             ``"optimizer"``).
         commit_callback: Optional callback run on process 0 once every process's
@@ -192,6 +199,16 @@ def tree_serialize_leaves(
             store per array. The OCDBT write is synchronous and committed on return.
         ocdbt_options: Write tuning for the OCDBT layout (data-file size, TensorStore
             concurrency). Ignored unless *ocdbt* is ``True``.
+        dtype: Optional floating dtype to cast floating-point leaves to during
+            serialization without duplicating the entire tree upfront.
+        concurrent_gb: Per-process in-flight write budget in GiB. Defaults to
+            ``SPECTRAX_SAVE_CONCURRENT_GB`` (``4.0`` GiB). Set to ``<= 0`` to
+            fall back to JAX's legacy unbounded ``GlobalAsyncCheckpointManager``.
+        balance_replicas: When ``True`` (default), load-balance replicated
+            leaves across all replicas instead of concentrating writes on
+            ``replica_id=0``.
+        release_memory: When ``True`` (default), run GC and return freed heap
+            pages (TCMalloc and glibc) to the OS after writes commit.
 
     Returns:
         ``None``
@@ -200,7 +217,8 @@ def tree_serialize_leaves(
         Uses a unified index file (``tensorstore_index.json``) that supports
         multiple prefixes in version 2.0 format.
     """
-    if manager is None:
+    use_bounded = concurrent_gb is None or float(concurrent_gb) > 0
+    if manager is None and (not use_bounded):
         manager = array_ser.GlobalAsyncCheckpointManager(timeout_secs=GLOBAL_CHECKPOINT_TIMEOUT)
         manager_was_none = True
     else:
@@ -239,7 +257,7 @@ def tree_serialize_leaves(
                 {
                     "path": rel_path,
                     "shape": list(a.shape),
-                    "dtype": str(a.dtype),
+                    "dtype": str(_io_utils.effective_save_dtype(a, dtype)),
                 }
             )
 
@@ -251,21 +269,57 @@ def tree_serialize_leaves(
 
     if ocdbt:
         # GlobalAsyncCheckpointManager never commits a transaction, so the OCDBT write bypasses it.
-        manager.wait_until_finished()
+        if manager is not None:
+            manager.wait_until_finished()
+        if dtype is not None:
+            target_dtype = jax.numpy.dtype(dtype)
+            arrays = [
+                a.astype(target_dtype)
+                if jax.numpy.issubdtype(a.dtype, jax.numpy.floating) and a.dtype != target_dtype
+                else a
+                for a in arrays
+            ]
         _ocdbt.save_prefix(
             checkpoint_dir,
             prefix,
             [info["path"] for info in array_info],
             arrays,
             options=ocdbt_options,
+            balance_replicas=balance_replicas,
+            release_memory=release_memory,
         )
         if jax.process_index() == 0:
             commit_callback()
+    elif use_bounded:
+        if manager is not None:
+            manager.wait_until_finished()
+        timeout_secs = int(getattr(manager, "_timeout_secs", GLOBAL_CHECKPOINT_TIMEOUT))
+        _io_utils.bounded_serialize_zarr(
+            arrays,
+            paths,
+            dtype=dtype,
+            concurrent_gb=concurrent_gb,
+            balance_replicas=balance_replicas,
+            on_commit_callback=commit_callback,
+            timeout_secs=timeout_secs,
+            release_memory=release_memory,
+        )
     else:
+        assert manager is not None
+        if dtype is not None:
+            target_dtype = jax.numpy.dtype(dtype)
+            arrays = [
+                a.astype(target_dtype)
+                if jax.numpy.issubdtype(a.dtype, jax.numpy.floating) and a.dtype != target_dtype
+                else a
+                for a in arrays
+            ]
         manager.serialize_with_paths(arrays, paths, on_commit_callback=commit_callback)
 
-    if manager_was_none:
+    if manager_was_none and manager is not None:
         manager.wait_until_finished()
+        if release_memory:
+            _io_utils.release_host_memory()
 
     if write_index and array_info and fsspec_utils.should_write_shared_checkpoint_files(checkpoint_dir):
         index_path = _fs.joinpath(checkpoint_dir, "tensorstore_index.json")
@@ -551,4 +605,5 @@ def tree_deserialize_leaves(
                             current = current[part]
                         current[parts[-1]] = array
 
+        _io_utils.release_host_memory()
         return result

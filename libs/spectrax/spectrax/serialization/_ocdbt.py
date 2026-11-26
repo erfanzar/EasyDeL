@@ -37,7 +37,7 @@ from jax.experimental.array_serialization import tensorstore_impl as ts_impl
 
 from spectrax._internal.logging import get_logger
 
-from . import _fs
+from . import _fs, _io_utils
 
 logger = get_logger(__name__)
 
@@ -47,12 +47,12 @@ MANIFEST_NAME = "manifest.ocdbt"
 DEFAULT_DATA_FILE_MB = 64
 _UNPREFIXED_STORE = "_root"
 _FALLBACK_CONTEXT_SPEC: dict[str, tp.Any] = {
-    "file_io_concurrency": {"limit": 128},
-    "data_copy_concurrency": {"limit": 128},
-    "cache_pool": {"total_bytes_limit": 10_000_000_000},
-    "cache_pool#remote": {"total_bytes_limit": 10_000_000_000},
+    "file_io_concurrency": {"limit": 64},
+    "data_copy_concurrency": {"limit": 64},
+    "cache_pool": {"total_bytes_limit": 0},
+    "cache_pool#remote": {"total_bytes_limit": 0},
 }
-_fallback_context: ts.Context | None = None
+_default_zero_cache_context: ts.Context | None = None
 
 _T = tp.TypeVar("_T")
 
@@ -148,19 +148,27 @@ def run_sync(factory: tp.Callable[[], tp.Awaitable[_T]]) -> _T:
 
 
 def default_context() -> ts.Context:
-    """Return JAX's module-level TensorStore context, or an equivalent fallback.
+    """Return SpectraX's shared zero-cache TensorStore context for OCDBT saves.
+
+    Inherits concurrency limits from JAX's TensorStore context when available while
+    keeping ``cache_pool`` and ``cache_pool#remote`` at 0 bytes so written arrays
+    are never retained across saves.
 
     Returns:
-        The shared :class:`tensorstore.Context` used by JAX array serialization.
+        The shared :class:`tensorstore.Context` used by OCDBT serialization.
     """
-    global _fallback_context
-    for context in (getattr(array_serialization, "TS_CONTEXT", None), getattr(ts_impl, "_TS_CONTEXT", None)):
-        if isinstance(context, ts.Context):
-            return context
-    if _fallback_context is None:
-        logger.warning("JAX no longer exposes its TensorStore context; OCDBT saves use spectrax's fallback context.")
-        _fallback_context = ts.Context(_FALLBACK_CONTEXT_SPEC)
-    return _fallback_context
+    global _default_zero_cache_context
+    if _default_zero_cache_context is not None:
+        return _default_zero_cache_context
+    spec = dict(_FALLBACK_CONTEXT_SPEC)
+    for jax_ctx in (getattr(array_serialization, "TS_CONTEXT", None), getattr(ts_impl, "_TS_CONTEXT", None)):
+        if isinstance(jax_ctx, ts.Context):
+            spec = _context_json(jax_ctx)
+            spec["cache_pool"] = {"total_bytes_limit": 0}
+            spec["cache_pool#remote"] = {"total_bytes_limit": 0}
+            break
+    _default_zero_cache_context = ts.Context(spec)
+    return _default_zero_cache_context
 
 
 def _context_json(context: ts.Context) -> dict[str, tp.Any]:
@@ -331,6 +339,8 @@ def serialize_arrays(
     specs: tp.Sequence[dict[str, tp.Any]],
     *,
     context: ts.Context | None = None,
+    balance_replicas: bool = True,
+    release_memory: bool = True,
 ) -> None:
     """Write arrays under one atomic transaction and commit it before returning.
 
@@ -341,6 +351,8 @@ def serialize_arrays(
         arrays: Arrays to write, positionally matching *specs*.
         specs: Write specs from :func:`write_specs`.
         context: Shared TensorStore context; defaults to :func:`default_context`.
+        balance_replicas: When ``True`` (default), load-balance replicated leaves across replicas.
+        release_memory: When ``True`` (default), return freed host heap pages to the OS after commit.
 
     Raises:
         ValueError: If *arrays* and *specs* differ in length.
@@ -350,24 +362,35 @@ def serialize_arrays(
     if not arrays:
         return
     context = context if context is not None else default_context()
+    replica_ids, _ = _io_utils.plan_replica_writes(arrays, balance_replicas=balance_replicas)
     transaction = ts.Transaction(atomic=True)
 
     async def _write() -> None:
         await asyncio.gather(
             *[
-                ts_impl.async_serialize(array, dict(spec), context=context, transaction=transaction)
-                for array, spec in zip(arrays, specs, strict=True)
+                ts_impl.async_serialize(
+                    array,
+                    dict(spec),
+                    context=context,
+                    transaction=transaction,
+                    replica_id=replica_id,
+                )
+                for array, spec, replica_id in zip(arrays, specs, replica_ids, strict=True)
             ]
         )
         await transaction.commit_async()
 
     started = time.monotonic()
     try:
-        run_sync(_write)
+        with _io_utils.patched_shard_transfer():
+            run_sync(_write)
     except BaseException:
         if not transaction.commit_started:
             transaction.abort()
         raise
+    finally:
+        if release_memory:
+            _io_utils.release_host_memory()
     logger.debug(f"OCDBT wrote {len(arrays)} arrays in {time.monotonic() - started:.2f}s")
 
 
@@ -424,6 +447,8 @@ def save_prefix(
     arrays: tp.Sequence[tp.Any],
     *,
     options: OcdbtSaveOptions | None = None,
+    balance_replicas: bool = True,
+    release_memory: bool = True,
 ) -> None:
     """Write a prefix's arrays in the OCDBT layout and, multi-process, merge the staging stores.
 
@@ -438,6 +463,8 @@ def save_prefix(
         relpaths: Array paths relative to *root*.
         arrays: Arrays positionally matching *relpaths*.
         options: Write options.
+        balance_replicas: When ``True`` (default), load-balance replicated leaves across replicas.
+        release_memory: When ``True`` (default), return freed host heap pages to the OS after commit.
 
     Raises:
         ValueError: If *relpaths* and *arrays* differ in length.
@@ -454,7 +481,13 @@ def save_prefix(
         multihost_utils.sync_global_devices(f"spectrax:ocdbt:cleared:{tag}")
     context = save_context(options)
     specs = write_specs(root, prefix, relpaths, options=options, process_count=count)
-    serialize_arrays(arrays, specs, context=context)
+    serialize_arrays(
+        arrays,
+        specs,
+        context=context,
+        balance_replicas=balance_replicas,
+        release_memory=release_memory,
+    )
     if count > 1:
         multihost_utils.sync_global_devices(f"spectrax:ocdbt:committed:{tag}")
         if jax.process_index() == 0:
