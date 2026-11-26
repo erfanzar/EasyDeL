@@ -28,6 +28,7 @@ jobs:
       eray: ${{ steps.filter.outputs.eray }}
       easydel: ${{ steps.filter.outputs.easydel }}
       surgecore: ${{ steps.filter.outputs.surgecore }}
+      eyvan: ${{ steps.filter.outputs.eyvan }}
       root: ${{ steps.filter.outputs.root }}
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +58,7 @@ jobs:
             eray: ['libs/eray/**']
             easydel: ['libs/easydel/**']
             surgecore: ['libs/surgecore/**']
+            eyvan: ['libs/eyvan/**']
             root: ['pyproject.toml', 'uv.lock']
 
   import-contract:
@@ -94,6 +96,8 @@ jobs:
             module: easydel
           - lib: surgecore
             module: surgecore._native
+          - lib: eyvan
+            module: eyvan
     steps:
       - name: Skip if unaffected
         id: gate
@@ -156,6 +160,13 @@ jobs:
           assert float(out.loss) > 0, "degenerate loss"
           print("easydel smoke OK, loss:", round(float(out.loss), 4))
           PY
+
+      - name: Functional smoke (eyvan CLI + internal import contracts)
+        if: steps.gate.outputs.run == 'true' && matrix.lib == 'eyvan'
+        run: |
+          uv run eyvan --help >/dev/null
+          uv run eyvan-server --help >/dev/null
+          (cd libs/eyvan && uv run --no-sync lint-imports)
 
   # libs/surgecore is a Rust crate (a PyO3 extension, abi3-py311, built by maturin): check its formatting and lints,
   # run the crate's tests, build its wheel, then run its CPU-only Python tests against the synced workspace.

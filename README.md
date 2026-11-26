@@ -47,6 +47,7 @@ This repository is a `uv` workspace monorepo. Each sibling library is developed 
 | **eFormer** | `libs/eformer` | `eformer` | `escale` sharding meshes, optimizers, TensorStore checkpointing, implicit quantized arrays |
 | **eRay** | `libs/eray` | `eray` | Ray pod/slice orchestration, `eray tpu job` / `sync` CLI, GCE helpers |
 | **surgecore** | `libs/surgecore` | `surgecore` | Rust (PyO3) host runtime for eSurge: step builder, KV-cache core, scheduler, detokenizer |
+| **Eyvan** | `libs/eyvan` | `eyvan` | Policy-aware fleet capacity plane: scheduler, worker runtime, experiment tracking, web dashboard |
 | **esurge-dashboard** | `libs/esurge-dashboard` | — | Standalone Rust/Axum live serving workbench and metrics dashboard |
 
 ## Installation

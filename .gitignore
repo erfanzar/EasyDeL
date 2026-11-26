@@ -172,3 +172,8 @@ dmypy.json
 debug/*
 model-files/*
 autoresearch-results.tsv
+
+# libs/eyvan tracks JSON/TXT files (package.json, openapi.json, requirements-*.txt, etc.);
+# libs/eyvan/.gitignore still overrides for credential/audit JSONs and build outputs.
+!libs/eyvan/**/*.json
+!libs/eyvan/**/*.txt

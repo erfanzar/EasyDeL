@@ -3,14 +3,14 @@
 # Keep in sync when subsystems move; verified against the tree on 2026-11-25.
 
 workspace:
-  kind: uv-workspace monorepo (source of truth; 6 workspace libs + standalone esurge-dashboard Rust crate; 5 companion libs mirrored on push)
+  kind: uv-workspace monorepo (source of truth; 7 workspace libs + standalone esurge-dashboard Rust crate; 6 companion libs mirrored on push)
   layering_contract:
-    rule: only easydel may import spectrax/ejkernel/eformer/eray/surgecore; foundation libs and surgecore independent of each other
+    rule: only easydel may import spectrax/ejkernel/eformer/eray/surgecore/eyvan; companion libs stay independent of each other
     enforced_by: [ uv run lint-imports, .github/workflows/workspace-ci.yaml ]
   # Computation tests MUST run on an accelerator (AGENTS.md golden rule 4); conftest guards refuse them on CPU.
   test_env_accelerator_tpu: "env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu"
   test_env_accelerator_gpu: "env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu"
-  test_env_cpu_non_computation: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"  # eray, surgecore (pytest + cargo test --locked), parsers, configs, or @pytest.mark.cpu_ok
+  test_env_cpu_non_computation: "ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8"  # eray, surgecore (pytest + cargo test --locked), eyvan, parsers, configs, or @pytest.mark.cpu_ok
   mesh_axes_easydel: [ pp, dp, fsdp, ep, tp, sp ]   # EasyDeLBaseConfig order; -1 dim auto-fills
 
 packages:
@@ -128,6 +128,18 @@ packages:
     build: uv sync compiles it through maturin, so a Rust toolchain (cargo) is required
     release: surgecore-v* tags -> publish.yaml surgecore-* jobs (manylinux_2_28 x86_64/aarch64 + macOS arm64 wheels, sdist)
     mirror: erfanzar/esurgecore (subtree, like the foundation libs)
+  eyvan:
+    path: libs/eyvan
+    role: Policy-aware fleet capacity plane (scheduler, capacity drivers, worker runtime, experiment tracking, React dashboard; AGPL-3.0-or-later)
+    tests: libs/eyvan/tests   # CPU-only (no JAX compute); full suite needs dashboard build + PostgreSQL
+    owns: [ domain (Scheduler DRF, gang preemption, TPU chip sharing, pricing/costing, sizing),
+            server (FastAPI API, ControlPlaneService 33 mixins, 24-phase controller + outbox, SQLAlchemy/Alembic persistence, team mode, MCP bridge, assistant),
+            capacity (hardware catalog, pool planning, autoscale, GCP/AWS/Azure/K8s/SSH/local drivers),
+            worker (eyvan-agent, eyvan-native-worker, systemd transient units, multi-host slices/gangs),
+            track (zero-dep client + eyvan-tracker), artifacts (content-addressed store + capability tokens),
+            "sdk (CLI, @execute, EasyDeLSetup, proof/race/soak)", dashboard (React 19 + TS + Vite SPA) ]
+    release: eyvan-v* tags -> publish.yaml eyvan-publish job (builds + stages dashboard before uv build)
+    mirror: erfanzar/eyvan (subtree, like the other companion libs)
   esurge-dashboard:
     path: libs/esurge-dashboard
     role: Standalone Rust/Axum server-rendered monitoring dashboard binary reading eSurge GET /metrics (publish = false; not a uv workspace member)
@@ -160,8 +172,8 @@ ci:
   - workspace-ci.yaml: affected-only import/forward smoke, lint-imports, and surgecore Rust fmt/clippy/test/wheel/CPU-pytest job on PR/push (main and vnext)
   - lint.yaml: ruff check + report-only (continue-on-error) basedpyright scoped to libs/easydel/easydel/
   - uv-lock-checkup.yaml: verifies uv lock --check on push and fork PRs
-  - publish.yaml: tag-triggered per-package PyPI publish (uv build for Python libs; surgecore-* maturin wheel/sdist jobs for surgecore-v*)
-  - sync-subtrees.yaml: server-side mirror backstop for the 5 mirrored libs
+  - publish.yaml: tag-triggered per-package PyPI publish (uv build for Python libs; surgecore-* maturin wheel/sdist jobs for surgecore-v*; eyvan-publish with dashboard staging for eyvan-v*)
+  - sync-subtrees.yaml: server-side mirror backstop for the 6 mirrored libs
   - docker-image_{cpu,gpu,tpu}.yaml: CPU, GPU, and TPU container image build workflows
 
 ownership_routing: # which .agents/agents expert owns a surface
@@ -182,4 +194,5 @@ ownership_routing: # which .agents/agents expert owns a surface
   libs/eformer: [ sharding-expert, quantization-expert ]
   libs/eray: [ tpu-expert, gpu-expert ]
   libs/surgecore: [ inference-expert ]
+  libs/eyvan: [ tpu-expert, gpu-expert, architect ]
   libs/esurge-dashboard: [ inference-expert ]

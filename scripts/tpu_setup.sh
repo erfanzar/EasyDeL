@@ -873,7 +873,7 @@ echo ""
 log_info "Starting package installations on TPU hosts..."
 
 log_info "Uninstalling existing easydel on TPU hosts (if any)..."
-run_on_tpu "~/.local/bin/uv pip uninstall --python ${REMOTE_VENV_PATH}/bin/python easydel easydel-foundation eformer ejkernel spectrax-lib || true" "uninstall existing EasyDeL packages on TPU hosts" || true
+run_on_tpu "~/.local/bin/uv pip uninstall --python ${REMOTE_VENV_PATH}/bin/python easydel easydel-foundation eformer ejkernel spectrax-lib eray surgecore eyvan || true" "uninstall existing EasyDeL packages on TPU hosts" || true
 
 log_info "Installing EasyDeL workspace (${EASYDEL_REPO_URL}@${EASYDEL_BRANCH}) on TPU hosts"
 if ! clone_workspace_on_tpu; then
@@ -892,6 +892,7 @@ packages = [
     ('spectrax-lib', 'spectrax'),
     ('eray', 'eray'),
     ('surgecore', 'surgecore'),
+    ('eyvan', 'eyvan'),
 ]
 versions = []
 for dist_name, module_name in packages:

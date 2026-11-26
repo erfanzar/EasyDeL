@@ -1,7 +1,7 @@
 # EasyDeL Stack — workspace guide
 
 This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)
-monorepo containing six packages that are developed together and released
+monorepo containing seven packages that are developed together and released
 independently (plus the standalone `libs/esurge-dashboard` Rust binary crate,
 which is not published to PyPI):
 
@@ -13,6 +13,7 @@ which is not published to PyPI):
 | eFormer   | `libs/eformer`   | `eformer`   | `eformer`      | `erfanzar/eformer`    |
 | eRay      | `libs/eray`      | `eray`      | `eray`         | `erfanzar/eray`       |
 | surgecore | `libs/surgecore` | `surgecore` | `surgecore`    | `erfanzar/esurgecore` |
+| Eyvan     | `libs/eyvan`     | `eyvan`     | `eyvan`        | `erfanzar/eyvan`      |
 
 **This monorepo is the source of truth.** The standalone repositories are
 read-only mirrors kept in sync automatically — do not merge changes there
@@ -21,11 +22,11 @@ directly (a direct push makes the sync fail until reconciled with
 
 ## What each package owns
 
-The stack splits along one line: the five companion libraries (four Python
-foundation libraries plus the Rust `surgecore` crate) know nothing about
-language models; `easydel` knows nothing about how to write a kernel, shard an
-array, split a pipeline, or manage Ray pods — it composes the companion
-packages.
+The stack splits along one line: the six companion libraries (five Python
+libraries plus the Rust `surgecore` crate) know nothing about language models;
+`easydel` knows nothing about how to write a kernel, shard an array, split a
+pipeline, manage Ray pods, or run a fleet capacity plane — it composes the
+companion packages.
 
 ### spectrax — the module system *and* the pipeline runtime
 
@@ -119,9 +120,27 @@ charts (throughput, load, latency, prefix cache, requests, per-key access) with
 no Grafana/Prometheus dependency. Build and check in `libs/esurge-dashboard`:
 `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 
+### eyvan — capacity plane for research compute
+
+Policy-aware global fleet control plane (`libs/eyvan`, `AGPL-3.0-or-later`) for
+scheduling, provisioning, and executing digest-verified Python callables across
+TPU, GPU, and CPU pools. Installed editable by `uv sync` via the workspace root
+(not a hard PyPI dependency of `easydel`). Ships a React 19 / TypeScript / Vite
+dashboard (`libs/eyvan/dashboard`) staged into `eyvan/_dashboard` at wheel build
+time.
+
+| area                    | owns                                                                                                                               |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `domain/`               | pure deterministic scheduler (hierarchical DRF, gang preemption, TPU chip sharing), pricing/costing/spend, memory sizing, carbon   |
+| `server/`               | FastAPI control plane (`eyvan-server`), `ControlPlaneService` (33 isolated mixins), 24-phase controller + outbox, SQLAlchemy/Alembic persistence, team mode, MCP bridge, fleet assistant |
+| `capacity/`             | sourced hardware catalog (`accelerator_shapes.yaml`), pool planner, autoscale compiler, conformance suite, GCP/AWS/Azure/K8s/SSH/local drivers |
+| `worker/`               | `eyvan-agent` + `eyvan-native-worker`, systemd transient units, multi-host TPU slice/gang execution, OCI stager, global-rank logs  |
+| `track/`, `artifacts/`  | zero-dependency experiment tracking client + `eyvan-tracker` service; content-addressed artifacts and scoped capability tokens     |
+| `sdk/`, `dashboard/`    | `@execute` decorator, `TpuConfig`/`GpuConfig`/`CpuConfig`, `EasyDeLSetup`, `eyvan` CLI (`proof`, `race`, `soak`, `head`, `team`), React SPA |
+
 ### easydel — the LLM framework
 
-The only package allowed to import the five companion packages. By subsystem:
+The only package allowed to import the six companion packages. By subsystem:
 
 | subsystem                        | owns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -170,12 +189,14 @@ runs these, a wheel build and the package's CPU tests whenever `libs/surgecore`,
 ## Layering contract (CI-enforced)
 
 ```md
-spectrax    ejkernel    eformer    eray    surgecore  <- independent of each other and of easydel
-       \        |        |       /        /
-                  easydel                             <- the only package that may import the others
+spectrax   ejkernel   eformer   eray   surgecore   eyvan  <- independent of each other and of easydel
+       \       |         |       /        /        /
+                         easydel                          <- the only package that may import the others
 ```
 
 `uv run lint-imports` checks this locally; Workspace CI runs it on every PR.
+`libs/eyvan` also enforces internal control-plane subsystem boundaries via
+`(cd libs/eyvan && uv run --no-sync lint-imports)`.
 
 ## Testing
 
@@ -198,21 +219,23 @@ env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NA
 ```
 
 The CPU trio is only for tests that do no array computation (`eray`, `surgecore`,
-tool/reasoning parsers, config/CLI/YAML parsing, data text transforms, loggers,
-paths, docs):
+`eyvan`, tool/reasoning parsers, config/CLI/YAML parsing, data text transforms,
+loggers, paths, docs):
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
 XLA_FLAGS=--xla_force_host_platform_device_count=8 \
   uv run pytest libs/eray/tests libs/surgecore/tests
+(cd libs/eyvan && uv run --package eyvan --extra dev pytest tests -m fast -q)   # full eyvan suite needs dashboard build + PostgreSQL
 ```
 
 The four JAX-library test suites (`easydel`, `spectrax`, `eformer`, `ejkernel`)
 enforce this in `conftest.py` via an array-library import regex
 (`_ARRAY_LIBRARY_IMPORT`), runtime XLA compile trapping (`_cpu_compile_guard`),
-and `@pytest.mark.cpu_ok` (`eray` and `surgecore` do no JAX computation and run
-on CPU). A CPU run of a computation test is never validation — with no
-accelerator available, report the change as unverified on hardware.
+and `@pytest.mark.cpu_ok` (`eray`, `surgecore`, and `eyvan` do no JAX
+computation and run on CPU). A CPU run of a computation test is never
+validation — with no accelerator available, report the change as unverified on
+hardware.
 
 ## Releasing
 
@@ -236,16 +259,22 @@ aarch64 and a macOS arm64 wheel (abi3, so one wheel per platform covers Python 3
 step publishes them. Because `easydel` pins exact sibling versions (`==`), any bumped foundation library or
 `surgecore` version must be on PyPI before an `easydel` release that requires it is published.
 
+`eyvan` also releases with `scripts/release.sh eyvan <ver>` and `scripts/publish.sh eyvan`: `release.sh`
+bumps `libs/eyvan/pyproject.toml`, `libs/eyvan/dashboard/package.json` (and `package-lock.json`), and
+`libs/eyvan/deploy/helm/eyvan/Chart.yaml`, and an `eyvan-v*` tag runs the `eyvan-publish` job in
+`.github/workflows/publish.yaml` to build and stage the React dashboard (`libs/eyvan/scripts/stage_dashboard.py`)
+into the wheel/sdist before publishing.
+
 ## Mirror sync
 
 Mirrors update automatically when you `git push`: the pre-push hook
 (`scripts/subtree-sync.sh auto`) detects which of
-spectrax/ejkernel/eformer/eray/surgecore changed and subtree-pushes just those
-to their standalone repos (`SUBTREE_SYNC_SKIP=1 git push` to bypass; mirror
-outages never block the push, and a library missing from HEAD is skipped).
-`.github/workflows/sync-subtrees.yaml` is the server-side backstop
+spectrax/ejkernel/eformer/eray/surgecore/eyvan changed and subtree-pushes just
+those to their standalone repos (`SUBTREE_SYNC_SKIP=1 git push` to bypass;
+mirror outages never block the push, and a library missing from HEAD is
+skipped). `.github/workflows/sync-subtrees.yaml` is the server-side backstop
 (requires the `SUBTREE_SYNC_TOKEN` secret: fine-grained PAT, Contents
-read/write on the five mirrors). Manual fallback:
+read/write on the six mirrors). Manual fallback:
 
 ```bash
 scripts/subtree-sync.sh push            # all mirrors

@@ -5,9 +5,8 @@ name: Publish package
 # package. Uses PyPI trusted publishing (configure each project on PyPI:
 # Publishing -> add GitHub publisher for this repo + this workflow); set the
 # PYPI_API_TOKEN secret instead if you prefer token auth.
-# surgecore (a Rust extension) is the exception: its tags run the surgecore-*
-# jobs below, which build manylinux_2_28 and macOS wheels plus an sdist with
-# maturin and publish them in one step.
+# surgecore (a Rust extension) and eyvan (ships a built React dashboard inside
+# the wheel) have dedicated publish jobs below.
 
 on:
   push:
@@ -18,6 +17,7 @@ on:
       - "eformer-v*"
       - "eray-v*"
       - "surgecore-v*"
+      - "eyvan-v*"
 
 permissions:
   id-token: write # PyPI trusted publishing
@@ -25,8 +25,8 @@ permissions:
 
 jobs:
   publish:
-    # surgecore tags are built and published by the surgecore-* jobs below.
-    if: ${{ !startsWith(github.ref_name, 'surgecore-v') }}
+    # surgecore and eyvan tags are built and published by their dedicated jobs below.
+    if: ${{ !startsWith(github.ref_name, 'surgecore-v') && !startsWith(github.ref_name, 'eyvan-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,6 +126,44 @@ jobs:
       - uses: astral-sh/setup-uv@v5
 
       - name: Publish surgecore to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$UV_PUBLISH_TOKEN" ]; then
+            uv publish dist/*
+          else
+            unset UV_PUBLISH_TOKEN
+            uv publish --trusted-publishing always dist/*
+          fi
+
+  # eyvan ships a built React dashboard under eyvan/_dashboard so `pip install eyvan`
+  # serves the UI at "/". Build and stage it before uv build, then verify both artifacts.
+  eyvan-publish:
+    if: ${{ startsWith(github.ref_name, 'eyvan-v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: libs/eyvan/dashboard/package-lock.json
+
+      - name: Build dashboard and stage into eyvan/_dashboard
+        run: |
+          npm --prefix libs/eyvan/dashboard ci
+          npm --prefix libs/eyvan/dashboard run build
+          python3 libs/eyvan/scripts/stage_dashboard.py
+
+      - name: Build eyvan wheel and sdist
+        run: |
+          uv build --package eyvan --out-dir dist/
+          python3 libs/eyvan/scripts/stage_dashboard.py --check dist/*.whl dist/*.tar.gz
+
+      - name: Publish eyvan to PyPI
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
