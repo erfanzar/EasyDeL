@@ -1,0 +1,14 @@
+apiVersion: v2
+name: eyvan
+description: The Eyvan fleet control plane, its cell agent, and the schema migration that must precede both.
+type: application
+version: 0.0.3
+appVersion: "0.0.3"
+home: https://github.com/erfanzar/eyvan
+sources:
+  - https://github.com/erfanzar/eyvan
+keywords:
+  - tpu
+  - gpu
+  - scheduler
+  - control-plane

@@ -1,0 +1,68 @@
+# Use libs/eyvan as the build context. Every image argument is copied
+# verbatim from oci/release-lock.json after validate-policy succeeds.
+# Standalone: docker buildx build -f Dockerfile.worker [required build args] .
+# Workspace:  docker buildx build -f libs/eyvan/Dockerfile.worker [required build args] libs/eyvan
+ARG TARGETPLATFORM
+ARG EYVAN_UV_IMAGE
+ARG EYVAN_WORKER_BASE_IMAGE
+
+FROM --platform=$TARGETPLATFORM ${EYVAN_UV_IMAGE} AS uv
+
+FROM --platform=$TARGETPLATFORM ${EYVAN_WORKER_BASE_IMAGE} AS runtime
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+ARG EYVAN_SOURCE
+ARG EYVAN_REVISION
+ARG EYVAN_VERSION
+RUN test "$TARGETOS" = linux && test "$TARGETARCH" = amd64 && \
+    test "$TARGETPLATFORM" = linux/amd64 && \
+    printf '%s' "$EYVAN_REVISION" | grep -Eq '^[0-9a-f]{40}$' && \
+    printf '%s' "$EYVAN_SOURCE" | grep -Eq '^https://github\.com/[^/]+/[^/]+$' && \
+    printf '%s' "$EYVAN_VERSION" | grep -Eq '^[0-9]+([.][0-9A-Za-z]+)+([-+][0-9A-Za-z.-]+)?$'
+LABEL org.opencontainers.image.source="${EYVAN_SOURCE}" \
+      org.opencontainers.image.revision="${EYVAN_REVISION}" \
+      org.opencontainers.image.version="${EYVAN_VERSION}" \
+      org.opencontainers.image.title="Eyvan native Kubernetes worker" \
+      org.opencontainers.image.description="Native execution worker for Eyvan Kubernetes capacity cells" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+COPY --from=uv /uv /uvx /bin/
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    EYVAN_NATIVE_WORKER_STATE_DIR=/var/lib/eyvan/native-worker
+WORKDIR /app
+COPY requirements-docker.txt requirements-build.txt ./
+# The interpreter is pinned, not resolved. `uv venv` alone takes the newest uv
+# knows about -- which became 3.14, outside this package's own >=3.10,<3.14 --
+# and the hashed exports carry wheels for supported versions only, so the build
+# fell through to compiling httptools from source in an image with no compiler.
+RUN uv venv --python 3.13 "$VIRTUAL_ENV" && \
+    uv pip install --require-hashes -r requirements-docker.txt && \
+    uv pip install --require-hashes -r requirements-build.txt
+COPY pyproject.toml README.md LICENSE ./src/
+COPY eyvan ./src/eyvan
+RUN uv pip install --no-build-isolation --no-deps ./src && \
+    uv pip uninstall uv-build && \
+    rm -rf ./src && \
+    install -d -o 65532 -g 65532 -m 0700 /var/lib/eyvan/native-worker && \
+    # Stage the multi-host initialization hook the same way the VM startup
+    # script does. Both slice executors put /opt/eyvan-native/multihost on a
+    # multi-host workload's PYTHONPATH on every substrate, but only the GCP VM
+    # path ever created it -- so on Kubernetes the path did not exist, the
+    # sitecustomize hook never ran, and jax.distributed.initialize was never
+    # called on the workload's behalf. Nothing failed: the ranks simply ran as
+    # independent single-process jobs, which is the wrong-results failure rather
+    # than the loud one.
+    install -d -m 0755 /opt/eyvan-native/multihost && \
+    install -m 0644 "$(python -c 'import eyvan.worker.runtime._multihost_site as m; print(m.__file__)')" \
+        /opt/eyvan-native/multihost/eyvan_multihost.py && \
+    install -m 0644 "$(python -c 'import eyvan.worker.distributed_environment as m; print(m.__file__)')" \
+        /opt/eyvan-native/multihost/eyvan_distributed_environment.py && \
+    printf '%s\n\n%s\n' 'from eyvan_multihost import initialize_worker_runtime' \
+        'initialize_worker_runtime()' >/opt/eyvan-native/multihost/sitecustomize.py && \
+    chmod 0644 /opt/eyvan-native/multihost/sitecustomize.py
+USER 65532:65532
+EXPOSE 8100
+ENTRYPOINT ["eyvan-native-worker"]
+CMD ["--host", "0.0.0.0", "--port", "8100", "--state-dir", "/var/lib/eyvan/native-worker", "--secret-file", "/var/run/eyvan/token"]

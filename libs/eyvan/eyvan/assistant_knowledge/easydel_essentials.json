@@ -1,0 +1,176 @@
+{
+ "_comment": "Hand-curated. Fields the fleet assistant MUST confirm with the user before drafting an EasyDeL job. Every field name is validated against easydel_trainers.json by scripts/generate_easydel_catalog.py. launch_inputs name eLarge auxiliary model blocks (<role>_model) and whether the YAML runner needs them.",
+ "common": {
+  "fields": {
+   "learning_rate": "Optimizer step size; trainer defaults differ (SFT 2e-5, DPO/GRPO 1e-6), confirm for the model size.",
+   "total_batch_size": "Global batch size across all devices; drives memory per chip and step time.",
+   "gradient_accumulation_steps": "Micro-steps per optimizer step; raises the effective batch without more memory.",
+   "save_directory": "Where checkpoints go; use a durable gs:// path so Spot preemption can resume.",
+   "save_steps": "Checkpoint cadence in steps; must be frequent enough to survive Spot reclamation."
+  },
+  "one_of": [
+   {
+    "fields": ["num_train_epochs", "max_training_steps"],
+    "why": "Training length: the base default is 10 epochs, which is rarely what the user wants."
+   }
+  ],
+  "launch": {
+   "model": "Base/policy model name_or_path (HF id or gs:// EasyDeL checkpoint) and its dtype.",
+   "dataset": "Training data: HF dataset id or files, split, and the columns the trainer expects.",
+   "sharding": "Mesh axis_dims over (dp, fsdp, ep, tp, sp); must multiply to the slice's chip count (-1 fills one axis)."
+  }
+ },
+ "trainers": {
+  "bco": {
+   "fields": {
+    "beta": "Strength of the implicit-reward term relative to the reference model.",
+    "max_length": "Max prompt + completion tokens.",
+    "max_prompt_length": "Max prompt tokens; completions get the remainder."
+   },
+   "launch_inputs": {
+    "reference_model": {"required": false, "why": "Frozen reference; omitted means a copy of the policy."}
+   }
+  },
+  "cpo": {
+   "fields": {
+    "beta": "Preference-loss temperature.",
+    "loss_type": "Loss variant (sigmoid, hinge, ipo, simpo, alphapo); simpo needs simpo_gamma.",
+    "cpo_alpha": "Weight of the behaviour-cloning NLL term on chosen responses.",
+    "max_length": "Max prompt + completion tokens.",
+    "max_prompt_length": "Max prompt tokens."
+   }
+  },
+  "distillation": {
+   "fields": {
+    "temperature": "Softmax temperature applied to teacher and student logits.",
+    "alpha": "Mix between distillation loss and the hard-label loss.",
+    "max_length": "Max sequence length for student and teacher."
+   },
+   "launch_inputs": {
+    "teacher_model": {"required": true, "why": "The model being distilled from; must share the tokenizer and fit on the same mesh."}
+   }
+  },
+  "dpo": {
+   "fields": {
+    "beta": "Temperature controlling deviation from the reference model (default 0.1).",
+    "loss_type": "DPO variant (sigmoid default; ipo, hinge, robust, apo_zero, ...); some need label_smoothing.",
+    "max_length": "Max prompt + completion tokens (default only 512; most chat data needs more).",
+    "max_prompt_length": "Max prompt tokens (default 256); completion length = max_length - max_prompt_length.",
+    "reference_free": "Drop the reference model entirely (cheaper, different objective)."
+   },
+   "launch_inputs": {
+    "reference_model": {"required": false, "why": "Frozen reference policy; omitted means a frozen copy of the starting model (doubles parameter memory unless precompute_ref_log_probs)."}
+   }
+  },
+  "gkd": {
+   "fields": {
+    "lmbda": "Fraction of on-policy (student-generated) batches.",
+    "beta": "Generalized JSD interpolation (0 = forward KL, 1 = reverse KL).",
+    "temperature": "Sampling temperature for student generations.",
+    "max_new_tokens": "Tokens generated per on-policy sample.",
+    "max_length": "Max sequence length."
+   },
+   "launch_inputs": {
+    "teacher_model": {"required": true, "why": "Teacher whose distribution the student matches."}
+   }
+  },
+  "grpo": {
+   "fields": {
+    "num_generations": "Completions sampled per prompt (group size); must be > 1 for group advantages.",
+    "beta": "KL penalty to the reference policy (default 0.04; 0 disables the reference).",
+    "max_prompt_length": "Max prompt tokens.",
+    "max_completion_length": "Max generated tokens per completion; dominates rollout cost.",
+    "loss_type": "GRPO loss normalisation variant.",
+    "temperature": "Sampling temperature for rollouts."
+   },
+   "launch_inputs": {
+    "reward_model": {"required": true, "why": "The YAML runner needs reward_model; Python reward functions (reward_funcs) cannot be expressed in YAML."}
+   }
+  },
+  "gspo": {
+   "fields": {
+    "num_generations": "Completions per prompt (group size).",
+    "beta": "KL penalty to the reference policy.",
+    "epsilon": "Lower clipping range of the sequence-level importance ratio.",
+    "epsilon_high": "Upper clipping range of the sequence-level importance ratio.",
+    "max_prompt_length": "Max prompt tokens.",
+    "max_completion_length": "Max generated tokens per completion."
+   },
+   "launch_inputs": {
+    "reward_model": {"required": true, "why": "YAML launches need a reward_model block."}
+   }
+  },
+  "kto": {
+   "fields": {
+    "beta": "Temperature controlling deviation from the reference model.",
+    "loss_type": "KTO variant (kto or apo_zero_unpaired).",
+    "desirable_weight": "Loss weight of desirable examples; balance against class counts.",
+    "undesirable_weight": "Loss weight of undesirable examples.",
+    "max_length": "Max prompt + completion tokens.",
+    "max_prompt_length": "Max prompt tokens."
+   },
+   "launch_inputs": {
+    "reference_model": {"required": false, "why": "Frozen reference; omitted means a copy of the policy."}
+   }
+  },
+  "online_dpo": {
+   "fields": {
+    "beta": "DPO temperature (inherited from DPO).",
+    "loss_type": "DPO loss variant used on generated pairs.",
+    "max_new_tokens": "Tokens generated per online completion.",
+    "temperature": "Sampling temperature for online generations.",
+    "max_length": "Max prompt + completion tokens.",
+    "max_prompt_length": "Max prompt tokens."
+   },
+   "launch_inputs": {
+    "reward_model": {"required": true, "why": "Judges the two online completions; required by eLarge for online_dpo."},
+    "reference_model": {"required": false, "why": "Frozen reference; omitted means a copy of the policy."}
+   }
+  },
+  "orpo": {
+   "fields": {
+    "beta": "Weight of the odds-ratio term (lambda in the paper).",
+    "max_length": "Max prompt + completion tokens (default 1024).",
+    "max_prompt_length": "Max prompt tokens (default 512)."
+   }
+  },
+  "ppo": {
+   "fields": {
+    "kl_coef": "KL penalty coefficient against the reference policy.",
+    "cliprange": "Policy-ratio clip range.",
+    "vf_coef": "Value-function loss weight.",
+    "num_ppo_epochs": "Optimization epochs over each rollout batch.",
+    "max_prompt_length": "Max prompt tokens.",
+    "max_completion_length": "Max generated tokens per rollout."
+   },
+   "launch_inputs": {
+    "reward_model": {"required": true, "why": "PPO needs reward_model (YAML) or reward_funcs (Python only)."}
+   }
+  },
+  "reward": {
+   "fields": {
+    "max_length": "Max tokens per chosen/rejected sequence.",
+    "center_rewards_coefficient": "Penalty keeping rewards centred near zero (None disables)."
+   }
+  },
+  "rloo": {
+   "fields": {
+    "num_generations": "Completions per prompt; RLOO requires > 1 (leave-one-out baseline).",
+    "beta": "KL penalty to the reference policy (default 0.05).",
+    "max_prompt_length": "Max prompt tokens.",
+    "max_completion_length": "Max generated tokens per completion."
+   },
+   "launch_inputs": {
+    "reward_model": {"required": true, "why": "YAML launches need a reward_model block."}
+   }
+  },
+  "sft": {
+   "fields": {
+    "max_length": "Max tokens per training sequence (truncation/packing length).",
+    "dataset_text_field": "Column holding text or chat messages (default 'text').",
+    "packing": "Pack short samples into max_length blocks for throughput.",
+    "assistant_only_loss": "Train only on assistant turns of conversational data."
+   }
+  }
+ }
+}

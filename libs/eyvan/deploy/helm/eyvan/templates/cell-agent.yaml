@@ -1,0 +1,105 @@
+{{- if .Values.cellAgent.enabled }}
+{{- $_ := include "eyvan.validateCellAgent" . }}
+{{- $_ = include "eyvan.validateNativeArtifacts" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eyvan-cell-agent
+  namespace: {{ include "eyvan.namespace" . }}
+  labels:
+    {{- include "eyvan.cellAgentLabels" . | nindent 4 }}
+spec:
+  # One per capacity boundary, and never more. Recreate prevents the temporary
+  # overlapping owners that a one-replica RollingUpdate would still create.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: eyvan-cell-agent
+  template:
+    metadata:
+      labels:
+        {{- include "eyvan.cellAgentLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: eyvan-cell-agent
+      containers:
+        - name: agent
+          image: {{ include "eyvan.cellAgentImage" . | quote }}
+          imagePullPolicy: {{ .Values.agentImage.pullPolicy }}
+          command: ["eyvan-agent"]
+          args: ["--host", "0.0.0.0", "--port", "8090"]
+          ports:
+            - name: http
+              containerPort: 8090
+          env:
+            - name: EYVAN_AGENT_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: agent-shared-secret
+            - name: EYVAN_NATIVE_WORKER_ROOT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: native-worker-root-secret
+            - name: EYVAN_CAPACITY_BACKEND
+              value: {{ include "eyvan.capacityBackend" . | quote }}
+            - name: EYVAN_EXECUTION_BACKEND
+              value: {{ .Values.cellAgent.executionBackend | quote }}
+            - name: EYVAN_FLEET_STATE_URI
+              value: {{ .Values.cellAgent.fleetStateUri | quote }}
+            - name: EYVAN_NATIVE_WORKER_PACKAGE
+              value: {{ .Values.cellAgent.nativeWorkerPackage | quote }}
+            - name: EYVAN_NATIVE_WORKER_PACKAGE_SHA256
+              value: {{ .Values.cellAgent.nativeWorkerPackageSha256 | quote }}
+            - name: EYVAN_NATIVE_WORKER_PACKAGE_GENERATION
+              value: {{ .Values.cellAgent.nativeWorkerPackageGeneration | quote }}
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE
+              value: {{ .Values.cellAgent.nativeWorkerWheelhouse | quote }}
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE_SHA256
+              value: {{ .Values.cellAgent.nativeWorkerWheelhouseSha256 | quote }}
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION
+              value: {{ .Values.cellAgent.nativeWorkerWheelhouseGeneration | quote }}
+{{- if eq (include "eyvan.capacityBackend" .) "kubernetes" }}
+            - name: EYVAN_KUBERNETES_NAMESPACE
+              value: {{ include "eyvan.workerNamespace" . | quote }}
+            - name: EYVAN_KUBERNETES_WORKER_IMAGE
+              value: {{ include "eyvan.kubernetesWorkerImage" . | quote }}
+{{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          # A wedged agent used to stay out of the Service and stay running, and
+          # a cell whose agent never answers is capacity nothing can observe,
+          # release, or stop paying for. The threshold is generous because the
+          # agent makes long provider calls and a restart mid-call loses the
+          # fence it was holding.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.cellAgent.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eyvan-cell-agent
+  namespace: {{ include "eyvan.namespace" . }}
+  labels:
+    {{- include "eyvan.cellAgentLabels" . | nindent 4 }}
+spec:
+  selector:
+    app: eyvan-cell-agent
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+{{- end }}

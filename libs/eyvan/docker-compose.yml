@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: eyvan
+      POSTGRES_USER: eyvan
+      POSTGRES_PASSWORD: ${EYVAN_POSTGRES_PASSWORD:?EYVAN_POSTGRES_PASSWORD is required}
+    ports:
+      # Loopback-only: the plane and its operators run on this host, and a
+      # publicly bound Postgres would be an open credential target.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eyvan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - eyvan-postgres:/var/lib/postgresql/data
+
+volumes:
+  eyvan-postgres:

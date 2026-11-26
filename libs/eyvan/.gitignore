@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.import_linter_cache/
+benchmark-results/
+browser-results/
+mutants/
+dependency-audit.json
+.coverage
+coverage.xml
+htmlcov/
+.DS_Store
+.env
+.env.local
+env.py
+
+# Private key material, certificates, and provider credential files. Eyvan
+# generates what it needs under ~/.eyvan at runtime; nothing of the sort
+# belongs in the tree.
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*credentials*.json
+google-cloud-credentials.json
+
+
+# Where a `--with` job caches its packages when /var/lib/eyvan is not writable,
+# which is every laptop. Submitting from a checkout otherwise dirties the tree.
+.eyvan-runtime-envs/
+# Session-to-session engineering handoffs are working notes, not product; they
+# name real incidents, hosts, and accounts, and have no business in a release.
+.handoff/
+.xerxes/
+XERXES.md
+# The built dashboard copied into the package for a release build
+# (scripts/stage_dashboard.py); a build output, never source.
+/eyvan/_dashboard/

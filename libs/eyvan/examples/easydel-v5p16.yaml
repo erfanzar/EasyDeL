@@ -1,0 +1,64 @@
+version: 1
+name: easydel-v5p16
+
+provider:
+  type: gcp
+  project: my-gcp-project
+  region: us-east5
+  zone: us-east5-a
+
+executor: eyvan-native
+capacity_class: spot
+
+autoscaling:
+  idle_timeout_s: 600
+  provisioning_timeout_s: 3600
+
+runtime:
+  env:
+    HF_HOME: /var/lib/eyvan/workload/.cache/huggingface
+    JAX_COMPILATION_CACHE_DIR: /var/lib/eyvan/workload/.cache/jax
+
+pools:
+  v5p-16:
+    label: v5p-16
+    # Per-host CPU, memory, and TPU count come from the sourced catalog.
+    min_workers: 0
+    max_workers: 2
+    runtime:
+      artifacts:
+        # Eyvan mounts staged artifacts read-only at the same path inside the
+        # container. Keep JAX and EasyDeL in the OCI image itself.
+        # Upload this object before `eyvan up`; the OCI image build does not
+        # implicitly publish application code.
+        - source: gs://my-eyvan-artifacts/easydel/training-code/
+          destination: /opt/eyvan-runtime/training
+          recursive: true
+      init_commands:
+        # Every TPU VM host needs a working Docker daemon before the native
+        # worker starts. eyvan_apt_get waits for transient dpkg locks. Prefer
+        # a prebaked VM image in production fleets.
+        # The registry host here must exactly match runtime.container.image.
+        - |
+            if ! command -v docker >/dev/null 2>&1; then
+              eyvan_apt_get update
+              eyvan_apt_get install -y --no-install-recommends docker.io
+            fi
+            systemctl enable --now docker
+            gcloud auth configure-docker us-east5-docker.pkg.dev --quiet
+      env:
+        PYTHONPATH: /opt/eyvan-runtime/training
+      container:
+        # Placeholder only. Replace with a real immutable image digest.
+        image: us-east5-docker.pkg.dev/my-gcp-project/eyvan/easydel-runtime@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        pull_policy: if-not-present
+        working_dir: /var/lib/eyvan/workload
+        # Native OCI TPU jobs reject launch unless this is true.
+        privileged: true
+        # Add typed bind mounts only for paths created on every TPU VM host.
+    provider_options:
+      # Docker installation and an OCI pull need an egress path. Use
+      # private-google-access only with a prebaked engine and wheelhouse.
+      bootstrap_egress: public-internet
+      network: default
+      subnetwork: default

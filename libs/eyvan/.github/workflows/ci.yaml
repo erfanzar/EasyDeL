@@ -1,0 +1,330 @@
+name: CI
+
+# Two reproducibility mechanisms ship together and check each other. The
+# uv.lock is what a standalone clone gets from `uv sync`; the hash-pinned
+# exports are what the Dockerfiles, the head bootstrap, and the installs
+# below use, stricter than a lock on its own: --require-hashes refuses a
+# substituted artifact. A dependency bumped without relocking fails the
+# lock check; bumped without regenerating the exports fails the install.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Nightly full matrix against real PostgreSQL, even without a new commit.
+  # UTC; GitHub may delay scheduled runs, so this is not a wall-clock SLA.
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python:
+    name: Python suite (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python is >=3.11,<3.14; the suite must hold at both edges,
+        # not just the version the maintainer happens to run.
+        python-version: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # The upgrade test builds an immutable historical baseline.
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+          python-version: ${{ matrix.python-version }}
+
+      - name: The lock matches the manifest
+        run: uv lock --check
+
+      # The suite asserts a checkout serves its dashboard at "/", so the
+      # bundle the dashboard job builds for its own tests has to exist here
+      # too: a fresh clone has no dashboard/dist until this step makes one.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm --prefix dashboard ci
+      - run: npm --prefix dashboard run build
+
+      - name: Install from the hashed exports
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python ${{ matrix.python-version }} .venv
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-docker.txt
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-dev.txt
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+          uv pip install --python .venv/bin/python --no-build-isolation --no-deps .
+
+      - name: Python dependency audit
+        if: matrix.python-version == '3.11'
+        # The export already resolves and hashes the complete dependency set.
+        # Disable pip resolution rather than creating another temporary venv.
+        run: >-
+          .venv/bin/pip-audit --disable-pip --require-hashes
+          --requirement requirements-docker.txt --format json --output dependency-audit.json
+
+      - name: Retain dependency audit receipt
+        if: "!cancelled() && matrix.python-version == '3.11'"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: python-dependency-audit
+          path: dependency-audit.json
+          if-no-files-found: warn
+
+      - name: Install qualification browser
+        if: matrix.python-version == '3.11'
+        run: npm --prefix dashboard run browser:install -- --with-deps
+
+      - name: Browser BFF qualification
+        if: matrix.python-version == '3.11'
+        run: >-
+          npm --prefix dashboard run test:browser --
+          --python "$PWD/.venv/bin/python" --output "$PWD/browser-results/bff.json"
+
+      - name: Retain browser qualification receipt
+        if: "!cancelled() && matrix.python-version == '3.11'"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: browser-bff
+          path: browser-results/
+          if-no-files-found: warn
+
+      - name: Suite, against the production backend
+        env:
+          EYVAN_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+          EYVAN_REQUIRE_POSTGRES: "1"
+          NO_COLOR: "1"
+          PYTHONHASHSEED: "0"
+          TZ: UTC
+          LC_ALL: C
+        run: .venv/bin/python -m pytest -q -rs tests
+
+      - name: Nightly repository soak
+        if: github.event_name == 'schedule' && matrix.python-version == '3.12'
+        # Continuous history on one repository: submit, replay, reconstruct
+        # service state, cancel and recheck invariants. Not a cloud/TPU proof.
+        env:
+          EYVAN_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+          EYVAN_REQUIRE_POSTGRES: "1"
+        run: .venv/bin/python -m pytest tests/test_repository_soak.py --soak-iterations=1000 -q -rs
+
+      - name: Nightly seeded invariant fuzz
+        if: github.event_name == 'schedule' && matrix.python-version == '3.12'
+        env:
+          EYVAN_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+          EYVAN_REQUIRE_POSTGRES: "1"
+          FUZZ_SEED: ${{ github.run_number }}
+        run: |
+          mkdir -p fuzz-results
+          printf '%s\n' "$FUZZ_SEED" > fuzz-results/seed.txt
+          .venv/bin/python -m pytest \
+            tests/test_scheduler_properties.py tests/test_scheduler_budget_properties.py \
+            tests/test_elastic_packing_preserves_feasible_subsets.py tests/test_chaos_on_postgres.py \
+            tests/test_settlement_properties.py tests/test_orphan_settlement_properties.py \
+            tests/test_unstarted_retry_properties.py tests/test_running_retry_properties.py \
+            tests/test_preemption_settlement_properties.py tests/test_controller_retry_properties.py \
+            tests/test_dispatch_delivery_properties.py tests/test_priority_preemption_properties.py \
+            tests/test_dispatch_response_loss.py tests/test_dispatch_claim_takeover.py \
+            tests/test_preemption_phase_recovery.py \
+            --hypothesis-seed="$FUZZ_SEED" --junitxml=fuzz-results/results.xml -q -rs
+
+      - name: Retain invariant fuzz receipts
+        if: "!cancelled() && github.event_name == 'schedule' && matrix.python-version == '3.12'"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: invariant-fuzz
+          path: fuzz-results/
+          if-no-files-found: warn
+
+      - name: Scheduler regression budget
+        id: scheduler_budget
+        if: matrix.python-version == '3.12'
+        run: >-
+          .venv/bin/python scripts/benchmark_scheduler.py --cells 1000 --iterations 20
+          --budget-file scripts/scheduler-budgets.json --output benchmark-results/scheduler-1000.json
+
+      - name: Diagnose scheduler budget failure
+        if: failure() && matrix.python-version == '3.12' && steps.scheduler_budget.conclusion == 'failure'
+        # Extra evidence only: never replace the original receipt or waive its failure.
+        run: >-
+          .venv/bin/python scripts/benchmark_scheduler.py --cells 1000 --iterations 20 --diagnostics
+          --budget-file scripts/scheduler-budgets.json --output benchmark-results/scheduler-diagnostics-1000.json
+
+      - name: Nightly 10k-cell simulation
+        if: github.event_name == 'schedule' && matrix.python-version == '3.12'
+        run: >-
+          .venv/bin/python scripts/benchmark_scheduler.py --cells 10000 --iterations 100
+          --budget-file scripts/scheduler-budgets.json --output benchmark-results/scheduler-10000.json
+
+      - name: Retain benchmark receipts
+        if: "!cancelled() && matrix.python-version == '3.12'"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: scheduler-benchmarks
+          path: benchmark-results/*.json
+          if-no-files-found: warn
+
+      - name: Nightly quarantine diagnostics
+        if: "!cancelled() && github.event_name == 'schedule' && matrix.python-version == '3.12'"
+        # Quarantine is tracking and isolated repetition, never a waived gate.
+        # The full suite above still includes these tests and remains blocking.
+        env:
+          EYVAN_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+          EYVAN_REQUIRE_POSTGRES: "1"
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .venv/bin/python -m pytest tests -m quarantine --strict-markers -q -rs || status=$?
+            case "$status" in
+              0) ;;
+              5) echo "No quarantined tests"; break ;;
+              *) exit "$status" ;;
+            esac
+          done
+
+      - name: Coverage ratchet
+        # The launch-latency assertions are wall-clock thresholds and the
+        # coverage trace slows hot paths, so the ratchet excludes that one
+        # module rather than letting instrumentation flake a perf gate.
+        env:
+          EYVAN_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+          EYVAN_REQUIRE_POSTGRES: "1"
+          NO_COLOR: "1"
+          PYTHONHASHSEED: "0"
+          TZ: UTC
+          LC_ALL: C
+        # Floor 84 measured 2026-09-07 (actual 86%, launch-latency excluded);
+        # raise it when coverage improves, never lower it without review.
+        run: .venv/bin/python -m pytest -q -rs tests -k "not launch_latency" --cov=eyvan --cov-report=term --cov-fail-under=84
+
+      - name: Ruff
+        run: |
+          uv tool run --from ruff==0.15.16 ruff check eyvan tests
+          uv tool run --from ruff==0.15.16 ruff format --check eyvan tests
+
+      - name: mypy ratchet
+        # The scope is pinned in pyproject [tool.mypy] (domain, settings,
+        # records, and the security-critical API policy modules); it may only
+        # grow. Runs from the hash-pinned dev install so the tool version is
+        # the locked one.
+        run: .venv/bin/python -m mypy
+
+      - name: Import boundaries
+        run: .venv/bin/lint-imports
+
+      - name: Generated API reference
+        run: .venv/bin/python scripts/generate_api_reference.py --check
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+      # Fail on any secret not already in the committed baseline. Runs the
+      # same hash-pinned tool a developer gets from `uv sync --extra dev`.
+      - run: uv sync --extra dev
+      - name: No new secrets against the baseline
+        run: |
+          set -euo pipefail
+          # The hook does not discover files. NUL delimiters preserve every
+          # tracked filename; xargs propagates failures from any scan batch.
+          # Never transmit a candidate credential for online verification.
+          git ls-files -z | xargs -0 uv run --no-sync python -m detect_secrets.pre_commit_hook \
+            --baseline .secrets.baseline --no-verify --
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm --prefix dashboard ci
+      # Coverage thresholds (the ratchet) live in dashboard/vite.config.ts.
+      - run: npm --prefix dashboard test -- --coverage --run
+      - run: npm --prefix dashboard run build
+      - name: ESLint
+        run: npm --prefix dashboard run lint
+      - name: Prettier
+        run: npm --prefix dashboard run format:check
+      - run: npm --prefix dashboard audit --audit-level=low
+
+  package:
+    name: Package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.21"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # The wheel carries the built dashboard as eyvan/_dashboard, so an
+      # installed plane serves its UI at "/".
+      - name: Build the dashboard and stage it into the package
+        run: |
+          set -euo pipefail
+          npm --prefix dashboard ci
+          npm --prefix dashboard run build
+          python3 scripts/stage_dashboard.py
+
+      - name: Build with the locked backend, never a resolved one
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --require-hashes -r requirements-build.txt
+          VIRTUAL_ENV=.venv PATH="$PWD/.venv/bin:$PATH" \
+            uv build --no-build-isolation --wheel --sdist --out-dir dist .
+          python3 scripts/stage_dashboard.py --check dist/*.whl dist/*.tar.gz
+
+      - name: Every entry point answers from an installed wheel
+        run: |
+          set -euo pipefail
+          export UV_PYTHON_DOWNLOADS=never
+          uv venv --python 3.12 .smoke
+          uv pip install --python .smoke/bin/python --require-hashes -r requirements-docker.txt
+          uv pip install --python .smoke/bin/python --no-deps dist/*.whl
+          for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate; do
+            .smoke/bin/"$entry" --help >/dev/null
+          done
+          .smoke/bin/python -c "import eyvan; print(eyvan.__version__)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: distributions
+          path: dist/

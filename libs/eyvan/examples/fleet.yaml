@@ -1,0 +1,95 @@
+version: 1
+name: research
+
+provider:
+  type: gcp
+  project: my-gcp-project
+  region: us-east5
+  zone: us-east5-a
+
+executor: eyvan-native
+capacity_class: spot
+
+autoscaling:
+  idle_timeout_s: 600
+  queue_timeout_s: null
+  provisioning_timeout_s: 1800
+  upscaling_speed: 1.0
+  launch_batch: 4
+
+# Native runtime defaults apply to every node type. Node-level runtime blocks
+# append artifacts and init_commands, and override individual environment keys.
+runtime:
+  # Built-in Ubuntu 22 accelerator images may default to unsupported Python 3.10.
+  python: "3.11"
+  env:
+    HF_HOME: /var/lib/eyvan/workload/.cache/huggingface
+    JAX_COMPILATION_CACHE_DIR: /var/lib/eyvan/workload/.cache/jax
+
+labels:
+  environment: research
+
+node_types:
+  cpu-workers:
+    kind: cpu
+    machine_type: n2-standard-16
+    resources:
+      cpu: 16
+      memory_gib: 64
+    min_workers: 1
+    max_workers: 10
+    agent_endpoint: https://eyvan-compute-agent.example.com
+    provider_options:
+      bootstrap_egress: private-google-access
+
+  gpu-workers:
+    kind: gpu
+    machine_type: a2-highgpu-1g
+    accelerator_type: nvidia-tesla-a100
+    resources:
+      cpu: 12
+      memory_gib: 85
+      gpu: 1
+    initial_workers: 1
+    min_workers: 0
+    max_workers: 8
+    idle_timeout_s: 300
+    agent_endpoint: https://eyvan-compute-agent.example.com
+    provider_options:
+      bootstrap_egress: private-google-access
+
+  tpu-workers:
+    kind: tpu
+    accelerator_type: v5p-8
+    # Known TPU resources are filled from the sourced hardware catalog.
+    min_workers: 0
+    max_workers: 16
+    agent_endpoint: https://eyvan-tpu-agent.example.com
+    provider_options:
+      bootstrap_egress: private-google-access
+    runtime:
+      artifacts:
+        # Training code is mounted read-only into the OCI workload at this
+        # same path. The image below supplies JAX and EasyDeL itself.
+        - source: gs://my-eyvan-artifacts/training-code/
+          destination: /opt/eyvan-runtime/training
+          recursive: true
+      init_commands:
+        # The native worker checks `docker version` after setup. The generated
+        # eyvan_apt_get helper waits for transient dpkg locks. Prebaked VM
+        # images are preferable for production; this is an Ubuntu example.
+        - |
+            if ! command -v docker >/dev/null 2>&1; then
+              eyvan_apt_get update
+              eyvan_apt_get install -y --no-install-recommends docker.io
+            fi
+            systemctl enable --now docker
+            gcloud auth configure-docker us-docker.pkg.dev --quiet
+      env:
+        PYTHONPATH: /opt/eyvan-runtime/training
+      container:
+        # Placeholder only. Use an immutable, real image digest in a fleet.
+        image: us-docker.pkg.dev/my-gcp-project/easydel/easydel-runtime@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        pull_policy: if-not-present
+        working_dir: /var/lib/eyvan/workload
+        privileged: true

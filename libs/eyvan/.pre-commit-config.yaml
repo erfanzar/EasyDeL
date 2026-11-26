@@ -1,0 +1,23 @@
+repos:
+  - repo: local
+    hooks:
+      - id: eyvan-license-headers
+        name: AGPL-3.0 header on Eyvan sources
+        description: Every Eyvan source file carries the AGPL-3.0 header
+        entry: python scripts/license_headers.py
+        language: system
+        files: \.(py|ts|tsx)$
+        exclude: node_modules|dist
+        stages: [pre-commit]
+      - id: ruff-check
+        name: ruff check (pinned in requirements-dev.txt)
+        entry: uv run --no-sync --extra dev ruff check --force-exclude
+        language: system
+        types: [python]
+        stages: [pre-commit]
+      - id: ruff-format
+        name: ruff format --check (pinned in requirements-dev.txt)
+        entry: uv run --no-sync --extra dev ruff format --check --force-exclude
+        language: system
+        types: [python]
+        stages: [pre-commit]

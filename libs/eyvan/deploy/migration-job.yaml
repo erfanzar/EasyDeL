@@ -1,0 +1,28 @@
+# Apply after deploy/prerequisites.yaml and the external Secrets, then wait for
+# this Job to complete before creating either Deployment.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eyvan-schema-migration
+  namespace: eyvan-system
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: eyvan-control-plane
+      containers:
+        - name: migrate
+          # Must match the digest rolled out by deploy/control-plane.yaml.
+          image: REGISTRY/eyvan-control-plane@sha256:REPLACE_WITH_PUBLISHED_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["eyvan-migrate"]
+          # No args is intentionally safe: fresh/same-head proceeds, while a
+          # behind non-empty schema refuses. Add --maintenance-acknowledged only
+          # for the quiesced/backup-verified procedure in docs/install.md.
+          env:
+            - name: EYVAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: database-url
