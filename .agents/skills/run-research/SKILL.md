@@ -25,7 +25,7 @@ specialization or `.agents/ops/OPS.md`.
   or found it with `rg` (or `git grep` on minimal containers where `rg` is absent).
 - **No new `os.environ` knobs**: wire new toggles through config dataclasses, constructor arguments, ContextVars, or
   explicit setters — never invent new env vars (even temporary ones left in diffs).
-- **Layering & registries**: only `easydel` may import `spectrax`, `ejkernel`, `eformer`, `eray`, or `surgecore`
+- **Layering & registries**: only `easydel` may import `spectrax`, `ejkernel`, `eformer`, `eray`, `surgecore`, or `eyvan`
   (`uv run lint-imports`). Never bypass model/trainer/operation/kernel registries.
 
 ## Workflow
@@ -51,9 +51,9 @@ Full per-package commands live in `.agents/skills/test-workspace/SKILL.md`. Core
   `env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu`, GPU:
   `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). TPU hosts hold a single `libtpu` lock: run one accelerator process
   at a time.
-- **CPU trio** is ONLY for non-computation tests (`eray`, `surgecore`, parsers, configs, `@pytest.mark.cpu_ok`). A CPU
-  run of a computation test is never validation; with no accelerator available, report the change as **unverified on
-  hardware**.
+- **CPU trio** is ONLY for non-computation tests (`eray`, `surgecore`, `eyvan`, parsers, configs, `@pytest.mark.cpu_ok`).
+  A CPU run of a computation test is never validation; with no accelerator available, report the change as **unverified
+  on hardware**.
 - **`libs/surgecore` changes** require Rust crate checks (`cargo fmt`, `cargo clippy`, `cargo test`) plus CPU pytest
   (see `.agents/skills/test-workspace/SKILL.md` and `.agents/skills/develop-surgecore/SKILL.md`).
 

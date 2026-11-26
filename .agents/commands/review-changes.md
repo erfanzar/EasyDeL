@@ -27,7 +27,7 @@ never blindly diff a `vnext` branch against `main`).
 - Validate every candidate finding against the live source code before reporting it.
 - Run the cheapest relevant verification for the touched surfaces:
   - `uv run lint-imports` and `uv run pre-commit run --files <touched files>`
-  - Focused pytest on an accelerator (TPU: `env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu uv run pytest ...`; GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). Use CPU only for pure-Python/Rust non-computation tests (`libs/eray/tests`, `libs/surgecore/tests`, parsers, configs, `@pytest.mark.cpu_ok`); without an accelerator, report computation checks as **unverified on hardware**.
+  - Focused pytest on an accelerator (TPU: `env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu uv run pytest ...`; GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). Use CPU only for pure-Python/Rust non-computation tests (`libs/eray/tests`, `libs/surgecore/tests`, `libs/eyvan/tests`, parsers, configs, `@pytest.mark.cpu_ok`); without an accelerator, report computation checks as **unverified on hardware**.
   - If `libs/surgecore` changed: `(cd libs/surgecore && cargo fmt --check && PYO3_PYTHON="$(which python)" cargo clippy --locked --all-targets -- -D warnings && PYO3_PYTHON="$(which python)" cargo test --locked && cargo test --locked --no-default-features)` and `ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu uv run pytest libs/surgecore/tests`.
   - If `libs/esurge-dashboard` changed: `(cd libs/esurge-dashboard && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test)`.
 - No style nits, speculative concerns, or lint-catchable noise.

@@ -124,10 +124,10 @@ no Grafana/Prometheus dependency. Build and check in `libs/esurge-dashboard`:
 
 Policy-aware global fleet control plane (`libs/eyvan`, `AGPL-3.0-or-later`) for
 scheduling, provisioning, and executing digest-verified Python callables across
-TPU, GPU, and CPU pools. Installed editable by `uv sync` via the workspace root
-(not a hard PyPI dependency of `easydel`). Ships a React 19 / TypeScript / Vite
-dashboard (`libs/eyvan/dashboard`) staged into `eyvan/_dashboard` at wheel build
-time.
+TPU, GPU, and CPU pools. Pinned by `easydel` (so installing `easydel` installs
+`eyvan` and its CLI entry points automatically) and resolved editable from
+`libs/eyvan` during `uv sync`. Ships a React 19 / TypeScript / Vite dashboard
+(`libs/eyvan/dashboard`) staged into `eyvan/_dashboard` at wheel build time.
 
 | area                    | owns                                                                                                                               |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
@@ -256,14 +256,15 @@ also bumps the crate's `[package] version` and its own entry in `libs/surgecore/
 and it syncs easydel's `surgecore==` pin like the other pins. A `surgecore-v*` tag skips the `uv build` job and
 runs the `surgecore-*` jobs of `publish.yaml` instead: maturin builds manylinux_2_28 wheels for x86_64 and
 aarch64 and a macOS arm64 wheel (abi3, so one wheel per platform covers Python 3.11-3.13) plus an sdist, and one
-step publishes them. Because `easydel` pins exact sibling versions (`==`), any bumped foundation library or
-`surgecore` version must be on PyPI before an `easydel` release that requires it is published.
+step publishes them. Because `easydel` pins exact sibling versions (`==`), any bumped companion library (`spectrax-lib`,
+`ejkernel`, `eformer`, `eray`, `surgecore`, or `eyvan`) must be on PyPI before an `easydel` release that requires it is
+published.
 
 `eyvan` also releases with `scripts/release.sh eyvan <ver>` and `scripts/publish.sh eyvan`: `release.sh`
 bumps `libs/eyvan/pyproject.toml`, `libs/eyvan/dashboard/package.json` (and `package-lock.json`), and
-`libs/eyvan/deploy/helm/eyvan/Chart.yaml`, and an `eyvan-v*` tag runs the `eyvan-publish` job in
-`.github/workflows/publish.yaml` to build and stage the React dashboard (`libs/eyvan/scripts/stage_dashboard.py`)
-into the wheel/sdist before publishing.
+`libs/eyvan/deploy/helm/eyvan/Chart.yaml`, syncs `eyvan==` in `libs/easydel/pyproject.toml`, and an `eyvan-v*` tag runs
+the `eyvan-publish` job in `.github/workflows/publish.yaml` to build and stage the React dashboard
+(`libs/eyvan/scripts/stage_dashboard.py`) into the wheel/sdist before publishing.
 
 ## Mirror sync
 

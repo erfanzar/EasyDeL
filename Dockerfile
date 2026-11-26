@@ -67,7 +67,7 @@ RUN uv venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:/usr/local/cuda/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
-# Project files (uv workspace: root pyproject + the four packages under libs/)
+# Project files (uv workspace: root pyproject + the seven packages under libs/)
 COPY pyproject.toml README.md ./
 COPY libs ./libs
 
@@ -79,7 +79,7 @@ RUN set -euxo pipefail; \
     export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo CARGO_TARGET_DIR=/tmp/surgecore-target; \
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path; \
-    PATH="$CARGO_HOME/bin:$PATH" uv pip install ./libs/surgecore; \
+    PATH="$CARGO_HOME/bin:$PATH" uv pip install ./libs/surgecore ./libs/eyvan; \
     rm -rf "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR"
 
 # Install project deps

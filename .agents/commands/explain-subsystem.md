@@ -11,8 +11,9 @@ MPMD runtime, or ejkernel dispatch), grounded in the current tree.
 ## Ground Rules
 
 1. Start from `WORKSPACE.md`, `AGENTS.md`, and `.agents/repo-map.yaml` so all packages (`easydel`, `spectrax`,
-   `ejkernel`, `eformer`, `eray`, `surgecore`, and standalone `libs/esurge-dashboard`) are covered from the start. Then
-   read the live source code before explaining — reflect the code as it is today, not assumptions from similar systems.
+   `ejkernel`, `eformer`, `eray`, `surgecore`, `eyvan`, and standalone `libs/esurge-dashboard`) are covered from the
+   start. Then read the live source code before explaining — reflect the code as it is today, not assumptions from
+   similar systems.
 2. Structure the explanation as:
    - **(a) Ownership and layering**: what the subsystem owns and where it sits in the workspace layering contract.
    - **(b) Main flow**: step-by-step execution with concrete class/function names and repo-root-relative file paths.

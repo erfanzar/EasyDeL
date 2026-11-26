@@ -28,8 +28,8 @@ Operational invariants of `scripts/release.sh`:
 
 - **Clean tree required**: fails if `git status --porcelain` is non-empty (commit or stash first).
 - Maps `spectrax` to PyPI distribution `spectrax-lib` (the other 6 match their lib name).
-- On sibling releases (`!= easydel`), syncs exact `==` pins in `libs/easydel/pyproject.toml` when present while
-  preserving environment markers (e.g. `; sys_platform == 'linux'`); `eyvan` is not pinned in `libs/easydel/pyproject.toml`.
+- On sibling releases (`!= easydel`), syncs exact `==` pins in `libs/easydel/pyproject.toml` while preserving
+  environment markers (e.g. `; sys_platform == 'linux'`).
 - On `easydel` releases, refreshes `libs/easydel/README.md` from root `README.md`.
 - On Rust crates (`libs/surgecore/Cargo.toml`), bumps `[package] version` in `Cargo.toml` and the crate's own entry in
   `Cargo.lock` via `sed` (no `cargo` required for the bump).
@@ -41,7 +41,7 @@ Operational invariants of `scripts/release.sh`:
 ## Publish Order, `surgecore` Wheels, And `eyvan` Dashboard
 
 - **Mandatory publish order**: `libs/easydel/pyproject.toml` pins exact sibling versions (`eformer==`, `ejkernel==`,
-  `eray==`, `spectrax-lib==`, `surgecore==`). Any bumped pinned sibling MUST be published and available on PyPI
+  `eray==`, `eyvan==`, `spectrax-lib==`, `surgecore==`). Any bumped sibling MUST be published and available on PyPI
   **before** publishing an `easydel` release that pins it.
 - **`surgecore` CI pipeline** (`.github/workflows/publish.yaml`): pushing `surgecore-v*` skips the Python `uv build`
   job and runs `surgecore-wheels` (maturin `manylinux_2_28` for `x86_64` and `aarch64` plus macOS `arm64`, `abi3-py311`

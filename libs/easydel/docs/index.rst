@@ -13,6 +13,7 @@ Key Features
 - **Quantization and Bit Operations**: Supports various quantization methods including NF4, A8BIT, A8Q, and A4Q for optimized inference and training
 - **Performance Optimization**: Integrates FlashAttention, RingAttention, and other performance-enhancing features
 - **Model Conversion**: Supports automatic conversion between JAX-EasyDeL and PyTorch-HF models
+- **Fleet Capacity & Job Orchestration**: Ships with Eyvan (`eyvan`, `eyvan-server`, `eyvan-agent`, `eyvan-tracker`) for TPU/GPU fleet scheduling, spot reclamation recovery, and experiment tracking
 
 
 Fully Customizable and Hackable 🛠️

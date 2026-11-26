@@ -40,8 +40,8 @@ agent-authored PRs when the user asks.
 
 Flag only issues grounded in code, tests, or repo contracts:
 
-- **Layering violations**: any of `spectrax`, `ejkernel`, `eformer`, `eray`, or `surgecore` importing `easydel` or each
-  other (`[tool.importlinter]`).
+- **Layering violations**: any of `spectrax`, `ejkernel`, `eformer`, `eray`, `surgecore`, or `eyvan` importing `easydel`
+  or each other (`[tool.importlinter]`, plus `libs/eyvan/.importlinter` for eyvan internals).
 - **Registry / API bypasses**: `easydel` changes bypassing model/trainer/operation/cache/sharding/conversion registries.
 - **New `os.environ` knobs**: new env vars added instead of config dataclasses, ContextVars, or explicit setters.
 - **Trainer contract drift**: missing either `@Registry.register("trainer-arguments", ...)` or
@@ -83,8 +83,8 @@ ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu uv run pytest libs/surgecore/tests
 ```
 
 Computation tests run on the accelerator only (GPU: `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`); the CPU trio is
-for non-computation tests (`eray`, `surgecore`, parsers, config/CLI). Without an accelerator, report computation claims
-as **unverified on hardware** — never substitute a CPU run.
+for non-computation tests (`eray`, `surgecore`, `eyvan`, parsers, config/CLI). Without an accelerator, report
+computation claims as **unverified on hardware** — never substitute a CPU run.
 
 ## Output
 

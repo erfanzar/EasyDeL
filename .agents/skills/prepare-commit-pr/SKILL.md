@@ -57,17 +57,18 @@ ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu uv run pytest libs/surgecore/tests
 
 ## Release And Mirror Policy
 
-Version bumps for all 6 workspace packages go through:
+Version bumps for all 7 workspace packages go through:
 
 ```bash
-scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore> <new-version> [--dry-run]
+scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore|eyvan> <new-version> [--dry-run]
 ```
 
 Never hand-edit versions or sibling dependency pins — see `.agents/skills/release-workspace/SKILL.md` (including the
 mandatory sibling-before-`easydel` PyPI publish order).
 
-The 5 standalone mirrors (`spectrax` -> `erfanzar/Spectrax`, `ejkernel` -> `erfanzar/ejkernel`, `eformer` ->
-`erfanzar/eformer`, `eray` -> `erfanzar/eray`, `surgecore` -> `erfanzar/esurgecore`) sync via the pre-push hook:
+The 6 standalone mirrors (`spectrax` -> `erfanzar/Spectrax`, `ejkernel` -> `erfanzar/ejkernel`, `eformer` ->
+`erfanzar/eformer`, `eray` -> `erfanzar/eray`, `surgecore` -> `erfanzar/esurgecore`, `eyvan` -> `erfanzar/eyvan`) sync
+via the pre-push hook:
 
 ```bash
 DRY_RUN=1 scripts/subtree-sync.sh auto   # preview

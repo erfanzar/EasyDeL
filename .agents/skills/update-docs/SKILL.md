@@ -22,9 +22,10 @@ description: Update EasyDeL workspace documentation when APIs change — regener
     `ruff format` across every `.py` file in `libs/<lib>/<lib>/`.
   - Avoid `--test`: it invokes bare `pytest <test_dir> -v` without accelerator env vars (tripping `conftest.py`'s CPU
     guard on computation suites). Run tests via `.agents/skills/test-workspace/SKILL.md`.
-- **Packages without `docs/`**: `libs/eray` and `libs/surgecore` are not in `format_and_generate_docs.py` and have no
-  `docs/` tree — update `libs/eray/README.md`, `libs/surgecore/README.md`, and `libs/surgecore/surgecore/_native.pyi`
-  directly.
+- **Packages outside `format_and_generate_docs.py`**: `libs/eray` and `libs/surgecore` have no `docs/` tree — update
+  `libs/eray/README.md`, `libs/surgecore/README.md`, and `libs/surgecore/surgecore/_native.pyi` directly. `libs/eyvan`
+  manages its own Markdown docs under `libs/eyvan/docs/` (with `libs/eyvan/scripts/generate_api_reference.py` and
+  `libs/eyvan/scripts/enumerate_env_surface.py`).
 - **Hand-written package docs**:
   - `libs/easydel/docs/`: `infra/` (`adding_models.md`, `base_config.md`, `base_module.md`, `customization.md`,
     `elarge_model.md`, `indexers_and_hyper_connections.md`, `overview.md`, `tpu_training_optimizations.md`),
