@@ -143,6 +143,7 @@ class LoopTransformerMixin:
                         dtype=self.dtype,
                         param_dtype=self.param_dtype,
                         precision=self.precision,
+                        pass_index=it,
                         norm_cls=norm_cls,
                         rngs=rngs,
                     )

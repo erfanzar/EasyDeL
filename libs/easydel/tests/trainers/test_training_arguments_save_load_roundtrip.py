@@ -72,6 +72,8 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "weight_decay": 0.05,
         "param_lr_multipliers": {"loop_gates": 10.0, "loop_iter_embeddings": 10.0},
         "no_weight_decay_patterns": ["loop_gates", "loop_iter_embeddings"],
+        "optimizer_stochastic_rounding": True,
+        "optimizer_stochastic_rounding_seed": 777,
         "clip_grad": 1.5,
         "optimizer": EasyDeLOptimizers.LION,
         "scheduler": EasyDeLSchedulers.COSINE,

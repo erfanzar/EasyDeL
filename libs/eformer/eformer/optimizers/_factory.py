@@ -47,6 +47,7 @@ from ._tx import (
     build_path_exclusion_mask,
     optax_add_scheduled_weight_decay,
     optax_scale_by_path_multipliers,
+    optax_stochastic_round_updates,
 )
 
 TxConfigs = (
@@ -230,6 +231,8 @@ class OptimizerFactory:
         weight_decay_mask: tp.Any | None = None,
         no_weight_decay_patterns: tp.Sequence[str] | None = None,
         param_lr_multipliers: tp.Mapping[str, float] | None = None,
+        stochastic_rounding: bool = False,
+        stochastic_rounding_seed: int = 0,
         gradient_accumulation_steps: int = 1,
         clip_grad: float | None = None,
         custom_scheduler: tp.Callable[[int], optax.Schedule] | None = None,
@@ -299,7 +302,7 @@ class OptimizerFactory:
         builder.validate()
         base_optimizer = builder.build(scheduler)
 
-        # Build the full optimizer chain (clip, base optimizer, weight decay, path LR multipliers, multi-step)
+        # Build the full optimizer chain (clip, base optimizer, weight decay, path LR multipliers, SR, multi-step)
         return cls._build_optimizer_chain(
             builder=builder,
             base_optimizer=base_optimizer,
@@ -309,6 +312,8 @@ class OptimizerFactory:
             weight_decay_mask=weight_decay_mask,
             no_weight_decay_patterns=no_weight_decay_patterns,
             param_lr_multipliers=param_lr_multipliers,
+            stochastic_rounding=stochastic_rounding,
+            stochastic_rounding_seed=stochastic_rounding_seed,
             gradient_accumulation_steps=gradient_accumulation_steps,
             clip_grad=clip_grad,
         )
@@ -365,6 +370,8 @@ class OptimizerFactory:
         weight_decay_mask: tp.Any | None = None,
         no_weight_decay_patterns: tp.Sequence[str] | None = None,
         param_lr_multipliers: tp.Mapping[str, float] | None = None,
+        stochastic_rounding: bool = False,
+        stochastic_rounding_seed: int = 0,
         gradient_accumulation_steps: int = 1,
         clip_grad: float | None = None,
     ) -> tuple[optax.GradientTransformation, optax.Schedule]:
@@ -417,10 +424,21 @@ class OptimizerFactory:
         if param_lr_multipliers:
             chain.append(optax_scale_by_path_multipliers(param_lr_multipliers))
 
+        if stochastic_rounding:
+            chain.append(optax_stochastic_round_updates(seed=int(stochastic_rounding_seed)))
+
         tx = optax.chain(*chain)
 
         if gradient_accumulation_steps > 1:
             tx = optax.MultiSteps(tx, gradient_accumulation_steps)
+
+        if stochastic_rounding:
+            tx = make_unsupported_stage_local_gradient_transformation(
+                tx,
+                optimizer_type=optimizer_type,
+                reason="stochastic_rounding=True is not yet supported by stage-local MPMD optimizers.",
+            )
+            return tx, scheduler
 
         try:
             tx = builder.build_mpmd(

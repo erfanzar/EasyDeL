@@ -549,6 +549,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     weight_decay: NotRequired[float]
     param_lr_multipliers: NotRequired[dict[str, float] | None]
     no_weight_decay_patterns: NotRequired[list[str] | None]
+    optimizer_stochastic_rounding: NotRequired[bool]
+    optimizer_stochastic_rounding_seed: NotRequired[int]
     clip_grad: NotRequired[float | None]
     extra_optimizer_kwargs: NotRequired[dict]
     custom_scheduler: NotRequired[Any]

@@ -966,6 +966,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     loop_gate_type: NotRequired[str]
     loop_gate_init_biases: NotRequired[list[float] | tuple[float, ...] | None]
     loop_use_iteration_embedding: NotRequired[bool]
+    loop_gate_stochastic_rounding: NotRequired[bool]
     loop_kv_cache_mode: NotRequired[str]
     loop_kv_sliding_window: NotRequired[int]
     loop_kv_overlap: NotRequired[bool]
@@ -1688,6 +1689,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         loop_gate_type: str = "scalar",
         loop_gate_init_biases: list[float] | tuple[float, ...] | None = None,
         loop_use_iteration_embedding: bool = False,
+        loop_gate_stochastic_rounding: bool = False,
         loop_kv_cache_mode: str = "separate",
         loop_kv_sliding_window: int = 128,
         loop_kv_overlap: bool = True,
@@ -1900,6 +1902,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.loop_gate_init_biases = [float(v) for v in _raw_loop_biases] if _raw_loop_biases is not None else None
         self.loop_use_iteration_embedding = bool(
             getattr(self, "loop_use_iteration_embedding", loop_use_iteration_embedding)
+        )
+        self.loop_gate_stochastic_rounding = bool(
+            getattr(self, "loop_gate_stochastic_rounding", loop_gate_stochastic_rounding)
         )
         self.loop_kv_cache_mode = str(getattr(self, "loop_kv_cache_mode", loop_kv_cache_mode))
         self.loop_kv_sliding_window = int(getattr(self, "loop_kv_sliding_window", loop_kv_sliding_window))

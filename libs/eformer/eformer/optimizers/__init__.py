@@ -93,6 +93,12 @@ from ._stage_local import (
     StageLocalOptimizerMetadata,
     make_stage_local_gradient_transformation,
 )
+from ._tx import (
+    OptaxStochasticRoundingState,
+    optax_stochastic_round_updates,
+    stochastic_cast,
+    stochastic_cast_bf16_with_bits,
+)
 
 __all__ = (
     "AdafactorConfig",
@@ -109,6 +115,7 @@ __all__ = (
     "MarsOptimizer",
     "MuonConfig",
     "MuonOptimizer",
+    "OptaxStochasticRoundingState",
     "OptimizerBuilder",
     "OptimizerFactory",
     "QuadOptimizer",
@@ -125,6 +132,9 @@ __all__ = (
     "StageLocalOptimizerMetadata",
     "WhiteKronConfig",
     "make_stage_local_gradient_transformation",
+    "optax_stochastic_round_updates",
     "register_optimizer",
     "register_scheduler",
+    "stochastic_cast",
+    "stochastic_cast_bf16_with_bits",
 )

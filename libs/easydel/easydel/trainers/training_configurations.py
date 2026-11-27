@@ -851,6 +851,22 @@ class TrainingArguments:
             )
         },
     )
+    optimizer_stochastic_rounding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, applies unbiased IEEE/bitwise stochastic rounding when casting narrow-float "
+                "(e.g. bfloat16/float16) parameter updates inside the optimizer chain, preventing sub-ULP "
+                "update stagnation without requiring float32 master weights."
+            )
+        },
+    )
+    optimizer_stochastic_rounding_seed: int = field(
+        default=0,
+        metadata={
+            "help": "Base integer seed for optimizer stochastic rounding (folded with step count and leaf index)."
+        },
+    )
     log_all_workers: bool = field(
         default=False,
         metadata={"help": "Whether to log metrics from all workers in a distributed setup."},
@@ -2009,6 +2025,14 @@ class TrainingArguments:
             else:
                 self.no_weight_decay_patterns = [str(p) for p in self.no_weight_decay_patterns]
 
+        self.optimizer_stochastic_rounding = bool(self.optimizer_stochastic_rounding)
+        if not _is_real_int(self.optimizer_stochastic_rounding_seed):
+            raise TypeError(
+                "`optimizer_stochastic_rounding_seed` must be an int, got "
+                f"{type(self.optimizer_stochastic_rounding_seed).__name__}: {self.optimizer_stochastic_rounding_seed!r}"
+            )
+        self.optimizer_stochastic_rounding_seed = int(self.optimizer_stochastic_rounding_seed)
+
         if self.clip_grad is not None and not _is_real_number(self.clip_grad):
             raise TypeError(
                 f"`clip_grad` must be a number when provided, got {type(self.clip_grad).__name__}: {self.clip_grad!r}"
@@ -2309,6 +2333,8 @@ class TrainingArguments:
             weight_decay=optimizer_kwargs.pop("weight_decay"),
             no_weight_decay_patterns=self.no_weight_decay_patterns,
             param_lr_multipliers=self.param_lr_multipliers,
+            stochastic_rounding=self.optimizer_stochastic_rounding,
+            stochastic_rounding_seed=self.optimizer_stochastic_rounding_seed,
             custom_scheduler=self.custom_scheduler,
             **optimizer_kwargs,
         )
@@ -2743,7 +2769,9 @@ class TrainingArguments:
                 for key, value in metrics.items():
                     try:
                         if isinstance(value, float | int | np.floating | np.integer):
-                            summary_writer.add_scalar(key, float(value) if isinstance(value, np.floating) else value, step)
+                            summary_writer.add_scalar(
+                                key, float(value) if isinstance(value, np.floating) else value, step
+                            )
                         elif isinstance(value, tuple) and len(value) == 2:
                             bin_counts, bin_edges = value
                             if isinstance(bin_counts, list | np.ndarray | jax.Array) and isinstance(
@@ -2884,7 +2912,9 @@ class TrainingArguments:
 
             if field_name in cls._RUNTIME_ONLY_FIELDS and (
                 isinstance(value, str)
-                or (field_name == "watchers" and isinstance(value, list) and any(isinstance(item, str) for item in value))
+                or (
+                    field_name == "watchers" and isinstance(value, list) and any(isinstance(item, str) for item in value)
+                )
             ):
                 continue
 
@@ -2968,9 +2998,7 @@ class TrainingArguments:
                 if class_name == cls.__name__:
                     resolved_cls = cls
                 else:
-                    raise ValueError(
-                        f"We couldn't clarify the trainer config class {class_name!r} from provided json."
-                    )
+                    raise ValueError(f"We couldn't clarify the trainer config class {class_name!r} from provided json.")
             cls = resolved_cls
         return cls.from_dict(config_dict)
 

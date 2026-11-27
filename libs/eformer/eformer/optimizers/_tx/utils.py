@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import functools
 import re
 import typing as tp
 import warnings
@@ -115,6 +116,188 @@ def optax_scale_by_path_multipliers(
 
         scaled = jax.tree_util.tree_map_with_path(_scale_leaf, updates)
         return scaled, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _stochastic_cast_bf16_bits_impl(x_f32: jax.Array, rand16: jax.Array) -> jax.Array:
+    """Exact IEEE-754 float32 -> bfloat16 stochastic rounding given uint32 ``rand16`` in ``[0, 65535]``.
+
+    Adds ``rand16`` into the low 16 discarded mantissa bits of the sign-magnitude float32
+    representation and truncates bits ``0..15``. Carries into bit 16 with exact probability
+    ``(bits & 0xFFFF) / 65536`` across every normal, subnormal, power-of-2, positive, and
+    negative finite value while never perturbing exact zeros or already-exact bfloat16 values.
+    """
+    u = jax.lax.bitcast_convert_type(x_f32, jnp.uint32)
+    rounded_u = (u + (rand16.astype(jnp.uint32) & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000)
+    rounded_bf16 = jax.lax.bitcast_convert_type(rounded_u, jnp.float32).astype(jnp.bfloat16)
+    return jnp.where(jnp.isfinite(x_f32), rounded_bf16, x_f32.astype(jnp.bfloat16))
+
+
+@jax.custom_vjp
+def stochastic_cast_bf16_with_bits(x: jax.Array, rand16: jax.Array) -> jax.Array:
+    """Stochastically cast ``x`` to ``bfloat16`` using caller-supplied 16-bit uniform bits (STE backward)."""
+    return _stochastic_cast_bf16_bits_impl(jnp.asarray(x, dtype=jnp.float32), rand16)
+
+
+def _stochastic_cast_bf16_with_bits_fwd(x: jax.Array, rand16: jax.Array):
+    x_arr = jnp.asarray(x)
+    out = _stochastic_cast_bf16_bits_impl(x_arr.astype(jnp.float32), rand16)
+    return out, jnp.empty((), dtype=x_arr.dtype)
+
+
+def _stochastic_cast_bf16_with_bits_bwd(x_proto: jax.Array, g: jax.Array):
+    return g.astype(x_proto.dtype), None
+
+
+stochastic_cast_bf16_with_bits.defvjp(_stochastic_cast_bf16_with_bits_fwd, _stochastic_cast_bf16_with_bits_bwd)
+
+
+def _stochastic_cast_impl(x: jax.Array, dtype: jnp.dtype, key: jax.Array) -> jax.Array:
+    """Unbiased stochastic rounding from wider floats into ``dtype``."""
+    target_dtype = jnp.dtype(dtype)
+    if not jnp.issubdtype(target_dtype, jnp.floating):
+        raise ValueError(f"stochastic_cast requires a floating-point target dtype, got {target_dtype.name}.")
+
+    x_arr = jnp.asarray(x)
+    if jnp.finfo(target_dtype).bits >= 32:
+        return x_arr.astype(target_dtype)
+
+    x_f32 = x_arr.astype(jnp.float32)
+
+    if target_dtype == jnp.bfloat16:
+        rand16 = jax.random.bits(key, x_f32.shape, dtype=jnp.uint32) >> jnp.uint32(16)
+        return _stochastic_cast_bf16_bits_impl(x_f32, rand16)
+
+    if target_dtype == jnp.float16:
+        x_rt_narrow = x_f32.astype(target_dtype)
+        x_rt = x_rt_narrow.astype(jnp.float32)
+        direction = jnp.where(x_f32 >= x_rt, jnp.inf, -jnp.inf).astype(target_dtype)
+        neighbor = jnp.nextafter(x_rt_narrow, direction).astype(jnp.float32)
+        lo = jnp.minimum(x_rt, neighbor)
+        hi = jnp.maximum(x_rt, neighbor)
+        span = hi - lo
+        safe_span = jnp.where(span > 0.0, span, 1.0)
+        prob_hi = jnp.where(span > 0.0, (x_f32 - lo) / safe_span, 0.0)
+        u01 = jax.random.uniform(key, x_f32.shape, dtype=jnp.float32)
+        rounded = jnp.where(u01 < prob_hi, hi, lo).astype(target_dtype)
+        valid = jnp.isfinite(x_f32) & jnp.isfinite(lo) & jnp.isfinite(hi)
+        return jnp.where(valid, rounded, x_rt_narrow)
+
+    # General narrow floats (e.g. float8_e4m3fn / float8_e5m2): exact bin ULP = 2^floor(log2(|x|)) * eps.
+    finfo = jnp.finfo(target_dtype)
+    tiny = float(finfo.tiny)
+    eps = float(finfo.eps)
+    abs_x = jnp.abs(x_f32)
+    ulp = jnp.where(abs_x >= tiny, jnp.exp2(jnp.floor(jnp.log2(jnp.maximum(abs_x, tiny)))) * eps, tiny * eps)
+    noise = jax.random.uniform(key, x_f32.shape, dtype=jnp.float32, minval=-0.5, maxval=0.5)
+    rounded = (x_f32 + noise * ulp).astype(target_dtype)
+    return jnp.where(jnp.isfinite(x_f32), rounded, x_f32.astype(target_dtype))
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _stochastic_cast_ste(x: jax.Array, key: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    return _stochastic_cast_impl(x, dtype, key)
+
+
+def _stochastic_cast_ste_fwd(x: jax.Array, key: jax.Array, dtype: jnp.dtype):
+    x_arr = jnp.asarray(x)
+    return _stochastic_cast_impl(x_arr, dtype, key), jnp.empty((), dtype=x_arr.dtype)
+
+
+def _stochastic_cast_ste_bwd(dtype: jnp.dtype, x_proto: jax.Array, g: jax.Array):
+    del dtype
+    return g.astype(x_proto.dtype), None
+
+
+_stochastic_cast_ste.defvjp(_stochastic_cast_ste_fwd, _stochastic_cast_ste_bwd)
+
+
+def stochastic_cast(x: jax.Array, dtype: tp.Any, key: jax.Array) -> jax.Array:
+    """Stochastically round ``x`` to floating-point ``dtype`` with STE backward support.
+
+    For ``bfloat16``, uses exact IEEE-754 bitwise 16-bit stochastic rounding (zero
+    perturbation on exact bfloat16 values, exact probability ``frac / 65536`` across
+    normals, subnormals, power-of-2 boundaries, and signed values). For ``float16``,
+    uses exact ``jnp.nextafter`` bracketing. For narrower floats (``float8_*``), uses
+    bin-exact ``2^floor(log2(|x|)) * eps`` ULP dither.
+
+    Args:
+        x: Input array (typically float32).
+        dtype: Target floating-point dtype.
+        key: JAX PRNG key.
+
+    Returns:
+        Array cast to ``dtype`` with unbiased expectation ``E[stochastic_cast(x)] = x``.
+    """
+    target_dtype = jnp.dtype(dtype)
+    if not jnp.issubdtype(target_dtype, jnp.floating):
+        raise ValueError(f"stochastic_cast requires a floating-point target dtype, got {target_dtype.name}.")
+    return _stochastic_cast_ste(jnp.asarray(x), key, target_dtype)
+
+
+class OptaxStochasticRoundingState(tp.NamedTuple):
+    """Minimal 4-byte step counter state for :func:`optax_stochastic_round_updates`."""
+
+    count: chex.Array
+
+
+def optax_stochastic_round_updates(seed: int = 0) -> optax.GradientTransformation:
+    """Quantize narrow-float parameter updates via unbiased stochastic rounding.
+
+    Sits at the end of an Optax chain (inside :class:`optax.MultiSteps` when gradient
+    accumulation is active). For every narrow-float parameter leaf (e.g. ``bfloat16``
+    or ``float16``, where ``finfo(dtype).bits < 32``), computes the exact float32 target
+    ``p_f32 + u_f32``, applies :func:`stochastic_cast` into ``p.dtype``, and returns
+    ``delta = p_new.astype(float32) - p_f32`` so ``optax.apply_updates(params, updates)``
+    lands on ``p_new`` bit-for-bit without needing FP32 master weights.
+
+    Full-precision leaves (``float32`` / ``float64``) pass through untouched. Uses a
+    deterministic counter-based key folded by ``(seed, step, leaf_index)`` so sharded
+    FSDP/TP parameters generate chip-local random bits with zero cross-device communication.
+
+    Args:
+        seed: Base integer seed folded with step count and leaf index.
+
+    Returns:
+        An ``optax.GradientTransformation`` carrying only a scalar ``int32`` step counter.
+    """
+    base_seed = int(seed)
+
+    def init_fn(params: chex.ArrayTree) -> OptaxStochasticRoundingState:
+        del params
+        return OptaxStochasticRoundingState(count=jnp.zeros((), dtype=jnp.int32))
+
+    def update_fn(
+        updates: chex.ArrayTree,
+        state: OptaxStochasticRoundingState,
+        params: chex.ArrayTree | None = None,
+    ) -> tuple[chex.ArrayTree, OptaxStochasticRoundingState]:
+        if params is None:
+            raise ValueError("Params cannot be None for optax_stochastic_round_updates!")
+
+        step_key = jax.random.fold_in(jax.random.key(base_seed), state.count)
+        u_leaves, treedef = jax.tree_util.tree_flatten(updates, is_leaf=lambda x: x is None)
+        p_leaves = jax.tree_util.tree_leaves(params, is_leaf=lambda x: x is None)
+
+        new_leaves: list[tp.Any] = []
+        for idx, (u_leaf, p_leaf) in enumerate(zip(u_leaves, p_leaves, strict=True)):
+            if u_leaf is None or p_leaf is None:
+                new_leaves.append(u_leaf)
+                continue
+            p_arr = jnp.asarray(p_leaf)
+            if not jnp.issubdtype(p_arr.dtype, jnp.floating) or jnp.finfo(p_arr.dtype).bits >= 32:
+                new_leaves.append(u_leaf)
+                continue
+            leaf_key = jax.random.fold_in(step_key, idx)
+            p_f32 = p_arr.astype(jnp.float32)
+            target_f32 = p_f32 + jnp.asarray(u_leaf, dtype=jnp.float32)
+            p_new = _stochastic_cast_impl(target_f32, p_arr.dtype, leaf_key)
+            # Returning fp32 delta makes optax.apply_updates(p, delta) == p_new bit-exact.
+            new_leaves.append(p_new.astype(jnp.float32) - p_f32)
+
+        rounded_updates = jax.tree_util.tree_unflatten(treedef, new_leaves)
+        return rounded_updates, OptaxStochasticRoundingState(count=optax.safe_int32_increment(state.count))
 
     return optax.GradientTransformation(init_fn, update_fn)
 

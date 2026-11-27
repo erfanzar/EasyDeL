@@ -28,6 +28,7 @@ from easydel.modules.qwen3_next.modeling_qwen3_next import compute_loop_gate_sta
 
 def _make_tiny_qwen3_5_text_config(
     *,
+    hidden_size: int = 64,
     num_hidden_layers: int = 12,
     loop_start_layer: int | None = None,
     loop_end_layer: int | None = None,
@@ -35,14 +36,16 @@ def _make_tiny_qwen3_5_text_config(
     loop_gate_type: str = "scalar",
     loop_gate_init_biases: tuple[float, ...] | None = None,
     loop_use_iteration_embedding: bool = False,
+    loop_gate_stochastic_rounding: bool = False,
     loop_kv_cache_mode: str = "separate",
     loop_kv_sliding_window: int = 128,
     loop_kv_overlap: bool = True,
+    sharding_axis_dims: tuple[int, ...] = (1, -1, 1, 1, 1, 1),
 ) -> ed.Qwen3_5TextConfig:
     return ed.Qwen3_5TextConfig(
         vocab_size=256,
-        hidden_size=64,
-        intermediate_size=128,
+        hidden_size=hidden_size,
+        intermediate_size=max(128, hidden_size * 2),
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -61,13 +64,14 @@ def _make_tiny_qwen3_5_text_config(
         attn_dtype=jnp.float32,
         kvdtype=jnp.float32,
         scan_layers=False,
-        sharding_axis_dims=(1, 1, 1, 1, 1, 1),
+        sharding_axis_dims=sharding_axis_dims,
         loop_start_layer=loop_start_layer,
         loop_end_layer=loop_end_layer,
         num_loop_iterations=num_loop_iterations,
         loop_gate_type=loop_gate_type,
         loop_gate_init_biases=loop_gate_init_biases,
         loop_use_iteration_embedding=loop_use_iteration_embedding,
+        loop_gate_stochastic_rounding=loop_gate_stochastic_rounding,
         loop_kv_cache_mode=loop_kv_cache_mode,
         loop_kv_sliding_window=loop_kv_sliding_window,
         loop_kv_overlap=loop_kv_overlap,
@@ -633,6 +637,146 @@ def test_differential_gate_lr_and_no_weight_decay_optimizer():
     assert isinstance(st_diff_0[-1], optax.EmptyState)
 
 
+def test_loop_gate_stochastic_rounding_preserves_sub_ulp_and_eval_determinism():
+    """Verify LoopGate(stochastic_rounding=True) preserves sub-ULP BF16 updates, STE grads, and eval determinism."""
+    from easydel.layers.loop import LoopGate
+
+    cfg = _make_tiny_qwen3_5_text_config(
+        hidden_size=256,
+        num_hidden_layers=8,
+        loop_start_layer=2,
+        loop_end_layer=6,
+        num_loop_iterations=2,
+        loop_gate_type="channel",
+        loop_gate_init_biases=(-5.0, 5.0),
+        loop_gate_stochastic_rounding=True,
+    )
+    gate_sr = LoopGate(
+        config=cfg,
+        init_bias=-5.0,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        pass_index=0,
+        stochastic_rounding=True,
+        rngs=spx.Rngs(7),
+    )
+    gate_rtn = LoopGate(
+        config=cfg,
+        init_bias=-5.0,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        pass_index=0,
+        stochastic_rounding=False,
+        rngs=spx.Rngs(7),
+    )
+
+    # With bias=-5.0 (beta ~= 0.00669) and delta = +0.25 on x_prev = 1.0:
+    # beta * delta ~= +0.00167 < half BF16 ULP (0.003906), so deterministic RTN drops 100% of updates!
+    x_prev = jnp.ones((8, 64, 256), dtype=jnp.bfloat16)
+    h_cand = jnp.full((8, 64, 256), 1.25, dtype=jnp.bfloat16)
+    expected_delta = float(jax.nn.sigmoid(-5.0)) * 0.25
+
+    gate_sr.train()
+    gate_rtn.train()
+    out_rtn = gate_rtn(x_prev, h_cand)
+    out_sr = gate_sr(x_prev, h_cand, rng_key=jax.random.key(19))
+    out_sr_auto = gate_sr(x_prev, h_cand)
+
+    assert out_sr.dtype == jnp.bfloat16 and out_sr_auto.dtype == jnp.bfloat16
+    assert float(jnp.max(jnp.abs(out_rtn.astype(jnp.float32) - 1.0))) == 0.0
+    assert abs(float(jnp.mean(out_sr.astype(jnp.float32) - 1.0)) - expected_delta) < 2e-4
+    assert abs(float(jnp.mean(out_sr_auto.astype(jnp.float32) - 1.0)) - expected_delta) < 3e-4
+
+    # Eval mode must be strictly deterministic and match RTN exactly.
+    gate_sr.eval()
+    out_eval = gate_sr(x_prev, h_cand)
+    assert bool(jnp.array_equal(out_eval, out_rtn))
+
+    # STE backward through stochastic_rounding produces finite, non-zero grads into inputs & gate params.
+    gate_sr.train()
+    g_params = spx.grad(lambda m: jnp.mean(m(x_prev, h_cand).astype(jnp.float32) ** 2))(gate_sr)
+    g_x, g_h = jax.grad(
+        lambda xp, hc: jnp.mean(gate_sr(xp, hc).astype(jnp.float32) ** 2),
+        argnums=(0, 1),
+    )(x_prev, h_cand)
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree_util.tree_leaves(g_params))
+    assert bool(jnp.all(jnp.isfinite(g_x))) and float(jnp.max(jnp.abs(g_h))) > 0.0
+
+
+def test_training_arguments_optimizer_stochastic_rounding_end_to_end():
+    """Verify TrainingArguments.optimizer_stochastic_rounding unfreezes BF16 LoopGate weights at lr=3e-5."""
+    import optax
+    from easydel.trainers.training_configurations import TrainingArguments
+
+    cfg = _make_tiny_qwen3_5_text_config(
+        num_hidden_layers=8,
+        loop_start_layer=2,
+        loop_end_layer=6,
+        num_loop_iterations=2,
+        loop_gate_type="channel",
+        loop_gate_init_biases=(-3.0, 3.0),
+        loop_use_iteration_embedding=True,
+        loop_gate_stochastic_rounding=True,
+    )
+    model = ed.Qwen3_5ForCausalLM(cfg, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(55))
+    _, params, _ = model.split_module()
+
+    sr_args = TrainingArguments(
+        optimizer="adamw",
+        scheduler="none",
+        learning_rate=3e-5,
+        weight_decay=0.01,
+        clip_grad=None,
+        max_training_steps=200,
+        param_lr_multipliers={"loop_gates": 10.0, "loop_iter_embeddings": 10.0},
+        no_weight_decay_patterns=["loop_gates", "loop_iter_embeddings"],
+        optimizer_stochastic_rounding=True,
+        optimizer_stochastic_rounding_seed=101,
+    )
+    rtn_args = TrainingArguments(
+        optimizer="adamw",
+        scheduler="none",
+        learning_rate=3e-5,
+        weight_decay=0.01,
+        clip_grad=None,
+        max_training_steps=200,
+        param_lr_multipliers={"loop_gates": 10.0, "loop_iter_embeddings": 10.0},
+        no_weight_decay_patterns=["loop_gates", "loop_iter_embeddings"],
+        optimizer_stochastic_rounding=False,
+    )
+    tx_sr, _ = sr_args.get_optimizer_and_scheduler(200)
+    tx_rtn, _ = rtn_args.get_optimizer_and_scheduler(200)
+
+    grads = jax.tree_util.tree_map(lambda x: jnp.ones_like(x, dtype=jnp.bfloat16), params)
+
+    def _run_steps(tx, p0, g_const):
+        st = tx.init(p0)
+
+        @jax.jit
+        def _scan_steps(p_init, s_init, g_in):
+            def _step(carry, _):
+                p, s = carry
+                u, s = tx.update(g_in, s, p)
+                return (optax.apply_updates(p, u), s), None
+
+            (p_end, _), _ = jax.lax.scan(_step, (p_init, s_init), None, length=100)
+            return p_end
+
+        return _scan_steps(p0, st, g_const)
+
+    p_rtn = _run_steps(tx_rtn, params, grads)
+    p_sr = _run_steps(tx_sr, params, grads)
+
+    flat_0 = {str(k): np.asarray(v.astype(jnp.float32)) for k, v in params.flatten().items()}
+    flat_rtn = {str(k): np.asarray(v.astype(jnp.float32)) for k, v in p_rtn.flatten().items()}
+    flat_sr = {str(k): np.asarray(v.astype(jnp.float32)) for k, v in p_sr.flatten().items()}
+
+    bias_key = next(k for k in flat_0 if k.endswith("loop_gates.0.proj.bias"))
+    # Gate bias=-3.0 has half-ULP 0.0078 >> 3e-4 step: RTN stays frozen at -3.0, SR moves ~ -0.03!
+    assert float(np.max(np.abs(flat_rtn[bias_key] - flat_0[bias_key]))) == 0.0
+    assert float(np.mean(flat_sr[bias_key] - flat_0[bias_key])) < -0.015
+
+
 def test_compute_loop_gate_stats_knockout_identity_and_active():
     """Verify Loop-Knockout deltas are ~0 at identity init and finite/non-zero when Pass-1 gate is open."""
     tokens = jnp.asarray([[2, 9, 17, 33, 45, 11, 7, 29]], dtype=jnp.int32)
@@ -752,9 +896,7 @@ def test_upgraded_loop_state_sharded_on_mesh_and_elarge_teacher_isolation(tmp_pa
         mesh_devices = set(student.mesh.jax_mesh.devices.flat)
         _, params, _ = student.split_module()
         loop_leaves = {
-            str(k): v
-            for k, v in params.flatten().items()
-            if "loop_gates" in str(k) or "loop_iter_embeddings" in str(k)
+            str(k): v for k, v in params.flatten().items() if "loop_gates" in str(k) or "loop_iter_embeddings" in str(k)
         }
         assert len(loop_leaves) == 9  # 2 gates x (x_norm, delta_norm, proj.weight, proj.bias) + loop_iter_embeddings
         for k, arr in loop_leaves.items():
@@ -1036,7 +1178,9 @@ def test_loop_scanned_block_scan_matches_unrolled_fwd_and_grads():
         uf = u_grads.flatten()
         sf = s_grads.flatten()
         for k in uf:
-            np.testing.assert_allclose(np.asarray(sf[k]), np.asarray(uf[k]), rtol=1e-3, atol=1e-3, err_msg=f"{kv_mode}: {k}")
+            np.testing.assert_allclose(
+                np.asarray(sf[k]), np.asarray(uf[k]), rtol=1e-3, atol=1e-3, err_msg=f"{kv_mode}: {k}"
+            )
 
 
 @pytest.mark.cpu_ok
@@ -1074,7 +1218,11 @@ def test_dual_stream_ragged_page_attn_registry_isolation_and_esurge_specs():
 
     # Layering hygiene: EasyDeL adapter must never import private ejkernel.kernels._* or Pallas directly.
     adapter_src = (
-        Path(__file__).resolve().parents[2] / "easydel" / "operations" / "kernels" / "dual_stream_ragged_page_attention.py"
+        Path(__file__).resolve().parents[2]
+        / "easydel"
+        / "operations"
+        / "kernels"
+        / "dual_stream_ragged_page_attention.py"
     ).read_text()
     for forbidden in ("ejkernel.kernels.", "_pallas", "_xla", "_triton", "pallas_call", "jax.experimental.pallas"):
         assert forbidden not in adapter_src, f"Forbidden private/backend import {forbidden!r} in EasyDeL adapter"
