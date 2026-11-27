@@ -15,6 +15,7 @@ from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.records import (
     CallableExecution,
     CapacityClass,
+    CrossRegionTransferPolicy,
     PriorityBand,
     TpuChipRequest,
     WorkloadSetup,
@@ -63,6 +64,7 @@ def pool_workload_request(
     tpu_chips: TpuChipRequest | None = None,
     setup: WorkloadSetup | None = None,
     reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
@@ -71,6 +73,8 @@ def pool_workload_request(
         optional_fields["setup"] = setup
     if reclaim_policy is not None and "reclaim_policy" in PoolWorkloadSubmitRequest.model_fields:
         optional_fields["reclaim_policy"] = reclaim_policy
+    if cross_region_transfer_policy is not None:
+        optional_fields["cross_region_transfer_policy"] = cross_region_transfer_policy
     return PoolWorkloadSubmitRequest(
         **optional_fields,
         org_id=org_id,
@@ -128,6 +132,7 @@ def pool_callable_request(
     tpu_chips: TpuChipRequest | None = None,
     setup: WorkloadSetup | None = None,
     reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload.
 
@@ -143,6 +148,8 @@ def pool_callable_request(
         optional_fields["setup"] = setup
     if reclaim_policy is not None and "reclaim_policy" in PoolCallableSubmitRequest.model_fields:
         optional_fields["reclaim_policy"] = reclaim_policy
+    if cross_region_transfer_policy is not None:
+        optional_fields["cross_region_transfer_policy"] = cross_region_transfer_policy
     return PoolCallableSubmitRequest(
         **optional_fields,
         org_id=org_id,

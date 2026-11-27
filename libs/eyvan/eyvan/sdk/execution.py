@@ -34,7 +34,7 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfileStore,
 )
 from eyvan.capacity.providers.gcp.runtime.supervisor import ensure_gcp_native_runtime, runtime_profile_path_for
-from eyvan.records import CapacityClass
+from eyvan.records import CapacityClass, CrossRegionTransferPolicy
 from eyvan.sdk.client.callables import EyvanCallableSubmitter
 from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
@@ -55,6 +55,7 @@ from eyvan.sdk.client.jobs import (
     SetupValue,
     TpuConfig,
     format_reclaim_status,
+    normalize_cross_region_transfer_policy,
     placement_error_labels,
     reject_remote_callable_signing_key,
     with_reclaim_options,
@@ -858,6 +859,23 @@ def _resolve_capacity_class(value: CapacityClass | str) -> CapacityClass:
     raise ValueError("capacity_class must be a CapacityClass or string name")
 
 
+def _resolve_cross_region_transfer_option(
+    *,
+    ban_cross_region_transfer: bool,
+    cross_region_transfer: CrossRegionTransferPolicy | str | None,
+) -> CrossRegionTransferPolicy | None:
+    """Resolve ``ban_cross_region_transfer`` and ``cross_region_transfer`` kwargs on ``execute()``."""
+
+    if not isinstance(ban_cross_region_transfer, bool):
+        raise ValueError("ban_cross_region_transfer must be a boolean")
+    resolved = normalize_cross_region_transfer_policy(cross_region_transfer, label="execute")
+    if ban_cross_region_transfer:
+        if resolved is not None and resolved is not CrossRegionTransferPolicy.BAN:
+            raise ValueError(f"ban_cross_region_transfer=True conflicts with cross_region_transfer={resolved.value!r}")
+        return CrossRegionTransferPolicy.BAN
+    return resolved
+
+
 def execute(
     config: AcceleratorConfig | str,
     *,
@@ -869,6 +887,8 @@ def execute(
     fleet: str | None = None,
     reclaim_grace_seconds: int | None = None,
     reclaim_policy: ReclaimPolicy | None = None,
+    ban_cross_region_transfer: bool = False,
+    cross_region_transfer: CrossRegionTransferPolicy | str | None = None,
 ) -> tp.Callable[[tp.Callable[P, R]], Executable[P, R]]:
     """Decorate a function for durable, scale-from-zero Eyvan execution.
 
@@ -899,6 +919,10 @@ def execute(
     ``reclaim_grace_seconds`` and ``reclaim_policy`` override the config's
     reclaim settings when provided (defaulting to a 600-second checkpoint
     grace window and ``"requeue"`` policy).
+
+    ``ban_cross_region_transfer=True`` (or ``cross_region_transfer="ban"`` /
+    ``"warn"`` / ``"allow"``) sets the per-workload cross-region GCS transfer
+    policy forwarded onto the submitted workload spec.
     """
 
     normalized_fleet: str | None = None
@@ -906,6 +930,11 @@ def execute(
         if not isinstance(fleet, str) or not fleet.strip():
             raise ValueError("fleet must be a non-empty string")
         normalized_fleet = fleet.strip()
+
+    resolved_cross_region_policy = _resolve_cross_region_transfer_option(
+        ban_cross_region_transfer=ban_cross_region_transfer,
+        cross_region_transfer=cross_region_transfer,
+    )
 
     if isinstance(config, str):
         if isinstance(packages, (str, bytes)) or not isinstance(packages, tp.Sequence):
@@ -923,6 +952,8 @@ def execute(
             tpu_kwargs["reclaim_grace_seconds"] = reclaim_grace_seconds
         if reclaim_policy is not None:
             tpu_kwargs["reclaim_policy"] = reclaim_policy
+        if resolved_cross_region_policy is not None:
+            tpu_kwargs["cross_region_transfer_policy"] = resolved_cross_region_policy
         resolved_config = tp.cast(AcceleratorConfig, TpuConfig(**tpu_kwargs))
     else:
         # A class object satisfies the protocol's attribute check as readily as an
@@ -952,6 +983,7 @@ def execute(
             config,
             reclaim_grace_seconds=reclaim_grace_seconds,
             reclaim_policy=reclaim_policy,
+            cross_region_transfer_policy=resolved_cross_region_policy,
         )
 
     def decorate(fn: tp.Callable[P, R]) -> Executable[P, R]:

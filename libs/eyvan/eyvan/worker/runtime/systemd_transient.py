@@ -41,6 +41,11 @@ from eyvan.capacity.drivers.base import (
 )
 from eyvan.secrets import redact_secret_material
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
+from eyvan.worker.runtime._multihost_site import (
+    CROSS_REGION_TRANSFER_BANNED_EXIT_CODE,
+    CROSS_REGION_TRANSFER_BANNED_REASON,
+    extract_cross_region_ban_marker,
+)
 from eyvan.worker.runtime.log_records import LogPage, parse_journal_json
 from eyvan.worker.runtime.preemption import (
     CHECKPOINT_RECEIPT_PATH_ENV,
@@ -1395,15 +1400,33 @@ class SystemdTransientServiceExecutor:
         if active == "inactive":
             if stop_requested:
                 return ExecutionWorkloadStatus.STOPPED, "systemd service stopped by Eyvan"
+            if main_status.strip() == str(CROSS_REGION_TRANSFER_BANNED_EXIT_CODE):
+                return self._cross_region_banned(record)
             if result in {"", "success"} and main_status in {"", "0"}:
                 return self._failed(record, "systemd service became inactive before Eyvan observed completion")
             return self._failed(record, f"systemd service exited with result {result or 'unknown'}")
         if active == "failed":
             if stop_requested:
                 return ExecutionWorkloadStatus.STOPPED, "systemd service stopped by Eyvan"
+            if main_status.strip() == str(CROSS_REGION_TRANSFER_BANNED_EXIT_CODE):
+                return self._cross_region_banned(record)
             return self._failed(record, f"systemd service failed with result {result or 'unknown'}")
         return ExecutionWorkloadStatus.INDETERMINATE, (
             f"systemd service reported unexpected ActiveState={active or 'missing'}"
+        )
+
+    def _cross_region_banned(self, record: tp.Mapping[str, JsonValue]) -> tuple[ExecutionWorkloadStatus, str]:
+        """Format a canonical exit-95 cross-region transfer ban diagnostic from unit logs."""
+
+        unit_name = record.get("unit_name")
+        tail = self._failure_journal_reader(unit_name) if isinstance(unit_name, str) and unit_name else None
+        detail = extract_cross_region_ban_marker(tail)
+        if detail:
+            return ExecutionWorkloadStatus.FAILED, f"{CROSS_REGION_TRANSFER_BANNED_REASON}: {detail}"
+        return (
+            ExecutionWorkloadStatus.FAILED,
+            f"{CROSS_REGION_TRANSFER_BANNED_REASON}: workload terminated with exit code "
+            f"{CROSS_REGION_TRANSFER_BANNED_EXIT_CODE}",
         )
 
     def _failed(self, record: tp.Mapping[str, JsonValue], message: str) -> tuple[ExecutionWorkloadStatus, str]:
@@ -2485,6 +2508,9 @@ class SystemdTransientServiceExecutor:
         # live training coordinator already holds. `without_distributed_topology_overrides`
         # is the same filter the slice applies before injecting its own values.
         environment = without_distributed_topology_overrides(source_environment)
+        for key, value in source_environment.items():
+            if key == "EYVAN_HOST_REGION" or key.startswith("EYVAN_CROSS_REGION_"):
+                environment[key] = value
         rank = _checkpoint_rank(source_environment)
         if rank is not None:
             environment["EYVAN_CHECKPOINT_RANK"] = str(rank)
@@ -2606,6 +2632,9 @@ class SystemdTransientServiceExecutor:
         # address would make this process try to join a cluster it is only
         # meant to look at.
         environment = without_distributed_topology_overrides(source_environment)
+        for key, value in source_environment.items():
+            if key == "EYVAN_HOST_REGION" or key.startswith("EYVAN_CROSS_REGION_"):
+                environment[key] = value
         environment["EYVAN_SOURCE_JOB_ID"] = remote_id
         control_group = source.get("control_group")
         if isinstance(control_group, str) and control_group:

@@ -2770,6 +2770,7 @@ def create_app(
             dependencies=request.dependencies,
             tpu_chips=request.tpu_chips,
             setup=request.setup,
+            cross_region_transfer_policy=request.cross_region_transfer_policy,
             idempotency_key=idempotency_key,
         )
         if replayed:
@@ -2828,6 +2829,7 @@ def create_app(
             atomic=request.atomic,
             tpu_chips=request.tpu_chips,
             setup=request.setup,
+            cross_region_transfer_policy=request.cross_region_transfer_policy,
             idempotency_key=idempotency_key,
         )
         if replayed:

@@ -27,6 +27,7 @@ from eyvan.records import (
     AuditEvent,
     CapacityClass,
     CommandExecution,
+    CrossRegionTransferPolicy,
     PriorityBand,
     ResourceGang,
     ResourceVector,
@@ -129,6 +130,24 @@ def _chip_request(chips: int | None, chip_indexes: tp.Sequence[int]) -> TpuChipR
     indexes = tuple(chip_indexes) if chip_indexes else None
     count = chips if chips is not None else len(chip_indexes)
     return TpuChipRequest(count=count, indexes=indexes)
+
+
+def _resolve_cross_region_policy_option(
+    *,
+    cross_region_transfer: str | None,
+    ban_cross_region_transfer: bool,
+) -> CrossRegionTransferPolicy | None:
+    """Resolve CLI cross-region transfer flags, rejecting conflicting combinations."""
+
+    if ban_cross_region_transfer:
+        if cross_region_transfer is not None and cross_region_transfer != CrossRegionTransferPolicy.BAN.value:
+            raise click.UsageError(
+                f"--ban-cross-region-transfer conflicts with --cross-region-transfer {cross_region_transfer}"
+            )
+        return CrossRegionTransferPolicy.BAN
+    if cross_region_transfer is not None:
+        return CrossRegionTransferPolicy(cross_region_transfer)
+    return None
 
 
 def _requirements(declared: tp.Sequence[str], path: Path | None) -> tuple[str, ...]:
@@ -410,6 +429,7 @@ class WorkloadCommandService:
         chip_indexes: tuple[int, ...] = (),
         secret_mounts: tuple[str, ...] = (),
         setup: WorkloadSetup | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
     ) -> int:
         """Submit one pool-targeted command using context and fleet defaults.
 
@@ -453,6 +473,7 @@ class WorkloadCommandService:
                 dependencies=dependencies,
                 tpu_chips=_chip_request(chips, chip_indexes),
                 setup=setup,
+                cross_region_transfer_policy=cross_region_transfer_policy,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -1057,6 +1078,18 @@ class WorkloadCommandService:
     help="A large input this job pulls, so cells that recently pulled it are preferred. A hint, never a pin.",
 )
 @click.option(
+    "--cross-region-transfer",
+    type=click.Choice(tuple(item.value for item in CrossRegionTransferPolicy)),
+    default=None,
+    help="Per-workload cross-region GCS transfer policy (allow, warn, or ban; tightens project policy, never weakens).",
+)
+@click.option(
+    "--ban-cross-region-transfer",
+    is_flag=True,
+    default=False,
+    help="Ban cross-region GCS transfers for this job (shorthand for --cross-region-transfer ban).",
+)
+@click.option(
     "--no-wait",
     "no_wait",
     is_flag=True,
@@ -1100,6 +1133,8 @@ def run_workload(
     checkpoint_grace_seconds: int,
     estimated_duration_seconds: int,
     named_assets: tuple[str, ...],
+    cross_region_transfer: str | None,
+    ban_cross_region_transfer: bool,
     no_wait: bool,
     command: tuple[str, ...],
 ) -> None:
@@ -1141,6 +1176,10 @@ def run_workload(
         easydel_branch=easydel_branch,
         accelerator=setup_accel,
     )
+    resolved_cross_region_policy = _resolve_cross_region_policy_option(
+        cross_region_transfer=cross_region_transfer,
+        ban_cross_region_transfer=ban_cross_region_transfer,
+    )
     exit_code = WorkloadCommandService(session).run(
         target_value=target,
         org_id=org_id,
@@ -1169,6 +1208,7 @@ def run_workload(
         chip_indexes=chip_indexes,
         secret_mounts=secret_mounts,
         setup=resolved_setup,
+        cross_region_transfer_policy=resolved_cross_region_policy,
     )
     if exit_code:
         # The job's outcome is this command's outcome, so `eyvan run ... && ...`
@@ -1701,6 +1741,18 @@ def estimate_workload(
         "live at once. Off by default: a credential nobody asked for is one nobody is watching."
     ),
 )
+@click.option(
+    "--cross-region-transfer",
+    type=click.Choice(tuple(item.value for item in CrossRegionTransferPolicy)),
+    default=None,
+    help="Per-workload cross-region GCS transfer policy (allow, warn, or ban; tightens project policy, never weakens).",
+)
+@click.option(
+    "--ban-cross-region-transfer",
+    is_flag=True,
+    default=False,
+    help="Ban cross-region GCS transfers for this workload (shorthand for --cross-region-transfer ban).",
+)
 @click.option("--idempotency-key")
 @click.pass_obj
 def submit_workload(
@@ -1742,6 +1794,8 @@ def submit_workload(
     easydel_branch: str | None,
     secret_mounts: tuple[str, ...],
     can_submit_children: bool,
+    cross_region_transfer: str | None,
+    ban_cross_region_transfer: bool,
     idempotency_key: str | None,
 ) -> None:
     """Submit a workload with explicit resource and placement intent."""
@@ -1768,6 +1822,10 @@ def submit_workload(
         if workspace is not None
         else None
     )
+    resolved_cross_region_policy = _resolve_cross_region_policy_option(
+        cross_region_transfer=cross_region_transfer,
+        ban_cross_region_transfer=ban_cross_region_transfer,
+    )
     optional_fields: dict[str, tp.Any] = {}
     if workspace_ref is not None:
         optional_fields["workspace"] = workspace_ref
@@ -1777,6 +1835,8 @@ def submit_workload(
         optional_fields["dependencies"] = declared
     if resolved_setup is not None:
         optional_fields["setup"] = resolved_setup
+    if resolved_cross_region_policy is not None:
+        optional_fields["cross_region_transfer_policy"] = resolved_cross_region_policy
     try:
         request = WorkloadSubmitRequest(
             org_id=scope.org_id,

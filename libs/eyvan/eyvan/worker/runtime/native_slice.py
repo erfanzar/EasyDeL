@@ -79,8 +79,13 @@ from eyvan.capacity.drivers.base import (
 from eyvan.identity.mtls import MutualTlsFiles, client_ssl_context
 from eyvan.worker.distributed_environment import chip_host_of, without_distributed_topology_overrides
 from eyvan.worker.runtime._multihost_site import (
+    CROSS_REGION_TRANSFER_BANNED_EXIT_CODE,
+    CROSS_REGION_TRANSFER_BANNED_MARKER,
+    CROSS_REGION_TRANSFER_BANNED_REASON,
     DEFAULT_GANG_INITIALIZATION,
     GangInitializationPolicy,
+    cross_region_ban_failure_reason,
+    extract_cross_region_ban_marker,
     gang_formation_failure_reason,
     gang_initialization_outcome,
 )
@@ -1047,7 +1052,13 @@ class NativeSliceExecutor:
             if not isinstance(value, str):
                 raise ValueError("native slice workload environment must be a string mapping")
             environment[key] = value
+        cross_region_environment = {
+            key: value
+            for key, value in environment.items()
+            if key == "EYVAN_HOST_REGION" or key.startswith("EYVAN_CROSS_REGION_")
+        }
         environment = without_distributed_topology_overrides(environment)
+        environment.update(cross_region_environment)
         # The checkpoint hook writes to ``{base}/rank-{n}``, so a resume handed
         # the bare base URI reads an object that was never written. It does not
         # fail: the workload sees "no checkpoint" and restarts from scratch,
@@ -1173,9 +1184,9 @@ class NativeSliceExecutor:
         status = _aggregate_status(workers)
         message = _aggregate_message(workers)
         if status is ExecutionWorkloadStatus.FAILED:
-            formation = self._gang_formation_failure(remote_id)
-            if formation is not None:
-                message = f"{formation} {message}"
+            terminal_reason = self._terminal_failure_reason(remote_id, workers)
+            if terminal_reason is not None:
+                message = f"{terminal_reason} {message}"
         aggregate = ExecutionWorkloadObservation(
             remote_id=remote_id,
             status=status,
@@ -1188,27 +1199,55 @@ class NativeSliceExecutor:
             "workers": [worker.as_result() for worker in workers],
         }
 
-    def _gang_formation_failure(self, remote_id: str) -> str | None:
-        """Return the terminal reason when this slice's gang never formed.
+    def _cross_region_marker_detail(
+        self,
+        remote_id: str,
+        ranks: tp.Sequence[int],
+        workers: tp.Sequence[_SliceWorkerObservation],
+    ) -> str | None:
+        """Extract the cross-region ban stderr marker from worker observations or logs."""
 
-        A slice is one cell, but its hosts join the same JAX registration
-        barrier a multi-cell gang does, so a cold start loses it the same way
-        and the operator needs the same distinction: lengthen the deadline and
-        resubmit, or go and read the user's traceback. The evidence is the exit
-        status Eyvan's own initialization hook gives a rank that never joined,
-        which each host keeps in its durable execution record -- so this is
-        re-derived on every poll from remote state and reads identically after a
-        controller restart.
+        by_rank = {worker.rank: worker for worker in workers}
+        for rank in sorted(set(ranks)):
+            obs = by_rank.get(rank)
+            if obs is not None:
+                detail = extract_cross_region_ban_marker(obs.observation.message)
+                if detail:
+                    return detail
+        for rank in sorted(set(ranks)):
+            if not 0 <= rank < len(self._workers):
+                continue
+            try:
+                logs = self._workers[rank].logs(remote_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                continue
+            detail = extract_cross_region_ban_marker(logs)
+            if detail:
+                return detail
+        return None
 
-        ``None`` means no rank offered that evidence, which is deliberately not
-        "the gang formed": an unreachable host, a reaped unit, and an ordinary
-        user-code failure all land here.
-        """
+    def _terminal_failure_reason(
+        self,
+        remote_id: str,
+        workers: tp.Sequence[_SliceWorkerObservation],
+    ) -> str | None:
+        """Return a structured terminal failure prefix for exit code 95 or gang-init failure."""
 
+        marker_ranks = [
+            worker.rank
+            for worker in workers
+            if CROSS_REGION_TRANSFER_BANNED_MARKER in worker.observation.message
+            or CROSS_REGION_TRANSFER_BANNED_REASON in worker.observation.message.lower()
+        ]
         if not self.initialization.fatal:
-            # Nothing can carry the evidence: without the fatal hook a rank that
-            # never joined is left to run on, and its exit status is user code's.
-            return None
+            if not marker_ranks:
+                return None
+            return cross_region_ban_failure_reason(
+                banned_ranks=marker_ranks,
+                marker_detail=self._cross_region_marker_detail(remote_id, marker_ranks, workers),
+            )
+
+        banned_ranks: list[int] = list(marker_ranks)
         deadline_ranks: list[int] = []
         error_ranks: list[int] = []
         for rank, worker in enumerate(self._workers):
@@ -1216,11 +1255,20 @@ class NativeSliceExecutor:
                 detail = worker.process_status(remote_id)
             except (httpx.HTTPError, RuntimeError, ValueError):
                 continue
-            outcome = gang_initialization_outcome(_reported_exit_status(detail))
+            exit_status = _reported_exit_status(detail)
+            if exit_status == CROSS_REGION_TRANSFER_BANNED_EXIT_CODE:
+                banned_ranks.append(rank)
+                continue
+            outcome = gang_initialization_outcome(exit_status)
             if outcome == "deadline":
                 deadline_ranks.append(rank)
             elif outcome == "error":
                 error_ranks.append(rank)
+        if banned_ranks:
+            return cross_region_ban_failure_reason(
+                banned_ranks=banned_ranks,
+                marker_detail=self._cross_region_marker_detail(remote_id, banned_ranks, workers),
+            )
         if not deadline_ranks and not error_ranks:
             return None
         return gang_formation_failure_reason(

@@ -26,10 +26,12 @@ from eyvan.records import (
     AuditEvent,
     CellRecord,
     CellState,
+    CrossRegionTransferPolicy,
     LeaseRecord,
     LeaseState,
     OutboxRecord,
     OutboxState,
+    PolicyRecord,
     WorkloadAttemptTopology,
     WorkloadDispatchReservation,
     WorkloadRecord,
@@ -37,6 +39,7 @@ from eyvan.records import (
     WorkloadState,
     WorkloadTopologyCell,
     WorkspaceRef,
+    strictest_cross_region_transfer_policy,
     utcnow,
 )
 from eyvan.secrets import redact_secret_material
@@ -45,6 +48,17 @@ from eyvan.server.controller._support import (
 )
 from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.storage._region_guard import (
+    CROSS_REGION_ALLOW_MULTIREGION_ENV,
+    CROSS_REGION_ALLOWED_BUCKETS_ENV,
+    CROSS_REGION_KILL_ENV,
+    CROSS_REGION_POLICY_ENV,
+    CROSS_REGION_TRANSFER_BANNED_REASON,
+    HOST_REGION_ENV,
+    check_gcs_uri_locality,
+    extract_gcs_uris,
+    resolve_bucket_location,
+)
 from eyvan.track._store import join_uri
 from eyvan.worker.agent.client import CellAgentInvalidConfigurationError
 from eyvan.worker.agent.models import (
@@ -280,6 +294,19 @@ class GangRendezvousCollision(PermanentDispatchRefusal):
     retry re-runs the same placement and refuses again. Failing the workload with
     the reason names the configuration to change instead of looping on it.
     """
+
+
+class CrossRegionTransferBannedDispatchRefusal(PermanentDispatchRefusal):
+    """A workload declared a cross-region ``gs://`` URI forbidden by policy.
+
+    Settled terminally as ``FAILED`` without retrying so no ghost lease or
+    infinite outbox retry loop occurs, carrying structured audit metadata for
+    ``workload.cross_region_transfer_banned``.
+    """
+
+    def __init__(self, message: str, *, audit_payload: dict[str, tp.Any]):
+        super().__init__(message)
+        self.audit_payload = audit_payload
 
 
 def _chip_share_dispatch(submission_id: str, chips: tp.Sequence[int], cell: CellRecord) -> tuple[str, dict[str, str]]:
@@ -808,12 +835,187 @@ class _ControllerWorkloadCommands:
             return False
         return True
 
+    @staticmethod
+    def _resolve_cross_region_policy(
+        policy: PolicyRecord | None,
+        workload: WorkloadRecord,
+    ) -> tuple[CrossRegionTransferPolicy, tuple[str, ...], bool]:
+        """Resolve effective cross-region transfer policy, allowlist, and multi-region setting.
+
+        A workload may tighten enforcement above its project policy, never weaken it.
+        """
+
+        project_policy = policy.cross_region_transfer_policy if policy is not None else CrossRegionTransferPolicy.ALLOW
+        allowed_buckets = policy.cross_region_allowed_buckets if policy is not None else ()
+        allow_multiregion = policy.cross_region_allow_multiregion if policy is not None else True
+        effective = strictest_cross_region_transfer_policy(
+            project_policy,
+            workload.spec.cross_region_transfer_policy,
+        )
+        return effective, allowed_buckets, allow_multiregion
+
+    def _tracking_uri_for_workload(self, workload: WorkloadRecord) -> str | None:
+        """Return the ``EYVAN_TRACKING_URI`` injected for ``workload``, if configured."""
+
+        if not self.settings.tracking_store_uri:
+            return None
+        from eyvan.track._format import validate_run_id
+
+        try:
+            org_id = validate_run_id(workload.org_id)
+            project_id = validate_run_id(workload.project_id)
+        except ValueError:
+            return None
+        return join_uri(self.settings.tracking_store_uri, org_id, project_id)
+
+    def _workload_gcs_uris(self, workload: WorkloadRecord) -> tuple[str, ...]:
+        """Collect all unique ``gs://`` URIs declared across a workload's spec and runtime config."""
+
+        candidates: list[str] = []
+        spec = workload.spec
+        for raw in (
+            spec.checkpoint_output_uri,
+            workload.checkpoint_uri,
+            spec.checkpoint_hook,
+        ):
+            if raw:
+                candidates.append(raw)
+        candidates.extend(spec.named_assets)
+        candidates.extend(spec.environment.values())
+
+        execution = spec.execution
+        if execution.kind == "command":
+            candidates.append(execution.command)
+        else:
+            candidates.append(execution.artifact_uri)
+            if execution.result_uri:
+                candidates.append(execution.result_uri)
+            if execution.workspace_uri:
+                candidates.append(execution.workspace_uri)
+
+        workspace = spec.resolved_workspace()
+        if workspace is not None:
+            candidates.append(workspace.uri)
+
+        if spec.setup is not None:
+            if spec.setup.script:
+                candidates.append(spec.setup.script)
+            if spec.setup.url:
+                candidates.append(spec.setup.url)
+            candidates.extend(spec.setup.args)
+
+        tracking_uri = self._tracking_uri_for_workload(workload)
+        if tracking_uri:
+            candidates.append(tracking_uri)
+
+        found: list[str] = []
+        seen: set[str] = set()
+        for text in candidates:
+            for uri in extract_gcs_uris(text):
+                if uri not in seen:
+                    seen.add(uri)
+                    found.append(uri)
+        return tuple(found)
+
+    def _refuse_cross_region_transfer(
+        self,
+        workload: WorkloadRecord,
+        *,
+        cells: tp.Sequence[CellRecord],
+        effective_policy: CrossRegionTransferPolicy,
+        allowed_buckets: tp.Sequence[str],
+        allow_multiregion: bool,
+    ) -> None:
+        """Refuse dispatch when ``effective_policy`` is BAN and any declared ``gs://`` URI is cross-region."""
+
+        if effective_policy is not CrossRegionTransferPolicy.BAN:
+            return
+        cloud_regions = tuple(
+            dict.fromkeys(
+                cell.region.strip()
+                for cell in cells
+                if isinstance(cell.region, str) and cell.region.strip() and cell.region.strip().lower() != "local"
+            )
+        )
+        if not cloud_regions:
+            return
+        uris = self._workload_gcs_uris(workload)
+        if not uris:
+            return
+        resolver = getattr(self, "location_resolver", None) or resolve_bucket_location
+        for region in cloud_regions:
+            for uri in uris:
+                result = check_gcs_uri_locality(
+                    uri,
+                    host_region=region,
+                    operation="dispatch",
+                    allowed_buckets=allowed_buckets,
+                    allow_multiregion=allow_multiregion,
+                    location_resolver=resolver,
+                    on_unknown="allow",
+                )
+                if not result.allowed:
+                    message = (
+                        f"{CROSS_REGION_TRANSFER_BANNED_REASON}: TPU in {region} cannot access {result.uri} "
+                        f"(bucket {result.bucket!r} is in {result.bucket_location}). "
+                        "Use a same-region bucket (e.g. eyvan.storage_path()) or allowlist the bucket in project policy."
+                    )
+                    raise CrossRegionTransferBannedDispatchRefusal(
+                        message,
+                        audit_payload={
+                            "org_id": workload.org_id,
+                            "project_id": workload.project_id,
+                            "workload_id": workload.id,
+                            "host_region": region,
+                            "bucket": result.bucket,
+                            "bucket_location": result.bucket_location,
+                            "uri": result.uri,
+                            "stage": "dispatch",
+                            "reason": message,
+                        },
+                    )
+
+    async def _check_cross_region_transfer(
+        self,
+        workload: WorkloadRecord,
+        *,
+        cells: tp.Sequence[CellRecord],
+        effective_policy: CrossRegionTransferPolicy,
+        allowed_buckets: tp.Sequence[str],
+        allow_multiregion: bool,
+    ) -> None:
+        """Run pre-dispatch cross-region locality check without blocking the event loop on network lookups."""
+
+        if effective_policy is not CrossRegionTransferPolicy.BAN:
+            return
+        if getattr(self, "location_resolver", None) is not None:
+            self._refuse_cross_region_transfer(
+                workload,
+                cells=cells,
+                effective_policy=effective_policy,
+                allowed_buckets=allowed_buckets,
+                allow_multiregion=allow_multiregion,
+            )
+            return
+        await asyncio.to_thread(
+            self._refuse_cross_region_transfer,
+            workload,
+            cells=cells,
+            effective_policy=effective_policy,
+            allowed_buckets=allowed_buckets,
+            allow_multiregion=allow_multiregion,
+        )
+
     def _render_execution(
         self,
         workload: WorkloadRecord,
         *,
         runtime_environment: tp.Mapping[str, str],
         cell_provider: str | None = None,
+        cell_region: str | None = None,
+        cross_region_policy: CrossRegionTransferPolicy = CrossRegionTransferPolicy.ALLOW,
+        cross_region_allowed_buckets: tp.Sequence[str] = (),
+        cross_region_allow_multiregion: bool = True,
     ) -> tuple[str, dict[str, str]]:
         """Return the entrypoint and environment for one workload dispatch.
 
@@ -830,6 +1032,22 @@ class _ControllerWorkloadCommands:
             "EYVAN_ATTEMPT": str(workload.attempt),
             "EYVAN_RESUME_CHECKPOINT_URI": workload.checkpoint_uri or "",
         }
+        # Strip any user- or runtime-supplied cross-region guard variables before
+        # writing Eyvan-owned values (defense in depth alongside distributed_environment).
+        for key in list(environment):
+            if key == HOST_REGION_ENV or key.startswith("EYVAN_CROSS_REGION_"):
+                environment.pop(key, None)
+        normalized_region = (cell_region or "").strip()
+        if (
+            cross_region_policy in {CrossRegionTransferPolicy.WARN, CrossRegionTransferPolicy.BAN}
+            and normalized_region
+            and normalized_region.lower() != "local"
+        ):
+            environment[CROSS_REGION_POLICY_ENV] = cross_region_policy.value
+            environment[HOST_REGION_ENV] = normalized_region
+            environment[CROSS_REGION_ALLOWED_BUCKETS_ENV] = ",".join(cross_region_allowed_buckets)
+            environment[CROSS_REGION_ALLOW_MULTIREGION_ENV] = "1" if cross_region_allow_multiregion else "0"
+            environment[CROSS_REGION_KILL_ENV] = "1" if cross_region_policy is CrossRegionTransferPolicy.BAN else "0"
         ca_b64 = control_plane_ca_b64()
         if ca_b64 is not None:
             # Every callback this job makes -- secret redemption, progress,
@@ -853,21 +1071,9 @@ class _ControllerWorkloadCommands:
         environment.update(self._secret_environment(workload))
         # Unlike progress, direct-to-store tracking also works for command jobs
         # and callables with unmanaged result URIs. Never give jobs the tracker token.
-        if self.settings.tracking_store_uri:
-            from eyvan.track._format import validate_run_id
-
-            try:
-                # Plane scope IDs are free-form, but tracking requires single,
-                # URI-safe components. In particular, never allow '%' aliases
-                # or decoded separators to cross an authorization boundary.
-                org_id = validate_run_id(workload.org_id)
-                project_id = validate_run_id(workload.project_id)
-            except ValueError:
-                # Tracking is optional; an unsupported scope must not prevent
-                # dispatch or expose its contents in a diagnostic.
-                pass
-            else:
-                environment["EYVAN_TRACKING_URI"] = join_uri(self.settings.tracking_store_uri, org_id, project_id)
+        tracking_uri = self._tracking_uri_for_workload(workload)
+        if tracking_uri is not None:
+            environment["EYVAN_TRACKING_URI"] = tracking_uri
         execution = workload.spec.execution
         if execution.kind == "command":
             # A workspace belongs to the workload, not to one execution kind, so
@@ -1230,6 +1436,15 @@ class _ControllerWorkloadCommands:
 
             await self.service._require_no_asset_eviction(transaction, workload, cell)
             self._refuse_unreachable_callback(workload, cell)
+            policy = await transaction.get_policy(workload.org_id, workload.project_id)
+            effective_policy, allowed_buckets, allow_multiregion = self._resolve_cross_region_policy(policy, workload)
+            await self._check_cross_region_transfer(
+                workload,
+                cells=(cell,),
+                effective_policy=effective_policy,
+                allowed_buckets=allowed_buckets,
+                allow_multiregion=allow_multiregion,
+            )
             reservation = self._new_dispatch_reservation(current_command, workload, (lease.id,))
             reserved = await self._persist_dispatch_reservation(
                 transaction,
@@ -1243,6 +1458,10 @@ class _ControllerWorkloadCommands:
                 reserved,
                 runtime_environment=cell.runtime.env,
                 cell_provider=cell.provider,
+                cell_region=cell.region,
+                cross_region_policy=effective_policy,
+                cross_region_allowed_buckets=allowed_buckets,
+                cross_region_allow_multiregion=allow_multiregion,
             )
             submission_id = f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}"
             if lease.tpu_chips:
@@ -1350,6 +1569,15 @@ class _ControllerWorkloadCommands:
             # refusal after the reservation would leave a dispatch marker for a
             # launch that never happened.
             await self._refuse_shared_gang_rendezvous(transaction, workload, coordinator_cell)
+            policy = await transaction.get_policy(workload.org_id, workload.project_id)
+            effective_policy, allowed_buckets, allow_multiregion = self._resolve_cross_region_policy(policy, workload)
+            await self._check_cross_region_transfer(
+                workload,
+                cells=concrete_cells,
+                effective_policy=effective_policy,
+                allowed_buckets=allowed_buckets,
+                allow_multiregion=allow_multiregion,
+            )
             reservation = self._new_dispatch_reservation(current_command, workload, lease_ids)
             reserved = await self._persist_dispatch_reservation(
                 transaction,
@@ -1363,6 +1591,10 @@ class _ControllerWorkloadCommands:
                 reserved,
                 runtime_environment=leader_cell.runtime.env,
                 cell_provider=leader_cell.provider,
+                cell_region=leader_cell.region,
+                cross_region_policy=effective_policy,
+                cross_region_allowed_buckets=allowed_buckets,
+                cross_region_allow_multiregion=allow_multiregion,
             )
             spec = {
                 "entrypoint": entrypoint,
@@ -1602,6 +1834,22 @@ class _ControllerWorkloadCommands:
             )
         except ConflictError as exc:
             raise StaleOutboxCommand("unlaunchable attempt lost ownership of the dispatch") from exc
+        if isinstance(refusal, CrossRegionTransferBannedDispatchRefusal):
+            async with self.repository.transaction() as transaction:
+                await transaction.append_event(
+                    AuditEvent(
+                        id=f"evt_{uuid.uuid4().hex}",
+                        actor=self._principal.subject,
+                        org_id=workload.org_id,
+                        project_id=workload.project_id,
+                        entity_type="workload",
+                        entity_id=workload.id,
+                        action="workload.cross_region_transfer_banned",
+                        previous_state=workload.state.value,
+                        new_state=WorkloadState.FAILED.value,
+                        payload=refusal.audit_payload,
+                    )
+                )
 
     async def _stale_build_report(
         self,

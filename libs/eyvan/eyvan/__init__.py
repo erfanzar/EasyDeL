@@ -12,7 +12,7 @@ import typing as tp
 if tp.TYPE_CHECKING:
     from eyvan.capacity.fleet_config import EyvanFleetConfig
     from eyvan.config import EyvanSettings
-    from eyvan.records import CapacityClass
+    from eyvan.records import CapacityClass, CrossRegionTransferPolicy
     from eyvan.sdk import AsyncEyvanClient, ClientIdentity, EyvanCallableSubmitter, EyvanClient
     from eyvan.sdk.client.easydel_setup import EasyDeLSetup
     from eyvan.sdk.client.jobs import CpuConfig, GpuConfig, SetupScript
@@ -26,8 +26,13 @@ if tp.TYPE_CHECKING:
         init,
     )
     from eyvan.storage import (
+        CrossRegionTransferError,
         StorageHandle,
+        check_gcs_uri_locality,
         configure_storage,
+        cross_region_guard,
+        disable_cross_region_guard,
+        enable_cross_region_guard,
         get_monitoring_storage,
         get_storage,
         monitoring_path,
@@ -49,6 +54,8 @@ __all__ = (
     "CapacityClass",
     "ClientIdentity",
     "CpuConfig",
+    "CrossRegionTransferError",
+    "CrossRegionTransferPolicy",
     "EasyDeLSetup",
     "EyvanCallableSubmitter",
     "EyvanClient",
@@ -64,7 +71,11 @@ __all__ = (
     "StorageHandle",
     "TpuConfig",
     "acknowledge_checkpoint",
+    "check_gcs_uri_locality",
     "configure_storage",
+    "cross_region_guard",
+    "disable_cross_region_guard",
+    "enable_cross_region_guard",
     "execute",
     "get_monitoring_storage",
     "get_storage",
@@ -109,6 +120,10 @@ def __getattr__(name: str):
         from eyvan.records import CapacityClass
 
         return _cache_export(name, CapacityClass)
+    if name == "CrossRegionTransferPolicy":
+        from eyvan.records import CrossRegionTransferPolicy
+
+        return _cache_export(name, CrossRegionTransferPolicy)
     if name == "ClientIdentity":
         from eyvan.sdk import ClientIdentity
 
@@ -174,8 +189,13 @@ def __getattr__(name: str):
 
         return _cache_export(name, init)
     if name in {
+        "CrossRegionTransferError",
         "StorageHandle",
+        "check_gcs_uri_locality",
         "configure_storage",
+        "cross_region_guard",
+        "disable_cross_region_guard",
+        "enable_cross_region_guard",
         "get_monitoring_storage",
         "get_storage",
         "monitoring_path",

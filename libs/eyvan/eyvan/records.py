@@ -53,6 +53,7 @@ JsonDocument: tp.TypeAlias = dict[str, PydanticJsonValue]
 
 _SAFE_FLEET_COMPONENT = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_GCS_BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 DEFAULT_MAX_RETRIES = 3
 #: Widest multi-machine cell any known backend builds. Derived from the backend
 #: capability table rather than written here, so the durable model stops being
@@ -194,6 +195,18 @@ def _validate_string_map(
 def _validate_strings(values: tp.Iterable[str], *, field_name: str) -> None:
     if any(not value or value != value.strip() for value in values):
         raise ValueError(f"{field_name} values must be non-empty and trimmed")
+
+
+def validate_gcs_bucket_names(values: tp.Iterable[str], *, field_name: str = "cross-region allowed buckets") -> None:
+    """Validate non-empty, trimmed GCS bucket names for policy allowlists."""
+
+    _validate_strings(values, field_name=field_name)
+    for bucket in values:
+        if bucket.startswith("gs://") or "/" in bucket or not _GCS_BUCKET_NAME.fullmatch(bucket):
+            raise ValueError(
+                f"{field_name} entry {bucket!r} must be a valid lowercase GCS bucket name "
+                "(3-63 characters, letters/digits/dots/underscores/hyphens, without 'gs://')"
+            )
 
 
 def _environment_name_is_reserved(name: str) -> bool:
@@ -664,6 +677,40 @@ class PriorityBand(StrEnum):
     BATCH = "batch"
     INTERACTIVE = "interactive"
     PRODUCTION = "production"
+
+
+class CrossRegionTransferPolicy(StrEnum):
+    """Enforcement mode for cross-region GCS transfers from compute hosts."""
+
+    ALLOW = "allow"
+    WARN = "warn"
+    BAN = "ban"
+
+
+_CROSS_REGION_POLICY_STRICTNESS: tp.Final[dict[CrossRegionTransferPolicy, int]] = {
+    CrossRegionTransferPolicy.ALLOW: 0,
+    CrossRegionTransferPolicy.WARN: 1,
+    CrossRegionTransferPolicy.BAN: 2,
+}
+
+
+def strictest_cross_region_transfer_policy(
+    project_policy: CrossRegionTransferPolicy,
+    workload_policy: CrossRegionTransferPolicy | None = None,
+) -> CrossRegionTransferPolicy:
+    """Return the stricter of project and per-workload cross-region transfer policies.
+
+    Ordering is ``ban > warn > allow``. A workload may tighten enforcement above
+    its project default (e.g. project ``allow`` + workload ``ban`` -> ``ban``),
+    but can never weaken an admin's project policy (e.g. project ``ban`` +
+    workload ``allow`` -> ``ban``).
+    """
+
+    if workload_policy is None:
+        return project_policy
+    if _CROSS_REGION_POLICY_STRICTNESS[workload_policy] > _CROSS_REGION_POLICY_STRICTNESS[project_policy]:
+        return workload_policy
+    return project_policy
 
 
 def normalize_capacity_class(value: tp.Any) -> tp.Any:
@@ -1679,6 +1726,11 @@ class WorkloadDefinition(EyvanModel):
     #: A bash step run on every host before the job, inside its environment.
     #: Omitted from the wire document while unset, like ``tpu_chips``.
     setup: WorkloadSetup | None = None
+    #: Optional per-workload cross-region GCS transfer policy override. May
+    #: tighten enforcement relative to the project policy (e.g. project=allow +
+    #: workload=ban -> ban), but can never weaken an admin project policy.
+    #: Omitted from the wire document while unset.
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
@@ -1689,6 +1741,8 @@ class WorkloadDefinition(EyvanModel):
             document.pop("setup", None)
         if self.reclaim_policy == "requeue":
             document.pop("reclaim_policy", None)
+        if self.cross_region_transfer_policy is None:
+            document.pop("cross_region_transfer_policy", None)
         return document
 
     @model_validator(mode="after")
@@ -2949,6 +3003,12 @@ class PolicyRecord(EyvanModel):
     #: spec.
     allowed_secret_references: tuple[str, ...] = ()
     preemption_enabled: bool = True
+    #: Enforcement mode for cross-region GCS transfers from compute hosts.
+    cross_region_transfer_policy: CrossRegionTransferPolicy = CrossRegionTransferPolicy.ALLOW
+    #: GCS bucket names explicitly exempt from cross-region transfer enforcement.
+    cross_region_allowed_buckets: tuple[str, ...] = ()
+    #: Whether continental multi-region buckets containing the host region are allowed.
+    cross_region_allow_multiregion: bool = True
     revision: int = 1
     updated_by: str
     updated_at: datetime = Field(default_factory=utcnow)
@@ -2962,6 +3022,7 @@ class PolicyRecord(EyvanModel):
         _validate_strings(self.allowed_regions, field_name="allowed regions")
         _validate_strings(self.denied_accelerator_types, field_name="denied accelerator types")
         _validate_strings(self.allowed_secret_references, field_name="allowed secret references")
+        validate_gcs_bucket_names(self.cross_region_allowed_buckets, field_name="cross-region allowed buckets")
         for reference in self.allowed_secret_references:
             validate_secret_reference(reference, policy_root=True)
         return self

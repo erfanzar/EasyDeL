@@ -787,6 +787,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 atomic=getattr(request.tpu, "atomic", False),
                 tpu_chips=getattr(request.tpu, "chip_request", None),
                 setup=getattr(request.tpu, "setup_request", None),
+                cross_region_transfer_policy=getattr(request.tpu, "cross_region_transfer_policy", None),
                 idempotency_key=idempotency_key,
             )
 

@@ -22,6 +22,7 @@ from eyvan.records import (
     CallableExecution,
     CapacityClass,
     CellRecord,
+    CrossRegionTransferPolicy,
     LeaseRecord,
     PolicyRecord,
     PriorityBand,
@@ -206,6 +207,7 @@ class EyvanClient:
         dependencies: tuple[str, ...] = (),
         setup: WorkloadSetup | None = None,
         reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -235,6 +237,7 @@ class EyvanClient:
             dependencies=dependencies,
             setup=setup,
             reclaim_policy=reclaim_policy,
+            cross_region_transfer_policy=cross_region_transfer_policy,
         )
         response = self._mutating_request(
             "POST",
@@ -275,6 +278,7 @@ class EyvanClient:
         tpu_chips: TpuChipRequest | None = None,
         setup: WorkloadSetup | None = None,
         reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -307,6 +311,7 @@ class EyvanClient:
             dependencies=dependencies,
             setup=setup,
             reclaim_policy=reclaim_policy,
+            cross_region_transfer_policy=cross_region_transfer_policy,
         )
         response = self._mutating_request(
             "POST",

@@ -23,6 +23,7 @@ from eyvan.records import (
     CallableExecution,
     CapacityClass,
     CellRecord,
+    CrossRegionTransferPolicy,
     LeaseRecord,
     PolicyRecord,
     PriorityBand,
@@ -189,6 +190,7 @@ class AsyncEyvanClient:
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
         setup: WorkloadSetup | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -217,6 +219,7 @@ class AsyncEyvanClient:
             named_assets=named_assets,
             dependencies=dependencies,
             setup=setup,
+            cross_region_transfer_policy=cross_region_transfer_policy,
         )
         response = await self._mutating_request(
             "POST",
@@ -256,6 +259,7 @@ class AsyncEyvanClient:
         atomic: bool = False,
         tpu_chips: TpuChipRequest | None = None,
         setup: WorkloadSetup | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -287,6 +291,7 @@ class AsyncEyvanClient:
             named_assets=named_assets,
             dependencies=dependencies,
             setup=setup,
+            cross_region_transfer_policy=cross_region_transfer_policy,
         )
         response = await self._mutating_request(
             "POST",

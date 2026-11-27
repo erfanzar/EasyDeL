@@ -285,6 +285,43 @@ def gang_formation_failure_reason(
     )
 
 
+def extract_cross_region_ban_marker(text: str | None) -> str | None:
+    """Extract the structured detail from the last cross-region ban stderr marker line."""
+
+    if not text:
+        return None
+    for line in reversed(text.splitlines()):
+        idx = line.find(CROSS_REGION_TRANSFER_BANNED_MARKER)
+        if idx != -1:
+            detail = line[idx + len(CROSS_REGION_TRANSFER_BANNED_MARKER) :].strip()
+            detail = detail.replace("\r", " ").replace("\n", " ")[:400]
+            return detail or CROSS_REGION_TRANSFER_BANNED_MARKER
+    return None
+
+
+def cross_region_ban_failure_reason(
+    *,
+    banned_ranks: tp.Sequence[int],
+    marker_detail: str | None = None,
+) -> str:
+    """Render the canonical terminal reason when one or more ranks hit exit code 95."""
+
+    ranks = ", ".join(str(rank) for rank in sorted(set(banned_ranks)))
+    if marker_detail:
+        if ranks:
+            return f"{CROSS_REGION_TRANSFER_BANNED_REASON}: rank(s) {ranks} blocked ({marker_detail})."
+        return f"{CROSS_REGION_TRANSFER_BANNED_REASON}: {marker_detail}."
+    if ranks:
+        return (
+            f"{CROSS_REGION_TRANSFER_BANNED_REASON}: rank(s) {ranks} terminated with exit code "
+            f"{CROSS_REGION_TRANSFER_BANNED_EXIT_CODE}."
+        )
+    return (
+        f"{CROSS_REGION_TRANSFER_BANNED_REASON}: workload terminated with exit code "
+        f"{CROSS_REGION_TRANSFER_BANNED_EXIT_CODE}."
+    )
+
+
 def _timeout(name: str, default: int) -> int:
     """Return a positive integer timeout from the environment, or the default."""
 
@@ -556,6 +593,8 @@ __all__ = (
     "HEARTBEAT_TIMEOUT_ENV",
     "INITIALIZATION_TIMEOUT_ENV",
     "GangInitializationPolicy",
+    "cross_region_ban_failure_reason",
+    "extract_cross_region_ban_marker",
     "gang_formation_failure_reason",
     "gang_initialization_outcome",
     "initialize_from_environment",

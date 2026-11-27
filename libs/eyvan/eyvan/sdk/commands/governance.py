@@ -26,7 +26,7 @@ import click
 from pydantic import ValidationError
 
 from eyvan._internal.json_types import JsonValue, is_json_object, model_json
-from eyvan.records import CapacityClass, EffectiveQuota, ResourceLimits
+from eyvan.records import CapacityClass, CrossRegionTransferPolicy, EffectiveQuota, ResourceLimits
 from eyvan.sdk.commands.common import JsonRenderer, emit_result
 from eyvan.sdk.commands.operations import OperationsCommandService
 from eyvan.sdk.commands.state import CliSession
@@ -401,6 +401,31 @@ def get_policy(session: CliSession, org_id: str | None, project_id: str | None) 
     is_flag=True,
     help="Refuse to preempt this project's workloads for higher-priority work.",
 )
+@click.option(
+    "--cross-region-transfer",
+    type=click.Choice(tuple(item.value for item in CrossRegionTransferPolicy)),
+    default=None,
+    help="Policy for cross-region GCS transfers from compute hosts (allow, warn, or ban).",
+)
+@click.option(
+    "--ban-cross-region-transfer",
+    is_flag=True,
+    default=False,
+    help="Shorthand for --cross-region-transfer ban.",
+)
+@click.option(
+    "--allow-cross-region-bucket",
+    "cross_region_allowed_buckets",
+    multiple=True,
+    metavar="BUCKET",
+    help="GCS bucket name exempt from cross-region transfer checks (repeatable).",
+)
+@click.option(
+    "--strict-same-region",
+    is_flag=True,
+    default=False,
+    help="Disallow continental multi-region buckets (sets cross_region_allow_multiregion=false).",
+)
 @click.option("--idempotency-key")
 @click.pass_obj
 def set_policy(
@@ -414,6 +439,10 @@ def set_policy(
     allowed_secret_references: tuple[str, ...],
     max_priority: int,
     no_preemption: bool,
+    cross_region_transfer: str | None,
+    ban_cross_region_transfer: bool,
+    cross_region_allowed_buckets: tuple[str, ...],
+    strict_same_region: bool,
     idempotency_key: str | None,
 ) -> None:
     """Set a project's scheduling policy.
@@ -428,6 +457,22 @@ def set_policy(
     privilege escalation available to anyone who can write a spec.
     """
 
+    if (
+        ban_cross_region_transfer
+        and cross_region_transfer is not None
+        and cross_region_transfer != CrossRegionTransferPolicy.BAN.value
+    ):
+        raise click.UsageError(
+            f"--ban-cross-region-transfer conflicts with --cross-region-transfer {cross_region_transfer}"
+        )
+    resolved_cross_region_policy = (
+        CrossRegionTransferPolicy.BAN
+        if ban_cross_region_transfer
+        else CrossRegionTransferPolicy(cross_region_transfer)
+        if cross_region_transfer is not None
+        else CrossRegionTransferPolicy.ALLOW
+    )
+
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
     try:
         request = PolicyPutRequest(
@@ -438,6 +483,9 @@ def set_policy(
             allowed_secret_references=allowed_secret_references,
             max_priority=max_priority,
             preemption_enabled=not no_preemption,
+            cross_region_transfer_policy=resolved_cross_region_policy,
+            cross_region_allowed_buckets=cross_region_allowed_buckets,
+            cross_region_allow_multiregion=not strict_same_region,
         )
     except (ValidationError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc

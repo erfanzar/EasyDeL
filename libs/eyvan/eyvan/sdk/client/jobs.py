@@ -22,6 +22,7 @@ from eyvan.records import (
     REMOTE_CALLABLE_SIGNATURE_ERROR,
     REMOTE_CALLABLE_SIGNING_KEY_ERROR,
     CapacityClass,
+    CrossRegionTransferPolicy,
     TpuChipRequest,
     WorkloadRecord,
     WorkloadSetup,
@@ -86,6 +87,26 @@ class AcceleratorConfig(tp.Protocol):
     dependencies: tp.Sequence[str]
     reclaim_grace_seconds: int
     reclaim_policy: ReclaimPolicy
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None
+
+
+def normalize_cross_region_transfer_policy(
+    value: CrossRegionTransferPolicy | str | None,
+    *,
+    label: str = "workload",
+) -> CrossRegionTransferPolicy | None:
+    """Validate and normalize an optional cross-region transfer policy."""
+
+    if value is None or isinstance(value, CrossRegionTransferPolicy):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        try:
+            return CrossRegionTransferPolicy(cleaned)
+        except ValueError as error:
+            valid = ", ".join(item.value for item in CrossRegionTransferPolicy)
+            raise ValueError(f"{label} cross_region_transfer_policy must be one of {valid}") from error
+    raise ValueError(f"{label} cross_region_transfer_policy must be a CrossRegionTransferPolicy, string, or None")
 
 
 def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, multi_worker: bool) -> str:
@@ -294,6 +315,8 @@ class TpuConfig:
     #: Action after a graceful reclaim checkpoint finishes: ``"requeue"``
     #: resumes automatically elsewhere; ``"stop"`` settles cleanly as CANCELLED.
     reclaim_policy: ReclaimPolicy = "requeue"
+    #: Optional per-workload cross-region GCS transfer policy override.
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None
     #: Whether the caller named ``capacity_class``. Derived, never passed: only
     #: an unnamed class may be substituted by a fleet's reserved capacity.
     capacity_class_explicit: bool = field(default=True, init=False, repr=False, compare=False)
@@ -307,6 +330,11 @@ class TpuConfig:
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
         self._validate_chips()
         object.__setattr__(self, "setup", workload_setup(self.setup))
+        object.__setattr__(
+            self,
+            "cross_region_transfer_policy",
+            normalize_cross_region_transfer_policy(self.cross_region_transfer_policy, label="TPU"),
+        )
 
     @property
     def setup_request(self) -> WorkloadSetup | None:
@@ -400,12 +428,19 @@ class GpuConfig:
     reclaim_grace_seconds: int = DEFAULT_RECLAIM_GRACE_SECONDS
     #: Post-reclaim behavior (``"requeue"`` or ``"stop"``). See ``TpuConfig``.
     reclaim_policy: ReclaimPolicy = "requeue"
+    #: Optional per-workload cross-region GCS transfer policy override.
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
         object.__setattr__(self, "type", normalized)
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
         object.__setattr__(self, "setup", workload_setup(self.setup))
+        object.__setattr__(
+            self,
+            "cross_region_transfer_policy",
+            normalize_cross_region_transfer_policy(self.cross_region_transfer_policy, label="GPU"),
+        )
 
     @property
     def setup_request(self) -> WorkloadSetup | None:
@@ -455,12 +490,19 @@ class CpuConfig:
     reclaim_grace_seconds: int = DEFAULT_RECLAIM_GRACE_SECONDS
     #: Post-reclaim behavior (``"requeue"`` or ``"stop"``). See ``TpuConfig``.
     reclaim_policy: ReclaimPolicy = "requeue"
+    #: Optional per-workload cross-region GCS transfer policy override.
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)
         object.__setattr__(self, "type", normalized)
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
         object.__setattr__(self, "setup", workload_setup(self.setup))
+        object.__setattr__(
+            self,
+            "cross_region_transfer_policy",
+            normalize_cross_region_transfer_policy(self.cross_region_transfer_policy, label="CPU"),
+        )
 
     @property
     def setup_request(self) -> WorkloadSetup | None:
@@ -615,16 +657,19 @@ def with_reclaim_options(
     *,
     reclaim_grace_seconds: int | None = None,
     reclaim_policy: ReclaimPolicy | None = None,
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
 ) -> AcceleratorConfig:
-    """Return ``config`` with updated reclaim grace/policy while preserving implicit capacity class."""
+    """Return ``config`` with updated reclaim/locality overrides while preserving implicit capacity class."""
 
-    if reclaim_grace_seconds is None and reclaim_policy is None:
+    if reclaim_grace_seconds is None and reclaim_policy is None and cross_region_transfer_policy is None:
         return config
     updates: dict[str, tp.Any] = {}
     if reclaim_grace_seconds is not None:
         updates["reclaim_grace_seconds"] = reclaim_grace_seconds
     if reclaim_policy is not None:
         updates["reclaim_policy"] = reclaim_policy
+    if cross_region_transfer_policy is not None:
+        updates["cross_region_transfer_policy"] = cross_region_transfer_policy
     if isinstance(config, TpuConfig):
         if not config.capacity_class_explicit:
             updates["capacity_class"] = _UNSET_CAPACITY_CLASS

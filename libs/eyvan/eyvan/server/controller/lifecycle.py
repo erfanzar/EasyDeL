@@ -42,6 +42,7 @@ from eyvan.server.controller.log_archival import _LogChunkProgress
 from eyvan.server.persistence.base import Repository
 from eyvan.server.service.control_plane import ControlPlaneService
 from eyvan.server.service.stage import CellStageExecutor
+from eyvan.storage._region_guard import BucketLocation
 from eyvan.worker.agent.client import (
     CellAgentClient,
 )
@@ -89,6 +90,10 @@ class _ControllerLifecycle:
         #: so lifecycle auditing does not depend on log collection. Unset by
         #: default: log lines remain the always-on record.
         capacity_audit_sink: str | None = None,
+        #: Optional bucket-location resolver for cross-region transfer checks.
+        #: Defaults to ``eyvan.storage._region_guard.resolve_bucket_location``;
+        #: injectable here for deterministic offline tests.
+        location_resolver: tp.Callable[[str], BucketLocation | None] | None = None,
     ):
         self.repository = repository
         self.service = service
@@ -140,6 +145,7 @@ class _ControllerLifecycle:
             max_s=self.settings.cell_agent_backoff_max_s,
         )
         self._capacity_lifecycle = CapacityLifecycleLogger(logger, sink_path=capacity_audit_sink)
+        self.location_resolver = location_resolver
         # The acquisition-backoff streak last announced per pool. A cache of the
         # audit ledger, which is the durable answer a new leader reads instead.
         self._acquisition_backoff_announcements: dict[str, str | None] = {}

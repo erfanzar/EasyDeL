@@ -32,6 +32,7 @@ from eyvan.records import (
     CapacityPoolRecord,
     CellRecord,
     CellState,
+    CrossRegionTransferPolicy,
     JsonDocument,
     NativeRuntimeConfig,
     OrganizationRecord,
@@ -52,6 +53,7 @@ from eyvan.records import (
     WorkloadRecord,
     WorkloadSetup,
     WorkspaceRef,
+    validate_gcs_bucket_names,
     validate_secret_mount_contract,
 )
 from eyvan.server.api.server_startup import ServerControllerMode
@@ -275,6 +277,9 @@ class PoolWorkloadSubmitRequest(ApiModel):
     #: A bash step run on every host before the command, inside the job's
     #: environment. Omitted from the wire document while unset.
     setup: WorkloadSetup | None = None
+    #: Optional per-workload cross-region GCS transfer policy override.
+    #: Omitted from the wire document while unset.
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
@@ -285,6 +290,8 @@ class PoolWorkloadSubmitRequest(ApiModel):
             document.pop("tpu_chips", None)
         if self.setup is None:
             document.pop("setup", None)
+        if self.cross_region_transfer_policy is None:
+            document.pop("cross_region_transfer_policy", None)
         return document
 
     @model_validator(mode="after")
@@ -353,6 +360,16 @@ class PoolCallableSubmitRequest(ApiModel):
     #: A bash step run on every host before the callable loads, inside the
     #: job's environment. Omitted by the SDK when unset.
     setup: WorkloadSetup | None = None
+    #: Optional per-workload cross-region GCS transfer policy override.
+    #: Omitted from the wire document while unset.
+    cross_region_transfer_policy: CrossRegionTransferPolicy | None = None
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.cross_region_transfer_policy is None:
+            document.pop("cross_region_transfer_policy", None)
+        return document
 
     @model_validator(mode="after")
     def validate_secret_mounts(self) -> PoolCallableSubmitRequest:
@@ -1062,6 +1079,14 @@ class PolicyPutRequest(ApiModel):
     #: Empty means *none*, unlike every other list here -- see PolicyRecord.
     allowed_secret_references: tuple[str, ...] = ()
     preemption_enabled: bool = True
+    cross_region_transfer_policy: CrossRegionTransferPolicy = CrossRegionTransferPolicy.ALLOW
+    cross_region_allowed_buckets: tuple[str, ...] = ()
+    cross_region_allow_multiregion: bool = True
+
+    @model_validator(mode="after")
+    def validate_cross_region_buckets(self) -> PolicyPutRequest:
+        validate_gcs_bucket_names(self.cross_region_allowed_buckets, field_name="cross-region allowed buckets")
+        return self
 
     def to_record(self, org_id: str, project_id: str) -> PolicyRecord:
         return PolicyRecord(org_id=org_id, project_id=project_id, updated_by="api", **self.model_dump())

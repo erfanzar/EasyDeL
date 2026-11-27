@@ -57,6 +57,10 @@ from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.errors import ConflictError, LogCursorRejectedError, NotFoundError
 from eyvan.server.service.expansion import bounded_release
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.storage._region_guard import (
+    CROSS_REGION_TRANSFER_BANNED_MARKER,
+    CROSS_REGION_TRANSFER_BANNED_REASON,
+)
 from eyvan.worker.agent.client import (
     CellAgentBusyError,
     CellAgentCapacityProviderError,
@@ -151,6 +155,52 @@ _HOST_FAULT_EVENT_SCAN_LIMIT = 512
 _TOPOLOGY_FROZEN = "frozen"
 _TOPOLOGY_UNKNOWN = "unknown"
 _TOPOLOGY_CHANGED = "changed"
+
+
+def _is_cross_region_transfer_ban_message(message: str | None) -> bool:
+    """Return whether an executor failure diagnostic reports a cross-region transfer ban."""
+
+    if not message:
+        return False
+    lowered = message.strip().lower()
+    return (
+        lowered.startswith(CROSS_REGION_TRANSFER_BANNED_REASON)
+        or f"{CROSS_REGION_TRANSFER_BANNED_REASON}:" in lowered
+        or CROSS_REGION_TRANSFER_BANNED_MARKER in lowered
+    )
+
+
+def _canonical_cross_region_ban_reason(message: str) -> str:
+    """Ensure a cross-region ban diagnostic begins with the stable machine prefix."""
+
+    stripped = message.strip()
+    if stripped.lower().startswith(CROSS_REGION_TRANSFER_BANNED_REASON):
+        return stripped
+    idx = stripped.find(CROSS_REGION_TRANSFER_BANNED_MARKER)
+    if idx != -1:
+        detail = stripped[idx + len(CROSS_REGION_TRANSFER_BANNED_MARKER) :].strip()
+        if detail:
+            return f"{CROSS_REGION_TRANSFER_BANNED_REASON}: {detail}"
+    return f"{CROSS_REGION_TRANSFER_BANNED_REASON}: {stripped}"
+
+
+def _parse_cross_region_ban_audit_fields(message: str) -> dict[str, str]:
+    """Extract structured key=value fields from a cross-region ban marker or reason."""
+
+    fields: dict[str, str] = {}
+    for key in ("host_region", "bucket", "bucket_location", "operation", "uri"):
+        prefix = f"{key}="
+        pos = message.find(prefix)
+        if pos == -1:
+            continue
+        start = pos + len(prefix)
+        end = start
+        while end < len(message) and not message[end].isspace() and message[end] not in {")", ",", ";"}:
+            end += 1
+        value = message[start:end].rstrip(".")
+        if value:
+            fields[key] = value
+    return fields
 
 
 def _live_cursor_context(
@@ -844,8 +894,17 @@ class _ControllerObservation:
         *,
         observed_members: tuple[tuple[LeaseRecord, CellRecord], ...] | None = None,
     ) -> None:
+        raw_message = message
+        is_cross_region_ban = status is ExecutionWorkloadStatus.FAILED and _is_cross_region_transfer_ban_message(
+            raw_message
+        )
         if workload.spec.secret_mounts:
-            message = _SECRET_OUTPUT_SUPPRESSED
+            message = (
+                f"{CROSS_REGION_TRANSFER_BANNED_REASON}: runtime cross-region GCS transfer blocked "
+                f"({_SECRET_OUTPUT_SUPPRESSED})"
+                if is_cross_region_ban
+                else _SECRET_OUTPUT_SUPPRESSED
+            )
         if status is ExecutionWorkloadStatus.INDETERMINATE:
             await self._escalate_unreadable_execution(workload, cell, message)
             return
@@ -883,8 +942,10 @@ class _ControllerObservation:
         elif status in {ExecutionWorkloadStatus.FAILED, ExecutionWorkloadStatus.STOPPED}:
             if status is ExecutionWorkloadStatus.FAILED:
                 await self._stop_terminal_workload_peers(workload, lease, cell, status)
-                if not preemption_owned and await self._quarantine_faulted_host(
-                    workload, message, observed_members or ((lease, cell),)
+                if (
+                    not preemption_owned
+                    and not is_cross_region_ban
+                    and await self._quarantine_faulted_host(workload, message, observed_members or ((lease, cell),))
                 ):
                     # The machine, not the workload, is what failed. Its cell is
                     # now a definitive capacity loss, so the loss path in
@@ -897,6 +958,7 @@ class _ControllerObservation:
             elif (
                 status is ExecutionWorkloadStatus.FAILED
                 and not preemption_owned
+                and not is_cross_region_ban
                 and workload.failure_count < workload.spec.max_failure_retries
             ):
                 if workload.lease_id != lease.id:
@@ -916,13 +978,46 @@ class _ControllerObservation:
             elif not preemption_owned:
                 # Persist the executor's diagnostic before releasing the cell;
                 # its logs may otherwise be the only account of the failure.
+                failure_reason = (
+                    _canonical_cross_region_ban_reason(message or raw_message or "")
+                    if is_cross_region_ban
+                    else (message or "execution backend reported failure without a diagnostic")
+                )
                 await self._release_terminal(
                     workload,
                     lease,
                     WorkloadState.FAILED,
                     "workload.failed",
-                    failure_reason=message or "execution backend reported failure without a diagnostic",
+                    failure_reason=failure_reason,
                 )
+                if is_cross_region_ban:
+                    parsed = _parse_cross_region_ban_audit_fields(raw_message or "")
+                    async with self.repository.transaction() as transaction:
+                        await transaction.append_event(
+                            AuditEvent(
+                                id=f"evt_{uuid.uuid4().hex}",
+                                actor=self._principal.subject,
+                                org_id=workload.org_id,
+                                project_id=workload.project_id,
+                                entity_type="workload",
+                                entity_id=workload.id,
+                                action="workload.cross_region_transfer_banned",
+                                previous_state=workload.state.value,
+                                new_state=WorkloadState.FAILED.value,
+                                payload={
+                                    "org_id": workload.org_id,
+                                    "project_id": workload.project_id,
+                                    "workload_id": workload.id,
+                                    "stage": "runtime",
+                                    "attempt": workload.attempt,
+                                    "host_region": parsed.get("host_region") or cell.region,
+                                    "bucket": parsed.get("bucket", ""),
+                                    "bucket_location": parsed.get("bucket_location", ""),
+                                    "uri": parsed.get("uri", ""),
+                                    "reason": failure_reason,
+                                },
+                            )
+                        )
         elif status in {ExecutionWorkloadStatus.LOST, ExecutionWorkloadStatus.NOT_FOUND}:
             await self._stop_terminal_workload_peers(workload, lease, cell, status)
             await self._recover_lost_workload(

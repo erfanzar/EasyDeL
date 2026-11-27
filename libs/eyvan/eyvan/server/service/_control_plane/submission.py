@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from eyvan.records import TpuChipRequest, WorkloadSetup
+from eyvan.records import CrossRegionTransferPolicy, TpuChipRequest, WorkloadSetup
 from eyvan.server.service._control_plane.shared import (
     DEFAULT_MAX_RETRIES,
     CommandExecution,
@@ -112,6 +112,7 @@ class SubmissionMixin:
         dependencies: tuple[str, ...] = (),
         tpu_chips: TpuChipRequest | None = None,
         setup: WorkloadSetup | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one command on a logical fleet node type, deriving all placement intent."""
@@ -163,6 +164,11 @@ class SubmissionMixin:
                 # Likewise: a different setup step is a different job.
                 **({"setup": setup.model_dump(mode="json")} if setup is not None else {}),
                 **({"reclaim_policy": reclaim_policy} if reclaim_policy != "requeue" else {}),
+                **(
+                    {"cross_region_transfer_policy": cross_region_transfer_policy.value}
+                    if cross_region_transfer_policy is not None
+                    else {}
+                ),
             }
         )
         async with self.repository.transaction() as tx:
@@ -295,6 +301,7 @@ class SubmissionMixin:
                 named_assets=named_assets,
                 dependencies=dependencies,
                 setup=setup,
+                cross_region_transfer_policy=cross_region_transfer_policy,
             )
             return await self._store_workload(
                 tx,

@@ -9,7 +9,7 @@ from typing import Literal
 
 from eyvan.capacity.hardware_catalog import shape_for
 from eyvan.domain.tpu_chips import chip_request_error
-from eyvan.records import ResourceVector, TpuChipRequest, WorkloadSetup
+from eyvan.records import CrossRegionTransferPolicy, ResourceVector, TpuChipRequest, WorkloadSetup
 from eyvan.server.service._control_plane.shared import (
     CALLABLE_SIGNING_KEY_ENV,
     DEFAULT_MAX_RETRIES,
@@ -104,6 +104,7 @@ class CallableSubmissionMixin:
         atomic: bool = False,
         tpu_chips: TpuChipRequest | None = None,
         setup: WorkloadSetup | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
         idempotency_key: str,
     ) -> tuple[WorkloadRecord, bool]:
         """Queue one callable on ``pods`` workers, packed or atomic.
@@ -175,6 +176,11 @@ class CallableSubmissionMixin:
                 # Likewise: a different setup step is a different job.
                 **({"setup": setup.model_dump(mode="json")} if setup is not None else {}),
                 **({"reclaim_policy": reclaim_policy} if reclaim_policy != "requeue" else {}),
+                **(
+                    {"cross_region_transfer_policy": cross_region_transfer_policy.value}
+                    if cross_region_transfer_policy is not None
+                    else {}
+                ),
             }
         )
         async with self.repository.transaction() as tx:
@@ -370,6 +376,7 @@ class CallableSubmissionMixin:
                 named_assets=named_assets,
                 dependencies=dependencies,
                 setup=setup,
+                cross_region_transfer_policy=cross_region_transfer_policy,
             )
             return await self._store_workload(
                 tx,
@@ -621,6 +628,7 @@ class CallableSubmissionMixin:
         alternate_pool_templates: tuple[str, ...] = (),
         tpu_chips: TpuChipRequest | None = None,
         setup: WorkloadSetup | None = None,
+        cross_region_transfer_policy: CrossRegionTransferPolicy | None = None,
     ) -> WorkloadDefinition:
         """Build a workload placed in one fleet pool, or any equivalent of it.
 
@@ -686,4 +694,5 @@ class CallableSubmissionMixin:
             named_assets=named_assets,
             dependencies=dependencies,
             setup=setup,
+            cross_region_transfer_policy=cross_region_transfer_policy,
         )
