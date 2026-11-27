@@ -860,3 +860,47 @@ def test_dual_stream_guards_attention_sinks_and_logit_softcap():
     gemma2 = ed.Gemma2ForCausalLM(gemma2_cfg, dtype=jnp.float32, param_dtype=jnp.float32, rngs=spx.Rngs(0))
     with pytest.raises(NotImplementedError, match="logits_soft_cap"):
         gemma2(input_ids=tokens)
+
+
+def test_loop_gate_sr_is_deterministic_under_active_cache():
+    """KV-cached inference must never apply LoopGate SR dither even when the module is in train() mode."""
+    cfg = ed.Qwen3Config(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        attn_mechanism="vanilla",
+        attn_dtype=jnp.bfloat16,
+        kvdtype=jnp.bfloat16,
+        scan_layers=False,
+        sharding_axis_dims=(1, 1, -1, 1, 1, 1),
+        loop_start_layer=1,
+        loop_end_layer=3,
+        num_loop_iterations=3,
+        loop_gate_type="channel",
+        loop_gate_init_biases=(-5.0, -5.0, 5.0),
+        loop_use_iteration_embedding=True,
+        loop_gate_stochastic_rounding=True,
+        loop_kv_cache_mode="hybrid_sliding_window",
+        loop_kv_sliding_window=4,
+        loop_kv_overlap=True,
+    )
+    model = ed.Qwen3ForCausalLM(cfg, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=spx.Rngs(7))
+    tokens = jnp.asarray([[1, 7, 19, 42, 5, 13]], dtype=jnp.int32)
+
+    model.eval()
+    eval_cache = model.init_cache(batch_size=1, max_length=16)
+    eval_logits = np.asarray(
+        spx.jit(lambda m, ids, c: m(input_ids=ids, past_key_values=c).logits)(model, tokens, eval_cache)
+    )
+
+    model.train()
+    train_cache = model.init_cache(batch_size=1, max_length=16)
+    train_cached_logits = np.asarray(
+        spx.jit(lambda m, ids, c: m(input_ids=ids, past_key_values=c).logits)(model, tokens, train_cache)
+    )
+    np.testing.assert_array_equal(train_cached_logits, eval_logits)

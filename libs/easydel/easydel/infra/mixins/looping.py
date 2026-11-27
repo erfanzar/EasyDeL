@@ -418,6 +418,10 @@ class LoopTransformerMixin:
             cache_slot += 1
 
         # 2. Shared Loop Core: layers [loop_start, loop_end) x num_loops with Gated Progressive Updates
+        # Never inject stochastic-rounding dither into KV-cached autoregressive inference/rollouts
+        # (e.g. eSurge rollouts sharing a live policy module during online RL).
+        has_active_cache = cv is not None and any(v is not None for v in cv)
+        gate_det = True if has_active_cache else None
         for loop_it in range(num_loops):
             x_prev = hidden_states
             if iter_embeddings is not None:
@@ -437,7 +441,7 @@ class LoopTransformerMixin:
                 if capture_kv and captured_kv is not None:
                     pass1_kv_streams[phys_idx] = captured_kv
                 cache_slot += 1
-            hidden_states = self.loop_gates[loop_it](x_prev, hidden_states)
+            hidden_states = self.loop_gates[loop_it](x_prev, hidden_states, deterministic=gate_det)
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,

@@ -137,6 +137,12 @@ class StatePacker:
         self.passthrough_indices = tuple(i for i in range(self.num_leaves) if i not in self._grouped_leaf_set)
         self.packed_bytes = int(max_packed_bytes) - budget
         self.packed_arg_count = len(self.groups) + len(self.passthrough_indices)
+        # Per-group compiled stackers emit arrays directly with ``group.sharding`` (NamedSharding),
+        # avoiding eager ``jnp.stack`` producing a GSPMDSharding that can trip JAX's
+        # ``_different_device_order_reshard`` assertion inside ``jax.device_put`` on multi-host meshes.
+        self._group_stack_fns = tuple(
+            jax.jit(lambda xs: jnp.stack(xs, axis=0), out_shardings=group.sharding) for group in self.groups
+        )
 
     @property
     def is_effective(self) -> bool:
@@ -159,9 +165,8 @@ class StatePacker:
         if len(leaves) != self.num_leaves:
             raise ValueError(f"StatePacker built for {self.num_leaves} leaves, got {len(leaves)}.")
         packed: list[jax.Array] = []
-        for group in self.groups:
-            stacked = jnp.stack([leaves[i] for i in group.leaf_indices], axis=0)
-            packed.append(jax.device_put(stacked, group.sharding))
+        for group, stack_fn in zip(self.groups, self._group_stack_fns, strict=True):
+            packed.append(stack_fn([leaves[i] for i in group.leaf_indices]))
         for idx in self.passthrough_indices:
             packed.append(leaves[idx])
         return tuple(packed)

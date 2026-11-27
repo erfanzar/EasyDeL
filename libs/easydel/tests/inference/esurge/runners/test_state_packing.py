@@ -113,3 +113,26 @@ def test_small_groups_pass_through(mesh):
     packer = StatePacker(leaves)
     assert not packer.groups
     assert not packer.is_effective
+
+
+def test_pack_preserves_named_sharding_on_non_default_device_order():
+    """Guard against eager jnp.stack GSPMDSharding device-order reshard crashes on topology-ordered meshes."""
+    devices = list(jax.devices())
+    permuted = np.array(devices[::-1]).reshape(-1)
+    perm_mesh = Mesh(permuted, axis_names=("d",))
+    sharded = NamedSharding(perm_mesh, PartitionSpec("d", None))
+    n_dev = perm_mesh.devices.size
+
+    leaves = tuple(
+        jax.jit(
+            lambda idx=i: jnp.full((n_dev * 2, 8), float(idx), dtype=jnp.bfloat16),
+            out_shardings=sharded,
+        )()
+        for i in range(4)
+    )
+    packer = StatePacker(leaves)
+    assert packer.is_effective
+    packed = packer.pack(leaves)
+    assert len(packed) == 1
+    assert isinstance(packed[0].sharding, NamedSharding)
+    assert packed[0].sharding.is_equivalent_to(packer.groups[0].sharding, packed[0].ndim)
