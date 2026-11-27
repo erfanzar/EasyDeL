@@ -17,18 +17,29 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from eyvan.config import EyvanSettings
-from eyvan.records import Principal
+from eyvan.records import Permission, Principal
 from eyvan.server.api.auth import authenticated_principal
 from eyvan.server.api.tracking_proxy import (
-    enrich_and_filter_runs,
+    authorize_run_access,
+    enrich_runs_snapshot,
+    fetch_tracker_run_metadata,
     is_project_admin,
     require_project_member,
+    require_project_writer,
+    resolve_run_workload_owner,
     resolve_tracker_credentials,
-    resolve_workload_owners,
+    sanitize_json_value,
     tracker_get_json,
 )
 from eyvan.server.service import ControlPlaneService
-from eyvan.server.service.collaboration import _UNSET, CollaborationStore, can_manage, can_view
+from eyvan.server.service.collaboration import (
+    _UNSET,
+    VALID_NOTE_TARGETS,
+    CollaborationStore,
+    can_manage,
+    can_view,
+)
+from eyvan.server.service.errors import AuthorizationError
 from eyvan.storage import (
     check_gcs_uri_locality,
     default_gcp_token_provider,
@@ -42,10 +53,31 @@ from eyvan.storage import (
 )
 
 _Principal = tp.Annotated[Principal, Depends(authenticated_principal)]
-_ScopeId = tp.Annotated[str, Query(min_length=1, max_length=128)]
+_ScopeId = tp.Annotated[str, Query(min_length=1, max_length=128, pattern=r"\S")]
 _RunId = tp.Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
 _ExpId = tp.Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
 _NoteId = tp.Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
+
+_ACTIVE_PERMISSIONS: tuple[Permission, ...] = (
+    Permission.READ,
+    Permission.SUBMIT,
+    Permission.OPERATE,
+    Permission.MANAGE_PROJECT,
+    Permission.MANAGE_FLEET,
+)
+_LEADERBOARD_CONCURRENCY = 16
+
+
+def require_any_active_permission(service: ControlPlaneService, principal: Principal) -> None:
+    """Require that ``principal`` holds at least one active Eyvan permission globally or in some scope."""
+
+    if service.authorizer.allows(principal, Permission.MANAGE_FLEET):
+        return
+    for grant in principal.grants:
+        for permission in _ACTIVE_PERMISSIONS:
+            if service.authorizer.allows(principal, permission, org_id=grant.org_id, project_id=grant.project_id):
+                return
+    raise AuthorizationError(f"{principal.subject!r} holds no active Eyvan permissions")
 
 
 class _Body(BaseModel):
@@ -65,9 +97,9 @@ class RunSharingUpdateRequest(_Body):
 class ExperimentCreateRequest(_Body):
     """Create a collaborative experiment or speedrun leaderboard."""
 
-    org_id: str = Field(min_length=1, max_length=128)
-    project_id: str = Field(min_length=1, max_length=128)
-    name: str = Field(min_length=1, max_length=160)
+    org_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
+    project_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
+    name: str = Field(min_length=1, max_length=160, pattern=r"\S")
     subject: str = Field(default="", max_length=120)
     kind: tp.Literal["experiment", "speedrun"] = "experiment"
     description: str = Field(default="", max_length=4000)
@@ -101,11 +133,11 @@ class ExperimentUpdateRequest(_Body):
 class NoteCreateRequest(_Body):
     """Create a team note attached to a run or experiment."""
 
-    org_id: str = Field(min_length=1, max_length=128)
-    project_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
+    project_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
     target_type: tp.Literal["run", "experiment"]
-    target_id: str = Field(min_length=1, max_length=128)
-    body: str = Field(min_length=1, max_length=4000)
+    target_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
+    body: str = Field(min_length=1, max_length=4000, pattern=r"\S")
     metric_ref: str | None = Field(default=None, max_length=128)
     step_ref: int | None = Field(default=None, ge=0)
 
@@ -113,7 +145,7 @@ class NoteCreateRequest(_Body):
 class StorageCheckRegionRequest(_Body):
     """Request body for ``POST /api/v1/storage/check-region``."""
 
-    uri: str = Field(min_length=1, max_length=2048)
+    uri: str = Field(min_length=1, max_length=2048, pattern=r"\S")
     region: str | None = Field(default=None, max_length=128)
     strict: bool = False
     allowed_buckets: list[str] = Field(default_factory=list, max_length=64)
@@ -254,15 +286,17 @@ def register_collaboration_routes(
 ) -> None:
     """Register collaborative runs, experiments/speedruns, team notes, feed, and region-check routes."""
 
-    async def _fetch_visible_runs(
-        request: Request,
+    async def _fetch_runs_snapshot(
         *,
         principal: Principal,
         org_id: str,
         project_id: str,
         limit: int = 500,
-    ) -> tuple[bool, list[dict[str, tp.Any]]]:
-        """Fetch and enrich visible runs from tracker; degrades cleanly when tracker is unavailable."""
+    ) -> tuple[bool, bool, dict[str, dict[str, tp.Any]], list[dict[str, tp.Any]]]:
+        """Fetch and enrich runs from tracker.
+
+        Returns ``(tracker_available, configured_unavailable, all_by_id, visible)``.
+        """
 
         try:
             status_code, payload = await tracker_get_json(
@@ -273,12 +307,14 @@ def register_collaboration_routes(
                 transport=transport,
             )
         except HTTPException as exc:
-            if exc.status_code in {502, 503}:
-                return False, []
+            if exc.status_code == 503:
+                return False, False, {}, []
+            if exc.status_code == 502:
+                return False, True, {}, []
             raise
         if status_code != 200 or not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
-            return False, []
-        runs = await enrich_and_filter_runs(
+            return False, True, {}, []
+        all_enriched, visible = await enrich_runs_snapshot(
             payload["runs"],
             service=service,
             store=store,
@@ -286,7 +322,114 @@ def register_collaboration_routes(
             org_id=org_id,
             project_id=project_id,
         )
-        return True, runs
+        return True, False, all_enriched, visible
+
+    async def _filter_visible_notes(
+        notes: list[dict[str, tp.Any]],
+        *,
+        principal: Principal,
+        admin: bool,
+        org_id: str,
+        project_id: str,
+        overlays: dict[str, dict[str, tp.Any]],
+        experiments_by_id: dict[str, dict[str, tp.Any]],
+        tracker_runs_by_id: dict[str, dict[str, tp.Any]] | None = None,
+        tracker_configured_unavailable: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, tp.Any]]:
+        """Filter notes by effective target visibility across overlays, experiments, and tracker metadata."""
+
+        if admin:
+            return notes[:limit] if limit is not None else notes
+
+        unverified_run_ids = list(
+            dict.fromkeys(
+                note["target_id"]
+                for note in notes
+                if note["target_type"] == "run"
+                and note["target_id"] not in overlays
+                and (tracker_runs_by_id is None or note["target_id"] not in tracker_runs_by_id)
+            )
+        )
+        run_allowed: dict[str, bool] = {}
+        if unverified_run_ids:
+            if tracker_configured_unavailable:
+                for rid in unverified_run_ids:
+                    run_allowed[rid] = False
+            else:
+                selected_transport = getattr(app.state, "tracking_transport", transport)
+                sem = asyncio.Semaphore(_LEADERBOARD_CONCURRENCY)
+                async with httpx.AsyncClient(
+                    transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
+                ) as client:
+
+                    async def _check_one(rid: str) -> tuple[str, bool]:
+                        async with sem:
+                            try:
+                                await authorize_run_access(
+                                    app=app,
+                                    settings=settings,
+                                    service=service,
+                                    store=store,
+                                    principal=principal,
+                                    org_id=org_id,
+                                    project_id=project_id,
+                                    run_id=rid,
+                                    overlay=None,
+                                    overlay_loaded=True,
+                                    transport=selected_transport,
+                                    client=client,
+                                    allow_unconfigured_tracker=True,
+                                    allow_missing_tracker_run=True,
+                                )
+                                return rid, True
+                            except HTTPException:
+                                return rid, False
+
+                    results = await asyncio.gather(*(_check_one(rid) for rid in unverified_run_ids))
+                    for rid, ok in results:
+                        run_allowed[rid] = ok
+
+        visible_notes: list[dict[str, tp.Any]] = []
+        for note in notes:
+            if note["target_type"] == "experiment":
+                exp = experiments_by_id.get(note["target_id"])
+                if exp is not None and not can_view(
+                    principal.subject,
+                    owner=exp["owner"],
+                    visibility=exp["visibility"],
+                    shared_with=exp["shared_with"],
+                    is_admin=False,
+                ):
+                    continue
+            elif note["target_type"] == "run":
+                rid = note["target_id"]
+                ov = overlays.get(rid)
+                if ov is not None:
+                    if not can_view(
+                        principal.subject,
+                        owner=ov["owner"],
+                        visibility=ov["visibility"],
+                        shared_with=ov["shared_with"],
+                        is_admin=False,
+                    ):
+                        continue
+                elif tracker_runs_by_id is not None and rid in tracker_runs_by_id:
+                    trun = tracker_runs_by_id[rid]
+                    if not can_view(
+                        principal.subject,
+                        owner=trun.get("owner"),
+                        visibility=trun.get("visibility") or "team",
+                        shared_with=trun.get("shared_with") or (),
+                        is_admin=False,
+                    ):
+                        continue
+                elif not run_allowed.get(rid, False):
+                    continue
+            visible_notes.append(note)
+            if limit is not None and len(visible_notes) >= limit:
+                break
+        return visible_notes
 
     # ------------------------------------------------------------------ run sharing / overlays
 
@@ -300,13 +443,38 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Update sharing visibility, selective share list, experiment link, or baseline pin for one run."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
-        existing = store.get_run_overlay(org_id, project_id, run_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_writer(service, principal, org_id=norm_org, project_id=norm_project)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
+        existing = await asyncio.to_thread(store.get_run_overlay, norm_org, norm_project, run_id)
         existing_owner = existing["owner"] if existing is not None else None
         if not existing_owner:
-            wl_owners = await resolve_workload_owners(service, [run_id], org_id=org_id, project_id=project_id)
-            existing_owner = wl_owners.get(run_id)
+            tracker_wid: str | None = None
+            status_code, meta = await fetch_tracker_run_metadata(
+                app,
+                settings,
+                org_id=norm_org,
+                project_id=norm_project,
+                run_id=run_id,
+                transport=transport,
+                allow_unconfigured=True,
+            )
+            if status_code == 200 and isinstance(meta, dict) and "run_id" in meta:
+                raw_owner = meta.get("owner")
+                if isinstance(raw_owner, str) and raw_owner.strip():
+                    existing_owner = raw_owner.strip()
+                raw_wid = meta.get("workload_id")
+                if isinstance(raw_wid, str) and raw_wid.strip():
+                    tracker_wid = raw_wid.strip()
+            if not existing_owner:
+                existing_owner = await resolve_run_workload_owner(
+                    service,
+                    org_id=norm_org,
+                    project_id=norm_project,
+                    run_id=run_id,
+                    workload_id=tracker_wid,
+                )
         if not can_manage(principal.subject, owner=existing_owner, is_admin=admin):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -328,12 +496,12 @@ def register_collaboration_routes(
                 )
             owner_arg = body.owner
         elif existing is None:
-            owner_arg = existing_owner or principal.subject
+            owner_arg = existing_owner
 
         experiment_arg: tp.Any = _UNSET
         if "experiment_id" in fields:
             if body.experiment_id is not None:
-                exp = store.get_experiment(org_id, project_id, body.experiment_id)
+                exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, body.experiment_id)
                 if exp is None:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
@@ -356,9 +524,10 @@ def register_collaboration_routes(
         shared_arg: tp.Any = body.shared_with if "shared_with" in fields and body.shared_with is not None else _UNSET
         pinned_arg: tp.Any = body.pinned if "pinned" in fields and body.pinned is not None else _UNSET
 
-        updated = store.upsert_run_overlay(
-            org_id,
-            project_id,
+        updated = await asyncio.to_thread(
+            store.upsert_run_overlay,
+            norm_org,
+            norm_project,
             run_id,
             updated_by=principal.subject,
             owner=owner_arg,
@@ -382,10 +551,19 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """List experiments and speedruns visible to the caller."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
-        rows = store.list_experiments(org_id, project_id, kind=kind, subject=subject, visibility=visibility)
-        note_counts = store.count_notes_by_target(org_id, project_id, "experiment")
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
+        rows = await asyncio.to_thread(
+            store.list_experiments,
+            norm_org,
+            norm_project,
+            kind=kind,
+            subject=subject,
+            visibility=visibility,
+        )
+        note_counts = await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "experiment")
         visible = [
             {**exp, "notes_count": note_counts.get(exp["id"], 0)}
             for exp in rows
@@ -406,10 +584,13 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Create a collaborative experiment or speedrun leaderboard."""
 
-        require_project_member(service, principal, org_id=body.org_id, project_id=body.project_id)
-        created = store.create_experiment(
-            body.org_id,
-            body.project_id,
+        norm_org = body.org_id.strip()
+        norm_project = body.project_id.strip()
+        require_project_writer(service, principal, org_id=norm_org, project_id=norm_project)
+        created = await asyncio.to_thread(
+            store.create_experiment,
+            norm_org,
+            norm_project,
             name=body.name,
             owner=principal.subject,
             subject=body.subject,
@@ -435,11 +616,13 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Return one experiment or speedrun record."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        exp = store.get_experiment(org_id, project_id, exp_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+        exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, exp_id)
         if exp is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Experiment {exp_id!r} not found")
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
         if not can_view(
             principal.subject,
             owner=exp["owner"],
@@ -451,7 +634,7 @@ def register_collaboration_routes(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have permission to view this experiment.",
             )
-        note_counts = store.count_notes_by_target(org_id, project_id, "experiment")
+        note_counts = await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "experiment")
         return JSONResponse(status_code=200, content={**exp, "notes_count": note_counts.get(exp_id, 0)})
 
     @app.patch("/api/v1/collaboration/experiments/{exp_id}", tags=["collaboration"])
@@ -464,11 +647,13 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Update mutable fields of an experiment or speedrun (owner or admin only)."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        exp = store.get_experiment(org_id, project_id, exp_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_writer(service, principal, org_id=norm_org, project_id=norm_project)
+        exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, exp_id)
         if exp is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Experiment {exp_id!r} not found")
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
         if not can_manage(principal.subject, owner=exp["owner"], is_admin=admin):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -495,9 +680,10 @@ def register_collaboration_routes(
                 if val is None and field_name in {"name", "kind", "goal", "visibility", "tag_filter", "shared_with"}:
                     continue
                 kwargs[field_name] = val
-        updated = store.update_experiment(org_id, project_id, exp_id, **kwargs)
-        assert updated is not None
-        note_counts = store.count_notes_by_target(org_id, project_id, "experiment")
+        updated = await asyncio.to_thread(store.update_experiment, norm_org, norm_project, exp_id, **kwargs)
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Experiment {exp_id!r} not found")
+        note_counts = await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "experiment")
         return JSONResponse(status_code=200, content={**updated, "notes_count": note_counts.get(exp_id, 0)})
 
     @app.delete(
@@ -513,17 +699,19 @@ def register_collaboration_routes(
     ) -> Response:
         """Delete an experiment or speedrun (owner or admin only)."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        exp = store.get_experiment(org_id, project_id, exp_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_writer(service, principal, org_id=norm_org, project_id=norm_project)
+        exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, exp_id)
         if exp is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Experiment {exp_id!r} not found")
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
         if not can_manage(principal.subject, owner=exp["owner"], is_admin=admin):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only the experiment owner or a project/fleet admin can delete it.",
             )
-        store.delete_experiment(org_id, project_id, exp_id)
+        await asyncio.to_thread(store.delete_experiment, norm_org, norm_project, exp_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/api/v1/collaboration/experiments/{exp_id}/leaderboard", tags=["collaboration"])
@@ -536,11 +724,13 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Rank visible runs belonging to an experiment or speedrun with baseline deltas and researcher stats."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        exp = store.get_experiment(org_id, project_id, exp_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+        exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, exp_id)
         if exp is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Experiment {exp_id!r} not found")
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
         if not can_view(
             principal.subject,
             owner=exp["owner"],
@@ -552,9 +742,10 @@ def register_collaboration_routes(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have permission to view this experiment.",
             )
-        notes_count = store.count_notes_by_target(org_id, project_id, "experiment").get(exp_id, 0)
-        tracker_available, visible_runs = await _fetch_visible_runs(
-            request, principal=principal, org_id=org_id, project_id=project_id
+        note_counts = await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "experiment")
+        notes_count = note_counts.get(exp_id, 0)
+        tracker_available, _, _, visible_runs = await _fetch_runs_snapshot(
+            principal=principal, org_id=norm_org, project_id=norm_project
         )
         matched_runs = [run for run in visible_runs if _run_matches_experiment(run, exp)]
         metric_key: str | None = exp.get("metric_key")
@@ -564,6 +755,7 @@ def register_collaboration_routes(
         raw_entries: list[dict[str, tp.Any]] = []
         if matched_runs and metric_key and tracker_available:
             selected_transport = getattr(request.app.state, "tracking_transport", transport)
+            sem = asyncio.Semaphore(_LEADERBOARD_CONCURRENCY)
             try:
                 resolve_tracker_credentials(settings)
                 async with httpx.AsyncClient(
@@ -573,59 +765,60 @@ def register_collaboration_routes(
                     async def _fetch_metric_series(
                         run: dict[str, tp.Any],
                     ) -> tuple[list[tp.Any], list[tp.Any]]:
-                        rid = run["run_id"]
-                        step_pts: list[tp.Any] = []
-                        time_pts: list[tp.Any] = []
-                        try:
-                            code, data = await tracker_get_json(
-                                app,
-                                settings,
-                                f"/api/v1/tracking/runs/{rid}/series",
-                                [
-                                    ("org_id", org_id),
-                                    ("project_id", project_id),
-                                    ("key", metric_key),
-                                    ("x", "step"),
-                                    ("points", 1000),
-                                ],
-                                client=client,
-                            )
-                            if (
-                                code == 200
-                                and isinstance(data, dict)
-                                and isinstance(data.get("series"), list)
-                                and data["series"]
-                                and isinstance(data["series"][0], dict)
-                            ):
-                                step_pts = list(data["series"][0].get("points") or [])
-                        except HTTPException:
-                            pass
-                        if target_value is not None and step_pts:
+                        async with sem:
+                            rid = run["run_id"]
+                            step_pts: list[tp.Any] = []
+                            time_pts: list[tp.Any] = []
                             try:
-                                tcode, tdata = await tracker_get_json(
+                                code, data = await tracker_get_json(
                                     app,
                                     settings,
                                     f"/api/v1/tracking/runs/{rid}/series",
                                     [
-                                        ("org_id", org_id),
-                                        ("project_id", project_id),
+                                        ("org_id", norm_org),
+                                        ("project_id", norm_project),
                                         ("key", metric_key),
-                                        ("x", "time"),
+                                        ("x", "step"),
                                         ("points", 1000),
                                     ],
                                     client=client,
                                 )
                                 if (
-                                    tcode == 200
-                                    and isinstance(tdata, dict)
-                                    and isinstance(tdata.get("series"), list)
-                                    and tdata["series"]
-                                    and isinstance(tdata["series"][0], dict)
+                                    code == 200
+                                    and isinstance(data, dict)
+                                    and isinstance(data.get("series"), list)
+                                    and data["series"]
+                                    and isinstance(data["series"][0], dict)
                                 ):
-                                    time_pts = list(tdata["series"][0].get("points") or [])
+                                    step_pts = list(data["series"][0].get("points") or [])
                             except HTTPException:
                                 pass
-                        return step_pts, time_pts
+                            if target_value is not None and step_pts:
+                                try:
+                                    tcode, tdata = await tracker_get_json(
+                                        app,
+                                        settings,
+                                        f"/api/v1/tracking/runs/{rid}/series",
+                                        [
+                                            ("org_id", norm_org),
+                                            ("project_id", norm_project),
+                                            ("key", metric_key),
+                                            ("x", "time"),
+                                            ("points", 1000),
+                                        ],
+                                        client=client,
+                                    )
+                                    if (
+                                        tcode == 200
+                                        and isinstance(tdata, dict)
+                                        and isinstance(tdata.get("series"), list)
+                                        and tdata["series"]
+                                        and isinstance(tdata["series"][0], dict)
+                                    ):
+                                        time_pts = list(tdata["series"][0].get("points") or [])
+                                except HTTPException:
+                                    pass
+                            return step_pts, time_pts
 
                     series_pairs = await asyncio.gather(*(_fetch_metric_series(run) for run in matched_runs))
             except HTTPException:
@@ -692,19 +885,23 @@ def register_collaboration_routes(
                 }
             )
 
-        def _metric_sort_value(val: float | None) -> tuple[int, float]:
-            if val is None:
+        def _metric_sort_value(val: object) -> tuple[int, float]:
+            finite = _finite_number(val)
+            if finite is None:
                 return (1, 0.0)
-            return (0, val if goal == "min" else -val)
+            return (0, finite if goal == "min" else -finite)
 
         def _sort_key(entry: dict[str, tp.Any]) -> tuple[tp.Any, ...]:
-            updated_neg = -(entry["updated_at"] if isinstance(entry.get("updated_at"), int | float) else -math.inf)
+            updated_val = _finite_number(entry.get("updated_at"))
+            updated_neg = -updated_val if updated_val is not None else math.inf
             if target_value is not None:
                 reached_rank = 0 if entry["reached_target"] else 1
-                time_missing = 0 if entry["time_to_target_s"] is not None else 1
-                time_val = entry["time_to_target_s"] if entry["time_to_target_s"] is not None else math.inf
-                step_missing = 0 if entry["steps_to_target"] is not None else 1
-                step_val = entry["steps_to_target"] if entry["steps_to_target"] is not None else math.inf
+                time_finite = _finite_number(entry.get("time_to_target_s"))
+                time_missing = 0 if time_finite is not None else 1
+                time_val = time_finite if time_finite is not None else math.inf
+                step_finite = _finite_number(entry.get("steps_to_target"))
+                step_missing = 0 if step_finite is not None else 1
+                step_val = step_finite if step_finite is not None else math.inf
                 return (
                     reached_rank,
                     time_missing,
@@ -729,12 +926,12 @@ def register_collaboration_routes(
         if baseline_run_id is not None:
             for entry in raw_entries:
                 if entry["run_id"] == baseline_run_id:
-                    baseline_value = entry["best_value"]
+                    baseline_value = _finite_number(entry["best_value"])
                     break
 
         entries: list[dict[str, tp.Any]] = []
         for rank, entry in enumerate(raw_entries, start=1):
-            best_val = entry["best_value"]
+            best_val = _finite_number(entry["best_value"])
             delta = round(best_val - baseline_value, 6) if best_val is not None and baseline_value is not None else None
             entries.append(
                 {
@@ -753,7 +950,7 @@ def register_collaboration_routes(
             by_owner.setdefault(owner_key, []).append(entry)
         researcher_breakdown: list[dict[str, tp.Any]] = []
         for owner_key, group_entries in by_owner.items():
-            best_vals = [e["best_value"] for e in group_entries if e["best_value"] is not None]
+            best_vals = [finite for e in group_entries if (finite := _finite_number(e["best_value"])) is not None]
             best_for_owner = (min(best_vals) if goal == "min" else max(best_vals)) if best_vals else None
             best_rank = min(e["rank"] for e in group_entries)
             researcher_breakdown.append(
@@ -772,18 +969,20 @@ def register_collaboration_routes(
 
         return JSONResponse(
             status_code=200,
-            content={
-                "experiment": {**exp, "notes_count": notes_count},
-                "metric_key": metric_key,
-                "goal": goal,
-                "target_value": target_value,
-                "baseline_run_id": baseline_run_id,
-                "baseline_value": baseline_value,
-                "tracker_available": tracker_available,
-                "entries": entries,
-                "researcher_breakdown": researcher_breakdown,
-                "notes_count": notes_count,
-            },
+            content=sanitize_json_value(
+                {
+                    "experiment": {**exp, "notes_count": notes_count},
+                    "metric_key": metric_key,
+                    "goal": goal,
+                    "target_value": target_value,
+                    "baseline_run_id": baseline_run_id,
+                    "baseline_value": baseline_value,
+                    "tracker_available": tracker_available,
+                    "entries": entries,
+                    "researcher_breakdown": researcher_breakdown,
+                    "notes_count": notes_count,
+                }
+            ),
         )
 
     # ------------------------------------------------------------------ team notes
@@ -799,11 +998,38 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """List visible team notes for a run, experiment, or the whole project."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
 
-        if target_type == "experiment" and target_id is not None:
-            exp = store.get_experiment(org_id, project_id, target_id)
+        norm_target_type: str | None = None
+        if target_type is not None:
+            cleaned_type = target_type.strip().lower()
+            if cleaned_type not in VALID_NOTE_TARGETS:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail='target_type must be "run" or "experiment"',
+                )
+            norm_target_type = cleaned_type
+
+        norm_target_id: str | None = None
+        if target_id is not None:
+            cleaned_id = target_id.strip()
+            if not cleaned_id:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="target_id must not be blank",
+                )
+            if norm_target_type is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="target_type is required when target_id is specified",
+                )
+            norm_target_id = cleaned_id
+
+        if norm_target_type == "experiment" and norm_target_id is not None:
+            exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, norm_target_id)
             if exp is not None and not can_view(
                 principal.subject,
                 owner=exp["owner"],
@@ -815,48 +1041,45 @@ def register_collaboration_routes(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="You do not have permission to view notes for this experiment.",
                 )
-        elif target_type == "run" and target_id is not None:
-            overlay = store.get_run_overlay(org_id, project_id, target_id)
-            if overlay is not None and not can_view(
-                principal.subject,
-                owner=overlay["owner"],
-                visibility=overlay["visibility"],
-                shared_with=overlay["shared_with"],
-                is_admin=admin,
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have permission to view notes for this run.",
-                )
+        elif norm_target_type == "run" and norm_target_id is not None:
+            await authorize_run_access(
+                app=app,
+                settings=settings,
+                service=service,
+                store=store,
+                principal=principal,
+                org_id=norm_org,
+                project_id=norm_project,
+                run_id=norm_target_id,
+                transport=transport,
+                allow_unconfigured_tracker=True,
+                allow_missing_tracker_run=True,
+                detail="You do not have permission to view notes for this run.",
+            )
 
-        notes = store.list_notes(org_id, project_id, target_type=target_type, target_id=target_id, limit=limit)
-        if not admin and target_id is None:
-            overlays = store.list_run_overlays(org_id, project_id)
-            exps = {e["id"]: e for e in store.list_experiments(org_id, project_id)}
-            filtered_notes: list[dict[str, tp.Any]] = []
-            for note in notes:
-                if note["target_type"] == "run":
-                    ov = overlays.get(note["target_id"])
-                    if ov is not None and not can_view(
-                        principal.subject,
-                        owner=ov["owner"],
-                        visibility=ov["visibility"],
-                        shared_with=ov["shared_with"],
-                        is_admin=False,
-                    ):
-                        continue
-                elif note["target_type"] == "experiment":
-                    exp = exps.get(note["target_id"])
-                    if exp is not None and not can_view(
-                        principal.subject,
-                        owner=exp["owner"],
-                        visibility=exp["visibility"],
-                        shared_with=exp["shared_with"],
-                        is_admin=False,
-                    ):
-                        continue
-                filtered_notes.append(note)
-            notes = filtered_notes
+        fetch_limit = limit if admin else min(limit * 3, 1000)
+        notes = await asyncio.to_thread(
+            store.list_notes,
+            norm_org,
+            norm_project,
+            target_type=norm_target_type,
+            target_id=norm_target_id,
+            limit=fetch_limit,
+        )
+        if not admin:
+            overlays = await asyncio.to_thread(store.list_run_overlays, norm_org, norm_project)
+            exp_rows = await asyncio.to_thread(store.list_experiments, norm_org, norm_project)
+            exps = {e["id"]: e for e in exp_rows}
+            notes = await _filter_visible_notes(
+                notes,
+                principal=principal,
+                admin=False,
+                org_id=norm_org,
+                project_id=norm_project,
+                overlays=overlays,
+                experiments_by_id=exps,
+                limit=limit,
+            )
         return JSONResponse(status_code=200, content={"notes": notes})
 
     @app.post("/api/v1/collaboration/notes", status_code=status.HTTP_201_CREATED, tags=["collaboration"])
@@ -866,14 +1089,17 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Create a team note on a visible run or experiment."""
 
-        require_project_member(service, principal, org_id=body.org_id, project_id=body.project_id)
-        admin = is_project_admin(service, principal, org_id=body.org_id, project_id=body.project_id)
+        norm_org = body.org_id.strip()
+        norm_project = body.project_id.strip()
+        norm_target_id = body.target_id.strip()
+        require_project_writer(service, principal, org_id=norm_org, project_id=norm_project)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
         if body.target_type == "experiment":
-            exp = store.get_experiment(body.org_id, body.project_id, body.target_id)
+            exp = await asyncio.to_thread(store.get_experiment, norm_org, norm_project, norm_target_id)
             if exp is None:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Experiment {body.target_id!r} not found",
+                    detail=f"Experiment {norm_target_id!r} not found",
                 )
             if not can_view(
                 principal.subject,
@@ -887,23 +1113,26 @@ def register_collaboration_routes(
                     detail="You do not have permission to comment on this experiment.",
                 )
         else:
-            overlay = store.get_run_overlay(body.org_id, body.project_id, body.target_id)
-            if overlay is not None and not can_view(
-                principal.subject,
-                owner=overlay["owner"],
-                visibility=overlay["visibility"],
-                shared_with=overlay["shared_with"],
-                is_admin=admin,
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You do not have permission to comment on this run.",
-                )
-        created = store.create_note(
-            body.org_id,
-            body.project_id,
+            await authorize_run_access(
+                app=app,
+                settings=settings,
+                service=service,
+                store=store,
+                principal=principal,
+                org_id=norm_org,
+                project_id=norm_project,
+                run_id=norm_target_id,
+                transport=transport,
+                allow_unconfigured_tracker=True,
+                allow_missing_tracker_run=True,
+                detail="You do not have permission to comment on this run.",
+            )
+        created = await asyncio.to_thread(
+            store.create_note,
+            norm_org,
+            norm_project,
             target_type=body.target_type,
-            target_id=body.target_id,
+            target_id=norm_target_id,
             author=principal.subject,
             body=body.body,
             metric_ref=body.metric_ref,
@@ -924,17 +1153,19 @@ def register_collaboration_routes(
     ) -> Response:
         """Delete a note (author or project/fleet admin only)."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        note = store.get_note(org_id, project_id, note_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_writer(service, principal, org_id=norm_org, project_id=norm_project)
+        note = await asyncio.to_thread(store.get_note, norm_org, norm_project, note_id)
         if note is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Note {note_id!r} not found")
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
         if not admin and note["author"] != principal.subject:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only the note author or a project/fleet admin can delete this note.",
             )
-        store.delete_note(org_id, project_id, note_id)
+        await asyncio.to_thread(store.delete_note, norm_org, norm_project, note_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     # ------------------------------------------------------------------ live team feed
@@ -949,17 +1180,20 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Return combined live runs, enriched experiments/speedruns, recent notes, and researcher stats."""
 
-        require_project_member(service, principal, org_id=org_id, project_id=project_id)
-        admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
-        tracker_available, visible_runs = await _fetch_visible_runs(
-            request, principal=principal, org_id=org_id, project_id=project_id
+        del request
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
+        tracker_available, tracker_configured_unavailable, all_runs_by_id, visible_runs = await _fetch_runs_snapshot(
+            principal=principal, org_id=norm_org, project_id=norm_project
         )
 
         active_runs = [run for run in visible_runs if run.get("status") == "running"][:limit]
         recent_runs = visible_runs[:limit]
 
-        exp_rows = store.list_experiments(org_id, project_id)
-        exp_note_counts = store.count_notes_by_target(org_id, project_id, "experiment")
+        exp_rows = await asyncio.to_thread(store.list_experiments, norm_org, norm_project)
+        exp_note_counts = await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "experiment")
         visible_exps = [
             exp
             for exp in exp_rows
@@ -1002,29 +1236,22 @@ def register_collaboration_routes(
                 }
             )
 
-        # Recent visible notes
-        overlays = store.list_run_overlays(org_id, project_id)
-        visible_exp_ids = {exp["id"] for exp in visible_exps}
-        all_exp_ids = {exp["id"] for exp in exp_rows}
-        raw_notes = store.list_notes(org_id, project_id, limit=min(limit * 3, 500))
-        recent_notes: list[dict[str, tp.Any]] = []
-        for note in raw_notes:
-            if note["target_type"] == "experiment":
-                if note["target_id"] in all_exp_ids and note["target_id"] not in visible_exp_ids:
-                    continue
-            elif note["target_type"] == "run":
-                ov = overlays.get(note["target_id"])
-                if ov is not None and not can_view(
-                    principal.subject,
-                    owner=ov["owner"],
-                    visibility=ov["visibility"],
-                    shared_with=ov["shared_with"],
-                    is_admin=admin,
-                ):
-                    continue
-            recent_notes.append(note)
-            if len(recent_notes) >= limit:
-                break
+        # Recent visible notes (reusing the fetched tracker runs snapshot + overlays + experiments)
+        overlays = await asyncio.to_thread(store.list_run_overlays, norm_org, norm_project)
+        exps_by_id = {exp["id"]: exp for exp in exp_rows}
+        raw_notes = await asyncio.to_thread(store.list_notes, norm_org, norm_project, limit=min(limit * 3, 500))
+        recent_notes = await _filter_visible_notes(
+            raw_notes,
+            principal=principal,
+            admin=admin,
+            org_id=norm_org,
+            project_id=norm_project,
+            overlays=overlays,
+            experiments_by_id=exps_by_id,
+            tracker_runs_by_id=all_runs_by_id,
+            tracker_configured_unavailable=tracker_configured_unavailable,
+            limit=limit,
+        )
 
         # Researcher activity breakdown
         researcher_map: dict[str, dict[str, tp.Any]] = {}
@@ -1059,16 +1286,18 @@ def register_collaboration_routes(
 
         return JSONResponse(
             status_code=200,
-            content={
-                "org_id": org_id,
-                "project_id": project_id,
-                "tracker_available": tracker_available,
-                "active_runs": active_runs,
-                "recent_runs": recent_runs,
-                "experiments": enriched_experiments,
-                "recent_notes": recent_notes,
-                "researchers": researchers,
-            },
+            content=sanitize_json_value(
+                {
+                    "org_id": norm_org,
+                    "project_id": norm_project,
+                    "tracker_available": tracker_available,
+                    "active_runs": active_runs,
+                    "recent_runs": recent_runs,
+                    "experiments": enriched_experiments,
+                    "recent_notes": recent_notes,
+                    "researchers": researchers,
+                }
+            ),
         )
 
     # ------------------------------------------------------------------ storage region locality check
@@ -1081,7 +1310,7 @@ def register_collaboration_routes(
     ) -> JSONResponse:
         """Evaluate whether accessing a ``gs://`` URI from a region is local or cross-region."""
 
-        del principal
+        require_any_active_permission(service, principal)
         bucket = extract_bucket_from_gcs_uri(body.uri) or extract_bucket_from_gcs_http_url(body.uri)
         if bucket is None:
             raise HTTPException(
@@ -1115,30 +1344,24 @@ def register_collaboration_routes(
 
         custom_resolver = getattr(request.app.state, "storage_location_resolver", None)
         if custom_resolver is not None:
-            result = check_gcs_uri_locality(
-                body.uri,
-                host_region=host_region,
-                operation="check",
-                allowed_buckets=validated_allowlist,
-                allow_multiregion=not body.strict,
-                location_resolver=custom_resolver,
-                on_unknown="allow",
-            )
+            resolver = custom_resolver
         else:
 
             def _default_resolver(target_bucket: str) -> tp.Any:
-                return resolve_bucket_location(target_bucket, token_provider=default_gcp_token_provider)
+                return resolve_bucket_location(target_bucket, token_provider=default_gcp_token_provider())
 
-            result = await asyncio.to_thread(
-                check_gcs_uri_locality,
-                body.uri,
-                host_region=host_region,
-                operation="check",
-                allowed_buckets=validated_allowlist,
-                allow_multiregion=not body.strict,
-                location_resolver=_default_resolver,
-                on_unknown="allow",
-            )
+            resolver = _default_resolver
+
+        result = await asyncio.to_thread(
+            check_gcs_uri_locality,
+            body.uri,
+            host_region=host_region,
+            operation="check",
+            allowed_buckets=validated_allowlist,
+            allow_multiregion=not body.strict,
+            location_resolver=resolver,
+            on_unknown="allow",
+        )
 
         allowlisted = bucket in set(validated_allowlist)
         return JSONResponse(

@@ -108,6 +108,18 @@ CROSS_TENANT_ROUTES: dict[str, str] = {
     "GET /api/v1/tracking/runs/{run_id}/tables": "read another org's logged tables",
     "GET /api/v1/tracking/runs/{run_id}/media": "list another org's logged media",
     "GET /api/v1/tracking/runs/{run_id}/blobs/{sha256}": "download another org's media bytes",
+    "POST /api/v1/tracking/compare": "compare another org's tracked training runs",
+    "PATCH /api/v1/collaboration/runs/{run_id}": "modify sharing or pinning on another org's run",
+    "GET /api/v1/collaboration/experiments": "list another org's collaborative experiments and speedruns",
+    "POST /api/v1/collaboration/experiments": "create an experiment inside another org",
+    "GET /api/v1/collaboration/experiments/{exp_id}": "read another org's collaborative experiment",
+    "PATCH /api/v1/collaboration/experiments/{exp_id}": "modify another org's collaborative experiment",
+    "DELETE /api/v1/collaboration/experiments/{exp_id}": "delete another org's collaborative experiment",
+    "GET /api/v1/collaboration/experiments/{exp_id}/leaderboard": "read another org's speedrun leaderboard",
+    "GET /api/v1/collaboration/notes": "read another org's team notes",
+    "POST /api/v1/collaboration/notes": "attach a team note inside another org",
+    "DELETE /api/v1/collaboration/notes/{note_id}": "delete another org's team note",
+    "GET /api/v1/collaboration/feed": "read another org's live team collaboration feed",
 }
 
 #: Routes that require fleet administration outright. A tenant principal is
@@ -191,6 +203,9 @@ EXEMPT_ROUTES: dict[str, str] = {
     "GET /api/v1/tracking/health": "authenticated tracker readiness; store root and segment count, no run data",
     "GET /api/v1/storage/status": (
         "authenticated non-secret storage configuration and detected GCP context; no tenant data"
+    ),
+    "POST /api/v1/storage/check-region": (
+        "authenticated GCS bucket locality probe; checks caller-specified URI against a region, no tenant data"
     ),
     "GET /api/v1/build": "what code this plane runs; authenticated because it fingerprints, but tenant-independent",
     "GET /healthz": "liveness; no tenant data",
@@ -298,6 +313,11 @@ FLEET_ONLY_ROUTES.update(
 
 ROUTE_CLASSIFICATION = {**CROSS_TENANT_ROUTES, **FLEET_ONLY_ROUTES, **EXEMPT_ROUTES}
 
+#: Static fallback routes registered only when no built dashboard bundle is mounted.
+OPTIONAL_EXEMPT_ROUTES: dict[str, str] = {
+    "GET /": "static HTML notice served only when no compiled dashboard bundle is mounted at /; no tenant data",
+}
+
 
 # --------------------------------------------------------------------------- harness
 
@@ -372,7 +392,7 @@ def test_every_route_is_classified() -> None:
         for method in sorted(route.methods - {"HEAD", "OPTIONS"})
     }
 
-    unclassified = sorted(live - set(ROUTE_CLASSIFICATION))
+    unclassified = sorted(live - set(ROUTE_CLASSIFICATION) - set(OPTIONAL_EXEMPT_ROUTES))
     assert not unclassified, (
         "these routes are not classified for tenant isolation; add each to "
         "CROSS_TENANT_ROUTES, FLEET_ONLY_ROUTES, or EXEMPT_ROUTES with a reason: " + ", ".join(unclassified)
@@ -461,6 +481,66 @@ def test_a_tenant_cannot_read_another_tenants_tracked_runs(plane: TestClient) ->
     # The owner passes authorization; without a tracker the honest answer is 503, never 403.
     own = plane.get("/api/v1/tracking/runs", params=scope, headers=ACME)
     assert own.status_code not in {401, 403, 404}, own.text
+
+
+def test_a_tenant_cannot_reach_another_tenants_collaboration_or_compare_routes(plane: TestClient) -> None:
+    """Every collaboration and multi-run compare endpoint enforces tenant scope before touching state."""
+
+    scope = {"org_id": "acme", "project_id": "research"}
+    created_exp = plane.post(
+        "/api/v1/collaboration/experiments",
+        json={**scope, "name": "Acme Speedrun", "kind": "speedrun"},
+        headers=ACME,
+    )
+    assert created_exp.status_code == 201, created_exp.text
+    exp_id = created_exp.json()["id"]
+
+    created_note = plane.post(
+        "/api/v1/collaboration/notes",
+        json={**scope, "target_type": "experiment", "target_id": exp_id, "body": "Acme private observation"},
+        headers=ACME,
+    )
+    assert created_note.status_code == 201, created_note.text
+    note_id = created_note.json()["id"]
+
+    attempts = {
+        "compare": plane.post(
+            "/api/v1/tracking/compare",
+            json={**scope, "run_ids": ["run-1"]},
+            headers=RIVAL,
+        ),
+        "patch-run": plane.patch(
+            "/api/v1/collaboration/runs/run-1",
+            params=scope,
+            json={"visibility": "team"},
+            headers=RIVAL,
+        ),
+        "list-exps": plane.get("/api/v1/collaboration/experiments", params=scope, headers=RIVAL),
+        "create-exp": plane.post(
+            "/api/v1/collaboration/experiments",
+            json={**scope, "name": "Intruder"},
+            headers=RIVAL,
+        ),
+        "get-exp": plane.get(f"/api/v1/collaboration/experiments/{exp_id}", params=scope, headers=RIVAL),
+        "patch-exp": plane.patch(
+            f"/api/v1/collaboration/experiments/{exp_id}",
+            params=scope,
+            json={"name": "Hijacked"},
+            headers=RIVAL,
+        ),
+        "delete-exp": plane.delete(f"/api/v1/collaboration/experiments/{exp_id}", params=scope, headers=RIVAL),
+        "leaderboard": plane.get(f"/api/v1/collaboration/experiments/{exp_id}/leaderboard", params=scope, headers=RIVAL),
+        "list-notes": plane.get("/api/v1/collaboration/notes", params=scope, headers=RIVAL),
+        "create-note": plane.post(
+            "/api/v1/collaboration/notes",
+            json={**scope, "target_type": "experiment", "target_id": exp_id, "body": "Intruder"},
+            headers=RIVAL,
+        ),
+        "delete-note": plane.delete(f"/api/v1/collaboration/notes/{note_id}", params=scope, headers=RIVAL),
+        "feed": plane.get("/api/v1/collaboration/feed", params=scope, headers=RIVAL),
+    }
+    for name, response in attempts.items():
+        assert response.status_code == 403, f"collaboration {name} leaked across tenants: {response.status_code}"
 
 
 def test_listing_workloads_never_returns_another_tenants(plane: TestClient) -> None:

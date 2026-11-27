@@ -11,8 +11,10 @@ import asyncio
 import hmac
 import logging
 import math
+import re
 import typing as tp
 from contextlib import asynccontextmanager, suppress
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -25,6 +27,7 @@ from eyvan.track.tracker.phase3_api import add_routes
 
 _LOG = logging.getLogger(__name__)
 _BASE = "/api/v1/tracking"
+_RUN_SUBPATH_RE = re.compile(rf"^{re.escape(_BASE)}/runs/([^/]+)(?:/.*)?$")
 
 
 def create_tracker_app(
@@ -68,6 +71,35 @@ def create_tracker_app(
                 await task
 
     app = FastAPI(title="Eyvan tracker", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def attach_run_access_headers(request: Request, call_next: tp.Any) -> tp.Any:
+        """Attach lightweight run access metadata headers on every 200 ``/runs/{run_id}*`` response."""
+
+        response = await call_next(request)
+        if response.status_code != 200:
+            return response
+        match = _RUN_SUBPATH_RE.match(request.url.path)
+        if match is None:
+            return response
+        org_id = request.query_params.get("org_id")
+        project_id = request.query_params.get("project_id")
+        run_id = match.group(1)
+        if not org_id or not project_id:
+            return response
+        try:
+            meta = await asyncio.to_thread(index.run_access_metadata, org_id, project_id, run_id)
+        except ValueError:
+            return response
+        if meta is not None:
+            response.headers["X-Eyvan-Run-Visibility"] = str(meta.get("visibility") or "team")
+            owner = meta.get("owner")
+            response.headers["X-Eyvan-Run-Owner"] = quote(owner, safe="@._-") if isinstance(owner, str) and owner else ""
+            workload_id = meta.get("workload_id")
+            response.headers["X-Eyvan-Workload-Id"] = (
+                quote(workload_id, safe="@._-") if isinstance(workload_id, str) and workload_id else ""
+            )
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def invalid_query(request: Request, error: RequestValidationError) -> JSONResponse:

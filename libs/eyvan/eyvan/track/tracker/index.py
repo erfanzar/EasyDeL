@@ -46,7 +46,8 @@ _METRIC_KEY = re.compile(r"[A-Za-z0-9_./-]{1,128}")
 _DROP_KEYS = ("keys", "rate", "invalid", "queue")
 _VALID_VISIBILITIES = frozenset({"private", "shared", "team"})
 _PRESERVE_IDENTITY_IF_NONE = frozenset({"workload_id", "owner", "visibility", "experiment"})
-_MAX_LATEST_METRICS = 24
+_IMMUTABLE_FIRST_IDENTITY = frozenset({"owner", "visibility"})
+_MAX_LATEST_METRICS = 256
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS segments (
     segment TEXT PRIMARY KEY, org TEXT NOT NULL, project TEXT NOT NULL, run TEXT NOT NULL,
@@ -198,20 +199,57 @@ class TrackingIndex(PhaseThreeIndexMixin):
     """Disposable, thread-safe tracking index backed by a local SQLite file."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path).expanduser().resolve()
+        self._is_memory = str(db_path) == ":memory:"
+        self.db_path = Path(db_path) if self._is_memory else Path(db_path).expanduser().resolve()
         self._lock = threading.RLock()
         self._scan_lock = threading.Lock()
+        self._memory_conn: sqlite3.Connection | None = None
+        self._init_schema()
         with self._connection() as db:
             phase3.populate_summaries(db)
             self._populate_latest_scalars(db)
 
+    def _init_schema(self) -> None:
+        """Create schema and enable WAL mode once when opening the index."""
+
+        with self._lock:
+            if self._is_memory:
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.executescript(_SCHEMA + phase2.SCHEMA + phase3.SCHEMA)
+                self._memory_conn = conn
+                return
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.executescript(_SCHEMA + phase2.SCHEMA + phase3.SCHEMA)
+            finally:
+                conn.close()
+
     @staticmethod
     def _populate_latest_scalars(db: sqlite3.Connection) -> None:
-        """Backfill ``latest_scalars`` once when opening an index created before the table existed."""
+        """Backfill ``latest_scalars`` for any run/metric/rank missing from the materialized table."""
 
-        if db.execute("SELECT 1 FROM latest_scalars LIMIT 1").fetchone() is not None:
-            return
-        if db.execute("SELECT 1 FROM scalars WHERE value IS NOT NULL LIMIT 1").fetchone() is None:
+        missing = db.execute(
+            """SELECT 1
+               FROM scalars v
+               JOIN segments s USING(segment)
+               WHERE v.value IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM latest_scalars ls
+                     WHERE ls.org = s.org AND ls.project = s.project AND ls.run = s.run
+                       AND ls.metric = v.metric AND ls.rank = s.rank
+                 )
+               LIMIT 1"""
+        ).fetchone()
+        if missing is None:
             return
         db.execute(
             """INSERT OR REPLACE INTO latest_scalars
@@ -227,6 +265,11 @@ class TrackingIndex(PhaseThreeIndexMixin):
                    FROM scalars v
                    JOIN segments s USING(segment)
                    WHERE v.value IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM latest_scalars ls
+                         WHERE ls.org = s.org AND ls.project = s.project AND ls.run = s.run
+                           AND ls.metric = v.metric AND ls.rank = s.rank
+                     )
                )
                WHERE rn = 1"""
         )
@@ -234,12 +277,19 @@ class TrackingIndex(PhaseThreeIndexMixin):
     @contextmanager
     def _connection(self) -> tp.Iterator[sqlite3.Connection]:
         with self._lock:
+            if self._is_memory:
+                if self._memory_conn is None:
+                    self._init_schema()
+                assert self._memory_conn is not None
+                with self._memory_conn:
+                    yield self._memory_conn
+                return
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(self.db_path, timeout=30)
             connection.row_factory = sqlite3.Row
             try:
                 connection.execute("PRAGMA foreign_keys = ON")
-                connection.executescript(_SCHEMA + phase2.SCHEMA + phase3.SCHEMA)
+                connection.execute("PRAGMA busy_timeout = 30000")
                 with connection:
                     yield connection
             finally:
@@ -381,20 +431,95 @@ class TrackingIndex(PhaseThreeIndexMixin):
         # Build beside the live database without holding its query lock. Readers
         # continue to see the complete old snapshot until atomic publication.
         with self._scan_lock:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary = tempfile.mkstemp(prefix=".tracking-rebuild-", dir=self.db_path.parent)
             os.close(descriptor)
             try:
                 candidate = TrackingIndex(temporary)
                 result = candidate.scan(store)
+                # Checkpoint and collapse candidate WAL into a single self-contained file
+                # before replacing the live DB path so no frames are stranded in -wal.
+                with candidate._connection() as cand_db:
+                    cand_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    cand_db.execute("PRAGMA journal_mode = DELETE")
                 with self._lock:
+                    Path(f"{self.db_path}-wal").unlink(missing_ok=True)
+                    Path(f"{self.db_path}-shm").unlink(missing_ok=True)
                     os.replace(temporary, self.db_path)
+                    conn = sqlite3.connect(self.db_path, timeout=30)
+                    try:
+                        conn.execute("PRAGMA journal_mode = WAL")
+                        conn.execute("PRAGMA synchronous = NORMAL")
+                        conn.execute("PRAGMA busy_timeout = 30000")
+                    finally:
+                        conn.close()
                 return result
             finally:
                 Path(temporary).unlink(missing_ok=True)
+                Path(f"{temporary}-wal").unlink(missing_ok=True)
+                Path(f"{temporary}-shm").unlink(missing_ok=True)
 
     @staticmethod
     def _scope(org: str, project: str, run: str | None = None) -> tuple[str, ...]:
         return tuple(validate_run_id(value) for value in (org, project, run) if value is not None)
+
+    @staticmethod
+    def _apply_start_identity(
+        identity: dict[str, tp.Any],
+        identity_order: dict[str, tuple[tp.Any, ...]],
+        record: dict[str, tp.Any],
+        order: tuple[tp.Any, ...],
+    ) -> None:
+        """Merge one ``start`` metadata record into ``identity``.
+
+        ``owner`` and ``visibility`` lock to the earliest non-``None`` start record
+        so a later rogue segment or attempt cannot flip ``private`` to ``team`` or
+        hijack ownership. Mutable display fields continue to follow the latest start.
+        """
+
+        for key in identity:
+            if key not in record:
+                continue
+            value = record[key]
+            if key in _IMMUTABLE_FIRST_IDENTITY:
+                if value is None:
+                    continue
+                if key not in identity_order or order < identity_order[key]:
+                    identity[key] = value
+                    identity_order[key] = order
+            elif (value is not None or key not in _PRESERVE_IDENTITY_IF_NONE) and order > identity_order.get(key, ()):
+                identity[key] = value
+                identity_order[key] = order
+
+    def run_access_metadata(self, org: str, project: str, run_id: str) -> dict[str, str | None] | None:
+        """Return lightweight ``owner``, ``visibility``, and ``workload_id`` for access checks."""
+
+        scope = self._scope(org, project, run_id)
+        with self._connection() as db:
+            exists = db.execute(
+                "SELECT 1 FROM segments WHERE org = ? AND project = ? AND run = ? LIMIT 1", scope
+            ).fetchone()
+            if exists is None:
+                return None
+            meta = db.execute(
+                """SELECT m.t, m.line, m.payload, s.attempt, s.rank, s.writer, s.seq
+                   FROM metadata m
+                   JOIN segments s USING(segment)
+                   WHERE s.org = ? AND s.project = ? AND s.run = ? AND m.op = 'start'
+                   ORDER BY m.t, s.attempt, s.seq, m.line, s.rank, s.writer""",
+                scope,
+            ).fetchall()
+        identity: dict[str, tp.Any] = {"owner": None, "visibility": "team", "workload_id": None}
+        identity_order: dict[str, tuple[tp.Any, ...]] = {}
+        for row in meta:
+            record = json.loads(row["payload"])
+            order = (row["attempt"], row["t"], row["seq"], row["line"], row["rank"], row["writer"])
+            self._apply_start_identity(identity, identity_order, record, order)
+        return {
+            "owner": identity["owner"],
+            "visibility": identity["visibility"],
+            "workload_id": identity["workload_id"],
+        }
 
     def list_runs(self, org: str, project: str, status: str | None = None, limit: int = 200) -> list[dict[str, tp.Any]]:
         """Return scoped run summaries, newest first, optionally filtered by status."""
@@ -476,14 +601,7 @@ class TrackingIndex(PhaseThreeIndexMixin):
             times[attempt].append(row["t"])
             order = (attempt, row["t"], row["seq"], row["line"], row["rank"], row["writer"])
             if op == "start":
-                for key in identity:
-                    if (
-                        key in record
-                        and (record[key] is not None or key not in _PRESERVE_IDENTITY_IF_NONE)
-                        and order > identity_order.get(key, ())
-                    ):
-                        identity[key] = record[key]
-                        identity_order[key] = order
+                TrackingIndex._apply_start_identity(identity, identity_order, record, order)
             elif op == "config" and order > config_order:
                 config = record["config"]
                 config_order = order

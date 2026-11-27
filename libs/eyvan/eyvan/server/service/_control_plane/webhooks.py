@@ -9,6 +9,7 @@ from math import isfinite
 
 from eyvan.server.service._control_plane.shared import (
     AuditEvent,
+    InputError,
     LeaseRecord,
     NotFoundError,
     Permission,
@@ -20,6 +21,7 @@ from eyvan.server.service._control_plane.shared import (
     spend_of,
     validate_webhook_target,
 )
+from eyvan.server.service.webhooks import WebhookTargetRefused
 
 
 class WebhooksMixin:
@@ -50,7 +52,10 @@ class WebhooksMixin:
         """
 
         self.authorizer.require(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
-        validate_webhook_target(url, allow_private=allow_private_targets)
+        try:
+            validate_webhook_target(url, allow_private=allow_private_targets)
+        except WebhookTargetRefused as exc:
+            raise InputError(str(exc)) from exc
         async with self.repository.transaction() as tx:
             latest = await tx.list_events(org_id=org_id, project_id=project_id, newest_first=True, limit=1)
             webhook = WebhookRecord(

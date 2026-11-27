@@ -11,6 +11,7 @@ import asyncio
 import json
 import math
 import typing as tp
+from urllib.parse import unquote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
@@ -41,7 +42,7 @@ _ItemId = tp.Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")]
 _UNCONFIGURED = "Run tracking is not configured; run `eyvan track up --local` or set EYVAN_TRACKER_URL."
 _PRIVATE_RUN_DETAIL = "You do not have permission to view this run."
 _RunId = tp.Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")]
-_ScopeId = tp.Annotated[str, Query(min_length=1, max_length=128)]
+_ScopeId = tp.Annotated[str, Query(min_length=1, max_length=128, pattern=r"\S")]
 _Principal = tp.Annotated[Principal, Depends(authenticated_principal)]
 
 _CONTROL_PLANE_RUN_FILTERS = frozenset({"org_id", "project_id", "owner", "visibility", "experiment_id", "group"})
@@ -53,12 +54,28 @@ class RunCompareRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    org_id: str = Field(min_length=1, max_length=128)
-    project_id: str = Field(min_length=1, max_length=128)
+    org_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
+    project_id: str = Field(min_length=1, max_length=128, pattern=r"\S")
     run_ids: list[str] = Field(min_length=1, max_length=12)
     keys: list[str] = Field(default_factory=list, max_length=32)
     x: str = Field(default="step", min_length=1, max_length=128)
     points: int = Field(default=300, ge=1, le=2000)
+
+
+def sanitize_json_value(value: tp.Any) -> tp.Any:
+    """Recursively replace non-finite floats (NaN / ±Inf) with ``None`` for strict JSON output."""
+
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_json_value(item) for item in value]
+    return value
 
 
 def require_project_member(
@@ -68,13 +85,34 @@ def require_project_member(
     org_id: str,
     project_id: str,
 ) -> None:
-    """Require at least ``READ`` or ``SUBMIT`` permission on ``(org_id, project_id)``."""
+    """Require ``READ``, ``SUBMIT``, ``MANAGE_PROJECT``, or ``MANAGE_FLEET`` access on ``(org_id, project_id)``."""
 
-    if service.authorizer.allows(principal, Permission.READ, org_id=org_id, project_id=project_id):
-        return
-    if service.authorizer.allows(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id):
+    if (
+        service.authorizer.allows(principal, Permission.READ, org_id=org_id, project_id=project_id)
+        or service.authorizer.allows(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        or service.authorizer.allows(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
+        or service.authorizer.allows(principal, Permission.MANAGE_FLEET)
+    ):
         return
     raise AuthorizationError(f"{principal.subject!r} lacks project access for {org_id}/{project_id}")
+
+
+def require_project_writer(
+    service: ControlPlaneService,
+    principal: Principal,
+    *,
+    org_id: str,
+    project_id: str,
+) -> None:
+    """Require ``SUBMIT``, ``MANAGE_PROJECT``, or ``MANAGE_FLEET`` permission to mutate project collaboration state."""
+
+    if (
+        service.authorizer.allows(principal, Permission.SUBMIT, org_id=org_id, project_id=project_id)
+        or service.authorizer.allows(principal, Permission.MANAGE_PROJECT, org_id=org_id, project_id=project_id)
+        or service.authorizer.allows(principal, Permission.MANAGE_FLEET)
+    ):
+        return
+    raise AuthorizationError(f"{principal.subject!r} lacks write access for {org_id}/{project_id}")
 
 
 def is_project_admin(
@@ -137,6 +175,27 @@ async def resolve_workload_owners(
     return owners
 
 
+async def resolve_run_workload_owner(
+    service: ControlPlaneService,
+    *,
+    org_id: str,
+    project_id: str,
+    run_id: str,
+    workload_id: str | None = None,
+) -> str | None:
+    """Resolve workload ``created_by`` matching either ``workload_id`` or ``run_id``."""
+
+    candidates: list[str] = []
+    if isinstance(workload_id, str) and workload_id:
+        candidates.append(workload_id)
+    if run_id and run_id not in candidates:
+        candidates.append(run_id)
+    owners = await resolve_workload_owners(service, candidates, org_id=org_id, project_id=project_id)
+    if isinstance(workload_id, str) and workload_id in owners:
+        return owners[workload_id]
+    return owners.get(run_id)
+
+
 def enrich_run_record(
     run: dict[str, tp.Any],
     overlay: dict[str, tp.Any] | None,
@@ -163,7 +222,7 @@ def enrich_run_record(
     return merged
 
 
-async def enrich_and_filter_runs(
+async def enrich_runs_snapshot(
     runs: list[tp.Any],
     *,
     service: ControlPlaneService,
@@ -175,11 +234,13 @@ async def enrich_and_filter_runs(
     visibility: str | None = None,
     experiment_id: str | None = None,
     group: str | None = None,
-) -> list[dict[str, tp.Any]]:
-    """Merge runs with overlays, workload owners, and note counts, then apply RBAC and filters."""
+) -> tuple[dict[str, dict[str, tp.Any]], list[dict[str, tp.Any]]]:
+    """Enrich every run and return ``(all_enriched_by_run_id, visible_filtered_runs)``."""
 
-    overlays = store.list_run_overlays(org_id, project_id) if store is not None else {}
-    note_counts = store.count_notes_by_target(org_id, project_id, "run") if store is not None else {}
+    overlays = await asyncio.to_thread(store.list_run_overlays, org_id, project_id) if store is not None else {}
+    note_counts = (
+        await asyncio.to_thread(store.count_notes_by_target, org_id, project_id, "run") if store is not None else {}
+    )
     missing_owner_workloads: list[str] = []
     for item in runs:
         if not isinstance(item, dict):
@@ -187,14 +248,18 @@ async def enrich_and_filter_runs(
         rid = item.get("run_id")
         overlay = overlays.get(rid) if isinstance(rid, str) else None
         has_owner = bool((overlay and overlay.get("owner")) or item.get("owner"))
-        wid = item.get("workload_id")
-        if not has_owner and isinstance(wid, str) and wid:
-            missing_owner_workloads.append(wid)
+        if not has_owner:
+            wid = item.get("workload_id")
+            if isinstance(wid, str) and wid:
+                missing_owner_workloads.append(wid)
+            if isinstance(rid, str) and rid:
+                missing_owner_workloads.append(rid)
     workload_owners = await resolve_workload_owners(
         service, missing_owner_workloads, org_id=org_id, project_id=project_id
     )
     admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
 
+    all_enriched: dict[str, dict[str, tp.Any]] = {}
     visible: list[dict[str, tp.Any]] = []
     for item in runs:
         if not isinstance(item, dict):
@@ -202,13 +267,17 @@ async def enrich_and_filter_runs(
         rid = item.get("run_id")
         overlay = overlays.get(rid) if isinstance(rid, str) else None
         wid = item.get("workload_id")
-        wl_owner = workload_owners.get(wid) if isinstance(wid, str) else None
+        wl_owner = (workload_owners.get(wid) if isinstance(wid, str) else None) or (
+            workload_owners.get(rid) if isinstance(rid, str) else None
+        )
         enriched = enrich_run_record(
             item,
             overlay,
             workload_owner=wl_owner,
             notes_count=note_counts.get(rid, 0) if isinstance(rid, str) else 0,
         )
+        if isinstance(rid, str):
+            all_enriched[rid] = enriched
         if not can_view(
             principal.subject,
             owner=enriched["owner"],
@@ -226,7 +295,221 @@ async def enrich_and_filter_runs(
         if group is not None and enriched.get("group") != group:
             continue
         visible.append(enriched)
+    return all_enriched, visible
+
+
+async def enrich_and_filter_runs(
+    runs: list[tp.Any],
+    *,
+    service: ControlPlaneService,
+    store: CollaborationStore | None,
+    principal: Principal,
+    org_id: str,
+    project_id: str,
+    owner: str | None = None,
+    visibility: str | None = None,
+    experiment_id: str | None = None,
+    group: str | None = None,
+) -> list[dict[str, tp.Any]]:
+    """Merge runs with overlays, workload owners, and note counts, then apply RBAC and filters."""
+
+    _, visible = await enrich_runs_snapshot(
+        runs,
+        service=service,
+        store=store,
+        principal=principal,
+        org_id=org_id,
+        project_id=project_id,
+        owner=owner,
+        visibility=visibility,
+        experiment_id=experiment_id,
+        group=group,
+    )
     return visible
+
+
+async def fetch_tracker_run_metadata(
+    app: FastAPI,
+    settings: EyvanSettings,
+    *,
+    org_id: str,
+    project_id: str,
+    run_id: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+    client: httpx.AsyncClient | None = None,
+    allow_unconfigured: bool = False,
+    allow_non_json_media_mock: bool = False,
+) -> tuple[int | None, dict[str, tp.Any] | None]:
+    """Fetch ``GET /api/v1/tracking/runs/{run_id}`` metadata from the configured tracker."""
+
+    try:
+        url, token = resolve_tracker_credentials(settings)
+    except HTTPException as exc:
+        if exc.status_code == 503 and allow_unconfigured:
+            return None, None
+        raise
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    target = f"{url.rstrip('/')}/api/v1/tracking/runs/{run_id}"
+    params = [("org_id", org_id), ("project_id", project_id)]
+    try:
+        if client is not None:
+            response = await client.get(target, params=params, headers=headers)
+        else:
+            selected_transport = getattr(app.state, "tracking_transport", transport)
+            async with httpx.AsyncClient(
+                transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
+            ) as owned_client:
+                response = await owned_client.get(target, params=params, headers=headers)
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=502,
+            detail="Run tracker timed out before responding; check `eyvan track status` or retry shortly.",
+        ) from None
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="Run tracker is unreachable; check `eyvan track status` or restart with `eyvan track up --local`.",
+        ) from None
+    if response.status_code == 404:
+        return 404, None
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail="Run tracker returned an error while verifying run visibility.",
+        )
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if allow_non_json_media_mock and content_type in MEDIA_TYPES:
+        return 200, None
+    try:
+        payload = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Run tracker returned an invalid JSON response; check `eyvan track status` or its logs.",
+        ) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Run tracker returned an unexpected response while verifying run visibility.",
+        )
+    return 200, payload
+
+
+async def authorize_run_access(
+    *,
+    app: FastAPI,
+    settings: EyvanSettings,
+    service: ControlPlaneService,
+    store: CollaborationStore | None,
+    principal: Principal,
+    org_id: str,
+    project_id: str,
+    run_id: str,
+    overlay: dict[str, tp.Any] | None = None,
+    overlay_loaded: bool = False,
+    tracker_headers: tp.Mapping[str, str] | None = None,
+    tracker_run: dict[str, tp.Any] | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    client: httpx.AsyncClient | None = None,
+    allow_unconfigured_tracker: bool = False,
+    allow_missing_tracker_run: bool = False,
+    allow_non_json_media_mock: bool = False,
+    detail: str = _PRIVATE_RUN_DETAIL,
+) -> dict[str, tp.Any] | None:
+    """Enforce run visibility across collaboration overlays, tracker metadata, and workload ownership.
+
+    Checks durable collaboration overlays first (pre-network fast reject). When no overlay
+    exists and the caller is not a project/fleet admin, verifies tracker-declared
+    ``owner``/``visibility``/``workload_id`` via response headers or ``GET /runs/{run_id}``
+    plus workload ``created_by`` resolution on both ``run_id`` and ``workload_id``.
+    """
+
+    admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+    if not overlay_loaded and store is not None:
+        overlay = await asyncio.to_thread(store.get_run_overlay, org_id, project_id, run_id)
+    if overlay is not None:
+        if not can_view(
+            principal.subject,
+            owner=overlay["owner"],
+            visibility=overlay["visibility"],
+            shared_with=overlay["shared_with"],
+            is_admin=admin,
+        ):
+            raise HTTPException(status_code=403, detail=detail)
+        return overlay
+    if admin:
+        return None
+
+    owner: str | None = None
+    visibility = "team"
+    shared_with: tp.Sequence[str] = ()
+    workload_id: str | None = None
+
+    if tracker_run is not None:
+        if "run_id" not in tracker_run:
+            return None
+        raw_owner = tracker_run.get("owner")
+        owner = raw_owner if isinstance(raw_owner, str) and raw_owner else None
+        raw_vis = tracker_run.get("visibility")
+        visibility = raw_vis.strip().lower() if isinstance(raw_vis, str) and raw_vis.strip() else "team"
+        raw_shared = tracker_run.get("shared_with")
+        shared_with = list(raw_shared) if isinstance(raw_shared, list) else ()
+        raw_wid = tracker_run.get("workload_id")
+        workload_id = raw_wid if isinstance(raw_wid, str) and raw_wid else None
+    elif tracker_headers is not None and tracker_headers.get("X-Eyvan-Run-Visibility") is not None:
+        raw_vis = tracker_headers.get("X-Eyvan-Run-Visibility") or ""
+        visibility = raw_vis.strip().lower() or "team"
+        raw_owner = unquote(tracker_headers.get("X-Eyvan-Run-Owner") or "")
+        owner = raw_owner or None
+        raw_wid = unquote(tracker_headers.get("X-Eyvan-Workload-Id") or "")
+        workload_id = raw_wid or None
+    else:
+        status_code, meta = await fetch_tracker_run_metadata(
+            app,
+            settings,
+            org_id=org_id,
+            project_id=project_id,
+            run_id=run_id,
+            transport=transport,
+            client=client,
+            allow_unconfigured=allow_unconfigured_tracker,
+            allow_non_json_media_mock=allow_non_json_media_mock,
+        )
+        if status_code is None:
+            return None
+        if status_code == 404:
+            if allow_missing_tracker_run:
+                return None
+            raise HTTPException(status_code=403, detail=detail)
+        if meta is None or "run_id" not in meta:
+            return None
+        raw_owner = meta.get("owner")
+        owner = raw_owner if isinstance(raw_owner, str) and raw_owner else None
+        raw_vis = meta.get("visibility")
+        visibility = raw_vis.strip().lower() if isinstance(raw_vis, str) and raw_vis.strip() else "team"
+        raw_shared = meta.get("shared_with")
+        shared_with = list(raw_shared) if isinstance(raw_shared, list) else ()
+        raw_wid = meta.get("workload_id")
+        workload_id = raw_wid if isinstance(raw_wid, str) and raw_wid else None
+
+    if not owner:
+        owner = await resolve_run_workload_owner(
+            service,
+            org_id=org_id,
+            project_id=project_id,
+            run_id=run_id,
+            workload_id=workload_id,
+        )
+
+    if not can_view(
+        principal.subject,
+        owner=owner,
+        visibility=visibility,
+        shared_with=shared_with,
+        is_admin=False,
+    ):
+        raise HTTPException(status_code=403, detail=detail)
+    return None
 
 
 async def tracker_get_json(
@@ -323,7 +606,7 @@ def register_tracking_routes(
     def _store(request: Request) -> CollaborationStore | None:
         return collaboration_store or getattr(request.app.state, "collaboration_store", None)
 
-    def _enforce_overlay_access(
+    async def _enforce_overlay_access(
         request: Request,
         *,
         principal: Principal,
@@ -334,7 +617,7 @@ def register_tracking_routes(
         store = _store(request)
         if store is None:
             return None
-        overlay = store.get_run_overlay(org_id, project_id, run_id)
+        overlay = await asyncio.to_thread(store.get_run_overlay, org_id, project_id, run_id)
         if overlay is not None:
             admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
             if not can_view(
@@ -355,30 +638,92 @@ def register_tracking_routes(
         project_id: str | None = None,
         run_id: str | None = None,
         blob: bool = False,
+        skip_post_auth: bool = False,
         strip_params: frozenset[str] = frozenset({"org_id", "project_id"}),
+        extra_params: tp.Sequence[tuple[str, str | int]] = (),
     ) -> httpx.Response:
-        if org_id is not None and project_id is not None:
-            require_project_member(service, principal, org_id=org_id, project_id=project_id)
+        norm_org = org_id.strip() if org_id is not None else None
+        norm_project = project_id.strip() if project_id is not None else None
+        overlay: dict[str, tp.Any] | None = None
+        admin = False
+        if norm_org is not None and norm_project is not None:
+            require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+            admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
             if run_id is not None:
-                _enforce_overlay_access(
-                    request, principal=principal, org_id=org_id, project_id=project_id, run_id=run_id
+                overlay = await _enforce_overlay_access(
+                    request, principal=principal, org_id=norm_org, project_id=norm_project, run_id=run_id
                 )
         url, token = resolve_tracker_credentials(settings)
         # Keep repeated metric keys, but bind the forwarded scope to exactly the
         # values we authorized, regardless of duplicate org/project parameters.
-        params = [(key, value) for key, value in request.query_params.multi_items() if key not in strip_params]
-        if org_id is not None and project_id is not None:
-            params.extend((("org_id", org_id), ("project_id", project_id)))
+        params: list[tuple[str, str | int]] = [
+            (key, value) for key, value in request.query_params.multi_items() if key not in strip_params
+        ]
+        if norm_org is not None and norm_project is not None:
+            params.extend((("org_id", norm_org), ("project_id", norm_project)))
+        if extra_params:
+            params.extend(extra_params)
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         selected_transport = getattr(request.app.state, "tracking_transport", transport)
+        store = _store(request)
+        needs_post_auth = (
+            not skip_post_auth
+            and run_id is not None
+            and norm_org is not None
+            and norm_project is not None
+            and overlay is None
+            and not admin
+        )
         try:
             async with httpx.AsyncClient(
                 transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
             ) as client:
                 target = f"{url.rstrip('/')}{request.url.path}"
                 if not blob:
-                    return await client.get(target, params=params, headers=headers)
+                    response = await client.get(target, params=params, headers=headers)
+                    if needs_post_auth and response.status_code == 200:
+                        assert norm_org is not None and norm_project is not None and run_id is not None
+                        await authorize_run_access(
+                            app=app,
+                            settings=settings,
+                            service=service,
+                            store=store,
+                            principal=principal,
+                            org_id=norm_org,
+                            project_id=norm_project,
+                            run_id=run_id,
+                            overlay=None,
+                            overlay_loaded=True,
+                            tracker_headers=response.headers,
+                            transport=selected_transport,
+                            client=client,
+                        )
+                    return response
+
+                had_access_headers = False
                 async with client.stream("GET", target, params=params, headers=headers) as response:
+                    if (
+                        needs_post_auth
+                        and response.status_code == 200
+                        and response.headers.get("X-Eyvan-Run-Visibility") is not None
+                    ):
+                        assert norm_org is not None and norm_project is not None and run_id is not None
+                        had_access_headers = True
+                        await authorize_run_access(
+                            app=app,
+                            settings=settings,
+                            service=service,
+                            store=store,
+                            principal=principal,
+                            org_id=norm_org,
+                            project_id=norm_project,
+                            run_id=run_id,
+                            overlay=None,
+                            overlay_loaded=True,
+                            tracker_headers=response.headers,
+                            transport=selected_transport,
+                            client=client,
+                        )
                     try:
                         content_length = int(response.headers.get("content-length", ""))
                     except ValueError:
@@ -395,9 +740,27 @@ def register_tracking_routes(
                         if len(content) + len(chunk) > MAX_BLOB_BYTES:
                             raise HTTPException(status_code=502, detail="Tracker returned an oversized blob.")
                         content.extend(chunk)
-                    return httpx.Response(
+                    blob_response = httpx.Response(
                         response.status_code, content=bytes(content), headers={"Content-Type": content_type}
                     )
+                if needs_post_auth and blob_response.status_code == 200 and not had_access_headers:
+                    assert norm_org is not None and norm_project is not None and run_id is not None
+                    await authorize_run_access(
+                        app=app,
+                        settings=settings,
+                        service=service,
+                        store=store,
+                        principal=principal,
+                        org_id=norm_org,
+                        project_id=norm_project,
+                        run_id=run_id,
+                        overlay=None,
+                        overlay_loaded=True,
+                        transport=selected_transport,
+                        client=client,
+                        allow_non_json_media_mock=True,
+                    )
+                return blob_response
         except httpx.TimeoutException:
             raise HTTPException(
                 status_code=502,
@@ -461,15 +824,26 @@ def register_tracking_routes(
         visibility: str | None = Query(default=None, max_length=32),
         experiment_id: str | None = Query(default=None, max_length=128),
         group: str | None = Query(default=None, max_length=256),
+        limit: int | None = Query(default=None, ge=1, le=1000),
     ) -> JSONResponse:
         """List runs visible to a project member, enriched with collaboration metadata."""
 
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
+        has_post_filter = any(v is not None for v in (owner, visibility, experiment_id, group)) or not admin
+        requested_limit = limit if limit is not None else 200
+        strip = _CONTROL_PLANE_RUN_FILTERS | ({"limit"} if has_post_filter else set())
+        overfetch_limit = min(max(requested_limit * 4, 200), 1000)
+        extra: list[tuple[str, str | int]] = [("limit", overfetch_limit)] if has_post_filter else []
         response = await upstream(
             request,
             principal=principal,
-            org_id=org_id,
-            project_id=project_id,
-            strip_params=_CONTROL_PLANE_RUN_FILTERS,
+            org_id=norm_org,
+            project_id=norm_project,
+            strip_params=strip,
+            extra_params=extra,
         )
         try:
             payload = response.json()
@@ -484,13 +858,15 @@ def register_tracking_routes(
                 service=service,
                 store=_store(request),
                 principal=principal,
-                org_id=org_id,
-                project_id=project_id,
+                org_id=norm_org,
+                project_id=norm_project,
                 owner=owner,
                 visibility=visibility,
                 experiment_id=experiment_id,
                 group=group,
             )
+            if has_post_filter:
+                filtered = filtered[:requested_limit]
             return JSONResponse(status_code=200, content={**payload, "runs": filtered})
         return JSONResponse(status_code=response.status_code, content=payload)
 
@@ -502,7 +878,9 @@ def register_tracking_routes(
     ) -> JSONResponse:
         """Compare multiple visible runs: aligned metric series, summary stats, and hyperparameter diff."""
 
-        require_project_member(service, principal, org_id=body.org_id, project_id=body.project_id)
+        norm_org = body.org_id.strip()
+        norm_project = body.project_id.strip()
+        require_project_member(service, principal, org_id=norm_org, project_id=norm_project)
         deduped_ids: list[str] = []
         seen_ids: set[str] = set()
         for raw_id in body.run_ids:
@@ -515,10 +893,13 @@ def register_tracking_routes(
                 deduped_ids.append(valid)
 
         store = _store(request)
-        admin = is_project_admin(service, principal, org_id=body.org_id, project_id=body.project_id)
+        admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
+        all_overlays = (
+            await asyncio.to_thread(store.list_run_overlays, norm_org, norm_project) if store is not None else {}
+        )
         overlays: dict[str, dict[str, tp.Any] | None] = {}
         for rid in deduped_ids:
-            overlay = store.get_run_overlay(body.org_id, body.project_id, rid) if store is not None else None
+            overlay = all_overlays.get(rid)
             overlays[rid] = overlay
             if overlay is not None and not can_view(
                 principal.subject,
@@ -531,7 +912,8 @@ def register_tracking_routes(
 
         resolve_tracker_credentials(settings)
         selected_transport = getattr(request.app.state, "tracking_transport", transport)
-        scope_params: list[tuple[str, str | int]] = [("org_id", body.org_id), ("project_id", body.project_id)]
+        scope_params: list[tuple[str, str | int]] = [("org_id", norm_org), ("project_id", norm_project)]
+        warnings: list[str] = []
 
         async with httpx.AsyncClient(
             transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
@@ -560,22 +942,29 @@ def register_tracking_routes(
                 raw_runs.append(payload)
                 overlay = overlays.get(rid)
                 has_owner = bool((overlay and overlay.get("owner")) or payload.get("owner"))
-                wid = payload.get("workload_id")
-                if not has_owner and isinstance(wid, str) and wid:
-                    missing_workloads.append(wid)
+                if not has_owner:
+                    wid = payload.get("workload_id")
+                    if isinstance(wid, str) and wid:
+                        missing_workloads.append(wid)
+                    missing_workloads.append(rid)
 
             workload_owners = await resolve_workload_owners(
-                service, missing_workloads, org_id=body.org_id, project_id=body.project_id
+                service, missing_workloads, org_id=norm_org, project_id=norm_project
             )
-            note_counts = store.count_notes_by_target(body.org_id, body.project_id, "run") if store is not None else {}
+            note_counts = (
+                await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "run")
+                if store is not None
+                else {}
+            )
 
             enriched_runs: list[dict[str, tp.Any]] = []
             for rid, raw_run in zip(deduped_ids, raw_runs, strict=True):
                 wid = raw_run.get("workload_id")
+                wl_owner = (workload_owners.get(wid) if isinstance(wid, str) else None) or workload_owners.get(rid)
                 enriched = enrich_run_record(
                     raw_run,
                     overlays.get(rid),
-                    workload_owner=workload_owners.get(wid) if isinstance(wid, str) else None,
+                    workload_owner=wl_owner,
                     notes_count=note_counts.get(rid, 0),
                 )
                 if not can_view(
@@ -599,32 +988,50 @@ def register_tracking_routes(
             series_by_key: dict[str, dict[str, dict[str, list[tp.Any]]]] = {k: {} for k in selected_keys}
             if selected_keys:
 
-                async def _fetch_run_series(rid: str, run_keys: set[str]) -> tuple[str, list[tp.Any]]:
+                async def _fetch_run_series(
+                    rid: str, run_keys: set[str]
+                ) -> tuple[str, list[tp.Any], str | None, bool, bool]:
                     keys_for_run = [k for k in selected_keys if not run_keys or k in run_keys]
                     if not keys_for_run:
-                        return rid, []
+                        return rid, [], None, False, False
                     params: list[tuple[str, str | int]] = [
-                        ("org_id", body.org_id),
-                        ("project_id", body.project_id),
+                        ("org_id", norm_org),
+                        ("project_id", norm_project),
                         ("x", body.x),
                         ("points", body.points),
                         *(("key", k) for k in keys_for_run),
                     ]
-                    code, data = await tracker_get_json(
-                        app,
-                        settings,
-                        f"/api/v1/tracking/runs/{rid}/series",
-                        params,
-                        client=client,
-                    )
+                    try:
+                        code, data = await tracker_get_json(
+                            app,
+                            settings,
+                            f"/api/v1/tracking/runs/{rid}/series",
+                            params,
+                            client=client,
+                        )
+                    except HTTPException as exc:
+                        return rid, [], f"Series fetch failed for run {rid!r}: {exc.detail}", True, True
                     if code == 200 and isinstance(data, dict) and isinstance(data.get("series"), list):
-                        return rid, data["series"]
-                    return rid, []
+                        return rid, data["series"], None, True, False
+                    err_detail = (
+                        data.get("detail")
+                        if isinstance(data, dict) and isinstance(data.get("detail"), str)
+                        else f"HTTP {code}"
+                    )
+                    return rid, [], f"Series fetch failed for run {rid!r}: {err_detail}", True, True
 
                 series_results = await asyncio.gather(
                     *(_fetch_run_series(rid, run_keys) for rid, run_keys in zip(deduped_ids, key_sets, strict=True))
                 )
-                for rid, series_list in series_results:
+                attempted_runs = 0
+                failed_runs = 0
+                for rid, series_list, warn, attempted, failed in series_results:
+                    if attempted:
+                        attempted_runs += 1
+                    if failed:
+                        failed_runs += 1
+                    if warn is not None:
+                        warnings.append(warn)
                     for item in series_list:
                         if not isinstance(item, dict) or not isinstance(item.get("key"), str):
                             continue
@@ -646,10 +1053,16 @@ def register_tracking_routes(
                             "min": mins,
                             "max": maxs,
                         }
+                if attempted_runs > 0 and failed_runs == attempted_runs:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Run tracker failed to return series for all requested runs.",
+                    )
 
         # Config diff table (flattened dot-separated keys, differing keys first).
         flat_configs = {
-            rid: _flatten_config(run.get("config")) for rid, run in zip(deduped_ids, enriched_runs, strict=True)
+            rid: sanitize_json_value(_flatten_config(run.get("config")))
+            for rid, run in zip(deduped_ids, enriched_runs, strict=True)
         }
         all_config_keys = sorted({key for flat in flat_configs.values() for key in flat})
         config_diff: list[dict[str, tp.Any]] = []
@@ -716,18 +1129,21 @@ def register_tracking_routes(
 
         return JSONResponse(
             status_code=200,
-            content={
-                "org_id": body.org_id,
-                "project_id": body.project_id,
-                "x": body.x,
-                "runs": enriched_runs,
-                "common_keys": common_keys,
-                "all_keys": all_keys,
-                "selected_keys": selected_keys,
-                "series_by_key": series_by_key,
-                "config_diff": config_diff,
-                "metric_summary": metric_summary,
-            },
+            content=sanitize_json_value(
+                {
+                    "org_id": norm_org,
+                    "project_id": norm_project,
+                    "x": body.x,
+                    "runs": enriched_runs,
+                    "common_keys": common_keys,
+                    "all_keys": all_keys,
+                    "selected_keys": selected_keys,
+                    "series_by_key": series_by_key,
+                    "config_diff": config_diff,
+                    "metric_summary": metric_summary,
+                    "warnings": warnings,
+                }
+            ),
         )
 
     @app.get("/api/v1/tracking/runs/{run_id}", tags=["tracking"])
@@ -736,7 +1152,16 @@ def register_tracking_routes(
     ) -> JSONResponse:
         """Read one run's metadata through its authorized scope and visibility policy."""
 
-        response = await upstream(request, principal=principal, org_id=org_id, project_id=project_id, run_id=run_id)
+        norm_org = org_id.strip()
+        norm_project = project_id.strip()
+        response = await upstream(
+            request,
+            principal=principal,
+            org_id=norm_org,
+            project_id=norm_project,
+            run_id=run_id,
+            skip_post_auth=True,
+        )
         try:
             payload = response.json()
         except ValueError:
@@ -746,21 +1171,34 @@ def register_tracking_routes(
             ) from None
         if response.status_code == 200 and isinstance(payload, dict) and "run_id" in payload:
             store = _store(request)
-            overlay = store.get_run_overlay(org_id, project_id, run_id) if store is not None else None
+            overlay = (
+                await asyncio.to_thread(store.get_run_overlay, norm_org, norm_project, run_id)
+                if store is not None
+                else None
+            )
             wl_owner: str | None = None
             has_owner = bool((overlay and overlay.get("owner")) or payload.get("owner"))
             wid = payload.get("workload_id")
-            if not has_owner and isinstance(wid, str) and wid:
-                resolved = await resolve_workload_owners(service, [wid], org_id=org_id, project_id=project_id)
-                wl_owner = resolved.get(wid)
-            note_counts = store.count_notes_by_target(org_id, project_id, "run") if store is not None else {}
+            if not has_owner:
+                wl_owner = await resolve_run_workload_owner(
+                    service,
+                    org_id=norm_org,
+                    project_id=norm_project,
+                    run_id=run_id,
+                    workload_id=wid if isinstance(wid, str) else None,
+                )
+            note_counts = (
+                await asyncio.to_thread(store.count_notes_by_target, norm_org, norm_project, "run")
+                if store is not None
+                else {}
+            )
             enriched = enrich_run_record(
                 payload,
                 overlay,
                 workload_owner=wl_owner,
                 notes_count=note_counts.get(run_id, 0),
             )
-            admin = is_project_admin(service, principal, org_id=org_id, project_id=project_id)
+            admin = is_project_admin(service, principal, org_id=norm_org, project_id=norm_project)
             if not can_view(
                 principal.subject,
                 owner=enriched["owner"],

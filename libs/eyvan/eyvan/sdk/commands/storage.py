@@ -54,7 +54,7 @@ def _default_context_detector(path: Path | None) -> GcpContext:
 
 
 def _default_location_resolver(bucket: str) -> BucketLocation | None:
-    return resolve_bucket_location(bucket, token_provider=default_gcp_token_provider)
+    return resolve_bucket_location(bucket, token_provider=default_gcp_token_provider())
 
 
 #: Factories replaced by CLI tests for hermetic offline execution.

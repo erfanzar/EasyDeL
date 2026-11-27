@@ -247,7 +247,7 @@ def can_view(
 def can_manage(principal_subject: str, *, owner: str | None, is_admin: bool) -> bool:
     """Return whether ``principal_subject`` may mutate sharing or metadata for an owned object."""
 
-    return bool(is_admin or not owner or owner == principal_subject)
+    return bool(is_admin or (bool(owner) and owner == principal_subject))
 
 
 def _overlay_from_row(row: sqlite3.Row) -> dict[str, tp.Any]:
@@ -311,15 +311,32 @@ class CollaborationStore:
         self._is_memory = str(db_path) == ":memory:"
         self.db_path: Path | None = None if self._is_memory else Path(db_path).expanduser().resolve()
         self._memory_conn: sqlite3.Connection | None = None
-        if self._is_memory:
-            conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        """Create schema and configure WAL mode once on store initialization."""
+
+        with self._lock:
+            if self._is_memory:
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.executescript(_SCHEMA)
+                self._memory_conn = conn
+                return
+            assert self.db_path is not None
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db_path, timeout=30)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.executescript(_SCHEMA)
-            self._memory_conn = conn
-        else:
-            with self._connection():
-                pass
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.executescript(_SCHEMA)
+            finally:
+                conn.close()
 
     def close(self) -> None:
         """Close the underlying connection if running in-memory."""
@@ -334,11 +351,8 @@ class CollaborationStore:
         with self._lock:
             if self._is_memory:
                 if self._memory_conn is None:
-                    conn = sqlite3.connect(":memory:", check_same_thread=False)
-                    conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA foreign_keys = ON")
-                    conn.executescript(_SCHEMA)
-                    self._memory_conn = conn
+                    self._init_schema()
+                assert self._memory_conn is not None
                 with self._memory_conn:
                     yield self._memory_conn
                 return
@@ -348,7 +362,7 @@ class CollaborationStore:
             conn.row_factory = sqlite3.Row
             try:
                 conn.execute("PRAGMA foreign_keys = ON")
-                conn.executescript(_SCHEMA)
+                conn.execute("PRAGMA busy_timeout = 30000")
                 with conn:
                     yield conn
             finally:
@@ -359,20 +373,25 @@ class CollaborationStore:
     def get_run_overlay(self, org_id: str, project_id: str, run_id: str) -> dict[str, tp.Any] | None:
         """Return one run's collaboration overlay, or ``None`` if none has been saved."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
+        norm_run = _validate_required_text(run_id, field_name="run_id", max_len=_MAX_RUN_ID_LEN)
         with self._connection() as db:
             row = db.execute(
                 "SELECT * FROM run_overlays WHERE org_id = ? AND project_id = ? AND run_id = ?",
-                (org_id, project_id, run_id),
+                (norm_org, norm_project, norm_run),
             ).fetchone()
             return _overlay_from_row(row) if row is not None else None
 
     def list_run_overlays(self, org_id: str, project_id: str) -> dict[str, dict[str, tp.Any]]:
         """Return all run overlays for ``(org_id, project_id)`` keyed by ``run_id``."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
         with self._connection() as db:
             rows = db.execute(
                 "SELECT * FROM run_overlays WHERE org_id = ? AND project_id = ?",
-                (org_id, project_id),
+                (norm_org, norm_project),
             ).fetchall()
             return {row["run_id"]: _overlay_from_row(row) for row in rows}
 
@@ -544,10 +563,13 @@ class CollaborationStore:
     def get_experiment(self, org_id: str, project_id: str, exp_id: str) -> dict[str, tp.Any] | None:
         """Return one experiment scoped to ``(org_id, project_id)``, or ``None``."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
+        norm_exp = _validate_required_text(exp_id, field_name="exp_id", max_len=_MAX_SCOPE_LEN)
         with self._connection() as db:
             row = db.execute(
                 "SELECT * FROM experiments WHERE id = ? AND org_id = ? AND project_id = ?",
-                (exp_id, org_id, project_id),
+                (norm_exp, norm_org, norm_project),
             ).fetchone()
             return _experiment_from_row(row) if row is not None else None
 
@@ -562,8 +584,10 @@ class CollaborationStore:
     ) -> list[dict[str, tp.Any]]:
         """List experiments in ``(org_id, project_id)`` newest-updated first."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
         clauses = ["org_id = ?", "project_id = ?"]
-        params: list[tp.Any] = [org_id, project_id]
+        params: list[tp.Any] = [norm_org, norm_project]
         if kind is not None:
             clauses.append("kind = ?")
             params.append(validate_experiment_kind(kind))
@@ -599,10 +623,13 @@ class CollaborationStore:
     ) -> dict[str, tp.Any] | None:
         """Partially update an experiment; returns ``None`` if absent in scope."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
+        norm_exp = _validate_required_text(exp_id, field_name="exp_id", max_len=_MAX_SCOPE_LEN)
         with self._connection() as db:
             existing_row = db.execute(
                 "SELECT * FROM experiments WHERE id = ? AND org_id = ? AND project_id = ?",
-                (exp_id, org_id, project_id),
+                (norm_exp, norm_org, norm_project),
             ).fetchone()
             if existing_row is None:
                 return None
@@ -674,32 +701,38 @@ class CollaborationStore:
                     json.dumps(resolved_shared),
                     resolved_baseline,
                     now,
-                    exp_id,
-                    org_id,
-                    project_id,
+                    norm_exp,
+                    norm_org,
+                    norm_project,
                 ),
             )
-            row = db.execute("SELECT * FROM experiments WHERE id = ?", (exp_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM experiments WHERE id = ? AND org_id = ? AND project_id = ?",
+                (norm_exp, norm_org, norm_project),
+            ).fetchone()
             assert row is not None
             return _experiment_from_row(row)
 
     def delete_experiment(self, org_id: str, project_id: str, exp_id: str) -> bool:
-        """Delete an experiment, unlinking run overlays and removing its notes."""
+        """Atomically delete an experiment, unlink run overlays, and remove its notes."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
+        norm_exp = _validate_required_text(exp_id, field_name="exp_id", max_len=_MAX_SCOPE_LEN)
         with self._connection() as db:
             cursor = db.execute(
                 "DELETE FROM experiments WHERE id = ? AND org_id = ? AND project_id = ?",
-                (exp_id, org_id, project_id),
+                (norm_exp, norm_org, norm_project),
             )
             if cursor.rowcount == 0:
                 return False
             db.execute(
                 "UPDATE run_overlays SET experiment_id = NULL WHERE org_id = ? AND project_id = ? AND experiment_id = ?",
-                (org_id, project_id, exp_id),
+                (norm_org, norm_project, norm_exp),
             )
             db.execute(
                 "DELETE FROM notes WHERE org_id = ? AND project_id = ? AND target_type = 'experiment' AND target_id = ?",
-                (org_id, project_id, exp_id),
+                (norm_org, norm_project, norm_exp),
             )
             return True
 
@@ -756,10 +789,13 @@ class CollaborationStore:
     def get_note(self, org_id: str, project_id: str, note_id: str) -> dict[str, tp.Any] | None:
         """Return one note scoped to ``(org_id, project_id)``, or ``None``."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
+        norm_note = _validate_required_text(note_id, field_name="note_id", max_len=_MAX_SCOPE_LEN)
         with self._connection() as db:
             row = db.execute(
                 "SELECT * FROM notes WHERE id = ? AND org_id = ? AND project_id = ?",
-                (note_id, org_id, project_id),
+                (norm_note, norm_org, norm_project),
             ).fetchone()
             return _note_from_row(row) if row is not None else None
 
@@ -776,8 +812,10 @@ class CollaborationStore:
 
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise InputError("limit must be an integer between 1 and 1000")
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
         clauses = ["org_id = ?", "project_id = ?"]
-        params: list[tp.Any] = [org_id, project_id]
+        params: list[tp.Any] = [norm_org, norm_project]
         if target_type is not None:
             clauses.append("target_type = ?")
             params.append(validate_note_target_type(target_type))
@@ -793,16 +831,21 @@ class CollaborationStore:
     def delete_note(self, org_id: str, project_id: str, note_id: str) -> bool:
         """Delete one note scoped to ``(org_id, project_id)``."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
+        norm_note = _validate_required_text(note_id, field_name="note_id", max_len=_MAX_SCOPE_LEN)
         with self._connection() as db:
             cursor = db.execute(
                 "DELETE FROM notes WHERE id = ? AND org_id = ? AND project_id = ?",
-                (note_id, org_id, project_id),
+                (norm_note, norm_org, norm_project),
             )
             return cursor.rowcount > 0
 
     def count_notes_by_target(self, org_id: str, project_id: str, target_type: str) -> dict[str, int]:
         """Return ``{target_id: count}`` for all notes of ``target_type`` in scope."""
 
+        norm_org = _validate_required_text(org_id, field_name="org_id", max_len=_MAX_SCOPE_LEN)
+        norm_project = _validate_required_text(project_id, field_name="project_id", max_len=_MAX_SCOPE_LEN)
         norm_target_type = validate_note_target_type(target_type)
         with self._connection() as db:
             rows = db.execute(
@@ -810,7 +853,7 @@ class CollaborationStore:
                    FROM notes
                    WHERE org_id = ? AND project_id = ? AND target_type = ?
                    GROUP BY target_id""",
-                (org_id, project_id, norm_target_type),
+                (norm_org, norm_project, norm_target_type),
             ).fetchall()
             return {row["target_id"]: int(row["cnt"]) for row in rows}
 

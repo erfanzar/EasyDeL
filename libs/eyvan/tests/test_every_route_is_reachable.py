@@ -70,6 +70,24 @@ BROWSER_ROUTES: dict[str, str] = {
     "POST /api/v1/assistant/oauth/openrouter/start": (
         "dashboard Settings 'Sign in with OpenRouter' sends the browser to OpenRouter's consent page"
     ),
+    "POST /api/v1/storage/check-region": (
+        "dashboard/src/api/client.ts checkStorageRegion tests GCS locality from the Storage & Tracking settings panel"
+    ),
+    "PATCH /api/v1/collaboration/experiments/{}": (
+        "dashboard/src/api/client.ts updateExperiment updates collaborative experiment/speedrun settings"
+    ),
+    "DELETE /api/v1/collaboration/experiments/{}": (
+        "dashboard/src/api/client.ts deleteExperiment deletes collaborative experiments/speedruns"
+    ),
+    "GET /api/v1/collaboration/feed": (
+        "dashboard/src/api/client.ts getCollaborationFeed populates the live team activity strip"
+    ),
+    "GET /api/v1/collaboration/notes": (
+        "dashboard/src/api/client.ts listNotes lists team notes attached to runs and experiments"
+    ),
+    "DELETE /api/v1/collaboration/notes/{}": (
+        "dashboard/src/api/client.ts deleteNote removes team notes from runs and experiments"
+    ),
 }
 
 #: Routes the SDK does reach, by a path this scanner cannot resolve statically.
@@ -131,6 +149,10 @@ DEFERRED_ROUTES: dict[str, str] = {
     "GET /api/v1/governance/summary": (
         "admin console governance overview route consumed by the Eyvan web dashboard UsersPage; "
         "CLI governance uses /api/v1/team/users and /api/v1/team/reclaim/plan"
+    ),
+    "GET /api/v1/collaboration/experiments/{}": (
+        "single-experiment metadata read kept for REST completeness; both the CLI (`eyvan experiments leaderboard`) "
+        "and dashboard fetch `/experiments/{id}/leaderboard` which embeds the full experiment alongside rankings"
     ),
 }
 
