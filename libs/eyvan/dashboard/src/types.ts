@@ -71,9 +71,13 @@ export interface TeamUser {
   /** Derived by the plane: admin, trusted or user. Older planes omit it. */
   tier?: TeamTier;
   trusted?: boolean;
+  /** Optional explicit override for idle-capacity borrowing; null falls back to tier default. */
+  can_borrow?: boolean | null;
 }
 
 export type TeamTier = "admin" | "trusted" | "user";
+
+export type ReclaimPolicy = "requeue" | "stop";
 
 export interface TeamUserRules {
   allowed_fleets: string[] | null;
@@ -83,6 +87,36 @@ export interface TeamUserRules {
   max_tpu_units: number | null;
   max_cpu_units: number | null;
   max_gpu_units: number | null;
+  /** Optional override for borrowing idle TPU capacity; null uses the account's tier default. */
+  can_borrow?: boolean | null;
+}
+
+export interface GovernanceUserSummary {
+  subject: string;
+  tier?: TeamTier | string;
+  guaranteed_tpu_units: number | null;
+  max_tpu_units: number | null;
+  can_borrow?: boolean | null;
+  in_use_tpu_units: number;
+  borrowed_tpu_units: number;
+}
+
+export interface ActiveReclaim {
+  workload_id: string;
+  owner: string;
+  requested_by?: string | null;
+  deadline_at?: string | null;
+  policy?: ReclaimPolicy | null;
+  state: string;
+}
+
+export interface GovernanceSummary {
+  enabled: boolean;
+  total_guaranteed_tpu_units: number;
+  total_in_use_tpu_units: number;
+  total_borrowed_tpu_units: number;
+  users: GovernanceUserSummary[];
+  active_reclaims: ActiveReclaim[];
 }
 
 export interface TeamRoleGrant {
@@ -427,7 +461,7 @@ export interface AssistantConversation {
   messages: AssistantConversationMessage[];
 }
 
-export type RunStatus = "running" | "finished" | "failed" | "aborted" | "unknown";
+export type RunStatus = "running" | "finished" | "failed" | "crashed" | "cancelled" | "killed" | "aborted" | "unknown";
 
 /** Tracker wire types intentionally retain the store's snake_case field names. */
 export interface RunSummary {
@@ -886,6 +920,14 @@ export interface WorkloadSummary {
   preemptionCount?: number;
   capacityLossCount?: number;
   failureReason?: string;
+  /** ISO timestamp when an active graceful reclaim checkpoint window ends. */
+  reclaimDeadlineAt?: string | null;
+  /** Principal who requested reclamation of borrowed capacity. */
+  reclaimRequestedBy?: string | null;
+  /** Post-checkpoint action for a reclaimed job: requeue elsewhere or stop cleanly. */
+  reclaimPolicy?: ReclaimPolicy | null;
+  /** Optional configured checkpoint grace window in seconds for progress scaling. */
+  checkpointGraceSeconds?: number;
 }
 
 export interface TimelineEvent {
@@ -989,6 +1031,8 @@ export interface Cell {
   id: string;
   name: string;
   backend: string;
+  /** Optional cloud credential account owning this cell's provider project. */
+  providerAccount?: string;
   region: string;
   zone: string;
   status: "healthy" | "starting" | "degraded" | "maintenance";
@@ -1229,6 +1273,12 @@ export interface CapacityPoolSummary {
   maxCells: number;
   minCells: number;
   enabled: boolean;
+  /** Optional cloud provider name (e.g. "gcp"). */
+  provider?: string | null;
+  /** Optional provider project ID (e.g. "example-project-a"). */
+  providerProject?: string | null;
+  /** Optional credential account email/identity associated with this pool's project. */
+  providerAccount?: string | null;
 }
 
 /** One person's settled usage in a project. */
@@ -1319,9 +1369,56 @@ export interface TpuQuotaEntry {
   usage_age_s: number | null;
 }
 
+export type TpuQuotaFailureCode =
+  | "permission_denied"
+  | "auth_required"
+  | "api_disabled"
+  | "project_not_found"
+  | "timeout"
+  | "gcloud_missing"
+  | "quota_read_failed";
+
 export interface TpuQuotaFailure {
   capacity_class: "reserved" | "on_demand" | "spot";
   reason: string;
+  /** Optional structured diagnostic fields returned by newer control planes. */
+  code?: TpuQuotaFailureCode | string | null;
+  summary?: string | null;
+  permission?: string | null;
+  account?: string | null;
+  remediation?: string | null;
+}
+
+export interface StorageGcpContext {
+  on_gcp: boolean;
+  project: string | null;
+  zone: string | null;
+  region: string | null;
+  accelerator_type: string | null;
+  source: string;
+}
+
+export interface StorageRegionalBucket {
+  bucket: string;
+  uri: string;
+  location: string;
+}
+
+export interface StorageMonitoringBucket {
+  bucket: string;
+  uri: string;
+  location: string;
+  prefix: string;
+}
+
+export interface StorageStatus {
+  configured: boolean;
+  auto_create: boolean;
+  config_path: string;
+  project: string | null;
+  monitoring: StorageMonitoringBucket | null;
+  regional: Record<string, StorageRegionalBucket>;
+  context: StorageGcpContext;
 }
 
 /** A fleet's dashboard-managed bash init script, as the init-script route answers. */

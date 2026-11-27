@@ -3,22 +3,31 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, FilterX, Gauge, HelpCircle, MapPin, RefreshCw, Search } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Clock, FilterX, FolderKanban, Gauge, HelpCircle, LoaderCircle, MapPin, RefreshCw, Search } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
 import { EmptyState } from "../components/EmptyState";
+import { ErrorCard, type ErrorCardAction } from "../components/ErrorCard";
 import { MetricCard } from "../components/MetricCard";
 import { LoadingState } from "../components/PageState";
 import { StatusBadge } from "../components/StatusBadge";
+import { groupQuotaFailures } from "../lib/errorDiagnostics";
 import { formatAgeSeconds, formatDateTime } from "../lib/format";
 import type { AuditEvent, Cell, TpuQuotaEntry, TpuQuotaSnapshot } from "../types";
 
+export interface QuotaLoadOptions {
+  refresh?: boolean;
+  project?: string;
+}
+
 interface CapacityPageProps {
-  loadQuota: (signal: AbortSignal, options?: { refresh?: boolean }) => Promise<TpuQuotaSnapshot>;
+  loadQuota: (signal: AbortSignal, options?: QuotaLoadOptions) => Promise<TpuQuotaSnapshot>;
   /** Cells the fleet currently holds. Empty for a session that may not read them. */
   cells?: Cell[];
   /** Fleet capacity history. Absent when this session may not manage the fleet. */
   loadCapacityEvents?: (signal: AbortSignal) => Promise<AuditEvent[]>;
+  /** Optional toast callback for copy/switch confirmations. */
+  onNotify?: (message: string) => void;
 }
 
 type SortKey = "free" | "limit" | "zone";
@@ -56,14 +65,24 @@ interface QuotaRow {
   bestFit: TpuQuotaEntry;
 }
 
-export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: CapacityPageProps) {
+export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents, onNotify }: CapacityPageProps) {
   // A loader represents one scope. A new loader must not render an older
   // scope's quota even for the frame before its effect starts the next read.
   const [quotaResult, setQuotaResult] = useState<{ loader: typeof loadQuota; value: TpuQuotaSnapshot } | null>(null);
-  const [quotaError, setQuotaError] = useState<{ loader: typeof loadQuota; message: string } | null>(null);
+  const [quotaError, setQuotaError] = useState<{ loader: typeof loadQuota; error: Error } | null>(null);
+  const [projectSelection, setProjectSelection] = useState<{
+    loader: typeof loadQuota;
+    project: string | undefined;
+  }>({ loader: loadQuota, project: undefined });
+  const selectedProject = projectSelection.loader === loadQuota ? projectSelection.project : undefined;
+
   const snapshot = quotaResult?.loader === loadQuota ? quotaResult.value : null;
-  const error = quotaError?.loader === loadQuota ? quotaError.message : null;
+  const error = quotaError?.loader === loadQuota ? quotaError.error : null;
+
   const [refreshing, setRefreshing] = useState(false);
+  const [switchingProject, setSwitchingProject] = useState<string | null>(null);
+  const [customProjectOpen, setCustomProjectOpen] = useState(false);
+  const [customProjectInput, setCustomProjectInput] = useState("");
   const [zoneQuery, setZoneQuery] = useState("");
   const [capacityClass, setCapacityClass] = useState("all");
   const [generation, setGeneration] = useState("all");
@@ -71,11 +90,16 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   const [fitsType, setFitsType] = useState("any");
   const [fitsCount, setFitsCount] = useState(1);
   const latestQuotaRequest = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
 
   const load = useCallback(
-    (signal: AbortSignal, refresh = false) => {
+    (signal: AbortSignal, options: { refresh?: boolean; project?: string } = {}) => {
       const request = ++latestQuotaRequest.current;
-      return loadQuota(signal, { refresh })
+      const callOptions: QuotaLoadOptions =
+        options.project !== undefined
+          ? { refresh: options.refresh ?? false, project: options.project }
+          : { refresh: options.refresh ?? false };
+      return loadQuota(signal, callOptions)
         .then((value) => {
           if (!signal.aborted && request === latestQuotaRequest.current) {
             setQuotaResult({ loader: loadQuota, value });
@@ -89,7 +113,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
           if (!signal.aborted && request === latestQuotaRequest.current) {
             setQuotaError({
               loader: loadQuota,
-              message: loadError instanceof Error ? loadError.message : "Unable to read provider quota",
+              error: loadError instanceof Error ? loadError : new Error("Unable to read provider quota"),
             });
           }
         });
@@ -99,18 +123,41 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
 
   useEffect(() => {
     const controller = new AbortController();
-    void load(controller.signal);
+    activeControllerRef.current?.abort();
+    activeControllerRef.current = controller;
+    if (selectedProject !== undefined) setSwitchingProject(selectedProject);
+    void load(controller.signal, { refresh: false, project: selectedProject }).finally(() => {
+      if (!controller.signal.aborted) setSwitchingProject(null);
+    });
     return () => controller.abort();
-  }, [load]);
+  }, [load, selectedProject]);
 
   const refresh = async () => {
     const controller = new AbortController();
+    activeControllerRef.current?.abort();
+    activeControllerRef.current = controller;
     setRefreshing(true);
     try {
-      await load(controller.signal, true);
+      await load(controller.signal, { refresh: true, project: selectedProject });
     } finally {
-      setRefreshing(false);
+      if (!controller.signal.aborted) setRefreshing(false);
     }
+  };
+
+  const selectProject = (project: string) => {
+    const trimmed = project.trim();
+    if (!trimmed) return;
+    if (trimmed === activeProject && !error) return;
+    setProjectSelection({ loader: loadQuota, project: trimmed });
+    setCustomProjectOpen(false);
+    setCustomProjectInput("");
+  };
+
+  const submitCustomProject = (event: FormEvent) => {
+    event.preventDefault();
+    const trimmed = customProjectInput.trim();
+    if (!trimmed) return;
+    selectProject(trimmed);
   };
 
   const [historyResult, setHistoryResult] = useState<{
@@ -119,12 +166,12 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   } | null>(null);
   const [historyFailure, setHistoryFailure] = useState<{
     loader: NonNullable<typeof loadCapacityEvents>;
-    message: string;
+    error: Error;
   } | null>(null);
   const capacityEvents =
     loadCapacityEvents && historyResult?.loader === loadCapacityEvents ? historyResult.events : null;
   const historyError =
-    loadCapacityEvents && historyFailure?.loader === loadCapacityEvents ? historyFailure.message : null;
+    loadCapacityEvents && historyFailure?.loader === loadCapacityEvents ? historyFailure.error : null;
 
   useEffect(() => {
     if (!loadCapacityEvents) return;
@@ -136,14 +183,14 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
           setHistoryFailure(null);
         }
       })
-      .catch((error: unknown) => {
+      .catch((historyErr: unknown) => {
         // Named. An empty history reads as "this fleet has been quiet", which
         // is the opposite of what a failed read means on the afternoon somebody
         // is looking at this page.
         if (!controller.signal.aborted) {
           setHistoryFailure({
             loader: loadCapacityEvents,
-            message: error instanceof Error ? error.message : "Unable to read capacity history",
+            error: historyErr instanceof Error ? historyErr : new Error("Unable to read capacity history"),
           });
         }
       });
@@ -174,6 +221,23 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     }
     return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right));
   }, [cells]);
+
+  const activeProject = selectedProject ?? snapshot?.project ?? null;
+  const availableProjects = useMemo(() => {
+    const set = new Set<string>();
+    for (const name of snapshot?.available_projects ?? []) {
+      const trimmed = name.trim();
+      if (trimmed) set.add(trimmed);
+    }
+    if (snapshot?.project?.trim()) set.add(snapshot.project.trim());
+    if (selectedProject?.trim()) set.add(selectedProject.trim());
+    return [...set];
+  }, [selectedProject, snapshot]);
+
+  const groupedFailures = useMemo(
+    () => groupQuotaFailures(snapshot?.failures ?? [], { project: snapshot?.project }),
+    [snapshot],
+  );
 
   const entries = useMemo(() => snapshot?.entries ?? [], [snapshot]);
   const generations = useMemo(() => Array.from(new Set(entries.map((entry) => entry.generation))).sort(), [entries]);
@@ -245,10 +309,6 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
   // only one of them should stop an operator trying.
   const unmeasured = useMemo(() => {
     const rows = selected.filter((entry) => !isMeasured(entry));
-    // Same collapse as the measured table above, for the same reason: one
-    // granted quota, however many sizes the provider offers against it. This
-    // table was the larger of the two -- 232 rows for the zones nobody could
-    // measure, which is a lot of screen for one sentence repeated.
     const byQuota = new Map<string, QuotaRow>();
     for (const entry of rows) {
       const key = `${entry.zone}:${entry.generation}:${entry.capacity_class}`;
@@ -279,31 +339,115 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     setFitsCount(1);
   };
 
-  // Summed over quotas now rather than over slice sizes. The old sum counted
-  // one zone's 80000 free chips once per size the provider offered, so a single
-  // v4 zone reported four million.
+  // Summed over quotas now rather than over slice sizes.
   const freeChips = measured.reduce((total, row) => total + (row.entry.free_chips ?? 0), 0);
   const measuredZones = new Set(measured.filter((row) => (row.entry.free_chips ?? 0) > 0).map((row) => row.entry.zone));
   const unmeasuredZones = new Set(unmeasured.map((row) => row.entry.zone));
   const age = snapshot?.age_s ?? null;
   const stale = snapshot !== null && snapshot.cached && age !== null && age > snapshot.ttl_s;
+  const busy = refreshing || switchingProject !== null;
+
+  const projectSwitcher = (
+    <div className="quota-project-bar" role="group" aria-label="GCP project">
+      <span className="quota-project-label">
+        <FolderKanban size={13} aria-hidden="true" />
+        Project
+      </span>
+      <div className="quota-project-pills">
+        {availableProjects.map((projectName) => {
+          const isCurrent = projectName === activeProject;
+          const isLoadingThis = switchingProject === projectName;
+          return (
+            <button
+              key={projectName}
+              type="button"
+              className={`project-pill${isCurrent ? " project-pill-active" : ""}`}
+              aria-pressed={isCurrent}
+              disabled={busy && !isCurrent}
+              onClick={() => selectProject(projectName)}
+            >
+              {isLoadingThis && <LoaderCircle size={12} className="spin" aria-hidden="true" />}
+              <span className="monospace">{projectName}</span>
+            </button>
+          );
+        })}
+        {customProjectOpen ? (
+          <form className="project-custom-form" onSubmit={submitCustomProject}>
+            <label className="sr-only" htmlFor="quota-custom-project">
+              Custom GCP project ID
+            </label>
+            <input
+              id="quota-custom-project"
+              type="text"
+              placeholder="my-gcp-project"
+              value={customProjectInput}
+              onChange={(event) => setCustomProjectInput(event.target.value)}
+              autoFocus
+            />
+            <button className="button button-primary" type="submit" disabled={!customProjectInput.trim() || busy}>
+              Read
+            </button>
+            <button
+              className="button button-ghost"
+              type="button"
+              onClick={() => {
+                setCustomProjectOpen(false);
+                setCustomProjectInput("");
+              }}
+            >
+              Cancel
+            </button>
+          </form>
+        ) : (
+          <button
+            type="button"
+            className="project-pill project-pill-custom"
+            disabled={busy}
+            onClick={() => setCustomProjectOpen(true)}
+          >
+            + Other project
+          </button>
+        )}
+      </div>
+    </div>
+  );
 
   if (error) {
+    const alternateProjects = availableProjects.filter((name) => name !== activeProject);
+    const errorActions: ErrorCardAction[] = [
+      { label: refreshing ? "Retrying" : "Retry", onClick: () => void refresh(), variant: "secondary", disabled: busy },
+      ...alternateProjects.map((projectName) => ({
+        label: `Switch to ${projectName}`,
+        onClick: () => selectProject(projectName),
+        variant: "primary" as const,
+        disabled: busy,
+      })),
+    ];
+
     return (
       <div className="page-stack">
         <section className="panel data-panel" aria-label="Provider quota">
           <div className="panel-header">
+            <Gauge size={16} aria-hidden="true" />
             <div>
               <h2>Provider quota</h2>
               <p>Where TPU quota is free right now</p>
             </div>
-            <Gauge size={18} />
+            <button className="button button-ghost" type="button" disabled={busy} onClick={() => void refresh()}>
+              <RefreshCw className={busy ? "spin" : undefined} size={14} aria-hidden="true" />
+              {busy ? "Reading provider" : "Re-read provider"}
+            </button>
           </div>
-          <div className="inline-error" role="alert">
-            <AlertTriangle size={16} aria-hidden="true" />
-            {error}
+          {availableProjects.length > 0 && projectSwitcher}
+          <div className="quota-alerts-stack">
+            <ErrorCard
+              error={error}
+              context={{ project: activeProject, fallbackTitle: "Unable to read provider quota" }}
+              actions={errorActions}
+              onCopied={onNotify}
+            />
           </div>
-          <div className="resource-row-detail">
+          <div className="resource-row-detail quota-honesty-note">
             <span>No zone is shown as empty, because none of them were read.</span>
           </div>
         </section>
@@ -327,10 +471,13 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
     );
   }
 
+  const alternateProjects = availableProjects.filter((name) => name !== snapshot.project);
+
   return (
     <div className="page-stack">
       <section className="panel data-panel" aria-label="Provider quota source">
         <div className="panel-header">
+          <Gauge size={16} aria-hidden="true" />
           <div>
             <h2>Provider quota</h2>
             <p>
@@ -339,61 +486,94 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                 : "no provider project is configured"}
             </p>
           </div>
-          <button className="button button-ghost" type="button" disabled={refreshing} onClick={() => void refresh()}>
-            <RefreshCw className={refreshing ? "spin" : undefined} size={14} aria-hidden="true" />
-            {refreshing ? "Reading provider" : "Re-read provider"}
+          <button className="button button-ghost" type="button" disabled={busy} onClick={() => void refresh()}>
+            <RefreshCw className={busy ? "spin" : undefined} size={14} aria-hidden="true" />
+            {busy ? "Reading provider" : "Re-read provider"}
           </button>
         </div>
+
+        {(availableProjects.length > 0 || snapshot.status === "unconfigured") && projectSwitcher}
+
         {/* A cached number presented as a live one is the quietest way this page
             could lie, so the age of the reading is stated beside every use of
             it rather than being available on request. */}
-        <div className="resource-row-detail">
-          <span>
-            {snapshot.refreshed_at === null
-              ? "The provider has not been read"
-              : `Provider read ${formatAgeSeconds(age)}${snapshot.cached ? " (cached reading, not re-read for this view)" : ""}`}
+        <div className="quota-source-meta">
+          <span className="quota-age-item">
+            <Clock size={12} aria-hidden="true" />
+            {switchingProject
+              ? `Reading provider quota for ${switchingProject}…`
+              : snapshot.refreshed_at === null
+                ? "The provider has not been read"
+                : `Provider read ${formatAgeSeconds(age)}${snapshot.cached ? " (cached reading, not re-read for this view)" : ""}`}
           </span>
-          {stale && <span>Older than the {Math.round(snapshot.ttl_s)}s refresh window</span>}
-          {snapshot.available_projects.length > 1 && (
-            <span>
-              Also declared by this fleet:{" "}
-              {snapshot.available_projects.filter((name) => name !== snapshot.project).join(", ")}
-            </span>
+          {stale && (
+            <span className="quota-stale-pill">Older than the {Math.round(snapshot.ttl_s)}s refresh window</span>
           )}
         </div>
+
         {snapshot.status === "unconfigured" && (
-          <div className="resource-row-detail">
+          <div className="quota-honesty-note">
             <span>
               No GCP capacity pool declares a provider project, so there is nothing to read quota for. This is not an
               empty quota.
             </span>
           </div>
         )}
-        {snapshot.failures.map((failure) => (
-          <div className="inline-warning" role="status" key={failure.capacity_class}>
-            <AlertTriangle size={16} aria-hidden="true" />
-            <span>
-              {failure.capacity_class === "spot" ? "Spot" : "On-demand"} quota could not be read, so no zone below
-              reports it: {failure.reason}
-            </span>
+
+        {groupedFailures.length > 0 && (
+          <div className="quota-alerts-stack">
+            {groupedFailures.map((group) => {
+              const showSwitchButtons =
+                alternateProjects.length > 0 &&
+                (group.diagnostic.code === "permission_denied" ||
+                  group.diagnostic.code === "project_not_found" ||
+                  group.diagnostic.code === "api_disabled");
+
+              const actions: ErrorCardAction[] = [
+                ...(showSwitchButtons
+                  ? alternateProjects.map((projectName, index) => ({
+                      label: `Switch to ${projectName}`,
+                      onClick: () => selectProject(projectName),
+                      variant: (index === 0 ? "primary" : "secondary") as "primary" | "secondary",
+                      disabled: busy,
+                    }))
+                  : []),
+                {
+                  label: busy ? "Reading provider" : "Re-read provider",
+                  onClick: () => void refresh(),
+                  variant: "secondary",
+                  disabled: busy,
+                },
+              ];
+
+              return (
+                <ErrorCard
+                  key={group.key}
+                  error={group.diagnostic}
+                  role="status"
+                  actions={actions}
+                  onCopied={onNotify}
+                />
+              );
+            })}
           </div>
-        ))}
+        )}
       </section>
 
       {snapshot.status !== "ok" && (
         <section className="panel data-panel" aria-label="No quota to report">
-          <EmptyState
-            title={
-              snapshot.status === "unconfigured"
+          <div className="quota-empty-compact">
+            <strong>
+              {snapshot.status === "unconfigured"
                 ? "This fleet declares no provider project"
-                : "No provider quota could be read"
-            }
-            detail={
-              snapshot.status === "unconfigured"
+                : "No provider quota could be read"}
+            </strong>
+            <span>
+              {snapshot.status === "unconfigured"
                 ? "Apply a GCP capacity pool, or read another project explicitly. Nothing here is a statement about capacity."
-                : "No zone is counted, listed, or shown as empty, because none of them were read. The reasons are above."
-            }
-          />
+                : "No zone is counted, listed, or shown as empty, because none of them were read. The reasons are above."}
+            </span>
+          </div>
         </section>
       )}
 
@@ -425,7 +605,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
           </section>
 
           <section className="panel data-panel" aria-label="Free capacity by zone">
-            <div className="table-toolbar">
+            <div className="table-toolbar quota-toolbar">
               <div className="filter-group">
                 <label className="search-field">
                   <Search size={14} aria-hidden="true" />
@@ -467,7 +647,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                     ))}
                   </select>
                 </label>
-                <label className="select-field">
+                <label className="select-field quota-fit-count">
                   <span className="sr-only">How many of that accelerator type</span>
                   <input
                     type="number"
@@ -492,6 +672,9 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                   </button>
                 )}
               </div>
+              <span className="table-count">
+                {measured.length} {measured.length === 1 ? "quota" : "quotas"}
+              </span>
             </div>
 
             {measured.length === 0 ? (
@@ -533,9 +716,6 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         </td>
                         <td>
                           <span className="resource-cell">
-                            {/* One size is its own name; several are a
-                                generation, and the sizes become what that
-                                generation buys rather than facts of their own. */}
                             <strong>{sliceCount === 1 ? entry.accelerator_type : entry.generation}</strong>
                             {sliceCount > 1 && (
                               <small>{`${sliceCount} slice sizes · ${smallestSlice}-${largestSlice} chips`}</small>
@@ -547,17 +727,16 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                         </td>
                         <td className="numeric">{chips(entry.limit_chips)}</td>
                         <td className="numeric">{chips(entry.in_use_chips)}</td>
-                        <td>
-                          <strong>{chips(entry.free_chips)}</strong>
+                        <td className="numeric">
+                          <strong className={(entry.free_chips ?? 0) > 0 ? "quota-free-positive" : "quota-free-zero"}>
+                            {chips(entry.free_chips)}
+                          </strong>
                         </td>
                         <td className="numeric">
                           {bestFit.free_slices === null
                             ? UNKNOWN
                             : `${bestFit.free_slices} x ${bestFit.accelerator_type}`}
                         </td>
-                        {/* The balance was measured at a point in time by a gauge
-                            that lags by minutes. Presenting it without that is
-                            how a stale number becomes a placement decision. */}
                         <td className="numeric">{formatAgeSeconds(entry.usage_age_s)}</td>
                       </tr>
                     ))}
@@ -570,11 +749,14 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
           {unmeasured.length > 0 && (
             <section className="panel data-panel" aria-label="Zones with no measurable free balance">
               <div className="panel-header">
+                <HelpCircle size={16} aria-hidden="true" />
                 <div>
                   <h2>Usage unknown</h2>
                   <p>Not empty and not full. These zones were never measured, so they carry no free balance.</p>
                 </div>
-                <HelpCircle size={18} />
+                <span className="table-count">
+                  {unmeasured.length} {unmeasured.length === 1 ? "quota" : "quotas"}
+                </span>
               </div>
               <div className="table-scroll">
                 <table className="data-table">
@@ -624,15 +806,20 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
       {(zones.length > 0 || historyError || capacityEvents) && (
         <section className="panel data-panel" aria-label="Zone capacity history">
           <div className="panel-header">
+            <MapPin size={16} aria-hidden="true" />
             <div>
               <h2>What each zone has been doing</h2>
               <p>What the fleet holds, what the planner is not asking, and why</p>
             </div>
-            <MapPin size={18} />
           </div>
           {historyError && (
-            <div className="resource-row-detail">
-              <span>{historyError}</span>
+            <div className="quota-alerts-stack">
+              <ErrorCard
+                compact
+                error={historyError}
+                context={{ fallbackTitle: "Unable to read capacity history" }}
+                onCopied={onNotify}
+              />
             </div>
           )}
           {zones.length > 0 && (
@@ -641,23 +828,28 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
                 <thead>
                   <tr>
                     <th>Zone</th>
-                    <th>Cells held</th>
+                    <th className="numeric">Cells held</th>
                     <th>Not being asked</th>
-                    <th>Reclamations</th>
+                    <th className="numeric">Reclamations</th>
                   </tr>
                 </thead>
                 <tbody>
                   {zones.map(([zone, row]) => (
                     <tr key={zone}>
                       <td className="monospace">{zone}</td>
-                      <td>{row.held}</td>
+                      <td className="numeric">{row.held}</td>
                       <td>
-                        {/* A cooldown is a decision, not an absence. Rendering
-                            it as "0 free" would send an operator looking for
-                            capacity that is being withheld on purpose. */}
-                        {row.cooling ? `${row.cooling} cooling until ${formatDateTime(row.until as string)}` : "none"}
+                        {row.cooling ? (
+                          <span className="quota-cooldown-badge">
+                            {row.cooling} cooling until {formatDateTime(row.until as string)}
+                          </span>
+                        ) : (
+                          <span className="muted">none</span>
+                        )}
                       </td>
-                      <td>{row.interruptions ? row.interruptions.toFixed(1) : "none"}</td>
+                      <td className="numeric">
+                        {row.interruptions ? row.interruptions.toFixed(1) : <span className="muted">none</span>}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -668,9 +860,6 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
             <ol className="timeline-list">
               {capacityEvents.slice(0, 12).map((event) => (
                 <li key={event.id} className={`timeline-${event.severity}`}>
-                  {/* Same three cells as the workload timeline: the list is a
-                      time / rail / body grid, and a missing cell shifts the
-                      body into the 22px rail column. */}
                   <time>{formatDateTime(event.timestamp)}</time>
                   <span className="timeline-rail" aria-hidden="true">
                     <span className="timeline-marker" />
@@ -686,7 +875,7 @@ export function CapacityPage({ loadQuota, cells = [], loadCapacityEvents }: Capa
             </ol>
           )}
           {capacityEvents !== null && capacityEvents.length === 0 && !historyError && (
-            <div className="resource-row-detail">
+            <div className="quota-honesty-note">
               <span>No capacity has been granted or released recently.</span>
             </div>
           )}

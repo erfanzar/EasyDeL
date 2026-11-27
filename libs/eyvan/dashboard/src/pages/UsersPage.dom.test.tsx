@@ -9,8 +9,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EyvanApiClient } from "../api/client";
-import type { TeamInvite, TeamToken, TeamUser } from "../types";
-import { UsersPage, type TeamClient } from "./UsersPage";
+import type { GovernanceSummary, TeamInvite, TeamToken, TeamUser } from "../types";
+import { inviteLoginCommand, UsersPage, type TeamClient } from "./UsersPage";
 
 const USER: TeamUser = {
   subject: "alice",
@@ -316,5 +316,198 @@ describe("Settings → Users & tokens", () => {
     await screen.findByText("No accounts yet. Invite someone above.");
     expect(screen.getByText("No personal tokens.")).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("renders the team quota and borrowing KPI strip, tier borrowing badges, and usage-vs-guarantee bars", async () => {
+    const client = mockClient();
+    const admin: TeamUser = {
+      ...USER,
+      subject: "admin",
+      email: "admin@example.com",
+      tier: "admin",
+      rules: {
+        allowed_fleets: null,
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: 64,
+        max_tpu_units: null,
+        max_cpu_units: null,
+        max_gpu_units: null,
+      },
+    };
+    const alice: TeamUser = {
+      ...USER,
+      subject: "alice",
+      email: "alice@example.com",
+      tier: "trusted",
+      rules: {
+        allowed_fleets: null,
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: 64,
+        max_tpu_units: 256,
+        max_cpu_units: null,
+        max_gpu_units: null,
+      },
+    };
+    const bob: TeamUser = {
+      ...USER,
+      subject: "bob",
+      email: "bob@example.com",
+      tier: "user",
+      rules: {
+        allowed_fleets: null,
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: 128,
+        max_tpu_units: 128,
+        max_cpu_units: null,
+        max_gpu_units: null,
+      },
+    };
+    const summary: GovernanceSummary = {
+      enabled: true,
+      total_guaranteed_tpu_units: 256,
+      total_in_use_tpu_units: 192,
+      total_borrowed_tpu_units: 64,
+      users: [
+        {
+          subject: "admin",
+          tier: "admin",
+          guaranteed_tpu_units: 64,
+          max_tpu_units: null,
+          can_borrow: null,
+          in_use_tpu_units: 32,
+          borrowed_tpu_units: 0,
+        },
+        {
+          subject: "alice",
+          tier: "trusted",
+          guaranteed_tpu_units: 64,
+          max_tpu_units: 256,
+          can_borrow: true,
+          in_use_tpu_units: 128,
+          borrowed_tpu_units: 64,
+        },
+        {
+          subject: "bob",
+          tier: "user",
+          guaranteed_tpu_units: 128,
+          max_tpu_units: 128,
+          can_borrow: false,
+          in_use_tpu_units: 32,
+          borrowed_tpu_units: 0,
+        },
+      ],
+      active_reclaims: [
+        {
+          workload_id: "wl-alice-borrowed",
+          owner: "alice",
+          requested_by: "bob",
+          deadline_at: new Date(Date.now() + 500_000).toISOString(),
+          policy: "requeue",
+          state: "checkpointing",
+        },
+      ],
+    };
+    vi.mocked(client.listTeamUsers).mockResolvedValue([admin, alice, bob]);
+    client.getGovernanceSummary = vi.fn(async () => summary);
+
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+
+    const kpis = await screen.findByRole("region", { name: "Team quota and borrowing summary" });
+    expect(within(kpis).getByText("Guaranteed TPUs")).toBeTruthy();
+    expect(within(kpis).getByText("256")).toBeTruthy();
+    expect(within(kpis).getByText("192")).toBeTruthy();
+    expect(within(kpis).getByText("64")).toBeTruthy();
+    expect(within(kpis).getByText("reclaimable")).toBeTruthy();
+    expect(within(kpis).getByText("Active reclaims")).toBeTruthy();
+
+    const activeReclaims = await screen.findByRole("region", { name: "Active team reclaims" });
+    expect(activeReclaims.textContent).toContain("wl-alice-borrowed");
+    expect(activeReclaims.textContent).toContain("bob");
+    expect(activeReclaims.textContent).toContain("Auto-resume elsewhere");
+
+    expect(screen.getByTestId("tier-badge-admin").textContent).toBe("Admin");
+    expect(screen.getByTestId("tier-badge-admin").getAttribute("title")).toContain("Fleet admin");
+    expect(screen.getByTestId("tier-badge-alice").textContent).toBe("Trusted · can borrow");
+    expect(screen.getByTestId("tier-badge-alice").getAttribute("title")).toContain("borrow idle TPU");
+    expect(screen.getByTestId("tier-badge-bob").textContent).toBe("User · own quota");
+    expect(screen.getByTestId("tier-badge-bob").getAttribute("title")).toContain("own guaranteed TPU quota");
+
+    const aliceUsage = screen.getByTestId("usage-alice");
+    expect(aliceUsage.textContent).toContain("128");
+    expect(aliceUsage.textContent).toContain("/ 64 TPU");
+    expect(aliceUsage.textContent).toContain("+64 borrowed");
+    expect(aliceUsage.querySelector(".usage-bar-own")).not.toBeNull();
+    expect(aliceUsage.querySelector(".usage-bar-borrowed")).not.toBeNull();
+    expect(aliceUsage.querySelector(".usage-bar-guarantee-mark")).not.toBeNull();
+  });
+
+  it("degrades gracefully when governance summary returns null (404-safe older plane)", async () => {
+    const client = mockClient();
+    client.getGovernanceSummary = vi.fn(async () => null);
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+
+    await screen.findByRole("region", { name: "Users" });
+    expect(screen.queryByRole("region", { name: "Team quota and borrowing summary" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("edits can_borrow rule (Default by tier / Allow / Deny) without sending spurious unchanged fields", async () => {
+    const client = mockClient();
+    const userWithTier: TeamUser = {
+      ...USER,
+      tier: "user",
+      rules: {
+        allowed_fleets: null,
+        approval_tpu_threshold: null,
+        guaranteed_tpu_units: 64,
+        max_tpu_units: 128,
+        max_cpu_units: null,
+        max_gpu_units: null,
+        can_borrow: null,
+      },
+    };
+    vi.mocked(client.listTeamUsers).mockResolvedValue([userWithTier]);
+    client.setTeamUserRules = vi.fn(async () => ({
+      ...userWithTier,
+      rules: { ...userWithTier.rules!, can_borrow: true },
+    }));
+
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" />);
+    const users = await screen.findByRole("region", { name: "Users" });
+    fireEvent.click(within(users).getByRole("button", { name: "Rules" }));
+    const form = await within(users).findByRole("form", { name: "Rules for alice" });
+
+    const borrowSelect = within(form).getByLabelText(/Can borrow idle capacity/) as HTMLSelectElement;
+    expect(borrowSelect.value).toBe("");
+    fireEvent.change(borrowSelect, { target: { value: "allow" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Save rules" }));
+    await waitFor(() => expect(client.setTeamUserRules).toHaveBeenCalledWith("alice", { can_borrow: true }));
+  });
+
+  it("shows a one-click copyable eyvan login --invite CLI onboarding command after creating an invite", async () => {
+    const client = mockClient();
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    const onNotify = vi.fn();
+
+    render(<UsersPage client={client} canAdminister defaultOrg="acme" defaultProject="r" onNotify={onNotify} />);
+    const invite = await screen.findByRole("region", { name: "Invite a user" });
+    fireEvent.change(within(invite).getByLabelText("Email"), { target: { value: "bob@example.com" } });
+    fireEvent.click(within(invite).getByRole("button", { name: /Create invite/ }));
+
+    const cmd = await within(invite).findByTestId("invite-login-command");
+    expect(cmd.textContent).toBe("eyvan login https://plane.example.com --invite secret-link");
+
+    fireEvent.click(within(invite).getByRole("button", { name: "Copy CLI command" }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("eyvan login https://plane.example.com --invite secret-link"),
+    );
+    expect(onNotify).toHaveBeenCalledWith("Copied CLI login command");
+    expect(inviteLoginCommand("https://tpu.example.com/eyvan/#/accept-invite/tok_1", "tok_1")).toBe(
+      "eyvan login https://tpu.example.com/eyvan --invite tok_1",
+    );
   });
 });

@@ -81,6 +81,8 @@ import type {
   TeamTokenCreated,
   TeamUser,
   TeamUserRules,
+  GovernanceSummary,
+  ReclaimPolicy,
   AvailableShape,
   BillingReport,
   CapacityPoolSummary,
@@ -122,6 +124,7 @@ import type {
   SchedulingPolicy,
   SessionAuthority,
   SessionPermission,
+  StorageStatus,
   SubmitWorkloadInput,
   TpuQuotaSnapshot,
   WarmthReport,
@@ -162,6 +165,9 @@ interface RawWorkload {
   lease_id?: string;
   checkpoint_uri?: string;
   scheduling_reason?: string;
+  reclaim_deadline_at?: string | null;
+  reclaim_requested_by?: string | null;
+  reclaim_policy?: ReclaimPolicy | null;
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -175,6 +181,8 @@ interface RawWorkload {
     /** Slices allocated together (pods=N). Absent on planes predating multislice. */
     cell_group_count?: number;
     worker_count?: number;
+    checkpoint_grace_seconds?: number | null;
+    reclaim_policy?: ReclaimPolicy | null;
   };
 }
 
@@ -182,6 +190,7 @@ interface RawCell {
   id: string;
   provider: string;
   provider_project?: string;
+  provider_account?: string | null;
   region: string;
   zone?: string;
   state: string;
@@ -466,6 +475,11 @@ function mapWorkload(raw: RawWorkload): WorkloadDetail {
     failureReason: raw.failure_reason ?? undefined,
     checkpointUri: raw.checkpoint_uri,
     leaseId: raw.lease_id,
+    reclaimDeadlineAt: raw.reclaim_deadline_at ?? undefined,
+    reclaimRequestedBy: raw.reclaim_requested_by ?? undefined,
+    reclaimPolicy: raw.reclaim_policy ?? raw.spec.reclaim_policy ?? undefined,
+    checkpointGraceSeconds:
+      typeof raw.spec.checkpoint_grace_seconds === "number" ? raw.spec.checkpoint_grace_seconds : undefined,
     // Populated by getWorkload from this workload's leases; the list view has no
     // allocation to show.
     allocation: [],
@@ -807,6 +821,51 @@ export class EyvanApiClient {
     return this.attachmentRequest<DiscoveredTpus>("/api/v1/attachments/discovered", { signal });
   }
 
+  /**
+   * Read non-secret regional & monitoring GCS storage configuration plus detected
+   * GCP context. Returns `null` when speaking to an older control plane that does
+   * not expose `/api/v1/storage/status`.
+   */
+  async getStorageStatus(signal?: AbortSignal): Promise<StorageStatus | null> {
+    if (this.forceDemo) {
+      return {
+        configured: true,
+        auto_create: false,
+        config_path: "~/.eyvan/storage.json",
+        project: "demo-project",
+        monitoring: {
+          bucket: "eyvan-monitoring-demo",
+          uri: "gs://eyvan-monitoring-demo/tracking",
+          location: "us-central1",
+          prefix: "tracking",
+        },
+        regional: {
+          "us-central2": {
+            bucket: "eyvan_us-central2",
+            uri: "gs://eyvan_us-central2",
+            location: "us-central2",
+          },
+        },
+        context: {
+          on_gcp: false,
+          project: "demo-project",
+          zone: null,
+          region: "us-central2",
+          accelerator_type: null,
+          source: "demo",
+        },
+      };
+    }
+    try {
+      return await this.attachmentRequest<StorageStatus>("/api/v1/storage/status", { signal });
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 405 || error.status === 501)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   // A fleet's bash init script (fleet admins). Full literal paths, like the
   // attachment routes, so the browser route inventory stays auditable. Demo
   // mode has no fleet behind it, so it refuses rather than pretending to save.
@@ -833,6 +892,26 @@ export class EyvanApiClient {
   async listTeamUsers(signal?: AbortSignal): Promise<TeamUser[]> {
     if (this.forceDemo) return [];
     return (await this.attachmentRequest<{ users: TeamUser[] }>("/api/v1/team/users", { signal })).users;
+  }
+
+  /**
+   * Read team governance quota, borrowing, and active-reclaim summary.
+   * Returns `null` on older planes without `/api/v1/governance/summary` or when
+   * the caller lacks fleet governance read access.
+   */
+  async getGovernanceSummary(signal?: AbortSignal): Promise<GovernanceSummary | null> {
+    if (this.forceDemo) return null;
+    try {
+      return await this.attachmentRequest<GovernanceSummary>("/api/v1/governance/summary", { signal });
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        (error.status === 404 || error.status === 405 || error.status === 501 || error.status === 403)
+      ) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   async setTeamUserDisabled(subject: string, disabled: boolean): Promise<TeamUser> {
@@ -2059,6 +2138,7 @@ export class EyvanApiClient {
           name: cell.id,
           capacityClass: cell.capacity_class as Cell["capacityClass"],
           backend: `${cell.provider}${cell.provider_project ? ` / ${cell.provider_project}` : ""}`,
+          providerAccount: cell.provider_account ?? undefined,
           region: cell.region,
           zone: cell.zone ?? "-",
           status: cellStatus(cell.state),
@@ -2394,6 +2474,11 @@ export class EyvanApiClient {
       maxCells: Number(pool.max_cells ?? 0),
       minCells: Number(pool.min_cells ?? 0),
       enabled: pool.enabled !== false,
+      provider: typeof pool.provider === "string" && pool.provider ? pool.provider : null,
+      providerProject:
+        typeof pool.provider_project === "string" && pool.provider_project ? pool.provider_project : null,
+      providerAccount:
+        typeof pool.provider_account === "string" && pool.provider_account ? pool.provider_account : null,
     }));
   }
 

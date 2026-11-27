@@ -8,8 +8,13 @@ import type { RunHistogramsResponse } from "../types";
 
 const PAD = { left: 48, right: 12, top: 12, bottom: 38 };
 const HEIGHT = 260;
-const number = (value: number | null) =>
-  value === null ? "unknown" : value.toLocaleString(undefined, { maximumFractionDigits: 3 });
+
+const number = (value: number | null) => {
+  if (value === null || !Number.isFinite(value)) return "unknown";
+  const abs = Math.abs(value);
+  if (abs !== 0 && (abs < 1e-3 || abs >= 1e6)) return value.toExponential(1);
+  return value.toLocaleString(undefined, { maximumFractionDigits: 3 });
+};
 
 /** Normalize before subtracting to avoid overflow and precision-losing padding. */
 function fraction(value: number, lo: number, hi: number) {
@@ -24,6 +29,8 @@ export function Heatmap({ data }: { data: RunHistogramsResponse }) {
   const [hovered, setHovered] = useState<number | null>(null);
   // The wire is step-ordered; time and custom axes need not be monotonic.
   const columns = useMemo(() => [...data.columns].sort((a, b) => a.x - b.x), [data.columns]);
+  const safeHovered = hovered !== null && hovered >= 0 && hovered < columns.length ? hovered : null;
+
   useEffect(() => {
     const element = canvas.current;
     if (!element || !columns.length || data.edges.length < 2) return;
@@ -66,19 +73,48 @@ export function Heatmap({ data }: { data: RunHistogramsResponse }) {
           );
         });
       });
+
+      // Highlight actively inspected column when hovering or stepping with keyboard.
+      if (safeHovered !== null) {
+        const pos = positions[safeHovered];
+        ctx.globalAlpha = 0.28;
+        ctx.fillStyle = token("--text");
+        ctx.fillRect(sx(pos) - 1, PAD.top, 2, plotHeight);
+      }
+
       ctx.globalAlpha = 1;
       ctx.fillStyle = token("--text-soft");
       ctx.font = `10px ${token("--mono")}`;
       ctx.textAlign = "right";
       [lo, lo / 2 + hi / 2, hi].forEach((value) => ctx.fillText(number(value), PAD.left - 7, sy(value) + 3));
       ctx.textAlign = "center";
-      for (let i = 0; i <= 4; i++) {
-        const value = first * (1 - i / 4) + last * (i / 4);
+
+      if (first === last) {
         const label =
           data.x === "time"
-            ? new Date(value * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-            : number(value);
-        ctx.fillText(label, sx(i / 4), HEIGHT - 21);
+            ? new Date(first * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
+            : data.x === "step"
+              ? Math.round(first).toLocaleString()
+              : number(first);
+        ctx.fillText(label, sx(0.5), HEIGHT - 21);
+      } else if (data.x === "step") {
+        const seen = new Set<number>();
+        for (let i = 0; i <= 4; i++) {
+          const raw = first * (1 - i / 4) + last * (i / 4);
+          const rounded = Math.round(raw);
+          if (seen.has(rounded)) continue;
+          seen.add(rounded);
+          ctx.fillText(rounded.toLocaleString(), sx(fraction(rounded, first, last)), HEIGHT - 21);
+        }
+      } else {
+        for (let i = 0; i <= 4; i++) {
+          const value = first * (1 - i / 4) + last * (i / 4);
+          const label =
+            data.x === "time"
+              ? new Date(value * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
+              : number(value);
+          ctx.fillText(label, sx(i / 4), HEIGHT - 21);
+        }
       }
       ctx.fillText(data.x, PAD.left + plotWidth / 2, HEIGHT - 4);
     };
@@ -93,8 +129,9 @@ export function Heatmap({ data }: { data: RunHistogramsResponse }) {
       theme.disconnect();
       globalThis.removeEventListener("resize", draw);
     };
-  }, [data, columns]);
-  const active = hovered === null ? null : columns[hovered];
+  }, [data, columns, safeHovered]);
+
+  const active = safeHovered === null ? null : columns[safeHovered];
   return (
     <>
       <canvas
@@ -106,7 +143,8 @@ export function Heatmap({ data }: { data: RunHistogramsResponse }) {
         onMouseMove={(event) => {
           const bounds = event.currentTarget.getBoundingClientRect();
           const width = bounds.width || event.currentTarget.clientWidth || 220;
-          const p = Math.max(0, Math.min(1, (event.clientX - bounds.left - PAD.left) / (width - PAD.left - PAD.right)));
+          const plotWidth = Math.max(1, width - PAD.left - PAD.right);
+          const p = Math.max(0, Math.min(1, (event.clientX - bounds.left - PAD.left) / plotWidth));
           if (!columns.length) return;
           const positions = columns.map((column) => fraction(column.x, columns[0].x, columns[columns.length - 1].x));
           let closest = 0;

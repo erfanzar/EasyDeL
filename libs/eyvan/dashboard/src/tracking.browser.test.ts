@@ -83,6 +83,15 @@ it("renders real tracking canvases, switches axes/themes, and retains top naviga
     const nav = await page.getByRole("complementary", { name: "Primary navigation" }).boundingBox();
     expect(nav?.height).toBe(48);
     expect(nav?.width).toBe(1440);
+    const topbar = await page.locator("header.topbar").boundingBox();
+    const meta = await page.locator(".tracking-meta").boundingBox();
+    const heading = await page.locator(".run-heading").boundingBox();
+    expect(topbar?.y).toBe(48);
+    expect(topbar?.height).toBe(48);
+    expect(meta && topbar ? meta.y >= topbar.y + topbar.height : false).toBe(true);
+    expect(heading && meta ? heading.y >= meta.y + meta.height : false).toBe(true);
+    const overflowX = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    expect(overflowX).toBeLessThanOrEqual(0);
     const style = await page.locator("body").evaluate((element) => ({
       bg: getComputedStyle(element).backgroundColor,
       grid: getComputedStyle(element).backgroundSize,

@@ -3,15 +3,29 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Cpu, Gauge, Layers, MapPin, MinusCircle, Network, Plus, RefreshCw, Timer } from "lucide-react";
+import {
+  AlertTriangle,
+  Cloud,
+  Cpu,
+  Gauge,
+  Layers,
+  MapPin,
+  MinusCircle,
+  Network,
+  Plus,
+  RefreshCw,
+  Timer,
+} from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { AddTpuModal, type AttachmentClient } from "../components/AddTpuModal";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { ErrorCard } from "../components/ErrorCard";
 import { FleetInitScript, type FleetInitScriptClient } from "../components/FleetInitScript";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
+import { diagnoseError } from "../lib/errorDiagnostics";
 import { formatDateTime, formatMoney, percent, summarizeShapes } from "../lib/format";
 import type {
   AttachmentInput,
@@ -250,7 +264,14 @@ export function FleetPage({
   const fleets = useMemo(() => {
     const grouped = new Map<
       string,
-      { name: string; pools: CapacityPoolSummary[]; shapes: string[]; zones: string[]; disabled: number }
+      {
+        name: string;
+        pools: CapacityPoolSummary[];
+        shapes: string[];
+        zones: string[];
+        credentials: Array<{ key: string; project: string | null; account: string | null }>;
+        disabled: number;
+      }
     >();
     for (const pool of pools) {
       const existing = grouped.get(pool.fleetName) ?? {
@@ -258,16 +279,49 @@ export function FleetPage({
         pools: [],
         shapes: [],
         zones: [],
+        credentials: [],
         disabled: 0,
       };
       existing.pools.push(pool);
       if (pool.acceleratorType && !existing.shapes.includes(pool.acceleratorType))
         existing.shapes.push(pool.acceleratorType);
       if (pool.zone && !existing.zones.includes(pool.zone)) existing.zones.push(pool.zone);
+      if (pool.providerProject || pool.providerAccount) {
+        const key = `${pool.providerProject ?? ""}::${pool.providerAccount ?? ""}`;
+        if (!existing.credentials.some((item) => item.key === key)) {
+          existing.credentials.push({
+            key,
+            project: pool.providerProject ?? null,
+            account: pool.providerAccount ?? null,
+          });
+        }
+      }
       if (!pool.enabled) existing.disabled += 1;
       grouped.set(pool.fleetName, existing);
     }
     return [...grouped.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }, [pools]);
+
+  const poolCredentials = useMemo(() => {
+    const seen = new Map<string, { key: string; project: string | null; account: string | null; poolCount: number }>();
+    for (const pool of pools) {
+      if (!pool.providerProject && !pool.providerAccount) continue;
+      const key = `${pool.providerProject ?? ""}::${pool.providerAccount ?? ""}`;
+      const existing = seen.get(key);
+      if (existing) {
+        existing.poolCount += 1;
+      } else {
+        seen.set(key, {
+          key,
+          project: pool.providerProject ?? null,
+          account: pool.providerAccount ?? null,
+          poolCount: 1,
+        });
+      }
+    }
+    return [...seen.values()].sort((left, right) =>
+      `${left.project ?? ""}:${left.account ?? ""}`.localeCompare(`${right.project ?? ""}:${right.account ?? ""}`),
+    );
   }, [pools]);
 
   // Pools actually holding capacity come first (most held first), then A-Z, so
@@ -358,9 +412,14 @@ export function FleetPage({
           </p>
         )}
         {refreshError && (
-          <div className="inline-error" role="alert">
-            <AlertTriangle size={16} />
-            {refreshError}
+          <div className="panel-alert-wrap">
+            <ErrorCard
+              compact
+              error={refreshError}
+              context={{ fallbackTitle: "Unable to refresh fleet inventory" }}
+              actions={[{ label: "Retry", onClick: () => void refreshInventory() }]}
+              onDismiss={() => setRefreshError(null)}
+            />
           </div>
         )}
         {refreshed && (
@@ -459,7 +518,8 @@ export function FleetPage({
                       {cell.name}
                     </h3>
                     <p>
-                      {cell.backend} · {cell.zone}
+                      {cell.backend}
+                      {cell.providerAccount ? ` · ${cell.providerAccount}` : ""} · {cell.zone}
                     </p>
                   </div>
                   <StatusBadge value={cell.status} tone={cell.status} />
@@ -496,20 +556,29 @@ export function FleetPage({
                     );
                   })}
                 </div>
-                {(cell.unavailableReason || cell.unavailableDetail) && (
-                  // The provider's own word for why this cell is not ready.
-                  // Code plus detail, so the card says "provider_error" and
-                  // also the quota message — not one without the other, and
-                  // never a bare spinner where an explanation exists.
-                  <p className="cell-card-error" role="alert">
-                    <AlertTriangle size={14} aria-hidden="true" />
-                    <span>
-                      {cell.unavailableReason && <strong>{cell.unavailableReason}</strong>}
-                      {cell.unavailableReason && cell.unavailableDetail ? ": " : ""}
-                      {cell.unavailableDetail}
-                    </span>
-                  </p>
-                )}
+                {(cell.unavailableReason || cell.unavailableDetail) &&
+                  (() => {
+                    const detail = cell.unavailableDetail ?? "";
+                    const longOrNoisy =
+                      detail.length > 160 || detail.includes("\n") || /@type|error_info_id/i.test(detail);
+                    if (longOrNoisy) {
+                      return (
+                        <div className="cell-card-error-wrap">
+                          <ErrorCard compact error={detail} title={cell.unavailableReason ?? "Cell unavailable"} />
+                        </div>
+                      );
+                    }
+                    return (
+                      <p className="cell-card-error" role="alert">
+                        <AlertTriangle size={14} aria-hidden="true" />
+                        <span>
+                          {cell.unavailableReason && <strong>{cell.unavailableReason}</strong>}
+                          {cell.unavailableReason && cell.unavailableDetail ? ": " : ""}
+                          {cell.unavailableDetail}
+                        </span>
+                      </p>
+                    );
+                  })()}
                 <div className="cell-card-footer">
                   <span>
                     Scoped utilization <strong>{cell.utilization}%</strong>
@@ -614,9 +683,13 @@ export function FleetPage({
             </div>
           </div>
           {discoveryError && (
-            <div className="inline-error" role="alert">
-              <AlertTriangle size={16} aria-hidden="true" />
-              {discoveryError}
+            <div className="panel-alert-wrap">
+              <ErrorCard
+                compact
+                error={discoveryError}
+                context={{ fallbackTitle: "Could not read discovered TPUs" }}
+                actions={[{ label: "Retry", onClick: () => setDiscoveryRevision((revision) => revision + 1) }]}
+              />
             </div>
           )}
           {discovered === null && !discoveryError && <p className="panel-note">Reading discovered TPUs…</p>}
@@ -689,12 +762,27 @@ export function FleetPage({
               </table>
             </div>
           )}
-          {discovered !== null &&
-            Object.entries(discovered.skipped).map(([project, reason]) => (
-              <p className="panel-note" key={project}>
-                {project}: skipped ({reason})
-              </p>
-            ))}
+          {discovered !== null && Object.keys(discovered.skipped).length > 0 && (
+            <div className="panel-alert-stack">
+              {Object.entries(discovered.skipped).map(([project, reason]) => {
+                const parsed = diagnoseError(reason, { project, fallbackTitle: `${project}: skipped` });
+                return parsed.hasTechnicalDetails ? (
+                  <ErrorCard
+                    key={project}
+                    compact
+                    tone="warning"
+                    role="status"
+                    error={parsed}
+                    title={`${project}: skipped`}
+                  />
+                ) : (
+                  <p className="panel-note" key={project}>
+                    {project}: skipped ({reason})
+                  </p>
+                );
+              })}
+            </div>
+          )}
         </section>
       )}
 
@@ -709,12 +797,33 @@ export function FleetPage({
           </div>
           {poolsLoading && <p className="panel-note">Reading capacity pools…</p>}
           {!poolsLoading && !poolsError && fleets.length === 0 && <p className="panel-note">No fleets are applied.</p>}
+          {poolCredentials.length > 0 && (
+            <div className="pool-credentials-bar" aria-label="Configured GCP projects and accounts">
+              <span className="pool-credentials-label">
+                <Cloud size={13} aria-hidden="true" />
+                Cloud projects &amp; accounts
+              </span>
+              <div className="pool-credentials-list">
+                {poolCredentials.map((cred) => (
+                  <span className="pool-credential-pill monospace" key={cred.key}>
+                    {cred.project && <strong>{cred.project}</strong>}
+                    {cred.project && cred.account && <span className="pool-credential-sep"> · </span>}
+                    {cred.account && <span className="pool-credential-account">{cred.account}</span>}
+                    <span className="pool-credential-count">
+                      {cred.poolCount} {cred.poolCount === 1 ? "pool" : "pools"}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
           {fleets.length > 0 && (
             <div className="table-scroll">
               <table className="data-table">
                 <thead>
                   <tr>
                     <th>Fleet</th>
+                    <th>Project &amp; account</th>
                     <th>Pools</th>
                     <th>Shapes</th>
                     <th>Zone</th>
@@ -729,6 +838,21 @@ export function FleetPage({
                           <strong>{fleet.name}</strong>
                           {fleet.disabled > 0 && <small>{fleet.disabled} pool(s) disabled</small>}
                         </span>
+                      </td>
+                      <td>
+                        {fleet.credentials.length > 0 ? (
+                          <div className="pool-credential-stack">
+                            {fleet.credentials.map((cred) => (
+                              <span className="pool-credential-line monospace" key={cred.key}>
+                                {cred.project && <strong>{cred.project}</strong>}
+                                {cred.project && cred.account && <span className="pool-credential-sep"> · </span>}
+                                {cred.account && <span className="pool-credential-account">{cred.account}</span>}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
                       </td>
                       <td>{fleet.pools.length}</td>
                       <td>
@@ -773,16 +897,18 @@ export function FleetPage({
             </div>
           )}
           {poolsError && (
-            <div className="inline-error" role="alert">
-              <AlertTriangle size={16} aria-hidden="true" />
-              {poolsError}
-              <button
-                className="button button-secondary"
-                type="button"
-                onClick={() => setPoolRetryRevision((revision) => revision + 1)}
-              >
-                Retry pool listing
-              </button>
+            <div className="panel-alert-wrap">
+              <ErrorCard
+                compact
+                error={poolsError}
+                context={{ fallbackTitle: "Could not read capacity pools" }}
+                actions={[
+                  {
+                    label: "Retry pool listing",
+                    onClick: () => setPoolRetryRevision((revision) => revision + 1),
+                  },
+                ]}
+              />
             </div>
           )}
         </section>
@@ -798,10 +924,12 @@ export function FleetPage({
       )}
 
       {stopError && (
-        <div className="inline-error" role="alert">
-          <AlertTriangle size={16} aria-hidden="true" />
-          {stopError}
-        </div>
+        <ErrorCard
+          compact
+          error={stopError}
+          context={{ fallbackTitle: "Could not stop fleet" }}
+          onDismiss={() => setStopError(null)}
+        />
       )}
 
       {confirmStop && onStopFleet && (
@@ -845,8 +973,8 @@ export function FleetPage({
           <Gauge size={15} />
         </div>
         {costError && (
-          <div className="resource-row-detail">
-            <span>{costError}</span>
+          <div className="panel-alert-wrap">
+            <ErrorCard compact error={costError} context={{ fallbackTitle: "Unable to read fleet cost" }} />
           </div>
         )}
         {!costError && !billing && (
@@ -914,8 +1042,8 @@ export function FleetPage({
           <Timer size={15} />
         </div>
         {latencyError && (
-          <div className="resource-row-detail">
-            <span>{latencyError}</span>
+          <div className="panel-alert-wrap">
+            <ErrorCard compact error={latencyError} context={{ fallbackTitle: "Unable to read launch latency" }} />
           </div>
         )}
         {!latencyError && !latency && (

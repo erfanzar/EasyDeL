@@ -180,4 +180,53 @@ describe("applied fleets", () => {
       expect(document.querySelector(".cell-card-error script")).toBeNull();
     },
   );
+
+  it("displays provider_project and provider_account cleanly across multi-project GCP pools", async () => {
+    const multiProjectPools: CapacityPoolSummary[] = [
+      {
+        id: "spot-v6e-8",
+        fleetName: "spot-fleet",
+        acceleratorType: "v6e-8",
+        capacityClass: "spot",
+        zone: "us-central2-b",
+        region: "us-central2",
+        maxCells: 8,
+        minCells: 0,
+        enabled: true,
+        provider: "gcp",
+        providerProject: "example-project-a",
+        providerAccount: "operator@example.com",
+      },
+      {
+        id: "acme-v5p-128",
+        fleetName: "acme-reserved",
+        acceleratorType: "v5p-128",
+        capacityClass: "reserved",
+        zone: "us-east5-a",
+        region: "us-east5",
+        maxCells: 4,
+        minCells: 1,
+        enabled: true,
+        provider: "gcp",
+        providerProject: "acme-tpus",
+        providerAccount: "alice@example.com",
+      },
+    ];
+
+    renderPage({ loadPools: async () => multiProjectPools });
+
+    const section = await waitFor(() => appliedFleets());
+    const auditBar = await within(section).findByLabelText("Configured GCP projects and accounts");
+    expect(auditBar.textContent).toContain("example-project-a");
+    expect(auditBar.textContent).toContain("operator@example.com");
+    expect(auditBar.textContent).toContain("acme-tpus");
+    expect(auditBar.textContent).toContain("alice@example.com");
+
+    const rows = within(section).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(2);
+    const acmeRow = rows.find((row) => row.textContent?.includes("acme-reserved"))!;
+    const spotRow = rows.find((row) => row.textContent?.includes("spot-fleet"))!;
+    expect(acmeRow.textContent).toContain("acme-tpus · alice@example.com");
+    expect(spotRow.textContent).toContain("example-project-a · operator@example.com");
+  });
 });

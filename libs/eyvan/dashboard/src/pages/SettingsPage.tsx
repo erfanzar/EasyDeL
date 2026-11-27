@@ -3,14 +3,16 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, CheckCircle2, X } from "lucide-react";
+import { CheckCircle2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { ErrorCard } from "../components/ErrorCard";
 import { AssistantProvidersSettings, type AssistantSettingsClient } from "./AssistantProvidersSettings";
+import { StorageTrackingSettings, type StorageSettingsClient } from "./StorageTrackingSettings";
 import { UsersPage, type TeamClient } from "./UsersPage";
 
 interface SettingsPageProps {
-  client: TeamClient & AssistantSettingsClient;
+  client: TeamClient & AssistantSettingsClient & StorageSettingsClient;
   /** Accounts, invites and tokens exist only on a team-mode plane. */
   teamMode: boolean;
   /** Fleet admins configure the assistant's providers. */
@@ -18,6 +20,7 @@ interface SettingsPageProps {
   defaultOrg: string;
   defaultProject: string;
   onProvidersChanged?: () => void;
+  onNotify?: (message: string) => void;
   assignLocation?: (url: string) => void;
 }
 
@@ -52,6 +55,7 @@ export function SettingsPage({
   defaultOrg,
   defaultProject,
   onProvidersChanged,
+  onNotify,
   assignLocation,
 }: SettingsPageProps) {
   const [notice, setNotice] = useState<SettingsNotice | null>(null);
@@ -69,26 +73,37 @@ export function SettingsPage({
 
   return (
     <div className="page-stack">
-      {notice && (
-        <div
-          className={notice.tone === "ok" ? "inline-notice" : "inline-error settings-alert"}
-          role={notice.tone === "ok" ? "status" : "alert"}
-        >
-          {notice.tone === "ok" ? (
+      {notice &&
+        (notice.tone === "ok" ? (
+          <div className="inline-notice" role="status">
             <CheckCircle2 size={15} aria-hidden="true" />
-          ) : (
-            <AlertTriangle size={15} aria-hidden="true" />
-          )}
-          <span>{notice.text}</span>
-          <button
-            className="icon-button icon-button-small"
-            type="button"
-            aria-label="Dismiss notice"
-            onClick={() => setNotice(null)}
-          >
-            <X size={13} aria-hidden="true" />
-          </button>
-        </div>
+            <span>{notice.text}</span>
+            <button
+              className="icon-button icon-button-small"
+              type="button"
+              aria-label="Dismiss notice"
+              onClick={() => setNotice(null)}
+            >
+              <X size={13} aria-hidden="true" />
+            </button>
+          </div>
+        ) : (
+          <ErrorCard
+            compact
+            title="Provider sign-in failed"
+            error={notice.text}
+            summary={notice.text}
+            onDismiss={() => setNotice(null)}
+            onCopied={onNotify}
+          />
+        ))}
+      {canManageFleet && client.getStorageStatus && (
+        <StorageTrackingSettings
+          client={client}
+          defaultOrg={defaultOrg}
+          defaultProject={defaultProject}
+          onNotify={onNotify}
+        />
       )}
       {canManageFleet && (
         <AssistantProvidersSettings client={client} onChanged={onProvidersChanged} assignLocation={assignLocation} />
@@ -99,6 +114,7 @@ export function SettingsPage({
           canAdminister={canManageFleet}
           defaultOrg={defaultOrg}
           defaultProject={defaultProject}
+          onNotify={onNotify}
         />
       )}
       {!canManageFleet && !teamMode && <p className="panel-note">Nothing here is configurable with your role.</p>}

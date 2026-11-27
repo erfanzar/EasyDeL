@@ -8,6 +8,7 @@ import { useMemo, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { ProgressBar } from "../components/ProgressBar";
+import { ReclaimBadge } from "../components/ReclaimBanner";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatAcceleratorRequest, formatDateTime, formatMoney, percent, titleCase } from "../lib/format";
 import type { WorkloadStatus, WorkloadSummary } from "../types";
@@ -31,6 +32,8 @@ const STATUS_ORDER: WorkloadStatus[] = [
   "completed",
   "cancelled",
 ];
+
+const TERMINAL_STATUSES = new Set<WorkloadStatus>(["completed", "failed", "cancelled"]);
 
 export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }: WorkloadsPageProps) {
   const [search, setSearch] = useState("");
@@ -182,6 +185,18 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                       </td>
                       <td>
                         <StatusBadge value={workload.status} tone={workload.status} />
+                        {workload.reclaimDeadlineAt && !TERMINAL_STATUSES.has(workload.status) && (
+                          <div className="cell-reclaim">
+                            <ReclaimBadge
+                              deadlineAt={workload.reclaimDeadlineAt}
+                              requestedBy={workload.reclaimRequestedBy}
+                              policy={workload.reclaimPolicy}
+                              role={
+                                workload.status === "queued" || workload.status === "planning" ? "waiting" : "victim"
+                              }
+                            />
+                          </div>
+                        )}
                         {workload.queueReason && (
                           <small className="cell-note" title={workload.queueReason}>
                             {workload.queueReason}

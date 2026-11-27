@@ -6,8 +6,9 @@
 import { AlertTriangle } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { MetricCard } from "../components/MetricCard";
 import { EmptyState } from "../components/EmptyState";
+import { ErrorCard } from "../components/ErrorCard";
+import { MetricCard } from "../components/MetricCard";
 import { LoadingState } from "../components/PageState";
 import { formatSpend } from "../lib/format";
 import type { BillingReport, ProjectUsage } from "../types";
@@ -28,7 +29,8 @@ function hours(seconds: number | undefined): string {
 export function BillingPage({ loadBilling, loadUsage, refreshRevision = 0 }: BillingPageProps) {
   const [billing, setBilling] = useState<BillingReport | null>(null);
   const [usage, setUsage] = useState<ProjectUsage | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+  const [retryRevision, setRetryRevision] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -41,20 +43,21 @@ export function BillingPage({ loadBilling, loadUsage, refreshRevision = 0 }: Bil
         setBilling(bill);
         setUsage(use);
       })
-      .catch((failure) => {
+      .catch((failure: unknown) => {
         if (controller.signal.aborted) return;
-        setError(failure instanceof Error ? failure.message : "Could not read billing");
+        setError(failure instanceof Error ? failure : new Error("Could not read billing"));
       });
     return () => controller.abort();
-  }, [loadBilling, loadUsage, refreshRevision]);
+  }, [loadBilling, loadUsage, refreshRevision, retryRevision]);
 
   if (error) {
     return (
       <div className="page-stack">
-        <div className="inline-error" role="alert">
-          <AlertTriangle size={16} aria-hidden="true" />
-          {error}
-        </div>
+        <ErrorCard
+          error={error}
+          context={{ fallbackTitle: "Unable to read billing" }}
+          actions={[{ label: "Retry", onClick: () => setRetryRevision((value) => value + 1) }]}
+        />
       </div>
     );
   }

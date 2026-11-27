@@ -288,7 +288,7 @@ describe("the quota page", () => {
     expect(screen.getByText(/PERMISSION_DENIED/)).toBeDefined();
   });
 
-  it("reports an unreadable snapshot rather than an empty table", async () => {
+  it("reports an unreadable snapshot as one deduplicated card rather than duplicate raw walls or an empty table", async () => {
     renderPage(
       snapshot({
         status: "unavailable",
@@ -300,7 +300,9 @@ describe("the quota page", () => {
       }),
     );
 
-    await waitFor(() => expect(screen.getAllByText(/gcloud auth token lookup failed/)).toHaveLength(2));
+    await waitFor(() => expect(screen.getByText(/Spot & On-demand quota could not be read/)).toBeDefined());
+    // Deduplicated: ONE error card covering both Spot & On-demand instead of two identical walls.
+    expect(screen.getAllByText(/gcloud auth token lookup failed/)).toHaveLength(1);
     // No summary tile either. "Free chips: 0" beside a failure banner is the
     // same lie as a zero in a row, one level up.
     expect(screen.queryByText("Free chips")).toBeNull();
@@ -308,6 +310,85 @@ describe("the quota page", () => {
     expect(
       screen.getByText(/No zone is counted, listed, or shown as empty, because none of them were read/),
     ).toBeDefined();
+  });
+
+  it("switches GCP projects via the interactive project switcher bar and quick-switch IAM error buttons", async () => {
+    const rawIamWall = [
+      "gcloud beta quotas info list failed: ERROR: (gcloud.beta.quotas.info.list) PERMISSION_DENIED:",
+      "Permission 'cloudquotas.quotas.get' denied on resource",
+      "'//cloudquotas.googleapis.com/projects/example-project-a/locations/global/services/tpu.googleapis.com'.",
+      "This command is authenticated as alice@example.com.",
+      "- '@type': type.googleapis.com/google.rpc.ErrorInfo",
+      "  error_info_id: Cg1JQU1fREVOSUVE",
+    ].join("\n");
+
+    const calls: Array<{ refresh?: boolean; project?: string } | undefined> = [];
+    const loadQuota = vi.fn(async (_signal: AbortSignal, options?: { refresh?: boolean; project?: string }) => {
+      calls.push(options);
+      if (options?.project === "example-project-b") {
+        return snapshot({
+          project: "example-project-b",
+          available_projects: ["example-project-a", "example-project-b", "acme-tpus"],
+          status: "ok",
+          entries: [entry({ zone: "us-central2-b", free_chips: 64, free_slices: 8 })],
+          failures: [],
+        });
+      }
+      if (options?.project === "custom-tpu-proj") {
+        return snapshot({
+          project: "custom-tpu-proj",
+          available_projects: ["example-project-a", "example-project-b", "acme-tpus"],
+          status: "ok",
+          entries: [entry({ zone: "europe-west4-a", region: "europe-west4", free_chips: 32, free_slices: 4 })],
+          failures: [],
+        });
+      }
+      return snapshot({
+        project: "example-project-a",
+        available_projects: ["example-project-a", "example-project-b", "acme-tpus"],
+        status: "unavailable",
+        entries: [],
+        failures: [
+          { capacity_class: "spot", reason: rawIamWall },
+          { capacity_class: "on_demand", reason: rawIamWall },
+        ],
+      });
+    });
+
+    const { container } = render(<CapacityPage loadQuota={loadQuota} />);
+
+    // Renders ONE deduplicated IAM error card instead of two 9-line protobuf walls.
+    expect(await screen.findByText("GCP IAM permission denied")).toBeDefined();
+    expect(container.querySelectorAll(".error-card")).toHaveLength(1);
+    expect(screen.getByText("Spot & On-demand")).toBeDefined();
+    expect(screen.getByText("alice@example.com")).toBeDefined();
+    expect(screen.getByText("cloudquotas.quotas.get")).toBeDefined();
+
+    // Project switcher bar exposes clickable project pills.
+    const switcher = screen.getByRole("group", { name: "GCP project" });
+    expect(within(switcher).getByRole("button", { name: "example-project-a" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(within(switcher).getByRole("button", { name: "example-project-b" }).getAttribute("aria-pressed")).toBe(
+      "false",
+    );
+    expect(within(switcher).getByRole("button", { name: "acme-tpus" })).toBeDefined();
+
+    // Clicking the quick "Switch to example-project-b" button inside the error card loads that project!
+    fireEvent.click(screen.getByRole("button", { name: "Switch to example-project-b" }));
+    await waitFor(() => expect(calls).toContainEqual({ refresh: false, project: "example-project-b" }));
+    expect(await screen.findByText("us-central2-b")).toBeDefined();
+    expect(within(switcher).getByRole("button", { name: "example-project-b" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(container.querySelectorAll(".error-card")).toHaveLength(0);
+
+    // Custom project input lets operators query an arbitrary project.
+    fireEvent.click(within(switcher).getByRole("button", { name: "+ Other project" }));
+    fireEvent.change(screen.getByLabelText("Custom GCP project ID"), { target: { value: "custom-tpu-proj" } });
+    fireEvent.click(within(switcher).getByRole("button", { name: "Read" }));
+    await waitFor(() => expect(calls).toContainEqual({ refresh: false, project: "custom-tpu-proj" }));
+    expect(await screen.findByText("europe-west4-a")).toBeDefined();
   });
 
   it("separates an unconfigured fleet from a fleet with no quota", async () => {

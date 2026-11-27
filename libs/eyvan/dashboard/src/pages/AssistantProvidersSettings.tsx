@@ -6,6 +6,8 @@
 import { AlertTriangle, ExternalLink, LoaderCircle, LogIn, Plus, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 
+import { ErrorCard } from "../components/ErrorCard";
+
 import type {
   AssistantModelDiscovery,
   AssistantModelDiscoveryInput,
@@ -770,9 +772,13 @@ export function AssistantProvidersSettings({
       </div>
 
       {error && (
-        <div className="inline-error provider-alert" role="alert">
-          <AlertTriangle size={14} aria-hidden="true" />
-          {error}
+        <div className="panel-alert-wrap">
+          <ErrorCard
+            compact
+            error={error}
+            context={{ fallbackTitle: "Provider settings error" }}
+            onDismiss={() => setError(null)}
+          />
         </div>
       )}
       {notice && (

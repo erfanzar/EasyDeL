@@ -3,10 +3,11 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Plug } from "lucide-react";
+import { Plug } from "lucide-react";
 import { useState, type FormEvent } from "react";
 
 import { CopyOnce } from "../components/CopyOnce";
+import { ErrorCard } from "../components/ErrorCard";
 import type { TeamTokenCreated } from "../types";
 import { AGENT_CLIENTS, EXPIRY_CHOICES, agentConfig, agentTokenName, type AgentClient } from "./agentConfigs";
 
@@ -61,9 +62,13 @@ export function ConnectAgentPanel({ client, onMinted, origin }: Props) {
         </div>
       </div>
       {error && (
-        <div className="inline-error" role="alert">
-          <AlertTriangle size={16} aria-hidden="true" />
-          {error}
+        <div className="panel-alert-wrap">
+          <ErrorCard
+            compact
+            error={error}
+            context={{ fallbackTitle: "Could not create token" }}
+            onDismiss={() => setError(null)}
+          />
         </div>
       )}
       <form className="form-grid form-grid-two" onSubmit={(event) => void connect(event)}>

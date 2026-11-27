@@ -3,9 +3,11 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Edit3, Shield } from "lucide-react";
+import { Edit3, Shield } from "lucide-react";
 import { useState } from "react";
 
+import { EmptyState } from "../components/EmptyState";
+import { ErrorCard } from "../components/ErrorCard";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -78,63 +80,74 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
               <p>Current spend, forecast, and admission enforcement</p>
             </div>
           </div>
-          <div className="budget-card-list">
-            {budgets.map((budget) => {
-              const spentPercent = percent(budget.spent, budget.limit);
-              const forecastPercent =
-                budget.forecast === undefined ? undefined : percent(budget.forecast, budget.limit);
-              return (
-                <article className="budget-card" key={budget.id}>
-                  <div className="budget-card-heading">
-                    <span className="budget-scope">{budget.scope}</span>
-                    <StatusBadge value={budget.enforcement} tone={budget.enforcement} dot={false} chip />
-                    <span title="Budget changes are available through the Eyvan API and SDK">
-                      <button
-                        className="icon-button icon-button-small"
-                        type="button"
-                        aria-label={`Editing ${budget.owner} budget is unavailable in the dashboard`}
-                        disabled
-                      >
-                        <Edit3 size={14} />
-                      </button>
-                    </span>
-                  </div>
-                  <div className="budget-owner">{budget.owner}</div>
-                  <div className="budget-amount-row">
-                    <strong>{formatMoney(budget.spent)}</strong>
-                    <span>of {formatMoney(budget.limit)}</span>
-                  </div>
-                  {/* The forecast is a tick above the bar, not a second fill:
-                      it has not been spent, and a filled track would say it
-                      has. */}
-                  <div className="dual-progress">
-                    <ProgressBar
-                      value={spentPercent}
-                      label={`${budget.owner} current budget usage`}
-                      tone={spentPercent > 90 ? "red" : spentPercent > 75 ? "amber" : "accent"}
-                    />
-                    {forecastPercent !== undefined && (
-                      <span
-                        className="forecast-marker"
-                        style={{ left: `${Math.min(forecastPercent, 100)}%` }}
-                        title={`Forecast ${forecastPercent}%`}
+          {budgets.length === 0 ? (
+            <section className="panel">
+              <EmptyState
+                title="No budgets configured for this scope"
+                detail="Define project or organization budgets via the Eyvan CLI or API to enforce spend limits."
+              />
+            </section>
+          ) : (
+            <div className="budget-card-list">
+              {budgets.map((budget) => {
+                const spentPercent = percent(budget.spent, budget.limit);
+                const forecastPercent =
+                  budget.forecast === undefined ? undefined : percent(budget.forecast, budget.limit);
+                return (
+                  <article className="budget-card" key={budget.id}>
+                    <div className="budget-card-heading">
+                      <span className="budget-scope">{budget.scope}</span>
+                      <StatusBadge value={budget.enforcement} tone={budget.enforcement} dot={false} chip />
+                      <span title="Budget changes are available through the Eyvan API and SDK">
+                        <button
+                          className="icon-button icon-button-small"
+                          type="button"
+                          aria-label={`Editing ${budget.owner} budget is unavailable in the dashboard`}
+                          disabled
+                        >
+                          <Edit3 size={14} />
+                        </button>
+                      </span>
+                    </div>
+                    <div className="budget-owner">{budget.owner}</div>
+                    <div className="budget-amount-row">
+                      <strong>{formatMoney(budget.spent)}</strong>
+                      <span>of {formatMoney(budget.limit)}</span>
+                    </div>
+                    {/* The forecast is a tick above the bar, not a second fill:
+                        it has not been spent, and a filled track would say it
+                        has. */}
+                    <div className="dual-progress">
+                      <ProgressBar
+                        value={spentPercent}
+                        label={`${budget.owner} current budget usage`}
+                        tone={spentPercent > 90 ? "red" : spentPercent > 75 ? "amber" : "accent"}
                       />
-                    )}
-                  </div>
-                  <div className="budget-card-footer">
-                    <span>{spentPercent}% spent</span>
-                    <span
-                      className={budget.forecast !== undefined && budget.forecast > budget.limit ? "text-critical" : ""}
-                    >
-                      {budget.forecast === undefined
-                        ? "forecast unavailable"
-                        : `forecast ${formatMoney(budget.forecast)}`}
-                    </span>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
+                      {forecastPercent !== undefined && (
+                        <span
+                          className="forecast-marker"
+                          style={{ left: `${Math.min(forecastPercent, 100)}%` }}
+                          title={`Forecast ${forecastPercent}%`}
+                        />
+                      )}
+                    </div>
+                    <div className="budget-card-footer">
+                      <span>{spentPercent}% spent</span>
+                      <span
+                        className={
+                          budget.forecast !== undefined && budget.forecast > budget.limit ? "text-critical" : ""
+                        }
+                      >
+                        {budget.forecast === undefined
+                          ? "forecast unavailable"
+                          : `forecast ${formatMoney(budget.forecast)}`}
+                      </span>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         <aside className="panel priority-policy-panel">
@@ -188,59 +201,70 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
           </div>
         </div>
         {mutationError && (
-          <div className="inline-error" role="alert">
-            <AlertTriangle size={16} />
-            {mutationError}
+          <div className="panel-alert-wrap">
+            <ErrorCard
+              compact
+              error={mutationError}
+              context={{ fallbackTitle: "Policy update failed" }}
+              onDismiss={() => setMutationError(null)}
+            />
           </div>
         )}
-        <div className="table-scroll">
-          <table className="data-table policies-table">
-            <thead>
-              <tr>
-                <th>Policy</th>
-                <th>Type</th>
-                <th>Scope</th>
-                <th>Behavior</th>
-                <th>Updated</th>
-                <th>Preemptible</th>
-              </tr>
-            </thead>
-            <tbody>
-              {policies.map((policy) => (
-                <tr key={policy.id}>
-                  <td>
-                    <span className="resource-cell">
-                      <strong>{policy.name}</strong>
-                      <small className="monospace">{policy.id}</small>
-                    </span>
-                  </td>
-                  <td>
-                    <StatusBadge value={policy.type} dot={false} />
-                  </td>
-                  <td>{policy.scope}</td>
-                  <td>{policy.summary}</td>
-                  <td>{formatDateTime(policy.updatedAt)}</td>
-                  <td>
-                    {canManageProject ? (
-                      <label className="switch-control">
-                        <input
-                          type="checkbox"
-                          checked={policy.preemptionEnabled}
-                          disabled={pendingPolicy === policy.id}
-                          onChange={() => void togglePolicy(policy)}
-                        />
-                        <span aria-hidden="true" />
-                        <span className="sr-only">Toggle {policy.name}</span>
-                      </label>
-                    ) : (
-                      <span className="muted">Read only</span>
-                    )}
-                  </td>
+        {policies.length === 0 ? (
+          <EmptyState
+            title="No scheduling policies configured"
+            detail="Default admission and placement rules apply until a project policy is created."
+          />
+        ) : (
+          <div className="table-scroll">
+            <table className="data-table policies-table">
+              <thead>
+                <tr>
+                  <th>Policy</th>
+                  <th>Type</th>
+                  <th>Scope</th>
+                  <th>Behavior</th>
+                  <th>Updated</th>
+                  <th>Preemptible</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {policies.map((policy) => (
+                  <tr key={policy.id}>
+                    <td>
+                      <span className="resource-cell">
+                        <strong>{policy.name}</strong>
+                        <small className="monospace">{policy.id}</small>
+                      </span>
+                    </td>
+                    <td>
+                      <StatusBadge value={policy.type} dot={false} />
+                    </td>
+                    <td>{policy.scope}</td>
+                    <td>{policy.summary}</td>
+                    <td>{formatDateTime(policy.updatedAt)}</td>
+                    <td>
+                      {canManageProject ? (
+                        <label className="switch-control">
+                          <input
+                            type="checkbox"
+                            checked={policy.preemptionEnabled}
+                            disabled={pendingPolicy === policy.id}
+                            onChange={() => void togglePolicy(policy)}
+                          />
+                          <span aria-hidden="true" />
+                          <span className="sr-only">Toggle {policy.name}</span>
+                        </label>
+                      ) : (
+                        <span className="muted">Read only</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
     </div>
   );

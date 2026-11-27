@@ -102,7 +102,7 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
   },
   settings: {
     title: "Settings",
-    description: "Assistant providers, team accounts, invites and personal API tokens",
+    description: "Storage, experiment tracking, assistant providers, team accounts, invites and personal API tokens",
   },
 };
 
@@ -284,7 +284,7 @@ export function Shell({
                     an empty section and an unread one are the same number and
                     opposite facts. */}
                   {count !== undefined && (
-                    <span className="nav-count rail-label" aria-hidden="true">
+                    <span className={`nav-count rail-label${count === 0 ? " nav-count-zero" : ""}`} aria-hidden="true">
                       {count}
                     </span>
                   )}
@@ -385,7 +385,9 @@ export function Shell({
             {detailId && (
               <>
                 <ChevronRight size={13} strokeWidth={1.7} aria-hidden="true" />
-                <span className="crumb-target">{detailId}</span>
+                <span className="crumb-target" title={detailId}>
+                  {detailId}
+                </span>
               </>
             )}
           </nav>

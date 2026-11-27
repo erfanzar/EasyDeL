@@ -193,7 +193,10 @@ export function RunMedia({
                 ))}
               </select>
             </label>
-            <span>Step {data?.step ?? "unknown"}</span>
+            <span>
+              Step {data?.step ?? "unknown"}
+              {data ? ` · ${data.rows.length.toLocaleString()} rows · ${data.columns.length} cols` : ""}
+            </span>
           </div>
           {table?.query !== tableQuery ? (
             <LoadingState label="Loading table" />

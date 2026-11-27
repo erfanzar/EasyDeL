@@ -8,7 +8,7 @@ import { type BlobLoader, useRunBlob } from "../components/BlobMedia";
 import { EmptyState } from "../components/EmptyState";
 import { LoadingState } from "../components/PageState";
 import { TrackingState } from "../components/TrackingState";
-import type { RunDetail, RunRollout, RunRolloutsOptions, RunRolloutsResponse } from "../types";
+import type { EpisodeKind, RunDetail, RunRollout, RunRolloutsOptions, RunRolloutsResponse } from "../types";
 
 export interface RolloutLoaders {
   loadRollouts: (id: string, options: RunRolloutsOptions, signal: AbortSignal) => Promise<RunRolloutsResponse>;
@@ -23,7 +23,7 @@ const fmt = (value: unknown) =>
     : value == null
       ? "unknown"
       : String(value);
-const LEFT = 70,
+const LEFT = 74,
   RIGHT = 12,
   ROW = 50;
 
@@ -45,13 +45,14 @@ function RolloutTracks({
     ]),
   ];
   const namesKey = names.join("\n");
+  const maxStep = Math.max(0, rollout.length - 1);
   useEffect(() => {
     const element = canvas.current;
     if (!element) return;
     const draw = () => {
-      const names = namesKey.split("\n").filter(Boolean);
+      const trackNames = namesKey.split("\n").filter(Boolean);
       const width = Math.max(220, element.parentElement?.clientWidth ?? 0),
-        height = Math.max(1, names.length) * ROW + 22;
+        height = Math.max(1, trackNames.length) * ROW + 22;
       const ratio = globalThis.devicePixelRatio || 1;
       element.width = Math.round(width * ratio);
       element.height = Math.round(height * ratio);
@@ -63,13 +64,14 @@ function RolloutTracks({
       ctx.clearRect(0, 0, width, height);
       const style = getComputedStyle(element),
         token = (name: string) => style.getPropertyValue(name).trim();
-      const plotWidth = width - LEFT - RIGHT,
+      const plotWidth = Math.max(1, width - LEFT - RIGHT),
+        safeLen = Math.max(1, rollout.length),
         sx = (step: number) => LEFT + (step / Math.max(1, rollout.length - 1)) * plotWidth;
       ctx.font = `10px ${token("--mono")}`;
-      names.forEach((name, row) => {
+      trackNames.forEach((name, row) => {
         const top = row * ROW;
         ctx.fillStyle = token("--text-soft");
-        ctx.fillText(name, 0, top + 26);
+        ctx.fillText(name, 0, top + 26, LEFT - 8);
         ctx.strokeStyle = token("--border");
         ctx.beginPath();
         ctx.moveTo(LEFT, top + ROW - 1);
@@ -79,20 +81,15 @@ function RolloutTracks({
           rollout.actions.forEach((action, step) => {
             if (action === null) return;
             ctx.fillStyle = token(COLORS[((action % COLORS.length) + COLORS.length) % COLORS.length]);
-            ctx.fillRect(
-              LEFT + (step / rollout.length) * plotWidth,
-              top + 12,
-              Math.max(0.6, plotWidth / rollout.length),
-              ROW - 24,
-            );
+            ctx.fillRect(LEFT + (step / safeLen) * plotWidth, top + 12, Math.max(0.6, plotWidth / safeLen), ROW - 24);
           });
           return;
         }
         const values = rollout.tracks[name] ?? [],
           finite = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+        if (!finite.length) return;
         const lo = name === "reward" ? Math.min(0, ...finite) : Math.min(...finite),
           hi = name === "reward" ? Math.max(0, ...finite) : Math.max(...finite);
-        if (!finite.length) return;
         // Scaling before subtraction avoids overflow; constants need no
         // artificial ±0.5 expansion (which rounds away at large magnitudes).
         const scale = Math.max(Math.abs(lo), Math.abs(hi)) || 1;
@@ -121,11 +118,11 @@ function RolloutTracks({
       ctx.strokeStyle = token("--amber");
       ctx.beginPath();
       ctx.moveTo(sx(position), 0);
-      ctx.lineTo(sx(position), names.length * ROW);
+      ctx.lineTo(sx(position), trackNames.length * ROW);
       ctx.stroke();
       ctx.fillStyle = token("--text-soft");
       ctx.fillText("0", LEFT, height - 4);
-      ctx.fillText(String(rollout.length - 1), width - RIGHT - 28, height - 4);
+      ctx.fillText(String(maxStep), width - RIGHT - 28, height - 4);
     };
     draw();
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(draw);
@@ -138,7 +135,7 @@ function RolloutTracks({
       theme.disconnect();
       globalThis.removeEventListener("resize", draw);
     };
-  }, [rollout, position, namesKey]);
+  }, [rollout, position, namesKey, maxStep]);
   return (
     <canvas
       ref={canvas}
@@ -149,7 +146,8 @@ function RolloutTracks({
       onClick={(event) => {
         const bounds = event.currentTarget.getBoundingClientRect();
         const width = bounds.width || event.currentTarget.clientWidth || 220;
-        seek(Math.round(((event.clientX - bounds.left - LEFT) / (width - LEFT - RIGHT)) * (rollout.length - 1)));
+        const plotWidth = Math.max(1, width - LEFT - RIGHT);
+        seek(Math.round(((event.clientX - bounds.left - LEFT) / plotWidth) * maxStep));
       }}
     />
   );
@@ -167,6 +165,7 @@ function RolloutPlayer({
   revision: number;
   onRetry: () => void;
 }) {
+  const maxStep = Math.max(0, rollout.length - 1);
   const [position, setPosition] = useState(0),
     [playing, setPlaying] = useState(false);
   const [playError, setPlayError] = useState(false);
@@ -188,7 +187,7 @@ function RolloutPlayer({
     });
   };
   const seek = (next: number) => {
-    const step = Math.max(0, Math.min(rollout.length - 1, next));
+    const step = Math.max(0, Math.min(maxStep, next));
     setPosition(step);
     const seconds = secondsPerStep(),
       target = step * seconds;
@@ -198,7 +197,7 @@ function RolloutPlayer({
     if (!playing || media?.url) return;
     const timer = globalThis.setTimeout(
       () => {
-        if (position >= rollout.length - 1) setPlaying(false);
+        if (position >= maxStep) setPlaying(false);
         else setPosition(position + 1);
       },
       rollout.fps != null && Number.isFinite(rollout.fps) && rollout.fps > 0
@@ -206,7 +205,7 @@ function RolloutPlayer({
         : 1000 / 30,
     );
     return () => globalThis.clearTimeout(timer);
-  }, [playing, position, media?.url, rollout.length, rollout.fps]);
+  }, [playing, position, media?.url, maxStep, rollout.fps]);
   const toggle = () => {
     if (rollout.video && rollout.video.available !== false && !media?.url) return;
     if (playing) {
@@ -214,11 +213,15 @@ function RolloutPlayer({
       setPlaying(false);
       return;
     }
-    if (position === rollout.length - 1) seek(0);
+    if (position === maxStep) seek(0);
     setPlayError(false);
     setPlaying(true);
     playVideo();
   };
+  const currentAction = rollout.actions ? rollout.actions[position] : null;
+  const currentActionLabel =
+    currentAction == null ? "unknown" : (rollout.action_names?.[currentAction] ?? `action ${currentAction}`);
+
   return (
     <section
       className="run-chart-cell rollout-player"
@@ -234,12 +237,12 @@ function RolloutPlayer({
     >
       <div className="chart-cell-heading">
         <span className="cell-index">r.02</span>
-        <h4>Per-step tracks · {rollout.episode_id}</h4>
+        <h4 title={rollout.episode_id}>Per-step tracks · {rollout.episode_id}</h4>
         <span>click to seek · space plays</span>
       </div>
       <div className="rollout-video">
         {!rollout.video || rollout.video.available === false ? (
-          <p className="run-panel-empty">Video not uploaded · no video in demo or this sampled trajectory.</p>
+          <p className="rollout-video-empty">Video not uploaded · no video in demo or this sampled trajectory.</p>
         ) : media?.error ? (
           <TrackingState
             error={media.error}
@@ -265,7 +268,7 @@ function RolloutPlayer({
             onTimeUpdate={() => {
               const seconds = secondsPerStep();
               if (video.current && seconds > 0)
-                setPosition(Math.max(0, Math.min(rollout.length - 1, Math.round(video.current.currentTime / seconds))));
+                setPosition(Math.max(0, Math.min(maxStep, Math.round(video.current.currentTime / seconds))));
             }}
           />
         ) : (
@@ -288,20 +291,20 @@ function RolloutPlayer({
           type="range"
           aria-label="Rollout step"
           min={0}
-          max={rollout.length - 1}
+          max={maxStep}
           value={position}
           onChange={(event) => seek(Number(event.target.value))}
         />
       </div>
       <div className="chart-readout">
         <output data-testid="rollout-position">
-          Step {position} / {rollout.length - 1}
+          Step {position} / {maxStep}
         </output>
         {rollout.actions && (
           <span>
             action{" "}
             <strong>
-              {rollout.action_names?.[rollout.actions[position] ?? -1] ?? "unknown"} · {fmt(rollout.actions[position])}
+              {currentActionLabel} · {fmt(currentAction)}
             </strong>
           </span>
         )}
@@ -311,16 +314,18 @@ function RolloutPlayer({
           </span>
         ))}
       </div>
-      <div className="action-legend" aria-label="Action legend">
-        {[...new Set(rollout.actions?.filter((action): action is number => action !== null) ?? [])]
-          .sort((a, b) => a - b)
-          .map((action) => (
-            <span key={action}>
-              <i style={{ background: color(action) }} />
-              {rollout.action_names?.[action] ?? `action ${action}`}
-            </span>
-          ))}
-      </div>
+      {rollout.actions && rollout.actions.some((action) => action !== null) && (
+        <div className="action-legend" aria-label="Action legend">
+          {[...new Set(rollout.actions.filter((action): action is number => action !== null))]
+            .sort((a, b) => a - b)
+            .map((action) => (
+              <span key={action}>
+                <i style={{ background: color(action) }} />
+                {rollout.action_names?.[action] ?? `action ${action}`}
+              </span>
+            ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -334,12 +339,13 @@ export function RunRollouts({
   onRetry,
 }: RolloutLoaders & { run: RunDetail; revision: number; onRetry: () => void }) {
   const [selected, setSelected] = useState("");
+  const [kind, setKind] = useState<"" | EpisodeKind>("");
   const [offset, setOffset] = useState(0);
   const [list, setList] = useState<{ query: string; data?: RunRolloutsResponse; error?: Error } | null>(null);
-  const query = JSON.stringify([run.run_id, offset]);
+  const query = JSON.stringify([run.run_id, kind, offset]);
   useEffect(() => {
     const controller = new AbortController();
-    loadRollouts(run.run_id, { limit: 50, offset }, controller.signal)
+    loadRollouts(run.run_id, { ...(kind ? { kind } : {}), limit: 50, offset }, controller.signal)
       .then((data) => {
         if (!controller.signal.aborted) setList({ query, data });
       })
@@ -348,7 +354,7 @@ export function RunRollouts({
           setList({ query, error: reason instanceof Error ? reason : new Error("Unable to load rollouts") });
       });
     return () => controller.abort();
-  }, [run.run_id, offset, query, loadRollouts, revision]);
+  }, [run.run_id, kind, offset, query, loadRollouts, revision]);
   const id =
     list?.query === query
       ? (list.data?.rollouts.find((item) => item.id === selected)?.id ?? list.data?.rollouts[0]?.id)
@@ -373,57 +379,112 @@ export function RunRollouts({
   }, [run.run_id, id, detailQuery, loadRollout, revision]);
   if (list?.query !== query) return <LoadingState label="Loading rollouts" />;
   if (list.error) return <TrackingState error={list.error} onRetry={onRetry} />;
-  if (!list.data?.total)
-    return <EmptyState title="No rollouts yet" detail="Log sampled trajectories with run.rollout()." />;
+  const total = list.data?.total ?? 0;
+  const pageStart = list.data?.rollouts.length ? offset + 1 : 0;
+  const pageEnd = offset + (list.data?.rollouts.length ?? 0);
+
   return (
     <div className="page-stack">
-      <div className="run-section-header">
-        <h3>r.0 · rollouts</h3>
-        <span>{list.data.total} sampled trajectories</span>
+      <div className="tracking-toolbar">
+        <label>
+          Kind{" "}
+          <select
+            aria-label="Rollout kind"
+            value={kind}
+            onChange={(event) => {
+              setKind(event.target.value as "" | EpisodeKind);
+              setSelected("");
+              setOffset(0);
+            }}
+          >
+            <option value="">All kinds</option>
+            <option value="train">train</option>
+            <option value="eval">eval</option>
+          </select>
+        </label>
+        <span>
+          {total.toLocaleString()} sampled {total === 1 ? "trajectory" : "trajectories"}
+        </span>
       </div>
-      <div className="rollout-layout">
-        <section className="run-chart-cell" aria-label="Sampled episodes">
-          <div className="chart-cell-heading">
-            <span className="cell-index">r.01</span>
-            <h4>Sampled episodes</h4>
+      {!total ? (
+        <EmptyState
+          title={kind ? `No ${kind} rollouts` : "No rollouts yet"}
+          detail={
+            kind
+              ? "Switch the kind filter back to All kinds to inspect other sampled trajectories."
+              : "Log sampled trajectories with run.rollout()."
+          }
+        />
+      ) : (
+        <>
+          <div className="run-section-header">
+            <h3>r.0 · rollouts</h3>
+            <span>
+              Showing {pageStart}–{pageEnd} of {total.toLocaleString()}
+            </span>
           </div>
-          <div className="tracking-item-list">
-            {list.data.rollouts.map((item) => (
-              <button type="button" key={item.id} aria-pressed={id === item.id} onClick={() => setSelected(item.id)}>
-                <span>{item.episode_id}</span>
-                <small>
-                  {item.kind} · actor {item.actor ?? "unknown"} · v{item.policy_version ?? "?"}
-                </small>
-                <span>
-                  return {fmt(item.ret)} · {item.length} steps
-                </span>
-              </button>
-            ))}
+          <div className="rollout-layout">
+            <section className="run-chart-cell rollout-sidebar" aria-label="Sampled episodes">
+              <div className="chart-cell-heading">
+                <span className="cell-index">r.01</span>
+                <h4>Sampled episodes</h4>
+              </div>
+              <div className="tracking-item-list rollout-item-list">
+                {list.data!.rollouts.map((item) => (
+                  <button
+                    type="button"
+                    key={item.id}
+                    aria-pressed={id === item.id}
+                    onClick={() => setSelected(item.id)}
+                  >
+                    <span className="rollout-item-id" title={item.episode_id}>
+                      {item.episode_id}
+                    </span>
+                    <small>
+                      {item.kind} · actor {item.actor ?? "unknown"} · v{item.policy_version ?? "?"}
+                    </small>
+                    <span>
+                      return {fmt(item.ret)} · {item.length} steps
+                    </span>
+                  </button>
+                ))}
+              </div>
+              <div className="tracking-toolbar rollout-pagination">
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  disabled={!offset}
+                  onClick={() => setOffset(Math.max(0, offset - 50))}
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  disabled={offset + 50 >= total}
+                  onClick={() => setOffset(offset + 50)}
+                >
+                  Next
+                </button>
+              </div>
+            </section>
+            {detail?.query !== detailQuery ? (
+              <LoadingState label="Loading rollout" />
+            ) : detail.error ? (
+              <TrackingState error={detail.error} onRetry={onRetry} />
+            ) : detail.data ? (
+              <RolloutPlayer
+                key={`${run.run_id}-${id}`}
+                runId={run.run_id}
+                rollout={detail.data}
+                loadBlob={loadBlob}
+                revision={revision}
+                onRetry={onRetry}
+              />
+            ) : null}
           </div>
-          <div className="tracking-toolbar">
-            <button type="button" disabled={!offset} onClick={() => setOffset(Math.max(0, offset - 50))}>
-              Previous
-            </button>
-            <button type="button" disabled={offset + 50 >= list.data.total} onClick={() => setOffset(offset + 50)}>
-              Next
-            </button>
-          </div>
-        </section>
-        {detail?.query !== detailQuery ? (
-          <LoadingState label="Loading rollout" />
-        ) : detail.error ? (
-          <TrackingState error={detail.error} onRetry={onRetry} />
-        ) : detail.data ? (
-          <RolloutPlayer
-            key={`${run.run_id}-${id}`}
-            runId={run.run_id}
-            rollout={detail.data}
-            loadBlob={loadBlob}
-            revision={revision}
-            onRetry={onRetry}
-          />
-        ) : null}
-      </div>
+        </>
+      )}
     </div>
   );
 }

@@ -21,6 +21,8 @@ import {
   type AuthIdentity,
   type AuthScope,
 } from "./auth/oidc";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ErrorCard } from "./components/ErrorCard";
 import { ErrorState, LoadingState } from "./components/PageState";
 import { Shell } from "./components/Shell";
 import { SubmitWorkloadModal } from "./components/SubmitWorkloadModal";
@@ -1000,7 +1002,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
   );
   const loadQuota = useCallback(
-    (signal: AbortSignal, options?: { refresh?: boolean }) =>
+    (signal: AbortSignal, options?: { refresh?: boolean; project?: string }) =>
       withAuthorityRefresh(() => client.getTpuQuota(fleetScope, signal, options)),
     [client, fleetScope.orgId, fleetScope.projectId, withAuthorityRefresh],
   );
@@ -1110,6 +1112,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
   const loadCapacityEvents = useCallback(
     (signal: AbortSignal) => withAuthorityRefresh(() => client.listCapacityEvents(200, signal)),
     [client, withAuthorityRefresh],
+  );
+  const loadGovernanceSummary = useCallback(
+    (signal: AbortSignal) =>
+      typeof client.getGovernanceSummary === "function" ? client.getGovernanceSummary(signal) : Promise.resolve(null),
+    [client],
   );
   const followedWorkloadId = selectedWorkload?.id;
   const followWorkloadLogs = useCallback(
@@ -1293,6 +1300,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             // is fleet-wide and answering it to a project reader would be a
             // cross-tenant read wearing a chart.
             loadCapacityEvents={capabilities.manageFleet ? loadCapacityEvents : undefined}
+            onNotify={(message) => setToast({ message })}
           />
         );
         break;
@@ -1323,6 +1331,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             defaultOrg={selectedScope?.orgId ?? configuredScope().orgId}
             defaultProject={selectedScope?.projectId ?? configuredScope().projectId}
             onProvidersChanged={bumpAssistantProviders}
+            onNotify={(message) => setToast({ message })}
           />
         );
         break;
@@ -1332,6 +1341,12 @@ export default function App({ client = apiClient, identityProvider = currentIden
             overview={data.overview}
             workloads={data.workloads}
             auditEvents={data.auditEvents}
+            loadGovernanceSummary={
+              capabilities.manageFleet && typeof client.getGovernanceSummary === "function"
+                ? loadGovernanceSummary
+                : undefined
+            }
+            refreshRevision={auxiliaryRefreshRevision}
             onOpenWorkload={openWorkload}
             onShowWorkloads={() => goToSection("workloads")}
             onShowAudit={sectionAvailability.audit === false ? undefined : () => goToSection("audit")}
@@ -1393,10 +1408,18 @@ export default function App({ client = apiClient, identityProvider = currentIden
         {/* A scope commit remounts page-local filters, pending controls, and panels. */}
         <Fragment key={selectedScopeIdentity}>
           {refreshWarning && (
-            <div className="inline-warning" role="status">
-              <AlertTriangle size={16} aria-hidden="true" />
-              <span>{refreshWarning}</span>
-            </div>
+            <ErrorCard
+              compact
+              tone="warning"
+              role="status"
+              title="Live refresh delayed"
+              summary={refreshWarning}
+              error={refreshWarning}
+              className="app-refresh-warning"
+              actions={[{ label: "Retry", onClick: () => void refreshDashboard(desiredScopeRef.current) }]}
+              onDismiss={() => setRefreshWarning(null)}
+              onCopied={(message) => setToast({ message })}
+            />
           )}
           {submissionAcknowledgement && (
             <div className="submission-acknowledgement" role="status" aria-live="polite">
@@ -1417,7 +1440,13 @@ export default function App({ client = apiClient, identityProvider = currentIden
               </button>
             </div>
           )}
-          {content}
+          <ErrorBoundary
+            resetKey={`${selectedScopeIdentity}:${JSON.stringify(activeRoute)}`}
+            onGoHome={() => goToSection("overview")}
+            onReload={() => void refreshDashboard(desiredScopeRef.current)}
+          >
+            {content}
+          </ErrorBoundary>
         </Fragment>
       </Shell>
       {submitInteraction &&

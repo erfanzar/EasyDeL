@@ -3,7 +3,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, LoaderCircle, RefreshCw } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
+
+import { ErrorCard } from "./ErrorCard";
 
 interface LoadingStateProps {
   /** What is being waited on. Defaults to the control plane's own state. */
@@ -28,19 +30,22 @@ export function LoadingState({ label = "Loading control-plane state", detail }: 
 
 interface ErrorStateProps {
   message: string;
+  error?: Error;
+  title?: string;
   onRetry: () => void;
+  onCopied?: (label: string) => void;
 }
 
-export function ErrorState({ message, onRetry }: ErrorStateProps) {
+export function ErrorState({ message, error, title, onRetry, onCopied }: ErrorStateProps) {
   return (
-    <div className="page-state page-state-error" role="alert">
-      <AlertTriangle size={22} aria-hidden="true" />
-      <strong>Unable to load Eyvan state</strong>
-      <span>{message}</span>
-      <button className="button button-secondary" type="button" onClick={onRetry}>
-        <RefreshCw size={16} aria-hidden="true" />
-        Retry
-      </button>
+    <div className="page-state-card">
+      <ErrorCard
+        error={error ?? message}
+        title={title}
+        context={{ fallbackTitle: "Unable to load Eyvan state" }}
+        actions={[{ label: "Retry", onClick: onRetry, variant: "secondary" }]}
+        onCopied={onCopied}
+      />
     </div>
   );
 }

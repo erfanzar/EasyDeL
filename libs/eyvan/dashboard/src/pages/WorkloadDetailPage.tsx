@@ -23,7 +23,9 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { ErrorCard } from "../components/ErrorCard";
 import { ProgressBar } from "../components/ProgressBar";
+import { ReclaimBanner, reclaimPolicyLabel } from "../components/ReclaimBanner";
 import { StatusBadge } from "../components/StatusBadge";
 import { pipelineCaption, StagePipeline, type PipelineVariant } from "../components/StagePipeline";
 import { formatAcceleratorRequest, formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
@@ -86,8 +88,8 @@ interface WorkloadDetailPageProps {
 function SpendPanel({ spend, error }: { spend: WorkloadSpend | null; error: string | null }) {
   if (error) {
     return (
-      <div className="resource-row-detail">
-        <span>{error}</span>
+      <div className="panel-alert-wrap">
+        <ErrorCard compact error={error} context={{ fallbackTitle: "Unable to total this run" }} />
       </div>
     );
   }
@@ -358,12 +360,20 @@ export function WorkloadDetailPage({
   }, [filteredLogs, following]);
 
   const copyCommand = async () => {
-    await navigator.clipboard.writeText(workload.command);
-    setCopied(true);
-    globalThis.setTimeout(() => setCopied(false), 1800);
+    try {
+      await navigator.clipboard?.writeText(workload.command);
+      setCopied(true);
+      globalThis.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Clipboard may be unavailable in restricted contexts.
+    }
   };
 
   const waitingBadly = workload.status === "failed" || workload.status === "preempting";
+  const hasActiveReclaim = Boolean(workload.reclaimDeadlineAt && !TERMINAL_STATUSES.has(workload.status));
+  const reclaimRole: "victim" | "waiting" =
+    workload.status === "queued" || workload.status === "planning" ? "waiting" : "victim";
+  const policyText = reclaimPolicyLabel(workload.reclaimPolicy);
 
   return (
     <div className="page-stack">
@@ -423,12 +433,23 @@ export function WorkloadDetailPage({
         )}
       </div>
 
+      {hasActiveReclaim && workload.reclaimDeadlineAt && (
+        <ReclaimBanner
+          deadlineAt={workload.reclaimDeadlineAt}
+          requestedBy={workload.reclaimRequestedBy}
+          policy={workload.reclaimPolicy}
+          role={reclaimRole}
+          reason={workload.queueReason}
+          graceSeconds={workload.checkpointGraceSeconds}
+        />
+      )}
+
       {/* Why this job is not running, said once at the top. The age beside it
           is what turns a reason into a problem: waiting on capacity is normal,
           waiting on it since yesterday is not. */}
       {/* A settled record keeps the scheduling_reason it queued with; showing
           it here said a finished job was still waiting, with a spinner. */}
-      {workload.queueReason && !TERMINAL_STATUSES.has(workload.status) && (
+      {workload.queueReason && !TERMINAL_STATUSES.has(workload.status) && !hasActiveReclaim && (
         <div className={`detail-wait-banner${waitingBadly ? " detail-wait-banner-bad" : ""}`} role="status">
           {waitingBadly ? (
             <AlertTriangle size={15} aria-hidden="true" />
@@ -579,8 +600,8 @@ export function WorkloadDetailPage({
                 </div>
               </div>
               {explainError && (
-                <div className="resource-row-detail">
-                  <span>{explainError}</span>
+                <div className="panel-alert-wrap">
+                  <ErrorCard compact error={explainError} context={{ fallbackTitle: "Unable to explain placement" }} />
                 </div>
               )}
               {!explainError && !explanation && (
@@ -672,30 +693,34 @@ export function WorkloadDetailPage({
                 <p>Committed hosts and failure domains</p>
               </div>
             </div>
-            <div className="allocation-grid">
-              {workload.allocation.map((allocation) => (
-                <div className="allocation-item" key={allocation.host}>
-                  <span className={`allocation-state allocation-${allocation.state}`} aria-hidden="true" />
-                  <span>
-                    <strong>{allocation.host}</strong>
-                    <small>
-                      {allocation.rack} · {allocation.resource}
-                    </small>
-                    <StatusBadge
-                      value={allocation.state}
-                      tone={
-                        allocation.state === "ready"
-                          ? "healthy"
-                          : allocation.state === "starting"
-                            ? "activating"
-                            : "revoking"
-                      }
-                      dot={false}
-                    />
-                  </span>
-                </div>
-              ))}
-            </div>
+            {workload.allocation.length === 0 ? (
+              <p className="panel-note">No hosts currently allocated.</p>
+            ) : (
+              <div className="allocation-grid">
+                {workload.allocation.map((allocation) => (
+                  <div className="allocation-item" key={allocation.host}>
+                    <span className={`allocation-state allocation-${allocation.state}`} aria-hidden="true" />
+                    <span>
+                      <strong>{allocation.host}</strong>
+                      <small>
+                        {allocation.rack} · {allocation.resource}
+                      </small>
+                      <StatusBadge
+                        value={allocation.state}
+                        tone={
+                          allocation.state === "ready"
+                            ? "healthy"
+                            : allocation.state === "starting"
+                              ? "activating"
+                              : "revoking"
+                        }
+                        dot={false}
+                      />
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
 
           <section className="panel runtime-section">
@@ -739,6 +764,12 @@ export function WorkloadDetailPage({
                 <dt>Capacity lost</dt>
                 <dd>{workload.capacityLossCount ?? "Unknown"}</dd>
               </div>
+              {policyText && (
+                <div>
+                  <dt>Reclaim policy</dt>
+                  <dd>{policyText}</dd>
+                </div>
+              )}
               {workload.failureReason ? (
                 <div>
                   <dt>Failure</dt>
@@ -748,11 +779,15 @@ export function WorkloadDetailPage({
               <div>
                 <dt>Labels</dt>
                 <dd>
-                  {Object.entries(workload.labels).map(([key, value]) => (
-                    <span className="label-chip" key={key}>
-                      {key}={value}
-                    </span>
-                  ))}
+                  {Object.keys(workload.labels).length === 0 ? (
+                    <span className="muted">None</span>
+                  ) : (
+                    Object.entries(workload.labels).map(([key, value]) => (
+                      <span className="label-chip" key={key}>
+                        {key}={value}
+                      </span>
+                    ))
+                  )}
                 </dd>
               </div>
             </dl>
@@ -873,9 +908,8 @@ export function WorkloadDetailPage({
             )}
           </div>
           {followError && (
-            <div className="log-notice log-notice-error">
-              <AlertTriangle size={14} aria-hidden="true" />
-              {followError}
+            <div className="panel-alert-wrap">
+              <ErrorCard compact error={followError} context={{ fallbackTitle: "Log stream interrupted" }} />
             </div>
           )}
           {attemptNotice && (

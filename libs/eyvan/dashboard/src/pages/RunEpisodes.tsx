@@ -31,11 +31,15 @@ export interface EpisodeLoaders {
     signal: AbortSignal,
   ) => Promise<EpisodeBreakdownResponse>;
 }
+
+const EPISODES_PAGE_SIZE = 50;
+
 const fmt = (value: number | null | undefined, digits = 1) =>
   value == null || !Number.isFinite(value)
     ? "unknown"
     : value.toLocaleString(undefined, { maximumFractionDigits: digits });
 const percent = (value: number | null) => (value === null ? "unknown" : `${fmt(value * 100)}%`);
+
 function median(values: number[]) {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -86,7 +90,8 @@ export function RunEpisodes({
   const [env, setEnv] = useState("");
   const [x, setX] = useState("step");
   const [includeReplayed, setIncludeReplayed] = useState(false);
-  const query = JSON.stringify([run.run_id, kind, env, x, includeReplayed]);
+  const [offset, setOffset] = useState(0);
+  const query = JSON.stringify([run.run_id, kind, env, x, includeReplayed, offset]);
   const [result, setResult] = useState<{
     query: string;
     data?: {
@@ -98,6 +103,7 @@ export function RunEpisodes({
     };
     error?: Error;
   } | null>(null);
+
   useEffect(() => {
     const controller = new AbortController();
     const options = { kind, x, points: 200, ...(env ? { env } : {}) };
@@ -105,7 +111,17 @@ export function RunEpisodes({
       loadEpisodeCurve(run.run_id, { ...options, metric: "return" }, controller.signal),
       loadEpisodeCurve(run.run_id, { ...options, metric: "length" }, controller.signal),
       loadEpisodeBreakdown(run.run_id, { kind, last: 200 }, controller.signal),
-      loadEpisodes(run.run_id, { kind, ...(env ? { env } : {}), limit: 50, includeReplayed }, controller.signal),
+      loadEpisodes(
+        run.run_id,
+        {
+          kind,
+          ...(env ? { env } : {}),
+          limit: EPISODES_PAGE_SIZE,
+          ...(offset > 0 ? { offset } : {}),
+          includeReplayed,
+        },
+        controller.signal,
+      ),
       // Breakdown has step/time but no custom axes. Only plot actual logged
       // axis values, never infer env_steps from a workload-specific ratio.
       x !== "step" && x !== "time" && !env
@@ -127,28 +143,44 @@ export function RunEpisodes({
     env,
     x,
     includeReplayed,
+    offset,
     query,
     loadEpisodes,
     loadEpisodeCurve,
     loadEpisodeBreakdown,
     revision,
   ]);
+
   const filters = (
     <div className="tracking-toolbar">
       <label>
         Kind{" "}
-        <select aria-label="Episode kind" value={kind} onChange={(event) => setKind(event.target.value as EpisodeKind)}>
+        <select
+          aria-label="Episode kind"
+          value={kind}
+          onChange={(event) => {
+            setKind(event.target.value as EpisodeKind);
+            setOffset(0);
+          }}
+        >
           <option value="train">train</option>
           <option value="eval">eval</option>
         </select>
       </label>
       <label>
         Environment{" "}
-        <select aria-label="Episode environment" value={env} onChange={(event) => setEnv(event.target.value)}>
+        <select
+          aria-label="Episode environment"
+          value={env}
+          onChange={(event) => {
+            setEnv(event.target.value);
+            setOffset(0);
+          }}
+        >
           <option value="">All environments</option>
-          {run.envs?.map((env) => (
-            <option key={env} value={env}>
-              {env}
+          {run.envs?.map((envName) => (
+            <option key={envName} value={envName}>
+              {envName}
             </option>
           ))}
         </select>
@@ -166,6 +198,7 @@ export function RunEpisodes({
       <span>Train actors · eval workers · percentile bands</span>
     </div>
   );
+
   if (result?.query !== query)
     return (
       <>
@@ -180,15 +213,14 @@ export function RunEpisodes({
         <TrackingState error={result.error} onRetry={onRetry} />
       </>
     );
+
   const data = result.data!;
   const { breakdown, returns, lengths } = data;
   const replayed = Math.max(returns.replayed_excluded, lengths.replayed_excluded, breakdown.replayed_excluded);
-  const actorMedian = median(
-    breakdown.actors.flatMap((actor) => (actor.mean_return === null ? [] : [actor.mean_return])),
-  );
   const actorValues = breakdown.actors.flatMap((actor) => (actor.mean_return === null ? [] : [actor.mean_return]));
-  const low = actorValues.length ? Math.min(...actorValues) : null,
-    high = actorValues.length ? Math.max(...actorValues) : null;
+  const actorMedian = median(actorValues);
+  const low = actorValues.length ? Math.min(...actorValues) : null;
+  const high = actorValues.length ? Math.max(...actorValues) : null;
   const outlier = (value: number | null) =>
     value !== null && actorMedian !== null && value < actorMedian - Math.max(3, Math.abs(actorMedian) * 0.25);
   const dots: Array<[number, number]> = env
@@ -209,7 +241,13 @@ export function RunEpisodes({
           : [];
       });
   const list = data.list.episodes.filter((episode) => includeReplayed || !episode.replayed);
+  const visibleRows = list.slice(0, EPISODES_PAGE_SIZE);
+  const hasExtraColumn = visibleRows.some((episode) => episode.extra && Object.keys(episode.extra).length > 0);
   const histogramKey = run.hist_keys?.find((key) => key.includes("advantage"));
+  const maxLagCount = Math.max(1, ...breakdown.lag.counts);
+  const pageStart = visibleRows.length ? offset + 1 : 0;
+  const pageEnd = offset + visibleRows.length;
+
   return (
     <div className="page-stack">
       {filters}
@@ -259,7 +297,7 @@ export function RunEpisodes({
             </article>
             <article className="run-chart-cell" aria-label="Actors">
               <div className="chart-cell-heading">
-                <span className="cell-index">e.05</span>
+                <span className="cell-index">e.02</span>
                 <h4>Actors · last 200 episodes each</h4>
                 <span>colour = return</span>
               </div>
@@ -285,8 +323,12 @@ export function RunEpisodes({
                         className={`actor-tile${warning ? " actor-outlier" : ""}`}
                         style={{ background: `color-mix(in srgb, var(--amber) ${intensity}%, transparent)` }}
                       >
-                        {actor.actor ?? "?"}
-                        {warning && <span aria-hidden="true">!</span>}
+                        <span className="actor-tile-label">{actor.actor ?? "?"}</span>
+                        {warning && (
+                          <span className="actor-tile-flag" aria-hidden="true">
+                            !
+                          </span>
+                        )}
                       </div>
                     );
                   })}
@@ -305,18 +347,18 @@ export function RunEpisodes({
             </article>
             <article className="run-chart-cell">
               <div className="chart-cell-heading">
-                <span className="cell-index">e.02</span>
+                <span className="cell-index">e.03</span>
                 <h4>episode/length</h4>
-                <span>frames</span>
+                <span>steps / turns</span>
               </div>
               <EpisodeChart curve={lengths} />
             </article>
             {histogramKey && loadHistograms && (
               <article className="run-chart-cell">
                 <div className="chart-cell-heading">
-                  <span className="cell-index">e.03</span>
+                  <span className="cell-index">e.04</span>
                   <h4>{histogramKey} · histogram over time</h4>
-                  <span>pre-norm</span>
+                  <span>distribution</span>
                 </div>
                 <RunHistogram
                   runId={run.run_id}
@@ -330,7 +372,7 @@ export function RunEpisodes({
             )}
             <article className="run-chart-cell">
               <div className="chart-cell-heading">
-                <span className="cell-index">e.04</span>
+                <span className="cell-index">e.05</span>
                 <h4>Actor lag</h4>
                 <span>learner − policy version</span>
               </div>
@@ -351,7 +393,7 @@ export function RunEpisodes({
                         <i
                           data-testid="lag-bar"
                           className={i >= 4 ? "lag-warning" : ""}
-                          style={{ height: `${(count / Math.max(1, ...breakdown.lag.counts)) * 110}px` }}
+                          style={{ height: `${count > 0 ? Math.max(2, (count / maxLagCount) * 110) : 0}px` }}
                         />
                         <span>{i}</span>
                       </div>
@@ -398,10 +440,10 @@ export function RunEpisodes({
                           className={evaluation.best ? "eval-best" : undefined}
                         >
                           <td>{evaluation.checkpoint ?? "unlabelled"}</td>
-                          <td>{fmt(evaluation.step, 0)}</td>
-                          <td>{fmt(evaluation.policy_version, 0)}</td>
-                          <td>{evaluation.count}</td>
-                          <td>
+                          <td className="numeric">{fmt(evaluation.step, 0)}</td>
+                          <td className="numeric">{fmt(evaluation.policy_version, 0)}</td>
+                          <td className="numeric">{evaluation.count}</td>
+                          <td className="numeric">
                             {fmt(evaluation.mean_return)}{" "}
                             <span className="unknown-value">± {fmt(evaluation.std_return)}</span>
                           </td>
@@ -409,13 +451,17 @@ export function RunEpisodes({
                             <div className="eval-success">
                               {evaluation.success_rate !== null && (
                                 <span className="eval-progress">
-                                  <i style={{ width: `${evaluation.success_rate * 100}%` }} />
+                                  <i
+                                    style={{
+                                      width: `${Math.max(0, Math.min(100, evaluation.success_rate * 100))}%`,
+                                    }}
+                                  />
                                 </span>
                               )}
                               {percent(evaluation.success_rate)}
                             </div>
                           </td>
-                          <td>{fmt(evaluation.mean_length, 0)}</td>
+                          <td className="numeric">{fmt(evaluation.mean_length, 0)}</td>
                           <td>{evaluation.best && <span className="eval-star">★ best</span>}</td>
                         </tr>
                       ))}
@@ -436,12 +482,15 @@ export function RunEpisodes({
             <input
               type="checkbox"
               checked={includeReplayed}
-              onChange={(event) => setIncludeReplayed(event.target.checked)}
+              onChange={(event) => {
+                setIncludeReplayed(event.target.checked);
+                setOffset(0);
+              }}
             />
             Include replayed episodes
           </label>
         </div>
-        {list.length ? (
+        {visibleRows.length ? (
           <div className="table-scroll">
             <table className="data-table">
               <thead>
@@ -455,25 +504,41 @@ export function RunEpisodes({
                   <th>Success</th>
                   <th>Attempt / rank</th>
                   <th>Replay</th>
+                  {hasExtraColumn && <th>Details</th>}
                 </tr>
               </thead>
               <tbody>
-                {list.slice(0, 50).map((episode, i) => (
+                {visibleRows.map((episode, i) => (
                   <tr
                     key={`${episode.attempt}-${episode.rank}-${episode.t}-${i}`}
                     className={episode.replayed ? "episode-replayed" : undefined}
                   >
-                    <td>{fmt(episode.step, 0)}</td>
+                    <td className="numeric">{fmt(episode.step, 0)}</td>
                     <td>{episode.kind}</td>
                     <td>{episode.actor ?? "unknown"}</td>
                     <td>{episode.env ?? "unknown"}</td>
-                    <td>{typeof episode.ret === "number" ? fmt(episode.ret) : episode.ret}</td>
-                    <td>{fmt(episode.length, 0)}</td>
+                    <td className="numeric">{typeof episode.ret === "number" ? fmt(episode.ret) : episode.ret}</td>
+                    <td className="numeric">{fmt(episode.length, 0)}</td>
                     <td>{episode.success === null ? "unknown" : episode.success ? "yes" : "no"}</td>
                     <td>
                       a.{episode.attempt} / r.{episode.rank}
                     </td>
                     <td>{episode.replayed ? "replayed" : "—"}</td>
+                    {hasExtraColumn && (
+                      <td>
+                        <div className="reward-pills">
+                          {Object.entries(episode.extra ?? {}).length ? (
+                            Object.entries(episode.extra).map(([extraKey, extraVal]) => (
+                              <span key={extraKey} className="run-tag">
+                                {extraKey} {typeof extraVal === "number" ? fmt(extraVal, 3) : String(extraVal)}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -482,10 +547,34 @@ export function RunEpisodes({
         ) : (
           <p className="run-panel-empty">No episodes for these filters.</p>
         )}
-        <p className="episode-note episode-list-count">
-          Latest {Math.min(50, list.length)} of {data.list.total.toLocaleString()} ·{" "}
-          {includeReplayed ? "including replayed" : "replayed rows hidden"}
-        </p>
+        <div className="episode-list-footer">
+          <p className="episode-note episode-list-count">
+            {visibleRows.length
+              ? `Showing ${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} of ${data.list.total.toLocaleString()}`
+              : `0 of ${data.list.total.toLocaleString()}`}{" "}
+            · {includeReplayed ? "including replayed" : "replayed rows hidden"}
+          </p>
+          {data.list.total > EPISODES_PAGE_SIZE && (
+            <div className="pagination-controls">
+              <button
+                type="button"
+                className="button button-secondary"
+                disabled={offset === 0}
+                onClick={() => setOffset(Math.max(0, offset - EPISODES_PAGE_SIZE))}
+              >
+                Previous episodes
+              </button>
+              <button
+                type="button"
+                className="button button-secondary"
+                disabled={offset + EPISODES_PAGE_SIZE >= data.list.total}
+                onClick={() => setOffset(offset + EPISODES_PAGE_SIZE)}
+              >
+                Next episodes
+              </button>
+            </div>
+          )}
+        </div>
       </section>
     </div>
   );

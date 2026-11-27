@@ -4,23 +4,49 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertTriangle, ArrowRight, CircleX, Layers3 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
 import { MetricCard } from "../components/MetricCard";
 import { EmptyState } from "../components/EmptyState";
 import { ProgressBar } from "../components/ProgressBar";
+import { ReclaimBadge } from "../components/ReclaimBanner";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatMoney, formatRelativeTime, percent } from "../lib/format";
-import type { AuditEvent, OverviewData, WorkloadSummary } from "../types";
+import type {
+  ActiveReclaim,
+  AuditEvent,
+  GovernanceSummary,
+  OverviewData,
+  ReclaimPolicy,
+  WorkloadSummary,
+} from "../types";
 
 interface OverviewPageProps {
   overview: OverviewData;
   workloads: WorkloadSummary[];
   /** The decision history, newest first. Empty when the ledger is out of scope. */
   auditEvents?: AuditEvent[];
+  /** Optional active reclaims supplied directly (e.g. from governance summary). */
+  activeReclaims?: ActiveReclaim[];
+  /** Optional 404-safe loader for fleet-wide governance active reclaims (fleet admins only). */
+  loadGovernanceSummary?: (signal: AbortSignal) => Promise<GovernanceSummary | null>;
+  refreshRevision?: number;
   onOpenWorkload: (id: string) => void;
   onShowWorkloads: () => void;
   onShowAudit?: () => void;
   fleetAvailable: boolean;
+}
+
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+interface OverviewReclaimEntry {
+  workloadId: string;
+  label: string;
+  owner: string;
+  requestedBy?: string | null;
+  deadlineAt: string;
+  policy?: ReclaimPolicy | null;
+  role: "victim" | "waiting";
 }
 
 /** How long the queue's oldest wait has been, said the way somebody says it. */
@@ -34,11 +60,72 @@ export function OverviewPage({
   overview,
   workloads,
   auditEvents = [],
+  activeReclaims,
+  loadGovernanceSummary,
+  refreshRevision = 0,
   onOpenWorkload,
   onShowWorkloads,
   onShowAudit,
   fleetAvailable,
 }: OverviewPageProps) {
+  const [governanceReclaims, setGovernanceReclaims] = useState<ActiveReclaim[]>([]);
+
+  useEffect(() => {
+    if (!loadGovernanceSummary) {
+      setGovernanceReclaims([]);
+      return;
+    }
+    const controller = new AbortController();
+    loadGovernanceSummary(controller.signal)
+      .then((summary) => {
+        if (!controller.signal.aborted) {
+          setGovernanceReclaims(summary?.active_reclaims ?? []);
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setGovernanceReclaims([]);
+      });
+    return () => controller.abort();
+  }, [loadGovernanceSummary, refreshRevision]);
+
+  const mergedReclaims = useMemo<OverviewReclaimEntry[]>(() => {
+    const byId = new Map<string, OverviewReclaimEntry>();
+    for (const workload of workloads) {
+      if (!workload.reclaimDeadlineAt || TERMINAL_STATUSES.has(workload.status)) continue;
+      byId.set(workload.id, {
+        workloadId: workload.id,
+        label: workload.name,
+        owner: workload.user,
+        requestedBy: workload.reclaimRequestedBy ?? null,
+        deadlineAt: workload.reclaimDeadlineAt,
+        policy: workload.reclaimPolicy ?? null,
+        role: workload.status === "queued" || workload.status === "planning" ? "waiting" : "victim",
+      });
+    }
+    for (const item of [...(activeReclaims ?? []), ...governanceReclaims]) {
+      if (!item.deadline_at) continue;
+      const existing = byId.get(item.workload_id);
+      if (existing) {
+        byId.set(item.workload_id, {
+          ...existing,
+          requestedBy: existing.requestedBy ?? item.requested_by ?? null,
+          policy: existing.policy ?? item.policy ?? null,
+        });
+      } else {
+        byId.set(item.workload_id, {
+          workloadId: item.workload_id,
+          label: item.workload_id,
+          owner: item.owner,
+          requestedBy: item.requested_by ?? null,
+          deadlineAt: item.deadline_at,
+          policy: item.policy ?? null,
+          role: item.state === "pending" || item.state === "admitted" ? "waiting" : "victim",
+        });
+      }
+    }
+    return [...byId.values()].sort((left, right) => Date.parse(left.deadlineAt) - Date.parse(right.deadlineAt));
+  }, [activeReclaims, governanceReclaims, workloads]);
+
   const activeWorkloads = workloads
     .filter((workload) => ["running", "provisioning", "checkpointing"].includes(workload.status))
     .slice(0, 5);
@@ -97,6 +184,50 @@ export function OverviewPage({
           tone="positive"
         />
       </section>
+
+      {mergedReclaims.length > 0 && (
+        <section className="panel data-panel" aria-label="Active reclaims">
+          <div className="panel-header">
+            <div>
+              <h2>Active reclaims</h2>
+              <p>Graceful checkpoint countdowns returning borrowed capacity to guaranteed owners</p>
+            </div>
+            <span className="alert-count">{mergedReclaims.length}</span>
+          </div>
+          <div className="reclaim-strip-list">
+            {mergedReclaims.map((item) => (
+              <button
+                type="button"
+                className="reclaim-overview-row"
+                key={item.workloadId}
+                onClick={() => onOpenWorkload(item.workloadId)}
+              >
+                <span className="reclaim-strip-identity">
+                  <strong>{item.label}</strong>
+                  <small>
+                    <span className="monospace">{item.workloadId}</span> · owner{" "}
+                    <span className="monospace">{item.owner}</span>
+                    {item.requestedBy ? (
+                      <>
+                        {" "}
+                        · requested by <span className="monospace">{item.requestedBy}</span>
+                      </>
+                    ) : null}
+                  </small>
+                </span>
+                <ReclaimBadge
+                  deadlineAt={item.deadlineAt}
+                  requestedBy={item.requestedBy}
+                  policy={item.policy}
+                  role={item.role}
+                  showPolicy
+                />
+                <ArrowRight size={15} aria-hidden="true" />
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="overview-primary-grid">
         {/* What the plane decided, newest first. It is the first thing an

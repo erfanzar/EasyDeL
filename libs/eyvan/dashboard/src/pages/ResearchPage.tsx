@@ -7,6 +7,7 @@ import { ArrowLeft } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
+import { ErrorCard } from "../components/ErrorCard";
 import { ErrorState, LoadingState } from "../components/PageState";
 import { ProgressBar } from "../components/ProgressBar";
 import {
@@ -83,9 +84,15 @@ export function ResearchPage({ loadPlans, onOpenPlan, refreshRevision = 0 }: Res
         <span>{anyActive ? `Refresh · ${ACTIVE_PLAN_REFRESH_MS / 1000}s while active` : "Refresh · on change"}</span>
       </div>
       {error && (
-        <div className="inline-warning" role="alert">
-          <span>Refresh failed; showing the last reading. {error.message}</span>
-        </div>
+        <ErrorCard
+          compact
+          tone="warning"
+          role="alert"
+          title="Refresh failed"
+          summary={`Refresh failed; showing the last reading. ${error.message}`}
+          error={error}
+          actions={[{ label: "Retry", onClick: () => setRevision((value) => value + 1) }]}
+        />
       )}
       <section className="panel data-panel">
         <div className="panel-header">
@@ -273,9 +280,15 @@ export function ResearchPlanPage({
         {active && <span>Refresh · {ACTIVE_PLAN_REFRESH_MS / 1000}s</span>}
       </div>
       {error && (
-        <div className="inline-warning" role="alert">
-          <span>Refresh failed; showing the last reading. {error.message}</span>
-        </div>
+        <ErrorCard
+          compact
+          tone="warning"
+          role="alert"
+          title="Refresh failed"
+          summary={`Refresh failed; showing the last reading. ${error.message}`}
+          error={error}
+          actions={[{ label: "Retry", onClick: () => setRevision((value) => value + 1) }]}
+        />
       )}
       <section className="run-heading research-heading">
         <div>
