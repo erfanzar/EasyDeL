@@ -404,4 +404,106 @@ describe("CLI-to-Dashboard Gap Closers", () => {
     fireEvent.click(await within(tenancyRegion).findByRole("button", { name: "Revoke project_operator from carol" }));
     await waitFor(() => expect(revokeRoleGrant).toHaveBeenCalled());
   });
+
+  it("retains global fleet_admin (org_id: null) role grants across reload while filtering unrelated orgs", async () => {
+    const listRoleGrants = vi.fn(async () => [
+      {
+        subject: "superadmin",
+        grant: { role: "fleet_admin", org_id: null, project_id: null },
+        reason: "platform operator",
+      },
+      {
+        subject: "alice",
+        grant: { role: "org_admin", org_id: "acme", project_id: null },
+        reason: "org lead",
+      },
+      {
+        subject: "outsider",
+        grant: { role: "project_operator", org_id: "other-org", project_id: "other-proj" },
+        reason: "different org",
+      },
+    ]);
+
+    render(
+      <SettingsPage
+        client={{
+          ...emptyTeamAndAssistantClient(),
+          listRoleGrants,
+          issueRoleGrant: vi.fn(),
+          revokeRoleGrant: vi.fn(),
+        }}
+        teamMode={false}
+        canManageFleet
+        defaultOrg="acme"
+        defaultProject="research"
+      />,
+    );
+
+    const tenancyRegion = await screen.findByRole("region", { name: "Projects and role grants" });
+    await waitFor(() => expect(listRoleGrants).toHaveBeenCalledWith({}, expect.any(AbortSignal)));
+
+    expect(await within(tenancyRegion).findByText("superadmin")).toBeDefined();
+    expect(within(tenancyRegion).getByText("global")).toBeDefined();
+    expect(within(tenancyRegion).getByText("alice")).toBeDefined();
+    expect(within(tenancyRegion).getByText("acme/*")).toBeDefined();
+    expect(within(tenancyRegion).queryByText("outsider")).toBeNull();
+  });
+
+  it("validates PolicyFormModal max_priority <= 1000 client-side and manages modal-open / Escape cleanly", () => {
+    const onPolicyUpdate = vi.fn(async (policy: SchedulingPolicy) => policy);
+    render(
+      <BudgetsPage
+        budgets={[]}
+        policies={[]}
+        orgId="acme"
+        projectId="research"
+        onPolicyToggle={async (policy) => policy}
+        onPolicyUpdate={onPolicyUpdate}
+        canManageProject
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Configure policy" }));
+    const dialog = screen.getByRole("dialog", { name: "Configure project scheduling policy" });
+    expect(document.body.classList.contains("modal-open")).toBe(true);
+
+    const maxPriorityInput = within(dialog).getByLabelText("Max priority") as HTMLInputElement;
+    expect(maxPriorityInput.max).toBe("1000");
+    fireEvent.change(maxPriorityInput, { target: { value: "1500" } });
+    fireEvent.submit(dialog.querySelector("form")!);
+
+    expect(within(dialog).getByRole("alert").textContent).toContain("between 0 and 1000");
+    expect(onPolicyUpdate).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Configure project scheduling policy" })).toBeNull();
+    expect(document.body.classList.contains("modal-open")).toBe(false);
+  });
+
+  it("applies extended timeout budgets to checkStorageRegion (15s), compareRuns (30s), and getExperimentLeaderboard (30s)", async () => {
+    const observedTimeouts: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      if (typeof timeout === "number") observedTimeouts.push(timeout);
+      return realSetTimeout(handler, timeout, ...args);
+    }) as typeof globalThis.setTimeout);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () => new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } }),
+      ),
+    );
+
+    const client = new EyvanApiClient("/api/v1", false, { orgId: "acme", projectId: "research" });
+    await client.checkStorageRegion({ uri: "gs://bucket/path", region: "us-central2" });
+    await client.compareRuns({ runIds: ["r1", "r2"] });
+    await client.getExperimentLeaderboard("exp-1");
+
+    expect(observedTimeouts).toEqual([15_000, 30_000, 30_000]);
+  });
 });

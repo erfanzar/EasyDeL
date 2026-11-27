@@ -129,13 +129,19 @@ export function GovernanceSettingsCard({ client, defaultOrg, defaultProject, onN
   }, [client, defaultOrg, revision]);
 
   useEffect(() => {
+    setGrantProject(defaultProject);
+  }, [defaultProject]);
+
+  useEffect(() => {
     if (!client.listRoleGrants) return;
     const controller = new AbortController();
     setGrantsError(null);
     client
-      .listRoleGrants({ orgId: defaultOrg }, controller.signal)
+      .listRoleGrants({}, controller.signal)
       .then((items) => {
-        if (!controller.signal.aborted) setGrants(items);
+        if (!controller.signal.aborted) {
+          setGrants(items.filter((item) => item.grant.org_id === null || item.grant.org_id === defaultOrg));
+        }
       })
       .catch((err: unknown) => {
         if (!controller.signal.aborted) {

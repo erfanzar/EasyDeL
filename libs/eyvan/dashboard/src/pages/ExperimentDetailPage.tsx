@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ArrowLeft, Edit3, FlaskConical, GitCompareArrows, RefreshCw, Star, Trash2, Trophy } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorCard } from "../components/ErrorCard";
@@ -57,7 +57,7 @@ export function ExperimentDetailPage({
   refreshRevision = 0,
 }: ExperimentDetailPageProps) {
   const [board, setBoard] = useState<ExperimentLeaderboardResponse | null>(null);
-  const [error, setError] = useState<Error | null>(null);
+  const [error, setError] = useState<{ experimentId: string; error: Error } | null>(null);
   const [revision, setRevision] = useState(0);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [editing, setEditing] = useState(false);
@@ -67,6 +67,17 @@ export function ExperimentDetailPage({
   const [pinningId, setPinningId] = useState<string | null>(null);
   const [visBusy, setVisBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const experimentIdRef = useRef(experimentId);
+  experimentIdRef.current = experimentId;
+
+  useEffect(() => {
+    setSelectedIds([]);
+    setEditing(false);
+    setConfirmDelete(false);
+    setDeleteError(null);
+    setPinningId(null);
+    setActionError(null);
+  }, [experimentId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -79,21 +90,26 @@ export function ExperimentDetailPage({
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) {
-          setError(reason instanceof Error ? reason : new Error("Unable to load experiment leaderboard"));
+          setError({
+            experimentId,
+            error: reason instanceof Error ? reason : new Error("Unable to load experiment leaderboard"),
+          });
         }
       });
     return () => controller.abort();
   }, [experimentId, loadLeaderboard, refreshRevision, revision]);
 
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const activeBoard = board?.experiment.id === experimentId ? board : null;
+  const activeError = error?.experimentId === experimentId ? error.error : null;
 
-  if (error && !board) {
+  if (activeError && !activeBoard) {
     return (
       <div className="page-stack">
         <section className="panel">
           <div className="panel-alert-wrap">
             <ErrorCard
-              error={error}
+              error={activeError}
               context={{ fallbackTitle: "Unable to load experiment" }}
               actions={[
                 { label: "Back to experiments", onClick: onBack },
@@ -106,58 +122,70 @@ export function ExperimentDetailPage({
     );
   }
 
-  if (!board) return <LoadingState label="Loading experiment leaderboard" />;
+  if (!activeBoard) return <LoadingState label="Loading experiment leaderboard" />;
 
-  const { experiment } = board;
+  const { experiment } = activeBoard;
   const canEdit = Boolean(canAdminister || !currentSubject || experiment.owner === currentSubject);
-  const goalOp = board.goal === "min" ? "≤" : "≥";
-  const topCompareIds = board.entries.slice(0, 4).map((e) => e.run_id);
+  const goalOp = activeBoard.goal === "min" ? "≤" : "≥";
+  const topCompareIds = activeBoard.entries.slice(0, 4).map((e) => e.run_id);
 
   const toggleSelect = (runId: string) => {
     setSelectedIds((prev) => (prev.includes(runId) ? prev.filter((id) => id !== runId) : [...prev, runId]));
   };
 
   const pinBaseline = async (runId: string) => {
+    const targetExpId = experiment.id;
     setPinningId(runId);
     setActionError(null);
     try {
-      const nextBaseline = board.baseline_run_id === runId ? null : runId;
-      await onUpdateExperiment(experiment.id, { pinned_baseline_run_id: nextBaseline });
+      const nextBaseline = activeBoard.baseline_run_id === runId ? null : runId;
+      await onUpdateExperiment(targetExpId, { pinned_baseline_run_id: nextBaseline });
+      if (experimentIdRef.current !== targetExpId) return;
       onNotify?.(nextBaseline ? `Pinned ${runId} as experiment baseline` : "Cleared pinned baseline");
       setRevision((v) => v + 1);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Unable to update baseline");
+      if (experimentIdRef.current === targetExpId) {
+        setActionError(err instanceof Error ? err.message : "Unable to update baseline");
+      }
     } finally {
-      setPinningId(null);
+      if (experimentIdRef.current === targetExpId) setPinningId(null);
     }
   };
 
   const changeVisibility = async (visibility: RunVisibility) => {
+    const targetExpId = experiment.id;
     setVisBusy(true);
     setActionError(null);
     try {
-      const updated = await onUpdateExperiment(experiment.id, { visibility });
-      setBoard((prev) => (prev ? { ...prev, experiment: updated } : prev));
+      const updated = await onUpdateExperiment(targetExpId, { visibility });
+      if (experimentIdRef.current !== targetExpId) return;
+      setBoard((prev) => (prev && prev.experiment.id === targetExpId ? { ...prev, experiment: updated } : prev));
       onNotify?.(`Experiment visibility set to ${updated.visibility}`);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Unable to update visibility");
+      if (experimentIdRef.current === targetExpId) {
+        setActionError(err instanceof Error ? err.message : "Unable to update visibility");
+      }
     } finally {
-      setVisBusy(false);
+      if (experimentIdRef.current === targetExpId) setVisBusy(false);
     }
   };
 
   const handleDelete = async () => {
+    const targetExpId = experiment.id;
     setDeleting(true);
     setDeleteError(null);
     try {
-      await onDeleteExperiment(experiment.id);
+      await onDeleteExperiment(targetExpId);
+      if (experimentIdRef.current !== targetExpId) return;
       setConfirmDelete(false);
       onNotify?.(`Deleted ${experiment.name}`);
       onBack();
     } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : "Unable to delete experiment");
+      if (experimentIdRef.current === targetExpId) {
+        setDeleteError(err instanceof Error ? err.message : "Unable to delete experiment");
+      }
     } finally {
-      setDeleting(false);
+      if (experimentIdRef.current === targetExpId) setDeleting(false);
     }
   };
 
@@ -166,13 +194,13 @@ export function ExperimentDetailPage({
       <div className="tracking-meta">
         <span>{experiment.kind === "speedrun" ? "Speedrun" : "Experiment"}</span>
         <span>{experiment.id}</span>
-        {board.metric_key && (
+        {activeBoard.metric_key && (
           <span>
-            Metric · {board.metric_key} ({board.goal}
-            {board.target_value !== null ? ` ${goalOp} ${board.target_value}` : ""})
+            Metric · {activeBoard.metric_key} ({activeBoard.goal}
+            {activeBoard.target_value !== null ? ` ${goalOp} ${activeBoard.target_value}` : ""})
           </span>
         )}
-        <span>{board.entries.length} runs</span>
+        <span>{activeBoard.entries.length} runs</span>
         <button
           type="button"
           className="tracking-meta-action"
@@ -213,10 +241,10 @@ export function ExperimentDetailPage({
                   Group filter <code className="monospace">{experiment.group_filter}</code>
                 </span>
               )}
-              {board.baseline_run_id && (
+              {activeBoard.baseline_run_id && (
                 <span>
-                  Baseline <code className="monospace">{board.baseline_run_id}</code>
-                  {board.baseline_value !== null ? ` (${formatChartValue(board.baseline_value)})` : ""}
+                  Baseline <code className="monospace">{activeBoard.baseline_run_id}</code>
+                  {activeBoard.baseline_value !== null ? ` (${formatChartValue(activeBoard.baseline_value)})` : ""}
                 </span>
               )}
             </div>
@@ -276,7 +304,7 @@ export function ExperimentDetailPage({
         )}
       </section>
 
-      {!board.tracker_available && (
+      {!activeBoard.tracker_available && (
         <ErrorCard
           compact
           tone="warning"
@@ -288,13 +316,13 @@ export function ExperimentDetailPage({
         />
       )}
 
-      {board.researcher_breakdown.length > 0 && (
+      {activeBoard.researcher_breakdown.length > 0 && (
         <section className="panel exp-researchers-strip" aria-label="Researcher breakdown">
           <div className="storage-subhead">
-            <span>Researcher breakdown ({board.researcher_breakdown.length})</span>
+            <span>Researcher breakdown ({activeBoard.researcher_breakdown.length})</span>
           </div>
           <div className="exp-researcher-grid">
-            {board.researcher_breakdown.map((item) => (
+            {activeBoard.researcher_breakdown.map((item) => (
               <div key={item.owner} className="exp-researcher-card">
                 <div className="exp-researcher-card-head">
                   <span className="collab-owner-pill">{item.owner}</span>
@@ -307,7 +335,7 @@ export function ExperimentDetailPage({
                   <span>
                     Best <strong className="monospace">{formatChartValue(item.best_value)}</strong>
                   </span>
-                  {board.target_value !== null && (
+                  {activeBoard.target_value !== null && (
                     <span>
                       <strong>{item.reached_target_count}</strong> hit target
                     </span>
@@ -324,8 +352,8 @@ export function ExperimentDetailPage({
           <div>
             <h2>{experiment.kind === "speedrun" ? "Speedrun leaderboard" : "Experiment runs"}</h2>
             <p>
-              {board.metric_key
-                ? `Ranked by ${board.target_value !== null ? `time to reach ${board.metric_key} ${goalOp} ${board.target_value}, then ` : ""}${board.goal}(${board.metric_key})`
+              {activeBoard.metric_key
+                ? `Ranked by ${activeBoard.target_value !== null ? `time to reach ${activeBoard.metric_key} ${goalOp} ${activeBoard.target_value}, then ` : ""}${activeBoard.goal}(${activeBoard.metric_key})`
                 : "Matched runs sorted by recency"}
             </p>
           </div>
@@ -337,7 +365,7 @@ export function ExperimentDetailPage({
           )}
         </div>
 
-        {board.entries.length ? (
+        {activeBoard.entries.length ? (
           <div className="table-scroll">
             <table className="data-table leaderboard-table">
               <thead>
@@ -358,14 +386,15 @@ export function ExperimentDetailPage({
                 </tr>
               </thead>
               <tbody>
-                {board.entries.map((entry) => {
-                  const isBaseline = Boolean(entry.is_baseline || entry.run_id === board.baseline_run_id);
+                {activeBoard.entries.map((entry) => {
+                  const isBaseline = Boolean(entry.is_baseline || entry.run_id === activeBoard.baseline_run_id);
                   const delta = entry.delta_vs_baseline;
-                  const deltaImproved = delta !== null && delta !== 0 && (board.goal === "min" ? delta < 0 : delta > 0);
+                  const deltaImproved =
+                    delta !== null && delta !== 0 && (activeBoard.goal === "min" ? delta < 0 : delta > 0);
                   const deltaRegressed =
-                    delta !== null && delta !== 0 && (board.goal === "min" ? delta > 0 : delta < 0);
+                    delta !== null && delta !== 0 && (activeBoard.goal === "min" ? delta > 0 : delta < 0);
                   const targetCell =
-                    board.target_value === null ? (
+                    activeBoard.target_value === null ? (
                       <span className="muted">—</span>
                     ) : entry.reached_target ? (
                       <span className="leaderboard-target-hit">
@@ -474,7 +503,7 @@ export function ExperimentDetailPage({
         onDeleteNote={onDeleteNote}
         currentSubject={currentSubject}
         canAdminister={canAdminister}
-        availableMetrics={board.metric_key ? [board.metric_key] : []}
+        availableMetrics={activeBoard.metric_key ? [activeBoard.metric_key] : []}
         refreshRevision={refreshRevision + revision}
       />
 
@@ -483,8 +512,10 @@ export function ExperimentDetailPage({
         initial={experiment}
         onClose={() => setEditing(false)}
         onSubmit={async (input) => {
-          const updated = await onUpdateExperiment(experiment.id, input);
-          setBoard((prev) => (prev ? { ...prev, experiment: updated } : prev));
+          const targetExpId = experiment.id;
+          const updated = await onUpdateExperiment(targetExpId, input);
+          if (experimentIdRef.current !== targetExpId) return;
+          setBoard((prev) => (prev && prev.experiment.id === targetExpId ? { ...prev, experiment: updated } : prev));
           setRevision((v) => v + 1);
           onNotify?.(`Updated ${updated.name}`);
         }}

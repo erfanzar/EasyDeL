@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertCircle, Edit3, Plus, Shield, ShieldAlert, X } from "lucide-react";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { ErrorCard } from "../components/ErrorCard";
@@ -13,6 +13,7 @@ import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { crossRegionPolicyLabel, normalizeCrossRegionTransferPolicy } from "../lib/crossRegionPolicy";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
+import { useModalAccessibility } from "../lib/useModalAccessibility";
 import type { Budget, BudgetPutInput, CrossRegionTransferPolicy, PolicyUpdatePatch, SchedulingPolicy } from "../types";
 
 interface BudgetsPageProps {
@@ -79,25 +80,28 @@ function BudgetFormModal({ open, orgId, projectId, initial, onClose, onSave }: B
   const [hourLimits, setHourLimits] = useState(formatHourLimits(initial?.acceleratorHourLimits));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useModalAccessibility(open, onClose, busy);
+  const wasOpenRef = useRef(false);
+  const lastInitialIdRef = useRef<string | null>(null);
+  const initialId = initial?.id ?? null;
 
   useEffect(() => {
-    if (!open) return;
+    const justOpened = open && !wasOpenRef.current;
+    const targetChanged = open && lastInitialIdRef.current !== initialId;
+    wasOpenRef.current = open;
+    if (!open) {
+      lastInitialIdRef.current = null;
+      return;
+    }
+    if (!justOpened && !targetChanged) return;
+    lastInitialIdRef.current = initialId;
     setLimit(initial ? String(initial.limit) : "10000");
     setPeriod(initial && ["monthly", "weekly", "daily"].includes(initial.period) ? initial.period : "monthly");
     setHardLimit(initial ? initial.enforcement === "hard" : true);
     setThresholds(initial?.alertThresholds?.length ? initial.alertThresholds.join(", ") : "0.5, 0.8, 0.95");
     setHourLimits(formatHourLimits(initial?.acceleratorHourLimits));
     setError(null);
-  }, [open, initial]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
-    };
-    globalThis.addEventListener("keydown", onKeyDown);
-    return () => globalThis.removeEventListener("keydown", onKeyDown);
-  }, [open, busy, onClose]);
+  }, [open, initialId, initial]);
 
   if (!open) return null;
 
@@ -151,7 +155,13 @@ function BudgetFormModal({ open, orgId, projectId, initial, onClose, onSave }: B
         disabled={busy}
         onClick={onClose}
       />
-      <div className="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="budget-modal-title">
+      <div
+        className="modal modal-narrow"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="budget-modal-title"
+        ref={dialogRef}
+      >
         <div className="modal-header">
           <div>
             <h2 id="budget-modal-title">{initial ? `Edit budget (${initial.owner})` : "Configure project budget"}</h2>
@@ -270,9 +280,21 @@ function PolicyFormModal({ open, orgId, projectId, initial, onClose, onSave }: P
   const [allowMultiregion, setAllowMultiregion] = useState(initial?.crossRegionAllowMultiregion ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useModalAccessibility(open, onClose, busy);
+  const wasOpenRef = useRef(false);
+  const lastInitialIdRef = useRef<string | null>(null);
+  const initialId = initial?.id ?? null;
 
   useEffect(() => {
-    if (!open) return;
+    const justOpened = open && !wasOpenRef.current;
+    const targetChanged = open && lastInitialIdRef.current !== initialId;
+    wasOpenRef.current = open;
+    if (!open) {
+      lastInitialIdRef.current = null;
+      return;
+    }
+    if (!justOpened && !targetChanged) return;
+    lastInitialIdRef.current = initialId;
     const c = initial?.configuration;
     setAllowedRegions((c?.allowedRegions ?? []).join(", "));
     setAllowedProviders((c?.allowedProviders ?? []).join(", "));
@@ -284,24 +306,16 @@ function PolicyFormModal({ open, orgId, projectId, initial, onClose, onSave }: P
     setAllowedBuckets((initial?.crossRegionAllowedBuckets ?? []).join(", "));
     setAllowMultiregion(initial?.crossRegionAllowMultiregion ?? true);
     setError(null);
-  }, [open, initial]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
-    };
-    globalThis.addEventListener("keydown", onKeyDown);
-    return () => globalThis.removeEventListener("keydown", onKeyDown);
-  }, [open, busy, onClose]);
+  }, [open, initialId, initial]);
 
   if (!open) return null;
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    const parsedPriority = Number.parseInt(maxPriority, 10);
-    if (!Number.isFinite(parsedPriority) || parsedPriority < 0) {
-      setError("Max priority must be a non-negative integer.");
+    const trimmedPriority = maxPriority.trim();
+    const parsedPriority = Number(trimmedPriority);
+    if (!trimmedPriority || !Number.isInteger(parsedPriority) || parsedPriority < 0 || parsedPriority > 1000) {
+      setError("Max priority must be an integer between 0 and 1000.");
       return;
     }
     const target: SchedulingPolicy = initial ?? {
@@ -355,7 +369,7 @@ function PolicyFormModal({ open, orgId, projectId, initial, onClose, onSave }: P
         disabled={busy}
         onClick={onClose}
       />
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="policy-modal-title">
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="policy-modal-title" ref={dialogRef}>
         <div className="modal-header">
           <div>
             <h2 id="policy-modal-title">{initial ? `Edit ${initial.name}` : "Configure project scheduling policy"}</h2>
@@ -434,6 +448,7 @@ function PolicyFormModal({ open, orgId, projectId, initial, onClose, onSave }: P
                 <input
                   type="number"
                   min={0}
+                  max={1000}
                   required
                   value={maxPriority}
                   disabled={busy}

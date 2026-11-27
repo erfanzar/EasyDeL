@@ -360,4 +360,249 @@ describe("Collaborative Runs, Experiments & Speedruns Hub", () => {
     fireEvent.click(within(bar).getByRole("button", { name: "Compare with…" }));
     expect(onCompareWith).toHaveBeenCalledWith([run.run_id]);
   });
+
+  it("filters unowned runs when clicking the 'unassigned' researcher chip and keeps researcher select in sync", async () => {
+    const ownedRun = { ...mockRuns[0], run_id: "run-owned", name: "owned-run", owner: "alice" };
+    const unownedRunA = { ...mockRuns[1], run_id: "run-anon-1", name: "anon-run-1", owner: null };
+    const unownedRunB = { ...mockRuns[2], run_id: "run-anon-2", name: "anon-run-2", owner: undefined };
+    const feed = {
+      ...getMockCollaborationFeed(),
+      active_runs: [],
+      researchers: [
+        { owner: "alice", total_runs: 1, running_runs: 0, shared_runs: 0, last_active_at: 1792630000 },
+        { owner: "unassigned", total_runs: 2, running_runs: 0, shared_runs: 0, last_active_at: 1792629000 },
+      ],
+    };
+
+    render(
+      <RunsPage
+        loadRuns={async () => [ownedRun, unownedRunA, unownedRunB]}
+        loadFeed={async () => feed}
+        onOpenRun={() => {}}
+        currentSubject="alice"
+      />,
+    );
+
+    const strip = await screen.findByRole("region", { name: "Live team activity" });
+    const researcherSelect = screen.getByRole("combobox", { name: "Filter by researcher" }) as HTMLSelectElement;
+    expect(Array.from(researcherSelect.options).map((opt) => opt.value)).toContain("unassigned");
+
+    // Clicking "unassigned" chip shows both unowned runs and syncs the select dropdown.
+    fireEvent.click(within(strip).getByRole("button", { name: /unassigned/i }));
+    expect(researcherSelect.value).toBe("unassigned");
+    expect(screen.getByRole("button", { name: "anon-run-1" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "anon-run-2" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "owned-run" })).toBeNull();
+
+    // Clicking again clears the filter back to all runs.
+    fireEvent.click(within(strip).getByRole("button", { name: /unassigned/i }));
+    expect(researcherSelect.value).toBe("all");
+    expect(screen.getByRole("button", { name: "owned-run" })).toBeDefined();
+  });
+
+  it("preserves dirty 'Shared with' input across RunDetailPage polling and hides it when switching to team/private", async () => {
+    const baseRun = {
+      ...getMockRun("pong-seed-3")!,
+      status: "running" as const,
+      visibility: "shared" as const,
+      shared_with: ["bob"],
+    };
+    let fetchCount = 0;
+    const loadRun = vi.fn(async () => {
+      fetchCount += 1;
+      return {
+        ...baseRun,
+        last_step: (baseRun.last_step ?? 100) + fetchCount * 10,
+        shared_with: ["bob"],
+      };
+    });
+    const onUpdateRunSharing = vi.fn(
+      async (_runId, patch): Promise<RunCollaborationOverlay> => ({
+        org_id: "acme",
+        project_id: "research",
+        run_id: baseRun.run_id,
+        owner: "alice",
+        visibility: patch.visibility ?? "shared",
+        shared_with: patch.shared_with ?? ["bob"],
+        experiment_id: baseRun.experiment_id ?? null,
+        pinned: Boolean(baseRun.pinned),
+        updated_at: "2026-07-10T10:05:00Z",
+        updated_by: "alice",
+      }),
+    );
+
+    const { rerender } = render(
+      <RunDetailPage
+        runId={baseRun.run_id}
+        loadRun={loadRun}
+        loadSeries={async () => ({ run_id: baseRun.run_id, x: "step", series: [] })}
+        onBack={() => {}}
+        onOpenWorkload={() => {}}
+        currentSubject="alice"
+        onUpdateRunSharing={onUpdateRunSharing}
+        refreshRevision={0}
+      />,
+    );
+
+    const bar = await screen.findByRole("region", { name: "Run collaboration and sharing" });
+    const sharedInput = within(bar).getByRole("textbox", { name: "Shared with subjects" }) as HTMLInputElement;
+    expect(sharedInput.value).toBe("bob");
+
+    // User edits the input mid-session without saving yet.
+    fireEvent.change(sharedInput, { target: { value: "bob, carol, dave" } });
+    expect(sharedInput.value).toBe("bob, carol, dave");
+
+    // Background poll arrives with server's older shared_with list; unsaved edits must survive.
+    rerender(
+      <RunDetailPage
+        runId={baseRun.run_id}
+        loadRun={loadRun}
+        loadSeries={async () => ({ run_id: baseRun.run_id, x: "step", series: [] })}
+        onBack={() => {}}
+        onOpenWorkload={() => {}}
+        currentSubject="alice"
+        onUpdateRunSharing={onUpdateRunSharing}
+        refreshRevision={1}
+      />,
+    );
+    await waitFor(() => expect(loadRun).toHaveBeenCalledTimes(2));
+    expect((within(bar).getByRole("textbox", { name: "Shared with subjects" }) as HTMLInputElement).value).toBe(
+      "bob, carol, dave",
+    );
+
+    // Switching visibility to team hides the Shared with row cleanly even when shared_with is non-empty.
+    fireEvent.change(within(bar).getByRole("combobox", { name: "Run visibility" }), { target: { value: "team" } });
+    await waitFor(() => expect(onUpdateRunSharing).toHaveBeenCalledWith(baseRun.run_id, { visibility: "team" }));
+    expect(within(bar).queryByRole("textbox", { name: "Shared with subjects" })).toBeNull();
+  });
+
+  it("preserves unsaved edits in ExperimentFormModal when parent refreshes with a new initial object identity", async () => {
+    const baseBoard = sampleLeaderboard();
+    const loadLeaderboard = vi.fn(async () => ({
+      ...baseBoard,
+      experiment: { ...baseBoard.experiment },
+    }));
+    const onUpdateExperiment = vi.fn(async (_id, patch) => ({ ...baseBoard.experiment, ...patch }));
+
+    const { rerender } = render(
+      <ExperimentDetailPage
+        experimentId={baseBoard.experiment.id}
+        loadLeaderboard={loadLeaderboard}
+        onUpdateExperiment={onUpdateExperiment}
+        onDeleteExperiment={async () => undefined}
+        loadNotes={async () => []}
+        onCreateNote={async () => mockNotes[0]}
+        onDeleteNote={async () => undefined}
+        onBack={() => {}}
+        onOpenRun={() => {}}
+        onCompareRuns={() => {}}
+        currentSubject="alice"
+        refreshRevision={0}
+      />,
+    );
+
+    await screen.findByRole("table");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit experiment" });
+    expect(document.body.classList.contains("modal-open")).toBe(true);
+
+    const nameInput = within(dialog).getByLabelText("Name") as HTMLInputElement;
+    const descInput = within(dialog).getByLabelText("Description") as HTMLTextAreaElement;
+    fireEvent.change(nameInput, { target: { value: "Edited NanoGPT Speedrun" } });
+    fireEvent.change(descInput, { target: { value: "Unsaved draft notes" } });
+
+    // Trigger a parent background poll that produces a fresh board.experiment object identity.
+    rerender(
+      <ExperimentDetailPage
+        experimentId={baseBoard.experiment.id}
+        loadLeaderboard={loadLeaderboard}
+        onUpdateExperiment={onUpdateExperiment}
+        onDeleteExperiment={async () => undefined}
+        loadNotes={async () => []}
+        onCreateNote={async () => mockNotes[0]}
+        onDeleteNote={async () => undefined}
+        onBack={() => {}}
+        onOpenRun={() => {}}
+        onCompareRuns={() => {}}
+        currentSubject="alice"
+        refreshRevision={1}
+      />,
+    );
+
+    await waitFor(() => expect(loadLeaderboard).toHaveBeenCalledTimes(2));
+    expect((within(dialog).getByLabelText("Name") as HTMLInputElement).value).toBe("Edited NanoGPT Speedrun");
+    expect((within(dialog).getByLabelText("Description") as HTMLTextAreaElement).value).toBe("Unsaved draft notes");
+
+    // Escape closes the dialog and cleans up modal-open scroll lock.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Edit experiment" })).toBeNull();
+    expect(document.body.classList.contains("modal-open")).toBe(false);
+  });
+
+  it("clears stale experiment and notes state when ExperimentDetailPage experimentId changes without remount", async () => {
+    const boardA = sampleLeaderboard();
+    const boardB: ExperimentLeaderboardResponse = {
+      ...sampleLeaderboard(),
+      experiment: {
+        ...boardA.experiment,
+        id: "exp-other",
+        name: "Other Experiment",
+      },
+      entries: [],
+      researcher_breakdown: [],
+    };
+    const loadLeaderboard = vi.fn(async (id: string) => (id === boardA.experiment.id ? boardA : boardB));
+    const loadNotes = vi.fn(async (_type: "run" | "experiment", id: string) =>
+      id === boardA.experiment.id
+        ? [{ ...mockNotes[0], id: "note-a", target_type: "experiment" as const, target_id: id, body: "Note for A" }]
+        : [{ ...mockNotes[0], id: "note-b", target_type: "experiment" as const, target_id: id, body: "Note for B" }],
+    );
+
+    const { rerender } = render(
+      <ExperimentDetailPage
+        experimentId={boardA.experiment.id}
+        loadLeaderboard={loadLeaderboard}
+        onUpdateExperiment={async () => boardA.experiment}
+        onDeleteExperiment={async () => undefined}
+        loadNotes={loadNotes}
+        onCreateNote={async () => mockNotes[0]}
+        onDeleteNote={async () => undefined}
+        onBack={() => {}}
+        onOpenRun={() => {}}
+        onCompareRuns={() => {}}
+        currentSubject="alice"
+      />,
+    );
+
+    expect(await screen.findByText("Note for A")).toBeDefined();
+    const notesRegion = screen.getByRole("region", { name: "Team notes" });
+    fireEvent.change(within(notesRegion).getByLabelText("Add team note"), { target: { value: "Unsent draft on A" } });
+
+    rerender(
+      <ExperimentDetailPage
+        experimentId={boardB.experiment.id}
+        loadLeaderboard={loadLeaderboard}
+        onUpdateExperiment={async () => boardB.experiment}
+        onDeleteExperiment={async () => undefined}
+        loadNotes={loadNotes}
+        onCreateNote={async () => mockNotes[0]}
+        onDeleteNote={async () => undefined}
+        onBack={() => {}}
+        onOpenRun={() => {}}
+        onCompareRuns={() => {}}
+        currentSubject="alice"
+      />,
+    );
+
+    expect(await screen.findByText("Other Experiment")).toBeDefined();
+    expect(await screen.findByText("Note for B")).toBeDefined();
+    expect(screen.queryByText("Note for A")).toBeNull();
+    expect(
+      (
+        within(screen.getByRole("region", { name: "Team notes" })).getByLabelText(
+          "Add team note",
+        ) as HTMLTextAreaElement
+      ).value,
+    ).toBe("");
+  });
 });

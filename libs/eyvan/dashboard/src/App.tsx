@@ -940,7 +940,6 @@ export default function App({ client = apiClient, identityProvider = currentIden
     }
     await withAuthorityRefresh(() => client.disableFleet(fleetName, scopeOperationAbortRef.current.signal));
     await refreshFleet();
-    await refreshDashboard(desiredScopeRef.current);
   };
 
   const updatePolicy = async (policy: SchedulingPolicy, update: boolean | PolicyUpdatePatch) => {

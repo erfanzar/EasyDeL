@@ -4348,6 +4348,8 @@ code,
     left: 9px;
   }
   .sidebar-nav {
+    position: relative;
+    min-width: 0;
     height: 48px;
     flex-direction: row;
     align-items: stretch;
@@ -4355,6 +4357,24 @@ code,
     overflow-x: auto;
     overflow-y: hidden;
     padding: 0;
+    scrollbar-width: none;
+  }
+  .sidebar-nav::-webkit-scrollbar {
+    display: none;
+  }
+  .sidebar-nav[data-overflow-right="true"] {
+    padding-right: 20px;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent 100%);
+  }
+  .sidebar-nav[data-overflow-left="true"]:not([data-overflow-right="true"]) {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 100%);
+    mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 100%);
+  }
+  .sidebar-nav[data-overflow-left="true"][data-overflow-right="true"] {
+    padding-right: 20px;
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 calc(100% - 28px), transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 calc(100% - 28px), transparent 100%);
   }
   .nav-item,
   .sidebar-collapsed .nav-item {
@@ -4473,6 +4493,32 @@ code,
     font-weight: 500;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+  }
+}
+
+@media (min-width: 901px) and (max-width: 1280px) {
+  .sidebar {
+    gap: 10px;
+    padding: 0 12px;
+  }
+  .environment-switcher {
+    width: 118px;
+  }
+  .sidebar-nav {
+    gap: 9px;
+  }
+  .nav-item,
+  .sidebar-collapsed .nav-item {
+    gap: 4px;
+    padding: 0 1px;
+    font-size: 10.5px;
+  }
+  .nav-count {
+    padding: 1px 4px;
+    font-size: 9px;
+  }
+  .sidebar-footer {
+    gap: 8px;
   }
 }
 

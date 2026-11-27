@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { ChevronDown, ChevronRight, MessageSquare, Send, Trash2 } from "lucide-react";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../api/client";
 import { formatDateTime } from "../lib/format";
 import type { CollaborationNote, CollaborationNoteInput } from "../types";
@@ -36,8 +36,12 @@ export function TeamNotesPanel({
   defaultOpen = true,
   refreshRevision = 0,
 }: TeamNotesPanelProps) {
+  const targetKey = `${targetType}:${targetId}`;
+  const activeTargetKeyRef = useRef(targetKey);
+  activeTargetKeyRef.current = targetKey;
+
   const [open, setOpen] = useState(defaultOpen);
-  const [notes, setNotes] = useState<CollaborationNote[] | null>(null);
+  const [notesState, setNotesState] = useState<{ targetKey: string; items: CollaborationNote[] } | null>(null);
   const [unsupported, setUnsupported] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [body, setBody] = useState("");
@@ -48,25 +52,37 @@ export function TeamNotesPanel({
   const [formError, setFormError] = useState<string | null>(null);
 
   useEffect(() => {
+    setBody("");
+    setMetricRef("");
+    setStepRef("");
+    setFormError(null);
+    setLoadError(null);
+    setUnsupported(false);
+    setDeletingId(null);
+  }, [targetKey]);
+
+  useEffect(() => {
     const controller = new AbortController();
     setUnsupported(false);
     setLoadError(null);
     loadNotes(targetType, targetId, controller.signal)
       .then((items) => {
-        if (!controller.signal.aborted) setNotes(items);
+        if (!controller.signal.aborted) setNotesState({ targetKey, items });
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         if (error instanceof ApiError && (error.status === 404 || error.status === 405 || error.status === 501)) {
           setUnsupported(true);
-          setNotes([]);
+          setNotesState({ targetKey, items: [] });
         } else {
           setLoadError(error instanceof Error ? error.message : "Unable to load notes");
-          setNotes([]);
+          setNotesState({ targetKey, items: [] });
         }
       });
     return () => controller.abort();
-  }, [loadNotes, targetType, targetId, refreshRevision]);
+  }, [loadNotes, targetType, targetId, targetKey, refreshRevision]);
+
+  const notes = notesState?.targetKey === targetKey ? notesState.items : null;
 
   if (unsupported) return null;
 
@@ -83,6 +99,7 @@ export function TeamNotesPanel({
       setFormError("Step reference must be a non-negative integer.");
       return;
     }
+    const submittedKey = targetKey;
     setSubmitting(true);
     setFormError(null);
     try {
@@ -93,28 +110,42 @@ export function TeamNotesPanel({
         metric_ref: metricRef.trim() || null,
         step_ref: parsedStep,
       });
-      setNotes((prev) => [created, ...(prev ?? [])]);
+      if (activeTargetKeyRef.current !== submittedKey) return;
+      setNotesState((prev) => ({
+        targetKey: submittedKey,
+        items: [created, ...(prev?.targetKey === submittedKey ? prev.items : [])],
+      }));
       setBody("");
       setMetricRef("");
       setStepRef("");
     } catch (error) {
-      setFormError(error instanceof Error ? error.message : "Unable to post note");
+      if (activeTargetKeyRef.current === submittedKey) {
+        setFormError(error instanceof Error ? error.message : "Unable to post note");
+      }
     } finally {
-      setSubmitting(false);
+      if (activeTargetKeyRef.current === submittedKey) setSubmitting(false);
     }
   };
 
   const handleDelete = async (noteId: string) => {
     if (!onDeleteNote) return;
+    const submittedKey = targetKey;
     setDeletingId(noteId);
     setFormError(null);
     try {
       await onDeleteNote(noteId);
-      setNotes((prev) => (prev ?? []).filter((item) => item.id !== noteId));
+      if (activeTargetKeyRef.current !== submittedKey) return;
+      setNotesState((prev) =>
+        prev?.targetKey === submittedKey
+          ? { targetKey: submittedKey, items: prev.items.filter((item) => item.id !== noteId) }
+          : prev,
+      );
     } catch (error) {
-      setFormError(error instanceof Error ? error.message : "Unable to delete note");
+      if (activeTargetKeyRef.current === submittedKey) {
+        setFormError(error instanceof Error ? error.message : "Unable to delete note");
+      }
     } finally {
-      setDeletingId(null);
+      if (activeTargetKeyRef.current === submittedKey) setDeletingId(null);
     }
   };
 

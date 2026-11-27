@@ -150,10 +150,11 @@ describe("applied fleets", () => {
     fireEvent.click(within(appliedFleets()).getAllByRole("button", { name: "Stop" })[0]);
     fireEvent.click(screen.getByRole("button", { name: "Stop fleet" }));
     await screen.findByRole("button", { name: "Stopping" });
-    await waitFor(() => expect(loadPools).toHaveBeenCalledTimes(2));
+    // Starting a stop must not trigger a redundant in-flight pool refetch before the DELETE finishes.
+    expect(loadPools).toHaveBeenCalledTimes(1);
 
     await act(async () => rejectStop(new Error("DELETE was rejected; fleet still enabled")));
-    await waitFor(() => expect(loadPools).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(loadPools).toHaveBeenCalledTimes(2));
     await act(async () => {
       await Promise.resolve();
     });

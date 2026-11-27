@@ -4,13 +4,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { AlertCircle, FlaskConical, MessageSquare, Plus, Search, Trophy, X } from "lucide-react";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../api/client";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorCard } from "../components/ErrorCard";
 import { LoadingState } from "../components/PageState";
 import { formatDateTime } from "../lib/format";
 import { formatChartValue } from "../lib/metricGrouping";
+import { useModalAccessibility } from "../lib/useModalAccessibility";
 import type {
   CollaborationFeedResponse,
   ExperimentCreateInput,
@@ -44,9 +45,21 @@ export function ExperimentFormModal({ open, initial, onClose, onSubmit }: Experi
   const [description, setDescription] = useState(initial?.description ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useModalAccessibility(open, onClose, busy);
+  const wasOpenRef = useRef(false);
+  const lastInitialIdRef = useRef<string | null>(null);
+  const initialId = initial?.id ?? null;
 
   useEffect(() => {
-    if (!open) return;
+    const justOpened = open && !wasOpenRef.current;
+    const targetChanged = open && lastInitialIdRef.current !== initialId;
+    wasOpenRef.current = open;
+    if (!open) {
+      lastInitialIdRef.current = null;
+      return;
+    }
+    if (!justOpened && !targetChanged) return;
+    lastInitialIdRef.current = initialId;
     setName(initial?.name ?? "");
     setSubject(initial?.subject ?? "");
     setKind(initial?.kind ?? "speedrun");
@@ -61,16 +74,7 @@ export function ExperimentFormModal({ open, initial, onClose, onSubmit }: Experi
     setSharedWith((initial?.shared_with ?? []).join(", "));
     setDescription(initial?.description ?? "");
     setError(null);
-  }, [open, initial]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
-    };
-    globalThis.addEventListener("keydown", onKeyDown);
-    return () => globalThis.removeEventListener("keydown", onKeyDown);
-  }, [open, busy, onClose]);
+  }, [open, initialId, initial]);
 
   if (!open) return null;
 
@@ -131,7 +135,7 @@ export function ExperimentFormModal({ open, initial, onClose, onSubmit }: Experi
         disabled={busy}
         onClick={onClose}
       />
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="experiment-modal-title">
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="experiment-modal-title" ref={dialogRef}>
         <div className="modal-header">
           <div>
             <h2 id="experiment-modal-title">{initial ? "Edit experiment" : "New experiment / speedrun"}</h2>

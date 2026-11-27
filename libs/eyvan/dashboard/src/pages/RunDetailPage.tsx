@@ -183,6 +183,7 @@ export function RunDetailPage({
   const [run, setRun] = useState<RunDetail | null>(null);
   const [experiments, setExperiments] = useState<ExperimentRecord[]>([]);
   const [sharedWithInput, setSharedWithInput] = useState("");
+  const sharedWithDirtyRef = useRef(false);
   const [sharingBusy, setSharingBusy] = useState(false);
   const [sharingError, setSharingError] = useState<string | null>(null);
   const [error, setError] = useState<{ runId: string; error: Error } | null>(null);
@@ -210,6 +211,9 @@ export function RunDetailPage({
     setActiveSubgroups({});
     setVisibleLimits({});
     setMetricSearch("");
+    sharedWithDirtyRef.current = false;
+    setSharedWithInput("");
+    setSharingError(null);
   }, [runId]);
 
   // Clear search-only expansion overrides whenever the query string changes so matches auto-expand.
@@ -223,7 +227,9 @@ export function RunDetailPage({
       .then((value) => {
         if (!controller.signal.aborted) {
           setRun(value);
-          setSharedWithInput((value.shared_with ?? []).join(", "));
+          if (!sharedWithDirtyRef.current) {
+            setSharedWithInput((value.shared_with ?? []).join(", "));
+          }
           setError(null);
         }
       })
@@ -540,6 +546,12 @@ export function RunDetailPage({
                               }
                             : prev,
                         );
+                        if (updated.visibility !== "shared") {
+                          sharedWithDirtyRef.current = false;
+                        }
+                        if (!sharedWithDirtyRef.current) {
+                          setSharedWithInput((updated.shared_with ?? []).join(", "));
+                        }
                         onNotify?.(`Visibility set to ${updated.visibility}`);
                       } catch (err) {
                         setSharingError(err instanceof Error ? err.message : "Unable to update visibility");
@@ -558,7 +570,7 @@ export function RunDetailPage({
               )}
             </div>
 
-            {(activeRun.visibility === "shared" || (activeRun.shared_with?.length ?? 0) > 0) &&
+            {activeRun.visibility === "shared" &&
               onUpdateRunSharing &&
               (canAdminister || !activeRun.owner || !currentSubject || activeRun.owner === currentSubject) && (
                 <form
@@ -585,6 +597,7 @@ export function RunDetailPage({
                             }
                           : prev,
                       );
+                      sharedWithDirtyRef.current = false;
                       setSharedWithInput(updated.shared_with.join(", "));
                       onNotify?.("Shared collaborators updated");
                     } catch (err) {
@@ -602,7 +615,10 @@ export function RunDetailPage({
                       placeholder="alice, bob"
                       value={sharedWithInput}
                       disabled={sharingBusy}
-                      onChange={(event) => setSharedWithInput(event.target.value)}
+                      onChange={(event) => {
+                        sharedWithDirtyRef.current = true;
+                        setSharedWithInput(event.target.value);
+                      }}
                     />
                   </label>
                   <button type="submit" className="button button-secondary" disabled={sharingBusy}>

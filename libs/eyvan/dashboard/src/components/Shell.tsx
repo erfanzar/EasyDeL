@@ -146,6 +146,7 @@ export function Shell({
   children,
 }: ShellProps) {
   const drawerRef = useRef<HTMLElement>(null);
+  const navRef = useRef<HTMLElement>(null);
   const [collapsed, setCollapsed] = useState(initialCollapsed);
   const [theme, setTheme] = useState(() =>
     typeof document !== "undefined" && document.documentElement.dataset.theme === "light" ? "light" : "dark",
@@ -191,6 +192,29 @@ export function Shell({
     drawerRef.current?.querySelector<HTMLButtonElement>("button.sidebar-close")?.focus();
     return () => globalThis.removeEventListener("keydown", onKeyDown);
   }, [mobileNavigationOpen, onMobileNavigationChange]);
+
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!nav) return;
+    const syncOverflow = () => {
+      const hasLeft = nav.scrollLeft > 2;
+      const hasRight = nav.scrollWidth - nav.clientWidth - nav.scrollLeft > 2;
+      if (hasLeft) nav.dataset.overflowLeft = "true";
+      else delete nav.dataset.overflowLeft;
+      if (hasRight) nav.dataset.overflowRight = "true";
+      else delete nav.dataset.overflowRight;
+    };
+    syncOverflow();
+    nav.addEventListener("scroll", syncOverflow, { passive: true });
+    globalThis.addEventListener("resize", syncOverflow);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncOverflow);
+    observer?.observe(nav);
+    return () => {
+      nav.removeEventListener("scroll", syncOverflow);
+      globalThis.removeEventListener("resize", syncOverflow);
+      observer?.disconnect();
+    };
+  }, [collapsed, counts, sectionAvailability]);
 
   const chooseSection = (section: Section) => {
     onNavigate(section);
@@ -272,7 +296,7 @@ export function Shell({
           </label>
         </div>
 
-        <nav className="sidebar-nav">
+        <nav className="sidebar-nav" ref={navRef}>
           <span className="nav-label">Control plane</span>
           {navigation
             .filter(({ section }) => sectionAvailability[section] !== false)

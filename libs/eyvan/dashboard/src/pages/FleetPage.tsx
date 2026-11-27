@@ -17,7 +17,7 @@ import {
   Timer,
   Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AddTpuModal, type AttachmentClient } from "../components/AddTpuModal";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -132,6 +132,8 @@ export function FleetPage({
   const [stopError, setStopError] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
+  const refreshRevisionRef = useRef(refreshRevision);
+  refreshRevisionRef.current = refreshRevision;
   const [refreshed, setRefreshed] = useState(false);
   const [draining, setDraining] = useState<Cell | null>(null);
   const [drainBusy, setDrainBusy] = useState(false);
@@ -249,7 +251,7 @@ export function FleetPage({
         if (!controller.signal.aborted) setPoolsLoading(false);
       });
     return () => controller.abort();
-  }, [loadPools, stopping, refreshRevision, poolRetryRevision]);
+  }, [loadPools, refreshRevision, poolRetryRevision]);
 
   useEffect(() => {
     // Called as a method on the client, never detached: the real client reads
@@ -991,12 +993,18 @@ export function FleetPage({
           onCancel={() => setConfirmStop(null)}
           onConfirm={() => {
             const name = confirmStop;
+            const revBeforeStop = refreshRevisionRef.current;
             setConfirmStop(null);
             setStopping(name);
             setStopError(null);
             void onStopFleet(name)
               .catch((error) => setStopError(error instanceof Error ? error.message : "Could not stop the fleet"))
-              .finally(() => setStopping(null));
+              .finally(() => {
+                setStopping(null);
+                if (refreshRevisionRef.current === revBeforeStop) {
+                  setPoolRetryRevision((rev) => rev + 1);
+                }
+              });
           }}
         />
       )}

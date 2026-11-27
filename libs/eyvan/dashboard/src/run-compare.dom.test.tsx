@@ -5,26 +5,40 @@
 
 // @vitest-environment jsdom
 
+import { memo } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getMockCompareRuns, mockRuns } from "./api/mockData";
 import { RunComparePage } from "./pages/RunComparePage";
 
+const chartRenderCounts = new Map<string, number>();
+
 vi.mock("./components/CompareLineChart", () => ({
-  CompareLineChart: ({ metricKey, runs }: { metricKey: string; runs: Array<{ label: string; visible: boolean }> }) => (
-    <div
-      role="img"
-      aria-label={`${metricKey} comparison chart`}
-      data-visible-runs={runs
-        .filter((r) => r.visible)
-        .map((r) => r.label)
-        .join(",")}
-    />
-  ),
+  CompareLineChart: memo(function MockCompareLineChart({
+    metricKey,
+    runs,
+  }: {
+    metricKey: string;
+    runs: Array<{ label: string; visible: boolean }>;
+  }) {
+    chartRenderCounts.set(metricKey, (chartRenderCounts.get(metricKey) ?? 0) + 1);
+    return (
+      <div
+        role="img"
+        aria-label={`${metricKey} comparison chart`}
+        data-visible-runs={runs
+          .filter((r) => r.visible)
+          .map((r) => r.label)
+          .join(",")}
+      />
+    );
+  }),
 }));
 
 afterEach(() => {
   cleanup();
+  chartRenderCounts.clear();
+  delete document.documentElement.dataset.theme;
   vi.restoreAllMocks();
 });
 
@@ -94,5 +108,48 @@ describe("RunComparePage", () => {
     await waitFor(() =>
       expect(compareRuns).toHaveBeenLastCalledWith(expect.objectContaining({ x: "time" }), expect.any(AbortSignal)),
     );
+  });
+
+  it("keeps CompareLineChart props stable across unrelated UI toggles and updates legend swatches for light/dark theme", async () => {
+    const baseResponse = getMockCompareRuns({ runIds: ["pong-seed-3", "pong-seed-1"], x: "step" }, "acme", "research");
+    baseResponse.config_diff = [
+      { key: "learning_rate", values: { "pong-seed-3": 0.00025, "pong-seed-1": 0.0005 }, differs: true },
+      { key: "env", values: { "pong-seed-3": "Pong-v5", "pong-seed-1": "Pong-v5" }, differs: false },
+    ];
+    document.documentElement.dataset.theme = "dark";
+
+    const { container } = render(
+      <RunComparePage
+        runIds={["pong-seed-3", "pong-seed-1"]}
+        onChangeRunIds={() => {}}
+        compareRuns={async () => baseResponse}
+        loadRuns={async () => mockRuns}
+        onBack={() => {}}
+        onOpenRun={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("img", { name: "loss/policy comparison chart" })).toBeDefined();
+    const initialRenders = chartRenderCounts.get("loss/policy") ?? 0;
+    expect(initialRenders).toBeGreaterThan(0);
+
+    // Toggling Config Diff "Only differences" must NOT re-render memoized CompareLineChart instances.
+    const configSection = screen.getByRole("region", { name: "Hyperparameter and config diff" });
+    fireEvent.click(within(configSection).getByRole("checkbox", { name: "Only differences" }));
+    expect(chartRenderCounts.get("loss/policy")).toBe(initialRenders);
+
+    // Dark-theme swatch matches COMPARE_RUN_PALETTE_DARK[0] (#fbbf24 -> rgb(251, 191, 36)).
+    const swatches = container.querySelectorAll<HTMLElement>(".compare-run-swatch");
+    expect(swatches.length).toBeGreaterThanOrEqual(2);
+    expect(swatches[0].style.background).toBe("rgb(251, 191, 36)");
+
+    // Switching document theme to light updates swatches to COMPARE_RUN_PALETTE_LIGHT[0] (#b45309 -> rgb(180, 83, 9)).
+    document.documentElement.dataset.theme = "light";
+    await waitFor(() => {
+      const updated = container.querySelectorAll<HTMLElement>(".compare-run-swatch");
+      expect(updated[0].style.background).toBe("rgb(180, 83, 9)");
+    });
+    // Theme flip in RunComparePage also does not recreate CompareLineChart props.
+    expect(chartRenderCounts.get("loss/policy")).toBe(initialRenders);
   });
 });

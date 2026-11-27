@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import type { CompareChartRun } from "../components/CompareLineChart";
 import { compareRunColor } from "../lib/comparePalette";
 import { EmptyState } from "../components/EmptyState";
 import { LoadingState } from "../components/PageState";
@@ -27,6 +28,8 @@ import { RunStatusBadge } from "./RunsPage";
 const CompareLineChart = lazy(() =>
   import("../components/CompareLineChart").then((module) => ({ default: module.CompareLineChart })),
 );
+
+const EMPTY_COMPARE_CHART_RUNS: CompareChartRun[] = [];
 
 export interface RunComparePageProps {
   runIds: string[];
@@ -85,6 +88,20 @@ export function RunComparePage({
   const [onlyConfigDiffs, setOnlyConfigDiffs] = useState<boolean | null>(null);
   const [addRunChoice, setAddRunChoice] = useState("");
   const [revision, setRevision] = useState(0);
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    typeof document !== "undefined" && document.documentElement.dataset.theme === "light" ? "light" : "dark",
+  );
+
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") return;
+    const syncTheme = () => {
+      setTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+    };
+    syncTheme();
+    const observer = new MutationObserver(syncTheme);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => observer.disconnect();
+  }, []);
 
   const idsSignature = runIds.join(",");
 
@@ -128,12 +145,33 @@ export function RunComparePage({
     return () => controller.abort();
   }, [idsSignature, x, compareRuns, refreshRevision, revision]);
 
-  const comparedRuns = data?.runs ?? [];
+  const comparedRuns = useMemo(() => data?.runs ?? [], [data]);
   const colorIndexByRun = useMemo(() => {
     const map = new Map<string, number>();
     comparedRuns.forEach((run, idx) => map.set(run.run_id, idx));
     return map;
   }, [comparedRuns]);
+
+  const chartRunsByKey = useMemo(() => {
+    const map = new Map<string, CompareChartRun[]>();
+    if (!data) return map;
+    for (const key of data.selected_keys) {
+      const byRun = data.series_by_key[key] ?? {};
+      map.set(
+        key,
+        comparedRuns
+          .filter((run) => Boolean(byRun[run.run_id]))
+          .map((run) => ({
+            runId: run.run_id,
+            label: run.name,
+            colorIndex: colorIndexByRun.get(run.run_id) ?? 0,
+            series: byRun[run.run_id],
+            visible: !hiddenRunIds.has(run.run_id),
+          })),
+      );
+    }
+    return map;
+  }, [data, comparedRuns, colorIndexByRun, hiddenRunIds]);
 
   const metricGroups = useMemo(() => {
     const keys = data?.selected_keys ?? [];
@@ -236,7 +274,7 @@ export function RunComparePage({
         <div className="compare-run-chips" role="list" aria-label="Compared runs">
           {comparedRuns.map((run, idx) => {
             const hidden = hiddenRunIds.has(run.run_id);
-            const swatch = compareRunColor(idx);
+            const swatch = compareRunColor(idx, theme);
             return (
               <div
                 key={run.run_id}
@@ -401,16 +439,7 @@ export function RunComparePage({
                         <div className="run-chart-grid">
                           {group.keys.map((key) => {
                             const { prefix, leaf } = splitMetricKey(key);
-                            const byRun = data.series_by_key[key] ?? {};
-                            const chartRuns = comparedRuns
-                              .filter((run) => Boolean(byRun[run.run_id]))
-                              .map((run) => ({
-                                runId: run.run_id,
-                                label: run.name,
-                                colorIndex: colorIndexByRun.get(run.run_id) ?? 0,
-                                series: byRun[run.run_id],
-                                visible: !hiddenRunIds.has(run.run_id),
-                              }));
+                            const chartRuns = chartRunsByKey.get(key) ?? EMPTY_COMPARE_CHART_RUNS;
                             return (
                               <article key={key} className="run-chart-cell">
                                 <div className="chart-cell-heading">
@@ -459,7 +488,7 @@ export function RunComparePage({
                         <th key={run.run_id} className="numeric">
                           <span
                             className="compare-run-swatch compare-swatch-inline"
-                            style={{ background: compareRunColor(idx) }}
+                            style={{ background: compareRunColor(idx, theme) }}
                             aria-hidden="true"
                           />
                           {run.name}

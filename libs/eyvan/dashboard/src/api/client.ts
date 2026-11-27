@@ -806,6 +806,12 @@ const WORKER_FORWARDED_TIMEOUT_MS = 5_000;
  */
 const PROVIDER_READ_TIMEOUT_MS = 45_000;
 
+/** Budget for a GCS bucket region metadata lookup (backend allows 5s + optional gcloud token lookup). */
+const STORAGE_REGION_CHECK_TIMEOUT_MS = 15_000;
+
+/** Budget for multi-run compare and experiment leaderboard reads that fan out across upstream tracker runs. */
+const TRACKING_FANOUT_TIMEOUT_MS = 30_000;
+
 export class EyvanApiClient {
   private activeScope: AuthScope;
 
@@ -2802,16 +2808,20 @@ export class EyvanApiClient {
 
   async checkStorageRegion(input: StorageRegionCheckInput, signal?: AbortSignal): Promise<StorageRegionCheckResult> {
     if (this.forceDemo) return checkMockStorageRegion(input);
-    return this.attachmentRequest<StorageRegionCheckResult>("/api/v1/storage/check-region", {
-      method: "POST",
-      body: JSON.stringify({
-        uri: input.uri,
-        ...(input.region ? { region: input.region } : {}),
-        strict: Boolean(input.strict),
-        allowed_buckets: input.allowed_buckets ?? [],
-      }),
-      signal,
-    });
+    return this.attachmentRequest<StorageRegionCheckResult>(
+      "/api/v1/storage/check-region",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          uri: input.uri,
+          ...(input.region ? { region: input.region } : {}),
+          strict: Boolean(input.strict),
+          allowed_buckets: input.allowed_buckets ?? [],
+        }),
+        signal,
+      },
+      STORAGE_REGION_CHECK_TIMEOUT_MS,
+    );
   }
 
   async listManagedArtifacts(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<ManagedArtifact[]> {
@@ -2907,18 +2917,22 @@ export class EyvanApiClient {
   ): Promise<RunCompareResponse> {
     const immutableScope = this.scopeSnapshot(scope);
     if (this.forceDemo) return getMockCompareRuns(input, immutableScope.orgId, immutableScope.projectId);
-    return this.attachmentRequest<RunCompareResponse>("/api/v1/tracking/compare", {
-      method: "POST",
-      body: JSON.stringify({
-        org_id: immutableScope.orgId,
-        project_id: immutableScope.projectId,
-        run_ids: input.runIds,
-        keys: input.keys ?? [],
-        x: input.x ?? "step",
-        points: input.points ?? 300,
-      }),
-      signal,
-    });
+    return this.attachmentRequest<RunCompareResponse>(
+      "/api/v1/tracking/compare",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          org_id: immutableScope.orgId,
+          project_id: immutableScope.projectId,
+          run_ids: input.runIds,
+          keys: input.keys ?? [],
+          x: input.x ?? "step",
+          points: input.points ?? 300,
+        }),
+        signal,
+      },
+      TRACKING_FANOUT_TIMEOUT_MS,
+    );
   }
 
   async updateRunSharing(
@@ -3031,6 +3045,7 @@ export class EyvanApiClient {
     return this.attachmentRequest<ExperimentLeaderboardResponse>(
       this.scope(`/api/v1/collaboration/experiments/${encodeURIComponent(expId)}/leaderboard`, immutableScope),
       { signal },
+      TRACKING_FANOUT_TIMEOUT_MS,
     );
   }
 

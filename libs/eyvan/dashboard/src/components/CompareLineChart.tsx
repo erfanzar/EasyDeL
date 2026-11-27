@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useEffect, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { computeIntegerStepSplits, computeXRange, computeYRange, formatAxisX } from "./LineChart";
@@ -43,10 +43,39 @@ function applyEma(values: Array<number | null>, smoothing: number): Array<number
   });
 }
 
+function compareSeriesDataEqual(a: RunCompareSeriesData, b: RunCompareSeriesData): boolean {
+  if (a === b) return true;
+  if (a.x.length !== b.x.length || a.y.length !== b.y.length) return false;
+  for (let i = 0; i < a.x.length; i++) {
+    if (a.x[i] !== b.x[i]) return false;
+  }
+  for (let i = 0; i < a.y.length; i++) {
+    if (a.y[i] !== b.y[i]) return false;
+  }
+  return true;
+}
+
+function compareRunsEqual(a: CompareChartRun[], b: CompareChartRun[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].runId !== b[i].runId ||
+      a[i].label !== b[i].label ||
+      a[i].colorIndex !== b[i].colorIndex ||
+      a[i].visible !== b[i].visible ||
+      !compareSeriesDataEqual(a[i].series, b[i].series)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function CompareLineChartInner({ metricKey, runs, x, smoothing }: CompareLineChartProps) {
   const target = useRef<HTMLDivElement>(null);
   const hoverRef = useRef<HTMLDivElement>(null);
-  const activeRuns = runs.filter((item) => item.visible && item.series.x.length > 0);
+  const activeRuns = useMemo(() => runs.filter((item) => item.visible && item.series.x.length > 0), [runs]);
 
   useEffect(() => {
     const element = target.current;
@@ -207,4 +236,11 @@ function CompareLineChartInner({ metricKey, runs, x, smoothing }: CompareLineCha
   );
 }
 
-export const CompareLineChart = memo(CompareLineChartInner);
+export const CompareLineChart = memo(
+  CompareLineChartInner,
+  (prev, next) =>
+    prev.metricKey === next.metricKey &&
+    prev.x === next.x &&
+    prev.smoothing === next.smoothing &&
+    compareRunsEqual(prev.runs, next.runs),
+);

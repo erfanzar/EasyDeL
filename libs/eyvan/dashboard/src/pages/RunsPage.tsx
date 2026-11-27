@@ -216,10 +216,14 @@ export function RunsPage({
 
   const researcherOptions = useMemo(() => {
     const owners = new Set<string>();
+    let hasUnassigned = false;
     for (const run of sortedRuns) {
       if (run.owner) owners.add(run.owner);
+      else hasUnassigned = true;
     }
-    return [...owners].sort((a, b) => a.localeCompare(b));
+    const sorted = [...owners].sort((a, b) => a.localeCompare(b));
+    if (hasUnassigned && !owners.has("unassigned")) sorted.push("unassigned");
+    return sorted;
   }, [sortedRuns]);
 
   const groupOptions = useMemo(() => {
@@ -236,7 +240,7 @@ export function RunsPage({
     () =>
       sortedRuns.filter((run) => {
         if (status !== "all" && run.status !== status) return false;
-        if (researcher !== "all" && (run.owner ?? "") !== researcher) return false;
+        if (researcher !== "all" && (run.owner || "unassigned") !== researcher) return false;
         if (visibilityFilter === "mine") {
           if (!currentSubject || run.owner !== currentSubject) return false;
         } else if (visibilityFilter !== "all") {
