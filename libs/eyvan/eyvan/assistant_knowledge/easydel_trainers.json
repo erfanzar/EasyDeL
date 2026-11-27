@@ -1,10 +1,326 @@
 {
  "classes": {
+  "AgentFlowConfig": {
+   "bases": [
+    "TrainingArguments"
+   ],
+   "checks": [
+    {
+     "fields": [
+      "max_turns"
+     ],
+     "if": "self.max_turns <= 0",
+     "message": "`max_turns` must be positive; got {self.max_turns}."
+    },
+    {
+     "fields": [
+      "context_mode"
+     ],
+     "if": "self.context_mode not in {'append', 'sliding_window', 'reset_with_summary'}",
+     "message": "`context_mode` must be 'append', 'sliding_window', or 'reset_with_summary'; got {self.context_mode}."
+    },
+    {
+     "fields": [
+      "context_mode",
+      "sliding_window_turns"
+     ],
+     "if": "self.context_mode == 'sliding_window' and self.sliding_window_turns is not None and (self.sliding_window_turns <= 0)",
+     "message": "`sliding_window_turns` must be positive; got {self.sliding_window_turns}."
+    },
+    {
+     "fields": [
+      "reward_mode"
+     ],
+     "if": "self.reward_mode not in {'sum', 'terminal', 'discounted_sum'}",
+     "message": "`reward_mode` must be 'sum', 'terminal', or 'discounted_sum'; got {self.reward_mode}."
+    },
+    {
+     "fields": [
+      "gamma"
+     ],
+     "if": "not 0.0 <= float(self.gamma) <= 1.0",
+     "message": "`gamma` must be in [0, 1]; got {self.gamma}."
+    },
+    {
+     "fields": [
+      "max_workers"
+     ],
+     "if": "self.max_workers <= 0",
+     "message": "`max_workers` must be positive; got {self.max_workers}."
+    },
+    {
+     "fields": [
+      "group_size"
+     ],
+     "if": "self.group_size is not None and self.group_size <= 0",
+     "message": "`group_size` must be positive; got {self.group_size}."
+    },
+    {
+     "fields": [
+      "environment_backend"
+     ],
+     "if": "self.environment_backend not in {'local', 'kiri', 'docker', 'auto'}",
+     "message": "`environment_backend` must be 'local', 'kiri', 'docker', or 'auto'; got {self.environment_backend}."
+    },
+    {
+     "fields": [
+      "base_trainer_type"
+     ],
+     "if": "self.base_trainer_type in {'agent_flow', 'agent-flow'}",
+     "message": "`base_trainer_type` cannot be 'agent_flow' (recursive wrapping is disallowed)."
+    },
+    {
+     "fields": [
+      "base_trainer_type"
+     ],
+     "if": "not _is_supported_base_trainer_type(self.base_trainer_type)",
+     "message": "`base_trainer_type` {self.base_trainer_type} is not supported by AgentFlowTrainer. AgentFlow adapts episodes for the GRPO family, the PPO/VAPO family, online DPO, and the supported distillation family; supported values: {sorted(AGENT_FLO..."
+    }
+   ],
+   "fields": {
+    "base_config": {
+     "default": null,
+     "doc": "Optional pre-built ``TrainingArguments`` or dict of overrides used when constructing the underlying trainer.",
+     "help": "Optional pre-built base trainer config or dict of overrides.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "Any"
+    },
+    "base_trainer_type": {
+     "accepts": [
+      "str"
+     ],
+     "default": "grpo",
+     "doc": "Registry name of the underlying trainer algorithm (e.g. ``\"grpo\"``, ``\"gmpo\"``, ``\"gdpo\"``, ``\"reinforce_plus_plus\"``, ``\"ppo\"``, ``\"vapo\"``, ``\"gkd\"``, ``\"on_policy_distillation\"``).",
+     "help": "Registry name of the underlying RL/distillation trainer.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "context_mode": {
+     "accepts": [
+      "str"
+     ],
+     "default": "append",
+     "doc": "Multi-turn context strategy: ``\"append\"`` (default), ``\"sliding_window\"``, or ``\"reset_with_summary\"``.",
+     "help": "Multi-turn context strategy: 'append', 'sliding_window', or 'reset_with_summary'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "environment": {
+     "default": null,
+     "doc": "Environment name, mapping specification, or ``None``.",
+     "help": "Environment name, mapping specification, or factory.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "Any"
+    },
+    "environment_backend": {
+     "accepts": [
+      "str"
+     ],
+     "default": "local",
+     "doc": "Sandbox backend (``\"kiri\"``, ``\"docker\"``, ``\"auto\"``, or ``\"local\"``).",
+     "help": "Sandbox backend for environment execution ('local', 'kiri', 'docker', 'auto').",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "environment_endpoints": {
+     "accepts": [
+      "list",
+      "none",
+      "str"
+     ],
+     "default": null,
+     "doc": "Optional explicit list of Kiri/Docker endpoints.",
+     "help": "Optional explicit sandbox daemon endpoints, or 'shm:N' / 'pod-shm:N' to auto-boot in /dev/shm.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "list[str] | str | None"
+    },
+    "gamma": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 1.0,
+     "doc": "Discount factor applied when ``reward_mode == \"discounted_sum\"`` and for per-turn return-to-go attribution.",
+     "help": "Discount factor for multi-turn return-to-go and discounted_sum rewards.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "group_size": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Optional rollouts per prompt group (defaults to the inner trainer's ``num_generations`` / ``num_return_sequences`` or ``1``).",
+     "help": "Optional explicit number of episodes per prompt group.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
+    },
+    "max_completion_length": {
+     "accepts": [
+      "int"
+     ],
+     "default": 1024,
+     "doc": "Maximum completion/trajectory token length.",
+     "help": "Maximum completion/trajectory length in tokens.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
+    "max_obs_tokens_per_turn": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional per-turn observation token cap. When None and per_turn_max_tokens is set, auto-caps observations so max_turns * per_turn_max_tokens + observations fit inside max_completion_length.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
+    },
+    "max_prompt_length": {
+     "accepts": [
+      "int"
+     ],
+     "default": 1024,
+     "doc": "Maximum prompt token length.",
+     "help": "Maximum prompt length in tokens.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
+    "max_turns": {
+     "accepts": [
+      "int"
+     ],
+     "default": 8,
+     "help": "Maximum interaction turns per multi-turn episode.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
+    "max_workers": {
+     "accepts": [
+      "int"
+     ],
+     "default": 8,
+     "help": "Maximum concurrent environment rollout workers.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
+    "num_generations": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Optional group size forwarded to the base config.",
+     "help": "Optional number of generations per prompt forwarded to base config.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
+    },
+    "per_turn_max_tokens": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional per-turn generation token cap passed to rollout().",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
+    },
+    "reward_mode": {
+     "accepts": [
+      "str"
+     ],
+     "default": "sum",
+     "doc": "How multi-turn step rewards aggregate into episode reward: ``\"sum\"``, ``\"terminal\"``, or ``\"discounted_sum\"``.",
+     "help": "Episode reward aggregation: 'sum', 'terminal', or 'discounted_sum'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "skip_apply_chat_template": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "help": "Skip chat template formatting on prompts.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "sliding_window_turns": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Number of recent turns retained when ``context_mode == \"sliding_window\"``.",
+     "help": "Number of recent turns kept when context_mode='sliding_window'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
+    },
+    "trainer_prefix": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": "AgentFlow",
+     "help": "Default prefix for AgentFlow checkpoints and logs.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    }
+   },
+   "module": "easydel.trainers.agent_flow_trainer.agent_flow_config",
+   "registered_ids": [
+    "agent_flow"
+   ],
+   "summary": "Configuration for multi-turn :class:`AgentFlowTrainer` wrapping any RL/distillation trainer.",
+   "validated_choices": {
+    "context_mode": [
+     "append",
+     "sliding_window",
+     "reset_with_summary"
+    ],
+    "environment_backend": [
+     "local",
+     "kiri",
+     "docker",
+     "auto"
+    ],
+    "reward_mode": [
+     "sum",
+     "terminal",
+     "discounted_sum"
+    ]
+   }
+  },
   "AgenticMoshPitConfig": {
    "bases": [
     "GRPOConfig"
    ],
    "checks": [
+    {
+     "fields": [
+      "group_size"
+     ],
+     "if": "isinstance(self.group_size, bool) or not isinstance(self.group_size, int) or self.group_size <= 0",
+     "message": "`group_size` must be a positive integer; got {self.group_size}."
+    },
     {
      "fields": [
       "reward_mode"
@@ -203,56 +519,56 @@
    "checks": [
     {
      "fields": [
-      "max_inflight_tasks"
+      "environment_backend"
      ],
-     "if": "self.max_inflight_tasks <= 0",
-     "message": "`max_inflight_tasks` must be positive."
-    },
-    {
-     "fields": [
-      "max_staleness"
-     ],
-     "if": "self.max_staleness < 0",
-     "message": "`max_staleness` must be non-negative."
-    },
-    {
-     "fields": [
-      "queue_maxsize"
-     ],
-     "if": "self.queue_maxsize < 0",
-     "message": "`queue_maxsize` must be non-negative."
-    },
-    {
-     "fields": [
-      "weight_sync_steps"
-     ],
-     "if": "self.weight_sync_steps <= 0",
-     "message": "`weight_sync_steps` must be positive."
-    },
-    {
-     "fields": [
-      "request_timeout"
-     ],
-     "if": "self.request_timeout <= 0",
-     "message": "`request_timeout` must be positive."
-    },
-    {
-     "fields": [
-      "heartbeat_stale_after_s"
-     ],
-     "if": "self.heartbeat_stale_after_s <= 0",
-     "message": "`heartbeat_stale_after_s` must be positive."
+     "if": "self.environment_backend not in {'local', 'auto', 'kiri', 'docker'}",
+     "message": "`environment_backend` must be one of 'local', 'auto', 'kiri', or 'docker'; got {self.environment_backend}."
     }
    ],
    "fields": {
-    "heartbeat_stale_after_s": {
+    "async_mode": {
      "accepts": [
-      "float",
-      "int"
+      "bool"
      ],
-     "default": 120.0,
+     "default": true,
+     "help": "Enable asynchronous background rollout generation with policy snapshots and staleness control on rollout-capable trainers (GRPO/GSPO/GFPO/RLOO/RLVR/DPPO/SDPO/SDFT/SSD/PAPO/NashMD/XPO/MiniLLM/AgenticMoshPit/NeMoGym/PPO/OnlineDPO/OnPolicyDistillation/GKD/SeqKD).",
+     "help_source": "inherited:TrainingArguments",
      "required": false,
-     "type": "float"
+     "type": "bool"
+    },
+    "environment": {
+     "accepts": [
+      "dict",
+      "none",
+      "str"
+     ],
+     "default": null,
+     "help": "Optional registered environment name, 'auto', or config mapping resolved via AutoEnvironment.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | dict[str, Any] | None"
+    },
+    "environment_backend": {
+     "accepts": [
+      "str"
+     ],
+     "default": "kiri",
+     "help": "Sandbox backend for environment rollouts: 'kiri', 'auto', 'docker', or 'local'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "environment_endpoints": {
+     "accepts": [
+      "list",
+      "none",
+      "str"
+     ],
+     "default": null,
+     "help": "Optional Kiri/Docker endpoints, or 'shm:N' / 'pod-shm:N' to auto-boot RAM-backed daemons.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "list[str] | str | None"
     },
     "learning_rate": {
      "accepts": [
@@ -262,39 +578,6 @@
      "default": 1e-06,
      "help": "The learning rate.",
      "help_source": "inherited:GRPOConfig",
-     "required": false,
-     "type": "float"
-    },
-    "max_inflight_tasks": {
-     "accepts": [
-      "int"
-     ],
-     "default": 32,
-     "required": false,
-     "type": "int"
-    },
-    "max_staleness": {
-     "accepts": [
-      "int"
-     ],
-     "default": 1,
-     "required": false,
-     "type": "int"
-    },
-    "queue_maxsize": {
-     "accepts": [
-      "int"
-     ],
-     "default": 0,
-     "required": false,
-     "type": "int"
-    },
-    "request_timeout": {
-     "accepts": [
-      "float",
-      "int"
-     ],
-     "default": 120.0,
      "required": false,
      "type": "float"
     },
@@ -308,21 +591,21 @@
      "help_source": "inherited:GRPOConfig",
      "required": false,
      "type": "str | None"
-    },
-    "weight_sync_steps": {
-     "accepts": [
-      "int"
-     ],
-     "default": 1,
-     "required": false,
-     "type": "int"
     }
    },
    "module": "easydel.trainers.async_grpo_trainer.async_grpo_config",
    "registered_ids": [
     "async_grpo"
    ],
-   "summary": "Configuration for AsyncGRPO with local eSurge async execution."
+   "summary": "Configuration for AsyncGRPO with local eSurge async execution.",
+   "validated_choices": {
+    "environment_backend": [
+     "local",
+     "auto",
+     "kiri",
+     "docker"
+    ]
+   }
   },
   "BCOConfig": {
    "bases": [
@@ -542,6 +825,15 @@
   "CPOConfig": {
    "bases": [
     "TrainingArguments"
+   ],
+   "checks": [
+    {
+     "fields": [
+      "beta"
+     ],
+     "if": "self.beta <= 0.0",
+     "message": "`beta` must be positive; got {self.beta}."
+    }
    ],
    "fields": {
     "alpha": {
@@ -1092,7 +1384,7 @@
       "int",
       "none"
      ],
-     "default": 1,
+     "default": null,
      "help": "Alias for group size; fixed to one.",
      "help_source": "metadata",
      "required": false,
@@ -1232,6 +1524,13 @@
    "checks": [
     {
      "fields": [
+      "beta"
+     ],
+     "if": "self.beta <= 0.0",
+     "message": "`beta` must be positive; got {self.beta}."
+    },
+    {
+     "fields": [
       "pad_to_multiple_of"
      ],
      "if": "self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0",
@@ -1243,6 +1542,13 @@
      ],
      "if": "self.precompute_ref_batch_size is not None and self.precompute_ref_batch_size <= 0",
      "message": "`precompute_ref_batch_size` must be a positive integer when set."
+    },
+    {
+     "fields": [
+      "loss_type"
+     ],
+     "if": "not self.loss_type",
+     "message": "`loss_type` must contain at least one DPO loss variant."
     },
     {
      "fields": [
@@ -1277,8 +1583,8 @@
       "label_smoothing",
       "loss_type"
      ],
-     "if": "'exo_pair' in self.loss_type and self.label_smoothing == 0.0",
-     "message": "Label smoothing must be greater than 0.0 when using 'exo_pair' loss. The EXO paper recommends a value of 1e-3."
+     "if": "'exo_pair' in self.loss_type and (not 0.0 < self.label_smoothing < 1.0)",
+     "message": "Label smoothing must be greater than 0.0 and less than 1.0 when using 'exo_pair' loss. The EXO paper recommends a value of 1e-3; got {self.label_smoothing}."
     },
     {
      "fields": [
@@ -1684,8 +1990,8 @@
       "none"
      ],
      "default": null,
-     "doc": "Reserved compatibility field for Relative Preference Optimization. EasyDeL DPO does not currently implement this loss term; leave as ``None``.",
-     "help": "Reserved compatibility field for Relative Preference Optimization. EasyDeL DPO does not currently implement this loss term.",
+     "doc": "Weight for the Relative Preference Optimization (RPO) chosen-completion NLL regularization term ``rpo_alpha * (-chosen_logps / chosen_lengths)``. Set to ``None`` or ``0.0`` to disable. Default: ``None``.",
+     "help": "Weight for the Relative Preference Optimization (RPO) chosen-completion NLL regularization term `rpo_alpha * (-chosen_logps / chosen_lengths)`. Set to None or 0.0 to disable.",
      "help_source": "metadata",
      "required": false,
      "type": "float | None"
@@ -2536,6 +2842,20 @@
      ],
      "if": "self.pooling_strategy is not None and self.pooling_strategy not in {'last', 'first', 'mean', 'weighted_mean', 'max'}",
      "message": "`pooling_strategy` must be one of 'last', 'first', 'mean', 'weighted_mean', or 'max'."
+    },
+    {
+     "fields": [
+      "matryoshka_dims"
+     ],
+     "if": "len(self.matryoshka_dims) == 0",
+     "message": "`matryoshka_dims` must be non-empty when set."
+    },
+    {
+     "fields": [
+      "matryoshka_dims"
+     ],
+     "if": "any((isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 for dim in self.matryoshka_dims))",
+     "message": "`matryoshka_dims` must contain only positive integers."
     }
    ],
    "fields": {
@@ -2701,6 +3021,41 @@
     ]
    }
   },
+  "GDPOConfig": {
+   "bases": [
+    "GRPOConfig"
+   ],
+   "fields": {
+    "decouple_reward_normalization": {
+     "accepts": [
+      "bool"
+     ],
+     "default": true,
+     "doc": "Per-reward group normalization switch. Default ``True``.",
+     "help": "Normalize each reward function within its prompt group before the weighted sum, then batch-normalize the summed reward.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "trainer_prefix": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": "GDPO",
+     "doc": "Default prefix used for checkpoints/logs (``\"GDPO\"``).",
+     "help": "default prefix name for trainer.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    }
+   },
+   "module": "easydel.trainers.gdpo_trainer.gdpo_config",
+   "registered_ids": [
+    "gdpo"
+   ],
+   "summary": "Configuration class for Group reward-Decoupled Policy Optimization (GDPO)."
+  },
   "GFPOConfig": {
    "bases": [
     "GRPOConfig"
@@ -2807,6 +3162,13 @@
    "checks": [
     {
      "fields": [
+      "temperature"
+     ],
+     "if": "self.temperature <= 0.0",
+     "message": "`temperature` must be strictly positive."
+    },
+    {
+     "fields": [
       "beta"
      ],
      "if": "not 0.0 <= self.beta <= 1.0",
@@ -2818,13 +3180,6 @@
      ],
      "if": "self.max_new_tokens <= 0",
      "message": "`max_new_tokens` must be strictly positive."
-    },
-    {
-     "fields": [
-      "lmbda"
-     ],
-     "if": "self.lmbda is not None and (not 0.0 <= self.lmbda <= 1.0)",
-     "message": "`lmbda` must be within [0, 1]."
     }
    ],
    "fields": {
@@ -2835,7 +3190,7 @@
      ],
      "default": 0.5,
      "doc": "Mixing weight inside the generalised JSD loss. ``0.0`` recovers forward ``KL(teacher || student)``; ``1.0`` recovers reverse ``KL(student || teacher)`` (GKD-paper / TRL convention). Validated in ``[0, 1]``. Default ``0.5``.",
-     "help": "Interpolation factor in the generalized Jensen-Shannon divergence. 0.0 reduces to KL(student‖teacher) while 1.0 becomes KL(teacher‖student).",
+     "help": "Interpolation factor in the generalized Jensen-Shannon divergence. 0.0 reduces to forward KL(teacher‖student) while 1.0 becomes reverse KL(student‖teacher).",
      "help_source": "metadata",
      "required": false,
      "type": "float"
@@ -2858,7 +3213,7 @@
       "none"
      ],
      "default": 0.5,
-     "doc": "Probability of replacing the supervised batch with on-policy student samples. ``None`` (or ``<= 0``) disables on-policy sampling. Validated in ``[0, 1]``. Default ``0.5``.",
+     "doc": "Probability of replacing the supervised batch with on-policy student samples. ``None`` (or ``0``) disables on-policy sampling. Validated in ``[0, 1]``. Default ``0.5``.",
      "help": "Probability of performing on-policy student generation for a batch. Set to `None` to disable on-policy sampling; `0` is accepted for backward compatibility.",
      "help_source": "metadata",
      "required": false,
@@ -2916,6 +3271,66 @@
     "gkd"
    ],
    "summary": "Configuration for the :class:`~easydel.trainers.GKDTrainer`."
+  },
+  "GMPOConfig": {
+   "bases": [
+    "GRPOConfig"
+   ],
+   "fields": {
+    "epsilon": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.4,
+     "doc": "Lower clip offset on token ratios (``1 - epsilon``). Default ``0.4``; must satisfy ``0 < epsilon < 1``.",
+     "help": "Lower clipping offset for token importance ratios (ratio >= 1 - epsilon).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "epsilon_high": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": 0.4,
+     "doc": "Upper clip offset on token ratios (``1 + epsilon_high``). Default ``0.4``.",
+     "help": "Upper clipping offset for token importance ratios (ratio <= 1 + epsilon_high).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
+    "loss_type": {
+     "accepts": [
+      "str"
+     ],
+     "default": "gmpo",
+     "doc": "Loss variant. Default ``\"gmpo\"``.",
+     "help": "Loss variant to use. GMPO uses the geometric-mean 'gmpo' surrogate by default.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "trainer_prefix": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": "GMPO",
+     "doc": "Default prefix used for checkpoints/logs (``\"GMPO\"``).",
+     "help": "default prefix name for trainer.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    }
+   },
+   "module": "easydel.trainers.gmpo_trainer.gmpo_config",
+   "registered_ids": [
+    "gmpo"
+   ],
+   "summary": "Configuration class for Geometric-Mean Policy Optimization (GMPO)."
   },
   "GOLDConfig": {
    "bases": [
@@ -3150,8 +3565,37 @@
      "fields": [
       "loss_type"
      ],
-     "if": "self.loss_type not in {'grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo', 'dppo'}",
-     "message": "`loss_type` must be one of 'grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo', or 'dppo'. Got {self.loss_type}."
+     "if": "self.loss_type not in {'grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo', 'dppo', 'gmpo'}",
+     "message": "`loss_type` must be one of 'grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo', 'dppo', or 'gmpo'. Got {self.loss_type}."
+    },
+    {
+     "fields": [
+      "kl_estimator"
+     ],
+     "if": "self.kl_estimator not in {'k1', 'k2', 'k3', 'l2'}",
+     "message": "`kl_estimator` must be one of 'k1', 'k2', 'k3', or 'l2'. Got {self.kl_estimator}."
+    },
+    {
+     "fields": [
+      "toggle_budget_interval"
+     ],
+     "if": "self.toggle_budget_interval < 0",
+     "message": "`toggle_budget_interval` must be non-negative; got {self.toggle_budget_interval}."
+    },
+    {
+     "fields": [
+      "dynamic_sampling_max_attempts"
+     ],
+     "if": "self.dynamic_sampling_max_attempts <= 0",
+     "message": "`dynamic_sampling_max_attempts` must be positive; got {self.dynamic_sampling_max_attempts}."
+    },
+    {
+     "fields": [
+      "dynamic_sampling",
+      "num_generations"
+     ],
+     "if": "self.dynamic_sampling and int(self.num_generations or 0) < 2",
+     "message": "`dynamic_sampling=True` requires `num_generations >= 2` so group variance is defined."
     },
     {
      "fields": [
@@ -3234,8 +3678,8 @@
      "fields": [
       "esurge_importance_sampling_mode"
      ],
-     "if": "self.esurge_importance_sampling_mode not in {'token_truncate', 'token_mask', 'sequence_truncate', 'sequence_mask'}",
-     "message": "`esurge_importance_sampling_mode` must be one of 'token_truncate', 'token_mask', 'sequence_truncate', or 'sequence_mask'."
+     "if": "self.esurge_importance_sampling_mode not in {'token_truncate', 'token_mask', 'token_icepop', 'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', 'sequence_log_mask'}",
+     "message": "`esurge_importance_sampling_mode` must be one of 'token_truncate', 'token_mask', 'token_icepop', 'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', or 'sequence_log_mask'."
     },
     {
      "fields": [
@@ -3243,6 +3687,28 @@
      ],
      "if": "self.esurge_importance_sampling_cap <= 0.0",
      "message": "`esurge_importance_sampling_cap` must be positive."
+    },
+    {
+     "fields": [
+      "esurge_importance_sampling_cap",
+      "esurge_importance_sampling_mode"
+     ],
+     "if": "self.esurge_importance_sampling_mode.endswith('_log_mask') and self.esurge_importance_sampling_cap <= 1.0",
+     "message": "`esurge_importance_sampling_cap` must be > 1.0 for log-mask modes so the band |log ratio| <= log(cap) is non-empty."
+    },
+    {
+     "fields": [
+      "off_policy_min_acceptance"
+     ],
+     "if": "self.off_policy_min_acceptance is not None and self.off_policy_min_acceptance > 1.0",
+     "message": "`off_policy_min_acceptance` must be in (0, 1]; got {self.off_policy_min_acceptance}."
+    },
+    {
+     "fields": [
+      "startup_behavior_tail_fraction_max"
+     ],
+     "if": "self.startup_behavior_tail_fraction_max <= 0.0",
+     "message": "`startup_behavior_tail_fraction_max` must be positive; got {self.startup_behavior_tail_fraction_max}."
     },
     {
      "fields": [
@@ -3294,6 +3760,72 @@
      ],
      "if": "self.generation_batch_size % self.total_batch_size != 0",
      "message": "`generation_batch_size` must be divisible by `total_batch_size` in EasyDeL."
+    },
+    {
+     "fields": [
+      "epsilon"
+     ],
+     "if": "not 0.0 < self.epsilon < 1.0",
+     "message": "`loss_type='gmpo'` requires `0 < epsilon < 1`; got {self.epsilon}."
+    },
+    {
+     "fields": [
+      "toggle_max_completion_length"
+     ],
+     "if": "self.toggle_max_completion_length is None",
+     "message": "`toggle_max_completion_length` is required when `toggle_budget_interval > 0`."
+    },
+    {
+     "fields": [
+      "max_completion_length",
+      "toggle_max_completion_length"
+     ],
+     "if": "not 0 < self.toggle_max_completion_length <= self.max_completion_length",
+     "message": "`toggle_max_completion_length` must be in (0, max_completion_length] (max_completion_length={self.max_completion_length}); got {self.toggle_max_completion_length}."
+    },
+    {
+     "fields": [
+      "esurge_importance_sampling_cap_low"
+     ],
+     "if": "self.esurge_importance_sampling_cap_low <= 0.0",
+     "message": "`esurge_importance_sampling_cap_low` must be positive when set."
+    },
+    {
+     "fields": [
+      "esurge_importance_sampling_cap",
+      "esurge_importance_sampling_cap_low"
+     ],
+     "if": "self.esurge_importance_sampling_cap_low > self.esurge_importance_sampling_cap",
+     "message": "`esurge_importance_sampling_cap_low` must be <= `esurge_importance_sampling_cap`."
+    },
+    {
+     "fields": [
+      "esurge_importance_sampling_cap",
+      "esurge_importance_sampling_mode"
+     ],
+     "if": "self.esurge_importance_sampling_mode.endswith('_icepop') and self.esurge_importance_sampling_cap < 1.0",
+     "message": "`esurge_importance_sampling_cap` must be >= 1.0 for IcePop modes when `esurge_importance_sampling_cap_low` is None so [1/cap, cap] is non-empty."
+    },
+    {
+     "fields": [
+      "esurge_importance_sampling_correction"
+     ],
+     "if": "not self.esurge_importance_sampling_correction",
+     "message": "`{knob}` requires behaviour log-probs from the rollout engine; set `esurge_importance_sampling_correction=True` (eSurge importance-sampling inputs)."
+    },
+    {
+     "fields": [
+      "completion_chunk_size"
+     ],
+     "if": "self.completion_chunk_size is not None",
+     "message": "`prefix_shared_forward=True` is not supported with `completion_chunk_size`."
+    },
+    {
+     "fields": [
+      "top_entropy_quantile"
+     ],
+     "if": "self.top_entropy_quantile < 1.0",
+     "message": "`prefix_shared_forward=True` requires `top_entropy_quantile == 1.0`."
     },
     {
      "fields": [
@@ -3369,6 +3901,17 @@
      "required": false,
      "type": "int | None"
     },
+    "decouple_reward_normalization": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "doc": "GDPO (arXiv:2601.05242) switch. When ``True`` each reward function is normalised within its prompt group before the weighted sum, and the summed reward is then normalised over the batch. This forces ``multi_objective_aggregation=\"normalize_then_sum\"``; after ``__post_init__`` the flag mirrors that setting.",
+     "help": "GDPO: normalize each reward function within its prompt group before the weighted sum, then batch-normalize the summed reward. Forces multi_objective_aggregation='normalize_then_sum'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
     "delta": {
      "accepts": [
       "float",
@@ -3392,6 +3935,39 @@
      "help_source": "metadata",
      "required": false,
      "type": "bool"
+    },
+    "discard_unscorable_groups": {
+     "accepts": [
+      "bool",
+      "none"
+     ],
+     "default": null,
+     "help": "What a None reward (unscorable sample: judge or infra failure) does to its prompt group. None (default): per-function opt-in -- the whole group is dropped from the update (zero advantages, tokens and sequences excluded from every loss normaliser) only when the None comes from a reward function whose `discard_unscorable` attribute is True; a None from any other function becomes NaN and is skipped by the nan-aware reward statistics. True: a None from any function drops the group. False: never drop; every None uses the nan-aware aggregation.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool | None"
+    },
+    "dynamic_sampling": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "doc": "DAPO dynamic sampling (arXiv:2503.14476). When ``True``, training batches whose prompt groups have zero reward variance are re-sampled; groups that stay uninformative after ``dynamic_sampling_max_attempts`` are removed from the loss by zeroing their completion mask. Requires ``num_generations >= 2``.",
+     "help": "DAPO dynamic sampling: re-sample training batches whose prompt groups have zero reward variance.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "dynamic_sampling_max_attempts": {
+     "accepts": [
+      "int"
+     ],
+     "default": 3,
+     "doc": "Total rollout attempts per training batch (the first rollout included).",
+     "help": "Total rollout attempts per training batch when dynamic_sampling=True.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
     },
     "environment_factory": {
      "default": null,
@@ -3431,16 +4007,31 @@
       "int"
      ],
      "default": 3.0,
-     "help": "eSurge importance-sampling cap.",
+     "doc": "Upper ratio bound (``beta``) for eSurge importance-sampling correction.",
+     "help": "Upper ratio bound for eSurge importance-sampling correction.",
      "help_source": "metadata",
      "required": false,
      "type": "float"
+    },
+    "esurge_importance_sampling_cap_low": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Optional lower ratio bound (``alpha``) for IcePop modes. When ``None``, defaults to ``1.0 / esurge_importance_sampling_cap`` (symmetric ``[1/beta, beta]``).",
+     "help": "Optional lower ratio bound for IcePop importance-sampling modes. When None, defaults to 1.0 / esurge_importance_sampling_cap.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
     },
     "esurge_importance_sampling_correction": {
      "accepts": [
       "bool"
      ],
      "default": true,
+     "doc": "When ``True``, apply importance-sampling correction between learner and eSurge rollout log-probabilities.",
      "help": "eSurge importance-sampling correction toggle.",
      "help_source": "metadata",
      "required": false,
@@ -3451,7 +4042,8 @@
       "str"
      ],
      "default": "sequence_mask",
-     "help": "eSurge importance-sampling mode.",
+     "doc": "Granularity and masking mode for rollout-to-learner mismatch correction. One of ``\"token_truncate\"``, ``\"token_mask\"``, ``\"token_icepop\"``, ``\"token_log_mask\"``, ``\"sequence_truncate\"``, ``\"sequence_mask\"``, ``\"sequence_icepop\"``, or ``\"sequence_log_mask\"``. ``\"token_icepop\"`` implements IcePop's double-sided token mask outside ``[cap_low, cap]``; ``\"sequence_icepop\"`` is a sequence-level extension of the same band mask. The ``*_log_mask`` modes (Kimi K2.5, arXiv:2602.02276) drop tokens/sequences with ``|log ratio| > log(cap)`` and keep the rest with weight ``1`` (no ratio re-weighting); the sequence variant uses the summed token log ratio and both require ``cap > 1``.",
+     "help": "eSurge importance-sampling mode. One of 'token_truncate', 'token_mask', 'token_icepop', 'token_log_mask', 'sequence_truncate', 'sequence_mask', 'sequence_icepop', or 'sequence_log_mask'.",
      "help_source": "metadata",
      "required": false,
      "type": "str"
@@ -3486,6 +4078,17 @@
      "default": "token",
      "doc": "``\"token\"`` or ``\"sequence\"``.",
      "help": "Importance sampling applied per 'token', aggregated per 'sequence', or GSPO-token 'sequence_token'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "kl_estimator": {
+     "accepts": [
+      "str"
+     ],
+     "default": "k3",
+     "doc": "Per-token estimator of ``KL(pi || pi_ref)`` used for the ``beta`` penalty: ``\"k1\"`` (``log r``), ``\"k2\"`` (``0.5 * (log r)^2``), ``\"k3\"`` (``1/r - 1 + log r``, default), or ``\"l2\"`` (``(log r)^2``), with ``r = pi / pi_ref``.",
+     "help": "Per-token estimator of KL(pi || pi_ref) used by the beta penalty: 'k1' (log r), 'k2' (0.5 * (log r)^2), 'k3' (1/r - 1 + log r), or 'l2' ((log r)^2), with r = pi / pi_ref.",
      "help_source": "metadata",
      "required": false,
      "type": "str"
@@ -3552,8 +4155,8 @@
       "str"
      ],
      "default": "dapo",
-     "doc": "One of ``\"grpo\"``, ``\"bnpo\"``, ``\"dr_grpo\"``, ``\"dapo\"``, ``\"cispo\"``, ``\"sapo\"``, ``\"luspo\"``, ``\"vespo\"``. Default ``\"dapo\"``.",
-     "help": "Loss variant to use. One of ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo'].",
+     "doc": "One of ``\"grpo\"``, ``\"bnpo\"``, ``\"dr_grpo\"``, ``\"dapo\"``, ``\"cispo\"``, ``\"sapo\"``, ``\"luspo\"``, ``\"vespo\"``, ``\"gmpo\"``. Default ``\"dapo\"``. ``\"gmpo\"`` (arXiv:2507.20673) optimises the geometric mean of the advantage-sign-aware clipped token ratios of each sequence and requires token-level importance sampling and ``epsilon < 1``.",
+     "help": "Loss variant to use. One of ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo', 'luspo', 'vespo', 'gmpo'].",
      "help_source": "metadata",
      "required": false,
      "type": "str"
@@ -3693,6 +4296,18 @@
      "required": false,
      "type": "int"
     },
+    "off_policy_k3_threshold": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional per-sequence mean K3 bound between learner and eSurge behaviour log-probs. Sequences above it are rejected (loss zeroed, normaliser unchanged). Requires esurge_importance_sampling_correction=True.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
     "off_policy_mask_threshold": {
      "accepts": [
       "float",
@@ -3702,6 +4317,18 @@
      "default": null,
      "doc": "Optional sequence-level forward-KL threshold for dropping negative-advantage off-policy samples from the policy objective.",
      "help": "Optional off-policy sequence mask threshold. Negative-advantage samples with mean forward KL above this value are removed from the policy objective.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
+    "off_policy_min_acceptance": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional minimum accepted/eligible sequence fraction; below it the step leaves parameters and optimizer state unchanged. Requires esurge_importance_sampling_correction=True.",
      "help_source": "metadata",
      "required": false,
      "type": "float | None"
@@ -3717,6 +4344,16 @@
      "help_source": "metadata",
      "required": false,
      "type": "int | None"
+    },
+    "prefix_shared_forward": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "help": "Run the policy loss forward with prompts once per group: a capture pass over the prompts records each layer's key/value states and a fork pass scores the completions against the gathered prefix. Dense full-attention models, and hybrid qwen3_next models (full attention plus gated-delta linear_attention layers, whose end-of-prompt conv window and recurrent state are captured instead; prompt and completion lengths must be >= 2), with attn_mechanism 'vanilla', 'sdpa', 'flash_attn2' or 'blocksparse' only (flash_attn2 at the model's default matmul precision is bf16-pass accurate, about 6e-3, on TPU; the TPU Pallas gated-delta kernel's default precision puts qwen3_next log-probs about 2.6e-4 from the repeated-prompt forward). Other hybrid/recurrent families (KDA, MLA, Mamba) are rejected; incompatible with completion_chunk_size, top_entropy_quantile < 1 and mpmd_scheduler. With 'vanilla'/'sdpa' the completions attend the shared prefix without a per-completion copy (exact log-sum-exp merge); on TPU (697M dense model, G=8) it beat the default forward at every measured prompt/completion ratio, e.g. 0.119 s vs 0.316 s per step at P=1024/C=256 and 0.325 s vs 0.378 s at P=512/C=2048. 'flash_attn2'/'blocksparse' still copy the prefix per completion and only pay off when prompts are at least as long as completions.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
     },
     "presence_penalty": {
      "accepts": [
@@ -3747,7 +4384,7 @@
       "int"
      ],
      "default": 0.9,
-     "doc": "Polyak mixing coefficient used when syncing the reference (``new_ref = alpha * ref + (1 - alpha) * policy``).",
+     "doc": "Polyak mixing coefficient used when syncing the reference (``new_ref = alpha * policy + (1 - alpha) * ref``).",
      "help": "The alpha parameter for mixing the reference model with the policy model.",
      "help_source": "metadata",
      "required": false,
@@ -3829,8 +4466,8 @@
       "str"
      ],
      "default": "group",
-     "doc": "Reward scaling strategy: ``\"group\"`` (default), ``\"batch\"``, ``\"none\"``. ``True``/``False`` are accepted and mapped to ``\"group\"``/``\"none\"``.",
-     "help": "Reward scaling strategy: 'group', 'batch', 'none', or the booleans True/False for group/none.",
+     "doc": "Reward scaling strategy: ``\"group\"`` (default), ``\"batch\"``, ``\"batch_advantage\"`` (standardize group-centred advantages over the batch), ``\"none\"``. ``True``/``False`` are accepted and mapped to ``\"group\"``/``\"none\"``.",
+     "help": "Reward scaling strategy: 'group', 'batch', 'batch_advantage', 'none', or the booleans True/False for group/none.",
      "help_source": "metadata",
      "required": false,
      "type": "str | bool"
@@ -3857,6 +4494,29 @@
      "help_source": "metadata",
      "required": false,
      "type": "bool"
+    },
+    "startup_behavior_k3_max": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional first-step parity bound on the token-mean behaviour K3. A violation skips the first update and raises. Requires esurge_importance_sampling_correction=True.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
+    "startup_behavior_tail_fraction_max": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.01,
+     "help": "First-step bound on the fraction of tokens with |log ratio| > 0.25.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
     },
     "steps_per_generation": {
      "accepts": [
@@ -3892,6 +4552,29 @@
      "help_source": "metadata",
      "required": false,
      "type": "float"
+    },
+    "toggle_budget_interval": {
+     "accepts": [
+      "int"
+     ],
+     "default": 0,
+     "doc": "Kimi \"Toggle\" budget alternation period in optimizer steps. ``0`` disables it. Otherwise steps in ``[k * interval, (k + 1) * interval)`` with odd ``k`` generate with ``toggle_max_completion_length`` new tokens and even ``k`` use the full budget. Budget-phase completions are right-padded to the full width so compiled shapes stay fixed.",
+     "help": "Kimi Toggle budget alternation period in optimizer steps. 0 disables it; otherwise odd periods generate with toggle_max_completion_length new tokens.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
+    "toggle_max_completion_length": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Completion budget of the constrained Toggle phase. Required when ``toggle_budget_interval > 0``; must be in ``(0, max_completion_length]``.",
+     "help": "Completion budget of the constrained Toggle phase. Required when toggling is enabled.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
     },
     "tool_caller": {
      "accepts": [
@@ -4041,8 +4724,18 @@
     "esurge_importance_sampling_mode": [
      "token_truncate",
      "token_mask",
+     "token_icepop",
+     "token_log_mask",
      "sequence_truncate",
-     "sequence_mask"
+     "sequence_mask",
+     "sequence_icepop",
+     "sequence_log_mask"
+    ],
+    "kl_estimator": [
+     "k1",
+     "k2",
+     "k3",
+     "l2"
     ],
     "loss_type": [
      "grpo",
@@ -4053,7 +4746,8 @@
      "sapo",
      "luspo",
      "vespo",
-     "dppo"
+     "dppo",
+     "gmpo"
     ],
     "multi_objective_aggregation": [
      "sum_then_normalize",
@@ -4482,7 +5176,7 @@
       "float",
       "int"
      ],
-     "default": 0.0,
+     "default": 1.0,
      "required": false,
      "type": "float"
     },
@@ -4664,6 +5358,8 @@
       "int"
      ],
      "default": 10800.0,
+     "help": "Timeout in seconds waiting for a background async rollout task.",
+     "help_source": "inherited:TrainingArguments",
      "required": false,
      "type": "float"
     },
@@ -4688,16 +5384,6 @@
      "help_source": "inherited:GRPOConfig",
      "required": false,
      "type": "str | None"
-    },
-    "use_esurge_generation": {
-     "accepts": [
-      "bool"
-     ],
-     "default": true,
-     "help": "Whether to use eSurge engine for preview generation instead of compiled functions.",
-     "help_source": "inherited:TrainingArguments",
-     "required": false,
-     "type": "bool"
     }
    },
    "module": "easydel.trainers.nemo_gym_trainer.nemo_gym_config",
@@ -4895,11 +5581,32 @@
    "checks": [
     {
      "fields": [
+      "distillation_mode"
+     ],
+     "if": "self.distillation_mode not in ('divergence', 'trust_region')",
+     "message": "`distillation_mode` must be 'divergence' or 'trust_region'; got {self.distillation_mode}."
+    },
+    {
+     "fields": [
+      "trust_region_top_k"
+     ],
+     "if": "self.trust_region_top_k < 1",
+     "message": "`trust_region_top_k` must be >= 1."
+    },
+    {
+     "fields": [
       "max_length",
       "max_prompt_length"
      ],
      "if": "self.max_length < self.max_prompt_length",
      "message": "`max_length` ({self.max_length}) must be >= `max_prompt_length` ({self.max_prompt_length})."
+    },
+    {
+     "fields": [
+      "generate_with_teacher"
+     ],
+     "if": "self.generate_with_teacher",
+     "message": "`distillation_mode='trust_region'` scores tokens the student proposed; it cannot be used with `generate_with_teacher=True`."
     },
     {
      "fields": [
@@ -4910,6 +5617,28 @@
     }
    ],
    "fields": {
+    "alpha": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 1.0,
+     "help": "Weight applied to the on-policy KL distillation loss (defaults to 1.0 because no hard-label CE term is active during on-policy rollouts).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "distillation_mode": {
+     "accepts": [
+      "str"
+     ],
+     "default": "divergence",
+     "doc": "``\"divergence\"`` or ``\"trust_region\"`` (speculative-decoding-style acceptance of sampled tokens).",
+     "help": "'divergence' (default) minimizes the selected divergence (forward KL, `beta` JSD/reverse KL, `cakld_gamma`, `loss_top_k`). 'trust_region' applies speculative-decoding-style acceptance to each sampled token: with P = min(exp(t_lp - s_lp), 1) and M ~ Bernoulli(P), accepted tokens get a reverse-KL policy gradient sg(s_lp - t_lp) * s_lp and rejected tokens the teacher-top-k forward KL (`trust_region_top_k`).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
     "frequency_penalty": {
      "accepts": [
       "float",
@@ -5052,13 +5781,41 @@
      "help_source": "metadata",
      "required": false,
      "type": "str | None"
+    },
+    "trust_region_seed": {
+     "accepts": [
+      "int"
+     ],
+     "default": 0,
+     "doc": "Base seed of the per-step acceptance draw.",
+     "help": "Base seed of the per-step trust-region acceptance draw (folded with the step).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
+    "trust_region_top_k": {
+     "accepts": [
+      "int"
+     ],
+     "default": 64,
+     "doc": "Teacher top-k support of the rejected-token forward KL in trust-region mode. Defaults to ``64``.",
+     "help": "Teacher top-k support of the rejected-token forward KL in trust-region mode.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
     }
    },
    "module": "easydel.trainers.on_policy_distillation_trainer.on_policy_distillation_config",
    "registered_ids": [
     "on_policy_distillation"
    ],
-   "summary": "Configuration for on-policy knowledge distillation training."
+   "summary": "Configuration for on-policy knowledge distillation training.",
+   "validated_choices": {
+    "distillation_mode": [
+     "divergence",
+     "trust_region"
+    ]
+   }
   },
   "OnlineActorCriticConfig": {
    "bases": [
@@ -5186,6 +5943,16 @@
     }
    ],
    "fields": {
+    "asynchronous_rollouts": {
+     "accepts": [
+      "bool"
+     ],
+     "default": true,
+     "help": "Enable bounded asynchronous rollout prefetching when running on a single host. Set to False to collect rollouts synchronously on the learner thread.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
     "critic_cliprange_value": {
      "accepts": [
       "float",
@@ -5431,7 +6198,7 @@
      ],
      "default": 1,
      "doc": "Actor updates between rollout-policy snapshots.",
-     "help": "Actor steps between rollout-policy snapshot refreshes.",
+     "help": "Actor steps between rollout-policy snapshot refreshes. Lookahead on a snapshot is capped to the remaining batches before its next refresh.",
      "help_source": "metadata",
      "required": false,
      "type": "int"
@@ -5675,6 +6442,49 @@
     },
     {
      "fields": [
+      "gae_lambda_critic"
+     ],
+     "if": "self.gae_lambda_critic is not None and (not 0.0 <= float(self.gae_lambda_critic) <= 1.0)",
+     "message": "`gae_lambda_critic` must be in [0, 1] when set."
+    },
+    {
+     "fields": [
+      "length_adaptive_gae_alpha"
+     ],
+     "if": "self.length_adaptive_gae_alpha <= 0",
+     "message": "`length_adaptive_gae_alpha` must be positive."
+    },
+    {
+     "fields": [
+      "cliprange_high"
+     ],
+     "if": "self.cliprange_high is not None and self.cliprange_high < 0",
+     "message": "`cliprange_high` must be non-negative when set."
+    },
+    {
+     "fields": [
+      "positive_nll_coef"
+     ],
+     "if": "self.positive_nll_coef < 0",
+     "message": "`positive_nll_coef` must be non-negative."
+    },
+    {
+     "fields": [
+      "value_pretrain_steps"
+     ],
+     "if": "self.value_pretrain_steps < 0",
+     "message": "`value_pretrain_steps` must be non-negative."
+    },
+    {
+     "fields": [
+      "value_pretrain_steps",
+      "vf_coef"
+     ],
+     "if": "self.value_pretrain_steps > 0 and self.vf_coef <= 0",
+     "message": "`value_pretrain_steps > 0` requires a positive `vf_coef`; the critic would not train."
+    },
+    {
+     "fields": [
       "num_mini_batches"
      ],
      "if": "self.num_mini_batches != 1",
@@ -5732,6 +6542,13 @@
     },
     {
      "fields": [
+      "kl_estimator"
+     ],
+     "if": "self.kl_estimator not in ('k1', 'k3')",
+     "message": "`kl_estimator` must be 'k1' or 'k3', got {self.kl_estimator}."
+    },
+    {
+     "fields": [
       "stop_token"
      ],
      "if": "self.stop_token is not None and self.stop_token != 'eos'",
@@ -5751,6 +6568,20 @@
      ],
      "if": "self.stop_token_id is not None and self.stop_token_id < 0",
      "message": "`stop_token_id` must be non-negative when set."
+    },
+    {
+     "fields": [
+      "num_return_sequences"
+     ],
+     "if": "self.num_return_sequences < 1",
+     "message": "`num_return_sequences` must be at least 1."
+    },
+    {
+     "fields": [
+      "num_generations"
+     ],
+     "if": "self.num_generations is not None and self.num_generations < 1",
+     "message": "`num_generations` must be at least 1 when set."
     },
     {
      "fields": [
@@ -5818,6 +6649,14 @@
      ],
      "if": "int(self.local_mini_batch_size) != int(self.mini_batch_size)",
      "message": "`local_mini_batch_size` must match `mini_batch_size` when `world_size=1`."
+    },
+    {
+     "fields": [
+      "num_generations",
+      "num_return_sequences"
+     ],
+     "if": "self.num_return_sequences != self.num_generations",
+     "message": "`num_return_sequences` and `num_generations` are aliases and must match when both are set; got num_return_sequences={self.num_return_sequences} and num_generations={self.num_generations}."
     }
    ],
    "fields": {
@@ -5855,6 +6694,19 @@
      "help_source": "metadata",
      "required": false,
      "type": "float"
+    },
+    "cliprange_high": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Optional decoupled upper policy-ratio clip (\"clip-higher\"). The ratio is clipped to ``[1 - cliprange, 1 + cliprange_high]``; ``None`` keeps the symmetric ``cliprange``.",
+     "help": "Optional upper policy-ratio clip (clip-higher). `None` keeps the symmetric `cliprange`.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
     },
     "cliprange_value": {
      "accepts": [
@@ -5914,6 +6766,19 @@
      "help_source": "metadata",
      "required": false,
      "type": "float"
+    },
+    "gae_lambda_critic": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "doc": "Decoupled GAE trace decay used to build the value-function targets. ``None`` reuses ``lam``; VAPO uses ``1.0`` (unbiased Monte-Carlo returns for the critic).",
+     "help": "Decoupled GAE lambda for value targets. `None` reuses `lam`; VAPO uses 1.0.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
     },
     "gamma": {
      "accepts": [
@@ -5987,6 +6852,29 @@
      "default": 1e-06,
      "doc": "Optimiser step size for the joint policy + value-head update.",
      "help": "Learning rate for PPO fine-tuning.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "length_adaptive_gae": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "doc": "When ``True`` the *policy* advantages use a per-trajectory lambda ``clip(1 - 1 / (length_adaptive_gae_alpha * l), 0, 1)`` where ``l`` is the number of completion tokens, instead of ``lam``.",
+     "help": "Use the per-trajectory policy lambda clip(1 - 1 / (alpha * length), 0, 1).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "length_adaptive_gae_alpha": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.05,
+     "doc": "``alpha`` in the length-adaptive lambda schedule. Must be positive.",
+     "help": "Alpha of the length-adaptive GAE lambda schedule. Must be positive.",
      "help_source": "metadata",
      "required": false,
      "type": "float"
@@ -6194,6 +7082,30 @@
      "required": false,
      "type": "int | None"
     },
+    "positive_nll_coef": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.0,
+     "doc": "Weight of the auxiliary negative log-likelihood on completions whose score exceeds ``positive_reward_threshold``. ``0`` disables it.",
+     "help": "Weight of the NLL auxiliary loss on positive (score > threshold) completions.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "positive_reward_threshold": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.0,
+     "doc": "A completion is \"positive\" when its scalar score (reward-function sum, after the missing-EOS penalty, before the KL penalty) is strictly greater than this.",
+     "help": "Completions with score strictly above this threshold count as positive examples.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
     "presence_penalty": {
      "accepts": [
       "float",
@@ -6323,6 +7235,17 @@
      "required": false,
      "type": "float"
     },
+    "token_level_loss": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "doc": "When ``True`` the policy-gradient loss (and the positive-example NLL) is a token sum divided by the total number of completion tokens in the rollout batch, so long sequences are not down-weighted, instead of a microbatch-local masked mean.",
+     "help": "Normalize the policy loss by the total completion-token count of the rollout batch.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
     "tools": {
      "accepts": [
       "list",
@@ -6382,6 +7305,17 @@
      "required": false,
      "type": "str | None"
     },
+    "value_pretrain_steps": {
+     "accepts": [
+      "int"
+     ],
+     "default": 0,
+     "doc": "Number of initial optimiser steps that train only the value head: the loss is ``vf_coef * vf_loss`` and the value head reads detached hidden states, so the policy receives no gradient. Counted in optimiser steps, so each PPO epoch counts.",
+     "help": "Number of initial optimizer steps that train only the value head.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
     "vf_coef": {
      "accepts": [
       "float",
@@ -6432,13 +7366,47 @@
    "registered_ids": [
     "ppo"
    ],
-   "summary": "Hyperparameters for RLHF-style Proximal Policy Optimization."
+   "summary": "Hyperparameters for RLHF-style Proximal Policy Optimization.",
+   "validated_choices": {
+    "kl_estimator": [
+     "k1",
+     "k3"
+    ]
+   }
   },
   "PRMConfig": {
    "bases": [
     "RewardConfig"
    ],
+   "checks": [
+    {
+     "fields": [
+      "center_rewards_coefficient"
+     ],
+     "if": "self.center_rewards_coefficient is not None",
+     "message": "`center_rewards_coefficient` is not supported by EasyDeL PRMTrainer (which trains with token-classification cross-entropy); leave it as None."
+    },
+    {
+     "fields": [
+      "max_completion_length"
+     ],
+     "if": "self.max_completion_length is not None and (isinstance(self.max_completion_length, bool) or self.max_completion_length <= 0)",
+     "message": "`max_completion_length` must be a positive integer when set."
+    }
+   ],
    "fields": {
+    "center_rewards_coefficient": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Inherited from RewardConfig for schema compatibility only; unused by PRMTrainer (token-classification loss) and must remain None.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
     "dataset_num_proc": {
      "accepts": [
       "int",
@@ -6557,7 +7525,7 @@
       "str"
      ],
      "default": "none",
-     "help": "Reward scaling strategy: 'group', 'batch', 'none', or the booleans True/False for group/none.",
+     "help": "Reward scaling strategy: 'group', 'batch', 'batch_advantage', 'none', or the booleans True/False for group/none.",
      "help_source": "inherited:GRPOConfig",
      "required": false,
      "type": "str | bool"
@@ -6644,6 +7612,27 @@
      "required": false,
      "type": "float"
     },
+    "length_penalty_max_length": {
+     "accepts": [
+      "int",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional maximum length above which the length penalty verifier scores 0.0. `None` disables the hard cap.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int | None"
+    },
+    "length_penalty_min_length": {
+     "accepts": [
+      "int"
+     ],
+     "default": 10,
+     "help": "Minimum length below which the length penalty verifier scores 0.0.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
     "length_penalty_target": {
      "accepts": [
       "int",
@@ -6668,16 +7657,28 @@
      "required": false,
      "type": "float"
     },
-    "max_len_mask": {
+    "mask_truncated_completions": {
      "accepts": [
-      "bool"
+      "bool",
+      "none"
      ],
-     "default": true,
-     "doc": "If True, mask out completions that hit the maximum length (no EOS token) from the loss.",
-     "help": "Mask completions without EOS from the loss.",
+     "default": null,
+     "help": "If True, drop completions that do not terminate with EOS from the loss calculation. Defaults to `max_len_mask` (True) when omitted.",
      "help_source": "metadata",
      "required": false,
-     "type": "bool"
+     "type": "bool | None"
+    },
+    "max_len_mask": {
+     "accepts": [
+      "bool",
+      "none"
+     ],
+     "default": null,
+     "doc": "If True, mask out completions that hit the maximum length (no EOS token) from the loss.",
+     "help": "Mask completions without EOS from the loss. Alias for `mask_truncated_completions`; defaults to True when neither is explicitly set.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool | None"
     },
     "reward_clip_range": {
      "accepts": [
@@ -6723,6 +7724,53 @@
    ],
    "summary": "Configuration for Reinforcement Learning with Verifiable Rewards."
   },
+  "ReinforcePlusPlusConfig": {
+   "bases": [
+    "GRPOConfig"
+   ],
+   "fields": {
+    "kl_estimator": {
+     "accepts": [
+      "str"
+     ],
+     "default": "k2",
+     "doc": "KL estimator for the ``beta`` penalty. Default ``\"k2\"``.",
+     "help": "Per-token KL estimator for the beta penalty. REINFORCE++ uses 'k2'.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str"
+    },
+    "scale_rewards": {
+     "accepts": [
+      "bool",
+      "str"
+     ],
+     "default": "batch_advantage",
+     "doc": "Reward scaling strategy. Default ``\"batch_advantage\"``.",
+     "help": "Reward scaling strategy. REINFORCE++ standardizes group-centred advantages over the batch ('batch_advantage').",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | bool"
+    },
+    "trainer_prefix": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": "REINFORCE++",
+     "doc": "Default prefix used for checkpoints/logs (``\"REINFORCE++\"``).",
+     "help": "default prefix name for trainer.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    }
+   },
+   "module": "easydel.trainers.reinforce_plus_plus_trainer.reinforce_plus_plus_config",
+   "registered_ids": [
+    "reinforce_plus_plus"
+   ],
+   "summary": "Configuration class for REINFORCE++ (arXiv:2501.03262)."
+  },
   "RewardConfig": {
    "bases": [
     "TrainingArguments"
@@ -6739,15 +7787,22 @@
      "fields": [
       "dataset_num_proc"
      ],
-     "if": "self.dataset_num_proc is not None and self.dataset_num_proc <= 0",
+     "if": "self.dataset_num_proc is not None and (isinstance(self.dataset_num_proc, bool) or self.dataset_num_proc <= 0)",
      "message": "`dataset_num_proc` must be positive when set."
     },
     {
      "fields": [
       "pad_to_multiple_of"
      ],
-     "if": "self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0",
+     "if": "self.pad_to_multiple_of is not None and (isinstance(self.pad_to_multiple_of, bool) or self.pad_to_multiple_of <= 0)",
      "message": "`pad_to_multiple_of` must be a positive integer when set."
+    },
+    {
+     "fields": [
+      "center_rewards_coefficient"
+     ],
+     "if": "isinstance(self.center_rewards_coefficient, bool) or not math.isfinite(float(self.center_rewards_coefficient)) or float(self.center_rewards_coefficient) < 0.0",
+     "message": "`center_rewards_coefficient` must be a finite non-negative float when set."
     }
    ],
    "fields": {
@@ -7089,7 +8144,7 @@
       "int",
       "none"
      ],
-     "default": 1,
+     "default": null,
      "doc": "Alias that is likewise fixed to one.",
      "help": "Alias for num_return_sequences; fixed to one by SAO.",
      "help_source": "metadata",
@@ -7507,8 +8562,8 @@
       "int"
      ],
      "default": 256,
-     "doc": "Maximum number of tokens reserved for the feedback separator inserted between the original prompt and the original completion in the teacher context. Longer feedback is truncated; shorter feedback is right-padded with the tokenizer's pad token. Defaults to ``256``.",
-     "help": "Maximum number of tokens reserved for the feedback separator that is inserted between the original prompt and the original completion in the teacher context. Feedback strings that are longer will be truncated; shorter ones are right-padded with the tokenizer's pad token.",
+     "doc": "Maximum number of tokens reserved for the feedback separator inserted between the original prompt and the original completion in the teacher context. Longer feedback is truncated; the combined prompt + feedback prefix is left-padded so ``completion_ids[:, 0]`` is always conditioned on a real token. Defaults to ``256``.",
+     "help": "Maximum number of tokens reserved for the feedback separator that is inserted between the original prompt and the original completion in the teacher context. Feedback strings that are longer will be truncated; the combined prompt + feedback prefix is left-padded with the tokenizer's pad token.",
      "help_source": "metadata",
      "required": false,
      "type": "int"
@@ -7693,8 +8748,22 @@
      "fields": [
       "pad_to_multiple_of"
      ],
-     "if": "self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0",
+     "if": "self.pad_to_multiple_of is not None and (isinstance(self.pad_to_multiple_of, bool) or self.pad_to_multiple_of <= 0)",
      "message": "`pad_to_multiple_of` must be a positive integer when set."
+    },
+    {
+     "fields": [
+      "completion_loss_chunk_size"
+     ],
+     "if": "self.completion_loss_chunk_size is not None and (isinstance(self.completion_loss_chunk_size, bool) or self.completion_loss_chunk_size <= 0)",
+     "message": "`completion_loss_chunk_size` must be a positive integer when set."
+    },
+    {
+     "fields": [
+      "packing_strategy"
+     ],
+     "if": "self.packing_strategy not in valid_packing_strategies",
+     "message": "`packing_strategy` must be one of {valid_packing_strategies}; got {self.packing_strategy}."
     }
    ],
    "fields": {
@@ -7987,9 +9056,20 @@
   },
   "SSDConfig": {
    "bases": [
-    "SDPOConfig"
+    "GRPOConfig"
    ],
    "fields": {
+    "beta": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.0,
+     "help": "The beta parameter for GRPO.",
+     "help_source": "inherited:GRPOConfig",
+     "required": false,
+     "type": "float"
+    },
     "filter_empty": {
      "accepts": [
       "bool"
@@ -8004,8 +9084,8 @@
       "str"
      ],
      "default": "SSD",
-     "help": "Default prefix name for the trainer checkpoint directory.",
-     "help_source": "inherited:SDPOConfig",
+     "help": "default prefix name for trainer.",
+     "help_source": "inherited:GRPOConfig",
      "required": false,
      "type": "str | None"
     }
@@ -8231,6 +9311,17 @@
     }
    ],
    "fields": {
+    "alpha": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 1.0,
+     "help": "Weight applied to the partial KL loss when hard labels are also provided (defaults to 1.0 for pure on-policy sparse distillation).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
     "frequency_penalty": {
      "accepts": [
       "float",
@@ -8636,6 +9727,13 @@
     },
     {
      "fields": [
+      "beta"
+     ],
+     "if": "self.beta <= 0.0",
+     "message": "`beta` must be positive; got {self.beta}."
+    },
+    {
+     "fields": [
       "tpo_alpha"
      ],
      "if": "self.tpo_alpha < 0.0",
@@ -8814,6 +9912,16 @@
      "required": false,
      "type": "str | None"
     },
+    "async_mode": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "help": "Enable asynchronous background rollout generation with policy snapshots and staleness control on rollout-capable trainers (GRPO/GSPO/GFPO/RLOO/RLVR/DPPO/SDPO/SDFT/SSD/PAPO/NashMD/XPO/MiniLLM/AgenticMoshPit/NeMoGym/PPO/OnlineDPO/OnPolicyDistillation/GKD/SeqKD).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
     "auto_shard_states": {
      "accepts": [
       "bool"
@@ -8902,6 +10010,16 @@
      "help_source": "metadata",
      "required": false,
      "type": "Callable[[int], Any] | None"
+    },
+    "data_lane_local_batch": {
+     "accepts": [
+      "bool"
+     ],
+     "default": false,
+     "help": "When True on the grain data lanes (`parquetra_train_datasets` / `arrayrecord_train_*`), each batch-shard host group loads and collates only its own local batch rows instead of the full global batch, and `place_batch` lifts each group's local batch into the global sharded array. Requires a `data_collator` sized to the local group batch (see `data_lanes.resolve_lane_batch_size`). Default False preserves the global-batch contract.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
     },
     "dataloader_fast_forward_on_resume": {
      "accepts": [
@@ -9192,6 +10310,93 @@
      "required": false,
      "type": "dict | None"
     },
+    "eyvan_report_progress": {
+     "accepts": [
+      "bool"
+     ],
+     "default": true,
+     "help": "Forward rank-0 scalar step progress (`step`, `total`, finite scalar metrics) to `eyvan.report_progress(...)`. Acts as a fast no-op when `EYVAN_PROGRESS_URL` is absent.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "eyvan_track_flush_interval_s": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 5.0,
+     "help": "Background flush interval in seconds for `eyvan.track.start(...)`.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "eyvan_track_group": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": null,
+     "help": "Optional sweep or experiment group name for Eyvan tracking.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    },
+    "eyvan_track_name": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": null,
+     "help": "Human-readable run name for Eyvan tracking. Falls back to `wandb_name` or a cached W&B-style auto-generated name (e.g. `qwen3-grpo-amber-falcon-42`).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    },
+    "eyvan_track_project": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": null,
+     "help": "Local Eyvan tracking project slug (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) used when no explicit store URI is configured. Defaults from `EasyDeL-{trainer_prefix}` or `easydel`.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    },
+    "eyvan_track_tags": {
+     "accepts": [
+      "list",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional list of tags for Eyvan tracking; merged with auto-detected framework, trainer, RL/feature, model, and hardware tags, deduplicated, and clamped to Eyvan limits.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "list[str] | None"
+    },
+    "eyvan_track_uri": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": null,
+     "help": "Explicit Eyvan tracking store URI (`gs://...`, `file://...`, or local directory). When omitted, respects `EYVAN_TRACKING_URI`, then queries `eyvan.storage.resolve_default_tracking_uri` (configured default monitoring bucket), and finally falls back to `~/.eyvan/tracking/default/<project>`.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    },
+    "first_rollout_timeout": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 3600.0,
+     "help": "Timeout in seconds for the very first async rollout (covers cold XLA compile).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
     "force_step_start_point": {
      "accepts": [
       "bool"
@@ -9459,7 +10664,7 @@
       "none"
      ],
      "default": null,
-     "help": "sharding count to be used for grain dataloaders in both train and eval steps.",
+     "help": "sharding count to be used for grain dataloaders in both train and eval steps (lanes: None = number of batch-shard host groups, see grain_shard_index).",
      "help_source": "metadata",
      "required": false,
      "type": "int | None"
@@ -9470,10 +10675,21 @@
       "none"
      ],
      "default": null,
-     "help": "sharding index to be used for grain dataloaders in both train and eval steps.",
+     "help": "sharding index to be used for grain dataloaders in both train and eval steps. For the parquetra / ArrayRecord lanes, None groups hosts by the batch shards their devices hold (hosts that share a shard read the same rows); set both index and count to override.",
      "help_source": "metadata",
      "required": false,
      "type": "int | None"
+    },
+    "heartbeat_stale_after_s": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 120.0,
+     "help": "Timeout in seconds before an async rollout worker is treated as stalled.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
     },
     "host_phase_log_path": {
      "accepts": [
@@ -9630,6 +10846,16 @@
      "required": false,
      "type": "int | None"
     },
+    "max_inflight_tasks": {
+     "accepts": [
+      "int"
+     ],
+     "default": 32,
+     "help": "Maximum number of queued/inflight async rollout tasks when `async_mode=True`.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
     "max_length": {
      "accepts": [
       "int",
@@ -9650,6 +10876,16 @@
      "init_only": true,
      "required": false,
      "type": "InitVar[int | None]"
+    },
+    "max_staleness": {
+     "accepts": [
+      "int"
+     ],
+     "default": 1,
+     "help": "Maximum allowed optimizer-step lag between rollout generation and consumption.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
     },
     "max_training_steps": {
      "accepts": [
@@ -9722,6 +10958,17 @@
      "required": false,
      "type": "MpMdSchedulers | None"
     },
+    "no_weight_decay_patterns": {
+     "accepts": [
+      "list",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional list of regex/substring parameter path patterns excluded from weight decay (e.g. ['loop_gates', 'loop_iter_embeddings']).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "list[str] | None"
+    },
     "num_train_epochs": {
      "accepts": [
       "int"
@@ -9785,6 +11032,17 @@
      "help_source": "metadata",
      "required": false,
      "type": "AVAILABLE_OPTIMIZERS"
+    },
+    "param_lr_multipliers": {
+     "accepts": [
+      "dict",
+      "none"
+     ],
+     "default": null,
+     "help": "Optional mapping of regex/substring parameter path patterns to learning-rate multipliers (e.g. {'loop_gates': 10.0, 'loop_iter_embeddings': 10.0}). Applied statelessly at the end of the optimizer chain (zero extra optimizer state).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "dict[str, float] | None"
     },
     "parquet_metadata_cache_dir": {
      "accepts": [
@@ -10116,6 +11374,16 @@
      "required": false,
      "type": "QuantizationMode | None"
     },
+    "queue_maxsize": {
+     "accepts": [
+      "int"
+     ],
+     "default": 0,
+     "help": "Optional cap on buffered async rollout tasks (0 uses `max_inflight_tasks`).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
     "randomized_yarn": {
      "default_factory": "RandomizedYaRNConfig",
      "help": "Randomized YaRN position_ids augmentation (sorted random positions under a length curriculum); disabled by default and mutually exclusive with `pose`.",
@@ -10162,6 +11430,17 @@
      "help_source": "metadata",
      "required": false,
      "type": "int"
+    },
+    "request_timeout": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 120.0,
+     "help": "Timeout in seconds waiting for a background async rollout task.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
     },
     "resume_if_possible": {
      "accepts": [
@@ -10447,15 +11726,16 @@
      "required": false,
      "type": "bool"
     },
-    "use_esurge_generation": {
+    "use_eyvan_track": {
      "accepts": [
-      "bool"
+      "bool",
+      "none"
      ],
-     "default": true,
-     "help": "Whether to use eSurge engine for preview generation instead of compiled functions.",
+     "default": null,
+     "help": "Whether to log experiment metrics to Eyvan (`eyvan.track`). `None` (default) auto-enables whenever `eyvan` is installed and `performance_mode=False` (and not suppressed by test isolation via `set_eyvan_auto_track_enabled(False)`); `True` forces on; `False` disables completely. Disabled automatically when `performance_mode=True`.",
      "help_source": "metadata",
      "required": false,
-     "type": "bool"
+     "type": "bool | None"
     },
     "use_grain": {
      "accepts": [
@@ -10560,6 +11840,16 @@
      "required": false,
      "type": "str"
     },
+    "weight_sync_steps": {
+     "accepts": [
+      "int"
+     ],
+     "default": 1,
+     "help": "Optimizer steps between rollout policy snapshot refreshes when `async_mode=True`.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "int"
+    },
     "xla_compiler_options": {
      "accepts": [
       "dict",
@@ -10612,9 +11902,102 @@
    ],
    "summary": "Comprehensive configuration class for training and evaluation."
   },
+  "VAPOConfig": {
+   "bases": [
+    "PPOConfig"
+   ],
+   "fields": {
+    "cliprange_high": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": 0.28,
+     "doc": "Upper policy-ratio clip. Default ``0.28``.",
+     "help": "Upper policy-ratio clip (clip-higher).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
+    "gae_lambda_critic": {
+     "accepts": [
+      "float",
+      "int",
+      "none"
+     ],
+     "default": 1.0,
+     "doc": "Critic GAE lambda. Default ``1.0``.",
+     "help": "Decoupled GAE lambda for value targets. VAPO uses 1.0.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float | None"
+    },
+    "length_adaptive_gae": {
+     "accepts": [
+      "bool"
+     ],
+     "default": true,
+     "doc": "Use the length-adaptive policy lambda. Default ``True``.",
+     "help": "Use the per-trajectory policy lambda clip(1 - 1 / (alpha * length), 0, 1).",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "positive_nll_coef": {
+     "accepts": [
+      "float",
+      "int"
+     ],
+     "default": 0.1,
+     "doc": "Positive-example NLL weight. Default ``0.1``.",
+     "help": "Weight of the NLL auxiliary loss on positive (score > threshold) completions.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "float"
+    },
+    "token_level_loss": {
+     "accepts": [
+      "bool"
+     ],
+     "default": true,
+     "doc": "Token-level policy-gradient normalisation. Default ``True``.",
+     "help": "Normalize the policy loss by the total completion-token count of the rollout batch.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "bool"
+    },
+    "trainer_prefix": {
+     "accepts": [
+      "none",
+      "str"
+     ],
+     "default": "VAPO",
+     "doc": "Prefix for logs and checkpoints. Default ``\"VAPO\"``.",
+     "help": "Default prefix name for trainer outputs/checkpoints.",
+     "help_source": "metadata",
+     "required": false,
+     "type": "str | None"
+    }
+   },
+   "module": "easydel.trainers.vapo_trainer.vapo_config",
+   "registered_ids": [
+    "vapo"
+   ],
+   "summary": "Value-model-based Augmented PPO (VAPO) hyperparameters."
+  },
   "XPOConfig": {
    "bases": [
     "GRPOConfig"
+   ],
+   "checks": [
+    {
+     "fields": [
+      "loss_type"
+     ],
+     "if": "self.loss_type not in ('sigmoid', 'ipo')",
+     "message": "Unsupported XPO `loss_type`: {self.loss_type}. Expected 'sigmoid' or 'ipo'."
+    }
    ],
    "fields": {
     "alpha": {
@@ -10624,8 +12007,8 @@
       "list"
      ],
      "default_factory": "lambda: [1e-05]",
-     "doc": "Exploration-bonus weight on ``-mean(log pi_theta(ref_completion | prompt))``. Default is the single-element list ``[1e-5]``, which the ``__post_init__`` collapses to the scalar ``1e-5``. Sequence form enables epoch-wise scheduling.",
-     "help": "Weight of the exploratory term that encourages the policy to assign probability mass to reference completions. Supports epoch-wise scheduling.",
+     "doc": "Optimistic exploration weight on ``+sum_t log pi_theta(y^ref_t | prompt, y^ref_<t)``. Default is the single-element list ``[1e-5]``, which the ``__post_init__`` collapses to the scalar ``1e-5``. Sequence form enables epoch-wise scheduling.",
+     "help": "Weight of the optimistic exploratory term (+alpha * log pi_theta(y_ref | x)) discouraging collapse onto reference completions. Supports epoch-wise scheduling.",
      "help_source": "metadata",
      "required": false,
      "type": "float | collections.abc.Sequence[float]"
@@ -10689,12 +12072,19 @@
    "registered_ids": [
     "xpo"
    ],
-   "summary": "Hyperparameters for Exploratory Preference Optimization (XPO)."
+   "summary": "Hyperparameters for Exploratory Preference Optimization (XPO).",
+   "validated_choices": {
+    "loss_type": [
+     "sigmoid",
+     "ipo"
+    ]
+   }
   }
  },
- "easydel_revision": "3362f13d1",
+ "easydel_revision": "89c905cf0",
  "elarge": {
   "base_defaults": {
+   "async_mode": false,
    "auto_shard_states": true,
    "aux_loss_enabled": false,
    "benchmark_interval": null,
@@ -10707,6 +12097,9 @@
    "do_eval": false,
    "do_last_save": true,
    "do_train": true,
+   "environment": null,
+   "environment_backend": "kiri",
+   "environment_endpoints": null,
    "esurge_async_scheduling": null,
    "esurge_data_parallelism_axis": null,
    "esurge_enable_prefix_caching": null,
@@ -10718,6 +12111,14 @@
    "esurge_page_size": 32,
    "esurge_runner_verbose": false,
    "esurge_silent_mode": true,
+   "eyvan_report_progress": true,
+   "eyvan_track_flush_interval_s": 5.0,
+   "eyvan_track_group": null,
+   "eyvan_track_name": null,
+   "eyvan_track_project": null,
+   "eyvan_track_tags": null,
+   "eyvan_track_uri": null,
+   "first_rollout_timeout": 3600.0,
    "force_step_start_point": false,
    "generation_dataset_prompt_field": "prompt",
    "generation_log_to_wandb": true,
@@ -10726,6 +12127,7 @@
    "generation_shard_inputs": true,
    "generation_use_train_prompts": false,
    "gradient_accumulation_steps": 1,
+   "heartbeat_stale_after_s": 120.0,
    "init_tx": true,
    "is_fine_tuning": true,
    "learning_rate": 5e-05,
@@ -10735,7 +12137,9 @@
    "log_steps": 10,
    "log_training_generations_to_wandb": true,
    "low_mem_usage": true,
+   "max_inflight_tasks": 32,
    "max_length": 4096,
+   "max_staleness": 1,
    "merge_lora_before_save": true,
    "merge_lora_before_tpu_preemption_save": false,
    "mpmd_scheduler": null,
@@ -10752,10 +12156,12 @@
    "profiler_path": null,
    "profiler_python_tracer_level": null,
    "progress_bar_type": "tqdm",
+   "queue_maxsize": 0,
    "remove_ckpt_after_load": false,
    "remove_unused_columns": true,
    "report_metrics": true,
    "report_steps": 5,
+   "request_timeout": 120.0,
    "resume_if_possible": true,
    "save_directory": "EasyDeL-Checkpoints",
    "save_optimizer_state": true,
@@ -10772,16 +12178,28 @@
    "trainable_selector": "parameters",
    "truncation_mode": "keep_end",
    "use_data_collator": true,
-   "use_esurge_generation": true,
+   "use_eyvan_track": null,
    "use_grain": true,
    "use_wandb": true,
    "verbose": true,
    "warmup_steps": 0,
    "weight_decay": 0.01,
    "weight_distribution_log_steps": 500,
-   "weight_distribution_pattern": ".*"
+   "weight_distribution_pattern": ".*",
+   "weight_sync_steps": 1
   },
   "trainer_defaults": {
+   "agent_flow": {
+    "base_trainer_type": "grpo",
+    "context_mode": "append",
+    "environment_backend": "local",
+    "max_completion_length": 1024,
+    "max_prompt_length": 1024,
+    "max_turns": 8,
+    "max_workers": 8,
+    "reward_mode": "sum",
+    "trainer_prefix": "AgentFlow"
+   },
    "agentic-moshpit": {
     "advantage_estimator": "grpo",
     "beta": 0.04,
@@ -10811,8 +12229,12 @@
     "trainer_prefix": "AgenticMoshPit"
    },
    "async_grpo": {
+    "async_mode": true,
     "beta": 0.04,
     "completion_chunk_size": null,
+    "environment": null,
+    "environment_backend": "kiri",
+    "environment_endpoints": null,
     "frequency_penalty": 0.0,
     "learning_rate": 1e-06,
     "logprob_vocab_chunk_size": null,
@@ -11000,6 +12422,31 @@
     "temperature": 0.05,
     "trainer_prefix": "Embedding"
    },
+   "gdpo": {
+    "beta": 0.04,
+    "completion_chunk_size": null,
+    "decouple_reward_normalization": true,
+    "frequency_penalty": 0.0,
+    "learning_rate": 1e-06,
+    "logprob_vocab_chunk_size": null,
+    "max_completion_length": 256,
+    "max_loss_completion_tokens": null,
+    "max_prompt_length": 512,
+    "multi_objective_aggregation": "normalize_then_sum",
+    "num_return_sequences": 1,
+    "presence_penalty": 0.0,
+    "ref_logps_chunk_size": null,
+    "ref_model_mixup_alpha": 0.9,
+    "ref_model_sync_steps": 64,
+    "remove_unused_columns": false,
+    "repetition_penalty": 1.0,
+    "skip_apply_chat_template": false,
+    "sync_ref_model": false,
+    "temperature": 0.7,
+    "top_k": 50,
+    "top_p": 0.95,
+    "trainer_prefix": "GDPO"
+   },
    "gfpo": {
     "beta": 0.04,
     "completion_chunk_size": null,
@@ -11036,6 +12483,32 @@
     "seq_kd": false,
     "temperature": 0.9,
     "trainer_prefix": "GKD"
+   },
+   "gmpo": {
+    "beta": 0.04,
+    "completion_chunk_size": null,
+    "epsilon": 0.4,
+    "epsilon_high": 0.4,
+    "frequency_penalty": 0.0,
+    "learning_rate": 1e-06,
+    "logprob_vocab_chunk_size": null,
+    "loss_type": "gmpo",
+    "max_completion_length": 256,
+    "max_loss_completion_tokens": null,
+    "max_prompt_length": 512,
+    "num_return_sequences": 1,
+    "presence_penalty": 0.0,
+    "ref_logps_chunk_size": null,
+    "ref_model_mixup_alpha": 0.9,
+    "ref_model_sync_steps": 64,
+    "remove_unused_columns": false,
+    "repetition_penalty": 1.0,
+    "skip_apply_chat_template": false,
+    "sync_ref_model": false,
+    "temperature": 0.7,
+    "top_k": 50,
+    "top_p": 0.95,
+    "trainer_prefix": "GMPO"
    },
    "gold": {
     "alpha": 0.9,
@@ -11349,6 +12822,31 @@
     "train_on_last_step_only": false,
     "trainer_prefix": "PRM"
    },
+   "reinforce_plus_plus": {
+    "beta": 0.04,
+    "completion_chunk_size": null,
+    "frequency_penalty": 0.0,
+    "kl_estimator": "k2",
+    "learning_rate": 1e-06,
+    "logprob_vocab_chunk_size": null,
+    "max_completion_length": 256,
+    "max_loss_completion_tokens": null,
+    "max_prompt_length": 512,
+    "num_return_sequences": 1,
+    "presence_penalty": 0.0,
+    "ref_logps_chunk_size": null,
+    "ref_model_mixup_alpha": 0.9,
+    "ref_model_sync_steps": 64,
+    "remove_unused_columns": false,
+    "repetition_penalty": 1.0,
+    "scale_rewards": "batch_advantage",
+    "skip_apply_chat_template": false,
+    "sync_ref_model": false,
+    "temperature": 0.7,
+    "top_k": 50,
+    "top_p": 0.95,
+    "trainer_prefix": "ReinforcePlusPlus"
+   },
    "reward": {
     "center_rewards_coefficient": 0.1,
     "disable_dropout": true,
@@ -11628,6 +13126,41 @@
     "trainer_prefix": "TPO",
     "use_weighting": false
    },
+   "vapo": {
+    "cliprange": 0.2,
+    "cliprange_high": 0.28,
+    "cliprange_value": 0.2,
+    "entropy_coef": null,
+    "frequency_penalty": 0.0,
+    "gae_lambda_critic": 1.0,
+    "gamma": 1.0,
+    "kl_coef": 0.05,
+    "kl_estimator": "k1",
+    "lam": 0.95,
+    "learning_rate": 1e-06,
+    "length_adaptive_gae": true,
+    "length_adaptive_gae_alpha": 0.05,
+    "logprob_vocab_chunk_size": null,
+    "max_completion_length": 256,
+    "max_length": 768,
+    "max_prompt_length": 512,
+    "missing_eos_penalty": null,
+    "num_return_sequences": 1,
+    "positive_nll_coef": 0.1,
+    "presence_penalty": 0.0,
+    "remove_unused_columns": false,
+    "repetition_penalty": 1.0,
+    "reward_weights": null,
+    "skip_apply_chat_template": false,
+    "temperature": 0.7,
+    "token_level_loss": true,
+    "top_k": 50,
+    "top_p": 0.95,
+    "trainer_prefix": "VAPO",
+    "vf_coef": 0.1,
+    "whiten_advantages": true,
+    "whiten_rewards": false
+   },
    "xpo": {
     "alpha": 1e-05,
     "beta": 0.1,
@@ -11655,6 +13188,7 @@
    }
   },
   "trainer_type_aliases": {
+   "agent-flow": "agent_flow",
    "agentic_moshpit": "agentic-moshpit",
    "async-grpo": "async_grpo",
    "compaction-rl": "compaction_rl",
@@ -11668,6 +13202,7 @@
    "nash_md": "nash-md",
    "nemo-gym": "nemo_gym",
    "online-dpo": "online_dpo",
+   "reinforce++": "reinforce_plus_plus",
    "rlvr_trainer": "rlvr",
    "self_distillation": "sdft",
    "single-rollout-asynchronous-optimization": "sao",
@@ -11681,6 +13216,17 @@
  "generated_by": "scripts/generate_easydel_catalog.py",
  "source": "easydel/trainers",
  "trainers": {
+  "agent_flow": {
+   "aliases": [],
+   "class": "AgentFlowConfig",
+   "elarge_trainer_type": "agent_flow",
+   "module": "easydel.trainers.agent_flow_trainer.agent_flow_config",
+   "mro": [
+    "AgentFlowConfig",
+    "TrainingArguments"
+   ],
+   "summary": "Configuration for multi-turn :class:`AgentFlowTrainer` wrapping any RL/distillation trainer."
+  },
   "agentic-moshpit": {
    "aliases": [],
    "class": "AgenticMoshPitConfig",
@@ -11798,6 +13344,18 @@
    ],
    "summary": "Configuration for contrastive embedding model training."
   },
+  "gdpo": {
+   "aliases": [],
+   "class": "GDPOConfig",
+   "elarge_trainer_type": "gdpo",
+   "module": "easydel.trainers.gdpo_trainer.gdpo_config",
+   "mro": [
+    "GDPOConfig",
+    "GRPOConfig",
+    "TrainingArguments"
+   ],
+   "summary": "Configuration class for Group reward-Decoupled Policy Optimization (GDPO)."
+  },
   "gfpo": {
    "aliases": [],
    "class": "GFPOConfig",
@@ -11821,6 +13379,18 @@
     "TrainingArguments"
    ],
    "summary": "Configuration for the :class:`~easydel.trainers.GKDTrainer`."
+  },
+  "gmpo": {
+   "aliases": [],
+   "class": "GMPOConfig",
+   "elarge_trainer_type": "gmpo",
+   "module": "easydel.trainers.gmpo_trainer.gmpo_config",
+   "mro": [
+    "GMPOConfig",
+    "GRPOConfig",
+    "TrainingArguments"
+   ],
+   "summary": "Configuration class for Geometric-Mean Policy Optimization (GMPO)."
   },
   "gold": {
    "aliases": [],
@@ -12001,6 +13571,18 @@
    ],
    "summary": "Configuration for process reward model fine-tuning."
   },
+  "reinforce_plus_plus": {
+   "aliases": [],
+   "class": "ReinforcePlusPlusConfig",
+   "elarge_trainer_type": "reinforce_plus_plus",
+   "module": "easydel.trainers.reinforce_plus_plus_trainer.reinforce_plus_plus_config",
+   "mro": [
+    "ReinforcePlusPlusConfig",
+    "GRPOConfig",
+    "TrainingArguments"
+   ],
+   "summary": "Configuration class for REINFORCE++ (arXiv:2501.03262)."
+  },
   "reward": {
    "aliases": [],
    "class": "RewardConfig",
@@ -12146,7 +13728,6 @@
    "module": "easydel.trainers.ssd_trainer.ssd_config",
    "mro": [
     "SSDConfig",
-    "SDPOConfig",
     "GRPOConfig",
     "TrainingArguments"
    ],
@@ -12163,6 +13744,18 @@
     "TrainingArguments"
    ],
    "summary": "Configuration for triple preference optimization."
+  },
+  "vapo": {
+   "aliases": [],
+   "class": "VAPOConfig",
+   "elarge_trainer_type": "vapo",
+   "module": "easydel.trainers.vapo_trainer.vapo_config",
+   "mro": [
+    "VAPOConfig",
+    "PPOConfig",
+    "TrainingArguments"
+   ],
+   "summary": "Value-model-based Augmented PPO (VAPO) hyperparameters."
   },
   "xpo": {
    "aliases": [],
