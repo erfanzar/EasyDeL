@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Edit3, Shield } from "lucide-react";
+import { Edit3, Shield, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
@@ -11,17 +11,30 @@ import { ErrorCard } from "../components/ErrorCard";
 import { MetricCard } from "../components/MetricCard";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
+import { crossRegionPolicyLabel, normalizeCrossRegionTransferPolicy } from "../lib/crossRegionPolicy";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { Budget, SchedulingPolicy } from "../types";
+import type { Budget, CrossRegionTransferPolicy, PolicyUpdatePatch, SchedulingPolicy } from "../types";
 
 interface BudgetsPageProps {
   budgets: Budget[];
   policies: SchedulingPolicy[];
   onPolicyToggle: (policy: SchedulingPolicy, preemptionEnabled: boolean) => Promise<SchedulingPolicy>;
+  onCrossRegionPolicyChange?: (
+    policy: SchedulingPolicy,
+    crossRegionTransferPolicy: CrossRegionTransferPolicy,
+  ) => Promise<SchedulingPolicy>;
+  onPolicyUpdate?: (policy: SchedulingPolicy, patch: PolicyUpdatePatch) => Promise<SchedulingPolicy>;
   canManageProject: boolean;
 }
 
-export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProject }: BudgetsPageProps) {
+export function BudgetsPage({
+  budgets,
+  policies,
+  onPolicyToggle,
+  onCrossRegionPolicyChange,
+  onPolicyUpdate,
+  canManageProject,
+}: BudgetsPageProps) {
   const [pendingPolicy, setPendingPolicy] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const orgBudget = budgets.find((budget) => budget.scope === "organization") ?? budgets[0];
@@ -33,6 +46,25 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
     setMutationError(null);
     try {
       await onPolicyToggle(policy, !policy.preemptionEnabled);
+    } catch (error) {
+      setMutationError(error instanceof Error ? error.message : `Unable to update ${policy.name}`);
+    } finally {
+      setPendingPolicy(null);
+    }
+  };
+
+  const changeCrossRegionPolicy = async (policy: SchedulingPolicy, nextMode: CrossRegionTransferPolicy) => {
+    const updater = onCrossRegionPolicyChange
+      ? (target: SchedulingPolicy, mode: CrossRegionTransferPolicy) => onCrossRegionPolicyChange(target, mode)
+      : onPolicyUpdate
+        ? (target: SchedulingPolicy, mode: CrossRegionTransferPolicy) =>
+            onPolicyUpdate(target, { crossRegionTransferPolicy: mode })
+        : null;
+    if (!updater) return;
+    setPendingPolicy(policy.id);
+    setMutationError(null);
+    try {
+      await updater(policy, nextMode);
     } catch (error) {
       setMutationError(error instanceof Error ? error.message : `Unable to update ${policy.name}`);
     } finally {
@@ -190,6 +222,16 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
               <small>When enabled, victims checkpoint together before capacity is reassigned.</small>
             </span>
           </div>
+          <div className="policy-callout policy-callout-critical">
+            <ShieldAlert size={17} aria-hidden="true" />
+            <span>
+              <strong>Cross-region transfer: Ban</strong>
+              <small>
+                Refuses cross-region GCS URIs at dispatch and immediately kills running workloads (exit 95,
+                non-retryable) if they read or write a bucket outside their TPU&apos;s region.
+              </small>
+            </span>
+          </div>
         </aside>
       </section>
 
@@ -224,43 +266,95 @@ export function BudgetsPage({ budgets, policies, onPolicyToggle, canManageProjec
                   <th>Type</th>
                   <th>Scope</th>
                   <th>Behavior</th>
+                  <th>Cross-region transfer</th>
                   <th>Updated</th>
                   <th>Preemptible</th>
                 </tr>
               </thead>
               <tbody>
-                {policies.map((policy) => (
-                  <tr key={policy.id}>
-                    <td>
-                      <span className="resource-cell">
-                        <strong>{policy.name}</strong>
-                        <small className="monospace">{policy.id}</small>
-                      </span>
-                    </td>
-                    <td>
-                      <StatusBadge value={policy.type} dot={false} />
-                    </td>
-                    <td>{policy.scope}</td>
-                    <td>{policy.summary}</td>
-                    <td>{formatDateTime(policy.updatedAt)}</td>
-                    <td>
-                      {canManageProject ? (
-                        <label className="switch-control">
-                          <input
-                            type="checkbox"
-                            checked={policy.preemptionEnabled}
-                            disabled={pendingPolicy === policy.id}
-                            onChange={() => void togglePolicy(policy)}
-                          />
-                          <span aria-hidden="true" />
-                          <span className="sr-only">Toggle {policy.name}</span>
-                        </label>
-                      ) : (
-                        <span className="muted">Read only</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {policies.map((policy) => {
+                  const crossRegionMode = normalizeCrossRegionTransferPolicy(policy.crossRegionTransferPolicy);
+                  const crossRegionTone =
+                    crossRegionMode === "ban" ? "critical" : crossRegionMode === "warn" ? "warning" : "standard";
+                  const allowedBuckets = policy.crossRegionAllowedBuckets ?? [];
+                  const isPending = pendingPolicy === policy.id;
+                  const canEditCrossRegion = canManageProject && Boolean(onCrossRegionPolicyChange || onPolicyUpdate);
+                  return (
+                    <tr key={policy.id}>
+                      <td>
+                        <span className="resource-cell">
+                          <strong>{policy.name}</strong>
+                          <small className="monospace">{policy.id}</small>
+                        </span>
+                      </td>
+                      <td>
+                        <StatusBadge value={policy.type} dot={false} />
+                      </td>
+                      <td>{policy.scope}</td>
+                      <td>{policy.summary}</td>
+                      <td>
+                        <div className="cross-region-policy-cell">
+                          <div className="cross-region-policy-row">
+                            <StatusBadge value={crossRegionPolicyLabel(crossRegionMode)} tone={crossRegionTone} />
+                            {canEditCrossRegion && (
+                              <label className={`select-field policy-select-field policy-select-${crossRegionMode}`}>
+                                <span className="sr-only">Cross-region transfer policy for {policy.name}</span>
+                                <select
+                                  aria-label={`Cross-region transfer policy for ${policy.name}`}
+                                  value={crossRegionMode}
+                                  disabled={isPending}
+                                  onChange={(event) => {
+                                    const nextMode = event.target.value as CrossRegionTransferPolicy;
+                                    if (nextMode !== crossRegionMode) {
+                                      void changeCrossRegionPolicy(policy, nextMode);
+                                    }
+                                  }}
+                                >
+                                  <option value="allow">Allow</option>
+                                  <option value="warn">Warn</option>
+                                  <option value="ban">Ban &amp; kill</option>
+                                </select>
+                              </label>
+                            )}
+                          </div>
+                          {isPending && (
+                            <small className="policy-pending-hint" role="status">
+                              Saving…
+                            </small>
+                          )}
+                          {allowedBuckets.length > 0 && (
+                            <small
+                              className="policy-bucket-hint"
+                              title={`Allowlisted buckets: ${allowedBuckets.join(", ")}`}
+                            >
+                              {allowedBuckets.length} allowlisted bucket{allowedBuckets.length === 1 ? "" : "s"}
+                            </small>
+                          )}
+                          {crossRegionMode !== "allow" && policy.crossRegionAllowMultiregion === false && (
+                            <small className="policy-bucket-hint">Multi-region blocked</small>
+                          )}
+                        </div>
+                      </td>
+                      <td>{formatDateTime(policy.updatedAt)}</td>
+                      <td>
+                        {canManageProject ? (
+                          <label className="switch-control">
+                            <input
+                              type="checkbox"
+                              checked={policy.preemptionEnabled}
+                              disabled={isPending}
+                              onChange={() => void togglePolicy(policy)}
+                            />
+                            <span aria-hidden="true" />
+                            <span className="sr-only">Toggle {policy.name}</span>
+                          </label>
+                        ) : (
+                          <span className="muted">Read only</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

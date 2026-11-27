@@ -3,13 +3,14 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { FilterX, Plus, Search } from "lucide-react";
+import { FilterX, Plus, Search, ShieldAlert } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { ProgressBar } from "../components/ProgressBar";
 import { ReclaimBadge } from "../components/ReclaimBanner";
 import { StatusBadge } from "../components/StatusBadge";
+import { getCrossRegionTransferBanReason } from "../lib/crossRegionPolicy";
 import { formatAcceleratorRequest, formatDateTime, formatMoney, percent, titleCase } from "../lib/format";
 import type { WorkloadStatus, WorkloadSummary } from "../types";
 
@@ -160,6 +161,7 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                 {filtered.map((workload) => {
                   const budgetTracked = workload.budgetSpent !== undefined && workload.budgetLimit !== undefined;
                   const budgetPercent = budgetTracked ? percent(workload.budgetSpent!, workload.budgetLimit!) : 0;
+                  const crossRegionBanReason = getCrossRegionTransferBanReason(workload);
                   return (
                     // The row opens the workload, not just the name in it. Rows
                     // already lit up on hover, so the whole width read as
@@ -185,6 +187,18 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                       </td>
                       <td>
                         <StatusBadge value={workload.status} tone={workload.status} />
+                        {crossRegionBanReason && (
+                          <div className="cell-policy-ban">
+                            <span
+                              className="policy-ban-badge"
+                              title={crossRegionBanReason}
+                              data-testid="cross-region-ban-badge"
+                            >
+                              <ShieldAlert size={11} aria-hidden="true" />
+                              <span>Cross-region banned</span>
+                            </span>
+                          </div>
+                        )}
                         {workload.reclaimDeadlineAt && !TERMINAL_STATUSES.has(workload.status) && (
                           <div className="cell-reclaim">
                             <ReclaimBadge
@@ -197,7 +211,7 @@ export function WorkloadsPage({ workloads, onOpenWorkload, onSubmit, canSubmit }
                             />
                           </div>
                         )}
-                        {workload.queueReason && (
+                        {workload.queueReason && !crossRegionBanReason && (
                           <small className="cell-note" title={workload.queueReason}>
                             {workload.queueReason}
                           </small>

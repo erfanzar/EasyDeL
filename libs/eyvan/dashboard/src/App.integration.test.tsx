@@ -264,12 +264,18 @@ function fakeClient(session: SessionAuthority, overrides: FakeOverrides = {}) {
     ),
     updatePolicy: vi.fn(
       overrides.updatePolicy ??
-        (async (policy, enabled, scope) => ({
-          ...policy,
-          id: `${scope?.orgId}/${scope?.projectId}`,
-          scope: scope?.projectId ?? policy.scope,
-          preemptionEnabled: enabled,
-        })),
+        (async (policy, update, scope) => {
+          const patch = typeof update === "boolean" ? { preemptionEnabled: update } : update;
+          return {
+            ...policy,
+            id: `${scope?.orgId}/${scope?.projectId}`,
+            scope: scope?.projectId ?? policy.scope,
+            preemptionEnabled: patch.preemptionEnabled ?? policy.preemptionEnabled,
+            crossRegionTransferPolicy: patch.crossRegionTransferPolicy ?? policy.crossRegionTransferPolicy,
+            crossRegionAllowedBuckets: patch.crossRegionAllowedBuckets ?? policy.crossRegionAllowedBuckets,
+            crossRegionAllowMultiregion: patch.crossRegionAllowMultiregion ?? policy.crossRegionAllowMultiregion,
+          };
+        }),
     ),
   };
   return { client: client as unknown as EyvanApiClient, calls: client, streamCallbacks };
@@ -586,9 +592,15 @@ describe("App scope and authority race guards", () => {
       effectiveScope("project_admin", b),
     ]);
     const pending = deferred<SchedulingPolicy>();
-    const updatePolicy = vi.fn(async (policy, enabled, scope) => {
+    const updatePolicy = vi.fn(async (policy, update, scope) => {
       await pending.promise;
-      return { ...policy, id: `${scope?.orgId}/${scope?.projectId}`, preemptionEnabled: enabled };
+      const patch = typeof update === "boolean" ? { preemptionEnabled: update } : update;
+      return {
+        ...policy,
+        id: `${scope?.orgId}/${scope?.projectId}`,
+        preemptionEnabled: patch.preemptionEnabled ?? policy.preemptionEnabled,
+        crossRegionTransferPolicy: patch.crossRegionTransferPolicy ?? policy.crossRegionTransferPolicy,
+      };
     });
     const { client } = fakeClient(session, { updatePolicy });
     renderApp(client);

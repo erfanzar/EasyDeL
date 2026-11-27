@@ -3181,8 +3181,51 @@ code,
   font-size: var(--text-2xs);
   line-height: 1.4;
 }
+.policy-callout-critical > svg {
+  color: var(--red);
+}
 .policies-table {
-  min-width: 1060px;
+  min-width: 1180px;
+}
+
+.cross-region-policy-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cross-region-policy-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.policy-select-field {
+  width: fit-content;
+  height: 24px;
+}
+.policy-select-field select {
+  min-width: 108px;
+  padding: 0 24px 0 8px;
+  background-position:
+    calc(100% - 13px) 10px,
+    calc(100% - 9px) 10px;
+  font-size: var(--text-xs);
+}
+.policy-select-field.policy-select-ban {
+  border-color: var(--red-line);
+}
+.policy-select-field.policy-select-warn {
+  border-color: var(--amber-line);
+}
+.policy-bucket-hint {
+  color: var(--text-faint);
+  font-size: var(--text-3xs);
+  line-height: 1.35;
+}
+.policy-pending-hint {
+  color: var(--accent-fg);
+  font-size: var(--text-3xs);
+  font-weight: 500;
 }
 
 .switch-control {
@@ -7707,8 +7750,88 @@ body.dock-resizing {
   color: var(--amber);
 }
 
-.cell-reclaim {
+.cell-reclaim,
+.cell-policy-ban {
   margin-top: 4px;
+}
+
+/* Cross-region GCS transfer ban banner & row badge */
+
+.policy-ban-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--red-line);
+  border-radius: var(--radius-md);
+  background: var(--red-soft);
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.policy-ban-banner-icon {
+  display: inline-flex;
+  flex: none;
+  margin-top: 2px;
+  color: var(--red);
+}
+
+.policy-ban-banner-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.policy-ban-banner-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.policy-ban-banner-headline {
+  color: var(--red);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.policy-ban-banner-detail {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.policy-ban-banner-tip {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+  line-height: 1.45;
+}
+
+.policy-ban-banner-tip code {
+  padding: 1px 5px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-sunk);
+  color: var(--text);
+  font-size: var(--text-2xs);
+}
+
+.policy-ban-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 6px;
+  border: 1px solid var(--red-line);
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
 }
 
 .reclaim-strip-list {

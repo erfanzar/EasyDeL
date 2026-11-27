@@ -1118,6 +1118,44 @@ export interface Budget {
   enforcement: "hard" | "soft";
 }
 
+export type CrossRegionTransferPolicy = "allow" | "warn" | "ban";
+
+export interface ApiPolicyRecord {
+  org_id: string;
+  project_id: string;
+  allowed_providers: string[];
+  allowed_regions: string[];
+  allowed_capacity_classes: string[];
+  denied_accelerator_types: string[];
+  allowed_secret_references?: string[];
+  max_priority: number;
+  preemption_enabled: boolean;
+  cross_region_transfer_policy?: CrossRegionTransferPolicy;
+  cross_region_allowed_buckets?: string[];
+  cross_region_allow_multiregion?: boolean;
+  updated_at: string;
+}
+
+export interface PolicyPutRequest {
+  allowed_providers: string[];
+  allowed_regions: string[];
+  allowed_capacity_classes: string[];
+  denied_accelerator_types: string[];
+  allowed_secret_references: string[];
+  max_priority: number;
+  preemption_enabled: boolean;
+  cross_region_transfer_policy: CrossRegionTransferPolicy;
+  cross_region_allowed_buckets: string[];
+  cross_region_allow_multiregion: boolean;
+}
+
+export interface PolicyUpdatePatch {
+  preemptionEnabled?: boolean;
+  crossRegionTransferPolicy?: CrossRegionTransferPolicy;
+  crossRegionAllowedBuckets?: string[];
+  crossRegionAllowMultiregion?: boolean;
+}
+
 export interface SchedulingPolicy {
   id: string;
   name: string;
@@ -1132,12 +1170,19 @@ export interface SchedulingPolicy {
    * for the project rather than disabling the policy.
    */
   preemptionEnabled: boolean;
+  /** Policy governing cross-region GCS transfers from TPU workloads. */
+  crossRegionTransferPolicy: CrossRegionTransferPolicy;
+  /** GCS buckets explicitly exempt from cross-region transfer enforcement. */
+  crossRegionAllowedBuckets: string[];
+  /** Whether multi-region buckets containing the TPU region are permitted. */
+  crossRegionAllowMultiregion: boolean;
   updatedAt: string;
   configuration?: {
     allowedProviders: string[];
     allowedRegions: string[];
     allowedCapacityClasses: string[];
     deniedAcceleratorTypes: string[];
+    allowedSecretReferences?: string[];
     maxPriority: number;
   };
 }

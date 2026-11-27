@@ -26,6 +26,7 @@ import { ErrorCard } from "./components/ErrorCard";
 import { ErrorState, LoadingState } from "./components/PageState";
 import { Shell } from "./components/Shell";
 import { SubmitWorkloadModal } from "./components/SubmitWorkloadModal";
+import { crossRegionPolicyLabel } from "./lib/crossRegionPolicy";
 import { useLiveRefresh } from "./lib/useLiveRefresh";
 import { useVisibilityPolling } from "./lib/useVisibilityPolling";
 import { AuditPage } from "./pages/AuditPage";
@@ -47,6 +48,7 @@ import type {
   AvailableShape,
   DashboardData,
   EffectiveProjectScope,
+  PolicyUpdatePatch,
   SchedulingPolicy,
   SessionAuthority,
   SessionPermission,
@@ -887,7 +889,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     await refreshDashboard(desiredScopeRef.current);
   };
 
-  const updatePolicy = async (policy: SchedulingPolicy, enabled: boolean) => {
+  const updatePolicy = async (policy: SchedulingPolicy, update: boolean | PolicyUpdatePatch) => {
     const current = snapshotRef.current;
     if (!current.selectedScope) throw new ApiError("No project scope is selected");
     const immutableScope = scopeSnapshot(current.selectedScope);
@@ -901,7 +903,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
     try {
       // Both path components come from the selected immutable scope. policy.scope
       // is display data and can collide across organizations.
-      const updated = await client.updatePolicy(policy, enabled, immutableScope, scopeOperationAbortRef.current.signal);
+      const updated = await client.updatePolicy(policy, update, immutableScope, scopeOperationAbortRef.current.signal);
       if (mutationIsCurrent(epoch, immutableScope)) {
         updateSnapshot((latest) => ({
           ...latest,
@@ -912,7 +914,13 @@ export default function App({ client = apiClient, identityProvider = currentIden
               }
             : latest.data,
         }));
-        setToast({ message: `${updated.name} ${updated.preemptionEnabled ? "enabled" : "disabled"}` });
+        const message =
+          typeof update === "boolean"
+            ? `${updated.name} ${updated.preemptionEnabled ? "enabled" : "disabled"}`
+            : update.crossRegionTransferPolicy !== undefined
+              ? `${updated.name} cross-region transfer: ${crossRegionPolicyLabel(updated.crossRegionTransferPolicy)}`
+              : `${updated.name} updated`;
+        setToast({ message });
       }
       return updated;
     } catch (policyError) {
@@ -1314,7 +1322,11 @@ export default function App({ client = apiClient, identityProvider = currentIden
           <BudgetsPage
             budgets={data.budgets}
             policies={data.policies}
-            onPolicyToggle={updatePolicy}
+            onPolicyToggle={(policy, enabled) => updatePolicy(policy, enabled)}
+            onCrossRegionPolicyChange={(policy, crossRegionTransferPolicy) =>
+              updatePolicy(policy, { crossRegionTransferPolicy })
+            }
+            onPolicyUpdate={(policy, patch) => updatePolicy(policy, patch)}
             canManageProject={capabilities.manageProject}
           />
         );

@@ -42,8 +42,10 @@ import {
   rejectSession,
   type AuthScope,
 } from "../auth/oidc";
+import { normalizeCrossRegionTransferPolicy } from "../lib/crossRegionPolicy";
 import { EventStreamHttpError, followEventStream, type StreamEvent } from "../lib/eventStream";
 import type {
+  ApiPolicyRecord,
   AttachmentInput,
   AttachmentJob,
   AttachmentPlan,
@@ -95,6 +97,8 @@ import type {
   LaunchLatencyReport,
   LogEntry,
   OverviewData,
+  PolicyPutRequest,
+  PolicyUpdatePatch,
   PriorityBand,
   RunDetail,
   RunRollout,
@@ -293,17 +297,7 @@ interface RawBudgetStatus {
   forecast: number | null;
 }
 
-interface RawPolicy {
-  org_id: string;
-  project_id: string;
-  allowed_regions: string[];
-  allowed_capacity_classes: string[];
-  preemption_enabled: boolean;
-  allowed_providers: string[];
-  denied_accelerator_types: string[];
-  max_priority: number;
-  updated_at: string;
-}
+type RawPolicy = ApiPolicyRecord;
 
 interface RawEvent {
   id: string;
@@ -544,6 +538,12 @@ function mapPolicy(policy: RawPolicy): SchedulingPolicy {
     policy.allowed_capacity_classes.join(", ") || "all capacity classes",
     policy.allowed_providers.join(", ") || "all providers",
   ].join("; ");
+  const crossRegionTransferPolicy = normalizeCrossRegionTransferPolicy(policy.cross_region_transfer_policy);
+  const crossRegionAllowedBuckets = Array.isArray(policy.cross_region_allowed_buckets)
+    ? policy.cross_region_allowed_buckets.filter((bucket): bucket is string => typeof bucket === "string")
+    : [];
+  const crossRegionAllowMultiregion =
+    typeof policy.cross_region_allow_multiregion === "boolean" ? policy.cross_region_allow_multiregion : true;
   return {
     id: `${policy.org_id}/${policy.project_id}`,
     name: `Placement policy (${policy.project_id})`,
@@ -551,12 +551,18 @@ function mapPolicy(policy: RawPolicy): SchedulingPolicy {
     type: "placement",
     summary: `${constraints}; preemption ${policy.preemption_enabled ? "enabled" : "disabled"}`,
     preemptionEnabled: policy.preemption_enabled,
+    crossRegionTransferPolicy,
+    crossRegionAllowedBuckets,
+    crossRegionAllowMultiregion,
     updatedAt: policy.updated_at,
     configuration: {
       allowedProviders: policy.allowed_providers,
       allowedRegions: policy.allowed_regions,
       allowedCapacityClasses: policy.allowed_capacity_classes,
       deniedAcceleratorTypes: policy.denied_accelerator_types,
+      allowedSecretReferences: Array.isArray(policy.allowed_secret_references)
+        ? policy.allowed_secret_references.filter((reference): reference is string => typeof reference === "string")
+        : [],
       maxPriority: policy.max_priority,
     },
   };
@@ -2538,27 +2544,51 @@ export class EyvanApiClient {
 
   async updatePolicy(
     policy: SchedulingPolicy,
-    preemptionEnabled: boolean,
+    update: boolean | PolicyUpdatePatch,
     scope: AuthScope = this.activeScope,
     signal?: AbortSignal,
   ): Promise<SchedulingPolicy> {
-    if (this.forceDemo) return { ...cloneMock(policy), preemptionEnabled, updatedAt: new Date().toISOString() };
+    const patch: PolicyUpdatePatch = typeof update === "boolean" ? { preemptionEnabled: update } : update;
+    const nextPreemptionEnabled = patch.preemptionEnabled ?? policy.preemptionEnabled;
+    const nextCrossRegionTransferPolicy = normalizeCrossRegionTransferPolicy(
+      patch.crossRegionTransferPolicy ?? policy.crossRegionTransferPolicy,
+    );
+    const nextCrossRegionAllowedBuckets = [
+      ...(patch.crossRegionAllowedBuckets ?? policy.crossRegionAllowedBuckets ?? []),
+    ];
+    const nextCrossRegionAllowMultiregion =
+      patch.crossRegionAllowMultiregion ?? policy.crossRegionAllowMultiregion ?? true;
+    if (this.forceDemo) {
+      return {
+        ...cloneMock(policy),
+        preemptionEnabled: nextPreemptionEnabled,
+        crossRegionTransferPolicy: nextCrossRegionTransferPolicy,
+        crossRegionAllowedBuckets: nextCrossRegionAllowedBuckets,
+        crossRegionAllowMultiregion: nextCrossRegionAllowMultiregion,
+        updatedAt: new Date().toISOString(),
+      };
+    }
     const requestScope = this.scopeSnapshot(scope);
     const configuration = policy.configuration;
     if (!configuration) throw new ApiError(`Policy ${policy.id} is missing its editable configuration`);
+    const payload: PolicyPutRequest = {
+      allowed_providers: configuration.allowedProviders,
+      allowed_regions: configuration.allowedRegions,
+      allowed_capacity_classes: configuration.allowedCapacityClasses,
+      denied_accelerator_types: configuration.deniedAcceleratorTypes,
+      allowed_secret_references: configuration.allowedSecretReferences ?? [],
+      max_priority: configuration.maxPriority,
+      preemption_enabled: nextPreemptionEnabled,
+      cross_region_transfer_policy: nextCrossRegionTransferPolicy,
+      cross_region_allowed_buckets: nextCrossRegionAllowedBuckets,
+      cross_region_allow_multiregion: nextCrossRegionAllowMultiregion,
+    };
     const raw = await this.request<RawPolicy>(
       `/policies/${encodeURIComponent(requestScope.orgId)}/${encodeURIComponent(requestScope.projectId)}`,
       {
         method: "PUT",
         headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
-        body: JSON.stringify({
-          allowed_providers: configuration.allowedProviders,
-          allowed_regions: configuration.allowedRegions,
-          allowed_capacity_classes: configuration.allowedCapacityClasses,
-          denied_accelerator_types: configuration.deniedAcceleratorTypes,
-          max_priority: configuration.maxPriority,
-          preemption_enabled: preemptionEnabled,
-        }),
+        body: JSON.stringify(payload),
         signal,
       },
     );
@@ -2566,6 +2596,15 @@ export class EyvanApiClient {
       throw new ApiError("Policy mutation returned a resource outside the immutable requested scope", 409);
     }
     return mapPolicy(raw);
+  }
+
+  async putPolicy(
+    policy: SchedulingPolicy,
+    patch: PolicyUpdatePatch,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<SchedulingPolicy> {
+    return this.updatePolicy(policy, patch, scope, signal);
   }
 }
 

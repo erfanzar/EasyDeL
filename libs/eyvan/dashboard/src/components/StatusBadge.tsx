@@ -22,7 +22,8 @@ type BadgeTone =
   | "on_demand"
   | "spot"
   | "hard"
-  | "soft";
+  | "soft"
+  | "standard";
 
 interface StatusBadgeProps {
   value: string;

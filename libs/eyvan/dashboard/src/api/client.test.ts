@@ -286,6 +286,9 @@ describe("EyvanApiClient", () => {
       type: "preemption" as const,
       summary: "us-central2; spot",
       preemptionEnabled: true,
+      crossRegionTransferPolicy: "allow" as const,
+      crossRegionAllowedBuckets: [],
+      crossRegionAllowMultiregion: true,
       updatedAt: rawPolicy.updated_at,
       configuration: {
         allowedProviders: ["gcp"],
@@ -326,6 +329,9 @@ describe("EyvanApiClient", () => {
       type: "placement" as const,
       summary: "scoped",
       preemptionEnabled: true,
+      crossRegionTransferPolicy: "allow" as const,
+      crossRegionAllowedBuckets: [],
+      crossRegionAllowMultiregion: true,
       updatedAt: rawPolicy.updated_at,
       configuration: {
         allowedProviders: ["gcp"],

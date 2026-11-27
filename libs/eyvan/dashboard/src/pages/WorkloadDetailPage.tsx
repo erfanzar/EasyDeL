@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldAlert,
   WalletCards,
   Zap,
 } from "lucide-react";
@@ -28,6 +29,11 @@ import { ProgressBar } from "../components/ProgressBar";
 import { ReclaimBanner, reclaimPolicyLabel } from "../components/ReclaimBanner";
 import { StatusBadge } from "../components/StatusBadge";
 import { pipelineCaption, StagePipeline, type PipelineVariant } from "../components/StagePipeline";
+import {
+  formatCrossRegionBanDetail,
+  getCrossRegionTransferBanReason,
+  isCrossRegionTransferBanReason,
+} from "../lib/crossRegionPolicy";
 import { formatAcceleratorRequest, formatDateTime, formatMoney, formatSpend, percent } from "../lib/format";
 import type { LogEntry, WorkloadDetail, WorkloadExplanation, WorkloadSpend } from "../types";
 
@@ -370,6 +376,8 @@ export function WorkloadDetailPage({
   };
 
   const waitingBadly = workload.status === "failed" || workload.status === "preempting";
+  const crossRegionBanReason = getCrossRegionTransferBanReason(workload);
+  const crossRegionKilled = isCrossRegionTransferBanReason(workload.failureReason);
   const hasActiveReclaim = Boolean(workload.reclaimDeadlineAt && !TERMINAL_STATUSES.has(workload.status));
   const reclaimRole: "victim" | "waiting" =
     workload.status === "queued" || workload.status === "planning" ? "waiting" : "victim";
@@ -433,6 +441,29 @@ export function WorkloadDetailPage({
         )}
       </div>
 
+      {crossRegionBanReason && (
+        <div className="policy-ban-banner" role="alert" data-testid="cross-region-ban-banner">
+          <span className="policy-ban-banner-icon" aria-hidden="true">
+            <ShieldAlert size={16} />
+          </span>
+          <div className="policy-ban-banner-copy">
+            <div className="policy-ban-banner-header">
+              <strong className="policy-ban-banner-headline">
+                {crossRegionKilled
+                  ? "Killed & banned: Cross-region GCS transfer blocked"
+                  : "Dispatch blocked: Cross-region GCS transfer banned"}
+              </strong>
+              <StatusBadge value="Policy ban" tone="critical" dot={false} chip />
+            </div>
+            <p className="policy-ban-banner-detail">{formatCrossRegionBanDetail(crossRegionBanReason)}</p>
+            <p className="policy-ban-banner-tip">
+              Tip: Use same-region storage via <code className="monospace">eyvan.storage_path()</code> to keep reads and
+              checkpoints in your TPU&apos;s region, or ask a project admin to allowlist the bucket.
+            </p>
+          </div>
+        </div>
+      )}
+
       {hasActiveReclaim && workload.reclaimDeadlineAt && (
         <ReclaimBanner
           deadlineAt={workload.reclaimDeadlineAt}
@@ -449,17 +480,22 @@ export function WorkloadDetailPage({
           waiting on it since yesterday is not. */}
       {/* A settled record keeps the scheduling_reason it queued with; showing
           it here said a finished job was still waiting, with a spinner. */}
-      {workload.queueReason && !TERMINAL_STATUSES.has(workload.status) && !hasActiveReclaim && (
-        <div className={`detail-wait-banner${waitingBadly ? " detail-wait-banner-bad" : ""}`} role="status">
-          {waitingBadly ? (
-            <AlertTriangle size={15} aria-hidden="true" />
-          ) : (
-            <Loader2 size={15} className="spin" aria-hidden="true" />
-          )}
-          <span className="detail-wait-message">Waiting: {workload.queueReason}</span>
-          {workload.submittedAt && <span className="detail-wait-age">waited {formatWaited(workload.submittedAt)}</span>}
-        </div>
-      )}
+      {workload.queueReason &&
+        !TERMINAL_STATUSES.has(workload.status) &&
+        !hasActiveReclaim &&
+        !crossRegionBanReason && (
+          <div className={`detail-wait-banner${waitingBadly ? " detail-wait-banner-bad" : ""}`} role="status">
+            {waitingBadly ? (
+              <AlertTriangle size={15} aria-hidden="true" />
+            ) : (
+              <Loader2 size={15} className="spin" aria-hidden="true" />
+            )}
+            <span className="detail-wait-message">Waiting: {workload.queueReason}</span>
+            {workload.submittedAt && (
+              <span className="detail-wait-age">waited {formatWaited(workload.submittedAt)}</span>
+            )}
+          </div>
+        )}
 
       <section className="panel pipeline-panel">
         <div className="panel-header">

@@ -627,6 +627,9 @@ export const mockPolicies: SchedulingPolicy[] = [
     type: "priority",
     summary: "production > interactive > batch; aging after 4 hours",
     preemptionEnabled: true,
+    crossRegionTransferPolicy: "allow",
+    crossRegionAllowedBuckets: [],
+    crossRegionAllowMultiregion: true,
     updatedAt: "2026-07-08T13:40:00Z",
   },
   {
@@ -636,6 +639,9 @@ export const mockPolicies: SchedulingPolicy[] = [
     type: "fairness",
     summary: "Weighted DRF with revocable borrowing and reservation accounting",
     preemptionEnabled: true,
+    crossRegionTransferPolicy: "allow",
+    crossRegionAllowedBuckets: [],
+    crossRegionAllowMultiregion: true,
     updatedAt: "2026-07-07T09:22:00Z",
   },
   {
@@ -645,6 +651,9 @@ export const mockPolicies: SchedulingPolicy[] = [
     type: "preemption",
     summary: "Checkpoint grace 180s; max 2 preemptions per workload per hour",
     preemptionEnabled: true,
+    crossRegionTransferPolicy: "warn",
+    crossRegionAllowedBuckets: [],
+    crossRegionAllowMultiregion: true,
     updatedAt: "2026-07-09T17:12:00Z",
   },
   {
@@ -654,6 +663,9 @@ export const mockPolicies: SchedulingPolicy[] = [
     type: "placement",
     summary: "Prefer cached shards when transfer delta exceeds 90 seconds",
     preemptionEnabled: true,
+    crossRegionTransferPolicy: "ban",
+    crossRegionAllowedBuckets: ["example-shared-datasets"],
+    crossRegionAllowMultiregion: true,
     updatedAt: "2026-07-06T11:04:00Z",
   },
   {
@@ -663,6 +675,9 @@ export const mockPolicies: SchedulingPolicy[] = [
     type: "placement",
     summary: "Apply regional carbon score after deadline and data constraints",
     preemptionEnabled: false,
+    crossRegionTransferPolicy: "allow",
+    crossRegionAllowedBuckets: [],
+    crossRegionAllowMultiregion: true,
     updatedAt: "2026-07-02T08:00:00Z",
   },
 ];
