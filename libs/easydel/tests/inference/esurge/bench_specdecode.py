@@ -24,7 +24,7 @@ It loads the real `Qwen/Qwen3.5-2B` checkpoint (which ships pretrained
 `mtp.*` weights), drives the real `eSurgeRunner` + `Scheduler` loop, and
 times generation WITH and WITHOUT the MTP drafter.
 
-Run:  /home/erfan/EasyDeL/.venv/bin/python tests/inference/esurge/bench_specdecode.py
+Run:  ${EASYDEL_PYTHON:-python} tests/inference/esurge/bench_specdecode.py
 """
 
 from __future__ import annotations

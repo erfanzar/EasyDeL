@@ -788,7 +788,10 @@ class eSurge:
                 enable_cache=True,
             )
 
-        self._monitoring = MonitoringStack(info=self._info)
+        self._monitoring = MonitoringStack(
+            info=self._info,
+            model_name=self.runtime_config.esurge_name or assets.model_name,
+        )
         self._engine_loop: EngineLoop | None = None
         self._scheduler_running = False
         self._kv_cache_valid = True
@@ -810,6 +813,7 @@ class eSurge:
         )
 
         tokenizer_endpoint = self.worker_config.tokenizer_endpoint or flags.get_str(flags.EASYDEL_TOKENIZER_ENDPOINT)
+        self._configured_tokenizer_endpoint = tokenizer_endpoint
 
         self._worker_manager = WorkerManager(
             assets.tokenizer_source, startup_timeout=self.worker_config.worker_startup_timeout
@@ -1396,13 +1400,12 @@ class eSurge:
     def close(self) -> None:
         """Release every resource the engine holds; the engine cannot be used afterwards.
 
-        Unlike :meth:`terminate` (which only stops the scheduler or replay loop and can be undone with
-        :meth:`initiate`), this also stops monitoring and profiling, the tokenizer/detokenizer workers, the
-        step coordinator, the runner (releasing KV pages, model weights, and compiled executables),
-        multimodal caches, drafter target references, request registry entries, and cyclic engine
-        back-references so closed engines are collectable even while ``gc.freeze()`` is held by another
-        engine. Works on leader and worker ranks and on partially constructed engines. Idempotent; each
-        step is attempted even if an earlier one fails.
+        Unlike :meth:`terminate` (which stops the scheduler or replay loop, monitoring, and pipeline workers,
+        and can be undone with :meth:`initiate`), this also shuts down the engine core, releases the runner
+        (KV pages, model weights, and compiled executables), multimodal caches, drafter target references,
+        request registry entries, and cyclic engine back-references so closed engines are collectable even
+        while ``gc.freeze()`` is held by another engine. Works on leader and worker ranks and on partially
+        constructed engines. Idempotent; each step is attempted even if an earlier one fails.
         """
         if getattr(self, "_closed", False):
             return
@@ -1438,6 +1441,7 @@ class eSurge:
             self._close_step("stop profiling", self.stop_profiling)
         registry = getattr(self, "_registry", None)
         if registry is not None:
+
             def _clear_registry_and_metrics() -> None:
                 metrics_collector = get_metrics_collector()
                 if metrics_collector is not None:
@@ -1474,6 +1478,7 @@ class eSurge:
             if callable(getattr(runner, "reset_state", None)):
                 self._close_step("runner reset_state", runner.reset_state)
             if callable(getattr(runner, "destroy_kv_cache", None)):
+
                 def _destroy_kv() -> None:
                     runner.destroy_kv_cache()
                     self._kv_cache_valid = False
@@ -1496,6 +1501,7 @@ class eSurge:
             self.drafter = None
         mm_manager = getattr(self, "_multimodal_manager", None)
         if mm_manager is not None:
+
             def _close_mm() -> None:
                 if callable(getattr(mm_manager, "close", None)):
                     mm_manager.close()
@@ -2885,6 +2891,8 @@ class eSurge:
         State on exit: ``_scheduler_running=True``, idle monitor armed,
         ``_paused=False``. No-op if the loop is already running.
         """
+        if getattr(self, "_closed", False):
+            raise RuntimeError("Cannot initiate a closed eSurge engine.")
         # Before any loop starts and outside the scheduler lock (the collection may run finalizers).
         self._freeze_startup_heap()
         with self._scheduler_lock:
@@ -2901,6 +2909,7 @@ class eSurge:
                 if replay_thread is not None and replay_thread.is_alive():
                     self._info("Worker replay loop is already running")
                     return
+                self._ensure_pipeline_workers_started()
                 step_coordinator.start()
                 self._scheduler_exception = None
                 self._scheduler_exception_tb = None
@@ -2924,6 +2933,8 @@ class eSurge:
             if self._scheduler_running:
                 self._info("Scheduler loop is already running")
                 return
+
+            self._ensure_pipeline_workers_started()
 
             if self.runner.executor_manager.kv_pages is None:
                 self.runner.initialize_kv_cache()
@@ -2979,7 +2990,63 @@ class eSurge:
             self._start_idle_monitor()
             self._paused = False
 
-    def terminate(self, *, shutdown_coordinator: bool = True) -> None:
+    def _stop_monitoring_best_effort(self) -> None:
+        """Stop active monitoring resources without failing engine teardown."""
+        monitoring = getattr(self, "_monitoring", None)
+        if monitoring is not None and (
+            getattr(monitoring, "monitoring_active", False) or getattr(monitoring, "has_active_resources", False)
+        ):
+            try:
+                self.stop_monitoring()
+            except Exception:
+                logger.debug("Monitoring stop encountered an error", exc_info=True)
+
+    def _stop_pipeline_workers_best_effort(self) -> None:
+        """Stop owned tokenizer/detokenizer workers without failing engine teardown."""
+        worker_manager = getattr(self, "_worker_manager", None)
+        if worker_manager is not None and hasattr(worker_manager, "shutdown"):
+            try:
+                worker_manager.shutdown()
+            except Exception:
+                logger.debug("Worker manager shutdown encountered an error", exc_info=True)
+            if hasattr(self, "_tokenizer_endpoint"):
+                self._tokenizer_endpoint = getattr(worker_manager, "tokenizer_endpoint", None)
+
+    def _ensure_pipeline_workers_started(self) -> None:
+        """Restart tokenizer/detokenizer workers if a prior :meth:`terminate` shut them down."""
+        worker_manager = getattr(self, "_worker_manager", None)
+        if worker_manager is None or not callable(getattr(worker_manager, "start", None)):
+            return
+        if getattr(worker_manager, "is_running", True):
+            return
+        worker_config = getattr(self, "worker_config", None)
+        detokenizer_max_states = (
+            int(worker_config.detokenizer_max_states)
+            if worker_config is not None and getattr(worker_config, "detokenizer_max_states", None) is not None
+            else 1024
+        )
+        tokenizer_endpoint = getattr(self, "_configured_tokenizer_endpoint", None)
+        tokenizer_client, detokenizer_client = worker_manager.start(
+            detokenizer_max_states=detokenizer_max_states,
+            tokenizer_endpoint=tokenizer_endpoint,
+        )
+        self._tokenizer_client = tokenizer_client
+        self._detokenizer_client = detokenizer_client
+        self._tokenizer_endpoint = worker_manager.tokenizer_endpoint
+        admission = getattr(self, "_admission", None)
+        if admission is not None:
+            admission._tokenizer_client = tokenizer_client
+        output_pipeline = getattr(self, "_output_pipeline", None)
+        if output_pipeline is not None:
+            output_pipeline._detokenizer_client = detokenizer_client
+
+    def terminate(
+        self,
+        *,
+        shutdown_coordinator: bool = True,
+        stop_monitoring: bool = True,
+        stop_workers: bool = True,
+    ) -> None:
         """Tear down the scheduler loop (or worker replay loop) and release subordinate resources.
 
         Engine-stop path. Steps:
@@ -2992,7 +3059,8 @@ class eSurge:
            can exit.
         3. If a profiler trace is active, stop it via
            :meth:`stop_profiling` (best-effort; failures are demoted to
-           DEBUG).
+           DEBUG). When ``stop_monitoring`` is ``True``, also stop and flush
+           active monitoring resources (including Eyvan tracking).
         4. Forward to :meth:`eSurgeRunner.shutdown` so resident PP-stage
            worker threads inside the :class:`ModelStepExecutor` are
            joined.
@@ -3001,33 +3069,55 @@ class eSurge:
         6. Clear runner buffers via :meth:`_reset_runner_state_if_idle`
            when the engine is genuinely idle, so a subsequent
            :meth:`initiate` starts from a clean slate.
+        7. When ``stop_workers`` is ``True``, shut down ``_worker_manager``
+           so the owned tokenizer subprocess is terminated and reaped (with
+           zero leaked child PIDs) and native detokenizer state is released;
+           a subsequent :meth:`initiate` transparently restarts them.
 
         Args:
             shutdown_coordinator: When ``True`` (default), shut down the step
                 coordinator and request plane. Pass ``False`` during leader
                 ``pause()`` so ZMQ workers are not killed by a ``Shutdown``
                 broadcast.
+            stop_monitoring: When ``True`` (default), stop and flush active
+                monitoring services (Prometheus/Grafana/Eyvan/console).
+                :meth:`pause` passes ``False`` so monitoring survives
+                pause/resume cycles.
+            stop_workers: When ``True`` (default), shut down the tokenizer
+                worker subprocess and native detokenizer so terminating an
+                engine leaves no orphaned child processes. :meth:`pause` and
+                :meth:`update_model_weights` pass ``False`` so pipeline
+                workers stay warm across pause/resume and weight updates.
 
         State on exit: the scheduler / replay thread is gone, the runner has
-        no in-flight state, and no background timers are active. Idempotent —
-        calling it on an already-terminated engine logs an info line and
-        returns.
+        no in-flight state, no background timers are active, and (when
+        ``stop_workers`` is ``True``) no owned tokenizer subprocess remains.
+        Idempotent — calling it on an already-terminated engine logs an info
+        line and returns.
         """
         self._stop_idle_monitor()
         worker_was_running = self._stop_worker_replay_loop()
         self._drop_heap_freeze()
         engine_loop: EngineLoop | None = None
+        early_return = False
         with self._scheduler_lock:
             scheduler_was_running = bool(self._scheduler_running)
             if not scheduler_was_running:
                 self._stop_engine_output_worker()
                 if not worker_was_running:
-                    self._info("Scheduler loop is not running")
-                    return
+                    early_return = True
             else:
                 self._info("Stopping background scheduler loop...")
                 engine_loop = self._engine_loop
                 self._scheduler_running = False
+
+        if early_return:
+            if stop_monitoring:
+                self._stop_monitoring_best_effort()
+            if stop_workers:
+                self._stop_pipeline_workers_best_effort()
+            self._info("Scheduler loop is not running")
+            return
 
         if engine_loop is not None:
             engine_loop.join(timeout=5.0)
@@ -3037,33 +3127,39 @@ class eSurge:
 
         self._stop_engine_output_worker()
         self._info("Background scheduler terminated")
-        if getattr(self, "_profiling_active", False):
-            try:
-                self.stop_profiling()
-            except Exception:
-                logger.debug("Profiler stop encountered an error", exc_info=True)
-        if hasattr(self.runner, "shutdown"):
-            try:
-                self.runner.shutdown()
-            except Exception:
-                logger.debug("Runner shutdown encountered an error", exc_info=True)
-        step_coordinator = getattr(self, "_step_coordinator", None)
-        if shutdown_coordinator and step_coordinator is not None:
-            try:
-                step_coordinator.shutdown("engine terminate")
-            except Exception:
-                logger.debug("Step coordinator shutdown encountered an error", exc_info=True)
-        request_plane = getattr(self, "_request_plane", None)
-        if shutdown_coordinator and request_plane is not None:
-            try:
-                if request_plane.owns_scheduling:
-                    request_plane.shutdown()
-                else:
-                    request_plane.fail_pending("engine terminated")
-            except Exception:
-                logger.debug("Request plane shutdown encountered an error", exc_info=True)
-        # Clear runner buffers if idle to avoid stale state on next start.
-        self._reset_runner_state_if_idle("terminate")
+        try:
+            if getattr(self, "_profiling_active", False):
+                try:
+                    self.stop_profiling()
+                except Exception:
+                    logger.debug("Profiler stop encountered an error", exc_info=True)
+            if stop_monitoring:
+                self._stop_monitoring_best_effort()
+            if hasattr(self.runner, "shutdown"):
+                try:
+                    self.runner.shutdown()
+                except Exception:
+                    logger.debug("Runner shutdown encountered an error", exc_info=True)
+            step_coordinator = getattr(self, "_step_coordinator", None)
+            if shutdown_coordinator and step_coordinator is not None:
+                try:
+                    step_coordinator.shutdown("engine terminate")
+                except Exception:
+                    logger.debug("Step coordinator shutdown encountered an error", exc_info=True)
+            request_plane = getattr(self, "_request_plane", None)
+            if shutdown_coordinator and request_plane is not None:
+                try:
+                    if request_plane.owns_scheduling:
+                        request_plane.shutdown()
+                    else:
+                        request_plane.fail_pending("engine terminated")
+                except Exception:
+                    logger.debug("Request plane shutdown encountered an error", exc_info=True)
+            # Clear runner buffers if idle to avoid stale state on next start.
+            self._reset_runner_state_if_idle("terminate")
+        finally:
+            if stop_workers:
+                self._stop_pipeline_workers_best_effort()
 
     def pause(self, *, shutdown_coordinator: bool | None = None) -> None:
         """Stop the scheduler (or worker replay) loop while preserving request bookkeeping.
@@ -3122,7 +3218,7 @@ class eSurge:
             return
 
         self._info("Pausing eSurge scheduler loop...")
-        self.terminate(shutdown_coordinator=should_shutdown_coordinator)
+        self.terminate(shutdown_coordinator=should_shutdown_coordinator, stop_monitoring=False, stop_workers=False)
         self._paused = True
         self._drain_pipeline_workers("pause")
         if self.cache_config.destroy_pages_on_pause:
@@ -3353,7 +3449,7 @@ class eSurge:
 
         try:
             if was_running:
-                self.terminate()
+                self.terminate(stop_monitoring=False, stop_workers=False)
 
             self._drain_pipeline_workers("update_model_weights")
 
@@ -4949,27 +5045,29 @@ class eSurge:
         return output
 
     def start_monitoring(self, **kwargs) -> dict[str, str]:
-        """Start Prometheus-based monitoring for the engine.
+        """Start monitoring services (Prometheus, Eyvan tracking, Grafana, console).
 
         Delegates to :meth:`MonitoringStack.start_monitoring`; see there for
-        the full keyword-argument reference (Prometheus port, Grafana
-        auto-start and provisioning, console monitor, metric logging).
+        the full keyword-argument reference (Prometheus port, Eyvan tracking
+        options, Grafana auto-start and provisioning, console monitor, metric
+        logging).
 
         Args:
             **kwargs: Forwarded verbatim to
                 :meth:`MonitoringStack.start_monitoring`.
 
         Returns:
-            Dictionary of service URLs (``prometheus``, ``grafana`` when
-            started).
+            Dictionary of active monitoring endpoints/identifiers
+            (``prometheus``, ``grafana``, ``eyvan_track``, ``eyvan_run_id``
+            when started).
         """
         return self._monitoring.start_monitoring(**kwargs)
 
     def stop_monitoring(self) -> None:
         """Stop all monitoring services.
 
-        Gracefully shuts down Prometheus server and console monitor
-        if they are running.
+        Gracefully shuts down Prometheus server, Eyvan tracking, Grafana, and
+        console monitor if they are running.
         """
         monitoring = getattr(self, "_monitoring", None)
         if monitoring is not None:

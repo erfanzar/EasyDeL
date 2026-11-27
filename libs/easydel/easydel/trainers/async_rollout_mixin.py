@@ -138,6 +138,23 @@ class AsyncRolloutMixin:
         flags = self.__dict__.get("_async_rollout_thread_flags")
         return bool(getattr(flags, "in_worker", False)) if flags is not None else False
 
+    @property
+    def _async_rollout_policy_version(self) -> int | None:
+        """Snapshot step (policy version) active on the current async rollout worker thread."""
+        flags = self.__dict__.get("_async_rollout_thread_flags")
+        if flags is None:
+            return None
+        value = getattr(flags, "policy_version", None)
+        return int(value) if value is not None else None
+
+    @_async_rollout_policy_version.setter
+    def _async_rollout_policy_version(self, value: int | None) -> None:
+        flags = self.__dict__.get("_async_rollout_thread_flags")
+        if flags is None:
+            with _THREAD_FLAGS_LOCK:
+                flags = self.__dict__.setdefault("_async_rollout_thread_flags", threading.local())
+        flags.policy_version = None if value is None else int(value)
+
     def _take_rollout_snapshot(
         self,
         state: EasyDeLState,
@@ -226,6 +243,7 @@ class AsyncRolloutMixin:
         """Generate, score, and pack one rollout batch in the background worker."""
         with capture_time() as preprocessing_time_fn:
             self._async_grpo_force_old_logps = True
+            self._async_rollout_policy_version = int(produced_at_step)
             try:
                 model_batch, informations = self._preprocess_batch_input(  # type: ignore[attr-defined]
                     state=state,
@@ -234,6 +252,7 @@ class AsyncRolloutMixin:
                 )
             finally:
                 self._async_grpo_force_old_logps = False
+                self._async_rollout_policy_version = None
         informations = dict(informations)
         informations["async_rollout/rollout_produced_at_step"] = produced_at_step
 
@@ -834,6 +853,7 @@ class AsyncRolloutMixin:
                                 scheduled_lookahead += 1
 
                         rollout.informations["async_rollout/rollout_staleness"] = rollout_staleness
+                        rollout.informations["rl/policy_lag"] = int(rollout_staleness)
                         rollout.informations["async_rollout/rollout_wait_time"] = rollout_wait_seconds
                         rollout.informations["async_rollout/rollout_preprocessing_time"] = rollout.preprocessing_time
                         rollout.informations["async_rollout/policy_sync_time"] = rollout_sync_seconds

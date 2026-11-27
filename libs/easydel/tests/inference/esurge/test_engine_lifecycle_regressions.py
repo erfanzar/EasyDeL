@@ -1,5 +1,8 @@
 """Array-free regressions for scheduler lifetime, request outputs and streaming stops."""
 
+import os
+import shutil
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -400,3 +403,232 @@ def test_public_consumer_start_failure_releases_request_and_output(monkeypatch, 
     assert not engine._registry.events
     assert not engine._registry.outputs
     assert not engine._registry.output_is_retained("request")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_esurge_terminate_reaps_real_tokenizer_worker_while_pause_and_weight_update_preserve_it(tmp_path):
+    """Real subprocess regression for P1 worker leak on eSurge.terminate() + pause/resume/initiate/weight-update."""
+    from easydel.workers.esurge.pipeline.worker_manager import WorkerManager
+    from tokenizers import Tokenizer as HfTokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    tok_dir = tmp_path / "tok"
+    hf_tok = PreTrainedTokenizerFast(
+        tokenizer_object=HfTokenizer(WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    hf_tok.save_pretrained(tok_dir)
+
+    ipc_dir = tempfile.mkdtemp(prefix="ed_term_", dir="/tmp")
+    manager = WorkerManager(
+        str(tok_dir),
+        tokenizer_kwargs={"local_files_only": True},
+        startup_timeout=60.0,
+        ipc_dir=ipc_dir,
+    )
+    try:
+        tok_client, detok_client = manager.start(detokenizer_max_states=16, tokenizer_endpoint=None)
+        first_proc = manager._tokenizer_process
+        first_endpoint = manager.tokenizer_endpoint
+        assert first_proc is not None and first_proc.poll() is None
+        assert first_endpoint is not None and first_endpoint.startswith("ipc://")
+        first_pid = first_proc.pid
+        first_sock = first_endpoint[len("ipc://") :]
+
+        engine = eSurge.__new__(eSurge)
+        engine._info = lambda *args, **kwargs: None
+        engine._scheduler_lock = threading.RLock()
+        engine._scheduler_running = True
+        engine._engine_loop = None
+        engine._worker_replay_thread = None
+        engine._worker_stop_event = threading.Event()
+        engine._monitoring = None
+        engine._profiling_active = False
+        engine._step_coordinator = None
+        engine._request_plane = None
+        engine._paused = False
+        engine._kv_cache_valid = True
+        engine._holds_heap_freeze = False
+        engine._configured_tokenizer_endpoint = None
+        engine._worker_manager = manager
+        engine._tokenizer_client = tok_client
+        engine._detokenizer_client = detok_client
+        engine._tokenizer_endpoint = first_endpoint
+        engine._admission = SimpleNamespace(_tokenizer_client=tok_client)
+        engine._output_pipeline = SimpleNamespace(
+            _detokenizer_client=detok_client, start=lambda: None, stop=lambda: None
+        )
+        engine.worker_config = SimpleNamespace(detokenizer_max_states=16)
+        engine.cache_config = SimpleNamespace(destroy_pages_on_pause=False)
+        engine.runtime_config = SimpleNamespace(
+            freeze_startup_heap=False,
+            overlap_execution=False,
+            async_scheduling=False,
+            runner_verbose=False,
+        )
+        engine.runner = SimpleNamespace(
+            shutdown=lambda: None,
+            executor_manager=SimpleNamespace(kv_pages=object()),
+        )
+        engine.core = SimpleNamespace(
+            num_running=0,
+            num_waiting=0,
+            closed_error=CoreClosed,
+            schedule=lambda: SimpleNamespace(total_num_scheduled_tokens=0, finished_req_ids=()),
+        )
+        engine._registry = RequestRegistry()
+        engine._stop_idle_monitor = lambda: None
+        engine._start_idle_monitor = lambda: None
+        engine._touch_activity = lambda: None
+        engine._reset_runner_state_if_idle = lambda reason: None
+        engine._install_signal_diagnostics = lambda: None
+        engine._enqueue_engine_outputs = lambda outputs: None
+        engine._drain_parser_stop_requests_locked = lambda: None
+        engine._abort_scheduler_due_to_error = lambda exc: None
+        engine._update_scheduler_heartbeat = lambda: None
+        engine._handle_profiling_step = lambda: None
+        engine._is_nonrecoverable_scheduler_error = lambda exc: False
+
+        # 1. pause() must keep the tokenizer worker alive and usable across pause/resume.
+        engine.pause()
+        assert engine._paused is True
+        assert manager.is_running is True
+        assert first_proc.poll() is None
+        assert _pid_alive(first_pid)
+        assert engine._tokenizer_client.tokenize("r-paused", "hello") == [1]
+
+        # 2. terminate() after pause() (early_return path, scheduler already stopped) must shut down and reap it
+        # without holding _scheduler_lock.
+        lock_free_during_shutdown: list[bool] = []
+        orig_shutdown = manager.shutdown
+
+        def _check_lock_free_shutdown():
+            acquired_from_other_thread: list[bool] = []
+
+            def _probe():
+                acquired = engine._scheduler_lock.acquire(blocking=False)
+                if acquired:
+                    engine._scheduler_lock.release()
+                acquired_from_other_thread.append(acquired)
+
+            probe = threading.Thread(target=_probe)
+            probe.start()
+            probe.join(timeout=2.0)
+            lock_free_during_shutdown.extend(acquired_from_other_thread)
+            orig_shutdown()
+
+        manager.shutdown = _check_lock_free_shutdown
+        try:
+            engine.terminate()
+        finally:
+            manager.shutdown = orig_shutdown
+
+        assert lock_free_during_shutdown == [True]
+        assert manager.is_running is False
+        assert engine._tokenizer_endpoint is None
+        assert first_proc.poll() is not None
+        assert not _pid_alive(first_pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(first_pid, os.WNOHANG)
+        assert not os.path.exists(first_sock)
+
+        # 3. Calling public initiate() after terminate() transparently restarts the tokenizer worker,
+        # starts a fresh EngineLoop, and rebinds clients on engine, admission, and output_pipeline.
+        engine.initiate()
+        assert engine.alive is True
+        second_proc = manager._tokenizer_process
+        second_endpoint = manager.tokenizer_endpoint
+        assert second_proc is not None and second_proc.poll() is None
+        assert second_proc.pid != first_pid
+        assert engine._tokenizer_client is engine._admission._tokenizer_client
+        assert engine._detokenizer_client is engine._output_pipeline._detokenizer_client
+        assert engine._tokenizer_client.tokenize("r-restarted", "world") == [2]
+
+        # 4. Normal running terminate() path stops the live loop and shuts down + reaps the restarted worker.
+        engine.terminate()
+        assert engine.alive is False
+        assert manager.is_running is False
+        assert second_proc.poll() is not None
+        assert not _pid_alive(second_proc.pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(second_proc.pid, os.WNOHANG)
+        assert second_endpoint is not None and not os.path.exists(second_endpoint[len("ipc://") :])
+
+        # 5. Calling initiate() on a closed engine is rejected without respawning workers.
+        engine._closed = True
+        with pytest.raises(RuntimeError, match="closed eSurge engine"):
+            engine.initiate()
+        assert manager.is_running is False
+    finally:
+        manager.shutdown()
+        shutil.rmtree(ipc_dir, ignore_errors=True)
+
+
+def test_esurge_update_model_weights_preserves_pipeline_workers_and_monitoring(monkeypatch):
+    """update_model_weights() stops the scheduler without killing tokenizer workers or active monitoring."""
+    engine = eSurge.__new__(eSurge)
+    engine._info = lambda *args, **kwargs: None
+    engine._closed = False
+    engine._weight_version = 0
+    engine._scheduler_lock = threading.RLock()
+    engine._scheduler_running = True
+    engine._engine_loop = None
+    engine._worker_replay_thread = None
+    engine._step_coordinator = None
+    engine._request_plane = None
+    engine._multimodal_manager = None
+    engine._kv_cache_valid = True
+    engine._scheduler_max_num_batched_tokens = 32
+    engine._registry = RequestRegistry()
+    engine._request_lock = engine._registry.request_lock
+    engine._output_lock = engine._registry.output_lock
+    engine._active_requests = engine._registry.records
+    engine._request_outputs = engine._registry.outputs
+    engine._finished_request_ids = engine._registry.finished_ids
+    engine._request_events = engine._registry.events
+    engine._stop_idle_monitor = lambda: None
+    engine._drop_heap_freeze = lambda: None
+    engine._stop_engine_output_worker = lambda: None
+    engine._reset_runner_state_if_idle = lambda reason: None
+    engine._log_cache_event = lambda event, extra=None: None
+
+    worker_events: list[str] = []
+    monitoring_events: list[str] = []
+    engine._worker_manager = SimpleNamespace(
+        drain_workers=lambda: worker_events.append("drain"),
+        shutdown=lambda: worker_events.append("shutdown"),
+    )
+    engine._monitoring = SimpleNamespace(monitoring_active=True, has_active_resources=True)
+    engine.stop_monitoring = lambda: monitoring_events.append("stop")
+    engine.core = SimpleNamespace(num_running=0, num_waiting=0, shutdown=lambda: None)
+    engine._build_core = lambda: SimpleNamespace(num_running=0, num_waiting=0, shutdown=lambda: None)
+    engine.runner = SimpleNamespace(
+        shutdown=lambda: None,
+        update_model_weights=lambda **kwargs: None,
+        executor_manager=SimpleNamespace(
+            has_compiled_variants=lambda: True,
+            kv_pages=object(),
+            graphdef="gd",
+            graphother="go",
+        ),
+    )
+    initiated: list[bool] = []
+    engine.initiate = lambda: initiated.append(True)
+    monkeypatch.setattr(engine, "_resolve_weight_update_components", lambda *args: ("gd", "gs", "go"))
+
+    version = engine.update_model_weights(graphstate="gs", restart_scheduler=True)
+
+    assert version == 1
+    assert worker_events == ["drain"]
+    assert monitoring_events == []
+    assert initiated == [True]

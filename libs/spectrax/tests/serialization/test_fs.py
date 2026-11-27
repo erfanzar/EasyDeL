@@ -22,8 +22,6 @@ from spectrax.serialization._fs import (
     write_text,
 )
 
-GCS_BASE = "gs://uscentral1stuff/spx-save-tmp"
-
 
 class TestIsRemotePath:
     """Tests for is_remote_path."""
@@ -95,7 +93,7 @@ class TestMkdir:
     def test_gs_mkdir(self, gcs_auth_ino):
         """Gs mkdir."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-mkdir-{run_id}"
+        path = f"{gcs_auth_ino}/test-mkdir-{run_id}"
         mkdir(path)
         write_text(joinpath(path, "marker.txt"), "ok")
         assert exists(joinpath(path, "marker.txt"))
@@ -118,7 +116,7 @@ class TestExists:
     def test_gs_existing_file(self, gcs_auth_ino):
         """Gs existing file."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-exists-{run_id}/file.txt"
+        path = f"{gcs_auth_ino}/test-exists-{run_id}/file.txt"
         write_text(path, "hello")
         assert exists(path) is True
         rm(joinpath(path, ".."), recursive=True)
@@ -126,7 +124,7 @@ class TestExists:
     def test_gs_missing_file(self, gcs_auth_ino):
         """Gs missing file."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-exists-missing-{run_id}/file.txt"
+        path = f"{gcs_auth_ino}/test-exists-missing-{run_id}/file.txt"
         assert exists(path) is False
 
 
@@ -196,7 +194,7 @@ class TestIsDir:
     def test_gs_directory(self, gcs_auth_ino):
         """Gs directory."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-isdir-{run_id}"
+        path = f"{gcs_auth_ino}/test-isdir-{run_id}"
         mkdir(path)
         write_text(joinpath(path, "marker.txt"), "ok")
         assert is_file(joinpath(path, "marker.txt")) is True
@@ -221,7 +219,7 @@ class TestIsFile:
     def test_gs_file(self, gcs_auth_ino):
         """Gs file."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-isfile-{run_id}/file.txt"
+        path = f"{gcs_auth_ino}/test-isfile-{run_id}/file.txt"
         write_text(path, "x")
         assert is_file(path) is True
         rm(joinpath(path, ".."), recursive=True)
@@ -245,7 +243,7 @@ class TestWriteText:
     def test_gs_write_and_read(self, gcs_auth_ino):
         """Gs write and read."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-writetext-{run_id}/file.txt"
+        path = f"{gcs_auth_ino}/test-writetext-{run_id}/file.txt"
         write_text(path, "gs content")
         assert read_text(path) == "gs content"
         rm(joinpath(path, ".."), recursive=True)
@@ -268,7 +266,7 @@ class TestReadText:
     def test_gs_missing_raises(self, gcs_auth_ino):
         """Gs missing raises."""
         run_id = str(uuid.uuid4())[:8]
-        path = f"{GCS_BASE}/test-readtext-missing-{run_id}/file.txt"
+        path = f"{gcs_auth_ino}/test-readtext-missing-{run_id}/file.txt"
         with pytest.raises(FileNotFoundError):
             read_text(path)
 
@@ -289,7 +287,7 @@ class TestIterdir:
     def test_gs_iterdir(self, gcs_auth_ino):
         """Gs iterdir."""
         run_id = str(uuid.uuid4())[:8]
-        base = f"{GCS_BASE}/test-iterdir-{run_id}"
+        base = f"{gcs_auth_ino}/test-iterdir-{run_id}"
         write_text(joinpath(base, "a.txt"), "a")
         write_text(joinpath(base, "b.txt"), "b")
         names = [p for p in iterdir(base)]
@@ -324,7 +322,7 @@ class TestRm:
     def test_gs_rm_recursive(self, gcs_auth_ino):
         """Gs rm recursive."""
         run_id = str(uuid.uuid4())[:8]
-        base = f"{GCS_BASE}/test-rm-{run_id}"
+        base = f"{gcs_auth_ino}/test-rm-{run_id}"
         write_text(joinpath(base, "file.txt"), "x")
         assert exists(base)
         rm(base, recursive=True)

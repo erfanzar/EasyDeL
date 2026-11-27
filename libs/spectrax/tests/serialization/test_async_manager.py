@@ -423,12 +423,12 @@ class TestAsyncCheckpointManager:
         assert "array_keys" in data
 
     def test_save_load_gcs_roundtrip(self, mesh, gcs_auth_ino):
-        """Save and load from GCS bucket gs://uscentral1stuff/spx-save-tmp."""
+        """Save and load from the configured GCS test bucket."""
         import uuid
 
         mgr = AsyncCheckpointManager()
         run_id = str(uuid.uuid4())[:8]
-        gcs_path = f"gs://uscentral1stuff/spx-save-tmp/test-{run_id}"
+        gcs_path = f"{gcs_auth_ino}/test-{run_id}"
 
         sh = NamedSharding(mesh, PartitionSpec("x", "y"))
         arr = jax.device_put(jnp.arange(16).reshape(4, 4), sh)

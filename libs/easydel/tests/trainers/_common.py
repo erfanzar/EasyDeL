@@ -216,7 +216,7 @@ def make_config(
         "save_optimizer_state": True,
         "do_last_save": True,
         "use_wandb": True,
-        "wandb_entity": "erfanzar",
+        "wandb_entity": "example-entity",
         "shuffle_train_dataset": False,
         "progress_bar_type": "json",
         "max_prompt_length": MAX_PROMPT_LENGTH,

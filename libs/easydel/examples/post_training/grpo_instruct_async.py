@@ -32,8 +32,8 @@ Reward signal — fully self-contained, no second model:
     GRPO turns the per-completion rewards into group-relative advantages.
 
 Model:
-    Loaded directly from the GCS checkpoint ``gs://uscentral2stuff/
-    qwen3.6-27b-bf16`` via tensorstore (no gcsfuse needed). EasyDeL reads the
+    Loaded directly from the GCS checkpoint ``gs://your-bucket/models/
+    qwen3-27b-bf16`` via tensorstore (no gcsfuse needed). EasyDeL reads the
     checkpoint's ``config.json`` ``model_type`` and binds the matching
     registered architecture — the checkpoint must declare a model_type EasyDeL
     knows (e.g. ``qwen3_5`` / ``qwen3_moe``); there is no ``qwen3_6`` module.
@@ -79,7 +79,7 @@ class GRPOInstructArgs:
     """Command-line arguments for async-GRPO instruction-following training."""
 
     model: str = field(
-        default="gs://uscentral2stuff/qwen3.6-27b-bf16",
+        default="gs://your-bucket/models/qwen3-27b-bf16",
         metadata={"help": "Policy model: GCS checkpoint, local dir, or HF repo id."},
     )
     tokenizer: str | None = field(

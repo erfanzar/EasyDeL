@@ -14,11 +14,12 @@
 
 """Monitoring stack for the eSurge engine.
 
-Owns Prometheus exporter startup, optional Grafana auto-spawn (local binary,
-Docker, or provisioning an already-running instance), and the rich-console
-live monitor. :class:`MonitoringStack` holds all process/temp-dir state that
-used to live as ``_monitoring_*`` / ``_grafana_*`` / ``_prometheus_*``
-attributes on :class:`eSurge`; the engine delegates ``start_monitoring`` /
+Owns Prometheus exporter startup, optional Eyvan metrics tracking
+(``eyvan.track``), optional Grafana auto-spawn (local binary, Docker, or
+provisioning an already-running instance), and the rich-console live monitor.
+:class:`MonitoringStack` holds all process/temp-dir/tracker state that used to
+live as ``_monitoring_*`` / ``_grafana_*`` / ``_prometheus_*`` attributes on
+:class:`eSurge`; the engine delegates ``start_monitoring`` /
 ``stop_monitoring`` to it.
 """
 
@@ -31,6 +32,7 @@ import subprocess
 import tempfile
 import typing
 import uuid
+import warnings
 from typing import Any
 
 from ..metrics import get_metrics_collector, initialize_metrics
@@ -223,9 +225,18 @@ class MonitoringStack:
         info: Engine-level info logger callable (respects ``silent_mode``).
     """
 
-    def __init__(self, *, info: typing.Callable[..., None]) -> None:
+    def __init__(
+        self,
+        *,
+        info: typing.Callable[..., None],
+        model_name: str | None = None,
+    ) -> None:
         self._info = info
+        self._model_name: str | None = model_name
         self._monitoring_server = None
+        self._eyvan_exporter = None
+        self._eyvan_auto_run_name = None
+        self._eyvan_init_failed = False
         self._console_monitor_active = False
         self._monitoring_urls: dict[str, str] | None = None
         self._monitoring_initialized = False
@@ -252,6 +263,7 @@ class MonitoringStack:
         return bool(
             self._monitoring_initialized
             or self._monitoring_server is not None
+            or self._eyvan_exporter is not None
             or self._console_monitor_active
             or self._grafana_container_name is not None
             or self._grafana_container_id is not None
@@ -876,6 +888,135 @@ providers:
         self._grafana_temp_dir = None
         self._grafana_url = None
 
+    @staticmethod
+    def _should_enable_eyvan_track(
+        enable_eyvan_track: bool | None,
+        eyvan_track_uri: str | None,
+    ) -> bool:
+        """Resolve whether Eyvan tracking should be started for this stack.
+
+        When ``enable_eyvan_track`` is ``None`` (the default), auto-enables
+        whenever ``eyvan_track_uri`` is set, Eyvan workload environment
+        variables are present, or ``eyvan.track`` is importable and implicit
+        auto-tracking is enabled via :func:`easydel.utils.eyvan_helpers.is_eyvan_auto_track_enabled`.
+        """
+        if enable_eyvan_track is not None:
+            return bool(enable_eyvan_track)
+        if eyvan_track_uri and str(eyvan_track_uri).strip():
+            return True
+        if (os.environ.get("EYVAN_TRACKING_URI") or "").strip() or (os.environ.get("EYVAN_WORKLOAD_ID") or "").strip():
+            return True
+        from easydel.utils.eyvan_helpers import is_eyvan_auto_track_enabled
+
+        if not is_eyvan_auto_track_enabled():
+            return False
+        try:
+            from .. import monitoring as _esurge_monitoring
+
+            return bool(_esurge_monitoring.EYVAN_TRACK_AVAILABLE and _esurge_monitoring._eyvan_track is not None)
+        except Exception:
+            return False
+
+    def _start_eyvan_tracking_service(
+        self,
+        *,
+        enable_prometheus: bool,
+        prometheus_port: int,
+        log_interval: float,
+        eyvan_track_uri: str | None,
+        eyvan_track_project: str | None,
+        eyvan_track_name: str | None,
+        eyvan_track_group: str | None,
+        eyvan_track_tags: tuple[str, ...] | list[str] | None,
+        eyvan_track_interval: float | None,
+        eyvan_track_flush_interval_s: float,
+    ) -> dict[str, str]:
+        """Start the owner-scoped Eyvan tracking exporter and return URL/run entries."""
+        if self._eyvan_init_failed:
+            return {}
+        if self._eyvan_exporter is not None:
+            out: dict[str, str] = {}
+            store_root = getattr(self._eyvan_exporter, "store_root", None)
+            run_id = getattr(self._eyvan_exporter, "run_id", None)
+            if store_root:
+                out["eyvan_track"] = str(store_root)
+            if run_id:
+                out["eyvan_run_id"] = str(run_id)
+            return out
+
+        effective_interval = (
+            float(eyvan_track_interval)
+            if eyvan_track_interval is not None
+            else (float(log_interval) if log_interval and log_interval > 0 else 5.0)
+        )
+
+        engine_config: dict[str, Any] = {
+            "engine": "eSurge",
+            "enable_prometheus": bool(enable_prometheus),
+            "prometheus_port": int(prometheus_port),
+            "eyvan_track_interval_s": effective_interval,
+            "eyvan_track_flush_interval_s": float(eyvan_track_flush_interval_s),
+        }
+        if self._model_name:
+            engine_config["model_name"] = str(self._model_name)
+
+        try:
+            from ..monitoring import _resolve_esurge_eyvan_run_name, start_eyvan_tracking
+
+            if isinstance(eyvan_track_name, str) and eyvan_track_name.strip():
+                resolved_name = eyvan_track_name.strip()
+            else:
+                if not self._eyvan_auto_run_name:
+                    self._eyvan_auto_run_name = _resolve_esurge_eyvan_run_name(
+                        model_name=self._model_name if isinstance(self._model_name, str) else None,
+                    )
+                resolved_name = self._eyvan_auto_run_name
+
+            exporter = start_eyvan_tracking(
+                name=resolved_name,
+                project=eyvan_track_project,
+                group=eyvan_track_group,
+                tags=eyvan_track_tags,
+                uri=eyvan_track_uri,
+                update_interval=effective_interval,
+                flush_interval_s=eyvan_track_flush_interval_s,
+                config=engine_config,
+                owner=self,
+            )
+        except ImportError:
+            self._eyvan_init_failed = True
+            self._info(" Eyvan tracking unavailable (install eyvan)")
+            return {}
+        except Exception as e:
+            self._eyvan_init_failed = True
+            warnings.warn(
+                f"Failed to initialize eSurge Eyvan tracking ({type(e).__name__}: {e}); "
+                "disabling Eyvan tracking for this monitoring stack.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._info(f" Failed to start Eyvan tracking: {e}")
+            return {}
+
+        self._eyvan_exporter = exporter
+        out = {}
+        store_root = getattr(exporter, "store_root", None)
+        run_id = getattr(exporter, "run_id", None)
+        if store_root:
+            out["eyvan_track"] = str(store_root)
+        if run_id:
+            out["eyvan_run_id"] = str(run_id)
+        if store_root and run_id:
+            run_name = getattr(getattr(exporter, "run", None), "name", None)
+            name_part = f", name={run_name}" if run_name else ""
+            self._info(
+                " Eyvan tracking active: %s (run_id=%s%s) — view with `eyvan dashboard`",
+                store_root,
+                run_id,
+                name_part,
+            )
+        return out
+
     def start_monitoring(
         self,
         dashboard_port: int | None = None,
@@ -899,13 +1040,21 @@ providers:
         grafana_datasource_name: str = "eSurge Prometheus",
         grafana_datasource_uid: str | None = None,
         grafana_datasource_url: str | None = None,
+        enable_eyvan_track: bool | None = None,
+        eyvan_track_uri: str | None = None,
+        eyvan_track_project: str | None = None,
+        eyvan_track_name: str | None = None,
+        eyvan_track_group: str | None = None,
+        eyvan_track_tags: tuple[str, ...] | list[str] | None = None,
+        eyvan_track_interval: float | None = None,
+        eyvan_track_flush_interval_s: float = 5.0,
     ) -> dict[str, str]:
-        """Start Prometheus-based monitoring for the engine.
+        """Start Prometheus, Eyvan tracking, Grafana, and/or console monitoring.
 
-        Initializes the Prometheus metrics exporter, optional console monitor,
-        and (by default) tries to auto-start a Grafana instance with a
-        pre-provisioned Prometheus data source (local grafana-server first,
-        optionally Docker if enabled).
+        Initializes the Prometheus metrics exporter, optional Eyvan metrics
+        tracking (``eyvan.track``), optional console monitor, and (by default
+        when Prometheus is enabled) tries to auto-start a Grafana instance with
+        a pre-provisioned Prometheus data source.
 
         Args:
             dashboard_port: Deprecated; no longer used (kept for compatibility).
@@ -929,15 +1078,39 @@ providers:
             grafana_datasource_name: Display name for the auto-provisioned Prometheus data source.
             grafana_datasource_uid: UID for the Prometheus data source (auto-generated if None).
             grafana_datasource_url: Override URL for the Prometheus data source inside Grafana.
+            enable_eyvan_track: Control Eyvan run tracking. ``None`` (default)
+                auto-enables whenever ``eyvan`` is importable (unless suppressed
+                via ``set_eyvan_auto_track_enabled(False)``), or when
+                ``eyvan_track_uri`` / ``EYVAN_TRACKING_URI`` / ``EYVAN_WORKLOAD_ID``
+                is set; ``True`` forces it on; ``False`` disables it.
+            eyvan_track_uri: Optional Eyvan tracking store URI (``gs://...``,
+                ``file://...``, or local directory path). When omitted, respects
+                ``EYVAN_TRACKING_URI``, then queries
+                ``eyvan.storage.resolve_default_tracking_uri``, and finally falls
+                back to ``~/.eyvan/tracking/default/<project>``.
+            eyvan_track_project: Local Eyvan project scope (default ``"esurge"``).
+            eyvan_track_name: Human-readable Eyvan run name (defaults to a
+                cached W&B-style auto-generated name).
+            eyvan_track_group: Optional Eyvan run group.
+            eyvan_track_tags: Optional tags merged with auto-detected eSurge,
+                inference, model, and hardware tags.
+            eyvan_track_interval: Polling interval in seconds for Eyvan metric
+                logging. Defaults to ``log_interval`` (or ``5.0`` when
+                ``log_interval <= 0``).
+            eyvan_track_flush_interval_s: Seconds between Eyvan segment flushes.
 
         Returns:
-            Dictionary of service URLs:
-            - 'prometheus': Prometheus metrics endpoint
-            - 'grafana': Grafana UI (when auto-start succeeds)
+            Dictionary of active monitoring endpoints/identifiers:
+            - ``'prometheus'``: Prometheus metrics endpoint (when enabled)
+            - ``'grafana'``: Grafana UI (when auto-start succeeds)
+            - ``'eyvan_track'``: Eyvan store root URI (when Eyvan tracking starts)
+            - ``'eyvan_run_id'``: Eyvan run identifier (when Eyvan tracking starts)
         """
+        eyvan_enabled = self._should_enable_eyvan_track(enable_eyvan_track, eyvan_track_uri)
+
         if self._monitoring_initialized:
+            existing_urls = dict(self._monitoring_urls or {})
             if start_grafana and not self._grafana_container_name and not self._grafana_url:
-                existing_urls = self._monitoring_urls or {}
                 prometheus_url = existing_urls.get("prometheus")
                 grafana_url = self._start_grafana_service(
                     prometheus_url=prometheus_url,
@@ -955,10 +1128,26 @@ providers:
                 if grafana_url:
                     existing_urls["grafana"] = grafana_url
                     self._monitoring_urls = existing_urls
+            if eyvan_enabled and self._eyvan_exporter is None:
+                eyvan_urls = self._start_eyvan_tracking_service(
+                    enable_prometheus=enable_prometheus,
+                    prometheus_port=prometheus_port,
+                    log_interval=log_interval,
+                    eyvan_track_uri=eyvan_track_uri,
+                    eyvan_track_project=eyvan_track_project,
+                    eyvan_track_name=eyvan_track_name,
+                    eyvan_track_group=eyvan_track_group,
+                    eyvan_track_tags=eyvan_track_tags,
+                    eyvan_track_interval=eyvan_track_interval,
+                    eyvan_track_flush_interval_s=eyvan_track_flush_interval_s,
+                )
+                if eyvan_urls:
+                    existing_urls.update(eyvan_urls)
+                    self._monitoring_urls = existing_urls
             self._info("Monitoring already initialized for this eSurge instance")
             return self._monitoring_urls or {}
 
-        self._info("Starting eSurge monitoring services (Prometheus exporter)...")
+        self._info("Starting eSurge monitoring services...")
 
         if not get_metrics_collector():
             initialize_metrics(
@@ -1016,6 +1205,21 @@ providers:
                     urls["grafana"] = grafana_url
                     self._info(f" Grafana UI: {grafana_url}")
 
+            if eyvan_enabled:
+                eyvan_urls = self._start_eyvan_tracking_service(
+                    enable_prometheus=enable_prometheus,
+                    prometheus_port=prometheus_port,
+                    log_interval=log_interval,
+                    eyvan_track_uri=eyvan_track_uri,
+                    eyvan_track_project=eyvan_track_project,
+                    eyvan_track_name=eyvan_track_name,
+                    eyvan_track_group=eyvan_track_group,
+                    eyvan_track_tags=eyvan_track_tags,
+                    eyvan_track_interval=eyvan_track_interval,
+                    eyvan_track_flush_interval_s=eyvan_track_flush_interval_s,
+                )
+                urls.update(eyvan_urls)
+
             if enable_console:
                 try:
                     from ..monitoring import start_console_monitor
@@ -1043,8 +1247,8 @@ providers:
     def stop_monitoring(self) -> None:
         """Stop all monitoring services.
 
-        Gracefully shuts down Prometheus server, Grafana, and console monitor
-        if they are running or were partially initialized.
+        Gracefully shuts down Prometheus server, Eyvan tracking, Grafana, and
+        console monitor if they are running or were partially initialized.
         """
         if not self.has_active_resources:
             self._info("No monitoring services to stop")
@@ -1054,15 +1258,26 @@ providers:
         # Release only this stack's service leases. Other stacks and direct
         # process-wide users retain their services; the last release still
         # closes listeners and clears singletons for a clean restart.
+        eyvan_exporter = self._eyvan_exporter
         try:
             from ..monitoring import stop_monitoring as _stop_global_monitoring
 
             _stop_global_monitoring(owner=self)
             if self._monitoring_server:
                 self._info(" Prometheus monitoring released")
+            if eyvan_exporter is not None:
+                self._info(" Eyvan tracking stopped and flushed")
         except Exception as e:
             self._info(f" Error stopping monitoring services: {e}")
+        if eyvan_exporter is not None and not getattr(eyvan_exporter, "closed", False):
+            try:
+                eyvan_exporter.close()
+            except Exception as e:
+                self._info(f" Error closing Eyvan exporter: {e}")
         self._monitoring_server = None
+        self._eyvan_exporter = None
+        self._eyvan_auto_run_name = None
+        self._eyvan_init_failed = False
         self._console_monitor_active = False
 
         self._stop_grafana_service()

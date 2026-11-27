@@ -57,6 +57,14 @@ def _full_training_arguments_kwargs() -> dict[str, Any]:
         "wandb_entity": "easydel-team",
         "wandb_name": "roundtrip-run",
         "use_wandb": False,
+        "use_eyvan_track": True,
+        "eyvan_track_uri": "/tmp/roundtrip-eyvan",
+        "eyvan_track_project": "roundtrip-project",
+        "eyvan_track_name": "roundtrip-eyvan-run",
+        "eyvan_track_group": "roundtrip-sweep",
+        "eyvan_track_tags": ["custom-tag", "eval"],
+        "eyvan_track_flush_interval_s": 2.5,
+        "eyvan_report_progress": False,
         # Core training schedule
         "learning_rate": 3e-5,
         "learning_rate_end": 1e-7,
@@ -558,6 +566,25 @@ def test_save_load_preserves_randomized_yarn_and_ga_mode(tmp_path, full_args):
     reloaded = TrainingArguments.load_arguments(path)
     assert reloaded.randomized_yarn == enabled.randomized_yarn
     assert reloaded.to_dict() == enabled.to_dict()
+
+
+def test_save_load_preserves_eyvan_tracking_fields(tmp_path, full_args):
+    """All Eyvan tracking and progress-reporting knobs survive JSON save/load."""
+    json_path = tmp_path / "eyvan.json"
+    full_args.save_arguments(json_path)
+    loaded = TrainingArguments.load_arguments(json_path)
+
+    expected = {
+        "use_eyvan_track": True,
+        "eyvan_track_uri": "/tmp/roundtrip-eyvan",
+        "eyvan_track_project": "roundtrip-project",
+        "eyvan_track_name": "roundtrip-eyvan-run",
+        "eyvan_track_group": "roundtrip-sweep",
+        "eyvan_track_tags": ["custom-tag", "eval"],
+        "eyvan_track_flush_interval_s": 2.5,
+        "eyvan_report_progress": False,
+    }
+    assert {key: getattr(loaded, key) for key in expected} == expected
 
 
 def test_unused_logwatcher_import_is_available():

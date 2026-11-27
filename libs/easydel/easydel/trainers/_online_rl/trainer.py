@@ -636,6 +636,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
         *,
         scoring_state: EasyDeLState,
         learner_step: int | None = None,
+        is_train: bool = True,
     ) -> dict[str, jax.Array]:
         """Validate and enrich a provider-supplied target-aligned batch.
 
@@ -643,10 +644,13 @@ class OnlineActorCriticTrainer(PPOTrainer):
             provider_batch: Full-token or target-aligned rollout arrays.
             scoring_state: Actor snapshot whose log-probabilities are used
                 when the provider requests synchronous recomputation.
+            learner_step: Optional learner step used for policy-lag accounting.
+            is_train: Whether this batch belongs to training or evaluation.
 
         Returns:
             A target-aligned actor/critic learner batch.
         """
+        self._last_provider_policy_lag: float | None = None
         if isinstance(provider_batch, (list, tuple)) and all(
             isinstance(trajectory, OnlineRLTrajectory) for trajectory in provider_batch
         ):
@@ -808,6 +812,8 @@ class OnlineActorCriticTrainer(PPOTrainer):
             normalized["trajectory_ids"] = trajectory_ids
 
         policy_versions = normalized.get("policy_versions")
+        host_versions: np.ndarray | None = None
+        resolved_learner_version: int | None = None
         if policy_versions is not None:
             policy_versions = policy_versions.reshape(-1)
             if policy_versions.shape != (input_ids.shape[0],):
@@ -815,34 +821,39 @@ class OnlineActorCriticTrainer(PPOTrainer):
             host_versions = np.asarray(jax.device_get(policy_versions), dtype=np.int64)
             if np.any(host_versions < 0):
                 raise ValueError("`policy_versions` must be non-negative.")
+            if learner_step is not None:
+                resolved_learner_version = int(learner_step)
+            elif hasattr(scoring_state, "step"):
+                resolved_learner_version = int(np.asarray(jax.device_get(scoring_state.step)))
             max_staleness = getattr(self.arguments, "max_policy_staleness", None)
             if max_staleness is not None:
-                if not hasattr(scoring_state, "step"):
+                if resolved_learner_version is None:
                     raise ValueError(
                         "`max_policy_staleness` requires the scoring actor state to expose its update step."
                     )
-                current_version = (
-                    int(np.asarray(jax.device_get(scoring_state.step))) if learner_step is None else learner_step
-                )
-                if np.any(host_versions > current_version):
+                if np.any(host_versions > resolved_learner_version):
                     raise ValueError(
                         "Rollout provider returned a policy version newer than the learner actor "
-                        f"(current={current_version}, newest={int(host_versions.max())})."
+                        f"(current={resolved_learner_version}, newest={int(host_versions.max())})."
                     )
-                stale_by = current_version - host_versions
+                stale_by = resolved_learner_version - host_versions
                 if np.any(stale_by > int(max_staleness)):
                     raise ValueError(
                         "Rollout provider batch exceeds `max_policy_staleness`: "
-                        f"current={current_version}, oldest={int(host_versions.min())}, "
+                        f"current={resolved_learner_version}, oldest={int(host_versions.min())}, "
                         f"allowed={int(max_staleness)}."
                     )
+            if resolved_learner_version is not None and host_versions.size > 0:
+                self._last_provider_policy_lag = float(np.mean(resolved_learner_version - host_versions))
 
         scores = normalized.get("scores")
+        host_scores: np.ndarray | None = None
         if scores is not None:
             scores = scores.reshape(-1).astype(jnp.float32)
             if scores.shape != (input_ids.shape[0],):
                 raise ValueError(f"`scores` must have one value per provider row, got {scores.shape}.")
-            if not np.all(np.isfinite(np.asarray(jax.device_get(scores)))):
+            host_scores = np.asarray(jax.device_get(scores), dtype=np.float32)
+            if not np.all(np.isfinite(host_scores)):
                 raise ValueError("`scores` must contain only finite values.")
             reward_endpoints = np.zeros(expected_shape, dtype=np.bool_)
             for row, row_actions in enumerate(host_action_mask):
@@ -850,6 +861,21 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 if positions.size:
                     reward_endpoints[row, positions[-1]] = True
             rewards = rewards + scores[:, None] * jnp.asarray(reward_endpoints, dtype=jnp.float32)
+
+        host_traj_ids: np.ndarray | None = None
+        if "trajectory_ids" in normalized:
+            host_traj_ids = np.asarray(jax.device_get(normalized["trajectory_ids"]), dtype=np.int64).reshape(-1)
+
+        if host_versions is not None and getattr(self.arguments, "eyvan_tracking_enabled", False):
+            self._log_eyvan_provider_episodes(
+                host_versions=host_versions,
+                host_rewards=host_rewards,
+                host_action_mask=host_action_mask,
+                host_scores=host_scores,
+                host_traj_ids=host_traj_ids,
+                learner_version=resolved_learner_version,
+                is_train=is_train,
+            )
 
         if not rewards_include_kl and float(self.arguments.kl_coef) != 0.0:
             reference_logps = normalized.get("reference_logps")
@@ -910,6 +936,50 @@ class OnlineActorCriticTrainer(PPOTrainer):
             if key in normalized:
                 learner_batch[key] = normalized[key]
         return self._prepare_target_batch(learner_batch)
+
+    def _log_eyvan_provider_episodes(
+        self,
+        *,
+        host_versions: np.ndarray,
+        host_rewards: np.ndarray,
+        host_action_mask: np.ndarray,
+        host_scores: np.ndarray | None = None,
+        host_traj_ids: np.ndarray | None = None,
+        learner_version: int | None = None,
+        is_train: bool = True,
+    ) -> None:
+        """Emit per-row Eyvan episode records with policy/learner version lag."""
+        args = getattr(self, "arguments", None)
+        if args is None or not getattr(args, "eyvan_tracking_enabled", False):
+            return
+        mask_bool = np.asarray(host_action_mask, dtype=np.bool_)
+        rewards_f32 = np.asarray(host_rewards, dtype=np.float32)
+        episode_returns_np = np.where(mask_bool, rewards_f32, 0.0).sum(axis=1)
+        if host_scores is not None:
+            scores_f32 = np.asarray(host_scores, dtype=np.float32).reshape(-1)
+            has_action_row = mask_bool.any(axis=1)
+            episode_returns_np = episode_returns_np + np.where(has_action_row, scores_f32, 0.0)
+        episode_lengths_np = mask_bool.sum(axis=1).astype(np.int64)
+        ep_kind = "train" if is_train else "eval"
+        for row_idx in range(int(host_versions.shape[0])):
+            ret_val = float(episode_returns_np[row_idx])
+            ep_len = int(episode_lengths_np[row_idx])
+            pver = int(host_versions[row_idx])
+            extra_fields: dict[str, float] = {"action_tokens": float(ep_len)}
+            if learner_version is not None:
+                extra_fields["policy_lag"] = float(learner_version - pver)
+            if host_traj_ids is not None and row_idx < host_traj_ids.shape[0]:
+                extra_fields["trajectory_id"] = float(host_traj_ids[row_idx])
+            args.log_eyvan_episode(
+                ret_val,
+                ep_len,
+                success=bool(np.isfinite(ret_val) and ret_val > 0.0),
+                kind=ep_kind,
+                policy_version=pver,
+                learner_version=learner_version,
+                step=learner_version,
+                extra=extra_fields,
+            )
 
     @staticmethod
     def _process_count() -> int:
@@ -1053,11 +1123,21 @@ class OnlineActorCriticTrainer(PPOTrainer):
             return output, {}
 
         def _prepare_output(provider_batch, *, scoring_state: EasyDeLState, learner_step: int):
+            self._last_provider_policy_lag = None
             if self.rollout_provider is None:
                 return self._adapt_ppo_rollout_batch(provider_batch)
             return self._normalize_provider_batch(
-                provider_batch, scoring_state=scoring_state, learner_step=learner_step
+                provider_batch,
+                scoring_state=scoring_state,
+                learner_step=learner_step,
+                is_train=is_train,
             )
+
+        def _resolve_policy_lag(learner_step: int, fallback_policy_version: int) -> float | int:
+            provider_lag = getattr(self, "_last_provider_policy_lag", None)
+            if self.rollout_provider is not None and provider_lag is not None:
+                return float(provider_lag)
+            return max(0, int(learner_step) - int(fallback_policy_version))
 
         if not is_train:
             # Evaluation never donates `state`; run synchronously on `state`
@@ -1077,6 +1157,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
                     {
                         **information,
                         "rollout/policy_version": current_step,
+                        "rl/policy_lag": _resolve_policy_lag(current_step, current_step),
                         "rollout/queue_time": 0.0,
                         "rollout/execution_time": execution_time,
                     },
@@ -1133,6 +1214,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
                         {
                             **information,
                             "rollout/policy_version": snapshot.policy_step,
+                            "rl/policy_lag": _resolve_policy_lag(current_step, snapshot.policy_step),
                             "rollout/queue_time": 0.0,
                             "rollout/execution_time": execution_time,
                         },
@@ -1157,9 +1239,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
                 return _collect_once(policy, payload)
             finally:
                 with eval_cond:
-                    self._online_running_train_workers = max(
-                        0, getattr(self, "_online_running_train_workers", 1) - 1
-                    )
+                    self._online_running_train_workers = max(0, getattr(self, "_online_running_train_workers", 1) - 1)
                     eval_cond.notify_all()
 
         step_increment = max(int(getattr(self.arguments, "num_ppo_epochs", 1)), 1)
@@ -1253,6 +1333,7 @@ class OnlineActorCriticTrainer(PPOTrainer):
                     {
                         **information,
                         "rollout/policy_version": snapshot.policy_step,
+                        "rl/policy_lag": _resolve_policy_lag(current_step, snapshot.policy_step),
                         "rollout/queue_time": completion.queue_time,
                         "rollout/execution_time": completion.execution_time,
                     },

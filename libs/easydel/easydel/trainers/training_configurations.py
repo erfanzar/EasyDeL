@@ -30,9 +30,14 @@ import ast
 import collections.abc
 import datetime
 import functools
+import hashlib
 import json
+import math
 import os
+import random
 import re
+import secrets
+import threading
 import traceback
 import types
 import typing as tp
@@ -69,6 +74,13 @@ from easydel.trainers.process_encoder import ProcessEncoderConfig
 from easydel.trainers.randomized_yarn import RandomizedYaRNConfig
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
+from easydel.utils.eyvan_helpers import (
+    _ensure_local_eyvan_store_writable,
+    is_eyvan_auto_track_enabled,
+)
+from easydel.utils.eyvan_helpers import (
+    set_eyvan_auto_track_enabled as set_eyvan_auto_track_enabled,
+)
 
 from .metrics import LogWatcher, MetricsHistogram, compute_weight_stats, run_watchers
 from .training_utils import (
@@ -193,6 +205,1264 @@ def _close_summary_writer(writer: tp.Any) -> None:
             writer.close()
     except Exception:
         pass
+
+
+_EYVAN_TRACKING_URI_ENV = "EYVAN_TRACKING_URI"
+_EYVAN_WORKLOAD_ID_ENV = "EYVAN_WORKLOAD_ID"
+_EYVAN_DEFAULT_TAGS: tuple[str, ...] = ("EasyDeL", "Jax", "Train")
+_EYVAN_MAX_TAGS = 64
+_EYVAN_MAX_TAG_LEN = 64
+_EYVAN_MAX_NAME_LEN = 256
+_EYVAN_MAX_AUTO_NAME_LEN = 64
+_EYVAN_MAX_KEY_LEN = 128
+_EYVAN_MAX_HIST_BINS = 512
+_EYVAN_MAX_EXTRA = 32
+_EYVAN_MAX_ACTOR_LEN = 64
+_EYVAN_MAX_ENV_LEN = 128
+_EYVAN_MAX_CHECKPOINT_LEN = 256
+_EYVAN_MAX_LABEL_LEN = 128
+_EYVAN_MAX_ACTION_NAME_LEN = 64
+_EYVAN_MAX_ACTION_NAMES = 256
+_EYVAN_MAX_GROUP_SIZE = 64
+_EYVAN_MAX_ROLLOUT_STEPS = 10_000
+_EYVAN_MAX_TRACKS = 32
+_EYVAN_MAX_TEXT_LEN = 32_768
+_EYVAN_MAX_INT64 = (1 << 63) - 1
+_EYVAN_MIN_INT64 = -(1 << 63)
+_EYVAN_EPISODE_KINDS = frozenset({"train", "eval"})
+_EYVAN_KEY_RE = re.compile(r"[A-Za-z0-9_./-]{1,128}")
+_EYVAN_KEY_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_./-]+")
+_EYVAN_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_EYVAN_SLUG_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_EYVAN_TAG_SLUG_UNSAFE_RE = re.compile(r"[^a-z0-9._-]+")
+_EYVAN_NAME_TOKEN_UNSAFE_RE = re.compile(r"[^a-z0-9-]+")
+_EYVAN_FINISH_STATUSES = frozenset({"finished", "failed", "aborted"})
+_EYVAN_INIT_LOCK = threading.Lock()
+_EYVAN_GCP_CONTEXT_LOCK = threading.Lock()
+_EYVAN_GCP_CONTEXT_CACHE: dict[int, tp.Any] = {}
+_EYVAN_SYSTEM_RANDOM = secrets.SystemRandom()
+
+_EYVAN_NAME_ADJECTIVES: tuple[str, ...] = (
+    "agate",
+    "amber",
+    "arctic",
+    "astral",
+    "azure",
+    "brisk",
+    "cedar",
+    "cobalt",
+    "coral",
+    "crisp",
+    "crimson",
+    "dawn",
+    "dusk",
+    "emerald",
+    "feral",
+    "flint",
+    "frost",
+    "gilded",
+    "glacier",
+    "golden",
+    "granite",
+    "harbor",
+    "ivory",
+    "jade",
+    "keen",
+    "lively",
+    "lunar",
+    "marble",
+    "misty",
+    "noble",
+    "obsidian",
+    "ochre",
+    "opal",
+    "pine",
+    "polar",
+    "quartz",
+    "quiet",
+    "radiant",
+    "rapid",
+    "scarlet",
+    "silver",
+    "solar",
+    "steady",
+    "storm",
+    "swift",
+    "velvet",
+    "vivid",
+    "zephyr",
+)
+_EYVAN_NAME_NOUNS: tuple[str, ...] = (
+    "badger",
+    "beacon",
+    "bison",
+    "canyon",
+    "comet",
+    "condor",
+    "coyote",
+    "crane",
+    "crest",
+    "drift",
+    "eagle",
+    "falcon",
+    "fjord",
+    "forge",
+    "fox",
+    "grove",
+    "hawk",
+    "heron",
+    "horizon",
+    "ibex",
+    "kestrel",
+    "lantern",
+    "lynx",
+    "meadow",
+    "mesa",
+    "nebula",
+    "orbit",
+    "osprey",
+    "otter",
+    "owl",
+    "peak",
+    "phoenix",
+    "pioneer",
+    "plume",
+    "puma",
+    "quasar",
+    "raven",
+    "ridge",
+    "river",
+    "spark",
+    "sparrow",
+    "summit",
+    "swift",
+    "tiger",
+    "trail",
+    "vector",
+    "wolf",
+    "wren",
+)
+_EYVAN_GENERIC_MODEL_NAMES: frozenset[str] = frozenset(
+    {
+        "",
+        "auto",
+        "base",
+        "base-trainer",
+        "base_trainer",
+        "basetrainer",
+        "default",
+        "easydel",
+        "easydel-model",
+        "easydel_model",
+        "model",
+        "module",
+        "none",
+        "trainer",
+        "unknown",
+        "unnamed",
+    }
+)
+_EYVAN_GENERIC_TRAINER_SLUGS: frozenset[str] = frozenset(
+    {
+        "",
+        "base",
+        "base_trainer",
+        "basetrainer",
+        "default",
+        "none",
+        "trainer",
+        "training",
+        "training_arguments",
+        "trainingarguments",
+    }
+)
+_EYVAN_TRAINER_ALIASES: dict[str, str] = {
+    "agent_flow": "agentflow",
+    "agent-flow": "agentflow",
+    "agentflow": "agentflow",
+    "agentic_moshpit": "agentic_moshpit",
+    "agentic-moshpit": "agentic_moshpit",
+    "agenticmoshpit": "agentic_moshpit",
+    "async_grpo": "async_grpo",
+    "asyncgrpo": "async_grpo",
+    "bco": "bco",
+    "compaction_rl": "compaction_rl",
+    "compactionrl": "compaction_rl",
+    "cpo": "cpo",
+    "distillation": "distillation",
+    "dpo": "dpo",
+    "dppo": "dppo",
+    "embedding": "embedding",
+    "esurge": "esurge",
+    "gdpo": "gdpo",
+    "gfpo": "gfpo",
+    "gkd": "gkd",
+    "gmpo": "gmpo",
+    "gold": "gold",
+    "grpo": "grpo",
+    "grpo_replay_buffer": "grpo_replay_buffer",
+    "grpo_with_replay_buffer": "grpo_replay_buffer",
+    "grpowithreplaybuffer": "grpo_replay_buffer",
+    "gspo": "gspo",
+    "gspo_token": "gspo_token",
+    "gspotoken": "gspo_token",
+    "kto": "kto",
+    "minillm": "minillm",
+    "nash_md": "nash_md",
+    "nashmd": "nash_md",
+    "nemo_gym": "nemo_gym",
+    "nemogym": "nemo_gym",
+    "on_policy_distillation": "on_policy_distillation",
+    "onpolicydistillation": "on_policy_distillation",
+    "online_actor_critic": "online_rl",
+    "online_dpo": "online_dpo",
+    "online_rl": "online_rl",
+    "onlinedpo": "online_dpo",
+    "onlinerl": "online_rl",
+    "orpo": "orpo",
+    "papo": "papo",
+    "ppo": "ppo",
+    "prm": "prm",
+    "reinforce_plus_plus": "reinforce_plus_plus",
+    "reinforceplusplus": "reinforce_plus_plus",
+    "reward": "reward",
+    "rloo": "rloo",
+    "rlvr": "rlvr",
+    "sao": "sao",
+    "sdft": "sdft",
+    "sdpo": "sdpo",
+    "self_distillation": "sdft",
+    "selfdistillation": "sdft",
+    "seq_kd": "seq_kd",
+    "seqkd": "seq_kd",
+    "sft": "sft",
+    "sparse_distillation": "sparse_distillation",
+    "speculative_decoding": "speculative_decoding",
+    "ssd": "ssd",
+    "tpo": "tpo",
+    "vapo": "vapo",
+    "xpo": "xpo",
+}
+_EYVAN_RL_TRAINER_SLUGS: frozenset[str] = frozenset(
+    {
+        "agentflow",
+        "agentic_moshpit",
+        "async_grpo",
+        "compaction_rl",
+        "dppo",
+        "gdpo",
+        "gfpo",
+        "gmpo",
+        "grpo",
+        "grpo_replay_buffer",
+        "gspo",
+        "gspo_token",
+        "minillm",
+        "nash_md",
+        "nemo_gym",
+        "online_dpo",
+        "online_rl",
+        "papo",
+        "ppo",
+        "reinforce_plus_plus",
+        "rloo",
+        "rlvr",
+        "sao",
+        "sdpo",
+        "tpo",
+        "vapo",
+        "xpo",
+    }
+)
+_EYVAN_GPU_CHIP_RE = re.compile(
+    r"\b(gb200|b200|b100|h200|h100|a100|a10g|a10|l40s|l40|l4|v100|t4|mi325x|mi300x|mi250x|mi250)\b"
+)
+_EYVAN_RTX_CHIP_RE = re.compile(r"\brtx[\s_-]*(\d{4}(?:[\s_-]*ti)?)\b")
+_EYVAN_TPU_GEN_RE = re.compile(r"\bv(\d+[a-z]?)(?:[-_\s]|$)")
+_EYVAN_GCP_ZONE_RE = re.compile(r"^([a-z0-9]+-[a-z0-9]+)-[a-z]$")
+
+
+def _import_eyvan():
+    """Lazily import ``eyvan`` when installed, returning ``None`` if absent."""
+    try:
+        import eyvan
+    except ImportError:
+        return None
+    return eyvan
+
+
+def _import_eyvan_track():
+    """Lazily import ``eyvan.track`` when installed, returning ``None`` if absent."""
+    try:
+        import eyvan.track as eyvan_track
+    except ImportError:
+        return None
+    return eyvan_track
+
+
+def _import_eyvan_storage():
+    """Lazily import ``eyvan.storage`` when installed, returning ``None`` if absent."""
+    try:
+        import eyvan.storage as eyvan_storage
+    except ImportError:
+        return None
+    return eyvan_storage
+
+
+def _clear_eyvan_auto_caches() -> None:
+    """Clear process-level Eyvan auto-detection caches (used by tests)."""
+    with _EYVAN_GCP_CONTEXT_LOCK:
+        _EYVAN_GCP_CONTEXT_CACHE.clear()
+
+
+def _detect_eyvan_gcp_context() -> tp.Any:
+    """Safely fetch and cache ``eyvan.storage.detect_gcp_context()`` without raising."""
+    storage = _import_eyvan_storage()
+    if storage is None:
+        return None
+    detect_fn = getattr(storage, "detect_gcp_context", None)
+    if not callable(detect_fn):
+        return None
+    cache_key = id(detect_fn)
+    with _EYVAN_GCP_CONTEXT_LOCK:
+        if cache_key in _EYVAN_GCP_CONTEXT_CACHE:
+            return _EYVAN_GCP_CONTEXT_CACHE[cache_key]
+    try:
+        ctx = detect_fn()
+    except Exception:
+        ctx = None
+    with _EYVAN_GCP_CONTEXT_LOCK:
+        _EYVAN_GCP_CONTEXT_CACHE[cache_key] = ctx
+    return ctx
+
+
+def _resolve_eyvan_default_tracking_uri(
+    *,
+    explicit_uri: str | None,
+    project: str,
+    org: str = "default",
+) -> str | None:
+    """Resolve the Eyvan tracking store URI with zero-config default bucket discovery.
+
+    Resolution order:
+    1. Explicit ``explicit_uri`` if non-empty.
+    2. Pre-existing ``EYVAN_TRACKING_URI`` environment variable if set.
+    3. ``eyvan.storage.resolve_default_tracking_uri(project=project, org=org, allow_create=False)``.
+    4. ``None`` so ``eyvan.track.start()`` falls back to ``~/.eyvan/tracking/default/<project>``.
+    """
+    if isinstance(explicit_uri, str) and explicit_uri.strip():
+        return explicit_uri.strip()
+    env_uri = os.environ.get(_EYVAN_TRACKING_URI_ENV, "").strip()
+    if env_uri:
+        return env_uri
+    storage = _import_eyvan_storage()
+    if storage is None:
+        return None
+    resolver = getattr(storage, "resolve_default_tracking_uri", None)
+    if not callable(resolver):
+        return None
+    try:
+        resolved = resolver(project=project, org=org, allow_create=False)
+    except Exception:
+        return None
+    if isinstance(resolved, str) and resolved.strip():
+        return resolved.strip()
+    return None
+
+
+def _camel_to_snake(text: str) -> str:
+    """Convert CamelCase identifiers into lowercase snake_case."""
+    step1 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    step2 = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", step1)
+    return step2.lower()
+
+
+def _normalize_eyvan_trainer_slug(raw: tp.Any) -> str | None:
+    """Normalize a trainer prefix, class name, or config name to a concise lowercase slug."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    for suffix in ("Trainer", "Config", "Arguments"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+    compact_key = re.sub(r"[^a-z0-9]+", "", text.lower())
+    if compact_key in _EYVAN_TRAINER_ALIASES:
+        return _EYVAN_TRAINER_ALIASES[compact_key]
+    snake = _camel_to_snake(text)
+    snake = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("_", snake)
+    snake = re.sub(r"_+", "_", snake).strip("._-")
+    if snake in _EYVAN_TRAINER_ALIASES:
+        return _EYVAN_TRAINER_ALIASES[snake]
+    if not snake or snake in _EYVAN_GENERIC_TRAINER_SLUGS or compact_key in _EYVAN_GENERIC_TRAINER_SLUGS:
+        return None
+    return snake[:_EYVAN_MAX_TAG_LEN]
+
+
+def _extract_eyvan_model_slug(
+    model_name: tp.Any = None,
+    *,
+    model: tp.Any = None,
+    prefer_model_type: bool = True,
+    for_run_name: bool = False,
+) -> str | None:
+    """Extract a clean lowercase model slug from ``model`` or ``model_name``, skipping generic placeholders."""
+    candidates: list[str] = []
+    if model is not None:
+        inner_model = getattr(model, "model", model)
+        model_cfg = getattr(inner_model, "config", None)
+        model_type = getattr(model_cfg, "model_type", None) if model_cfg is not None else None
+        if isinstance(model_type, str) and model_type.strip():
+            candidates.append(model_type.strip())
+        internal_type = getattr(inner_model, "_model_type", None)
+        if isinstance(internal_type, str) and internal_type.strip():
+            candidates.append(internal_type.strip())
+
+    name_candidate: str | None = None
+    if isinstance(model_name, str) and model_name.strip():
+        raw_name = model_name.strip().rstrip("/")
+        # Strip org/path prefix (e.g. "Qwen/Qwen3-8B" -> "Qwen3-8B", "/ckpt/qwen3/step-10" -> "qwen3").
+        segments = [seg for seg in raw_name.replace("\\", "/").split("/") if seg and not seg.endswith(":")]
+        if segments:
+            chosen = segments[-1]
+            if len(segments) >= 2 and re.fullmatch(r"(?:checkpoint|ckpt|step|run)[-_]?\d+", chosen.lower()):
+                chosen = segments[-2]
+            name_candidate = chosen
+
+    ordered = [*candidates, name_candidate] if prefer_model_type else [name_candidate, *candidates]
+    for item in ordered:
+        if not item:
+            continue
+        lower = item.strip().lower()
+        if lower in _EYVAN_GENERIC_MODEL_NAMES:
+            continue
+        if for_run_name:
+            slug = _EYVAN_NAME_TOKEN_UNSAFE_RE.sub("-", lower)
+            slug = re.sub(r"-{2,}", "-", slug).strip(".-")
+        else:
+            slug = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("-", lower)
+            slug = re.sub(r"-{2,}", "-", slug).strip("._-")
+        if not slug or slug in _EYVAN_GENERIC_MODEL_NAMES:
+            continue
+        return slug[:_EYVAN_MAX_TAG_LEN]
+    return None
+
+
+def _extract_eyvan_env_slug(env_name: tp.Any) -> str | None:
+    """Normalize an environment identifier into a compact lowercase tag slug."""
+    if env_name is None:
+        return None
+    raw: str | None = None
+    if isinstance(env_name, str):
+        raw = env_name.strip()
+    elif isinstance(env_name, collections.abc.Mapping):
+        val = env_name.get("name") or env_name.get("type")
+        if isinstance(val, str):
+            raw = val.strip()
+    elif isinstance(env_name, type):
+        raw = env_name.__name__
+    elif isinstance(env_name, functools.partial):
+        fn_name = getattr(env_name.func, "__name__", None)
+        if isinstance(fn_name, str) and fn_name != "<lambda>":
+            raw = fn_name
+    elif callable(env_name):
+        fn_name = getattr(env_name, "__name__", None)
+        if isinstance(fn_name, str) and fn_name != "<lambda>":
+            raw = fn_name
+    if not raw:
+        return None
+    slug = _camel_to_snake(raw.lstrip("_"))
+    slug = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("_", slug)
+    slug = re.sub(r"_+", "_", slug).strip("._-")
+    if not slug or slug in {"none", "unknown", "default"}:
+        return None
+    # Leave room for the "env:" prefix within Eyvan's 64-char tag limit.
+    return slug[: _EYVAN_MAX_TAG_LEN - 4]
+
+
+def _extract_quantization_method(obj: tp.Any) -> str | None:
+    """Extract a normalized quantization method name from a mode string, config object, or mapping."""
+    if obj is None or isinstance(obj, bool):
+        return None
+    if hasattr(obj, "value") and isinstance(obj.value, str):
+        obj = obj.value
+    if isinstance(obj, str):
+        cleaned = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("-", obj.strip().lower()).strip("._-")
+        return cleaned[: _EYVAN_MAX_TAG_LEN - 6] if cleaned and cleaned not in {"none", "false"} else None
+    if isinstance(obj, collections.abc.Mapping):
+        for key in ("quant_method", "quant_type", "quant_dtype", "quantization_type", "mode", "method"):
+            val = obj.get(key)
+            if val is not None:
+                found = _extract_quantization_method(val)
+                if found:
+                    return found
+        return None
+    for attr in ("quant_method", "quant_type", "quant_dtype", "quantization_type", "mode", "method"):
+        val = getattr(obj, attr, None)
+        if val is not None:
+            found = _extract_quantization_method(val)
+            if found:
+                return found
+    return None
+
+
+def _normalize_eyvan_chip_generation(
+    device_kind: str | None,
+    accelerator_type: str | None = None,
+) -> str | None:
+    """Normalize a JAX ``device_kind`` or GCP ``accelerator_type`` into a concise chip generation tag."""
+    for raw in (device_kind, accelerator_type):
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = raw.strip().lower()
+        if text in {"cpu", "host"}:
+            continue
+        if "v6e" in text or "v6 lite" in text or "v6_lite" in text or "v6lite" in text or "trillium" in text:
+            return "v6e"
+        if "v5e" in text or "v5 lite" in text or "v5_lite" in text or "v5lite" in text:
+            return "v5e"
+        if "v5p" in text:
+            return "v5p"
+        if "tpu" in text and re.search(r"\bv5(?:\b|[-_])", text):
+            return "v5p"
+        gpu_match = _EYVAN_GPU_CHIP_RE.search(text)
+        if gpu_match is not None:
+            return gpu_match.group(1)
+        rtx_match = _EYVAN_RTX_CHIP_RE.search(text)
+        if rtx_match is not None:
+            return "rtx" + re.sub(r"[\s_-]+", "", rtx_match.group(1))
+        if "tpu" in text or re.match(r"^v\d+[a-z]?-\d+$", text):
+            tpu_match = _EYVAN_TPU_GEN_RE.search(text)
+            if tpu_match is not None:
+                return f"v{tpu_match.group(1)}"
+    return None
+
+
+def _detect_eyvan_hardware_tags() -> tuple[str, ...]:
+    """Detect metadata-only hardware, topology, and GCP region tags without JAX collectives or compiles."""
+    tags: list[str] = []
+    platform: str | None = None
+    total_devices = 0
+    local_devices = 0
+    process_count = 1
+    device_kind: str | None = None
+
+    try:
+        raw_backend = str(jax.default_backend()).strip().lower()
+        if raw_backend in {"cuda", "rocm", "gpu"}:
+            platform = "gpu"
+        elif raw_backend in {"tpu", "cpu"}:
+            platform = raw_backend
+        elif raw_backend:
+            platform = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("-", raw_backend).strip("._-") or None
+    except Exception:
+        platform = None
+
+    try:
+        total_devices = max(0, int(jax.device_count()))
+    except Exception:
+        total_devices = 0
+    try:
+        local_devices = max(0, int(jax.local_device_count()))
+    except Exception:
+        local_devices = 0
+    try:
+        process_count = max(1, int(jax.process_count()))
+    except Exception:
+        process_count = 1
+    try:
+        local_devs = jax.local_devices()
+        if local_devs:
+            kind = getattr(local_devs[0], "device_kind", None)
+            if isinstance(kind, str) and kind.strip():
+                device_kind = kind.strip()
+    except Exception:
+        device_kind = None
+
+    gcp_ctx = _detect_eyvan_gcp_context()
+    accel_type = getattr(gcp_ctx, "accelerator_type", None) if gcp_ctx is not None else None
+    chip_gen = _normalize_eyvan_chip_generation(device_kind, accel_type)
+
+    if platform:
+        tags.append(platform)
+    if chip_gen:
+        tags.append(chip_gen)
+        if process_count > 1:
+            per_host = local_devices if local_devices > 0 else (total_devices // process_count)
+            if per_host > 0:
+                tags.append(f"{chip_gen}-{per_host}x{process_count}")
+            elif total_devices > 0:
+                tags.append(f"{chip_gen}-{total_devices}")
+        elif total_devices > 0:
+            tags.append(f"{chip_gen}-{total_devices}")
+    if platform in {"tpu", "gpu"} and total_devices > 1:
+        tags.append(f"{total_devices}-chips")
+
+    if gcp_ctx is not None:
+        raw_region = getattr(gcp_ctx, "region", None)
+        if not (isinstance(raw_region, str) and raw_region.strip()):
+            raw_zone = getattr(gcp_ctx, "zone", None)
+            if isinstance(raw_zone, str) and raw_zone.strip():
+                zone_match = _EYVAN_GCP_ZONE_RE.match(raw_zone.strip().lower())
+                if zone_match is not None:
+                    raw_region = zone_match.group(1)
+        if isinstance(raw_region, str) and raw_region.strip():
+            region_slug = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("-", raw_region.strip().lower()).strip("._-")
+            if region_slug:
+                tags.append(region_slug[:_EYVAN_MAX_TAG_LEN])
+
+    return tuple(dict.fromkeys(tags))
+
+
+def _fallback_generate_eyvan_run_name(*, prefix: str | None = None, seed: int | None = None) -> str:
+    """Generate a W&B-style ``<adj>-<noun>-<num>`` run name using only stdlib randomness."""
+    rng = random.Random(seed) if seed is not None else _EYVAN_SYSTEM_RANDOM
+    adj = rng.choice(_EYVAN_NAME_ADJECTIVES)
+    noun = rng.choice(_EYVAN_NAME_NOUNS)
+    num = rng.randint(1, 99)
+    suffix = f"{adj}-{noun}-{num}"
+    if prefix:
+        clean_prefix = _EYVAN_NAME_TOKEN_UNSAFE_RE.sub("-", str(prefix).strip().lower())
+        clean_prefix = re.sub(r"-{2,}", "-", clean_prefix).strip(".-")
+        if clean_prefix:
+            max_prefix = _EYVAN_MAX_AUTO_NAME_LEN - len(suffix) - 1
+            if max_prefix > 0:
+                clipped = clean_prefix[:max_prefix].rstrip(".-")
+                if clipped:
+                    return f"{clipped}-{suffix}"
+    return suffix[:_EYVAN_MAX_AUTO_NAME_LEN]
+
+
+def _generate_eyvan_wandb_style_name(*, prefix: str | None = None, seed: int | None = None) -> str:
+    """Generate a readable W&B-style run name (<=64 chars) via ``eyvan.track.generate_run_name`` or stdlib fallback."""
+    clean_prefix: str | None = None
+    if prefix:
+        norm = _EYVAN_NAME_TOKEN_UNSAFE_RE.sub("-", str(prefix).strip().lower())
+        norm = re.sub(r"-{2,}", "-", norm).strip(".-")
+        if norm:
+            # Reserve room for a typical "-adjective-noun-99" suffix while staying <= 64 chars.
+            clean_prefix = norm[:36].rstrip(".-") or None
+
+    eyvan_track = _import_eyvan_track()
+    gen_fn = getattr(eyvan_track, "generate_run_name", None) if eyvan_track is not None else None
+    if callable(gen_fn):
+        try:
+            generated = gen_fn(prefix=clean_prefix, seed=seed) if seed is not None else gen_fn(prefix=clean_prefix)
+            if isinstance(generated, str):
+                candidate = generated.strip()
+                if candidate:
+                    if len(candidate) <= _EYVAN_MAX_AUTO_NAME_LEN:
+                        return candidate
+                    # Preserve the random suffix at the tail if prefix made the string exceed 64 chars.
+                    if clean_prefix and candidate.startswith(f"{clean_prefix}-"):
+                        tail = candidate[len(clean_prefix) + 1 :]
+                        budget = _EYVAN_MAX_AUTO_NAME_LEN - len(tail) - 1
+                        if budget > 0:
+                            clipped_prefix = clean_prefix[:budget].rstrip(".-")
+                            if clipped_prefix:
+                                return f"{clipped_prefix}-{tail}"
+                        return tail[:_EYVAN_MAX_AUTO_NAME_LEN].strip(".-") or "easydel-run"
+                    return candidate[:_EYVAN_MAX_AUTO_NAME_LEN].rstrip(".-") or "easydel-run"
+        except Exception:
+            pass
+    return _fallback_generate_eyvan_run_name(prefix=clean_prefix, seed=seed)
+
+
+def _resolve_eyvan_run_name(
+    args: tp.Any = None,
+    *,
+    explicit_name: str | None = None,
+    wandb_name: str | None = None,
+    model_name: str | None = None,
+    model: tp.Any = None,
+    trainer: tp.Any = None,
+    trainer_slug: str | None = None,
+    seed: int | None = None,
+) -> str:
+    """Resolve an Eyvan run name: explicit name -> ``wandb_name`` -> cached W&B-style auto name.
+
+    Auto-generated names are <=64 characters, optionally prefixed with a compact
+    ``<model>-<trainer>`` context slug (skipping generic placeholders), and cached on
+    ``args.__dict__["_eyvan_auto_run_name"]`` so repeated calls on the same config instance
+    return the exact same name without adding dataclass schema fields.
+    """
+    raw_explicit = explicit_name if explicit_name is not None else getattr(args, "eyvan_track_name", None)
+    if isinstance(raw_explicit, str) and raw_explicit.strip():
+        return _sanitize_eyvan_utf8_text(raw_explicit.strip(), _EYVAN_MAX_NAME_LEN).strip() or "easydel-run"
+
+    raw_wandb = wandb_name if wandb_name is not None else getattr(args, "wandb_name", None)
+    if isinstance(raw_wandb, str) and raw_wandb.strip():
+        return _sanitize_eyvan_utf8_text(raw_wandb.strip(), _EYVAN_MAX_NAME_LEN).strip() or "easydel-run"
+
+    if args is not None and seed is None and hasattr(args, "__dict__"):
+        cached = args.__dict__.get("_eyvan_auto_run_name")
+        if isinstance(cached, str) and cached.strip():
+            return cached
+
+    ctx = args.__dict__.get("_eyvan_runtime_context", {}) if args is not None and hasattr(args, "__dict__") else {}
+    resolved_model_name = model_name if model_name is not None else getattr(args, "model_name", None)
+    model_token = _extract_eyvan_model_slug(
+        resolved_model_name,
+        model=model,
+        prefer_model_type=False,
+        for_run_name=True,
+    )
+    if not model_token:
+        ctx_model_slug = ctx.get("model_slug")
+        if isinstance(ctx_model_slug, str) and ctx_model_slug:
+            model_token = _EYVAN_NAME_TOKEN_UNSAFE_RE.sub("-", ctx_model_slug.lower()).strip(".-") or None
+
+    resolved_trainer_token: str | None = None
+    for candidate in (
+        trainer_slug,
+        *(ctx.get("extra_trainer_tags") or ()),
+        ctx.get("trainer_slug"),
+        getattr(args, "trainer_prefix", None),
+        type(trainer).__name__ if trainer is not None else None,
+        type(args).__name__ if args is not None else None,
+    ):
+        slug = _normalize_eyvan_trainer_slug(candidate)
+        if slug:
+            resolved_trainer_token = slug.replace("_", "-")
+            break
+
+    prefix_parts: list[str] = []
+    if model_token:
+        prefix_parts.append(model_token[:20].rstrip(".-"))
+    if resolved_trainer_token and resolved_trainer_token not in prefix_parts:
+        prefix_parts.append(resolved_trainer_token[:16].rstrip(".-"))
+    prefix = "-".join(part for part in prefix_parts if part) or None
+
+    generated = _generate_eyvan_wandb_style_name(prefix=prefix, seed=seed)
+    if args is not None and seed is None and hasattr(args, "__dict__"):
+        args.__dict__["_eyvan_auto_run_name"] = generated
+    return generated
+
+
+def _merge_eyvan_tags(
+    auto_tags: tp.Iterable[tp.Any] | None,
+    user_tags: tp.Iterable[tp.Any] | None,
+) -> tuple[str, ...]:
+    """Merge auto-detected and user tags cleanly within Eyvan's 64-tag / 64-char limits.
+
+    User tags are always preserved (up to 64 unique tags); remaining slots are filled with
+    deduplicated auto-detected tags in canonical order.
+    """
+
+    def _clean(items: tp.Iterable[tp.Any] | None) -> list[str]:
+        out: list[str] = []
+        seen_local: set[str] = set()
+        for raw in items or ():
+            if raw is None:
+                continue
+            tag = _sanitize_eyvan_utf8_text(str(raw).strip(), _EYVAN_MAX_TAG_LEN).strip()
+            if not tag or tag in seen_local:
+                continue
+            seen_local.add(tag)
+            out.append(tag)
+        return out
+
+    clean_user = _clean(user_tags)[:_EYVAN_MAX_TAGS]
+    clean_auto = _clean(auto_tags)
+    user_set = set(clean_user)
+    auto_only = [tag for tag in clean_auto if tag not in user_set]
+
+    auto_budget = max(0, _EYVAN_MAX_TAGS - len(clean_user))
+    kept_auto = set(auto_only[:auto_budget])
+    # Place canonical auto tags first and append user tags (keeping duplicates at their auto position).
+    seen: set[str] = set()
+    merged: list[str] = []
+    for tag in (*clean_auto, *clean_user):
+        if tag in seen:
+            continue
+        if tag not in user_set and tag not in kept_auto:
+            continue
+        seen.add(tag)
+        merged.append(tag)
+        if len(merged) >= _EYVAN_MAX_TAGS:
+            break
+    return tuple(merged)
+
+
+def _auto_detect_eyvan_tags(
+    args: tp.Any,
+    *,
+    trainer: tp.Any = None,
+    model: tp.Any = None,
+    env_name: str | None = None,
+    extra_trainer_tags: tp.Iterable[str] | None = None,
+    include_user_tags: bool = True,
+) -> tuple[str, ...]:
+    """Auto-detect rich framework, trainer, RL/feature, model, and hardware tags for Eyvan tracking.
+
+    Inspects trainer/config/model metadata safely via ``getattr`` (zero circular imports) and
+    merges with user ``eyvan_track_tags`` (preserving user tags within Eyvan's 64-tag / 64-char limits).
+    """
+    ctx = args.__dict__.get("_eyvan_runtime_context", {}) if args is not None and hasattr(args, "__dict__") else {}
+    auto: list[str] = ["easydel", "jax"]
+
+    # 1. Trainer identifiers (outer wrapper + inner trainer/prefix/config class) and RL mode tag.
+    trainer_slugs: list[str] = []
+    for candidate in (
+        *(extra_trainer_tags or ()),
+        *(ctx.get("extra_trainer_tags") or ()),
+        ctx.get("trainer_slug"),
+        getattr(args, "trainer_prefix", None),
+        type(trainer).__name__ if trainer is not None else None,
+        type(args).__name__ if args is not None else None,
+    ):
+        slug = _normalize_eyvan_trainer_slug(candidate)
+        if slug and slug not in trainer_slugs:
+            trainer_slugs.append(slug)
+    auto.extend(trainer_slugs)
+
+    resolved_env_raw = (
+        env_name
+        if env_name is not None
+        else (ctx.get("env_name") or getattr(trainer, "_eyvan_env_name", None) or getattr(args, "environment", None))
+    )
+    env_slug = _extract_eyvan_env_slug(resolved_env_raw)
+
+    is_icepop = bool(getattr(args, "esurge_importance_sampling_correction", False))
+    is_async_rl = bool(getattr(args, "async_mode", False)) or bool(getattr(args, "asynchronous_rollouts", False))
+    is_rl = (
+        any(slug in _EYVAN_RL_TRAINER_SLUGS for slug in trainer_slugs)
+        or is_icepop
+        or bool(env_slug)
+        or (is_async_rl and any(hasattr(args, attr) for attr in ("num_generations", "advantage_estimator", "cliprange")))
+    )
+    if is_rl:
+        auto.append("rl")
+
+    # 2. RL & training feature tags (detected cleanly via getattr).
+    if is_icepop:
+        auto.append("icepop")
+        is_mode = getattr(args, "esurge_importance_sampling_mode", None)
+        if isinstance(is_mode, str) and is_mode.strip():
+            mode_slug = _EYVAN_TAG_SLUG_UNSAFE_RE.sub("_", is_mode.strip().lower()).strip("._-")
+            if mode_slug:
+                auto.append(mode_slug[:_EYVAN_MAX_TAG_LEN])
+
+    if is_async_rl:
+        auto.append("async_rl")
+
+    if env_slug:
+        auto.append(f"env:{env_slug}")
+
+    beta = getattr(args, "beta", None)
+    if _is_real_number(beta):
+        beta_f = float(beta)
+        if math.isfinite(beta_f) and beta_f > 0.0:
+            auto.append("kl")
+
+    # LoRA / PEFT detection.
+    lora_active = bool(ctx.get("lora_active", False))
+    peft_active = bool(ctx.get("peft_active", False))
+    inner_model = getattr(model, "model", model) if model is not None else None
+    if inner_model is not None and bool(getattr(inner_model, "lora_is_enabled", False)):
+        lora_active = True
+    if trainer is not None and bool(getattr(trainer, "lora_is_enabled", False)):
+        lora_active = True
+    trainable_selector = getattr(args, "trainable_selector", None)
+    if isinstance(trainable_selector, str) and "lora" in trainable_selector.lower():
+        lora_active = True
+    elif isinstance(trainable_selector, collections.abc.Iterable) and not isinstance(trainable_selector, (str, bytes)):
+        for sel in trainable_selector:
+            sel_text = getattr(sel, "__name__", str(sel)).lower()
+            if "lora" in sel_text:
+                lora_active = True
+                break
+    if getattr(args, "lora_config", None) is not None or bool(getattr(args, "use_lora", False)):
+        lora_active = True
+    peft_cfg = getattr(args, "peft_config", None) or getattr(trainer, "peft_config", None)
+    if peft_cfg is not None:
+        peft_active = True
+        if "lora" in type(peft_cfg).__name__.lower() or "lora" in str(getattr(peft_cfg, "peft_type", "")).lower():
+            lora_active = True
+    if lora_active:
+        auto.append("lora")
+        auto.append("peft")
+    elif peft_active:
+        auto.append("peft")
+
+    # Quantization detection.
+    quant_method = (
+        _extract_quantization_method(getattr(args, "quantization_mode", None))
+        or _extract_quantization_method(getattr(args, "quantization_config", None))
+        or _extract_quantization_method(
+            getattr(getattr(inner_model, "config", None), "quantization_config", None)
+            if inner_model is not None
+            else None
+        )
+        or _extract_quantization_method(
+            getattr(inner_model, "quantization_config", None) if inner_model is not None else None
+        )
+        or (ctx.get("quant_method") if isinstance(ctx.get("quant_method"), str) else None)
+    )
+    if quant_method:
+        auto.append(f"quant:{quant_method}")
+
+    # 3. Model family slug (prefer model.config.model_type, fall back to sanitized model_name).
+    model_slug = (
+        _extract_eyvan_model_slug(None, model=inner_model, prefer_model_type=True)
+        or (ctx.get("model_slug") if isinstance(ctx.get("model_slug"), str) else None)
+        or _extract_eyvan_model_slug(getattr(args, "model_name", None), prefer_model_type=False)
+    )
+    if model_slug:
+        auto.append(model_slug)
+
+    # 4. Hardware & topology tags (metadata-only, non-blocking).
+    auto.extend(_detect_eyvan_hardware_tags())
+
+    user_tags = getattr(args, "eyvan_track_tags", None) if include_user_tags and args is not None else None
+    return _merge_eyvan_tags(auto, user_tags)
+
+
+def _close_eyvan_run(run: tp.Any, status: str = "finished") -> None:
+    """Flush, finish, and join the background writer thread of an Eyvan tracking Run safely."""
+    if run is None:
+        return
+    resolved_status = status if status in _EYVAN_FINISH_STATUSES else "finished"
+    try:
+        if not getattr(run, "finished", False) and hasattr(run, "finish"):
+            run.finish(status=resolved_status)
+    except Exception:
+        pass
+    thread = getattr(run, "_thread", None)
+    if isinstance(thread, threading.Thread) and thread.is_alive() and thread is not threading.current_thread():
+        try:
+            thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+
+def _sanitize_eyvan_slug(value: tp.Any, fallback: str = "easydel") -> str:
+    """Sanitize a project or scope identifier to Eyvan's ``[A-Za-z0-9][A-Za-z0-9._-]{0,127}`` slug."""
+    if value is None:
+        return fallback
+    slug = _EYVAN_SLUG_UNSAFE_RE.sub("-", str(value).strip()).strip("-._")
+    slug = slug[:_EYVAN_MAX_KEY_LEN]
+    if not slug or slug in {".", ".."} or not _EYVAN_SLUG_RE.fullmatch(slug):
+        return fallback
+    return slug
+
+
+def _sanitize_eyvan_key(key: tp.Any) -> str:
+    """Sanitize a metric/histogram/config key to Eyvan's ``[A-Za-z0-9_./-]{1,128}`` regex."""
+    raw = str(key).strip()
+    if _EYVAN_KEY_RE.fullmatch(raw):
+        return raw
+    sanitized = _EYVAN_KEY_UNSAFE_RE.sub("_", raw)
+    sanitized = re.sub(r"/{2,}", "/", sanitized).strip("_")
+    if not sanitized:
+        return "metric"
+    if len(sanitized) > _EYVAN_MAX_KEY_LEN:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+        sanitized = f"{sanitized[: _EYVAN_MAX_KEY_LEN - 9]}_{digest}"
+    if not _EYVAN_KEY_RE.fullmatch(sanitized):
+        return "metric"
+    return sanitized
+
+
+def _sanitize_eyvan_tags(tags: tp.Iterable[tp.Any] | None) -> tuple[str, ...]:
+    """Merge default EasyDeL tags with user tags, deduplicating within Eyvan's 64-tag / 64-char limits."""
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw in (*_EYVAN_DEFAULT_TAGS, *(tags or ())):
+        if raw is None:
+            continue
+        tag = str(raw).strip()[:_EYVAN_MAX_TAG_LEN].strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        cleaned.append(tag)
+        if len(cleaned) >= _EYVAN_MAX_TAGS:
+            break
+    return tuple(cleaned)
+
+
+def _eyvan_in_workload_env() -> bool:
+    """Return True when running inside an Eyvan workload with tracking env configured."""
+    return bool(
+        os.environ.get(_EYVAN_TRACKING_URI_ENV, "").strip() or os.environ.get(_EYVAN_WORKLOAD_ID_ENV, "").strip()
+    )
+
+
+def _effective_eyvan_rank(env: tp.Mapping[str, str] | None = None) -> int:
+    """Return the effective Eyvan distributed process rank matching ``eyvan.track.start``."""
+    src = os.environ if env is None else env
+    for key in ("EYVAN_DISTRIBUTED_PROCESS_ID", "JAX_PROCESS_ID"):
+        raw = (src.get(key) or "").strip()
+        if raw:
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                pass
+    try:
+        return max(0, int(jax.process_index()))
+    except Exception:
+        return 0
+
+
+def _resolve_eyvan_rank_environment() -> dict[str, str] | None:
+    """Return an environment copy carrying ``JAX_PROCESS_ID`` for nonzero JAX ranks when unset.
+
+    Never mutates ``os.environ``. Returns ``None`` when an explicit Eyvan/JAX rank env var is
+    already present (non-empty) or when the current process is rank 0.
+    """
+    if os.environ.get("EYVAN_DISTRIBUTED_PROCESS_ID", "").strip() or os.environ.get("JAX_PROCESS_ID", "").strip():
+        return None
+    try:
+        proc_idx = int(jax.process_index())
+    except Exception:
+        return None
+    if proc_idx <= 0:
+        return None
+    env = dict(os.environ)
+    env["JAX_PROCESS_ID"] = str(proc_idx)
+    return env
+
+
+def _is_eyvan_real_numeric_dtype(dtype: tp.Any) -> bool:
+    """Return True for real numeric or boolean NumPy/JAX dtypes, explicitly excluding complex dtypes."""
+    if dtype == jnp.bfloat16:
+        return True
+    return (np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.complexfloating)) or dtype == np.bool_
+
+
+def _is_eyvan_local_jax_array(value: tp.Any) -> bool:
+    """Return True when a JAX array can be read locally without cross-host collectives."""
+    if getattr(value, "is_fully_addressable", True):
+        return True
+    if getattr(value, "is_fully_replicated", False):
+        sharding = getattr(value, "sharding", None)
+        return bool(getattr(sharding, "has_addressable_devices", True))
+    return False
+
+
+def _safe_eyvan_device_get(value: tp.Any) -> tuple[bool, tp.Any]:
+    """Read a host or locally-addressable/replicated JAX array without triggering cross-host collectives."""
+    if isinstance(value, jax.Array):
+        if not _is_eyvan_local_jax_array(value):
+            return False, None
+        return True, jax.device_get(value)
+    return True, value
+
+
+def _sanitize_eyvan_utf8_text(value: tp.Any, limit: int) -> str:
+    """Coerce text to strict UTF-8 (replacing lone surrogates) and clip to ``limit`` characters."""
+    return str(value).encode("utf-8", errors="replace").decode("utf-8")[:limit]
+
+
+def _normalize_eyvan_meta_value(value: tp.Any) -> tp.Any:
+    """Convert JAX/NumPy scalars and arrays into host-native values for Eyvan config/summary records."""
+    if isinstance(value, jax.Array):
+        ok, value = _safe_eyvan_device_get(value)
+        if not ok:
+            return None
+    if isinstance(value, np.ndarray):
+        arr = value.astype(np.float32) if value.dtype == jnp.bfloat16 else value
+        if arr.ndim == 0 or arr.size == 1:
+            return arr.reshape(()).item()
+        return arr.tolist()
+    if isinstance(value, np.generic):
+        if value.dtype == jnp.bfloat16:
+            return float(value)
+        return value.item()
+    return value
+
+
+def _to_eyvan_scalar(value: tp.Any) -> tuple[bool, float]:
+    """Extract a Python float from a scalar or 0-d/size-1 array, returning ``(ok, float_value)``."""
+    if isinstance(value, bool | np.bool_):
+        return True, 1.0 if bool(value) else 0.0
+    if isinstance(value, int | float):
+        return True, float(value)
+    if isinstance(value, np.generic):
+        if np.issubdtype(value.dtype, np.complexfloating):
+            return False, 0.0
+        if value.dtype == jnp.bfloat16:
+            return True, float(value)
+        item = value.item()
+        if isinstance(item, bool):
+            return True, 1.0 if item else 0.0
+        if isinstance(item, int | float):
+            return True, float(item)
+        if _is_eyvan_real_numeric_dtype(value.dtype):
+            return True, float(value)
+        return False, 0.0
+    if isinstance(value, np.ndarray | jax.Array):
+        ok_read, host_value = _safe_eyvan_device_get(value)
+        if not ok_read:
+            return False, 0.0
+        arr = np.asarray(host_value)
+        if not _is_eyvan_real_numeric_dtype(arr.dtype):
+            return False, 0.0
+        if arr.ndim == 0 or arr.size == 1:
+            if arr.dtype == jnp.bfloat16:
+                arr = arr.astype(np.float32)
+            item = arr.reshape(()).item()
+            if isinstance(item, bool | np.bool_):
+                return True, 1.0 if bool(item) else 0.0
+            if isinstance(item, int | float | np.integer | np.floating):
+                return True, float(item)
+    return False, 0.0
+
+
+def _sanitize_eyvan_axes(axes: tp.Mapping[str, tp.Any] | None) -> dict[str, float] | None:
+    """Sanitize extra Eyvan x-axes to ``{valid_key: finite_float}`` or ``None`` when empty."""
+    if not isinstance(axes, tp.Mapping):
+        return None
+    cleaned: dict[str, float] = {}
+    for key, raw in axes.items():
+        if raw is None:
+            continue
+        ok, val = _to_eyvan_scalar(raw)
+        if ok and math.isfinite(val):
+            cleaned[_sanitize_eyvan_key(key)] = float(val)
+    return cleaned or None
+
+
+def _coerce_eyvan_int(
+    value: tp.Any,
+    *,
+    minimum: int | None = None,
+    maximum: int = _EYVAN_MAX_INT64,
+    clamp_min: bool = False,
+    allow_float_round: bool = False,
+) -> int | None:
+    """Coerce a Python/NumPy/JAX scalar into a bounded integer, rejecting bools and complex dtypes."""
+    if value is None or isinstance(value, bool | np.bool_ | str | bytes | bytearray):
+        return None
+    if isinstance(value, jax.Array):
+        ok_read, value = _safe_eyvan_device_get(value)
+        if not ok_read:
+            return None
+    if isinstance(value, np.ndarray):
+        if not _is_eyvan_real_numeric_dtype(value.dtype) or value.dtype == np.bool_:
+            return None
+        if value.ndim != 0 and value.size != 1:
+            return None
+        if value.dtype == jnp.bfloat16:
+            value = value.astype(np.float32)
+        value = value.reshape(()).item()
+    elif isinstance(value, np.generic):
+        if not _is_eyvan_real_numeric_dtype(value.dtype) or value.dtype == np.bool_:
+            return None
+        value = float(value) if value.dtype == jnp.bfloat16 else value.item()
+
+    if isinstance(value, bool | np.bool_):
+        return None
+    if isinstance(value, int | np.integer):
+        result = int(value)
+    elif isinstance(value, float | np.floating):
+        fval = float(value)
+        if not math.isfinite(fval):
+            return None
+        if allow_float_round:
+            result = round(fval)
+        elif fval.is_integer():
+            result = int(fval)
+        else:
+            return None
+    else:
+        return None
+
+    if minimum is not None and result < minimum:
+        if clamp_min:
+            result = minimum
+        else:
+            return None
+    if result > maximum:
+        result = maximum
+    return result
+
+
+def _sanitize_eyvan_text_label(value: tp.Any, limit: int) -> str | None:
+    """Coerce an optional short label into a non-empty bounded UTF-8 string."""
+    if value is None or isinstance(value, bool | np.bool_):
+        return None
+    text = _sanitize_eyvan_utf8_text(str(value).strip(), limit)
+    if not text:
+        return None
+    return text
+
+
+def _coerce_eyvan_sequence(value: tp.Any) -> list[tp.Any] | None:
+    """Coerce a 1-D array or sequence (excluding strings/mappings/complex arrays) into a Python list."""
+    if value is None or isinstance(value, str | bytes | bytearray | tp.Mapping):
+        return None
+    if isinstance(value, jax.Array):
+        ok_read, value = _safe_eyvan_device_get(value)
+        if not ok_read:
+            return None
+    if isinstance(value, np.ndarray):
+        if np.issubdtype(value.dtype, np.complexfloating):
+            return None
+        if value.dtype == jnp.bfloat16:
+            value = value.astype(np.float32)
+        return value.reshape(-1).tolist()
+    if isinstance(value, list | tuple):
+        return list(value)
+    if isinstance(value, collections.abc.Iterable):
+        return list(value)
+    return None
+
+
+def _normalize_eyvan_rollout_actions(
+    raw_actions: list[tp.Any],
+    raw_action_names: list[tp.Any] | None,
+) -> tuple[list[int | None], list[str] | None]:
+    """Normalize rollout actions to integer indices plus optional bounded ``action_names``."""
+    sanitized_names: list[str] | None = None
+    if raw_action_names is not None:
+        sanitized_names = [
+            (_sanitize_eyvan_utf8_text(str(name).strip(), _EYVAN_MAX_ACTION_NAME_LEN) or "action")
+            for name in raw_action_names[:_EYVAN_MAX_ACTION_NAMES]
+        ]
+
+    int_actions: list[int | None] = []
+    all_int_like = True
+    for item in raw_actions:
+        if item is None:
+            int_actions.append(None)
+            continue
+        coerced = _coerce_eyvan_int(item, minimum=_EYVAN_MIN_INT64, maximum=_EYVAN_MAX_INT64)
+        if coerced is None:
+            all_int_like = False
+            break
+        int_actions.append(coerced)
+    if all_int_like:
+        return int_actions, sanitized_names
+
+    palette: list[str] = list(sanitized_names) if sanitized_names is not None else []
+    name_to_idx: dict[str, int] = {name: idx for idx, name in enumerate(palette)}
+    indexed_actions: list[int | None] = []
+    for item in raw_actions:
+        if item is None:
+            indexed_actions.append(None)
+            continue
+        label = _sanitize_eyvan_utf8_text(str(item).strip(), _EYVAN_MAX_ACTION_NAME_LEN) or "action"
+        idx = name_to_idx.get(label)
+        if idx is None:
+            if len(palette) < _EYVAN_MAX_ACTION_NAMES - 1:
+                idx = len(palette)
+                palette.append(label)
+                name_to_idx[label] = idx
+            else:
+                other_idx = name_to_idx.get("other")
+                if other_idx is None:
+                    if len(palette) < _EYVAN_MAX_ACTION_NAMES:
+                        other_idx = len(palette)
+                        palette.append("other")
+                    else:
+                        other_idx = _EYVAN_MAX_ACTION_NAMES - 1
+                        palette[other_idx] = "other"
+                    name_to_idx["other"] = other_idx
+                idx = other_idx
+        indexed_actions.append(idx)
+    return indexed_actions, palette or None
 
 
 _TB_HISTOGRAM_MAX_SAMPLES = 4096
@@ -1495,6 +2765,71 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to use Weights & Biases for logging."},
     )
+    use_eyvan_track: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to log experiment metrics to Eyvan (`eyvan.track`). "
+                "`None` (default) auto-enables whenever `eyvan` is installed and `performance_mode=False` "
+                "(and not suppressed by test isolation via `set_eyvan_auto_track_enabled(False)`); "
+                "`True` forces on; `False` disables completely. Disabled automatically when `performance_mode=True`."
+            )
+        },
+    )
+    eyvan_track_uri: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Explicit Eyvan tracking store URI (`gs://...`, `file://...`, or local directory). "
+                "When omitted, respects `EYVAN_TRACKING_URI`, then queries `eyvan.storage.resolve_default_tracking_uri` "
+                "(configured default monitoring bucket), and finally falls back to `~/.eyvan/tracking/default/<project>`."
+            )
+        },
+    )
+    eyvan_track_project: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Local Eyvan tracking project slug (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) used when no "
+                "explicit store URI is configured. Defaults from `EasyDeL-{trainer_prefix}` or `easydel`."
+            )
+        },
+    )
+    eyvan_track_name: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Human-readable run name for Eyvan tracking. Falls back to `wandb_name` or "
+                "a cached W&B-style auto-generated name (e.g. `qwen3-grpo-amber-falcon-42`)."
+            )
+        },
+    )
+    eyvan_track_group: str | None = field(
+        default=None,
+        metadata={"help": "Optional sweep or experiment group name for Eyvan tracking."},
+    )
+    eyvan_track_tags: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional list of tags for Eyvan tracking; merged with auto-detected framework, trainer, "
+                "RL/feature, model, and hardware tags, deduplicated, and clamped to Eyvan limits."
+            )
+        },
+    )
+    eyvan_track_flush_interval_s: float = field(
+        default=5.0,
+        metadata={"help": "Background flush interval in seconds for `eyvan.track.start(...)`."},
+    )
+    eyvan_report_progress: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Forward rank-0 scalar step progress (`step`, `total`, finite scalar metrics) to "
+                "`eyvan.report_progress(...)`. Acts as a fast no-op when `EYVAN_PROGRESS_URL` is absent."
+            )
+        },
+    )
     verbose: bool = field(
         default=True,
         metadata={"help": "Whether to print verbose output."},
@@ -1759,6 +3094,8 @@ class TrainingArguments:
         if self.quantization_group_size is not None and self.quantization_group_size <= 0:
             raise ValueError("`quantization_group_size` must be > 0 when specified.")
         validate_quantization_bits(self.quantization_mode, self.quantization_bits)
+        if not np.isfinite(float(self.eyvan_track_flush_interval_s)) or float(self.eyvan_track_flush_interval_s) <= 0:
+            raise ValueError("`eyvan_track_flush_interval_s` must be a finite number > 0.")
         self._validate_data_lane_config()
 
     def _validate_data_lane_config(self) -> None:
@@ -1884,6 +3221,10 @@ class TrainingArguments:
         if self.use_wandb and self.performance_mode:
             logger.info("WandB logging disabled due to performance mode")
             self.use_wandb = False
+        if self.performance_mode and self.use_eyvan_track is not False:
+            if self.use_eyvan_track is True:
+                logger.info("Eyvan tracking disabled due to performance mode")
+            self.use_eyvan_track = False
         if self.report_metrics and self.performance_mode:
             logger.info("Metrics reporting disabled due to performance mode")
             self._can_log_metrics = False
@@ -1982,7 +3323,36 @@ class TrainingArguments:
         self.max_length = _coerce_int(self.max_length)
         self.log_steps = _coerce_int(self.log_steps)
         self.report_steps = _coerce_int(self.report_steps)
+        self.eyvan_track_flush_interval_s = _coerce_float(self.eyvan_track_flush_interval_s)
         self.tx_mu_dtype = _parse_dtype(self.tx_mu_dtype)
+
+        if self.use_eyvan_track is not None and not isinstance(self.use_eyvan_track, bool):
+            raise TypeError(
+                "`use_eyvan_track` must be a bool or None, got "
+                f"{type(self.use_eyvan_track).__name__}: {self.use_eyvan_track!r}"
+            )
+        for name in ("eyvan_track_uri", "eyvan_track_project", "eyvan_track_name", "eyvan_track_group"):
+            value = getattr(self, name, None)
+            if value is not None:
+                if not isinstance(value, str):
+                    raise TypeError(f"`{name}` must be a string when provided, got {type(value).__name__}: {value!r}")
+                setattr(self, name, value.strip() or None)
+        if self.eyvan_track_tags is not None:
+            if isinstance(self.eyvan_track_tags, str):
+                self.eyvan_track_tags = [self.eyvan_track_tags]
+            elif isinstance(self.eyvan_track_tags, collections.abc.Iterable):
+                self.eyvan_track_tags = [str(tag) for tag in self.eyvan_track_tags]
+            else:
+                raise TypeError(
+                    "`eyvan_track_tags` must be a sequence of strings when provided, got "
+                    f"{type(self.eyvan_track_tags).__name__}."
+                )
+        if not _is_real_number(self.eyvan_track_flush_interval_s):
+            raise TypeError(
+                "`eyvan_track_flush_interval_s` must be a number, got "
+                f"{type(self.eyvan_track_flush_interval_s).__name__}: {self.eyvan_track_flush_interval_s!r}"
+            )
+        self.eyvan_report_progress = bool(self.eyvan_report_progress)
 
         for name in ("learning_rate", "weight_decay"):
             value = getattr(self, name, None)
@@ -2415,6 +3785,267 @@ class TrainingArguments:
         writer = self.__dict__.pop("_tensorboard_writer", None)
         _close_summary_writer(writer)
 
+    @staticmethod
+    def resolve_eyvan_storage_path(
+        *parts: str,
+        region: str | None = None,
+        zone: str | None = None,
+        create: bool | None = None,
+        **kwargs: tp.Any,
+    ) -> str:
+        """Resolve a regional Eyvan GCS path (``gs://eyvan_<region>/...``) for checkpoints or datasets.
+
+        Delegates lazily to :func:`easydel.utils.eyvan_helpers.storage_path` so
+        calling this helper never pulls in ``eyvan.sdk``, ``fastapi``, or ``uvicorn``.
+
+        Args:
+            *parts: Relative object path segments appended under the regional bucket
+                (e.g. ``args.resolve_eyvan_storage_path("checkpoints", "qwen3-8b")``).
+            region: Optional GCP region override (auto-detected when omitted).
+            zone: Optional GCP zone override (implies its parent region).
+            create: Consent-by-default bucket creation policy (``True``, ``False``, or ``None``).
+            **kwargs: Additional keyword arguments forwarded to
+                :func:`easydel.utils.eyvan_helpers.storage_path`.
+
+        Returns:
+            Canonical ``gs://`` URI string.
+        """
+        from easydel.utils.eyvan_helpers import storage_path
+
+        return storage_path(*parts, region=region, zone=zone, create=create, **kwargs)
+
+    @property
+    def eyvan_tracking_enabled(self) -> bool:
+        """Whether Eyvan experiment tracking is active for this process.
+
+        When ``use_eyvan_track`` is ``None`` (the default), auto-enables whenever
+        ``eyvan.track`` is importable (unless suppressed by
+        :func:`set_eyvan_auto_track_enabled`), or whenever ``eyvan_track_uri`` or
+        Eyvan workload environment variables are present. Always respects
+        ``performance_mode``, ``can_log_metrics``, explicit ``use_eyvan_track=False``,
+        and the warn-once init-failure guard (``_eyvan_init_failed``).
+        """
+        if getattr(self, "performance_mode", False):
+            return False
+        if not self.can_log_metrics:
+            return False
+        if self.__dict__.get("_eyvan_init_failed", False):
+            return False
+        use_eyvan = getattr(self, "use_eyvan_track", None)
+        if use_eyvan is False:
+            return False
+        if use_eyvan is True:
+            return True
+        uri = getattr(self, "eyvan_track_uri", None)
+        if isinstance(uri, str) and uri.strip():
+            return True
+        if _eyvan_in_workload_env():
+            return True
+        if not is_eyvan_auto_track_enabled():
+            return False
+        return _import_eyvan_track() is not None
+
+    def _bind_eyvan_runtime_context(
+        self,
+        *,
+        trainer: tp.Any = None,
+        model: tp.Any = None,
+        env_name: tp.Any = None,
+        extra_trainer_tags: tp.Iterable[str] | None = None,
+        auto_run_name: str | None = None,
+    ) -> None:
+        """Record lightweight trainer/model/env metadata in ``__dict__`` without retaining object references."""
+        ctx: dict[str, tp.Any] = dict(self.__dict__.get("_eyvan_runtime_context") or {})
+
+        merged_extra: list[str] = list(ctx.get("extra_trainer_tags") or ())
+        for raw_tag in extra_trainer_tags or ():
+            slug = _normalize_eyvan_trainer_slug(raw_tag)
+            if slug and slug not in merged_extra:
+                merged_extra.append(slug)
+        if merged_extra:
+            ctx["extra_trainer_tags"] = tuple(merged_extra)
+
+        if trainer is not None:
+            trainer_slug = _normalize_eyvan_trainer_slug(type(trainer).__name__)
+            if trainer_slug:
+                ctx["trainer_slug"] = trainer_slug
+            if bool(getattr(trainer, "lora_is_enabled", False)):
+                ctx["lora_active"] = True
+            peft_cfg = getattr(trainer, "peft_config", None)
+            if peft_cfg is not None:
+                ctx["peft_active"] = True
+                if (
+                    "lora" in type(peft_cfg).__name__.lower()
+                    or "lora" in str(getattr(peft_cfg, "peft_type", "")).lower()
+                ):
+                    ctx["lora_active"] = True
+
+        if model is not None:
+            inner_model = getattr(model, "model", model)
+            model_slug = _extract_eyvan_model_slug(None, model=inner_model, prefer_model_type=True)
+            if model_slug:
+                ctx["model_slug"] = model_slug
+            if bool(getattr(inner_model, "lora_is_enabled", False)):
+                ctx["lora_active"] = True
+            qcfg = getattr(getattr(inner_model, "config", None), "quantization_config", None) or getattr(
+                inner_model, "quantization_config", None
+            )
+            qmethod = _extract_quantization_method(qcfg)
+            if qmethod:
+                ctx["quant_method"] = qmethod
+
+        if env_name is not None:
+            env_slug = _extract_eyvan_env_slug(env_name)
+            if env_slug:
+                ctx["env_name"] = env_slug
+
+        if ctx:
+            self.__dict__["_eyvan_runtime_context"] = ctx
+
+        if isinstance(auto_run_name, str) and auto_run_name.strip():
+            self.__dict__["_eyvan_auto_run_name"] = auto_run_name.strip()
+
+    def resolve_eyvan_run_name(
+        self,
+        *,
+        trainer: tp.Any = None,
+        model: tp.Any = None,
+        trainer_slug: str | None = None,
+    ) -> str:
+        """Resolve and cache the human-readable Eyvan run name for this config instance."""
+        return _resolve_eyvan_run_name(self, trainer=trainer, model=model, trainer_slug=trainer_slug)
+
+    def get_eyvan_track(
+        self,
+        *,
+        trainer: tp.Any = None,
+        model: tp.Any = None,
+        env_name: str | None = None,
+    ):
+        """Lazily initialize and return the cached Eyvan tracking :class:`~eyvan.track.Run`.
+
+        Args:
+            trainer: Optional trainer instance used to enrich auto-detected tags and run name.
+            model: Optional model or state instance used to extract model family, LoRA, and
+                quantization tags.
+            env_name: Optional environment identifier used to emit ``env:<slug>`` tags.
+
+        Returns:
+            eyvan.track.Run | None: The active Eyvan run handle, or ``None`` if
+                Eyvan tracking is disabled, ``eyvan`` is not installed, or run
+                initialization fails.
+        """
+        if not self.eyvan_tracking_enabled:
+            return None
+        if self.__dict__.get("_eyvan_init_failed", False):
+            return None
+        cached = self.__dict__.get("_eyvan_track_run")
+        if cached is not None and not getattr(cached, "finished", False):
+            return cached
+
+        with _EYVAN_INIT_LOCK:
+            if self.__dict__.get("_eyvan_init_failed", False):
+                return None
+            cached = self.__dict__.get("_eyvan_track_run")
+            if cached is not None:
+                if not getattr(cached, "finished", False):
+                    return cached
+                self.__dict__.pop("_eyvan_track_run", None)
+
+            eyvan_track = _import_eyvan_track()
+            if eyvan_track is None:
+                if getattr(self, "use_eyvan_track", None) is True and not self.__dict__.get(
+                    "_eyvan_track_missing_warned"
+                ):
+                    self.__dict__["_eyvan_track_missing_warned"] = True
+                    warnings.warn(
+                        "You have set `use_eyvan_track=True` but `eyvan` is not installed.",
+                        stacklevel=2,
+                    )
+                return None
+
+            prefix = (getattr(self, "trainer_prefix", None) or "").strip()
+            default_project = f"EasyDeL-{prefix}" if prefix else "easydel"
+            project = _sanitize_eyvan_slug(
+                getattr(self, "eyvan_track_project", None) or default_project,
+                fallback="easydel",
+            )
+
+            run_name = _resolve_eyvan_run_name(self, trainer=trainer, model=model)
+
+            raw_group = getattr(self, "eyvan_track_group", None)
+            group = str(raw_group).strip()[:_EYVAN_MAX_NAME_LEN].strip() or None if raw_group is not None else None
+            tags = _auto_detect_eyvan_tags(self, trainer=trainer, model=model, env_name=env_name)
+
+            raw_uri = getattr(self, "eyvan_track_uri", None)
+            uri = _resolve_eyvan_default_tracking_uri(
+                explicit_uri=raw_uri if isinstance(raw_uri, str) else None,
+                project=project,
+                org="default",
+            )
+
+            flush_interval_s = float(getattr(self, "eyvan_track_flush_interval_s", 5.0))
+            if not np.isfinite(flush_interval_s) or flush_interval_s <= 0:
+                flush_interval_s = 5.0
+
+            ranks = "all" if getattr(self, "log_all_workers", False) else "zero"
+            environment = _resolve_eyvan_rank_environment()
+            effective_rank = _effective_eyvan_rank(environment)
+            will_write = ranks == "all" or effective_rank == 0
+            try:
+                run_config = self.to_dict()
+            except Exception:
+                run_config = None
+
+            try:
+                if will_write:
+                    _ensure_local_eyvan_store_writable(uri, project=project, org="default")
+                run = eyvan_track.start(
+                    name=run_name,
+                    project=project,
+                    group=group,
+                    tags=tags,
+                    config=run_config,
+                    uri=uri,
+                    ranks=ranks,
+                    episode_ranks=ranks,
+                    flush_interval_s=flush_interval_s,
+                    environment=environment,
+                )
+            except Exception as exc:
+                self.__dict__["_eyvan_init_failed"] = True
+                warnings.warn(
+                    f"Failed to initialize Eyvan tracking ({type(exc).__name__}: {exc}); "
+                    "disabling Eyvan tracking for this run.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return None
+
+            self.__dict__["_eyvan_track_run"] = run
+            old_finalizer = self.__dict__.pop("_eyvan_track_finalizer", None)
+            if old_finalizer is not None:
+                old_finalizer.detach()
+            self.__dict__["_eyvan_track_finalizer"] = weakref.finalize(self, _close_eyvan_run, run)
+            if effective_rank == 0 and getattr(run, "active", True):
+                run_id = getattr(run, "id", None)
+                store_root = getattr(run, "store_root", None)
+                resolved_name = getattr(run, "name", run_name)
+                logger.info(
+                    f"Eyvan tracking active: name={resolved_name} run_id={run_id} "
+                    f"store={store_root} (view with `eyvan dashboard`)"
+                )
+            return run
+
+    def close_eyvan_track(self, status: str = "finished") -> None:
+        """Idempotently flush, finish, and clear the cached Eyvan tracking run."""
+        with _EYVAN_INIT_LOCK:
+            finalizer = self.__dict__.pop("_eyvan_track_finalizer", None)
+            if finalizer is not None:
+                finalizer.detach()
+            run = self.__dict__.pop("_eyvan_track_run", None)
+        _close_eyvan_run(run, status=status)
+
     def get_wandb_init(self):
         """
         Initialize Weights & Biases for experiment tracking.
@@ -2533,13 +4164,15 @@ class TrainingArguments:
         metrics: MetricsType,
         step: int,
         log_as: tp.Literal["summary", "config"] | None = None,
+        *,
+        axes: tp.Mapping[str, float | int] | None = None,
     ):
         """
         Log metrics to configured logging backends.
 
-        This method handles logging to multiple backends (WandB, TensorBoard)
-        and supports various metric types including scalars, histograms, and
-        distributions. It automatically filters and formats metrics for each
+        This method handles logging to multiple backends (WandB, TensorBoard,
+        Eyvan) and supports various metric types including scalars, histograms,
+        and distributions. It automatically filters and formats metrics for each
         backend's requirements.
 
         Args:
@@ -2551,8 +4184,10 @@ class TrainingArguments:
             step: The current training/evaluation step
             log_as: Special logging mode:
                 - None: Regular step-based logging
-                - "summary": Log as final summary (WandB only)
-                - "config": Log as configuration (WandB only)
+                - "summary": Log as final summary
+                - "config": Log as configuration
+            axes: Optional extra x-axis values (e.g. ``{"tokens": ..., "wall_s": ...}``)
+                forwarded to Eyvan tracking.
 
         Note:
             - Metrics are automatically filtered for None values
@@ -2566,6 +4201,7 @@ class TrainingArguments:
             metrics = {self._restructure_metric_name(k): get_safe_arr(v) for k, v in filtered_metrics.items()}
             self._log_to_wandb(metrics, step, log_as)
             self._log_to_tensorboard(metrics, step, log_as)
+            self._log_to_eyvan(metrics, step, log_as, axes=axes)
 
     def _restructure_metric_name(self, metric_name: str) -> str:
         """
@@ -2743,7 +4379,9 @@ class TrainingArguments:
                 for key, value in metrics.items():
                     try:
                         if isinstance(value, float | int | np.floating | np.integer):
-                            summary_writer.add_scalar(key, float(value) if isinstance(value, np.floating) else value, step)
+                            summary_writer.add_scalar(
+                                key, float(value) if isinstance(value, np.floating) else value, step
+                            )
                         elif isinstance(value, tuple) and len(value) == 2:
                             bin_counts, bin_edges = value
                             if isinstance(bin_counts, list | np.ndarray | jax.Array) and isinstance(
@@ -2761,6 +4399,598 @@ class TrainingArguments:
                         warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
             finally:
                 summary_writer.flush()
+
+    def _log_eyvan_histogram_tuple(
+        self,
+        run: tp.Any,
+        key: str,
+        bin_counts: tp.Any,
+        bin_edges: tp.Any,
+        step: int,
+        *,
+        axes: dict[str, float] | None = None,
+    ) -> None:
+        """Record a pre-binned ``(bin_counts, bin_edges)`` histogram on an Eyvan run safely."""
+        ok_counts, host_counts = _safe_eyvan_device_get(bin_counts)
+        ok_edges, host_edges = _safe_eyvan_device_get(bin_edges)
+        if not (ok_counts and ok_edges):
+            return
+        counts_arr = np.asarray(host_counts).reshape(-1)
+        edges_arr = np.asarray(host_edges).reshape(-1)
+        if not (_is_eyvan_real_numeric_dtype(counts_arr.dtype) and _is_eyvan_real_numeric_dtype(edges_arr.dtype)):
+            return
+        if counts_arr.dtype == jnp.bfloat16:
+            counts_arr = counts_arr.astype(np.float32)
+        if edges_arr.dtype == jnp.bfloat16:
+            edges_arr = edges_arr.astype(np.float32)
+
+        axes_kwargs = {"axes": axes} if axes else {}
+        if 1 <= counts_arr.size <= _EYVAN_MAX_HIST_BINS and edges_arr.size == counts_arr.size + 1:
+            counts_f = counts_arr.astype(np.float64)
+            edges_f = edges_arr.astype(np.float64)
+            if (
+                np.all(np.isfinite(counts_f))
+                and np.all(counts_f >= 0)
+                and np.all(np.isfinite(edges_f))
+                and np.all(np.diff(edges_f) > 0)
+            ):
+                count_list = np.rint(counts_f).astype(np.int64).tolist()
+                run.histogram(key, counts=count_list, edges=edges_f.tolist(), step=step, **axes_kwargs)
+                return
+
+        samples = _histogram_tuple_to_samples(counts_arr, edges_arr)
+        if samples.size > 0:
+            run.histogram(key, values=samples, step=step, **axes_kwargs)
+
+    def _log_to_eyvan(
+        self,
+        metrics: dict[str, tp.Any],
+        step: int,
+        log_as: tp.Literal["summary", "config"] | None = None,
+        *,
+        axes: tp.Mapping[str, float | int] | None = None,
+    ) -> None:
+        """Log metrics to Eyvan experiment tracking and optionally forward rank-0 progress.
+
+        Never raises on any tracking or transport error so training is never interrupted.
+        """
+        run = self.get_eyvan_track()
+        should_report_progress = (
+            log_as is None
+            and bool(getattr(self, "eyvan_report_progress", True))
+            and not getattr(self, "performance_mode", False)
+        )
+        if run is None and not should_report_progress:
+            return
+
+        try:
+            step_int = max(int(get_safe_arr(step)), 0)
+        except Exception:
+            step_int = 0
+
+        if log_as == "summary":
+            if run is not None:
+                try:
+                    sanitized = {
+                        _sanitize_eyvan_key(k): _normalize_eyvan_meta_value(v)
+                        for k, v in metrics.items()
+                        if v is not None
+                    }
+                    if sanitized:
+                        run.summary(**sanitized)
+                except Exception as exc:
+                    warnings.warn(f"Failed to log summary metrics to Eyvan: {exc}", stacklevel=2)
+            return
+
+        if log_as == "config":
+            if run is not None:
+                try:
+                    sanitized = {
+                        _sanitize_eyvan_key(k): _normalize_eyvan_meta_value(v)
+                        for k, v in metrics.items()
+                        if v is not None
+                    }
+                    if sanitized:
+                        run.config(sanitized)
+                except Exception as exc:
+                    warnings.warn(f"Failed to log config metrics to Eyvan: {exc}", stacklevel=2)
+            return
+
+        clean_axes = _sanitize_eyvan_axes(axes)
+        scalars: dict[str, float] = {}
+        hist_tuples: list[tuple[str, tp.Any, tp.Any]] = []
+        hist_arrays: list[tuple[str, tp.Any]] = []
+
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            try:
+                skey = _sanitize_eyvan_key(key)
+                is_scalar, scalar_val = _to_eyvan_scalar(value)
+                if is_scalar:
+                    scalars[skey] = scalar_val
+                    continue
+                if run is None:
+                    continue
+                if isinstance(value, tuple) and len(value) == 2:
+                    bin_counts, bin_edges = value
+                    if isinstance(bin_counts, list | tuple | np.ndarray | jax.Array) and isinstance(
+                        bin_edges, list | tuple | np.ndarray | jax.Array
+                    ):
+                        hist_tuples.append((skey, bin_counts, bin_edges))
+                        continue
+                if isinstance(value, list | tuple | np.ndarray | jax.Array):
+                    hist_arrays.append((skey, value))
+            except Exception as exc:
+                warnings.warn(f"Failed to prepare metric {key!r} for Eyvan: {exc}", stacklevel=2)
+
+        if run is not None:
+            if scalars:
+                try:
+                    if clean_axes:
+                        run.log(scalars, step=step_int, axes=clean_axes)
+                    else:
+                        run.log(scalars, step=step_int)
+                except Exception as exc:
+                    warnings.warn(f"Failed to log scalar metrics to Eyvan: {exc}", stacklevel=2)
+            for skey, bin_counts, bin_edges in hist_tuples:
+                try:
+                    self._log_eyvan_histogram_tuple(run, skey, bin_counts, bin_edges, step_int, axes=clean_axes)
+                except Exception as exc:
+                    warnings.warn(f"Failed to log histogram {skey!r} to Eyvan: {exc}", stacklevel=2)
+            for skey, raw_values in hist_arrays:
+                try:
+                    ok_vals, host_vals = _safe_eyvan_device_get(raw_values)
+                    if not ok_vals:
+                        continue
+                    arr = np.asarray(host_vals)
+                    if not _is_eyvan_real_numeric_dtype(arr.dtype):
+                        continue
+                    if arr.dtype == jnp.bfloat16:
+                        arr = arr.astype(np.float32)
+                    if arr.size > 0:
+                        if clean_axes:
+                            run.histogram(skey, values=arr.reshape(-1), step=step_int, axes=clean_axes)
+                        else:
+                            run.histogram(skey, values=arr.reshape(-1), step=step_int)
+                except Exception as exc:
+                    warnings.warn(f"Failed to log array histogram {skey!r} to Eyvan: {exc}", stacklevel=2)
+
+        if should_report_progress:
+            try:
+                is_rank_zero = bool(self.is_process_zero)
+            except Exception:
+                is_rank_zero = False
+            if is_rank_zero:
+                eyvan = _import_eyvan()
+                report_fn = getattr(eyvan, "report_progress", None) if eyvan is not None else None
+                if callable(report_fn):
+                    raw_total = getattr(self, "max_training_steps", None)
+                    if raw_total is None:
+                        raw_total = self.__dict__.get("_eyvan_total_steps")
+                    total: int | None = None
+                    if raw_total is not None and _is_real_int(raw_total):
+                        candidate_total = int(raw_total)
+                        if candidate_total >= 0:
+                            total = max(candidate_total, step_int)
+                    finite_scalars = {k: v for k, v in scalars.items() if math.isfinite(v)}
+                    try:
+                        report_fn(step=step_int, total=total, metrics=finite_scalars)
+                    except Exception as exc:
+                        warnings.warn(f"Failed to report progress to Eyvan: {exc}", stacklevel=2)
+
+    def log_eyvan_completions(
+        self,
+        prompt: str,
+        responses: tp.Sequence[str],
+        *,
+        rewards: tp.Any = None,
+        advantages: tp.Any = None,
+        group: str | int | None = None,
+        answer: str | None = None,
+        tokens: tp.Any = None,
+        kl: tp.Any = None,
+        truncated: tp.Any = None,
+        policy_version: int | None = None,
+        step: int | None = None,
+    ) -> bool:
+        """Record one LLM-RL completion group on the active Eyvan run without raising.
+
+        Args:
+            prompt: Prompt string shared by the completion group.
+            responses: Non-empty sequence of completion strings (capped at 64).
+            rewards: Optional per-response scalar rewards or mapping of
+                ``{component_name: per_response_rewards}``.
+            advantages: Optional per-response advantage values.
+            group: Optional group identifier (1-128 chars).
+            answer: Optional reference answer text.
+            tokens: Optional per-response non-negative token counts.
+            kl: Optional per-response finite KL values.
+            truncated: Optional per-response truncation flags.
+            policy_version: Optional non-negative behavior policy version.
+            step: Optional non-negative learner step.
+
+        Returns:
+            ``True`` when queued onto an active Eyvan run, ``False`` otherwise.
+        """
+        run = self.get_eyvan_track()
+        if run is None or getattr(run, "finished", False) or not getattr(run, "active", True):
+            return False
+        try:
+            raw_responses = _coerce_eyvan_sequence(responses)
+            if not raw_responses:
+                return False
+            response_texts = [
+                _sanitize_eyvan_utf8_text(item, _EYVAN_MAX_TEXT_LEN) for item in raw_responses[:_EYVAN_MAX_GROUP_SIZE]
+            ]
+            size = len(response_texts)
+            prompt_text = _sanitize_eyvan_utf8_text(prompt, _EYVAN_MAX_TEXT_LEN)
+            answer_text = _sanitize_eyvan_utf8_text(answer, _EYVAN_MAX_TEXT_LEN) if answer is not None else None
+
+            clean_rewards: tp.Any = None
+            if rewards is not None:
+                if isinstance(rewards, tp.Mapping):
+                    clean_components: dict[str, list[float]] = {}
+                    for comp_name, comp_vals in rewards.items():
+                        seq = _coerce_eyvan_sequence(comp_vals)
+                        if seq is None or len(seq) < size:
+                            continue
+                        skey = _sanitize_eyvan_key(comp_name)
+                        col: list[float] = []
+                        for val in seq[:size]:
+                            ok, fval = _to_eyvan_scalar(val)
+                            col.append(fval if ok else math.nan)
+                        clean_components[skey] = col
+                    clean_rewards = clean_components or None
+                else:
+                    seq = _coerce_eyvan_sequence(rewards)
+                    if seq is not None and len(seq) >= size:
+                        clean_rewards = [
+                            fval if ok else math.nan for ok, fval in (_to_eyvan_scalar(val) for val in seq[:size])
+                        ]
+
+            clean_advantages: list[float] | None = None
+            if advantages is not None:
+                seq = _coerce_eyvan_sequence(advantages)
+                if seq is not None and len(seq) >= size:
+                    clean_advantages = [
+                        fval if ok else math.nan for ok, fval in (_to_eyvan_scalar(val) for val in seq[:size])
+                    ]
+
+            clean_tokens: list[int | None] | None = None
+            if tokens is not None:
+                seq = _coerce_eyvan_sequence(tokens)
+                if seq is not None and len(seq) >= size:
+                    clean_tokens = [
+                        _coerce_eyvan_int(val, minimum=0, clamp_min=True, allow_float_round=True) for val in seq[:size]
+                    ]
+
+            clean_kl: list[float | None] | None = None
+            if kl is not None:
+                seq = _coerce_eyvan_sequence(kl)
+                if seq is not None and len(seq) >= size:
+                    clean_kl = []
+                    for val in seq[:size]:
+                        if val is None:
+                            clean_kl.append(None)
+                            continue
+                        ok, fval = _to_eyvan_scalar(val)
+                        clean_kl.append(fval if (ok and math.isfinite(fval)) else None)
+
+            clean_truncated: list[bool | None] | None = None
+            if truncated is not None:
+                seq = _coerce_eyvan_sequence(truncated)
+                if seq is not None and len(seq) >= size:
+                    clean_truncated = [None if val is None else bool(val) for val in seq[:size]]
+
+            clean_group = _sanitize_eyvan_text_label(group, _EYVAN_MAX_LABEL_LEN)
+            clean_policy_version = _coerce_eyvan_int(policy_version, minimum=0)
+            clean_step = _coerce_eyvan_int(step, minimum=0, clamp_min=True)
+
+            run.completions(
+                prompt_text,
+                response_texts,
+                rewards=clean_rewards,
+                advantages=clean_advantages,
+                group=clean_group,
+                answer=answer_text,
+                tokens=clean_tokens,
+                kl=clean_kl,
+                truncated=clean_truncated,
+                policy_version=clean_policy_version,
+                step=clean_step,
+            )
+            return True
+        except Exception as exc:
+            warnings.warn(f"Failed to log completions to Eyvan: {exc}", stacklevel=2)
+            return False
+
+    def log_eyvan_episode(
+        self,
+        ret: tp.Any,
+        length: int | None = None,
+        *,
+        success: bool | None = None,
+        kind: str = "train",
+        actor: str | int | None = None,
+        env: str | None = None,
+        seed: int | None = None,
+        policy_version: int | None = None,
+        learner_version: int | None = None,
+        checkpoint: str | None = None,
+        step: int | None = None,
+        axes: tp.Mapping[str, tp.Any] | None = None,
+        extra: tp.Mapping[str, tp.Any] | None = None,
+    ) -> bool:
+        """Record one completed RL episode on the active Eyvan run without raising.
+
+        Args:
+            ret: Episode return scalar (Python, NumPy, or JAX scalar; NaN/inf preserved).
+            length: Optional non-negative episode length.
+            success: Optional boolean task-success flag.
+            kind: ``"train"`` or ``"eval"``.
+            actor: Optional actor identifier (truncated to 64 chars).
+            env: Optional environment name (truncated to 128 chars).
+            seed: Optional integer environment seed.
+            policy_version: Optional non-negative policy version that generated the episode.
+            learner_version: Optional non-negative learner version for lag tracking.
+            checkpoint: Optional checkpoint identifier (truncated to 256 chars).
+            step: Optional non-negative learner step.
+            axes: Optional extra x-axis values.
+            extra: Optional mapping of up to 32 finite numeric fields.
+
+        Returns:
+            ``True`` when queued onto an active Eyvan run, ``False`` otherwise.
+        """
+        run = self.get_eyvan_track()
+        if (
+            run is None
+            or getattr(run, "finished", False)
+            or not getattr(run, "episodes_active", getattr(run, "active", True))
+        ):
+            return False
+        try:
+            ok_ret, ret_val = _to_eyvan_scalar(ret)
+            if not ok_ret:
+                return False
+            clean_length = _coerce_eyvan_int(length, minimum=0, clamp_min=True, allow_float_round=True)
+            clean_success = None if success is None else bool(success)
+            clean_kind = kind if kind in _EYVAN_EPISODE_KINDS else "train"
+            clean_actor = _sanitize_eyvan_text_label(actor, _EYVAN_MAX_ACTOR_LEN)
+            clean_env = _sanitize_eyvan_text_label(env, _EYVAN_MAX_ENV_LEN)
+            clean_seed = _coerce_eyvan_int(seed, minimum=_EYVAN_MIN_INT64, maximum=_EYVAN_MAX_INT64)
+            clean_policy_version = _coerce_eyvan_int(policy_version, minimum=0)
+            clean_learner_version = _coerce_eyvan_int(learner_version, minimum=0)
+            clean_checkpoint = _sanitize_eyvan_text_label(checkpoint, _EYVAN_MAX_CHECKPOINT_LEN)
+            clean_step = _coerce_eyvan_int(step, minimum=0, clamp_min=True)
+            clean_axes = _sanitize_eyvan_axes(axes)
+
+            clean_extra: dict[str, float] | None = None
+            if isinstance(extra, tp.Mapping):
+                sanitized_extra: dict[str, float] = {}
+                for key, raw in extra.items():
+                    if raw is None:
+                        continue
+                    ok_val, fval = _to_eyvan_scalar(raw)
+                    if not (ok_val and math.isfinite(fval)):
+                        continue
+                    skey = _sanitize_eyvan_key(key)
+                    if skey not in sanitized_extra and len(sanitized_extra) >= _EYVAN_MAX_EXTRA:
+                        continue
+                    sanitized_extra[skey] = float(fval)
+                clean_extra = sanitized_extra or None
+
+            run.episode(
+                ret_val,
+                clean_length,
+                success=clean_success,
+                kind=clean_kind,
+                actor=clean_actor,
+                env=clean_env,
+                seed=clean_seed,
+                policy_version=clean_policy_version,
+                learner_version=clean_learner_version,
+                checkpoint=clean_checkpoint,
+                step=clean_step,
+                axes=clean_axes,
+                extra=clean_extra,
+            )
+            return True
+        except Exception as exc:
+            warnings.warn(f"Failed to log episode to Eyvan: {exc}", stacklevel=2)
+            return False
+
+    def log_eyvan_rollout(
+        self,
+        steps: tp.Any = None,
+        *,
+        tracks: tp.Mapping[str, tp.Any] | None = None,
+        actions: tp.Any = None,
+        action_names: tp.Any = None,
+        every: int = 1,
+        episode_id: str | int | None = None,
+        actor: str | int | None = None,
+        env: str | None = None,
+        kind: str = "train",
+        policy_version: int | None = None,
+        step: int | None = None,
+        axes: tp.Mapping[str, tp.Any] | None = None,
+    ) -> bool:
+        """Record a sampled RL trajectory on the active Eyvan run without raising.
+
+        Accepts either per-step mappings (``steps``) or columnar ``tracks``/``actions``.
+        String action labels passed via ``actions`` are automatically indexed into
+        ``action_names`` so Eyvan's integer-action wire contract is always satisfied.
+
+        Returns:
+            ``True`` when the rollout was sampled and queued, ``False`` otherwise.
+        """
+        run = self.get_eyvan_track()
+        if (
+            run is None
+            or getattr(run, "finished", False)
+            or not getattr(run, "episodes_active", getattr(run, "active", True))
+        ):
+            return False
+        try:
+            raw_tracks: dict[str, list[tp.Any]] = {}
+            raw_actions: list[tp.Any] | None = None
+
+            if steps is not None:
+                step_rows = _coerce_eyvan_sequence(steps)
+                if not step_rows:
+                    return False
+                step_rows = step_rows[:_EYVAN_MAX_ROLLOUT_STEPS]
+                track_order: list[str] = []
+                step_has_action = False
+                for row in step_rows:
+                    if not isinstance(row, tp.Mapping):
+                        return False
+                    for key in row:
+                        if key == "action":
+                            step_has_action = True
+                            continue
+                        if key not in track_order:
+                            track_order.append(key)
+                for key in track_order:
+                    skey = _sanitize_eyvan_key(key)
+                    if skey not in raw_tracks and len(raw_tracks) >= _EYVAN_MAX_TRACKS:
+                        continue
+                    raw_tracks[skey] = [row.get(key) for row in step_rows]
+                if actions is None and step_has_action:
+                    raw_actions = [row.get("action") for row in step_rows]
+
+            if tracks is not None and isinstance(tracks, tp.Mapping):
+                for key, vals in tracks.items():
+                    seq = _coerce_eyvan_sequence(vals)
+                    if seq is None or not seq:
+                        continue
+                    skey = _sanitize_eyvan_key(key)
+                    if skey not in raw_tracks and len(raw_tracks) >= _EYVAN_MAX_TRACKS:
+                        continue
+                    raw_tracks[skey] = seq[:_EYVAN_MAX_ROLLOUT_STEPS]
+
+            if actions is not None:
+                seq = _coerce_eyvan_sequence(actions)
+                if seq is not None and seq:
+                    raw_actions = seq[:_EYVAN_MAX_ROLLOUT_STEPS]
+
+            lengths = [len(vals) for vals in raw_tracks.values()]
+            if raw_actions is not None:
+                lengths.append(len(raw_actions))
+            if not lengths:
+                return False
+            common_len = min(min(lengths), _EYVAN_MAX_ROLLOUT_STEPS)
+            if common_len < 1:
+                return False
+
+            clean_tracks: dict[str, list[float | None]] = {}
+            for skey, vals in raw_tracks.items():
+                encoded: list[float | None] = []
+                valid_track = True
+                for val in vals[:common_len]:
+                    if val is None:
+                        encoded.append(None)
+                        continue
+                    ok, fval = _to_eyvan_scalar(val)
+                    if not ok:
+                        valid_track = False
+                        break
+                    encoded.append(fval)
+                if valid_track:
+                    clean_tracks[skey] = encoded
+
+            raw_action_names = _coerce_eyvan_sequence(action_names) if action_names is not None else None
+            clean_actions: list[int | None] | None = None
+            clean_action_names: list[str] | None = None
+            if raw_actions is not None:
+                clean_actions, clean_action_names = _normalize_eyvan_rollout_actions(
+                    raw_actions[:common_len],
+                    raw_action_names,
+                )
+            elif raw_action_names is not None:
+                clean_action_names = [
+                    (_sanitize_eyvan_utf8_text(str(name).strip(), _EYVAN_MAX_ACTION_NAME_LEN) or "action")
+                    for name in raw_action_names[:_EYVAN_MAX_ACTION_NAMES]
+                ]
+
+            if not clean_tracks and clean_actions is None:
+                return False
+
+            clean_every = _coerce_eyvan_int(every, minimum=1, clamp_min=True) or 1
+            clean_episode_id = _sanitize_eyvan_text_label(episode_id, _EYVAN_MAX_LABEL_LEN)
+            clean_actor = _sanitize_eyvan_text_label(actor, _EYVAN_MAX_ACTOR_LEN)
+            clean_env = _sanitize_eyvan_text_label(env, _EYVAN_MAX_ENV_LEN)
+            clean_kind = kind if kind in _EYVAN_EPISODE_KINDS else "train"
+            clean_policy_version = _coerce_eyvan_int(policy_version, minimum=0)
+            clean_step = _coerce_eyvan_int(step, minimum=0, clamp_min=True)
+            clean_axes = _sanitize_eyvan_axes(axes)
+
+            return bool(
+                run.rollout(
+                    tracks=clean_tracks or None,
+                    actions=clean_actions,
+                    action_names=clean_action_names,
+                    every=clean_every,
+                    episode_id=clean_episode_id,
+                    actor=clean_actor,
+                    env=clean_env,
+                    kind=clean_kind,
+                    policy_version=clean_policy_version,
+                    step=clean_step,
+                    axes=clean_axes,
+                )
+            )
+        except Exception as exc:
+            warnings.warn(f"Failed to log rollout to Eyvan: {exc}", stacklevel=2)
+            return False
+
+    def log_eyvan_histogram(
+        self,
+        key: str,
+        values: tp.Any,
+        *,
+        step: int | None = None,
+        bins: int = 64,
+        axes: tp.Mapping[str, tp.Any] | None = None,
+    ) -> bool:
+        """Record a numeric distribution histogram on the active Eyvan run without raising.
+
+        Safely excludes complex dtypes, converts ``bfloat16`` to ``float32``, and
+        sanitizes histogram keys and extra x-axes.
+
+        Returns:
+            ``True`` when queued onto an active Eyvan run, ``False`` otherwise.
+        """
+        run = self.get_eyvan_track()
+        if run is None or getattr(run, "finished", False) or not getattr(run, "active", True):
+            return False
+        if values is None:
+            return False
+        try:
+            ok_read, raw = _safe_eyvan_device_get(values)
+            if not ok_read:
+                return False
+            arr = np.asarray(raw)
+            if not _is_eyvan_real_numeric_dtype(arr.dtype):
+                return False
+            if arr.dtype == jnp.bfloat16:
+                arr = arr.astype(np.float32)
+            flat = arr.reshape(-1)
+            if flat.size == 0:
+                return False
+            skey = _sanitize_eyvan_key(key)
+            clean_bins = _coerce_eyvan_int(bins, minimum=1, maximum=_EYVAN_MAX_HIST_BINS, clamp_min=True) or 64
+            clean_step = _coerce_eyvan_int(step, minimum=0, clamp_min=True)
+            clean_axes = _sanitize_eyvan_axes(axes)
+            if clean_axes:
+                run.histogram(skey, values=flat, step=clean_step, bins=clean_bins, axes=clean_axes)
+            else:
+                run.histogram(skey, values=flat, step=clean_step, bins=clean_bins)
+            return True
+        except Exception as exc:
+            warnings.warn(f"Failed to log histogram {key!r} to Eyvan: {exc}", stacklevel=2)
+            return False
 
     def _create_wandb_histogram(self, value):
         """Create a wandb.Histogram object from the given value.
@@ -2884,7 +5114,9 @@ class TrainingArguments:
 
             if field_name in cls._RUNTIME_ONLY_FIELDS and (
                 isinstance(value, str)
-                or (field_name == "watchers" and isinstance(value, list) and any(isinstance(item, str) for item in value))
+                or (
+                    field_name == "watchers" and isinstance(value, list) and any(isinstance(item, str) for item in value)
+                )
             ):
                 continue
 
@@ -2968,9 +5200,7 @@ class TrainingArguments:
                 if class_name == cls.__name__:
                     resolved_cls = cls
                 else:
-                    raise ValueError(
-                        f"We couldn't clarify the trainer config class {class_name!r} from provided json."
-                    )
+                    raise ValueError(f"We couldn't clarify the trainer config class {class_name!r} from provided json.")
             cls = resolved_cls
         return cls.from_dict(config_dict)
 

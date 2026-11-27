@@ -362,6 +362,19 @@ class BaseTrainerCfg(TypedDict, total=False):
         use_wandb: Whether to use Weights & Biases for experiment tracking.
         wandb_entity: WandB entity (team or user) for logging.
         wandb_name: Name for the WandB run.
+        use_eyvan_track: Whether to log experiment metrics to Eyvan (``eyvan.track``).
+            ``None`` (default) auto-enables whenever ``eyvan`` is installed and
+            ``performance_mode`` is ``False``; ``True`` forces on; ``False`` disables.
+        eyvan_track_uri: Explicit Eyvan tracking store URI (``gs://...``, ``file://...``,
+            or local directory). Falls back to ``EYVAN_TRACKING_URI``, then
+            ``eyvan.storage.resolve_default_tracking_uri``, and finally
+            ``~/.eyvan/tracking/default/<project>``.
+        eyvan_track_project: Local Eyvan project slug when no explicit store URI is set.
+        eyvan_track_name: Human-readable run name for Eyvan tracking.
+        eyvan_track_group: Optional sweep or experiment group name for Eyvan tracking.
+        eyvan_track_tags: Optional list of tags merged with EasyDeL defaults for Eyvan tracking.
+        eyvan_track_flush_interval_s: Background flush interval in seconds for ``eyvan.track.start``.
+        eyvan_report_progress: Whether rank 0 forwards scalar step progress to ``eyvan.report_progress``.
         trainer_prefix: Prefix for the trainer name in logging and checkpoints.
         backend: JAX backend to use (e.g., "gpu", "tpu").
         auto_shard_states: Whether to automatically shard model states across devices.
@@ -624,6 +637,14 @@ class BaseTrainerCfg(TypedDict, total=False):
     use_wandb: NotRequired[bool]
     wandb_entity: NotRequired[str | None]
     wandb_name: NotRequired[str | None]
+    use_eyvan_track: NotRequired[bool | None]
+    eyvan_track_uri: NotRequired[str | None]
+    eyvan_track_project: NotRequired[str | None]
+    eyvan_track_name: NotRequired[str | None]
+    eyvan_track_group: NotRequired[str | None]
+    eyvan_track_tags: NotRequired[list[str] | None]
+    eyvan_track_flush_interval_s: NotRequired[float]
+    eyvan_report_progress: NotRequired[bool]
     trainer_prefix: NotRequired[str | None]
 
     backend: NotRequired[str | None]
@@ -2374,6 +2395,14 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "verbose": True,
     "process_zero_is_admin": True,
     "use_wandb": True,
+    "use_eyvan_track": None,
+    "eyvan_track_uri": None,
+    "eyvan_track_project": None,
+    "eyvan_track_name": None,
+    "eyvan_track_group": None,
+    "eyvan_track_tags": None,
+    "eyvan_track_flush_interval_s": 5.0,
+    "eyvan_report_progress": True,
     "auto_shard_states": True,
     "performance_mode": False,
     "profiler_path": None,

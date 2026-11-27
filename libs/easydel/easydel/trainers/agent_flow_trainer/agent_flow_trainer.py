@@ -18,8 +18,10 @@ from __future__ import annotations
 import collections.abc
 import concurrent.futures
 import dataclasses
+import functools
 import inspect
 import json
+import math
 import threading
 import typing as tp
 
@@ -30,6 +32,7 @@ from jax import numpy as jnp
 
 from easydel.utils import Registry
 
+from ..training_configurations import _is_eyvan_real_numeric_dtype, _resolve_eyvan_run_name, _sanitize_eyvan_key
 from .agent_flow_config import (
     AgentFlowConfig,
     _normalize_base_trainer_type,
@@ -39,16 +42,567 @@ from .agent_flow_config import (
 
 logger = get_logger(__name__)
 
+_EYVAN_CONFIG_FIELDS: tuple[str, ...] = (
+    "use_eyvan_track",
+    "eyvan_track_uri",
+    "eyvan_track_project",
+    "eyvan_track_name",
+    "eyvan_track_group",
+    "eyvan_track_tags",
+    "eyvan_track_flush_interval_s",
+    "eyvan_report_progress",
+)
+_EYVAN_MAX_ROLLOUTS_PER_STEP = 8
+_EYVAN_MAX_COMPLETION_GROUPS_PER_STEP = 8
+_EYVAN_MAX_GROUP_RESPONSES = 64
+_EYVAN_MAX_ROLLOUT_STEPS = 10_000
+_EYVAN_MAX_ACTION_NAMES = 256
+_EYVAN_MAX_ACTION_NAME_LEN = 64
+_EYVAN_MAX_TEXT_CHARS = 32_000
+_EYVAN_MAX_OBS_PREVIEW_CHARS = 400
+_EYVAN_MAX_EXTRA_FIELDS = 32
+_EYVAN_MAX_ENV_LEN = 128
+_EYVAN_MAX_LABEL_LEN = 128
+
+
+def _is_locally_readable_jax_array(arr: jax.Array) -> bool:
+    """Return True if ``arr`` can be read via local ``jax.device_get`` with zero cross-host collectives.
+
+    On multi-host JAX meshes, global replicated arrays have ``is_fully_addressable=False`` and
+    ``is_fully_replicated=True``; reading their local shard via ``jax.device_get`` requires no
+    collective as long as ``sharding.has_addressable_devices`` is true.
+    """
+    if getattr(arr, "is_fully_addressable", True):
+        return True
+    if getattr(arr, "is_fully_replicated", False):
+        sharding = getattr(arr, "sharding", None)
+        return bool(getattr(sharding, "has_addressable_devices", True))
+    return False
+
 
 def _to_host_numpy(arr: tp.Any) -> np.ndarray:
     """Bring a host or (potentially non-fully-addressable sharded) JAX array to host NumPy safely."""
     if isinstance(arr, jax.Array):
-        if not getattr(arr, "is_fully_addressable", True):
+        if not _is_locally_readable_jax_array(arr):
             from jax.experimental import multihost_utils
 
             return np.asarray(multihost_utils.process_allgather(arr, tiled=True))
         return np.asarray(jax.device_get(arr))
     return np.asarray(arr)
+
+
+def _to_host_numpy_local_only(arr: tp.Any) -> np.ndarray | None:
+    """Convert an array to host NumPy without invoking any cross-host collective.
+
+    Safe to call inside rank-0-only blocks (never calls ``process_allgather``).
+    Accepts fully-addressable arrays as well as multi-host fully-replicated arrays
+    with local addressable devices; returns ``None`` if ``arr`` is genuinely sharded
+    across hosts or has a non-real numeric (e.g. complex) dtype.
+    """
+    if arr is None:
+        return None
+    if isinstance(arr, jax.Array):
+        if not _is_locally_readable_jax_array(arr):
+            return None
+        host = np.asarray(jax.device_get(arr))
+    else:
+        host = np.asarray(arr)
+    if not _is_eyvan_real_numeric_dtype(host.dtype):
+        return None
+    if host.dtype == jnp.bfloat16:
+        host = host.astype(np.float32)
+    return host
+
+
+def _extract_nonneg_step(state: tp.Any, fallback: int = 0) -> int:
+    """Safely extract a non-negative Python int step from ``state`` without cross-host collectives."""
+    raw = getattr(state, "step", None) if state is not None else None
+    if raw is None:
+        return max(0, int(fallback))
+    try:
+        if isinstance(raw, jax.Array):
+            if not _is_locally_readable_jax_array(raw):
+                return max(0, int(fallback))
+            raw = jax.device_get(raw)
+        if isinstance(raw, np.ndarray):
+            raw = raw.reshape(()).item()
+        elif isinstance(raw, np.generic):
+            raw = raw.item()
+        return max(0, int(raw))
+    except Exception:
+        return max(0, int(fallback))
+
+
+def _sanitize_eyvan_axes(axes: tp.Mapping[str, tp.Any] | None) -> dict[str, float] | None:
+    """Return a mapping of sanitized Eyvan axis keys to finite Python floats."""
+    if not axes:
+        return None
+    cleaned: dict[str, float] = {}
+    for key, raw in axes.items():
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(val):
+            cleaned[_sanitize_eyvan_key(key)] = val
+    return cleaned or None
+
+
+def _sanitize_eyvan_extra(extra: tp.Mapping[str, tp.Any] | None) -> dict[str, float] | None:
+    """Clamp and sanitize episode ``extra`` fields to at most 32 valid numeric keys."""
+    if not extra:
+        return None
+    cleaned: dict[str, float] = {}
+    for key, raw in extra.items():
+        if len(cleaned) >= _EYVAN_MAX_EXTRA_FIELDS:
+            break
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        cleaned[_sanitize_eyvan_key(key)] = val
+    return cleaned or None
+
+
+def _clip_eyvan_text(text: tp.Any, limit: int = _EYVAN_MAX_TEXT_CHARS) -> str:
+    """Return a UTF-8-safe string bounded to ``limit`` characters."""
+    s = "" if text is None else str(text)
+    s = s.encode("utf-8", errors="replace").decode("utf-8")
+    if len(s) > limit:
+        return s[: max(0, limit - 3)] + "..." if limit >= 3 else s[:limit]
+    return s
+
+
+def _resolve_eyvan_env_name(spec: tp.Any, fallback: str = "agent_flow") -> str:
+    """Resolve a clean 1..128 character Eyvan environment name from ``spec``."""
+    candidate: str | None = None
+    if isinstance(spec, str):
+        candidate = spec.strip()
+    elif isinstance(spec, collections.abc.Mapping):
+        raw = spec.get("name") or spec.get("type")
+        if isinstance(raw, str):
+            candidate = raw.strip()
+    elif isinstance(spec, type):
+        candidate = spec.__name__
+    elif isinstance(spec, functools.partial):
+        func = spec.func
+        name = getattr(func, "__name__", None)
+        if isinstance(name, str) and name and name != "<lambda>":
+            candidate = name
+    elif callable(spec):
+        name = getattr(spec, "__name__", None)
+        if isinstance(name, str) and name and name != "<lambda>":
+            candidate = name
+    elif spec is not None:
+        cls_name = type(spec).__name__
+        if cls_name and cls_name not in {"function", "method", "builtin_function_or_method"}:
+            candidate = cls_name
+    resolved = (candidate or fallback).strip()
+    return (resolved or fallback)[:_EYVAN_MAX_ENV_LEN]
+
+
+def _eyvan_log_episode(
+    args: tp.Any,
+    ret: float,
+    length: int | None = None,
+    *,
+    success: bool | None = None,
+    kind: str = "train",
+    env: str | None = None,
+    policy_version: int | None = None,
+    learner_version: int | None = None,
+    step: int | None = None,
+    axes: tp.Mapping[str, tp.Any] | None = None,
+    extra: tp.Mapping[str, tp.Any] | None = None,
+) -> bool:
+    """Emit one Eyvan episode via ``TrainingArguments.log_eyvan_episode`` or direct ``Run.episode``."""
+    if args is None or not bool(getattr(args, "eyvan_tracking_enabled", False)):
+        return False
+    clean_axes = _sanitize_eyvan_axes(axes)
+    clean_extra = _sanitize_eyvan_extra(extra)
+    clean_env = str(env).strip()[:_EYVAN_MAX_ENV_LEN] if env else None
+    clean_env = clean_env or None
+    clean_len = None if length is None else max(0, int(length))
+    clean_success = None if success is None else bool(success)
+    clean_step = None if step is None else max(0, int(step))
+    clean_pv = None if policy_version is None else max(0, int(policy_version))
+    clean_lv = None if learner_version is None else max(0, int(learner_version))
+    clean_kind = kind if kind in ("train", "eval") else "train"
+    helper = getattr(args, "log_eyvan_episode", None)
+    if callable(helper):
+        try:
+            return bool(
+                helper(
+                    float(ret),
+                    clean_len,
+                    success=clean_success,
+                    kind=clean_kind,
+                    env=clean_env,
+                    policy_version=clean_pv,
+                    learner_version=clean_lv,
+                    step=clean_step,
+                    axes=clean_axes,
+                    extra=clean_extra,
+                )
+            )
+        except Exception as exc:
+            logger.warning("AgentFlow Eyvan episode logging failed (%s): %s", type(exc).__name__, exc)
+            return False
+    get_run = getattr(args, "get_eyvan_track", None)
+    if not callable(get_run):
+        return False
+    try:
+        run = get_run()
+        if run is None or getattr(run, "finished", False):
+            return False
+        run.episode(
+            float(ret),
+            clean_len,
+            success=clean_success,
+            kind=clean_kind,
+            env=clean_env,
+            policy_version=clean_pv,
+            learner_version=clean_lv,
+            step=clean_step,
+            axes=clean_axes,
+            extra=clean_extra,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("AgentFlow Eyvan episode logging failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+def _eyvan_log_rollout(
+    args: tp.Any,
+    *,
+    tracks: tp.Mapping[str, tp.Sequence[float | None]] | None = None,
+    actions: tp.Sequence[int | None] | None = None,
+    action_names: tp.Sequence[str] | None = None,
+    episode_id: str | None = None,
+    env: str | None = None,
+    kind: str = "train",
+    policy_version: int | None = None,
+    step: int | None = None,
+    axes: tp.Mapping[str, tp.Any] | None = None,
+) -> bool:
+    """Emit one Eyvan rollout via ``TrainingArguments.log_eyvan_rollout`` or direct ``Run.rollout``."""
+    if args is None or not bool(getattr(args, "eyvan_tracking_enabled", False)):
+        return False
+    if not tracks and not actions:
+        return False
+    clean_axes = _sanitize_eyvan_axes(axes)
+    clean_env = str(env).strip()[:_EYVAN_MAX_ENV_LEN] if env else None
+    clean_env = clean_env or None
+    clean_ep_id = str(episode_id).strip()[:_EYVAN_MAX_LABEL_LEN] if episode_id else None
+    clean_ep_id = clean_ep_id or None
+    clean_step = None if step is None else max(0, int(step))
+    clean_pv = None if policy_version is None else max(0, int(policy_version))
+    clean_kind = kind if kind in ("train", "eval") else "train"
+    clean_tracks = {_sanitize_eyvan_key(k): list(v) for k, v in tracks.items()} if tracks is not None else None
+    clean_actions = [None if a is None else int(a) for a in actions] if actions is not None else None
+    clean_names = (
+        [(str(n).strip()[:_EYVAN_MAX_ACTION_NAME_LEN] or f"action_{i}") for i, n in enumerate(action_names)][
+            :_EYVAN_MAX_ACTION_NAMES
+        ]
+        if action_names is not None
+        else None
+    )
+    helper = getattr(args, "log_eyvan_rollout", None)
+    if callable(helper):
+        try:
+            return bool(
+                helper(
+                    tracks=clean_tracks,
+                    actions=clean_actions,
+                    action_names=clean_names,
+                    episode_id=clean_ep_id,
+                    env=clean_env,
+                    kind=clean_kind,
+                    policy_version=clean_pv,
+                    step=clean_step,
+                    axes=clean_axes,
+                )
+            )
+        except Exception as exc:
+            logger.warning("AgentFlow Eyvan rollout logging failed (%s): %s", type(exc).__name__, exc)
+            return False
+    get_run = getattr(args, "get_eyvan_track", None)
+    if not callable(get_run):
+        return False
+    try:
+        run = get_run()
+        if run is None or getattr(run, "finished", False):
+            return False
+        return bool(
+            run.rollout(
+                tracks=clean_tracks,
+                actions=clean_actions,
+                action_names=clean_names,
+                episode_id=clean_ep_id,
+                env=clean_env,
+                kind=clean_kind,
+                policy_version=clean_pv,
+                step=clean_step,
+                axes=clean_axes,
+            )
+        )
+    except Exception as exc:
+        logger.warning("AgentFlow Eyvan rollout logging failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+def _eyvan_log_completions(
+    args: tp.Any,
+    prompt: str,
+    responses: tp.Sequence[str],
+    *,
+    rewards: tp.Any = None,
+    advantages: tp.Any = None,
+    group: str | int | None = None,
+    tokens: tp.Sequence[int] | None = None,
+    kl: tp.Sequence[float | None] | None = None,
+    truncated: tp.Sequence[bool] | None = None,
+    policy_version: int | None = None,
+    step: int | None = None,
+) -> bool:
+    """Emit one Eyvan completion group via ``TrainingArguments.log_eyvan_completions`` or direct ``Run.completions``."""
+    if args is None or not bool(getattr(args, "eyvan_tracking_enabled", False)):
+        return False
+    if not responses:
+        return False
+    n = min(len(responses), _EYVAN_MAX_GROUP_RESPONSES)
+    clean_prompt = _clip_eyvan_text(prompt)
+    clean_responses = [_clip_eyvan_text(r) for r in responses[:n]]
+    clean_rewards: tp.Any = None
+    if isinstance(rewards, collections.abc.Mapping):
+        clean_rewards = {_sanitize_eyvan_key(k): [float(x) for x in list(v)[:n]] for k, v in rewards.items()}
+    elif rewards is not None:
+        clean_rewards = [float(x) for x in list(rewards)[:n]]
+    clean_adv = [float(x) for x in list(advantages)[:n]] if advantages is not None else None
+    clean_tokens = [max(0, int(x)) for x in list(tokens)[:n]] if tokens is not None else None
+    clean_kl = (
+        [None if (x is None or not math.isfinite(float(x))) else float(x) for x in list(kl)[:n]]
+        if kl is not None
+        else None
+    )
+    clean_trunc = [bool(x) for x in list(truncated)[:n]] if truncated is not None else None
+    clean_group = str(group).strip()[:_EYVAN_MAX_LABEL_LEN] if group is not None else None
+    clean_group = clean_group or None
+    clean_step = None if step is None else max(0, int(step))
+    clean_pv = None if policy_version is None else max(0, int(policy_version))
+    helper = getattr(args, "log_eyvan_completions", None)
+    if callable(helper):
+        try:
+            return bool(
+                helper(
+                    clean_prompt,
+                    clean_responses,
+                    rewards=clean_rewards,
+                    advantages=clean_adv,
+                    group=clean_group,
+                    tokens=clean_tokens,
+                    kl=clean_kl,
+                    truncated=clean_trunc,
+                    policy_version=clean_pv,
+                    step=clean_step,
+                )
+            )
+        except Exception as exc:
+            logger.warning("AgentFlow Eyvan completions logging failed (%s): %s", type(exc).__name__, exc)
+            return False
+    get_run = getattr(args, "get_eyvan_track", None)
+    if not callable(get_run):
+        return False
+    try:
+        run = get_run()
+        if run is None or getattr(run, "finished", False):
+            return False
+        run.completions(
+            clean_prompt,
+            clean_responses,
+            rewards=clean_rewards,
+            advantages=clean_adv,
+            group=clean_group,
+            tokens=clean_tokens,
+            kl=clean_kl,
+            truncated=clean_trunc,
+            policy_version=clean_pv,
+            step=clean_step,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("AgentFlow Eyvan completions logging failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+def _eyvan_log_histogram(
+    args: tp.Any,
+    key: str,
+    values: tp.Any,
+    *,
+    step: int | None = None,
+    bins: int = 64,
+    axes: tp.Mapping[str, tp.Any] | None = None,
+) -> bool:
+    """Emit one Eyvan histogram via ``TrainingArguments.log_eyvan_histogram`` or direct ``Run.histogram``."""
+    if args is None or not bool(getattr(args, "eyvan_tracking_enabled", False)):
+        return False
+    arr = _to_host_numpy_local_only(values)
+    if arr is None or arr.size == 0:
+        return False
+    flat = arr.reshape(-1)
+    clean_key = _sanitize_eyvan_key(key)
+    clean_step = None if step is None else max(0, int(step))
+    clean_axes = _sanitize_eyvan_axes(axes)
+    helper = getattr(args, "log_eyvan_histogram", None)
+    if callable(helper):
+        try:
+            return bool(helper(clean_key, flat, step=clean_step, bins=bins, axes=clean_axes))
+        except Exception as exc:
+            logger.warning("AgentFlow Eyvan histogram %r logging failed (%s): %s", clean_key, type(exc).__name__, exc)
+            return False
+    get_run = getattr(args, "get_eyvan_track", None)
+    if not callable(get_run):
+        return False
+    try:
+        run = get_run()
+        if run is None or getattr(run, "finished", False):
+            return False
+        run.histogram(clean_key, values=flat, step=clean_step, bins=bins, axes=clean_axes)
+        return True
+    except Exception as exc:
+        logger.warning("AgentFlow Eyvan histogram %r logging failed (%s): %s", clean_key, type(exc).__name__, exc)
+        return False
+
+
+def _compute_icepop_active_ratios(
+    is_ratio_np: np.ndarray,
+    active_mask: np.ndarray,
+) -> tuple[np.ndarray, float, float, float]:
+    """Compute IcePop / IS ratio statistics over active action tokens (``active_mask > 0``)."""
+    mask_bool = np.asarray(active_mask) > 0
+    arr = np.asarray(is_ratio_np)
+    if arr.dtype == jnp.bfloat16:
+        arr = arr.astype(np.float32)
+    else:
+        arr = arr.astype(np.float32, copy=False)
+    if arr.ndim == 1 and mask_bool.ndim == 2 and arr.shape[0] == mask_bool.shape[0]:
+        arr = arr[:, None]
+    broadcasted = np.broadcast_to(arr, mask_bool.shape)
+    active = broadcasted[mask_bool]
+    if active.size == 0:
+        return active, 0.0, 0.0, 0.0
+    finite = active[np.isfinite(active)]
+    ratio_mean = float(np.mean(finite)) if finite.size else 0.0
+    ratio_max = float(np.max(finite)) if finite.size else 0.0
+    masked_frac = float(np.mean(active == 0.0))
+    return active, ratio_mean, ratio_max, masked_frac
+
+
+def _compute_per_episode_kl_numpy(
+    policy_logps: np.ndarray,
+    ref_logps: np.ndarray,
+    active_mask: np.ndarray,
+    kl_estimator: str = "k3",
+) -> list[float | None]:
+    """Compute per-episode mean KL over active action tokens in float64 NumPy."""
+    mask_bool = np.asarray(active_mask) > 0
+    diff = np.asarray(ref_logps, dtype=np.float64) - np.asarray(policy_logps, dtype=np.float64)
+    est = str(kl_estimator or "k3").lower()
+    if est == "k1":
+        per_tok = -diff
+    elif est == "k2":
+        per_tok = 0.5 * np.square(diff)
+    elif est == "l2":
+        per_tok = np.square(diff)
+    else:
+        clamped = np.clip(diff, -80.0, 80.0)
+        per_tok = np.exp(clamped) - clamped - 1.0
+    out: list[float | None] = []
+    for row_idx in range(mask_bool.shape[0]):
+        row_mask = mask_bool[row_idx]
+        if not np.any(row_mask):
+            out.append(None)
+            continue
+        vals = per_tok[row_idx][row_mask]
+        finite = vals[np.isfinite(vals)]
+        out.append(float(np.mean(finite)) if finite.size else None)
+    return out
+
+
+def _select_rollout_sample_indices(
+    rewards: tp.Sequence[float],
+    eligible_indices: tp.Sequence[int],
+    cap: int = _EYVAN_MAX_ROLLOUTS_PER_STEP,
+) -> list[int]:
+    """Select up to ``cap`` episode indices prioritizing best reward, worst reward, then remaining."""
+    if not eligible_indices or cap <= 0:
+        return []
+    selected: list[int] = []
+    finite = [idx for idx in eligible_indices if math.isfinite(float(rewards[idx]))]
+    if finite:
+        best_idx = max(finite, key=lambda idx: (float(rewards[idx]), -idx))
+        worst_idx = min(finite, key=lambda idx: (float(rewards[idx]), idx))
+        selected.append(best_idx)
+        if worst_idx != best_idx and len(selected) < cap:
+            selected.append(worst_idx)
+    seen = set(selected)
+    for idx in eligible_indices:
+        if len(selected) >= cap:
+            break
+        if idx not in seen:
+            selected.append(idx)
+            seen.add(idx)
+    return selected
+
+
+def _encode_action_labels(raw_texts: tp.Sequence[str]) -> tuple[list[int], list[str]]:
+    """Map per-turn action strings into Eyvan int action IDs and bounded ``action_names``."""
+    action_names: list[str] = []
+    name_to_idx: dict[str, int] = {}
+    action_ids: list[int] = []
+    for turn_i, raw in enumerate(raw_texts):
+        cleaned = (
+            " ".join(str(raw or "").split())
+            .encode("utf-8", errors="replace")
+            .decode("utf-8")[:_EYVAN_MAX_ACTION_NAME_LEN]
+            .strip()
+        )
+        if not cleaned:
+            cleaned = f"turn_{turn_i}"
+        existing = name_to_idx.get(cleaned)
+        if existing is not None:
+            action_ids.append(existing)
+        elif len(action_names) < _EYVAN_MAX_ACTION_NAMES:
+            idx = len(action_names)
+            action_names.append(cleaned)
+            name_to_idx[cleaned] = idx
+            action_ids.append(idx)
+        else:
+            action_ids.append(_EYVAN_MAX_ACTION_NAMES - 1)
+    return action_ids, action_names
+
+
+def _format_agent_flow_transcript(
+    ep: AgentFlowEpisode,
+    *,
+    max_obs_chars: int = _EYVAN_MAX_OBS_PREVIEW_CHARS,
+    max_total_chars: int = _EYVAN_MAX_TEXT_CHARS,
+) -> str:
+    """Format a multi-turn :class:`AgentFlowEpisode` as a compact completion transcript."""
+    if not ep.turns:
+        return "[env_error: no turns]" if ep.env_error else "[empty episode]"
+    parts: list[str] = []
+    for turn in ep.turns:
+        segment = f"[Turn {turn.turn_index} | r={float(turn.reward):.4g}]\nAction: {turn.action_text}"
+        if turn.observation_text:
+            obs = turn.observation_text
+            if len(obs) > max_obs_chars:
+                obs = obs[: max_obs_chars - 3] + "..."
+            segment += f"\nObservation: {obs}"
+        parts.append(segment)
+    return _clip_eyvan_text("\n\n".join(parts), limit=max_total_chars)
 
 
 def _serialize_episodes(episodes: list[AgentFlowEpisode]) -> bytes:
@@ -396,6 +950,12 @@ class AgentFlowTrainer:
         self._rollout_lock = threading.RLock()
         self._rollout_call_count = 0
         self._owned_env_runtime: tp.Any = None
+        self._eyvan_total_turns: int = 0
+        self._eyvan_total_action_tokens: int = 0
+
+        self._env_spec = environment_factory or environment or self.arguments.environment
+        self._eyvan_env_name = _resolve_eyvan_env_name(self._env_spec, fallback="agent_flow")
+        self._eyvan_tag_env_name = _resolve_eyvan_env_name(self._env_spec, fallback="") or None
 
         if trainer is not None:
             if isinstance(trainer, _unsupported_base_trainer_classes()):
@@ -409,6 +969,17 @@ class AgentFlowTrainer:
                 self.arguments.base_trainer_type = _normalize_base_trainer_type(inferred)
                 if self.arguments.base_config is None and hasattr(trainer, "arguments"):
                     self.arguments.base_config = trainer.arguments
+            inner_args = getattr(trainer, "arguments", None)
+            inner_model = getattr(trainer, "_model", None) or getattr(
+                getattr(trainer, "model_state", None), "model", None
+            )
+            if inner_args is not None:
+                self._sync_eyvan_config_and_context(
+                    self.arguments,
+                    inner_args,
+                    model=inner_model or model or model_state,
+                    env_name=self._eyvan_tag_env_name,
+                )
         else:
             self.trainer = self._build_inner_trainer(
                 self.arguments,
@@ -436,7 +1007,6 @@ class AgentFlowTrainer:
             else:
                 self.arguments.async_mode = bool(self.trainer.arguments.async_mode)
 
-        self._env_spec = environment_factory or environment or self.arguments.environment
         self._env_factory = self._resolve_env_factory(self._env_spec)
         try:
             self._env_accepted_keys = self._resolve_accepted_env_keys(self._env_spec)
@@ -446,9 +1016,9 @@ class AgentFlowTrainer:
             orig_teardown = getattr(self.trainer, "_teardown_resources", None)
             if callable(orig_teardown):
 
-                def _wrapped_teardown() -> None:
+                def _wrapped_teardown(*args: tp.Any, **kwargs: tp.Any) -> None:
                     try:
-                        orig_teardown()
+                        orig_teardown(*args, **kwargs)
                     finally:
                         self._close_owned_env_runtime()
 
@@ -524,6 +1094,49 @@ class AgentFlowTrainer:
                         updated["max_length"] = needed
         return updated
 
+    @staticmethod
+    def _sync_eyvan_config_and_context(
+        outer_cfg: tp.Any,
+        inner_cfg: tp.Any,
+        *,
+        model: tp.Any = None,
+        env_name: str | None = None,
+    ) -> None:
+        """Bind AgentFlow Eyvan context onto both configs and synchronize any auto-generated run name."""
+        for target in (outer_cfg, inner_cfg):
+            bind_fn = getattr(target, "_bind_eyvan_runtime_context", None)
+            if callable(bind_fn):
+                bind_fn(
+                    model=model,
+                    env_name=env_name,
+                    extra_trainer_tags=("agentflow",),
+                )
+
+        inner_explicit = getattr(inner_cfg, "eyvan_track_name", None) or getattr(inner_cfg, "wandb_name", None)
+        outer_explicit = getattr(outer_cfg, "eyvan_track_name", None) or getattr(outer_cfg, "wandb_name", None)
+        if isinstance(inner_explicit, str) and inner_explicit.strip():
+            return
+        if isinstance(outer_explicit, str) and outer_explicit.strip():
+            if hasattr(inner_cfg, "__dict__"):
+                inner_cfg.__dict__["_eyvan_auto_run_name"] = outer_explicit.strip()
+            return
+
+        cached = (inner_cfg.__dict__.get("_eyvan_auto_run_name") if hasattr(inner_cfg, "__dict__") else None) or (
+            outer_cfg.__dict__.get("_eyvan_auto_run_name") if hasattr(outer_cfg, "__dict__") else None
+        )
+        if not (isinstance(cached, str) and cached.strip()):
+            resolved_model_name = getattr(inner_cfg, "model_name", None) or getattr(outer_cfg, "model_name", None)
+            cached = _resolve_eyvan_run_name(
+                outer_cfg,
+                model_name=resolved_model_name,
+                model=model,
+                trainer_slug="agentflow",
+            )
+        if hasattr(outer_cfg, "__dict__"):
+            outer_cfg.__dict__["_eyvan_auto_run_name"] = cached
+        if hasattr(inner_cfg, "__dict__"):
+            inner_cfg.__dict__["_eyvan_auto_run_name"] = cached
+
     def _build_inner_trainer(
         self,
         cfg: AgentFlowConfig,
@@ -547,6 +1160,7 @@ class AgentFlowTrainer:
             cfg_cls = Registry.get_or_raise("trainer-arguments", base_type)
             sig = inspect.signature(cfg_cls)
             candidate_kwargs: dict[str, tp.Any] = {
+                "model_name": cfg.model_name,
                 "learning_rate": cfg.learning_rate,
                 "max_training_steps": cfg.max_training_steps,
                 "save_directory": cfg.save_directory,
@@ -558,21 +1172,40 @@ class AgentFlowTrainer:
                 "num_generations": cfg.num_generations,
                 "gamma": cfg.gamma,
             }
+            for eyvan_key in _EYVAN_CONFIG_FIELDS:
+                val = getattr(cfg, eyvan_key, None)
+                if val is not None:
+                    candidate_kwargs[eyvan_key] = list(val) if isinstance(val, list) else val
             init_kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig.parameters and v is not None}
             init_kwargs = self._ensure_online_dpo_lengths(cfg_cls, init_kwargs)
             base_cfg = cfg_cls(**init_kwargs)
         elif isinstance(base_cfg, collections.abc.Mapping):
             cfg_cls = Registry.get_or_raise("trainer-arguments", base_type)
+            cfg_params = inspect.signature(cfg_cls).parameters
             raw_dict = dict(base_cfg)
+            if "model_name" not in base_cfg and "model_name" in cfg_params and cfg.model_name is not None:
+                raw_dict["model_name"] = cfg.model_name
             if bool(cfg.async_mode) and raw_dict.get("async_mode") is None:
-                if "async_mode" in inspect.signature(cfg_cls).parameters:
+                if "async_mode" in cfg_params:
                     raw_dict["async_mode"] = True
+            for eyvan_key in _EYVAN_CONFIG_FIELDS:
+                if eyvan_key not in base_cfg and eyvan_key in cfg_params:
+                    val = getattr(cfg, eyvan_key, None)
+                    if val is not None:
+                        raw_dict[eyvan_key] = list(val) if isinstance(val, list) else val
             raw_dict = self._ensure_online_dpo_lengths(
                 cfg_cls,
                 raw_dict,
                 explicit_keys=base_cfg.keys(),
             )
             base_cfg = _reconstruct_base_config(cfg_cls, raw_dict)
+
+        self._sync_eyvan_config_and_context(
+            cfg,
+            base_cfg,
+            model=model or model_state,
+            env_name=getattr(self, "_eyvan_tag_env_name", None),
+        )
 
         ctor_params: collections.abc.Mapping[str, inspect.Parameter] = {}
         accepts_var_kw = False
@@ -1012,7 +1645,9 @@ class AgentFlowTrainer:
             except Exception as close_exc:
                 logger.warning("AgentFlow env.close() failed (%s): %s", type(close_exc).__name__, close_exc)
 
-    def _prepare_initial_prompt(self, reset_res: tp.Any, task: dict[str, tp.Any]) -> tuple[str, list[dict[str, str]], list[int], bool]:
+    def _prepare_initial_prompt(
+        self, reset_res: tp.Any, task: dict[str, tp.Any]
+    ) -> tuple[str, list[dict[str, str]], list[int], bool]:
         """Format and clip initial prompt tokens to ``prompt_width`` before turn 0 for TITO alignment."""
         prompt_source = reset_res.observation or task.get("prompt", "")
         if _is_message_list(prompt_source):
@@ -1541,31 +2176,58 @@ class AgentFlowTrainer:
             for ep in episodes
             if ep.prompt_clipped or len(ep.prompt_token_ids) > prompt_width or len(ep.completion_token_ids) > comp_width
         )
+        valid_bool = valid_np > 0.0
+        ep_action_tokens = [max(0, int(sum(ep.action_mask))) for ep in episodes]
+        ep_obs_tokens = [max(0, int(sum(len(t.observation_token_ids) for t in ep.turns))) for ep in episodes]
+        ep_truncated = [
+            bool(any(t.truncated for t in ep.turns) or len(ep.completion_token_ids) > comp_width) for ep in episodes
+        ]
+        pass_rate = float(np.mean(rewards_np[valid_bool] > 0.0)) if np.any(valid_bool) else 0.0
+        truncation_rate = float(np.mean(ep_truncated)) if episodes else 0.0
+        eff_group_size = max(1, int(group_size))
+        zero_var_flags: list[bool] = []
+        for g_start in range(0, len(episodes), eff_group_size):
+            g_end = min(g_start + eff_group_size, len(episodes))
+            g_vals = rewards_np[g_start:g_end][valid_bool[g_start:g_end]]
+            zero_var_flags.append(g_vals.size < 2 or bool(np.isclose(float(np.std(g_vals)), 0.0, atol=1e-8)))
+        zero_var_group_frac = float(np.mean(zero_var_flags)) if zero_var_flags else 0.0
+
         finite_vals = rewards_np[finite_rewards]
-        metrics = {
+        metrics: dict[str, float] = {
             "agent_flow/mean_reward": float(np.mean(finite_vals)) if finite_vals.size else 0.0,
             "agent_flow/mean_turns": float(np.mean([len(ep.turns) for ep in episodes])) if episodes else 0.0,
             "agent_flow/action_tokens": float(np.sum(comp_mask_np)),
+            "agent_flow/mean_action_tokens": float(np.mean(ep_action_tokens)) if episodes else 0.0,
+            "agent_flow/mean_obs_tokens": float(np.mean(ep_obs_tokens)) if episodes else 0.0,
             "agent_flow/env_errors": float(sum(1 for ep in episodes if ep.env_error)),
             "agent_flow/clipped_episodes": float(clipped_count),
+            "agent_flow/pass_rate": pass_rate,
+            "rl/pass_rate": pass_rate,
+            "agent_flow/zero_var_group_frac": zero_var_group_frac,
+            "rl/zero_var_group_frac": zero_var_group_frac,
+            "agent_flow/truncation_rate": truncation_rate,
+            "rl/truncation_rate": truncation_rate,
         }
 
         has_lps = all(ep.logprobs is not None for ep in episodes)
-        lp_arr = (
-            self._gather_array(
-                _pad_right_2d(
-                    [ep.logprobs or [] for ep in episodes],
-                    width=comp_width,
-                    pad_value=0.0,
-                    dtype=np.float32,
-                )
+        lp_np = (
+            _pad_right_2d(
+                [ep.logprobs or [] for ep in episodes],
+                width=comp_width,
+                pad_value=0.0,
+                dtype=np.float32,
             )
             if has_lps
             else None
         )
+        lp_arr = self._gather_array(lp_np) if lp_np is not None else None
+
+        final_batch: dict[str, tp.Any]
+        ref_logps_for_kl: tp.Any = None
+        policy_logps_for_kl: tp.Any = lp_np
 
         if self._is_online_dpo():
-            pair_batch, pair_metrics = self._build_preference_pair_batch(
+            final_batch, pair_metrics = self._build_preference_pair_batch(
                 episodes,
                 group_size,
                 prompt_ids_np=prompt_ids_np,
@@ -1575,9 +2237,7 @@ class AgentFlowTrainer:
                 comp_attn_np=comp_attn_np,
             )
             metrics.update(pair_metrics)
-            return pair_batch, metrics
-
-        if self._is_ppo_family():
+        elif self._is_ppo_family():
             input_ids = self._gather_array(jnp.concatenate([prompt_ids, completion_ids], axis=1))
             attention_mask = self._gather_array(jnp.concatenate([prompt_mask, completion_attention_mask], axis=1))
             inner_args = getattr(self.trainer, "arguments", None)
@@ -1632,6 +2292,7 @@ class AgentFlowTrainer:
                     )
                     ref_logps = jnp.asarray(ref_logps)[:, -comp_width:]
                     ref_logps = jnp.where(mask_bool, ref_logps.astype(jnp.float32), 0.0)
+                    ref_logps_for_kl = self._gather_array(ref_logps)
                     logr = jnp.where(mask_bool, ref_logps - old_logps_masked, 0.0)
                     kl_estimator = str(getattr(inner_args, "kl_estimator", "k1") or "k1").lower()
                     if kl_estimator == "k1":
@@ -1676,11 +2337,15 @@ class AgentFlowTrainer:
                     flat_pcols = np.concatenate(
                         [np.arange(pos.size, dtype=np.int32) for pos in active_pos if pos.size > 0]
                     )
-                    adv_2d = jnp.zeros((batch_sz, comp_width), dtype=jnp.float32).at[flat_rows, flat_cols].set(
-                        packed_adv[flat_rows, flat_pcols]
+                    adv_2d = (
+                        jnp.zeros((batch_sz, comp_width), dtype=jnp.float32)
+                        .at[flat_rows, flat_cols]
+                        .set(packed_adv[flat_rows, flat_pcols])
                     )
-                    ret_2d = jnp.zeros((batch_sz, comp_width), dtype=jnp.float32).at[flat_rows, flat_cols].set(
-                        packed_ret[flat_rows, flat_pcols]
+                    ret_2d = (
+                        jnp.zeros((batch_sz, comp_width), dtype=jnp.float32)
+                        .at[flat_rows, flat_cols]
+                        .set(packed_ret[flat_rows, flat_pcols])
                     )
                 else:
                     adv_2d = jnp.zeros((batch_sz, comp_width), dtype=jnp.float32)
@@ -1700,9 +2365,9 @@ class AgentFlowTrainer:
                 "num_items_in_batch": jnp.sum(comp_mask_f32),
                 "num_positive_tokens": jnp.sum(comp_mask_f32 * positive_mask[:, None]),
             }
-            return self._gather_batch(out), metrics
-
-        if self._is_ssd():
+            final_batch = self._gather_batch(out)
+            policy_logps_for_kl = final_batch.get("old_logps")
+        elif self._is_ssd():
             out = {
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
@@ -1710,9 +2375,8 @@ class AgentFlowTrainer:
                 "completion_mask": completion_mask,
                 "completion_attention_mask": completion_attention_mask,
             }
-            return self._gather_batch(out), metrics
-
-        if self._is_seq_kd():
+            final_batch = self._gather_batch(out)
+        elif self._is_seq_kd():
             input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
             attention_mask = jnp.concatenate([prompt_mask, completion_attention_mask], axis=1)
             full_completion_mask = jnp.concatenate([jnp.zeros_like(prompt_mask), completion_mask], axis=1)
@@ -1722,9 +2386,8 @@ class AgentFlowTrainer:
                 "attention_mask": attention_mask,
                 "labels": labels,
             }
-            return self._gather_batch(out), metrics
-
-        if self._is_on_policy_distillation():
+            final_batch = self._gather_batch(out)
+        elif self._is_on_policy_distillation():
             input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
             attention_mask = jnp.concatenate([prompt_mask, completion_attention_mask], axis=1)
             full_completion_mask = jnp.concatenate([jnp.zeros_like(prompt_mask), completion_mask], axis=1)
@@ -1733,9 +2396,8 @@ class AgentFlowTrainer:
                 "attention_mask": attention_mask,
                 "completion_mask": full_completion_mask,
             }
-            return self._gather_batch(out), metrics
-
-        if self._is_gkd():
+            final_batch = self._gather_batch(out)
+        elif self._is_gkd():
             input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
             attention_mask = jnp.concatenate([prompt_mask, completion_attention_mask], axis=1)
             full_completion_mask = jnp.concatenate([jnp.zeros_like(prompt_mask), completion_mask], axis=1)
@@ -1751,89 +2413,99 @@ class AgentFlowTrainer:
                 "action_mask": full_completion_mask,
                 "rewards": jnp.asarray(rewards_safe_np),
             }
-            return self._gather_batch(out), metrics
+            final_batch = self._gather_batch(out)
+        else:
+            # GRPO / GMPO / GDPO / REINFORCE++ / GSPO / GFPO / RLOO / DPPO / PAPO / MiniLLM family.
+            out = {
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
+                "completion_ids": completion_ids,
+                "completion_mask": completion_mask,
+                "completion_attention_mask": completion_attention_mask,
+                "advantages": jnp.asarray(advantages_np),
+                "environment_rewards": jnp.asarray(rewards_safe_np),
+                "difficulty_weights": jnp.asarray(valid_np, dtype=jnp.float32),
+                "num_items_in_batch": jnp.sum(completion_mask),
+            }
+            if lp_arr is not None:
+                out["sampling_per_token_logps"] = lp_arr
+                out["old_per_token_logps"] = lp_arr
 
-        # GRPO / GMPO / GDPO / REINFORCE++ / GSPO / GFPO / RLOO / DPPO / PAPO / MiniLLM family.
-        out = {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "completion_attention_mask": completion_attention_mask,
-            "advantages": jnp.asarray(advantages_np),
-            "environment_rewards": jnp.asarray(rewards_safe_np),
-            "difficulty_weights": jnp.asarray(valid_np, dtype=jnp.float32),
-            "num_items_in_batch": jnp.sum(completion_mask),
-        }
-        if lp_arr is not None:
-            out["sampling_per_token_logps"] = lp_arr
-            out["old_per_token_logps"] = lp_arr
+            inner_args = getattr(self.trainer, "arguments", None)
+            needs_esurge_is = (
+                bool(getattr(inner_args, "esurge_importance_sampling_correction", False)) and lp_arr is not None
+            )
+            force_old_logps = bool(getattr(self.trainer, "_async_grpo_force_old_logps", False))
+            needs_state_old_logps = is_train and (needs_esurge_is or (force_old_logps and lp_arr is None))
+            full_ids_cached: jax.Array | None = None
+            full_mask_cached: jax.Array | None = None
+            empty_model_kwargs_cached: dict[str, tp.Any] | None = None
 
-        inner_args = getattr(self.trainer, "arguments", None)
-        needs_esurge_is = (
-            bool(getattr(inner_args, "esurge_importance_sampling_correction", False)) and lp_arr is not None
-        )
-        force_old_logps = bool(getattr(self.trainer, "_async_grpo_force_old_logps", False))
-        needs_state_old_logps = is_train and (needs_esurge_is or (force_old_logps and lp_arr is None))
-        full_ids_cached: jax.Array | None = None
-        full_mask_cached: jax.Array | None = None
-        empty_model_kwargs_cached: dict[str, tp.Any] | None = None
-
-        def _get_full_inputs() -> tuple[jax.Array, jax.Array, dict[str, tp.Any]]:
-            nonlocal full_ids_cached, full_mask_cached, empty_model_kwargs_cached
-            if full_ids_cached is None:
-                from easydel.trainers.group_relative_policy_optimization.grpo_trainer import (
-                    normalize_generation_model_kwargs,
-                )
-
-                full_ids_cached = self._gather_array(jnp.concatenate([prompt_ids, completion_ids], axis=1))
-                full_mask_cached = self._gather_array(jnp.concatenate([prompt_mask, completion_attention_mask], axis=1))
-                empty_model_kwargs_cached = normalize_generation_model_kwargs(None)
-            return full_ids_cached, full_mask_cached, empty_model_kwargs_cached  # type: ignore[return-value]
-
-        if needs_state_old_logps:
-            compute_state_logps = getattr(self.trainer, "compute_state_logps", None)
-            if callable(compute_state_logps) and state is not None:
-                full_ids, full_mask, empty_model_kwargs = _get_full_inputs()
-                policy_old_logps = compute_state_logps(
-                    state,
-                    full_ids,
-                    full_mask,
-                    empty_model_kwargs,
-                    prompt_length=prompt_width,
-                    logprob_vocab_chunk_size=getattr(inner_args, "logprob_vocab_chunk_size", None),
-                )
-                out["old_per_token_logps"] = self._gather_array(policy_old_logps)
-            if needs_esurge_is:
-                is_fn = getattr(self.trainer, "_esurge_importance_sampling_ratio", None)
-                if callable(is_fn):
-                    out["importance_sampling_ratio"] = is_fn(
-                        out["old_per_token_logps"],
-                        lp_arr,
-                        completion_mask,
+            def _get_full_inputs() -> tuple[jax.Array, jax.Array, dict[str, tp.Any]]:
+                nonlocal full_ids_cached, full_mask_cached, empty_model_kwargs_cached
+                if full_ids_cached is None:
+                    from easydel.trainers.group_relative_policy_optimization.grpo_trainer import (
+                        normalize_generation_model_kwargs,
                     )
 
-        beta = float(getattr(inner_args, "beta", 0.0) or 0.0)
-        if beta != 0.0:
-            compute_ref = getattr(self.trainer, "compute_refmodel_logps", None)
-            ref_state = getattr(self.trainer, "ref_state", None)
-            if callable(compute_ref) and ref_state is not None:
-                full_ids, full_mask, empty_model_kwargs = _get_full_inputs()
-                call_ref = getattr(self.trainer, "_call_compute_refmodel_logps", None)
-                prompt_len = int(prompt_ids.shape[1])
-                if callable(call_ref):
-                    try:
-                        ref_logps = call_ref(
-                            ref_state.graphstate,
-                            ref_state.graphother,
-                            full_ids,
-                            full_mask,
-                            empty_model_kwargs,
-                            prompt_length=prompt_len,
+                    full_ids_cached = self._gather_array(jnp.concatenate([prompt_ids, completion_ids], axis=1))
+                    full_mask_cached = self._gather_array(
+                        jnp.concatenate([prompt_mask, completion_attention_mask], axis=1)
+                    )
+                    empty_model_kwargs_cached = normalize_generation_model_kwargs(None)
+                return full_ids_cached, full_mask_cached, empty_model_kwargs_cached  # type: ignore[return-value]
+
+            if needs_state_old_logps:
+                compute_state_logps = getattr(self.trainer, "compute_state_logps", None)
+                if callable(compute_state_logps) and state is not None:
+                    full_ids, full_mask, empty_model_kwargs = _get_full_inputs()
+                    policy_old_logps = compute_state_logps(
+                        state,
+                        full_ids,
+                        full_mask,
+                        empty_model_kwargs,
+                        prompt_length=prompt_width,
+                        logprob_vocab_chunk_size=getattr(inner_args, "logprob_vocab_chunk_size", None),
+                    )
+                    out["old_per_token_logps"] = self._gather_array(policy_old_logps)
+                if needs_esurge_is:
+                    is_fn = getattr(self.trainer, "_esurge_importance_sampling_ratio", None)
+                    if callable(is_fn):
+                        out["importance_sampling_ratio"] = is_fn(
+                            out["old_per_token_logps"],
+                            lp_arr,
+                            completion_mask,
                         )
-                    except ValueError as exc:
-                        if "pjit does not support kwargs" not in str(exc):
-                            raise
+
+            beta = float(getattr(inner_args, "beta", 0.0) or 0.0)
+            if beta != 0.0:
+                compute_ref = getattr(self.trainer, "compute_refmodel_logps", None)
+                ref_state = getattr(self.trainer, "ref_state", None)
+                if callable(compute_ref) and ref_state is not None:
+                    full_ids, full_mask, empty_model_kwargs = _get_full_inputs()
+                    call_ref = getattr(self.trainer, "_call_compute_refmodel_logps", None)
+                    prompt_len = int(prompt_ids.shape[1])
+                    if callable(call_ref):
+                        try:
+                            ref_logps = call_ref(
+                                ref_state.graphstate,
+                                ref_state.graphother,
+                                full_ids,
+                                full_mask,
+                                empty_model_kwargs,
+                                prompt_length=prompt_len,
+                            )
+                        except ValueError as exc:
+                            if "pjit does not support kwargs" not in str(exc):
+                                raise
+                            ref_logps = compute_ref(
+                                ref_state.graphstate,
+                                ref_state.graphother,
+                                full_ids,
+                                full_mask,
+                                empty_model_kwargs,
+                            )
+                    else:
                         ref_logps = compute_ref(
                             ref_state.graphstate,
                             ref_state.graphother,
@@ -1841,23 +2513,253 @@ class AgentFlowTrainer:
                             full_mask,
                             empty_model_kwargs,
                         )
+                    if ref_logps.shape[1] == full_ids.shape[1]:
+                        ref_logps = ref_logps[:, prompt_len:]
+                    out["ref_per_token_logps"] = self._gather_array(ref_logps)
+                elif lp_arr is not None:
+                    out["ref_per_token_logps"] = lp_arr
                 else:
-                    ref_logps = compute_ref(
-                        ref_state.graphstate,
-                        ref_state.graphother,
-                        full_ids,
-                        full_mask,
-                        empty_model_kwargs,
-                    )
-                if ref_logps.shape[1] == full_ids.shape[1]:
-                    ref_logps = ref_logps[:, prompt_len:]
-                out["ref_per_token_logps"] = self._gather_array(ref_logps)
-            elif lp_arr is not None:
-                out["ref_per_token_logps"] = lp_arr
-            else:
-                out["ref_per_token_logps"] = jnp.zeros_like(completion_ids, dtype=jnp.float32)
+                    out["ref_per_token_logps"] = jnp.zeros_like(completion_ids, dtype=jnp.float32)
 
-        return self._gather_batch(out), metrics
+            final_batch = self._gather_batch(out)
+            ref_logps_for_kl = final_batch.get("ref_per_token_logps")
+            policy_logps_for_kl = final_batch.get("old_per_token_logps")
+            if policy_logps_for_kl is None:
+                policy_logps_for_kl = lp_np
+
+        icepop_active_ratios: np.ndarray | None = None
+        is_ratio_val = final_batch.get("importance_sampling_ratio")
+        if is_ratio_val is not None:
+            # Compute on all hosts unconditionally (final_batch is already gathered) so metrics match across ranks.
+            is_ratio_np = _to_host_numpy(is_ratio_val)
+            icepop_active_ratios, ratio_mean, ratio_max, masked_frac = _compute_icepop_active_ratios(
+                is_ratio_np,
+                comp_mask_np,
+            )
+            metrics["agent_flow/icepop_ratio_mean"] = ratio_mean
+            metrics["agent_flow/icepop_ratio_max"] = ratio_max
+            metrics["agent_flow/icepop_masked_frac"] = masked_frac
+            metrics["rl/icepop_ratio_mean"] = ratio_mean
+            metrics["rl/icepop_ratio_max"] = ratio_max
+            metrics["rl/icepop_masked_frac"] = masked_frac
+
+        self._log_eyvan_agent_flow_telemetry(
+            episodes=episodes,
+            rewards_np=rewards_np,
+            advantages_np=advantages_np,
+            comp_mask_np=comp_mask_np,
+            ep_action_tokens=ep_action_tokens,
+            ep_obs_tokens=ep_obs_tokens,
+            ep_truncated=ep_truncated,
+            state=state,
+            is_train=is_train,
+            policy_logps=policy_logps_for_kl,
+            ref_logps=ref_logps_for_kl,
+            icepop_active_ratios=icepop_active_ratios,
+        )
+
+        return final_batch, metrics
+
+    def _log_eyvan_agent_flow_telemetry(
+        self,
+        *,
+        episodes: list[AgentFlowEpisode],
+        rewards_np: np.ndarray,
+        advantages_np: np.ndarray,
+        comp_mask_np: np.ndarray,
+        ep_action_tokens: list[int],
+        ep_obs_tokens: list[int],
+        ep_truncated: list[bool],
+        state: tp.Any,
+        is_train: bool,
+        policy_logps: tp.Any = None,
+        ref_logps: tp.Any = None,
+        icepop_active_ratios: np.ndarray | None = None,
+    ) -> None:
+        """Emit native Eyvan episodes, rollouts, grouped completions, and distributions for AgentFlow."""
+        if not episodes:
+            return
+        total_turns_before = int(getattr(self, "_eyvan_total_turns", 0))
+        total_action_before = int(getattr(self, "_eyvan_total_action_tokens", 0))
+        inner_args = getattr(self.trainer, "arguments", None)
+        if inner_args is None or not bool(getattr(inner_args, "eyvan_tracking_enabled", False)):
+            if is_train:
+                self._eyvan_total_turns = total_turns_before + sum(len(ep.turns) for ep in episodes)
+                self._eyvan_total_action_tokens = total_action_before + sum(ep_action_tokens)
+            return
+
+        try:
+            cur_step = _extract_nonneg_step(state, fallback=0)
+            raw_pv = getattr(self.trainer, "_async_rollout_policy_version", None)
+            if raw_pv is None and state is not None:
+                raw_pv = getattr(state, "policy_step", None)
+            policy_version = max(0, int(raw_pv)) if raw_pv is not None else cur_step
+            kind = "train" if is_train else "eval"
+            env_name = getattr(self, "_eyvan_env_name", None) or _resolve_eyvan_env_name(
+                getattr(self, "_env_spec", None),
+                fallback="agent_flow",
+            )
+
+            # 1. Record every episode with monotonically advancing cumulative axes.
+            cum_turns = total_turns_before
+            cum_action_tokens = total_action_before
+            for idx, ep in enumerate(episodes):
+                ep_turns_n = len(ep.turns)
+                ep_act_n = ep_action_tokens[idx]
+                ep_obs_n = ep_obs_tokens[idx]
+                if is_train:
+                    cum_turns += ep_turns_n
+                    cum_action_tokens += ep_act_n
+                ep_reward = float(ep.episode_reward)
+                ep_success = bool((not ep.env_error) and math.isfinite(ep_reward) and ep_reward > 0.0)
+                finite_step_rewards = [float(r) for r in ep.step_rewards if math.isfinite(float(r))]
+                mean_turn_reward = (
+                    float(sum(finite_step_rewards) / len(finite_step_rewards)) if finite_step_rewards else 0.0
+                )
+                ep_axes = {"env_turns": float(cum_turns), "action_tokens": float(cum_action_tokens)}
+                _eyvan_log_episode(
+                    inner_args,
+                    ret=ep_reward,
+                    length=ep_turns_n,
+                    success=ep_success,
+                    kind=kind,
+                    env=env_name,
+                    policy_version=policy_version,
+                    learner_version=cur_step,
+                    step=cur_step,
+                    axes=ep_axes,
+                    extra={
+                        "action_tokens": float(ep_act_n),
+                        "obs_tokens": float(ep_obs_n),
+                        "truncated": 1.0 if ep_truncated[idx] else 0.0,
+                        "env_error": 1.0 if ep.env_error else 0.0,
+                        "prompt_clipped": 1.0 if ep.prompt_clipped else 0.0,
+                        "mean_turn_reward": mean_turn_reward,
+                    },
+                )
+            if is_train:
+                self._eyvan_total_turns = cum_turns
+                self._eyvan_total_action_tokens = cum_action_tokens
+            batch_axes = {"env_turns": float(cum_turns), "action_tokens": float(cum_action_tokens)}
+
+            # 2. Sample up to 8 multi-turn rollouts (best, worst, then remaining; skip 0-turn episodes).
+            non_empty_indices = [idx for idx, ep in enumerate(episodes) if len(ep.turns) > 0]
+            rollout_indices = _select_rollout_sample_indices(
+                [float(ep.episode_reward) for ep in episodes],
+                non_empty_indices,
+                cap=_EYVAN_MAX_ROLLOUTS_PER_STEP,
+            )
+            for idx in rollout_indices:
+                ep = episodes[idx]
+                turns = ep.turns[:_EYVAN_MAX_ROLLOUT_STEPS]
+                if not turns:
+                    continue
+                tracks: dict[str, list[float | None]] = {
+                    "reward": [float(t.reward) for t in turns],
+                    "action_tokens": [float(len(t.action_token_ids)) for t in turns],
+                    "obs_tokens": [float(len(t.observation_token_ids)) for t in turns],
+                    "terminated": [1.0 if t.terminated else 0.0 for t in turns],
+                    "truncated": [1.0 if t.truncated else 0.0 for t in turns],
+                }
+                if any(t.logprobs for t in turns):
+                    tracks["mean_logprob"] = [
+                        float(np.mean(np.asarray(t.logprobs, dtype=np.float64))) if t.logprobs else None for t in turns
+                    ]
+                action_ids, action_names = _encode_action_labels([t.action_text for t in turns])
+                _eyvan_log_rollout(
+                    inner_args,
+                    tracks=tracks,
+                    actions=action_ids,
+                    action_names=action_names,
+                    episode_id=f"s{cur_step}-p{ep.prompt_index}-g{ep.group_id}",
+                    env=env_name,
+                    kind=kind,
+                    policy_version=policy_version,
+                    step=cur_step,
+                    axes=batch_axes,
+                )
+
+            # 3. Compute optional per-episode KL locally (never invoking cross-host collectives).
+            per_ep_kl: list[float | None] | None = None
+            if ref_logps is not None and policy_logps is not None:
+                ref_np = _to_host_numpy_local_only(ref_logps)
+                pol_np = _to_host_numpy_local_only(policy_logps)
+                if (
+                    ref_np is not None
+                    and pol_np is not None
+                    and ref_np.shape == comp_mask_np.shape
+                    and pol_np.shape == comp_mask_np.shape
+                ):
+                    kl_estimator = str(getattr(inner_args, "kl_estimator", "k3") or "k3")
+                    per_ep_kl = _compute_per_episode_kl_numpy(pol_np, ref_np, comp_mask_np, kl_estimator=kl_estimator)
+
+            # 4. Log up to 8 grouped multi-turn completions.
+            grouped: dict[int, list[int]] = {}
+            for idx, ep in enumerate(episodes):
+                grouped.setdefault(int(ep.prompt_index), []).append(idx)
+            for p_idx, grp_indices in list(grouped.items())[:_EYVAN_MAX_COMPLETION_GROUPS_PER_STEP]:
+                grp_indices = grp_indices[:_EYVAN_MAX_GROUP_RESPONSES]
+                if not grp_indices:
+                    continue
+                first_ep = episodes[grp_indices[0]]
+                if first_ep.prompt_token_ids:
+                    prompt_text = self._decode_ids(first_ep.prompt_token_ids)
+                elif first_ep.turns:
+                    prompt_text = first_ep.turns[0].prompt_text
+                else:
+                    prompt_text = ""
+                responses = [_format_agent_flow_transcript(episodes[i]) for i in grp_indices]
+                grp_rewards = [float(episodes[i].episode_reward) for i in grp_indices]
+                grp_adv = [float(advantages_np[i]) for i in grp_indices]
+                grp_tokens = [ep_action_tokens[i] for i in grp_indices]
+                grp_trunc = [bool(ep_truncated[i]) for i in grp_indices]
+                grp_kl = (
+                    [per_ep_kl[i] for i in grp_indices]
+                    if per_ep_kl is not None and any(per_ep_kl[i] is not None for i in grp_indices)
+                    else None
+                )
+                group_prefix = f"s{cur_step}" if is_train else f"eval-s{cur_step}"
+                _eyvan_log_completions(
+                    inner_args,
+                    prompt=prompt_text,
+                    responses=responses,
+                    rewards=grp_rewards,
+                    advantages=grp_adv,
+                    group=f"{group_prefix}-p{p_idx}",
+                    tokens=grp_tokens,
+                    kl=grp_kl,
+                    truncated=grp_trunc,
+                    policy_version=policy_version,
+                    step=cur_step,
+                )
+
+            # 5. Log RL distributions.
+            _eyvan_log_histogram(inner_args, "rl/reward_dist", rewards_np, step=cur_step, axes=batch_axes)
+            _eyvan_log_histogram(inner_args, "rl/advantage_dist", advantages_np, step=cur_step, axes=batch_axes)
+            _eyvan_log_histogram(
+                inner_args,
+                "rl/episode_turns_dist",
+                np.asarray([float(len(ep.turns)) for ep in episodes], dtype=np.float32),
+                step=cur_step,
+                axes=batch_axes,
+            )
+            _eyvan_log_histogram(
+                inner_args,
+                "rl/action_tokens_dist",
+                np.asarray(ep_action_tokens, dtype=np.float32),
+                step=cur_step,
+                axes=batch_axes,
+            )
+            if icepop_active_ratios is not None and icepop_active_ratios.size > 0:
+                _eyvan_log_histogram(
+                    inner_args,
+                    "rl/icepop_ratio_dist",
+                    icepop_active_ratios,
+                    step=cur_step,
+                    axes=batch_axes,
+                )
+        except Exception as exc:
+            logger.warning("AgentFlow Eyvan telemetry logging failed (%s): %s", type(exc).__name__, exc)
 
     def _collect_episodes_multihost(
         self,
@@ -2028,9 +2930,7 @@ class AgentFlowTrainer:
                         except Exception as exc:
                             return None, exc
 
-                    step_futs = {
-                        pool.submit(_step_one, idx, turn_actions[idx][1]): idx for idx in active_indices
-                    }
+                    step_futs = {pool.submit(_step_one, idx, turn_actions[idx][1]): idx for idx in active_indices}
                     step_outcomes: dict[int, tuple[tp.Any | None, Exception | None]] = {}
                     for fut in concurrent.futures.as_completed(step_futs):
                         step_outcomes[step_futs[fut]] = fut.result()
@@ -2161,6 +3061,19 @@ class AgentFlowTrainer:
         batch: collections.abc.Mapping[str, tp.Any],
         is_train: bool,
     ) -> tuple[dict[str, tp.Any], dict[str, tp.Any]]:
+        if is_train:
+            check_eyvan_reclaim = getattr(self.trainer, "_should_save_eyvan_reclaim_checkpoint", None)
+            if callable(check_eyvan_reclaim):
+                raw_step = getattr(state, "step", 0)
+                try:
+                    cur_step = int(jax.device_get(raw_step))
+                except Exception:
+                    cur_step = int(raw_step) if isinstance(raw_step, (int, np.integer)) else 0
+                eyvan_notice = check_eyvan_reclaim(cur_step)
+                if eyvan_notice is not None:
+                    handle_reclaim = getattr(self.trainer, "_handle_eyvan_reclaim_preemption", None)
+                    if callable(handle_reclaim):
+                        raise handle_reclaim(state=state, step=cur_step, notice=eyvan_notice)
         tasks = self._extract_tasks(batch)
         group_size = self._resolve_group_size(is_train)
 
@@ -2205,7 +3118,13 @@ class AgentFlowTrainer:
         return self._adapt_episodes_to_trainer(episodes, group_size, state=state, is_train=is_train)
 
     def train(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
-        """Delegate training to the wrapped trainer."""
+        """Delegate training to the wrapped trainer after installing Eyvan's preemption handler."""
+        try:
+            from easydel.utils.eyvan_helpers import install_preemption_handler
+
+            install_preemption_handler()
+        except Exception:
+            pass
         return self.trainer.train(*args, **kwargs)
 
     def eval(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:

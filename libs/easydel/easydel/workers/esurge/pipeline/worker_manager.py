@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,63 @@ logger = get_logger(__name__)
 DEFAULT_WORKER_STARTUP_TIMEOUT = float(
     next(spec.default for spec in flags.registered_flags() if spec.name == flags.EASYDEL_WORKER_STARTUP_TIMEOUT)
 )
+
+
+def _terminate_and_reap_process(
+    process: subprocess.Popen | None,
+    *,
+    grace_timeout: float = 0.0,
+    terminate_timeout: float = 5.0,
+) -> None:
+    """Terminate and reap a subprocess (optional grace wait -> SIGTERM -> bounded wait -> SIGKILL -> wait)."""
+    if process is None:
+        return
+    if grace_timeout > 0 and process.poll() is None:
+        try:
+            process.wait(timeout=grace_timeout)
+        except subprocess.TimeoutExpired:
+            pass
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=terminate_timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Tokenizer worker process (pid=%s) did not exit after SIGTERM; sending SIGKILL.",
+                getattr(process, "pid", None),
+            )
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            process.wait()
+    else:
+        process.wait()
+
+
+def _unlink_ipc_file(endpoint: str | None) -> None:
+    """Remove an owned IPC socket file if it still exists."""
+    if not endpoint or not endpoint.startswith("ipc://"):
+        return
+    try:
+        os.unlink(endpoint[len("ipc://") :])
+    except FileNotFoundError:
+        pass
+
+
+def _cleanup_owned_worker(process: subprocess.Popen | None, endpoint: str | None) -> None:
+    """Best-effort GC/atexit cleanup for an owned tokenizer subprocess."""
+    try:
+        _terminate_and_reap_process(process)
+    except Exception:
+        pass
+    try:
+        _unlink_ipc_file(endpoint)
+    except Exception:
+        pass
 
 
 class WorkerManager:
@@ -65,11 +123,26 @@ class WorkerManager:
         self._tokenizer_process: subprocess.Popen | None = None
         self._tokenizer_owned = False
         self._tokenizer_endpoint: str | None = None
+        self._process_finalizer: weakref.finalize | None = None
 
     @property
     def tokenizer_endpoint(self) -> str | None:
         """The owned or attached tokenizer endpoint, or ``None`` before startup."""
         return self._tokenizer_endpoint
+
+    @property
+    def is_running(self) -> bool:
+        """Whether tokenizer/detokenizer clients or an owned tokenizer subprocess are active."""
+        if self._tokenizer_client is not None or self._detokenizer_client is not None:
+            return True
+        return self._tokenizer_process is not None and self._tokenizer_process.poll() is None
+
+    def _detach_process_finalizer(self) -> None:
+        """Cancel any pending GC/atexit finalizer once the subprocess has been reaped."""
+        finalizer = self._process_finalizer
+        self._process_finalizer = None
+        if finalizer is not None:
+            finalizer.detach()
 
     def start(
         self,
@@ -78,23 +151,33 @@ class WorkerManager:
         tokenizer_endpoint: str | None,
     ) -> tuple[TokenizerWorkerClient, Detokenizer]:
         """Start the tokenizer client and construct the native detokenizer."""
-        if self._tokenizer_client or self._detokenizer_client:
+        if self.is_running:
             raise RuntimeError("WorkerManager has already started clients.")
         if not self._tokenizer_source:
             raise ValueError("Tokenizer identifier must be provided.")
 
-        if tokenizer_endpoint is None:
+        needs_spawn = tokenizer_endpoint is None
+        if needs_spawn:
             tokenizer_endpoint = self._make_ipc_endpoint("tokenizer")
             self._tokenizer_process = self._spawn_worker(tokenizer_endpoint)
             self._tokenizer_owned = True
+            self._process_finalizer = weakref.finalize(
+                self,
+                _cleanup_owned_worker,
+                self._tokenizer_process,
+                tokenizer_endpoint,
+            )
             try:
                 self._wait_for_endpoint("tokenizer", tokenizer_endpoint, self._tokenizer_process)
-            except Exception:
+            except BaseException:
                 self._terminate_tokenizer_process()
                 self._cleanup_ipc_file(tokenizer_endpoint)
+                self._detach_process_finalizer()
                 self._tokenizer_owned = False
                 self._tokenizer_endpoint = None
                 raise
+        else:
+            self._tokenizer_owned = False
         self._tokenizer_endpoint = tokenizer_endpoint
 
         try:
@@ -110,37 +193,64 @@ class WorkerManager:
                 context_window=max(0, flags.get_int(flags.ESURGE_DETOKENIZER_CONTEXT_WINDOW)),
                 max_states=detokenizer_max_states,
             )
-        except Exception:
+        except BaseException:
             if self._tokenizer_client is not None:
-                self._tokenizer_client.close()
+                try:
+                    self._tokenizer_client.close()
+                except Exception:
+                    pass
                 self._tokenizer_client = None
             self._terminate_tokenizer_process()
             if self._tokenizer_owned:
                 self._cleanup_ipc_file(tokenizer_endpoint)
+            self._detach_process_finalizer()
             self._tokenizer_owned = False
             self._tokenizer_endpoint = None
             raise
         return self._tokenizer_client, self._detokenizer_client
 
     def shutdown(self) -> None:
-        """Release native decode state and stop an owned tokenizer worker."""
-        if self._detokenizer_client is not None:
-            self._detokenizer_client.shutdown()
-            self._detokenizer_client = None
-        if self._tokenizer_client is not None:
-            try:
-                if self._tokenizer_owned:
-                    self._tokenizer_client.shutdown()
-                else:
-                    self._tokenizer_client.close()
-            except Exception:
-                pass
-            self._tokenizer_client = None
-        self._terminate_tokenizer_process()
-        if self._tokenizer_owned:
-            self._cleanup_ipc_file(self._tokenizer_endpoint)
-        self._tokenizer_owned = False
-        self._tokenizer_endpoint = None
+        """Release native decode state and reliably stop and reap an owned tokenizer worker."""
+        if (
+            self._detokenizer_client is None
+            and self._tokenizer_client is None
+            and self._tokenizer_process is None
+            and not self._tokenizer_owned
+            and self._tokenizer_endpoint is None
+        ):
+            self._detach_process_finalizer()
+            return
+
+        owned = self._tokenizer_owned
+        endpoint = self._tokenizer_endpoint
+        sent_graceful_shutdown = False
+        try:
+            if self._detokenizer_client is not None:
+                try:
+                    self._detokenizer_client.shutdown()
+                except Exception:
+                    logger.debug("Detokenizer shutdown encountered an error", exc_info=True)
+                finally:
+                    self._detokenizer_client = None
+            if self._tokenizer_client is not None:
+                try:
+                    process_alive = self._tokenizer_process is None or self._tokenizer_process.poll() is None
+                    if owned and process_alive:
+                        self._tokenizer_client.shutdown()
+                        sent_graceful_shutdown = True
+                    else:
+                        self._tokenizer_client.close()
+                except Exception:
+                    logger.debug("Tokenizer client shutdown encountered an error", exc_info=True)
+                finally:
+                    self._tokenizer_client = None
+        finally:
+            self._terminate_tokenizer_process(grace_timeout=1.0 if sent_graceful_shutdown else 0.0)
+            if owned:
+                self._cleanup_ipc_file(endpoint)
+            self._detach_process_finalizer()
+            self._tokenizer_owned = False
+            self._tokenizer_endpoint = None
 
     def drain_workers(self) -> None:
         """Flush native detokenization state and acknowledge the stateless tokenizer worker."""
@@ -185,6 +295,8 @@ class WorkerManager:
             self._tokenizer_source,
             "--tokenizer-kwargs",
             json.dumps(self._tokenizer_kwargs),
+            "--parent-pid",
+            str(os.getpid()),
         ]
         env = os.environ.copy()
         env["JAX_PLATFORMS"] = "cpu"
@@ -218,25 +330,21 @@ class WorkerManager:
         file_path = os.path.join(self._ipc_dir, f"easydel_{prefix}_{uuid.uuid4().hex}.sock")
         return f"ipc://{file_path}"
 
-    def _terminate_tokenizer_process(self) -> None:
-        """Terminate an owned tokenizer subprocess, escalating after five seconds."""
+    def _terminate_tokenizer_process(self, *, grace_timeout: float = 0.0, terminate_timeout: float = 5.0) -> None:
+        """Terminate and reap an owned tokenizer subprocess, escalating after ``terminate_timeout`` seconds."""
         process = self._tokenizer_process
         if process is None:
             return
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        self._tokenizer_process = None
+        try:
+            _terminate_and_reap_process(
+                process,
+                grace_timeout=grace_timeout,
+                terminate_timeout=terminate_timeout,
+            )
+        finally:
+            self._tokenizer_process = None
 
     @staticmethod
     def _cleanup_ipc_file(endpoint: str | None) -> None:
         """Remove an owned IPC socket file if it still exists."""
-        if not endpoint or not endpoint.startswith("ipc://"):
-            return
-        try:
-            os.unlink(endpoint[len("ipc://") :])
-        except FileNotFoundError:
-            pass
+        _unlink_ipc_file(endpoint)

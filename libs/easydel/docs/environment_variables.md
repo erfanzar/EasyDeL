@@ -65,13 +65,11 @@ Known `EASYDEL_TARGETED_TPU_GENERATION` values:
 - `v4`, `tpu-v4`, `4`: v4-style async all-gather plus `TPU_MEGACORE=MEGACORE_DENSE`.
 - `v5e`, `tpu-v5e`, `5e`: v5e-style data-parallel overlap and all-gather continuation-fusion flags.
 - `v5p`, `tpu-v5p`, `5p`: v5p-style async collective-permute, AG backward pipelining, data-parallel overlap, and all-gather continuation-fusion flags.
-- `v6e`, `v6`, `trillium`, `max-6`, `max6`, `tpu-v6e`, `6`, `6e`: v6e dense continuation-fusion bundle:
+- `v6e`, `v6`, `trillium`, `max-6`, `max6`, `tpu-v6e`, `6`, `6e`: v6e async-collective bundle (continuation-fusion flags are omitted because `libtpu 0.0.48` rejects AllGather continuation fusion on `ghostlite`):
   - `--xla_tpu_scoped_vmem_limit_kib=98304`
   - `--xla_enable_async_all_gather=true`
   - `--xla_tpu_overlap_compute_collective_tc=true`
   - `--xla_tpu_enable_async_collective_fusion_multiple_steps=true`
-  - `--xla_tpu_enable_async_collective_fusion=true`
-  - `--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true`
 
 Set only if missing when `EASYDEL_AUTO` is true:
 

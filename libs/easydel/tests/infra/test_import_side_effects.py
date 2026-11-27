@@ -149,9 +149,46 @@ def test_import_easydel_detects_tpu_generation_from_env_without_explicit_selecto
         }
     )
     assert returncode == 0
-    flags = _last_stdout_line(stdout)
+    flags = _last_stdout_line(stdout).split()
     assert "--xla_tpu_scoped_vmem_limit_kib=98304" in flags
-    assert "--xla_tpu_enable_async_collective_fusion=true" in flags
+    assert "--xla_enable_async_all_gather=true" in flags
+    assert "--xla_tpu_overlap_compute_collective_tc=true" in flags
+    assert all(
+        flag.split("=", 1)[0]
+        not in {
+            "--xla_tpu_enable_async_collective_fusion",
+            "--xla_tpu_enable_async_collective_fusion_fuse_all_gather",
+        }
+        for flag in flags
+    )
+
+
+@pytest.mark.parametrize("selector", ["EASYDEL_TARGETED_TPU_GENERATION", "TPU_TYPE"])
+def test_import_easydel_omits_v6e_continuation_fusion_flags(selector):
+    returncode, stdout, stderr = _run_libtpu_env_probe(
+        {
+            "ENABLE_DISTRIBUTED_INIT": "0",
+            "XLA_FLAGS": "",
+            selector: "v6e-4",
+        },
+        code=(
+            "import os\n"
+            "from jax._src import xla_bridge\n"
+            "assert not xla_bridge.backends_are_initialized()\n"
+            "import easydel\n"
+            "assert not xla_bridge.backends_are_initialized()\n"
+            "print(os.environ.get('LIBTPU_INIT_ARGS', ''))\n"
+        ),
+    )
+    assert returncode == 0, stderr
+    flags = _last_stdout_line(stdout).split()
+    flag_names = {flag.split("=", 1)[0] for flag in flags}
+    assert "--xla_tpu_enable_async_collective_fusion" not in flag_names
+    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather" not in flag_names
+    assert "--xla_tpu_scoped_vmem_limit_kib=98304" in flags
+    assert "--xla_enable_async_all_gather=true" in flags
+    assert "--xla_tpu_overlap_compute_collective_tc=true" in flags
+    assert "--xla_tpu_enable_async_collective_fusion_multiple_steps=true" in flags
 
 
 @pytest.mark.parametrize("selector", ["EASYDEL_TARGETED_TPU_GENERATION", "TPU_TYPE"])
@@ -198,7 +235,7 @@ def test_import_easydel_keeps_v5e_continuation_fusion_defaults():
 
 
 @pytest.mark.parametrize("source", ["LIBTPU_INIT_ARGS", "XLA_FLAGS"])
-@pytest.mark.parametrize("generation,value", [("v5p", "true"), ("v5e", "false"), ("v6e", "false")])
+@pytest.mark.parametrize("generation,value", [("v5p", "true"), ("v5e", "false"), ("v6e", "false"), ("v6e", "true")])
 def test_import_easydel_preserves_explicit_tpu_fusion_flags(source, generation, value):
     overrides = (
         f"--xla_tpu_enable_async_collective_fusion={value} "
@@ -246,10 +283,14 @@ def test_import_easydel_applies_maxtext_v6e_libtpu_flags_when_requested():
         }
     )
     assert returncode == 0
-    flags = _last_stdout_line(stdout)
+    flags = _last_stdout_line(stdout).split()
+    flag_names = {flag.split("=", 1)[0] for flag in flags}
     assert "--xla_tpu_scoped_vmem_limit_kib=98304" in flags
-    assert "--xla_tpu_enable_async_collective_fusion=true" in flags
-    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true" in flags
+    assert "--xla_enable_async_all_gather=true" in flags
+    assert "--xla_tpu_overlap_compute_collective_tc=true" in flags
+    assert "--xla_tpu_enable_async_collective_fusion_multiple_steps=true" in flags
+    assert "--xla_tpu_enable_async_collective_fusion" not in flag_names
+    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather" not in flag_names
     assert "TPU_MEGACORE=MEGACORE_DENSE" not in flags
 
 
@@ -278,3 +319,122 @@ def test_import_easydel_silences_hf_default_rope_mrope_metadata_warning():
     assert "Unrecognized keys in `rope_parameters`" not in stderr
     assert "mrope_section" not in stderr
     assert "mrope_interleaved" not in stderr
+
+
+def test_import_easydel_does_not_import_eyvan_or_server_deps_or_spawn_threads():
+    code = (
+        "import sys, threading\n"
+        "from jax._src import xla_bridge\n"
+        "before_threads = set(threading.enumerate())\n"
+        "import easydel\n"
+        "after_threads = [t for t in threading.enumerate() if t not in before_threads and t.is_alive()]\n"
+        "assert not xla_bridge.backends_are_initialized()\n"
+        "assert after_threads == [], f'unexpected threads: {after_threads}'\n"
+        "forbidden = ('eyvan', 'eyvan.sdk', 'eyvan.storage', 'eyvan.track', 'fastapi', 'uvicorn')\n"
+        "loaded = [name for name in forbidden if name in sys.modules]\n"
+        "assert loaded == [], f'unexpected modules loaded at import: {loaded}'\n"
+        "print('ok')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={**os.environ.copy(), "ENABLE_DISTRIBUTED_INIT": "0"},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _last_stdout_line(proc.stdout) == "ok"
+
+
+def test_easydel_top_level_excludes_eyvan_exports_and_internal_helpers_stay_lazy(tmp_path):
+    cfg_path = tmp_path / "storage.json"
+    code = (
+        "import sys, threading\n"
+        "from jax._src import xla_bridge\n"
+        "import easydel as ed\n"
+        "before_threads = set(threading.enumerate())\n"
+        "removed_top_level_names = (\n"
+        "    'PreemptionNotice',\n"
+        "    'acknowledge_checkpoint',\n"
+        "    'configure_storage',\n"
+        "    'eyvan_execute',\n"
+        "    'eyvan_init',\n"
+        "    'get_monitoring_storage',\n"
+        "    'get_storage',\n"
+        "    'install_preemption_handler',\n"
+        "    'monitoring_path',\n"
+        "    'preemption_notice',\n"
+        "    'reclaim_requested',\n"
+        "    'resume_checkpoint_uri',\n"
+        "    'run_on_tpu',\n"
+        "    'storage_path',\n"
+        ")\n"
+        "for name in removed_top_level_names:\n"
+        "    assert not hasattr(ed, name), f'top-level easydel must not export {name}'\n"
+        "    assert name not in dir(ed), f'top-level easydel dir() must not include {name}'\n"
+        "from easydel.utils import eyvan_helpers as eh\n"
+        "for removed_dispatch in ('run_on_tpu', 'eyvan_execute', 'eyvan_init'):\n"
+        "    assert not hasattr(eh, removed_dispatch), f'eyvan_helpers must not expose {removed_dispatch}'\n"
+        "internal_names = (\n"
+        "    'PreemptionNotice',\n"
+        "    'acknowledge_checkpoint',\n"
+        "    'configure_storage',\n"
+        "    'get_monitoring_storage',\n"
+        "    'get_storage',\n"
+        "    'install_preemption_handler',\n"
+        "    'is_eyvan_auto_track_enabled',\n"
+        "    'monitoring_path',\n"
+        "    'preemption_notice',\n"
+        "    'reclaim_requested',\n"
+        "    'resume_checkpoint_uri',\n"
+        "    'set_eyvan_auto_track_enabled',\n"
+        "    'storage_path',\n"
+        ")\n"
+        "for name in internal_names:\n"
+        "    fn = getattr(eh, name)\n"
+        "    assert callable(fn), f'{name} not callable'\n"
+        "    assert fn.__module__ == 'easydel.utils.eyvan_helpers', f'{name} from {fn.__module__}'\n"
+        "assert not xla_bridge.backends_are_initialized()\n"
+        "forbidden_on_attr = ('eyvan', 'eyvan.sdk', 'eyvan.storage', 'eyvan.track', 'fastapi', 'uvicorn')\n"
+        "loaded_attr = [m for m in forbidden_on_attr if m in sys.modules]\n"
+        "assert loaded_attr == [], f'internal helper import loaded: {loaded_attr}'\n"
+        "assert eh.preemption_notice(environment={}) is None\n"
+        "assert eh.reclaim_requested(environment={}) is False\n"
+        "assert eh.resume_checkpoint_uri(environment={}) is None\n"
+        "forbidden_after_preempt = ('eyvan.sdk', 'fastapi', 'uvicorn')\n"
+        "loaded_preempt = [m for m in forbidden_after_preempt if m in sys.modules]\n"
+        "assert loaded_preempt == [], f'preemption helpers imported: {loaded_preempt}'\n"
+        "class _StubBackend:\n"
+        "    def bucket_exists(self, bucket): return True\n"
+        "    def get_bucket(self, bucket): return None\n"
+        "    def create_bucket(self, *a, **kw): raise AssertionError('create forbidden')\n"
+        f"cfg = {str(cfg_path)!r}\n"
+        "eh.configure_storage(\n"
+        "    project='demo-proj',\n"
+        "    region='us-central2',\n"
+        "    bucket='eyvan_us_central2',\n"
+        "    monitoring_bucket='eyvan_monitoring',\n"
+        "    monitoring_location='us-central2',\n"
+        "    create=False,\n"
+        "    config_path=cfg,\n"
+        ")\n"
+        "uri = eh.storage_path('checkpoints', 'demo', region='us-central2', create=False, config_path=cfg, backend=_StubBackend())\n"
+        "mon = eh.monitoring_path('runs', create=False, config_path=cfg, backend=_StubBackend())\n"
+        "assert uri == 'gs://eyvan_us_central2/checkpoints/demo', uri\n"
+        "assert mon == 'gs://eyvan_monitoring/tracking/runs', mon\n"
+        "forbidden_after_storage = ('eyvan.sdk', 'fastapi', 'uvicorn')\n"
+        "loaded_storage = [m for m in forbidden_after_storage if m in sys.modules]\n"
+        "assert loaded_storage == [], f'storage helpers imported: {loaded_storage}'\n"
+        "after_threads = [t for t in threading.enumerate() if t not in before_threads and t.is_alive()]\n"
+        "assert after_threads == [], f'unexpected threads: {after_threads}'\n"
+        "print('ok')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={**os.environ.copy(), "ENABLE_DISTRIBUTED_INIT": "0", "HOME": str(tmp_path)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _last_stdout_line(proc.stdout) == "ok"

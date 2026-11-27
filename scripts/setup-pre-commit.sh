@@ -5,12 +5,13 @@ echo "Setting up pre-commit hooks for EasyDeL..."
 
 # Check if we're in a virtual environment, otherwise use the project venv
 if [ -z "$VIRTUAL_ENV" ]; then
+    REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     if [ -d ".venv" ]; then
         echo "Activating .venv..."
         source .venv/bin/activate
-    elif [ -d "/home/erfan/Projects/EasyDeL/.venv" ]; then
+    elif [ -d "$REPO_ROOT/.venv" ]; then
         echo "Activating EasyDeL venv..."
-        source /home/erfan/Projects/EasyDeL/.venv/bin/activate
+        source "$REPO_ROOT/.venv/bin/activate"
     fi
 fi
 

@@ -70,6 +70,25 @@ def skip_gated_hf_model_configs(request, monkeypatch):
     monkeypatch.setattr(AutoConfig, "from_pretrained", classmethod(from_pretrained))
 
 
+@pytest.fixture(autouse=True)
+def isolate_eyvan_auto_track(request):
+    """Suppress implicit Eyvan auto-tracking in ordinary pytest runs.
+
+    Keeps test suites hermetic so they never write junk runs to ``~/.eyvan/tracking``
+    unless a test explicitly passes ``use_eyvan_track=True``, ``eyvan_track_uri=...``,
+    ``enable_eyvan_track=True``, Eyvan workload env vars, or enables auto-tracking
+    via ``set_eyvan_auto_track_enabled(True)``. Skips ``test_import_side_effects.py``
+    so the parent test process does not eagerly import ``easydel``.
+    """
+    if request.path.name == "test_import_side_effects.py":
+        yield
+        return
+    from easydel.utils.eyvan_helpers import set_eyvan_auto_track_enabled
+
+    with set_eyvan_auto_track_enabled(False, global_default=True):
+        yield
+
+
 # --- Computation tests run on an accelerator (AGENTS.md golden rule 5) ---------------------------
 # A test file that imports an array / accelerator library is a computation test and must run on a
 # TPU or GPU JAX backend; a CPU run of it validates nothing. Pure-Python tests (parsers, configs,
