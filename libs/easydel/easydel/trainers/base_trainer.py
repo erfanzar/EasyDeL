@@ -2860,51 +2860,54 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _teardown_resources(self, *, status: str | None = None) -> None:
         """Release trainer-owned host and device resources (TensorBoard, Eyvan, Rich, iterators, eSurge, tables)."""
-        self._close_rich_progress_bar()
-        self._close_bucket_iterators()
+        try:
+            self._close_rich_progress_bar()
+            self._close_bucket_iterators()
 
-        resolved_status = status or getattr(self, "_eyvan_finish_status", None) or "finished"
-        self._eyvan_finish_status = None
+            resolved_status = status or getattr(self, "_eyvan_finish_status", None) or "finished"
+            self._eyvan_finish_status = None
 
-        args = getattr(self, "arguments", None)
-        if args is not None:
-            close_tb = getattr(args, "close_tensorboard", None)
-            if callable(close_tb):
-                try:
-                    close_tb()
-                except Exception as exc:  # pragma: no cover - best-effort cleanup
-                    log_debug_maybe(f"Failed to close TensorBoard SummaryWriter: {exc}")
-            close_eyvan = getattr(args, "close_eyvan_track", None)
-            if callable(close_eyvan):
-                try:
-                    close_eyvan(status=resolved_status)
-                except TypeError:
+            args = getattr(self, "arguments", None)
+            if args is not None:
+                close_tb = getattr(args, "close_tensorboard", None)
+                if callable(close_tb):
                     try:
-                        close_eyvan()
+                        close_tb()
+                    except Exception as exc:  # pragma: no cover - best-effort cleanup
+                        log_debug_maybe(f"Failed to close TensorBoard SummaryWriter: {exc}")
+                close_eyvan = getattr(args, "close_eyvan_track", None)
+                if callable(close_eyvan):
+                    try:
+                        close_eyvan(status=resolved_status)
+                    except TypeError:
+                        try:
+                            close_eyvan()
+                        except Exception as exc:  # pragma: no cover - best-effort cleanup
+                            log_debug_maybe(f"Failed to close Eyvan tracking run: {exc}")
                     except Exception as exc:  # pragma: no cover - best-effort cleanup
                         log_debug_maybe(f"Failed to close Eyvan tracking run: {exc}")
+
+            eyvan_run = self.__dict__.get("_eyvan_run")
+            if eyvan_run is not None:
+                self.eyvan_run = None
+                _close_eyvan_run(eyvan_run, status=resolved_status)
+
+            release_fn = getattr(self, "release_generation_runtime", None)
+            if callable(release_fn):
+                try:
+                    release_fn(clear_esurge_compiled_cache=True)
                 except Exception as exc:  # pragma: no cover - best-effort cleanup
-                    log_debug_maybe(f"Failed to close Eyvan tracking run: {exc}")
+                    log_debug_maybe(f"Failed to release generation runtime during teardown: {exc}")
 
-        eyvan_run = self.__dict__.get("_eyvan_run")
-        if eyvan_run is not None:
-            self.eyvan_run = None
-            _close_eyvan_run(eyvan_run, status=resolved_status)
-
-        release_fn = getattr(self, "release_generation_runtime", None)
-        if callable(release_fn):
-            try:
-                release_fn(clear_esurge_compiled_cache=True)
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                log_debug_maybe(f"Failed to release generation runtime during teardown: {exc}")
-
-        for attr in ("preview_log_table", "benchmark_log_table", "training_generation_log_table"):
-            if hasattr(self, attr):
-                setattr(self, attr, None)
-            for suffix in ("_increments", "_rows"):
-                counter_attr = f"_{attr}{suffix}"
-                if hasattr(self, counter_attr):
-                    setattr(self, counter_attr, 0)
+            for attr in ("preview_log_table", "benchmark_log_table", "training_generation_log_table"):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+                for suffix in ("_increments", "_rows"):
+                    counter_attr = f"_{attr}{suffix}"
+                    if hasattr(self, counter_attr):
+                        setattr(self, counter_attr, 0)
+        finally:
+            self._uninstall_eyvan_preemption_handler()
 
     def finish(self=None, *, status: str | None = None):
         """Clean up trainer resources and finish any active logging sessions.
@@ -2913,15 +2916,27 @@ class BaseTrainer(BaseTrainerProtocol):
         directly on the class (``BaseTrainer.finish()``). Safe to call even
         when optional loggers are not initialized.
         """
-        if self is not None:
-            if status is not None:
-                self._eyvan_finish_status = status
-            self._teardown_resources()
-        if wandb is not None:
-            try:
-                wandb.finish()
-            except Exception:
-                ...
+        try:
+            if self is not None:
+                if status is not None:
+                    self._eyvan_finish_status = status
+                self._teardown_resources()
+            if wandb is not None:
+                try:
+                    wandb.finish()
+                except Exception:
+                    ...
+        finally:
+            uninstall_fn = getattr(self, "_uninstall_eyvan_preemption_handler", None) if self is not None else None
+            if callable(uninstall_fn):
+                uninstall_fn()
+            else:
+                try:
+                    from easydel.utils.eyvan_helpers import uninstall_preemption_handler
+
+                    uninstall_preemption_handler()
+                except Exception as exc:  # pragma: no cover - best-effort cleanup
+                    log_debug_maybe(f"Failed to uninstall Eyvan preemption handler: {exc}")
 
     def on_step_start(
         self,
@@ -8356,6 +8371,15 @@ class BaseTrainer(BaseTrainerProtocol):
             install_preemption_handler()
         except Exception as exc:
             log_debug_maybe(f"Failed to install Eyvan preemption handler: {exc}")
+
+    def _uninstall_eyvan_preemption_handler(self) -> None:
+        """Uninstall Eyvan's graceful preemption signal handler and clear live signal notices without raising."""
+        try:
+            from easydel.utils.eyvan_helpers import uninstall_preemption_handler
+
+            uninstall_preemption_handler()
+        except Exception as exc:
+            log_debug_maybe(f"Failed to uninstall Eyvan preemption handler: {exc}")
 
     @staticmethod
     def _resolve_eyvan_resume_checkpoint_uri() -> str | None:

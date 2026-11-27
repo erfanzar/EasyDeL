@@ -40,6 +40,7 @@ import dataclasses
 import json
 import os
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -574,27 +575,89 @@ def _get_eyvan_preemption_callable(name: str) -> tp.Callable[..., tp.Any] | None
     return candidate if callable(candidate) else None
 
 
-def _reset_fallback_preemption_state() -> None:
-    """Reset module-level fallback signal state (intended for test isolation)."""
+def _uninstall_eyvan_preemption_module(preemption_mod: tp.Any, *, on_main_thread: bool) -> None:
+    """Safely uninstall or clear live notice state on ``eyvan.worker.runtime.preemption``.
+
+    On the main thread, delegates directly to ``preemption_mod.uninstall_preemption_handler()``.
+    On a background thread, clears ``_signal_notice`` and ``_callbacks`` under ``_install_lock``
+    without discarding ``_installed_signals`` / ``_previous_handlers`` so a subsequent main-thread
+    uninstall can still restore the original handlers cleanly (even with older ``eyvan`` builds).
+    """
+    if on_main_thread:
+        uninstall = getattr(preemption_mod, "uninstall_preemption_handler", None)
+        if callable(uninstall):
+            uninstall()
+        return
+
+    install_lock = getattr(preemption_mod, "_install_lock", None)
+    has_internal_state = (
+        hasattr(preemption_mod, "_signal_notice")
+        and hasattr(preemption_mod, "_installed_signals")
+        and hasattr(preemption_mod, "_previous_handlers")
+    )
+    if has_internal_state and hasattr(install_lock, "__enter__") and hasattr(install_lock, "__exit__"):
+        with install_lock:
+            preemption_mod._signal_notice = None
+            callbacks = getattr(preemption_mod, "_callbacks", None)
+            if isinstance(callbacks, list):
+                callbacks.clear()
+        return
+
+    uninstall = getattr(preemption_mod, "uninstall_preemption_handler", None)
+    if callable(uninstall):
+        uninstall()
+
+
+def uninstall_preemption_handler() -> None:
+    """Restore previous ``SIGUSR1`` / ``SIGTERM`` handlers and clear live signal notice state.
+
+    Delegates lazily to Eyvan's ``uninstall_preemption_handler`` when available
+    and also restores any fallback handlers recorded in ``_PREV_SIGNAL_HANDLERS``
+    while clearing process-local signal notices and callbacks so subsequent
+    trainers in the same process never observe a stale reclaim notice.
+
+    Safe and idempotent to call multiple times or from a non-main thread. When
+    called from a background thread, live signal notices and callbacks are
+    cleared without discarding saved main-thread original handlers so a later
+    main-thread call can still restore them cleanly.
+    """
     global _SIGNAL_PREEMPTION_NOTICE, _SIGNAL_HANDLERS_INSTALLED
+    on_main_thread = threading.current_thread() is threading.main_thread()
+
     with _PREEMPTION_LOCK:
         _SIGNAL_PREEMPTION_NOTICE = None
         _SIGNAL_CALLBACKS.clear()
-        if _SIGNAL_HANDLERS_INSTALLED and threading.current_thread() is threading.main_thread():
+        if on_main_thread:
             for signum, prev in list(_PREV_SIGNAL_HANDLERS.items()):
                 try:
                     signal.signal(signum, prev)
                 except (OSError, ValueError):
                     pass
-        _PREV_SIGNAL_HANDLERS.clear()
-        _SIGNAL_HANDLERS_INSTALLED = False
-    import sys
+            _PREV_SIGNAL_HANDLERS.clear()
+            _SIGNAL_HANDLERS_INSTALLED = False
+
+    eyvan_fn = _get_eyvan_preemption_callable("uninstall_preemption_handler")
+    if eyvan_fn is not None:
+        if not on_main_thread and getattr(eyvan_fn, "__module__", None) == "eyvan.worker.runtime.preemption":
+            preemption_mod = sys.modules.get("eyvan.worker.runtime.preemption")
+            if preemption_mod is not None and eyvan_fn is getattr(preemption_mod, "uninstall_preemption_handler", None):
+                _uninstall_eyvan_preemption_module(preemption_mod, on_main_thread=False)
+                return
+        eyvan_fn()
+
+
+def _reset_fallback_preemption_state() -> None:
+    """Reset module-level fallback and Eyvan signal state (intended for test isolation)."""
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    try:
+        uninstall_preemption_handler()
+    except Exception:
+        pass
 
     preemption_mod = sys.modules.get("eyvan.worker.runtime.preemption")
-    uninstall = getattr(preemption_mod, "uninstall_preemption_handler", None)
-    if callable(uninstall):
+    if preemption_mod is not None:
         try:
-            uninstall()
+            _uninstall_eyvan_preemption_module(preemption_mod, on_main_thread=on_main_thread)
         except Exception:
             pass
 
@@ -870,4 +933,5 @@ __all__ = (
     "resume_checkpoint_uri",
     "set_eyvan_auto_track_enabled",
     "storage_path",
+    "uninstall_preemption_handler",
 )

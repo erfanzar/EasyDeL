@@ -3117,6 +3117,16 @@ class AgentFlowTrainer:
 
         return self._adapt_episodes_to_trainer(episodes, group_size, state=state, is_train=is_train)
 
+    @staticmethod
+    def _uninstall_eyvan_preemption_handler() -> None:
+        """Uninstall Eyvan's graceful preemption signal handler and clear live signal notices without raising."""
+        try:
+            from easydel.utils.eyvan_helpers import uninstall_preemption_handler
+
+            uninstall_preemption_handler()
+        except Exception:
+            pass
+
     def train(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
         """Delegate training to the wrapped trainer after installing Eyvan's preemption handler."""
         try:
@@ -3125,7 +3135,10 @@ class AgentFlowTrainer:
             install_preemption_handler()
         except Exception:
             pass
-        return self.trainer.train(*args, **kwargs)
+        try:
+            return self.trainer.train(*args, **kwargs)
+        finally:
+            self._uninstall_eyvan_preemption_handler()
 
     def eval(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
         """Delegate evaluation to the wrapped trainer."""
@@ -3149,7 +3162,10 @@ class AgentFlowTrainer:
                 if callable(teardown_fn):
                     teardown_fn()
         finally:
-            self._close_owned_env_runtime()
+            try:
+                self._close_owned_env_runtime()
+            finally:
+                self._uninstall_eyvan_preemption_handler()
 
     def finish(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
         """Delegate finalization to the wrapped trainer and close any owned environment runtime."""
@@ -3159,7 +3175,10 @@ class AgentFlowTrainer:
                 return finish_fn(*args, **kwargs)
             return None
         finally:
-            self._close_owned_env_runtime()
+            try:
+                self._close_owned_env_runtime()
+            finally:
+                self._uninstall_eyvan_preemption_handler()
 
     def save_pretrained(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
         """Delegate checkpoint/model export to the wrapped trainer."""

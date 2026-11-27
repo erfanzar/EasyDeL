@@ -206,6 +206,7 @@ def test_preemption_bridge_delegates_to_eyvan_when_available(monkeypatch, tmp_pa
         preemption_notice=lambda **kw: calls.append(("preemption_notice", kw)) or fake_notice,
         reclaim_requested=lambda **kw: calls.append(("reclaim_requested", kw)) or True,
         install_preemption_handler=lambda **kw: calls.append(("install_preemption_handler", kw)),
+        uninstall_preemption_handler=lambda **kw: calls.append(("uninstall_preemption_handler", kw)),
         acknowledge_checkpoint=lambda uri, **kw: (
             calls.append(("acknowledge_checkpoint", (uri, kw))) or (tmp_path / "r.json")
         ),
@@ -217,17 +218,20 @@ def test_preemption_bridge_delegates_to_eyvan_when_available(monkeypatch, tmp_pa
     assert eh.preemption_notice() is fake_notice
     assert eh.reclaim_requested() is True
     eh.install_preemption_handler(callback=cb)
+    eh.uninstall_preemption_handler()
     assert eh.acknowledge_checkpoint("gs://bucket/run-7", step=7) == tmp_path / "r.json"
     assert eh.resume_checkpoint_uri() == "gs://bucket/run-7"
     assert [name for name, _ in calls] == [
         "preemption_notice",
         "reclaim_requested",
         "install_preemption_handler",
+        "uninstall_preemption_handler",
         "acknowledge_checkpoint",
         "resume_checkpoint_uri",
     ]
     assert calls[2][1] == {"callback": cb}
-    assert calls[3][1] == ("gs://bucket/run-7", {"step": 7})
+    assert calls[3][1] == {}
+    assert calls[4][1] == ("gs://bucket/run-7", {"step": 7})
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +257,12 @@ def test_easydel_public_api_does_not_reexport_eyvan_sdk_or_compute_dispatch():
         "resume_checkpoint_uri",
         "run_on_tpu",
         "storage_path",
+        "uninstall_preemption_handler",
     ):
         assert not hasattr(ed, name), f"easydel.{name} should live only in eyvan, not top-level easydel"
+
+    assert "uninstall_preemption_handler" in eh.__all__
+    assert callable(eh.uninstall_preemption_handler)
 
     for name in ("run_on_tpu", "eyvan_execute", "eyvan_init"):
         assert not hasattr(eh, name), f"easydel.utils.eyvan_helpers.{name} should live only in eyvan"
@@ -813,3 +821,336 @@ def test_base_trainer_auto_resumes_from_eyvan_reclaimed_checkpoint_uri(monkeypat
     assert trainer_parent._resumed_from_checkpoint is True
     assert load_calls == [str(saved_ckpt)]
     assert any(f"Resuming from Eyvan reclaimed checkpoint: {saved_ckpt}" in msg for msg in info_logs), info_logs
+
+
+# ---------------------------------------------------------------------------
+# 7. Handler Restoration, Cross-Trainer Notice Isolation, & Thread Safety
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("use_fallback", [False, True])
+def test_trainer_finish_restores_signal_handlers_and_clears_live_notice(
+    monkeypatch,
+    tmp_path: Path,
+    use_fallback: bool,
+):
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("SIGUSR1 not available on this platform")
+    if use_fallback:
+        monkeypatch.setattr(eh, "_get_eyvan_preemption_callable", lambda name: None)
+
+    saved_term = signal.getsignal(signal.SIGTERM)
+    saved_usr1 = signal.getsignal(signal.SIGUSR1)
+
+    def _sentinel_term(signum, frame):
+        del signum, frame
+
+    def _sentinel_usr1(signum, frame):
+        del signum, frame
+
+    signal.signal(signal.SIGTERM, _sentinel_term)
+    signal.signal(signal.SIGUSR1, _sentinel_usr1)
+    try:
+        trainer = _build_loop_trainer(
+            tmp_path=tmp_path,
+            store_dir=tmp_path / "store",
+            save_directory=None,
+            max_training_steps=2,
+        )
+        trainer._install_eyvan_preemption_handler()
+
+        assert signal.getsignal(signal.SIGTERM) is not _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is not _sentinel_usr1
+
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert eh.reclaim_requested() is True
+        assert eh.preemption_notice() is not None
+
+        trainer.finish()
+
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # Idempotent on repeated finish() calls.
+        trainer.finish()
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+    finally:
+        eh._reset_fallback_preemption_state()
+        signal.signal(signal.SIGTERM, saved_term)
+        signal.signal(signal.SIGUSR1, saved_usr1)
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("use_fallback", [False, True])
+def test_second_trainer_in_same_process_does_not_trigger_stale_reclaim(
+    monkeypatch,
+    tmp_path: Path,
+    use_fallback: bool,
+):
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("SIGUSR1 not available on this platform")
+    if use_fallback:
+        monkeypatch.setattr(eh, "_get_eyvan_preemption_callable", lambda name: None)
+
+    saved_term = signal.getsignal(signal.SIGTERM)
+    saved_usr1 = signal.getsignal(signal.SIGUSR1)
+
+    def _sentinel_term(signum, frame):
+        del signum, frame
+
+    def _sentinel_usr1(signum, frame):
+        del signum, frame
+
+    signal.signal(signal.SIGTERM, _sentinel_term)
+    signal.signal(signal.SIGUSR1, _sentinel_usr1)
+    try:
+        # Trainer 1 receives SIGUSR1 mid-training and exits via graceful reclaim.
+        run1_steps: list[int] = []
+
+        def _exec_run1(*, state, batch):
+            del batch
+            next_step = int(state.step) + 1
+            run1_steps.append(next_step)
+            if next_step == 1:
+                os.kill(os.getpid(), signal.SIGUSR1)
+            return (
+                _StateStub(step=next_step, model=state.model),
+                LossMetrics(loss=0.5, accuracy=0.8, execution_time=0.01),
+                None,
+            )
+
+        trainer1 = _build_loop_trainer(
+            tmp_path=tmp_path,
+            store_dir=tmp_path / "store1",
+            save_directory=str(tmp_path / "ckpts1"),
+            max_training_steps=4,
+            execute_step_fn=_exec_run1,
+        )
+        trainer1.checkpointer = object()
+        trainer1._save_checkpoint_for_step = lambda *, state, step, force=False, merge_lora_before_save=False: (
+            str(tmp_path / "ckpts1" / f"run-{step}") if force else None
+        )
+        trainer1.train()
+
+        assert run1_steps == [1]
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # Trainer 2 runs in the same process and must complete all steps with zero stale reclaim at step 0.
+        run2_steps: list[int] = []
+        run2_exceptions: list[BaseException | None] = []
+
+        def _exec_run2(*, state, batch):
+            del batch
+            next_step = int(state.step) + 1
+            run2_steps.append(next_step)
+            return (
+                _StateStub(step=next_step, model=state.model),
+                LossMetrics(loss=0.25, accuracy=0.9, execution_time=0.01),
+                None,
+            )
+
+        trainer2 = _build_loop_trainer(
+            tmp_path=tmp_path,
+            store_dir=tmp_path / "store2",
+            save_directory=None,
+            max_training_steps=3,
+            execute_step_fn=_exec_run2,
+        )
+        trainer2.arguments.do_last_save = False
+        trainer2.checkpointer = None
+        trainer2._save_checkpoint_for_step = lambda **kw: None
+        assert trainer2._should_save_eyvan_reclaim_checkpoint(step=0) is None
+        orig_run_loop = trainer2._run_training_loop
+
+        def _spy_run_loop(*a, **kw):
+            out, exc = orig_run_loop(*a, **kw)
+            run2_exceptions.append(exc)
+            return out, exc
+
+        trainer2._run_training_loop = _spy_run_loop
+        trainer2.train()
+
+        assert run2_steps == [1, 2, 3]
+        assert run2_exceptions == [None]
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # Trainer 3 raises an unexpected exception mid-training and still restores handlers + clears notice.
+        def _exec_run3_boom(*, state, batch):
+            del state, batch
+            os.kill(os.getpid(), signal.SIGUSR1)
+            raise RuntimeError("boom during train step")
+
+        trainer3 = _build_loop_trainer(
+            tmp_path=tmp_path,
+            store_dir=tmp_path / "store3",
+            save_directory=None,
+            max_training_steps=2,
+            execute_step_fn=_exec_run3_boom,
+        )
+        trainer3.arguments.do_last_save = False
+        trainer3.checkpointer = None
+        trainer3._save_checkpoint_for_step = lambda **kw: None
+        with pytest.raises(RuntimeError, match="boom during train step"):
+            trainer3.train()
+
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+    finally:
+        eh._reset_fallback_preemption_state()
+        signal.signal(signal.SIGTERM, saved_term)
+        signal.signal(signal.SIGUSR1, saved_usr1)
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("use_fallback", [False, True])
+def test_agent_flow_trainer_teardown_restores_handlers_and_clears_notice(
+    monkeypatch,
+    use_fallback: bool,
+):
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("SIGUSR1 not available on this platform")
+    if use_fallback:
+        monkeypatch.setattr(eh, "_get_eyvan_preemption_callable", lambda name: None)
+
+    saved_term = signal.getsignal(signal.SIGTERM)
+    saved_usr1 = signal.getsignal(signal.SIGUSR1)
+
+    def _sentinel_term(signum, frame):
+        del signum, frame
+
+    def _sentinel_usr1(signum, frame):
+        del signum, frame
+
+    signal.signal(signal.SIGTERM, _sentinel_term)
+    signal.signal(signal.SIGUSR1, _sentinel_usr1)
+    try:
+        af = object.__new__(AgentFlowTrainer)
+        af._owned_env_runtime = None
+
+        # 1. Normal AgentFlowTrainer.train() exit restores handlers & clears notice.
+        def _inner_train_normal():
+            os.kill(os.getpid(), signal.SIGUSR1)
+            assert eh.reclaim_requested() is True
+            return "ok"
+
+        af.trainer = types.SimpleNamespace(train=_inner_train_normal)
+        assert af.train() == "ok"
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # 2. Failing AgentFlowTrainer.train() still restores handlers & clears notice.
+        def _inner_train_fail():
+            os.kill(os.getpid(), signal.SIGUSR1)
+            raise RuntimeError("agentflow boom")
+
+        af.trainer = types.SimpleNamespace(train=_inner_train_fail)
+        with pytest.raises(RuntimeError, match="agentflow boom"):
+            af.train()
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # 3. AgentFlowTrainer.finish() restores handlers & clears notice even without inner.finish.
+        eh.install_preemption_handler()
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert eh.reclaim_requested() is True
+        af.trainer = types.SimpleNamespace()
+        af.finish()
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+    finally:
+        eh._reset_fallback_preemption_state()
+        signal.signal(signal.SIGTERM, saved_term)
+        signal.signal(signal.SIGUSR1, saved_usr1)
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize("use_fallback", [False, True])
+def test_uninstall_preemption_handler_off_main_thread_preserves_saved_handlers(
+    monkeypatch,
+    use_fallback: bool,
+):
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("SIGUSR1 not available on this platform")
+    if use_fallback:
+        monkeypatch.setattr(eh, "_get_eyvan_preemption_callable", lambda name: None)
+
+    saved_term = signal.getsignal(signal.SIGTERM)
+    saved_usr1 = signal.getsignal(signal.SIGUSR1)
+
+    def _sentinel_term(signum, frame):
+        del signum, frame
+
+    def _sentinel_usr1(signum, frame):
+        del signum, frame
+
+    signal.signal(signal.SIGTERM, _sentinel_term)
+    signal.signal(signal.SIGUSR1, _sentinel_usr1)
+    try:
+        eh.install_preemption_handler()
+        assert signal.getsignal(signal.SIGTERM) is not _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is not _sentinel_usr1
+
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert eh.reclaim_requested() is True
+        assert eh.preemption_notice() is not None
+
+        bg_errors: list[BaseException] = []
+
+        def _bg_uninstall():
+            try:
+                eh.uninstall_preemption_handler()
+            except BaseException as exc:
+                bg_errors.append(exc)
+
+        worker = threading.Thread(target=_bg_uninstall, name="test-bg-uninstall")
+        worker.start()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert bg_errors == []
+
+        # Live notice was safely cleared off the main thread.
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # Saved original handlers were NOT discarded by the background-thread call.
+        if use_fallback:
+            assert eh._PREV_SIGNAL_HANDLERS.get(int(signal.SIGTERM)) is _sentinel_term
+            assert eh._PREV_SIGNAL_HANDLERS.get(int(signal.SIGUSR1)) is _sentinel_usr1
+        else:
+            preemption_mod = sys.modules["eyvan.worker.runtime.preemption"]
+            assert preemption_mod._previous_handlers.get(signal.SIGTERM) is _sentinel_term
+            assert preemption_mod._previous_handlers.get(signal.SIGUSR1) is _sentinel_usr1
+
+        # A subsequent main-thread uninstall restores both original handlers cleanly.
+        eh.uninstall_preemption_handler()
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+        assert eh.preemption_notice() is None
+        assert eh.reclaim_requested() is False
+
+        # Repeated main-thread uninstall remains idempotent.
+        eh.uninstall_preemption_handler()
+        assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        assert signal.getsignal(signal.SIGUSR1) is _sentinel_usr1
+    finally:
+        eh._reset_fallback_preemption_state()
+        signal.signal(signal.SIGTERM, saved_term)
+        signal.signal(signal.SIGUSR1, saved_usr1)

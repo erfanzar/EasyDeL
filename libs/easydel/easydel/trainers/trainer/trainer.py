@@ -1602,12 +1602,17 @@ class Trainer(BaseTrainer):
             self._runtime_trace("train.exception", exc_type=type(exc).__name__, exc=str(exc))
             raise
         finally:
-            if not finalized:
-                if caught_exc is not None:
-                    record_final_summary = getattr(self, "_record_eyvan_final_summary", None)
-                    if callable(record_final_summary):
-                        record_final_summary(output=None, run_exception=caught_exc)
-                self.finish()
+            try:
+                if not finalized:
+                    if caught_exc is not None:
+                        record_final_summary = getattr(self, "_record_eyvan_final_summary", None)
+                        if callable(record_final_summary):
+                            record_final_summary(output=None, run_exception=caught_exc)
+                    self.finish()
+            finally:
+                uninstall_preemption = getattr(self, "_uninstall_eyvan_preemption_handler", None)
+                if callable(uninstall_preemption):
+                    uninstall_preemption()
 
     def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """
