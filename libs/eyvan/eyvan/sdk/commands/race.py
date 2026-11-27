@@ -63,7 +63,10 @@ def _summary(report: RaceReport) -> None:
         cleanup = f"  [{zone.cleanup}]" if zone.cleanup else ""
         click.echo(f"  {zone.zone:26} {zone.outcome.value:10} {detail}{cleanup}")
     if report.not_offered:
-        click.echo(f"  not offered in: {', '.join(report.not_offered)}")
+        if len(report.not_offered) > 12:
+            click.echo(f"  not offered in {len(report.not_offered)} zones (full list in receipt / --json)")
+        else:
+            click.echo(f"  not offered in: {', '.join(report.not_offered)}")
     if report.unknown_offer:
         click.echo(f"  could not check (not raced): {', '.join(report.unknown_offer)}")
     sweep = report.sweep
@@ -100,6 +103,11 @@ def race() -> None:
 @click.option("--zone", "zones", multiple=True, metavar="Z", help="Race only these zones (repeatable).")
 @click.option("--on-demand", is_flag=True, help="Request on-demand instead of Spot capacity.")
 @click.option("--keep-first", is_flag=True, help="Keep the first grant (it bills) and delete everything else.")
+@click.option(
+    "--internal-ips",
+    is_flag=True,
+    help="Request internal-only TPU nodes without external IPs (default enables external IPs).",
+)
 @click.option("--account", metavar="EMAIL", help="gcloud account to request as; gcloud config is not changed.")
 @click.option(
     "--timeout",
@@ -119,6 +127,7 @@ def race_tpu(
     zones: tuple[str, ...],
     on_demand: bool,
     keep_first: bool,
+    internal_ips: bool,
     account: str | None,
     timeout_min: float,
     runtime_version: str | None,
@@ -142,6 +151,7 @@ def race_tpu(
             zones=zones,
             spot=not on_demand,
             keep_first=keep_first,
+            enable_external_ips=not internal_ips,
             runtime_version=runtime_version,
             account=account,
             timing=RaceTiming(timeout_s=timeout_min * 60.0),
@@ -181,36 +191,80 @@ def race_tpu(
 
 
 @race.command("sweep")
-@click.argument("run_id")
+@click.argument("run_id", required=False)
 @click.option("--project", metavar="P", help="Project; defaults to the one in the race's receipt.")
-@click.option("--zone", "zones", multiple=True, metavar="Z", help="Zones to sweep; defaults to the receipt's.")
-@click.option("--account", metavar="EMAIL", help="gcloud account to delete as; gcloud config is not changed.")
+@click.option(
+    "--zone",
+    "zones",
+    multiple=True,
+    metavar="Z",
+    help="Zones to sweep; defaults to the receipt's zones or every TPU zone in the project.",
+)
+@click.option("--account", metavar="EMAIL", help="gcloud account to delete as; defaults to the receipt's account.")
+@click.option(
+    "--receipt",
+    "receipt_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to the race receipt JSON; defaults to ~/.eyvan/races/RUN_ID.json.",
+)
 @click.option("--include-kept", is_flag=True, help="Also delete a grant the race kept.")
 def race_sweep(
-    run_id: str, project: str | None, zones: tuple[str, ...], account: str | None, include_kept: bool
+    run_id: str | None,
+    project: str | None,
+    zones: tuple[str, ...],
+    account: str | None,
+    receipt_path: Path | None,
+    include_kept: bool,
 ) -> None:
     """Delete everything race RUN_ID left behind (except a kept grant) and confirm the zones are clean."""
 
+    if run_id is None and receipt_path is None:
+        raise click.UsageError("pass RUN_ID or --receipt PATH")
     receipt: dict[str, tp.Any] = {}
-    path = default_receipt(run_id)
+    path = receipt_path if receipt_path is not None else default_receipt(run_id or "")
+    if receipt_path is not None and not path.is_file():
+        raise click.UsageError(f"receipt not found at {path}")
     if path.is_file():
         try:
-            receipt = json.loads(path.read_text(encoding="utf-8"))
-        except ValueError:
-            receipt = {}
-    project = project or receipt.get("project")
-    zone_list = list(zones) or list(receipt.get("raced_zones") or [])
-    if not project or not zone_list:
-        raise click.UsageError(f"no receipt at {path}; pass --project and --zone")
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            if receipt_path is not None:
+                raise click.UsageError(f"could not read receipt at {path}: {exc}") from exc
+            loaded = {}
+        if isinstance(loaded, dict):
+            receipt = loaded
+        elif receipt_path is not None:
+            raise click.UsageError(f"receipt at {path} must be a JSON object")
+    resolved_run_id = run_id or (receipt.get("run_id") if isinstance(receipt.get("run_id"), str) else None)
+    if not resolved_run_id:
+        raise click.UsageError(f"receipt at {path} has no run_id; pass RUN_ID explicitly")
+    project = project or (receipt.get("project") if isinstance(receipt.get("project"), str) else None)
+    if not project:
+        raise click.UsageError(f"no receipt at {path}; pass --project (or --receipt PATH)")
+    resolved_account = account or (receipt.get("account") if isinstance(receipt.get("account"), str) else None)
+    api = _api_factory(resolved_account)
+    receipt_zones = [z for z in (receipt.get("raced_zones") or []) if isinstance(z, str)]
+    if not receipt_zones and isinstance(receipt.get("zones"), list):
+        receipt_zones = [
+            entry["zone"] for entry in receipt["zones"] if isinstance(entry, dict) and isinstance(entry.get("zone"), str)
+        ]
+    zone_list = list(zones) or receipt_zones
+    if not zone_list:
+        try:
+            zone_list = api.list_zones(project)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+    if not zone_list:
+        raise click.ClickException(f"no TPU zones found in {project}; pass --zone explicitly")
     kept = receipt.get("kept") if isinstance(receipt.get("kept"), dict) else None
     keep = () if include_kept or kept is None else (str(kept.get("name")),)
     try:
-        result = sweep_race(_api_factory(account), project=project, zones=zone_list, run_id=run_id, keep=keep)
+        result = sweep_race(api, project=project, zones=zone_list, run_id=resolved_run_id, keep=keep, on_event=_event)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     click.echo(json.dumps(result.document(), indent=2))
     if not result.clean:
-        raise click.ClickException(f"race {run_id} is not confirmed clean")
+        raise click.ClickException(f"race {resolved_run_id} is not confirmed clean")
 
 
 def register_race_commands(main: click.Group) -> None:

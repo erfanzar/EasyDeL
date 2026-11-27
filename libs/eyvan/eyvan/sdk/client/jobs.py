@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import re
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from eyvan.artifacts import StoredCallableArtifact
@@ -31,6 +32,14 @@ from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 R_co = tp.TypeVar("R_co", covariant=True)
 
 _ACCELERATOR_TYPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_RECLAIM_FROM = re.compile(r"\bfrom\s+([A-Za-z0-9._@-]+)", re.IGNORECASE)
+
+#: Default checkpoint grace window (10 minutes) granted when borrowed capacity
+#: is reclaimed by its owner.
+DEFAULT_RECLAIM_GRACE_SECONDS = 600
+MAX_RECLAIM_GRACE_SECONDS = 86_400
+ReclaimPolicy: tp.TypeAlias = tp.Literal["requeue", "stop"]
+RECLAIM_POLICIES: tuple[str, ...] = ("requeue", "stop")
 
 
 def reject_remote_callable_signing_key(signing_key: bytes | None) -> None:
@@ -75,6 +84,8 @@ class AcceleratorConfig(tp.Protocol):
     checkpoint_output_uri: str | None
     can_submit_children: bool
     dependencies: tp.Sequence[str]
+    reclaim_grace_seconds: int
+    reclaim_policy: ReclaimPolicy
 
 
 def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, multi_worker: bool) -> str:
@@ -116,6 +127,23 @@ def _validate_accelerator_request(config: AcceleratorConfig, *, label: str, mult
         or config.max_failure_retries > 100
     ):
         raise ValueError(f"{label} max_failure_retries must be an integer from 0 through 100")
+    if (
+        isinstance(config.max_preemption_retries, bool)
+        or not isinstance(config.max_preemption_retries, int)
+        or config.max_preemption_retries < 0
+        or config.max_preemption_retries > 1000
+    ):
+        raise ValueError(f"{label} max_preemption_retries must be an integer from 0 through 1000")
+    deps = config.dependencies
+    if isinstance(deps, (str, bytes)) or not isinstance(deps, tp.Sequence):
+        raise ValueError(f"{label} dependencies must be a sequence of package requirement strings")
+    if any(not isinstance(item, str) for item in deps):
+        raise ValueError(f"{label} dependencies must contain only strings")
+    grace = config.reclaim_grace_seconds
+    if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0 or grace > MAX_RECLAIM_GRACE_SECONDS:
+        raise ValueError(f"{label} reclaim_grace_seconds must be an integer from 0 through {MAX_RECLAIM_GRACE_SECONDS}")
+    if config.reclaim_policy not in RECLAIM_POLICIES:
+        raise ValueError(f"{label} reclaim_policy must be one of {', '.join(RECLAIM_POLICIES)}")
     return accelerator_type
 
 
@@ -260,6 +288,12 @@ class TpuConfig:
     #: ``https://`` URL, a ``SetupScript`` with args, or the built-in
     #: ``EasyDeLSetup``; cached per host by the script's content and args.
     setup: SetupValue = None
+    #: Seconds given to finish the active step and flush a checkpoint when
+    #: borrowed capacity is reclaimed by its owner (default: 10 minutes).
+    reclaim_grace_seconds: int = DEFAULT_RECLAIM_GRACE_SECONDS
+    #: Action after a graceful reclaim checkpoint finishes: ``"requeue"``
+    #: resumes automatically elsewhere; ``"stop"`` settles cleanly as CANCELLED.
+    reclaim_policy: ReclaimPolicy = "requeue"
     #: Whether the caller named ``capacity_class``. Derived, never passed: only
     #: an unnamed class may be substituted by a fleet's reserved capacity.
     capacity_class_explicit: bool = field(default=True, init=False, repr=False, compare=False)
@@ -270,6 +304,7 @@ class TpuConfig:
             object.__setattr__(self, "capacity_class_explicit", False)
         normalized = _validate_accelerator_request(self, label="TPU", multi_worker=True)
         object.__setattr__(self, "type", normalized)
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
         self._validate_chips()
         object.__setattr__(self, "setup", workload_setup(self.setup))
 
@@ -361,10 +396,15 @@ class GpuConfig:
     dependencies: tuple[str, ...] = ()
     #: A bash step run before the callable loads. See ``TpuConfig.setup``.
     setup: SetupValue = None
+    #: Graceful checkpoint window when borrowed capacity is reclaimed. See ``TpuConfig``.
+    reclaim_grace_seconds: int = DEFAULT_RECLAIM_GRACE_SECONDS
+    #: Post-reclaim behavior (``"requeue"`` or ``"stop"``). See ``TpuConfig``.
+    reclaim_policy: ReclaimPolicy = "requeue"
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="GPU", multi_worker=False)
         object.__setattr__(self, "type", normalized)
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
         object.__setattr__(self, "setup", workload_setup(self.setup))
 
     @property
@@ -411,10 +451,15 @@ class CpuConfig:
     dependencies: tuple[str, ...] = ()
     #: A bash step run before the callable loads. See ``TpuConfig.setup``.
     setup: SetupValue = None
+    #: Graceful checkpoint window when borrowed capacity is reclaimed. See ``TpuConfig``.
+    reclaim_grace_seconds: int = DEFAULT_RECLAIM_GRACE_SECONDS
+    #: Post-reclaim behavior (``"requeue"`` or ``"stop"``). See ``TpuConfig``.
+    reclaim_policy: ReclaimPolicy = "requeue"
 
     def __post_init__(self) -> None:
         normalized = _validate_accelerator_request(self, label="CPU", multi_worker=False)
         object.__setattr__(self, "type", normalized)
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
         object.__setattr__(self, "setup", workload_setup(self.setup))
 
     @property
@@ -494,11 +539,21 @@ class EyvanJobError(RuntimeError):
         self.completion = completion
 
 
+def placement_error_labels(config: AcceleratorConfig | None) -> tuple[str, str]:
+    """Return the user-facing hardware label and config class name for ``config``."""
+
+    if isinstance(config, CpuConfig):
+        return "CPU", "CpuConfig"
+    if isinstance(config, GpuConfig):
+        return "GPU", "GpuConfig"
+    return "TPU", "TpuConfig"
+
+
 class EyvanPlacementError(RuntimeError):
-    """Raised when no enabled capacity pool can satisfy a callable's TPU request.
+    """Raised when no enabled capacity pool can satisfy a callable's hardware request.
 
     ``fleet`` names the fleet that was already selected. It is ``None`` when the
-    request failed while auto-resolving a fleet from a :class:`TpuConfig`, in
+    request failed while auto-resolving a fleet from an accelerator config, in
     which case ``scope`` names the ``org/project`` that was searched.
     """
 
@@ -511,6 +566,8 @@ class EyvanPlacementError(RuntimeError):
         scope: str | None = None,
         fleets_providing_requested_type: tp.Iterable[str] = (),
         available_fleets: tp.Iterable[str] = (),
+        accelerator_label: str = "TPU",
+        config_name: str = "TpuConfig",
     ) -> None:
         self.fleet = fleet
         self.scope = scope
@@ -518,17 +575,19 @@ class EyvanPlacementError(RuntimeError):
         self.available_accelerator_types = sort_accelerator_types(available_accelerator_types)
         self.fleets_providing_requested_type = tuple(sorted(set(fleets_providing_requested_type)))
         self.available_fleets = tuple(sorted(set(available_fleets)))
+        self.accelerator_label = accelerator_label
+        self.config_name = config_name
         if fleet is not None:
             location = f"in selected fleet {fleet!r}"
-            empty_detail = "That fleet has no compatible enabled TPU pools for this request."
+            empty_detail = f"That fleet has no compatible enabled {accelerator_label} pools for this request."
         else:
             location = "in any enabled fleet" if scope is None else f"in any enabled fleet for {scope}"
-            empty_detail = "No enabled fleet exposes a compatible TPU pool for this request."
-        parts = [f"Eyvan cannot run TPU {requested_accelerator_type!r} {location}."]
+            empty_detail = f"No enabled fleet exposes a compatible {accelerator_label} pool for this request."
+        parts = [f"Eyvan cannot run {accelerator_label} {requested_accelerator_type!r} {location}."]
         if self.available_accelerator_types:
             available = ", ".join(self.available_accelerator_types)
-            parts.append(f"Compatible TPU types for this request: {available}.")
-            parts.append("Change TpuConfig(type=...) to one of those.")
+            parts.append(f"Compatible {accelerator_label} types for this request: {available}.")
+            parts.append(f"Change {config_name}(type=...) to one of those.")
         else:
             parts.append(empty_detail)
         # Name the fleets that would work. The commonest cause of this error is
@@ -551,6 +610,120 @@ class EyvanPlacementError(RuntimeError):
         super().__init__(" ".join(parts))
 
 
+def with_reclaim_options(
+    config: AcceleratorConfig,
+    *,
+    reclaim_grace_seconds: int | None = None,
+    reclaim_policy: ReclaimPolicy | None = None,
+) -> AcceleratorConfig:
+    """Return ``config`` with updated reclaim grace/policy while preserving implicit capacity class."""
+
+    if reclaim_grace_seconds is None and reclaim_policy is None:
+        return config
+    updates: dict[str, tp.Any] = {}
+    if reclaim_grace_seconds is not None:
+        updates["reclaim_grace_seconds"] = reclaim_grace_seconds
+    if reclaim_policy is not None:
+        updates["reclaim_policy"] = reclaim_policy
+    if isinstance(config, TpuConfig):
+        if not config.capacity_class_explicit:
+            updates["capacity_class"] = _UNSET_CAPACITY_CLASS
+        return replace(config, **updates)
+    if isinstance(config, (GpuConfig, CpuConfig)):
+        return replace(config, **updates)
+    raise TypeError("reclaim overrides require a TpuConfig, GpuConfig, or CpuConfig instance")
+
+
+def _parse_deadline(value: object) -> datetime | None:
+    """Parse a datetime or ISO-8601 timestamp string into a UTC-aware ``datetime``."""
+
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    return None
+
+
+def format_countdown(seconds: float) -> str:
+    """Format a remaining grace duration cleanly (e.g. ``9m 42s`` or ``45s``)."""
+
+    total = max(0, round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s" if secs else f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    return f"{secs}s"
+
+
+def format_reclaim_status(workload: object, *, now: datetime | None = None) -> str | None:
+    """Return a user-facing reclaim status line for ``workload``, or ``None`` when not reclaiming.
+
+    Handles both perspectives seamlessly:
+    - The borrowed victim job checkpointing before releasing capacity
+      (``CHECKPOINTING`` or active ``reclaim_requested_by`` / ``reclaim_deadline_at``).
+    - The guaranteed owner's ``PENDING``/``ADMITTED`` job waiting on borrowed
+      capacity to be reclaimed.
+    """
+
+    state = getattr(workload, "state", None)
+    if state in {WorkloadState.SUCCEEDED, WorkloadState.FAILED, WorkloadState.CANCELLED}:
+        return None
+    deadline = _parse_deadline(getattr(workload, "reclaim_deadline_at", None))
+    requested_by = getattr(workload, "reclaim_requested_by", None)
+    policy = getattr(workload, "reclaim_policy", None)
+    if policy is None:
+        spec = getattr(workload, "spec", None)
+        policy = getattr(spec, "reclaim_policy", None)
+    scheduling_reason = getattr(workload, "scheduling_reason", None)
+    reason_text = scheduling_reason.strip() if isinstance(scheduling_reason, str) else ""
+
+    current = now if now is not None else datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    remaining = format_countdown((deadline - current).total_seconds()) if deadline is not None else None
+
+    # Perspective 1: borrowed victim job being gracefully reclaimed / checkpointing.
+    if state is WorkloadState.CHECKPOINTING or (
+        requested_by and state in {WorkloadState.RUNNING, WorkloadState.DISPATCHING, WorkloadState.LEASED}
+    ):
+        by_part = f" (requested by {requested_by})" if isinstance(requested_by, str) and requested_by.strip() else ""
+        policy_part = ""
+        if policy == "requeue":
+            policy_part = " — will requeue automatically"
+        elif policy == "stop":
+            policy_part = " — will stop after checkpoint"
+        if remaining is not None:
+            return f"Reclaiming borrowed capacity{by_part} — checkpoint deadline in {remaining}{policy_part}"
+        if by_part or "reclaim" in reason_text.lower():
+            return f"Reclaiming borrowed capacity{by_part} — checkpointing before releasing capacity{policy_part}"
+        return None
+
+    # Perspective 2: owner job waiting while borrowed capacity is reclaimed.
+    if state in {WorkloadState.PENDING, WorkloadState.ADMITTED} and (
+        deadline is not None or "reclaim" in reason_text.lower()
+    ):
+        from_match = _RECLAIM_FROM.search(reason_text)
+        from_part = f" from {from_match.group(1)}" if from_match else ""
+        if remaining is not None:
+            return f"Reclaiming borrowed capacity{from_part} — checkpoint deadline in {remaining}"
+        if reason_text.lower().startswith("reclaiming"):
+            return reason_text
+        return f"Reclaiming borrowed capacity — {reason_text}" if reason_text else "Reclaiming borrowed capacity"
+
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class EyvanJob(tp.Generic[R_co]):
     """Durable handle returned by an Eyvan callable submission."""
@@ -564,6 +737,10 @@ class EyvanJob(tp.Generic[R_co]):
     def wait(self, timeout: float | None = None, *, progress: bool = False) -> JobCompletion:
         """Wait until the workload reaches a terminal state.
 
+        Surfaces live reclaim/preemption checkpoint deadlines on stderr whenever
+        reclamation is active (both with ``progress=True`` and ``progress=False``),
+        while remaining quiet for ordinary non-reclaimed ``wait()`` calls.
+
         Args:
             timeout: Maximum number of seconds to wait, or ``None`` to wait indefinitely.
             progress: Render control-plane lifecycle updates while waiting when the backend supports them.
@@ -571,6 +748,9 @@ class EyvanJob(tp.Generic[R_co]):
 
         if progress and self.progress_waiter is not None:
             return self.progress_waiter(self.id, timeout)
+        reclaim_wait = getattr(self.backend, "wait_with_reclaim_updates", None)
+        if callable(reclaim_wait):
+            return tp.cast(JobCompletion, reclaim_wait(self.id, timeout))
         return self.backend.wait(self.id, timeout)
 
     def status(self) -> WorkloadState:
@@ -607,6 +787,7 @@ class CallableSubmitter(tp.Protocol[R_co]):
 
 
 __all__ = (
+    "DEFAULT_RECLAIM_GRACE_SECONDS",
     "AcceleratorConfig",
     "CallableSubmission",
     "CallableSubmitter",
@@ -618,8 +799,12 @@ __all__ = (
     "JobBackend",
     "JobCompletion",
     "JobProgressWaiter",
+    "ReclaimPolicy",
     "TpuConfig",
+    "format_countdown",
+    "format_reclaim_status",
     "reject_remote_callable_signature",
     "reject_remote_callable_signing_environment",
     "reject_remote_callable_signing_key",
+    "with_reclaim_options",
 )

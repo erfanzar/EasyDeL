@@ -26,10 +26,12 @@ from eyvan.worker.agent.models import (
     CellStageActionRequest,
     CellStageActionResult,
     CheckpointRequest,
+    GangReclaimNoticeRequest,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
     MutationConflict,
     MutationConflictCode,
+    ReclaimNoticeRequest,
     WorkloadMutationRequest,
     WorkloadObservation,
     WorkloadRequest,
@@ -174,7 +176,15 @@ def _raise_for_status(response: httpx.Response) -> None:
         if isinstance(payload, dict) and payload.get("code") == "invalid_configuration":
             raise CellAgentInvalidConfigurationError(str(payload.get("detail") or "").strip() or "invalid configuration")
     if response.status_code == 501:
-        detail = str(response.text or "").strip() or "the cell agent backend does not support this operation"
+        detail = ""
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = payload["detail"].strip()
+        if not detail:
+            detail = str(response.text or "").strip() or "the cell agent backend does not support this operation"
         raise CellAgentUnsupportedCapabilityError(detail)
     if response.status_code == 502:
         try:
@@ -433,6 +443,46 @@ class CellAgentClient:
             f"/api/v1/cells/{cell_id}/workloads/{remote_id}/checkpoint",
             json=_wire(request),
         )
+        return WorkloadObservation.model_validate(response.json())
+
+    def reclaim_notice(self, cell_id: str, remote_id: str, request: ReclaimNoticeRequest) -> WorkloadObservation | None:
+        """Deliver a graceful reclaim notice, returning ``None`` if unsupported by the agent."""
+
+        try:
+            response = self._send(
+                "POST",
+                f"/api/v1/cells/{cell_id}/workloads/{remote_id}/reclaim-notice",
+                json=_wire(request),
+            )
+        except CellAgentUnsupportedCapabilityError:
+            return None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        return WorkloadObservation.model_validate(response.json())
+
+    def reclaim_notice_gang(
+        self,
+        coordinator_cell_id: str,
+        workload_id: str,
+        remote_id: str,
+        request: GangReclaimNoticeRequest,
+    ) -> WorkloadObservation | None:
+        """Deliver a graceful reclaim notice across every gang member, or ``None`` if unsupported."""
+
+        try:
+            response = self._send(
+                "POST",
+                f"/api/v1/cells/{coordinator_cell_id}/workload-gangs/{workload_id}/{remote_id}/reclaim-notice",
+                json=_wire(request),
+            )
+        except CellAgentUnsupportedCapabilityError:
+            return None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
         return WorkloadObservation.model_validate(response.json())
 
     def logs(self, cell_id: str, remote_id: str) -> str:

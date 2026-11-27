@@ -41,7 +41,12 @@ from eyvan.sdk.client.requests import (
 )
 from eyvan.sdk.client.transport import EyvanUnavailableError, SyncApiTransport, read_deadline
 from eyvan.sdk.client.types import HeaderMap, QueryParams
-from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadEstimateRequest, WorkloadSubmitRequest
+from eyvan.server.api.schemas import (
+    CapacityPoolResponse,
+    StorageStatusResponse,
+    WorkloadEstimateRequest,
+    WorkloadSubmitRequest,
+)
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.runtime.callables import CallableArtifact
 
@@ -200,6 +205,7 @@ class EyvanClient:
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
         setup: WorkloadSetup | None = None,
+        reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a command on a configured fleet node type."""
@@ -228,6 +234,7 @@ class EyvanClient:
             named_assets=named_assets,
             dependencies=dependencies,
             setup=setup,
+            reclaim_policy=reclaim_policy,
         )
         response = self._mutating_request(
             "POST",
@@ -267,6 +274,7 @@ class EyvanClient:
         atomic: bool = False,
         tpu_chips: TpuChipRequest | None = None,
         setup: WorkloadSetup | None = None,
+        reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
         idempotency_key: str | None = None,
     ) -> WorkloadRecord:
         """Queue a trusted callable on the fleet pool matching an accelerator type."""
@@ -298,6 +306,7 @@ class EyvanClient:
             named_assets=named_assets,
             dependencies=dependencies,
             setup=setup,
+            reclaim_policy=reclaim_policy,
         )
         response = self._mutating_request(
             "POST",
@@ -527,6 +536,12 @@ class EyvanClient:
 
         response = self._transport.request_checked("GET", "/api/v1/policies", params={"org_id": org_id})
         return [PolicyRecord.model_validate(item) for item in response.json()]
+
+    def get_storage_status(self) -> StorageStatusResponse:
+        """Read non-secret Eyvan storage configuration and detected GCP context."""
+
+        response = self._transport.request_checked("GET", "/api/v1/storage/status")
+        return StorageStatusResponse.model_validate(response.json())
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""

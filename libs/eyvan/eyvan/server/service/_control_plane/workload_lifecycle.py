@@ -110,7 +110,11 @@ class WorkloadLifecycleMixin:
             workload,
             target,
             action,
-            updates={"preemption_id": None},
+            updates={
+                "preemption_id": None,
+                "reclaim_deadline_at": None,
+                "reclaim_requested_by": None,
+            },
         )
         if target is WorkloadState.CANCELLING:
             for lease in await self._current_leases(tx, updated):
@@ -181,7 +185,14 @@ class WorkloadLifecycleMixin:
             return updated, False
 
     async def reclaim_workload(
-        self, principal: Principal, workload_id: str, *, idempotency_key: str, reason: str
+        self,
+        principal: Principal,
+        workload_id: str,
+        *,
+        idempotency_key: str,
+        reason: str,
+        grace_seconds: int | None = None,
+        requested_by: str | None = None,
     ) -> tuple[WorkloadRecord, bool]:
         """Take one running workload's capacity back without ending the workload.
 
@@ -220,6 +231,8 @@ class WorkloadLifecycleMixin:
             raise InputError("reclaim reason must not be empty")
         if len(reason) > 500:
             raise InputError("reclaim reason must be at most 500 characters")
+        if grace_seconds is not None and (isinstance(grace_seconds, bool) or grace_seconds <= 0):
+            raise InputError("reclaim grace_seconds must be a positive integer")
         async with self.repository.transaction() as tx:
             await self._lock_settlement(tx, workload_id)
             workload = await self._require_workload(tx, workload_id)
@@ -249,10 +262,29 @@ class WorkloadLifecycleMixin:
             target = WorkloadState.CHECKPOINTING if checkpoint else WorkloadState.CANCELLING
             ensure_workload_transition(workload.state, target)
             now = utcnow()
+            default_grace = int(getattr(self, "default_reclaim_grace_s", 600))
+            if grace_seconds is not None:
+                effective_grace_s = grace_seconds
+            elif spec.checkpoint_grace_seconds > 0:
+                effective_grace_s = spec.checkpoint_grace_seconds
+            else:
+                effective_grace_s = default_grace if default_grace > 0 else 600
+            deadline_at = now + timedelta(seconds=effective_grace_s)
+            requester = (
+                requested_by.strip()
+                if isinstance(requested_by, str) and requested_by.strip()
+                else (
+                    principal.subject.removeprefix("reclaim:")
+                    if principal.subject.startswith("reclaim:")
+                    else principal.subject
+                )
+            )
             updated = workload.model_copy(
                 update={
                     "state": target,
                     "scheduling_reason": f"reclaim requested by {principal.subject}: {reason}",
+                    "reclaim_deadline_at": deadline_at,
+                    "reclaim_requested_by": requester,
                     "updated_at": now,
                 }
             )
@@ -289,6 +321,11 @@ class WorkloadLifecycleMixin:
                     "hook": spec.checkpoint_hook if checkpoint else None,
                     "output_uri": spec.checkpoint_output_uri if checkpoint else None,
                     "grace_period_seconds": spec.checkpoint_grace_seconds,
+                    "reclaim_grace_seconds": effective_grace_s,
+                    "reclaim_deadline_at": deadline_at.isoformat(),
+                    "reclaim_deadline_epoch_s": deadline_at.timestamp(),
+                    "reclaim_policy": spec.reclaim_policy,
+                    "requested_by": requester,
                     "reason": reason,
                     "actor": principal.subject,
                 },
@@ -300,7 +337,16 @@ class WorkloadLifecycleMixin:
                 "workload.reclaim_requested",
                 previous_state=workload.state.value,
                 new_state=updated.state.value,
-                payload={"reason": reason, "checkpoint": checkpoint, "lease_ids": lease_ids, "command_id": command.id},
+                payload={
+                    "reason": reason,
+                    "checkpoint": checkpoint,
+                    "lease_ids": lease_ids,
+                    "command_id": command.id,
+                    "grace_seconds": effective_grace_s,
+                    "deadline_at": deadline_at.isoformat(),
+                    "policy": spec.reclaim_policy,
+                    "requested_by": requester,
+                },
             )
             await self._bind_idempotency(tx, scope, "workload.reclaim", key, fingerprint, updated)
             return updated, False
@@ -378,6 +424,8 @@ class WorkloadLifecycleMixin:
                     "autoscale_block_reason": None,
                     "queue_admission_denial": None,
                     "scheduling_reason": None,
+                    "reclaim_deadline_at": None,
+                    "reclaim_requested_by": None,
                     "updated_at": now,
                 }
             )

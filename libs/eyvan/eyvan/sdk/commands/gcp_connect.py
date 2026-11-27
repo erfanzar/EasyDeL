@@ -88,7 +88,7 @@ from eyvan.worker.runtime.native_bootstrap import (
 _WHEEL = "<local-worker-wheel>"
 _REMOTE_WHEEL = "<remote-worker-wheel>"
 _PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
-_ZONE = re.compile(r"^[a-z]+[0-9]?-[a-z]+[0-9]+-[a-z]$")
+_ZONE = re.compile(r"^[a-z]+[0-9]?-[a-z]+[0-9]+-[a-z][a-z0-9]*$")
 #: Diagnostic lines ssh/scp/gcloud print about themselves; anything else a remote
 #: command printed is withheld, since a remote side may echo what it received.
 _TOOL_DIAGNOSTIC = re.compile(r"^(ERROR:|ssh:|scp:|kex_exchange|Connection |.*Permission denied|.*Host key)")
@@ -131,7 +131,54 @@ def _quiet_progress(label: str) -> tp.ContextManager[tp.Any]:
     return _QuietPhase()
 
 
-def _runtime_needs_deploy(endpoint: ControlPlaneEndpoint, *, require_current: bool = False) -> str | None:
+def _resolved_local_agent_endpoint(profile_path: Path) -> ControlPlaneEndpoint:
+    """Resolve the local loopback cell agent URL for ``profile_path`` (supporting custom-port planes)."""
+
+    from eyvan._internal.platform import load_platform_config
+    from eyvan.server.local.daemon import (
+        DEFAULT_LOCAL_CELL_AGENT_URL,
+        LocalDaemonError,
+        LocalDaemonPaths,
+        LocalDaemonTarget,
+        process_is_alive,
+        read_owner_only_record,
+    )
+
+    try:
+        platform = load_platform_config(EyvanSettings.from_env().platform_config_path)
+    except ValueError:
+        platform = None
+    if platform is not None and platform.default_agent_endpoint:
+        try:
+            candidate = ControlPlaneEndpoint.parse(platform.default_agent_endpoint)
+        except ValueError:
+            candidate = None
+        if candidate is not None and LocalDaemonTarget.from_endpoint(candidate) is not None:
+            return candidate
+
+    target_profile = str(profile_path.expanduser().resolve())
+    directory = LocalDaemonPaths().resolved_directory
+    for pid_path in sorted(directory.glob("cell-agent-*.pid")):
+        try:
+            record = read_owner_only_record(pid_path)
+        except (LocalDaemonError, OSError):
+            continue
+        if (
+            record is not None
+            and record.runtime_profile_path == target_profile
+            and LocalDaemonTarget.from_endpoint(record.endpoint) is not None
+            and process_is_alive(record.pid)
+        ):
+            return record.endpoint
+    return ControlPlaneEndpoint.parse(DEFAULT_LOCAL_CELL_AGENT_URL)
+
+
+def _runtime_needs_deploy(
+    endpoint: ControlPlaneEndpoint,
+    *,
+    require_current: bool = False,
+    agent_endpoint: ControlPlaneEndpoint | None = None,
+) -> str | None:
     """Return why the local runtime cannot serve attached TPUs, or ``None`` when it can.
 
     The cell agent is kept at the build the local plane was launched from, so an
@@ -142,15 +189,15 @@ def _runtime_needs_deploy(endpoint: ControlPlaneEndpoint, *, require_current: bo
 
     from eyvan._internal.build_identity import build_identity
     from eyvan.capacity.providers.gcp.runtime.supervisor import HttpCellAgentCapabilitiesProbe
-    from eyvan.server.local.daemon import DEFAULT_LOCAL_CELL_AGENT_URL, serving_source_digest
+    from eyvan.server.local.daemon import serving_source_digest
 
+    profile_path = runtime_profile_path_for(endpoint)
     try:
-        profile = GcpNativeRuntimeProfileStore(runtime_profile_path_for(endpoint)).load()
+        profile = GcpNativeRuntimeProfileStore(profile_path).load()
     except FileNotFoundError:
         return None
-    capabilities = HttpCellAgentCapabilitiesProbe(timeout_s=3.0)(
-        ControlPlaneEndpoint.parse(DEFAULT_LOCAL_CELL_AGENT_URL), profile.agent_shared_secret
-    )
+    resolved_agent = agent_endpoint if agent_endpoint is not None else _resolved_local_agent_endpoint(profile_path)
+    capabilities = HttpCellAgentCapabilitiesProbe(timeout_s=3.0)(resolved_agent, profile.agent_shared_secret)
     if capabilities is not None and capabilities.capacity_backends:
         if ATTACH_CAPACITY_BACKEND not in capabilities.capacity_backends:
             return "the local cell agent runs an Eyvan build without attached-TPU support"
@@ -171,10 +218,28 @@ def _deploy_runtime(endpoint: ControlPlaneEndpoint) -> None:
     _deploy_native_runtime(endpoint=endpoint, profile_path=runtime_profile_path_for(endpoint))
 
 
-def _run_gcloud(args: tp.Sequence[str], *, stdin_text: str | None, timeout: float) -> subprocess.CompletedProcess[str]:
+def _run_gcloud(
+    args: tp.Sequence[str],
+    *,
+    stdin_text: str | None,
+    timeout: float,
+    account: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Reuse head's scrubbed runner, resolving it at call time for embedding/tests."""
 
-    return head_commands._run_gcloud(args, stdin_text=stdin_text, timeout=timeout)
+    if account is None:
+        return head_commands._run_gcloud(args, stdin_text=stdin_text, timeout=timeout)
+    from eyvan._internal.subprocess_env import provider_cli_env
+
+    return subprocess.run(
+        ["gcloud", *args],
+        input=stdin_text,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=provider_cli_env(overrides={"CLOUDSDK_CORE_ACCOUNT": account}),
+    )
 
 
 def _public_ingress(profile: GcpNativeRuntimeProfile, runner: HeadCommandRunner) -> GcloudNativeWorkerPublicIngress:
@@ -369,6 +434,18 @@ class GcpConnector:
     #: Host setup for TPU hosts: interpreter, init commands, OCI image. The CLI
     #: fills it from the same defaults profile ``eyvan up`` derives fleets from.
     runtime: NativeRuntimeConfig = field(default_factory=lambda: resolve_attach_runtime(defaults=None))
+    #: Optional gcloud account used for REST and gcloud calls without changing gcloud config.
+    account: str | None = None
+
+    def _gcloud_runner(self) -> HeadCommandRunner:
+        if self.runner is not None:
+            return self.runner
+        if self.account is None:
+            return _run_gcloud
+        account = self.account
+        return lambda args, *, stdin_text, timeout: _run_gcloud(
+            args, stdin_text=stdin_text, timeout=timeout, account=account
+        )
 
     def resolve(self, *, project: str, name: str, zone: str | None) -> TpuNode:
         """Resolve an exact incarnation, refusing ambiguous names and unknown zones."""
@@ -416,8 +493,7 @@ class GcpConnector:
         """
 
         if ssh_entry is None:
-            runner = self.runner if self.runner is not None else _run_gcloud
-            return GcloudHostAccess(node, internal=endpoint_mode != "public", runner=runner)
+            return GcloudHostAccess(node, internal=endpoint_mode != "public", runner=self._gcloud_runner())
         internal = node.endpoint_ips("internal")
         if internal is None:
             raise AttachError("resolve", f"TPU {node.name!r} does not report an internal address for every host")
@@ -889,7 +965,7 @@ class GcpConnector:
         node = plan.node
         assert node is not None and plan.access is not None
         access: HostAccess = plan.access
-        runner = self.runner if self.runner is not None else _run_gcloud
+        runner = self._gcloud_runner()
         # Prove every host accepts this machine's SSH login before anything is
         # changed, so a refused key cannot leave firewall or TPU tag changes
         # behind before worker installation begins.
@@ -1033,8 +1109,7 @@ class GcpConnector:
             if access is not None:
                 result = access.run(argv, stdin_text=stdin_text, timeout=timeout)
             else:
-                runner = self.runner if self.runner is not None else _run_gcloud
-                result = runner(argv, stdin_text=stdin_text, timeout=timeout)
+                result = self._gcloud_runner()(argv, stdin_text=stdin_text, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as exc:
             raise AttachError(
                 step, f"command could not complete ({type(exc).__name__}); inspect the host without sharing credentials"

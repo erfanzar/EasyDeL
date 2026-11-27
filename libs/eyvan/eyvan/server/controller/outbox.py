@@ -621,7 +621,10 @@ class _ControllerOutbox:
                         "updated_at": now,
                     }
                 )
-            elif terminal or failure_code is CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED:
+            elif terminal or failure_code in {
+                CapacityProviderFailureCode.QUEUE_ADMISSION_DENIED,
+                CapacityProviderFailureCode.CONFIGURATION,
+            }:
                 logger.warning(
                     "outbox %s (%s for %s %s) will not be retried: %s",
                     current.id,

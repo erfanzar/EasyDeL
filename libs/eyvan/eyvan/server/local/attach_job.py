@@ -64,7 +64,7 @@ class AttachmentRequest(BaseModel):
             validate_fleet_name(self.fleet)
         if self.project is not None and not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", self.project):
             raise ValueError("invalid GCP project ID")
-        if self.zone is not None and not re.fullmatch(r"[a-z]+[0-9]?-[a-z]+[0-9]+-[a-z]", self.zone):
+        if self.zone is not None and not re.fullmatch(r"[a-z]+[0-9]?-[a-z]+[0-9]+-[a-z][a-z0-9]*", self.zone):
             raise ValueError("invalid GCP zone")
         return self
 

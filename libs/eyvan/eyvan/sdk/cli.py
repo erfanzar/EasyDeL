@@ -48,6 +48,7 @@ from eyvan.sdk.commands.soak import register_soak_commands
 from eyvan.sdk.commands.soak_monitor import register_soak_monitor_commands
 from eyvan.sdk.commands.start import register_start_commands
 from eyvan.sdk.commands.state import CliSession, ContextOverrides
+from eyvan.sdk.commands.storage import register_storage_commands
 from eyvan.sdk.commands.team import register_team_commands
 from eyvan.sdk.commands.team_up import register_team_up_commands
 from eyvan.sdk.commands.tenancy import register_tenancy_commands
@@ -57,11 +58,28 @@ from eyvan.sdk.contexts import DEFAULT_BASE_URL, ContextConfigError, FileContext
 from eyvan.sdk.node import discover_node_context, discover_node_token_or_warn
 from eyvan.sdk.team_credentials import team_token_or_warn
 from eyvan.sdk.terminal import stream_is_terminal, terminal_console
+from eyvan.server.local.auth import LocalDevelopmentCredentialError
 
 __all__ = ("EyvanApiError", "EyvanClient", "main")
 
 
-@click.group()
+class _EyvanGroup(click.Group):
+    """Root CLI group that detects subcommand ``--help`` before loading session state."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        help_names = set(ctx.help_option_names)
+        asking_help = False
+        for token in args:
+            if token == "--":
+                break
+            if token in help_names:
+                asking_help = True
+                break
+        ctx.meta["eyvan_help_requested"] = asking_help
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=_EyvanGroup)
 @click.option("--url", envvar="EYVAN_URL", show_default=DEFAULT_BASE_URL)
 @click.option("--token", envvar="EYVAN_TOKEN")
 @click.option("--user", envvar="EYVAN_DEV_USER")
@@ -80,9 +98,14 @@ def main(
 ) -> None:
     """Operate workloads and fleet governance through Eyvan."""
 
-    if ctx.invoked_subcommand == "demo":
-        # The demo owns a private disposable runtime. A saved context, remote
-        # URL or node credential must never redirect it to an existing fleet.
+    if (
+        ctx.resilient_parsing
+        or ctx.meta.get("eyvan_help_requested")
+        or ctx.invoked_subcommand in {"demo", "race", "storage"}
+    ):
+        # Help rendering, shell completion, the disposable demo, and plane-free
+        # GCP races never contact the control plane, so they must neither load
+        # ~/.config/eyvan/config.json nor print the development-plane banner.
         return
     context_store = FileContextStore()
     try:
@@ -99,14 +122,27 @@ def main(
     org_id = org or (active_context.org_id if active_context else None)
     project_id = project or (active_context.project_id if active_context else None)
 
+    # Resolve any stored team or node bearer token before deciding whether this
+    # invocation falls back to loopback development authentication, so a signed-in
+    # non-admin team user on localhost is never told they are acting as fleet_admin.
+    resolved_token = (
+        token
+        # A personal token from `eyvan login` for exactly this plane, if any.
+        or team_token_or_warn(endpoint.url, warn=lambda message: click.echo(message, err=True))
+        or discover_node_token_or_warn(
+            endpoint,
+            warn=lambda message: click.echo(message, err=True),
+        )
+    )
     if (
         token is None
+        and resolved_token is None
         and user is None
         and endpoint.is_loopback
         and ctx.get_parameter_source("role") is ParameterSource.DEFAULT
     ):
         role = "fleet_admin"
-        if stream_is_terminal(sys.stderr):
+        if stream_is_terminal(sys.stderr) and ctx.invoked_subcommand not in {"login", "logout"}:
             # This prints above *every* command run against a local plane, so it
             # is built to recede: one dim line, phrased as where you are rather
             # than as a warning about what was done to you. Only the role is
@@ -119,20 +155,17 @@ def main(
                 f"[dim]development plane[/dim] {endpoint.url} "
                 f"[dim]· acting as[/dim] fleet_admin [dim](--role to change)[/dim]"
             )
-    identity = resolve_control_plane_identity(
-        endpoint,
-        token=token
-        # A personal token from `eyvan login` for exactly this plane, if any.
-        or team_token_or_warn(endpoint.url, warn=lambda message: click.echo(message, err=True))
-        or discover_node_token_or_warn(
+    try:
+        identity = resolve_control_plane_identity(
             endpoint,
-            warn=lambda message: click.echo(message, err=True),
-        ),
-        dev_user=user,
-        dev_org=org_id,
-        dev_project=project_id,
-        dev_roles=role,
-    )
+            token=resolved_token,
+            dev_user=user,
+            dev_org=org_id,
+            dev_project=project_id,
+            dev_roles=role,
+        )
+    except LocalDevelopmentCredentialError as exc:
+        raise click.ClickException(str(exc)) from exc
     ctx.obj = CliSession(
         client=EyvanClient(endpoint.url, headers=identity.headers()),
         identity=identity,
@@ -182,6 +215,7 @@ for register_commands in (
     register_service_commands,
     register_soak_commands,
     register_soak_monitor_commands,
+    register_storage_commands,
     register_dashboard_commands,
     register_track_commands,
 ):

@@ -164,7 +164,7 @@ _NODE_CONTEXT_SNIPPET = (
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 _RESOURCE_NAME_PATTERN = re.compile(r"^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 _REGION_PATTERN = re.compile(r"^[a-z]+[0-9]?-[a-z]+[0-9]+$")
-_ZONE_PATTERN = re.compile(r"^[a-z]+[0-9]?-[a-z]+[0-9]+-[a-z]$")
+_ZONE_PATTERN = re.compile(r"^[a-z]+[0-9]?-[a-z]+[0-9]+-[a-z][a-z0-9]*$")
 _SAFE_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9_-]{24,}$")
 _UNSAFE_VALUE_PATTERN = re.compile(r"[\s'\"`$\\]")
 

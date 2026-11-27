@@ -64,11 +64,23 @@ def test_valid_opaque_pool_survives_fleet_plan_and_teardown_rendering(shape: str
 @pytest.mark.parametrize("shape", ["custom-²", "custom-①"])
 def test_capacity_fleets_human_output_preserves_valid_opaque_pool(shape: str) -> None:
     pool = _pool_payload(shape)
+    capacity_pool = {
+        "fleet": pool["fleet_name"],
+        "pool": pool["id"],
+        "accelerator_type": pool["accelerator_type"],
+        "capacity_class": pool["capacity_class"],
+        "region": pool["region"],
+        "zone": pool["zone"],
+        "min_cells": pool["min_cells"],
+        "max_cells": pool["max_cells"],
+        "enabled": pool["enabled"],
+    }
 
     class InventoryClient:
-        def request(self, method: str, path: str, *, params: object) -> list[JsonObject]:
-            assert (method, path) == ("GET", "/api/v1/capacity-pools")
-            return [pool]
+        def request(self, method: str, path: str, *, params: object = None) -> dict[str, object]:
+            assert (method, path) == ("GET", "/api/v1/capacity")
+            assert params == {"org_id": "research", "project_id": "training"}
+            return {"pools": [capacity_pool]}
 
     session = SimpleNamespace(client=InventoryClient(), org_id="research", project_id="training")
     result = CliRunner().invoke(capacity, ["fleets"], obj=session)

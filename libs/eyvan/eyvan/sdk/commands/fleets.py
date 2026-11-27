@@ -405,20 +405,39 @@ class FleetCommandService:
         else:
             self.renderer.emit({"apply": applied, "autoscale": generated_payload})
 
+    def _resolve_fleet_name(self, fleet_or_config: Path | str) -> str:
+        """Resolve a fleet name from either a YAML config path or a plain fleet name."""
+
+        if isinstance(fleet_or_config, Path):
+            return self.loader.load(fleet_or_config).name
+        candidate = Path(fleet_or_config).expanduser()
+        looks_like_path = (
+            candidate.exists()
+            or "/" in fleet_or_config
+            or "\\" in fleet_or_config
+            or fleet_or_config.endswith((".yaml", ".yml"))
+        )
+        if looks_like_path:
+            return self.loader.load(candidate).name
+        try:
+            return validate_fleet_name(fleet_or_config)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     def down(
         self,
-        config_path: Path,
+        config_path: Path | str,
         *,
         yes: bool,
         dry_run: bool,
         as_json: bool,
         idempotency_key: str | None,
     ) -> None:
-        """Disable and release one declared fleet."""
+        """Disable and release one declared, generated, or attached fleet."""
 
-        config = self.loader.load(config_path)
+        fleet_name = self._resolve_fleet_name(config_path)
         if dry_run:
-            planned = self.session.client.request("GET", f"/api/v1/fleets/{config.name}")
+            planned = self.session.client.request("GET", f"/api/v1/fleets/{fleet_name}")
             if as_json:
                 self.renderer.emit(planned)
             elif is_json_object(planned):
@@ -428,13 +447,13 @@ class FleetCommandService:
                 self.renderer.emit(planned)
             return
         if not yes:
-            click.confirm(f"Disable, drain, and release fleet {config.name!r}?", abort=True)
+            click.confirm(f"Disable, drain, and release fleet {fleet_name!r}?", abort=True)
         response = self.session.client.request(
             "DELETE",
-            f"/api/v1/fleets/{config.name}",
+            f"/api/v1/fleets/{fleet_name}",
             headers={"Idempotency-Key": self.keys.create("down", idempotency_key)},
         )
-        emit_result(self.renderer, response, f"Released fleet {config.name}", as_json=as_json)
+        emit_result(self.renderer, response, f"Released fleet {fleet_name}", as_json=as_json)
 
 
 @click.command("up")
@@ -616,7 +635,7 @@ def up_fleet(
 
 
 @click.command("down")
-@click.argument("config_path", type=click.Path(path_type=Path, dir_okay=False))
+@click.argument("fleet_or_config", metavar="FLEET_OR_CONFIG")
 @click.option("-y", "--yes", is_flag=True, help="Do not ask for confirmation.")
 @click.option("--dry-run", is_flag=True, help="Print managed cells without draining or deleting them.")
 @click.option("--idempotency-key", help="Reuse one key only when retrying the same disable operation.")
@@ -624,16 +643,16 @@ def up_fleet(
 @click.pass_obj
 def down_fleet(
     session: CliSession,
-    config_path: Path,
+    fleet_or_config: str,
     yes: bool,
     dry_run: bool,
     idempotency_key: str | None,
     as_json: bool,
 ) -> None:
-    """Drain and release every cell managed by CONFIG_PATH."""
+    """Drain and release every cell managed by FLEET_OR_CONFIG (fleet name or config YAML)."""
 
     FleetCommandService(session).down(
-        config_path,
+        fleet_or_config,
         yes=yes,
         dry_run=dry_run,
         as_json=as_json,

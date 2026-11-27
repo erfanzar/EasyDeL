@@ -60,10 +60,12 @@ from eyvan.worker.agent.models import (
     CellStageActionResult,
     CellStageVerdict,
     CheckpointRequest,
+    GangReclaimNoticeRequest,
     GangWorkloadMember,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
     MutationModel,
+    ReclaimNoticeRequest,
     WorkloadMutationRequest,
     WorkloadObservation,
     WorkloadRequest,
@@ -721,6 +723,7 @@ class CellAgentService:
         member_payload = self._gang_member_payload(members)
         submitted_executor = None
         launched_remote_id: str | None = None
+        launch_cells: tuple[tp.Any, ...] = ()
         try:
             with self.state.gang_workload_submission(
                 workload_id,
@@ -794,7 +797,21 @@ class CellAgentService:
         members = self._stored_gang_members(coordinator_cell_id, workload_id, remote_id)
         executor = self._gang_executor(members)
         try:
-            return _workload_observation(executor.status(remote_id))
+            observation = _workload_observation(executor.status(remote_id))
+            if observation.checkpoint_uri is None:
+                reader = getattr(executor, "read_checkpoint_uri", None)
+                uri = reader(remote_id) if callable(reader) else None
+                if (not isinstance(uri, str) or not uri.strip()) and callable(getattr(self.executors, "resolve", None)):
+                    for member in members:
+                        cell_exec = self._executor(member.cell_id)
+                        cell_reader = getattr(cell_exec, "read_checkpoint_uri", None)
+                        candidate = cell_reader(remote_id) if callable(cell_reader) else None
+                        if isinstance(candidate, str) and candidate.strip():
+                            uri = candidate.strip()
+                            break
+                if isinstance(uri, str) and uri.strip():
+                    observation = observation.model_copy(update={"checkpoint_uri": uri.strip()})
+            return observation
         finally:
             self._close_gang_executor(executor)
 
@@ -872,6 +889,59 @@ class CellAgentService:
             remote_id=checkpoint_id,
             status=ExecutionWorkloadStatus.CHECKPOINTING,
             checkpoint_uri=output_uri,
+        )
+
+    def reclaim_notice_gang(
+        self,
+        coordinator_cell_id: str,
+        workload_id: str,
+        remote_id: str,
+        request: GangReclaimNoticeRequest,
+    ) -> WorkloadObservation:
+        """Deliver a graceful reclaim notice across every member of a workload gang."""
+
+        stored = self._stored_gang_members(coordinator_cell_id, workload_id, remote_id)
+        members = self._validate_gang_mutation_members(stored, request.members)
+        notice_payload: JsonObject = {
+            "reason": request.reason,
+            "requested_by": request.requested_by,
+            "deadline_at": request.deadline_at,
+            "deadline_epoch_s": request.deadline_epoch_s,
+            "grace_seconds": request.grace_seconds,
+            "policy": request.policy,
+            "checkpoint_uri": request.checkpoint_uri,
+            "workload_id": request.workload_id or workload_id,
+        }
+        executor = self._gang_executor(members)
+        try:
+            notifier = getattr(executor, "notify_reclaim", None)
+            if callable(notifier):
+                notifier(remote_id, notice=notice_payload, grace_s=request.grace_seconds)
+            else:
+                delivered = False
+                if callable(getattr(self.executors, "resolve", None)):
+                    for member in members:
+                        cell_executor = self._executor(member.cell_id)
+                        cell_notifier = getattr(cell_executor, "notify_reclaim", None)
+                        if callable(cell_notifier):
+                            cell_notifier(
+                                remote_id,
+                                notice=notice_payload,
+                                grace_s=request.grace_seconds,
+                                context=_context(WorkloadMutationRequest(mutation=member.mutation)),
+                            )
+                            delivered = True
+                if not delivered:
+                    raise UnsupportedCapabilityError(
+                        f"execution backend {self.execution_backend!r} does not support graceful gang reclaim notices"
+                    )
+        finally:
+            self._close_gang_executor(executor)
+        return WorkloadObservation(
+            remote_id=remote_id,
+            status=ExecutionWorkloadStatus.CHECKPOINTING,
+            message="graceful gang reclaim notice delivered",
+            checkpoint_uri=request.checkpoint_uri,
         )
 
     def gang_logs(self, coordinator_cell_id: str, workload_id: str, remote_id: str) -> str:
@@ -1111,7 +1181,46 @@ class CellAgentService:
         return _retire_observation(executor.status(remote_id))
 
     def workload(self, cell_id: str, remote_id: str) -> WorkloadObservation:
-        return _workload_observation(self._executor(cell_id).status(remote_id))
+        executor = self._executor(cell_id)
+        observation = _workload_observation(executor.status(remote_id))
+        if observation.checkpoint_uri is None:
+            reader = getattr(executor, "read_checkpoint_uri", None)
+            uri = reader(remote_id) if callable(reader) else None
+            if isinstance(uri, str) and uri.strip():
+                observation = observation.model_copy(update={"checkpoint_uri": uri.strip()})
+        return observation
+
+    def reclaim_notice(self, cell_id: str, remote_id: str, request: ReclaimNoticeRequest) -> WorkloadObservation:
+        """Deliver a graceful reclaim notice file and signal to one live workload."""
+
+        executor = self._executor(cell_id)
+        notifier = getattr(executor, "notify_reclaim", None)
+        if not callable(notifier):
+            raise UnsupportedCapabilityError(
+                f"execution backend {self.execution_backend!r} does not support graceful reclaim notices"
+            )
+        notice_payload: JsonObject = {
+            "reason": request.reason,
+            "requested_by": request.requested_by,
+            "deadline_at": request.deadline_at,
+            "deadline_epoch_s": request.deadline_epoch_s,
+            "grace_seconds": request.grace_seconds,
+            "policy": request.policy,
+            "checkpoint_uri": request.checkpoint_uri,
+            "workload_id": request.workload_id,
+        }
+        notifier(
+            remote_id,
+            notice=notice_payload,
+            grace_s=request.grace_seconds,
+            context=_context(request),
+        )
+        return WorkloadObservation(
+            remote_id=remote_id,
+            status=ExecutionWorkloadStatus.CHECKPOINTING,
+            message="graceful reclaim notice delivered",
+            checkpoint_uri=request.checkpoint_uri,
+        )
 
     def stop(self, cell_id: str, remote_id: str, request: WorkloadMutationRequest) -> WorkloadObservation:
         executor = self._executor(cell_id)
@@ -1155,7 +1264,7 @@ class CellAgentService:
 
         if not self.capacity.capabilities().supports_exec:
             raise UnsupportedCapabilityError(
-                "this fleet does not permit exec; set supports_exec on the capacity backend to allow it"
+                "this fleet does not permit exec; set EYVAN_CAPACITY_SUPPORTS_EXEC=1 on the cell agent to allow it"
             )
         executor = self._executor(cell_id)
         if not isinstance(executor, ExecCapableExecutionDriver):

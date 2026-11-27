@@ -105,3 +105,29 @@ def test_per_rank_suppressed_exec_remains_success(monkeypatch) -> None:
 def test_an_unexpected_document_is_not_called_a_failure() -> None:
     assert _failed_exec_ranks({"workload_id": WORKLOAD_ID}) == []
     assert _failed_exec_ranks([]) == []
+
+
+def test_human_exec_renders_stdout_stderr_exit_codes_and_errors(monkeypatch) -> None:
+    document = _document(
+        {"rank": 0, "exit_code": 0, "stdout": "host-0\n", "stderr": "warn-0\n"},
+        {
+            "rank": 1,
+            "ranks": [
+                {"rank": 0, "result": {"exit_code": 0, "stdout": "slice-host-0\n"}},
+                {"rank": 1, "result": {"observed": False, "detail": "worker unreachable"}},
+            ],
+        },
+        {"rank": 2, "error": "exec refused"},
+    )
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_a, **_k: _Plane(document))
+    result = CliRunner().invoke(cli.main, ["workload", "exec", WORKLOAD_ID, "--", "hostname"])
+
+    assert result.exit_code == 1
+    assert "[rank 0] exit=0" in result.output
+    assert "host-0" in result.output
+    assert "warn-0" in result.output
+    assert "[rank 1.0] exit=0" in result.output
+    assert "slice-host-0" in result.output
+    assert "[rank 1.1] unobserved: worker unreachable" in result.output
+    assert "[rank 2] error: exec refused" in result.output
+    assert "exec failed on rank(s) 1, 2" in result.output

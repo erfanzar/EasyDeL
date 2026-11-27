@@ -37,8 +37,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
 from eyvan.sdk.commands.head import HeadCommandError, HeadCommandRunner
 from eyvan.sdk.commands.head_discovery import DiscoveredHead, configured_project, discover_heads
+from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.terminal import print_block
 
 #: What a local development plane answers on when nobody has said otherwise.
@@ -83,6 +85,7 @@ class StartOutcome:
     project: str | None = None
     heads: list[DiscoveredHead] = field(default_factory=list)
     local_reachable: bool = False
+    local_url: str = LOCAL_URL
     discovery_error: str | None = None
     targets: list[PlaneTarget] = field(default_factory=list)
 
@@ -224,7 +227,7 @@ def discover(
     project: str | None,
     *,
     runner: HeadCommandRunner | None = None,
-    probe: tp.Callable[[str], bool] = _probe,
+    probe: tp.Callable[[str], bool] | None = None,
     local_url: str = LOCAL_URL,
 ) -> StartOutcome:
     """Look for control planes, without changing anything.
@@ -236,8 +239,9 @@ def discover(
     ends with a duplicate head.
     """
 
-    outcome = StartOutcome(project=project or configured_project(runner))
-    outcome.local_reachable = probe(local_url)
+    probe_fn = _probe if probe is None else probe
+    outcome = StartOutcome(project=project or configured_project(runner), local_url=local_url)
+    outcome.local_reachable = probe_fn(local_url)
     if outcome.project:
         try:
             outcome.heads = discover_heads(outcome.project, runner=runner)
@@ -316,13 +320,29 @@ def render_outcome(console: Console, outcome: StartOutcome) -> None:
     render_targets(console, outcome.targets)
 
 
+def _local_url_from_context(context: click.Context) -> str:
+    """Return the CLI session's URL when it names a loopback plane, else ``LOCAL_URL``."""
+
+    root = context.find_root()
+    session = root.obj
+    if isinstance(session, CliSession) and session.base_url:
+        try:
+            endpoint = ControlPlaneEndpoint.parse(session.base_url)
+        except ValueError:
+            return LOCAL_URL
+        if endpoint.is_loopback:
+            return endpoint.url
+    return LOCAL_URL
+
+
 def start_flow(
     console: Console,
     *,
     project: str | None,
     runner: HeadCommandRunner | None = None,
-    probe: tp.Callable[[str], bool] = _probe,
+    probe: tp.Callable[[str], bool] | None = None,
     choose: tp.Callable[[int], int] | None = None,
+    local_url: str = LOCAL_URL,
 ) -> StartOutcome:
     """Run the guided first screen and print what to do next.
 
@@ -333,12 +353,13 @@ def start_flow(
         probe: Injected health check.
         choose: Injected selection, so the flow is testable without a terminal.
             ``None`` prompts.
+        local_url: Loopback plane address to probe when looking for a local plane.
 
     Returns:
         What was discovered, so a caller can render it another way.
     """
 
-    outcome = discover(project, runner=runner, probe=probe)
+    outcome = discover(project, runner=runner, probe=probe, local_url=local_url)
     render_outcome(console, outcome)
     if not outcome.targets:
         return outcome
@@ -369,7 +390,8 @@ def start_flow(
 @click.command("start")
 @click.option("--project", help="GCP project to search for heads; defaults to gcloud's configured project.")
 @click.option("--json", "as_json", is_flag=True, help="Emit what was discovered and exit without prompting.")
-def start(project: str | None, as_json: bool) -> None:
+@click.pass_context
+def start(context: click.Context, project: str | None, as_json: bool) -> None:
     """Find the control planes that already exist, and connect to one.
 
     The first screen: what is running in this project, what is running on this
@@ -383,12 +405,14 @@ def start(project: str | None, as_json: bool) -> None:
     from eyvan.sdk.commands.common import JsonRenderer
     from eyvan.sdk.terminal import terminal_console
 
+    local_url = _local_url_from_context(context)
     if as_json:
-        outcome = discover(project)
+        outcome = discover(project) if local_url == LOCAL_URL else discover(project, local_url=local_url)
         JsonRenderer().emit(
             {
                 "project": outcome.project,
                 "local_reachable": outcome.local_reachable,
+                "local_url": outcome.local_url,
                 "discovery_error": outcome.discovery_error,
                 "heads": [
                     {
@@ -403,7 +427,10 @@ def start(project: str | None, as_json: bool) -> None:
             }
         )
         return
-    start_flow(terminal_console(sys.stdout), project=project)
+    if local_url == LOCAL_URL:
+        start_flow(terminal_console(sys.stdout), project=project)
+    else:
+        start_flow(terminal_console(sys.stdout), project=project, local_url=local_url)
 
 
 def register_start_commands(group: click.Group) -> None:

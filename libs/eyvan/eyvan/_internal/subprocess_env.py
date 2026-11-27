@@ -39,14 +39,25 @@ INTERPRETER_STEERING_ENV_NAMES: tuple[str, ...] = (
 )
 
 
-def provider_cli_env(base: tp.Mapping[str, str] | None = None) -> dict[str, str]:
+def provider_cli_env(
+    base: tp.Mapping[str, str] | None = None,
+    *,
+    overrides: tp.Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Return ``base`` (default ``os.environ``) minus interpreter-steering variables.
+
+    Optional ``overrides`` are merged before stripping interpreter-steering
+    variables so callers can forward CLI-scoped variables (such as
+    ``CLOUDSDK_CORE_ACCOUNT``) in one call without re-introducing interpreter
+    steering.
 
     The result is a fresh dict every call, so a caller may further adjust it
     without mutating the process environment.
     """
 
     environment = dict(os.environ if base is None else base)
+    if overrides:
+        environment.update(overrides)
     for name in INTERPRETER_STEERING_ENV_NAMES:
         environment.pop(name, None)
     return environment

@@ -43,7 +43,7 @@ from eyvan.sdk.client.requests import (
 from eyvan.sdk.client.sync import UNREACHABLE_GRACE_S
 from eyvan.sdk.client.transport import AsyncApiTransport, EyvanUnavailableError, read_deadline
 from eyvan.sdk.client.types import HeaderMap, QueryParams
-from eyvan.server.api.schemas import WorkloadEstimateRequest, WorkloadSubmitRequest
+from eyvan.server.api.schemas import CapacityPoolResponse, WorkloadEstimateRequest, WorkloadSubmitRequest
 from eyvan.server.service.state import TERMINAL_WORKLOAD_STATES
 from eyvan.worker.runtime.callables import CallableArtifact
 
@@ -322,6 +322,24 @@ class AsyncEyvanClient:
         )
         return [WorkloadRecord.model_validate(item) for item in response.json()]
 
+    async def list_capacity(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        accelerator_type: str | None = None,
+        capacity_class: CapacityClass | None = None,
+    ) -> list[CapacityPoolResponse]:
+        """List enabled pools available to a workload scope, optionally filtered by accelerator shape."""
+
+        params: QueryParams = {"org_id": org_id, "project_id": project_id}
+        if accelerator_type is not None:
+            params["accelerator_type"] = accelerator_type
+        if capacity_class is not None:
+            params["capacity_class"] = capacity_class.value
+        response = await self._transport.request_checked("GET", "/api/v1/capacity", params=params)
+        return [CapacityPoolResponse.model_validate(item) for item in response.json()["pools"]]
+
     async def get_workload(self, workload_id: str) -> WorkloadRecord:
         """Return one typed workload record."""
 
@@ -429,6 +447,16 @@ class AsyncEyvanClient:
             idempotency_key=idempotency_key,
         )
         return WorkloadRecord.model_validate(response.json())
+
+    async def workload_log_page(self, workload_id: str, *, after: str, limit: int) -> dict[str, tp.Any]:
+        """Read one page of a workload's archived output."""
+
+        response = await self._transport.request_checked(
+            "GET",
+            f"/api/v1/workloads/{workload_id}/log-page",
+            params={"after": after, "limit": limit},
+        )
+        return response.json()
 
     async def workload_logs(self, workload_id: str) -> str:
         """Return currently available workload logs."""

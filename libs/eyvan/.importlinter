@@ -57,10 +57,14 @@ forbidden_modules =
     eyvan.server.controller
 
 [importlinter:contract:domain-boundary]
-name = Domain decisions cannot depend on server or SDK layers
+name = Domain decisions cannot depend on server, capacity, or SDK layers
 type = forbidden
 source_modules =
     eyvan.domain
 forbidden_modules =
     eyvan.server
+    eyvan.capacity
     eyvan.sdk
+ignore_imports =
+    eyvan.records -> eyvan.capacity
+    eyvan.records -> eyvan.capacity.drivers.base

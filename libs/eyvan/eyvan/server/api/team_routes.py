@@ -102,6 +102,7 @@ class RulesBody(_Body):
     max_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
     max_cpu_units: float | None = Field(default=None, ge=0, le=1_000_000, strict=True)
     max_gpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
+    can_borrow: bool | None = Field(default=None, strict=True)
 
 
 class ReclaimBody(_Body):
@@ -121,7 +122,17 @@ def user_document(user: UserRecord, tier: TeamTier | None = None) -> dict[str, t
     """
 
     derived = tier if tier is not None else (TeamTier.TRUSTED if user.trusted else TeamTier.USER)
-    return {
+    rules_doc: dict[str, tp.Any] = {
+        "allowed_fleets": None if user.allowed_fleets is None else list(user.allowed_fleets),
+        "approval_tpu_threshold": user.approval_tpu_threshold,
+        "guaranteed_tpu_units": user.guaranteed_tpu_units,
+        "max_tpu_units": user.max_tpu_units,
+        "max_cpu_units": user.max_cpu_units,
+        "max_gpu_units": user.max_gpu_units,
+    }
+    if user.can_borrow is not None:
+        rules_doc["can_borrow"] = user.can_borrow
+    doc: dict[str, tp.Any] = {
         "subject": user.subject,
         "email": user.email,
         "display_name": user.display_name,
@@ -130,15 +141,11 @@ def user_document(user: UserRecord, tier: TeamTier | None = None) -> dict[str, t
         "created_by": user.created_by,
         "tier": derived.value,
         "trusted": user.trusted,
-        "rules": {
-            "allowed_fleets": None if user.allowed_fleets is None else list(user.allowed_fleets),
-            "approval_tpu_threshold": user.approval_tpu_threshold,
-            "guaranteed_tpu_units": user.guaranteed_tpu_units,
-            "max_tpu_units": user.max_tpu_units,
-            "max_cpu_units": user.max_cpu_units,
-            "max_gpu_units": user.max_gpu_units,
-        },
+        "rules": rules_doc,
     }
+    if user.can_borrow is not None:
+        doc["can_borrow"] = user.can_borrow
+    return doc
 
 
 def token_document(record: ApiTokenRecord) -> dict[str, tp.Any]:

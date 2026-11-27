@@ -127,3 +127,86 @@ def test_a_named_identity_is_never_silently_elevated(monkeypatch) -> None:
     assert role_for(token=None, dev_user="alice", environment={}, url=loopback) == "operator"
     assert role_for(token=None, dev_user=None, environment={"EYVAN_ROLE": "operator"}, url=loopback) == "operator"
     assert role_for(token=None, dev_user=None, environment={}, url="https://plane.example.com") == "operator"
+
+
+def test_ensure_fleet_applied_falls_through_on_404_and_ignores_403(tmp_path) -> None:
+    """A 404 fleet triggers auto-apply from GeneratedAutoscaleCache; 403 is left to submission."""
+
+    import httpx
+
+    from eyvan.capacity.autoscale import DEFAULT_TPU_PROFILES, AutoscaleRequest, generate_autoscale_config
+    from eyvan.capacity.autoscale.cache import GeneratedAutoscaleCache
+    from eyvan.sdk.client.transport import EyvanHTTPError
+    from eyvan.sdk.execution import _ensure_fleet_applied
+
+    generated = generate_autoscale_config(
+        AutoscaleRequest(
+            project="project-a",
+            zone="us-east5-a",
+            profile=DEFAULT_TPU_PROFILES[0],
+            fleet_prefix="research",
+        )
+    )
+    fleet_name = generated.config.name
+    GeneratedAutoscaleCache(tmp_path).store(generated)
+
+    class _StatusTransport:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            self.mutations: list[tuple[str, str]] = []
+
+        def request_checked(self, method: str, path: str, **kwargs):
+            del kwargs
+            req = httpx.Request(method, f"http://127.0.0.1:8080{path}")
+            resp = httpx.Response(self.status_code, json={"detail": "error"}, request=req)
+            raise EyvanHTTPError(resp, "error")
+
+        def mutate(self, method: str, path: str, **kwargs):
+            del kwargs
+            self.mutations.append((method, path))
+
+    class _Client:
+        def __init__(self, transport) -> None:
+            self._transport = transport
+
+    missing = _StatusTransport(404)
+    _ensure_fleet_applied(_Client(missing), fleet_name, tmp_path)
+    assert missing.mutations == [("PUT", f"/api/v1/fleets/{fleet_name}")]
+
+    forbidden = _StatusTransport(403)
+    _ensure_fleet_applied(_Client(forbidden), fleet_name, tmp_path)
+    assert forbidden.mutations == []
+
+
+def test_run_connect_forwards_scope_and_auth_via_env(monkeypatch) -> None:
+    """``_run_connect`` passes org/project/user on argv and bearer token in env only."""
+
+    import subprocess
+
+    from eyvan.sdk.execution import _run_connect
+
+    seen: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append((list(argv), dict(kwargs["env"])))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    rc = _run_connect(
+        "http://plane.example:8080",
+        "gcp-proj",
+        "us-east5-a",
+        "my-tpu",
+        org_id="acme",
+        project_id="research",
+        token="secret-bearer-token",
+        dev_user="alice",
+    )
+    assert rc == 0
+    [(argv, env)] = seen
+    assert "--url" in argv and "http://plane.example:8080" in argv
+    assert "--org" in argv and "acme" in argv
+    assert "--project" in argv and "research" in argv
+    assert "--user" in argv and "alice" in argv
+    assert "secret-bearer-token" not in argv
+    assert env["EYVAN_TOKEN"] == "secret-bearer-token"

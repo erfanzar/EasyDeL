@@ -82,13 +82,15 @@ class _ControllerPreemption:
                     agent = self._agent_factory(cell)
                     if workload.remote_id:
                         source = await asyncio.to_thread(agent.workload, cell.id, workload.remote_id)
+                        if source.checkpoint_uri:
+                            checkpoint_uri = source.checkpoint_uri
                         if source.status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
                             victim_outcomes[lease.id] = self._preemption_outcome(source.status)
                             # A gang's members share one workload id: a sibling
                             # that checkpointed first owns the recorded URI, and
                             # this rank only proves the workload reached a
                             # terminal state on its own cell.
-                            checkpoint_uris.setdefault(workload.id, None)
+                            checkpoint_uris[workload.id] = checkpoint_uri or checkpoint_uris.get(workload.id)
                             continue
                     if victim.checkpoint and victim.hook and workload.remote_id:
                         mutation = MutationModel(

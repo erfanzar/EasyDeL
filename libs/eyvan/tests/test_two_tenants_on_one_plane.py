@@ -189,6 +189,9 @@ EXEMPT_ROUTES: dict[str, str] = {
     "GET /api/v1/session": "authenticated self-introspection; only the caller's resolved grants and scopes",
     "GET /api/v1/health": "liveness; no tenant data",
     "GET /api/v1/tracking/health": "authenticated tracker readiness; store root and segment count, no run data",
+    "GET /api/v1/storage/status": (
+        "authenticated non-secret storage configuration and detected GCP context; no tenant data"
+    ),
     "GET /api/v1/build": "what code this plane runs; authenticated because it fingerprints, but tenant-independent",
     "GET /healthz": "liveness; no tenant data",
     "GET /readyz": "readiness; reports only whether this replica can reach its store",
@@ -282,6 +285,7 @@ FLEET_ONLY_ROUTES.update(
         "PUT /api/v1/team/users/{subject}/rules": "set any account's fleet rules, approval threshold and guarantee",
         "PUT /api/v1/team/users/{subject}/tier": "make any account admin, trusted or user (grants + trusted flag)",
         "POST /api/v1/team/workloads/{workload_id}/reclaim": "checkpoint, stop and requeue any tenant's workload",
+        "GET /api/v1/governance/summary": "plane-wide team quota, borrowing, and active reclaim overview",
         "POST /api/v1/assistant/providers": "add a plane-wide assistant provider",
         "POST /api/v1/assistant/models/discover": "read a provider's model list with a typed or stored key",
         "POST /api/v1/assistant/oauth/openrouter/start": "begin connecting a plane-wide OpenRouter provider",

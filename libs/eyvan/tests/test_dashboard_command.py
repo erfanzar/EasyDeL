@@ -10,13 +10,17 @@ from __future__ import annotations
 import typing as tp
 from urllib.parse import quote
 
+import httpx
 from click.testing import CliRunner
 
 import eyvan.sdk.cli as cli
 import eyvan.sdk.commands.dashboard as dashboard_commands
 from eyvan.sdk.cli import main
-from eyvan.sdk.commands.http import EyvanApiError
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.commands.http import EyvanApiError, EyvanCliUnavailableError
 from eyvan.server.local.auth import LocalDevelopmentCredentialStore
+from eyvan.server.local.daemon import LocalDaemonResult, LocalDaemonState
+from eyvan.server.local.tracker import LocalTrackerError, TrackerRecord
 
 
 def _env(output: str) -> dict[str, str]:
@@ -213,6 +217,17 @@ def test_dashboard_dev_fails_explicitly_without_source_files(monkeypatch) -> Non
     assert "opens the hosted production UI" in result.output
 
 
+def _healthy_tracker_record(tmp_path) -> TrackerRecord:
+    return TrackerRecord(
+        url="http://127.0.0.1:8095",
+        pid=4242,
+        store=str(tmp_path / "tracking"),
+        db=str(tmp_path / "tracker" / "index.sqlite3"),
+        log=str(tmp_path / "tracker" / "tracker.log"),
+        token_path=str(tmp_path / "tracker" / "token"),
+    )
+
+
 def test_a_loopback_plane_is_opened_with_the_credential_the_browser_cannot_read(tmp_path, monkeypatch) -> None:
     """A browser cannot read the 0600 file a loopback plane demands; a terminal can.
 
@@ -226,6 +241,8 @@ def test_a_loopback_plane_is_opened_with_the_credential_the_browser_cannot_read(
     credential = LocalDevelopmentCredentialStore().load_or_create().value
     opened: list[str] = []
     monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: _RaisingClient(200))
+    monkeypatch.setattr(dashboard_commands, "_ensure_local_tracker", lambda: (_healthy_tracker_record(tmp_path), False))
 
     result = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard"])
 
@@ -241,6 +258,8 @@ def test_a_loopback_plane_with_no_credential_yet_gets_a_plain_url(tmp_path, monk
     monkeypatch.setenv("HOME", str(tmp_path))
     opened: list[str] = []
     monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: _RaisingClient(200))
+    monkeypatch.setattr(dashboard_commands, "_ensure_local_tracker", lambda: (_healthy_tracker_record(tmp_path), False))
 
     result = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard"])
 
@@ -262,9 +281,112 @@ def test_the_local_credential_never_leaves_this_machine(tmp_path, monkeypatch) -
     opened: list[str] = []
     monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
 
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("remote dashboard must never auto-start loopback services")
+
+    monkeypatch.setattr(dashboard_commands, "_ensure_loopback_plane", forbidden)
+    monkeypatch.setattr(dashboard_commands, "_ensure_local_tracker", forbidden)
+
     result = CliRunner().invoke(main, ["--url", "https://eyvan.example.com", "dashboard"])
 
     assert result.exit_code == 0, result.output
     assert opened == ["https://eyvan.example.com/"]
     assert "eyvan-local-credential" not in result.output
     assert credential not in result.output
+
+
+def test_dashboard_auto_bootstraps_unreachable_loopback_plane_tracker_and_credential(tmp_path, monkeypatch) -> None:
+    """One-command `eyvan dashboard` boots an unreachable loopback plane, refreshes credential, and starts tracker."""
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("EYVAN_TRACKER_URL", raising=False)
+    opened: list[str] = []
+    plane_starts: list[str] = []
+    tracker_starts: list[bool] = []
+    minted_credential: list[str] = []
+    probe_calls = 0
+
+    class _BootstrappingClient:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def request(self, method: str, path: str, **_kwargs: tp.Any) -> tp.Any:
+            nonlocal probe_calls
+            del method, path
+            probe_calls += 1
+            if probe_calls == 1:
+                raise EyvanCliUnavailableError(ControlPlaneEndpoint.parse("http://127.0.0.1:8099"), "GET")
+            raise EyvanApiError(200, "control plane returned a non-JSON response body: '<html>'")
+
+        def replace_identity_headers(self, headers: tp.Mapping[str, str]) -> None:
+            self.headers = dict(headers)
+
+    def fake_ensure_plane(endpoint: ControlPlaneEndpoint) -> LocalDaemonResult:
+        plane_starts.append(endpoint.url)
+        minted = LocalDevelopmentCredentialStore().load_or_create().value
+        minted_credential.append(minted)
+        return LocalDaemonResult(endpoint=endpoint, state=LocalDaemonState.STARTED, pid=1234, log_path=None)
+
+    def fake_ensure_tracker() -> tuple[TrackerRecord, bool]:
+        tracker_starts.append(True)
+        return _healthy_tracker_record(tmp_path), True
+
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: _BootstrappingClient())
+    monkeypatch.setattr(dashboard_commands, "_ensure_loopback_plane", fake_ensure_plane)
+    monkeypatch.setattr(dashboard_commands, "_ensure_local_tracker", fake_ensure_tracker)
+
+    result = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard"])
+
+    assert result.exit_code == 0, result.output
+    assert plane_starts == ["http://127.0.0.1:8099"]
+    assert tracker_starts == [True]
+    assert "Started local Eyvan control plane at http://127.0.0.1:8099" in result.output
+    assert "Started local Eyvan run tracker at http://127.0.0.1:8095" in result.output
+    expected = f"http://127.0.0.1:8099/#eyvan-local-credential={quote(minted_credential[0])}"
+    assert opened == [expected]
+
+
+def test_dashboard_no_auto_start_and_nonfatal_tracker_warning(tmp_path, monkeypatch) -> None:
+    """`--no-auto-start` skips bootstrap; tracker errors warn without blocking dashboard launch."""
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("EYVAN_TRACKER_URL", raising=False)
+    opened: list[str] = []
+
+    class _ConnectErrorClient:
+        def request(self, method: str, path: str, **_kwargs: tp.Any) -> tp.Any:
+            del method, path
+            raise httpx.ConnectError("connection refused")
+
+        def replace_identity_headers(self, headers: tp.Mapping[str, str]) -> None:
+            del headers
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("must not auto-start when --no-auto-start is passed")
+
+    monkeypatch.setattr(dashboard_commands.click, "launch", opened.append)
+    monkeypatch.setattr(cli, "EyvanClient", lambda *_args, **_kwargs: _ConnectErrorClient())
+    monkeypatch.setattr(dashboard_commands, "_ensure_loopback_plane", forbidden)
+    monkeypatch.setattr(dashboard_commands, "_ensure_local_tracker", forbidden)
+
+    no_auto = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard", "--no-auto-start"])
+    assert no_auto.exit_code == 0, no_auto.output
+    assert opened == ["http://127.0.0.1:8099/"]
+
+    # Now enable auto-start with failing tracker: plane boots, tracker warns, dashboard still opens!
+    opened.clear()
+    monkeypatch.setattr(
+        dashboard_commands,
+        "_ensure_loopback_plane",
+        lambda ep: LocalDaemonResult(endpoint=ep, state=LocalDaemonState.REUSED, pid=1234, log_path=None),
+    )
+
+    def broken_tracker():
+        raise LocalTrackerError("port 8095 in use")
+
+    monkeypatch.setattr(dashboard_commands, "_ensure_local_tracker", broken_tracker)
+    with_warn = CliRunner().invoke(main, ["--url", "http://127.0.0.1:8099", "dashboard"])
+    assert with_warn.exit_code == 0, with_warn.output
+    assert "Warning: could not start local run tracker" in with_warn.output
+    assert opened == ["http://127.0.0.1:8099/"]

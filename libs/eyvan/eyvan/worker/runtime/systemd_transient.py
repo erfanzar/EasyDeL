@@ -19,6 +19,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -41,6 +42,11 @@ from eyvan.capacity.drivers.base import (
 from eyvan.secrets import redact_secret_material
 from eyvan.worker.distributed_environment import without_distributed_topology_overrides
 from eyvan.worker.runtime.log_records import LogPage, parse_journal_json
+from eyvan.worker.runtime.preemption import (
+    CHECKPOINT_RECEIPT_PATH_ENV,
+    RECLAIM_NOTICE_PATH_ENV,
+    read_checkpoint_receipt,
+)
 from eyvan.worker.runtime.secret_materialization import (
     SecretMaterializationError,
     materialize_secrets,
@@ -77,6 +83,36 @@ _UNRECOVERABLE_INDETERMINATE_FIELD = "indeterminate_unrecoverable"
 #: unit reporting one of these is answering the question even if systemd could
 #: not fully load the unit file.
 _DEFINITIVE_ACTIVE_STATES = frozenset({"failed", "inactive"})
+
+#: ExecMainCode values representing a normal process exit (``CLD_EXITED`` is
+#: reported as ``1`` by ``systemctl show`` and ``exited`` by test doubles).
+_EXITED_EXEC_MAIN_CODES = frozenset({"1", "exited"})
+
+
+def _is_definitive_unloadable_unit(properties: tp.Mapping[str, str]) -> bool:
+    """Return whether an unloadable unit still reports a definitive outcome.
+
+    A unit whose ``LoadState`` is ``bad-setting``, ``error``, or ``masked``
+    still reports its live runtime properties. Terminal ``ActiveState`` values
+    (``failed``, ``inactive``) and a cleanly exited ``RemainAfterExit=yes``
+    service (``ActiveState=active``, ``SubState=exited``, ``Result=success``,
+    ``ExecMainCode`` in ``{1, exited}``, ``ExecMainStatus=0``) settle what
+    happened to the main process; ``_status_from_properties`` still checks the
+    cgroup on systemd 249 before declaring ``SUCCEEDED``. A still-running or
+    ambiguous unloadable unit returns ``False`` so it stays unreadable.
+    """
+
+    active = properties.get("ActiveState", "").lower()
+    if active in _DEFINITIVE_ACTIVE_STATES:
+        return True
+    if active != "active" or properties.get("SubState", "").lower() != "exited":
+        return False
+    return (
+        properties.get("Result", "").lower() == "success"
+        and properties.get("ExecMainCode", "").lower() in _EXITED_EXEC_MAIN_CODES
+        and properties.get("ExecMainStatus", "").strip() == "0"
+    )
+
 
 #: Journal lines read when naming why a service died. Enough to hold any Python
 #: traceback plus the systemd noise around it, small enough to keep the status
@@ -375,6 +411,136 @@ def _systemd_environment_value(value: str) -> str:
     # occur, and encoding them explicitly preserves their literal bytes.
     escaped = "".join("\\" + character if character in '\\"$`' else character for character in value)
     return '"' + escaped + '"'
+
+
+def _escape_systemd_exec_arg(value: str) -> str:
+    """Escape ``$`` for ``systemd-run`` ``ExecStart`` argv elements.
+
+    PID 1 runs ``replace_env_arg()`` on every ``ExecStart`` argument before
+    ``execve()``, expanding ``$VAR`` and ``${...}`` (including bash syntax such
+    as ``${#UV[@]}``) unless every ``$`` is doubled to ``$$``. Specifier ``%``
+    tokens are not expanded on D-Bus positional argv and are left untouched.
+    """
+
+    return value.replace("$", "$$")
+
+
+#: Inline ``--setup`` JSON payloads larger than this or containing ``%`` are
+#: staged into a file and passed via ``--setup-file`` rather than inline in
+#: ``systemd-run`` ``ExecStart=`` argv. On systemd 249, re-parsing
+#: ``/run/systemd/transient/*.service`` runs ``unit_full_printf()`` over
+#: ``ExecStart=`` and flips ``LoadState`` to ``bad-setting`` on unescaped ``%``
+#: specifiers or oversized unit settings (such as the ~16 KB ``EasyDeLSetup``
+#: JSON containing bash ``${line%%;*}`` syntax).
+_INLINE_SETUP_LIMIT_BYTES = 1024
+_DEPENDENCY_ENTRY_MODULE = "eyvan.worker.runtime.dependency_entry"
+_DEPENDENCY_ENTRY_SCRIPT_SUFFIX = "/dependency_entry.py"
+_SETUP_SHELL_CONTROL_TOKENS = frozenset({"&", "&&", "|", "|&", ";", ";;", "(", ")"})
+_SETUP_STANDALONE_REDIRECT = re.compile(r"\d*(>>?|<<?)|\d*>&\d*")
+
+
+def _should_stage_setup_payload(payload: str) -> bool:
+    """Return whether a ``dependency_entry --setup`` JSON payload should be staged to disk."""
+
+    return "%" in payload or len(payload.encode("utf-8")) > _INLINE_SETUP_LIMIT_BYTES
+
+
+def _extract_stageable_setup_payload(entrypoint: str) -> tuple[list[str], int, int, str] | None:
+    """Locate an inline ``dependency_entry --setup`` argument that should be staged to a file.
+
+    Returns ``(tokens, flag_index, end_index, payload)`` describing the
+    ``--setup <json>`` (or ``--setup=<json>``) slice to replace with
+    ``("--setup-file", path)``, or ``None`` when the entrypoint is not a
+    ``dependency_entry`` invocation or its setup payload is small and free of ``%``.
+    """
+
+    try:
+        parts = shlex.split(entrypoint)
+    except ValueError:
+        return None
+    if any(part in _SETUP_SHELL_CONTROL_TOKENS or _SETUP_STANDALONE_REDIRECT.fullmatch(part) for part in parts):
+        return None
+
+    options_start: int | None = None
+    for index, part in enumerate(parts):
+        if part == "--":
+            break
+        if index >= 2 and parts[index - 1] == "-m" and part == _DEPENDENCY_ENTRY_MODULE:
+            options_start = index + 1
+            break
+        if index >= 1 and part.endswith(_DEPENDENCY_ENTRY_SCRIPT_SUFFIX):
+            options_start = index + 1
+            break
+    if options_start is None:
+        return None
+
+    cursor = options_start
+    while cursor < len(parts) and parts[cursor] != "--":
+        token = parts[cursor]
+        if token == "--require":
+            cursor += 2
+            continue
+        if token.startswith("--require="):
+            cursor += 1
+            continue
+        if token == "--setup" and cursor + 1 < len(parts):
+            payload = parts[cursor + 1]
+            return (parts, cursor, cursor + 2, payload) if _should_stage_setup_payload(payload) else None
+        if token.startswith("--setup="):
+            payload = token.removeprefix("--setup=")
+            return (parts, cursor, cursor + 1, payload) if _should_stage_setup_payload(payload) else None
+        cursor += 1
+    return None
+
+
+def _ensure_setup_directory(directory: Path, *, mode: int) -> None:
+    """Create or tighten one setup-staging directory without following symlinks."""
+
+    if mode == 0o700:
+        _ensure_private_directory(directory)
+        return
+    directory.mkdir(parents=True, exist_ok=True, mode=mode)
+    try:
+        descriptor = _open_directory_no_follow(directory)
+    except OSError:
+        raise RuntimeError("runtime setup directory is unsafe") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.geteuid():
+            raise RuntimeError("runtime setup directory is not owned by this process identity")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_setup_file(path: Path, payload: str, *, dir_mode: int, file_mode: int) -> None:
+    """Atomically write one staged ``dependency_entry --setup-file`` JSON document."""
+
+    _ensure_setup_directory(path.parent, mode=dir_mode)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    published = False
+    try:
+        os.fchmod(descriptor, file_mode)
+        stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        published = True
+        _fsync_directory(path.parent)
+    except BaseException:
+        if not published:
+            try:
+                _durable_unlink(temporary)
+            except BaseException as cleanup_error:
+                raise RuntimeError("could not durably remove a staged setup temporary file") from cleanup_error
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _write_environment_file(path: Path, environment: tp.Mapping[str, str], *, systemd: bool = False) -> None:
@@ -887,6 +1053,8 @@ class SystemdTransientServiceExecutor:
         self.jobs_dir = self.state_dir / "jobs"
         self.workloads_dir = self.state_dir / "workloads"
         self.env_dir = self.state_dir / "env"
+        self.setup_dir = self.state_dir / "setup"
+        self.notices_dir = self.state_dir / "notices"
         for directory in (self.state_dir, self.jobs_dir, self.workloads_dir, self.env_dir):
             _ensure_private_directory(directory)
         self._command_timeout_s = command_timeout_s
@@ -927,6 +1095,90 @@ class SystemdTransientServiceExecutor:
         """Return every owner-only plaintext environment file for one run."""
 
         return (self._environment_file_path(remote_id),)
+
+    def _notice_file_paths(self, remote_id: str) -> tuple[Path, Path, int]:
+        """Return ``(notice_path, receipt_path, notice_mode)`` for one workload run."""
+
+        digest = _record_name(remote_id)
+        if self._workload_directory is not None:
+            workload_root = Path(self._workload_directory)
+            if not workload_root.is_symlink() and workload_root.is_dir():
+                directory = workload_root / ".eyvan-notices"
+                return directory / f"{digest}.reclaim.json", directory / f"{digest}.checkpoint.json", 0o644
+        return self.notices_dir / f"{digest}.reclaim.json", self.notices_dir / f"{digest}.checkpoint.json", 0o600
+
+    def _setup_file_paths(self, remote_id: str) -> tuple[Path, Path, int, int]:
+        """Return ``(host_path, workload_path, dir_mode, file_mode)`` for a staged setup JSON.
+
+        On native TPU/GPU hosts ``self.state_dir`` is ``0700`` owned by the
+        root worker daemon, so a workload running as ``workload_user`` cannot
+        traverse it. When ``workload_directory`` exists on disk (already
+        ``0750`` owned by ``workload_user``), stage under
+        ``<workload_directory>/.eyvan-setup`` with ``0755``/``0644`` so the
+        workload user can read it while other host users cannot enter
+        ``workload_directory``. Otherwise stage privately under ``self.setup_dir``.
+        """
+
+        filename = f"{_record_name(remote_id)}.json"
+        if self._workload_directory is not None:
+            workload_root = Path(self._workload_directory)
+            if not workload_root.is_symlink() and workload_root.is_dir():
+                staged = workload_root / ".eyvan-setup" / filename
+                return staged, staged, 0o755, 0o644
+        staged = self.setup_dir / filename
+        return staged, staged, 0o700, 0o600
+
+    def _setup_file_host_paths(self, remote_id: str) -> tuple[Path, ...]:
+        """Return every candidate host path that may hold a staged setup file for ``remote_id``."""
+
+        filename = f"{_record_name(remote_id)}.json"
+        paths = [self.setup_dir / filename]
+        if self._workload_directory is not None:
+            paths.append(Path(self._workload_directory) / ".eyvan-setup" / filename)
+        return tuple(paths)
+
+    def _stage_setup_file(self, remote_id: str, spec: tp.Mapping[str, JsonValue]) -> None:
+        """Stage a large or ``%``-bearing ``--setup`` payload to disk before launch."""
+
+        entrypoint = spec.get("entrypoint")
+        if not isinstance(entrypoint, str):
+            return
+        extracted = _extract_stageable_setup_payload(entrypoint)
+        if extracted is None:
+            return
+        _parts, _start, _end, payload = extracted
+        host_path, _workload_path, dir_mode, file_mode = self._setup_file_paths(remote_id)
+        _atomic_write_setup_file(host_path, payload, dir_mode=dir_mode, file_mode=file_mode)
+
+    def _rewrite_staged_setup_entrypoint(self, entrypoint: str, remote_id: str) -> str:
+        """Replace a staged inline ``--setup <json>`` option with ``--setup-file <path>``."""
+
+        extracted = _extract_stageable_setup_payload(entrypoint)
+        if extracted is None:
+            return entrypoint
+        parts, start, end, _payload = extracted
+        _host_path, workload_path, _dir_mode, _file_mode = self._setup_file_paths(remote_id)
+        return shlex.join([*parts[:start], "--setup-file", str(workload_path), *parts[end:]])
+
+    def _remove_setup_files(self, record: tp.Mapping[str, JsonValue], *, runtime_absent: bool = False) -> None:
+        """Remove staged setup JSON files once the workload is terminal or absent.
+
+        Unlike ``EnvironmentFile`` (read by PID 1 before ``execve``), a staged
+        ``--setup-file`` is read by ``dependency_entry`` after the unit starts,
+        so it must remain on disk while the unit is ``RUNNING``.
+        """
+
+        status = _known_persisted_status(record)
+        if status not in _TERMINAL_STATES and not runtime_absent:
+            return
+        remote_id = record.get("remote_id")
+        if not isinstance(remote_id, str) or not remote_id:
+            return
+        for path in self._setup_file_host_paths(remote_id):
+            try:
+                _durable_unlink(path)
+            except OSError:
+                raise RuntimeError("could not remove staged workload setup file") from None
 
     def _environment_temporary_directories(self) -> tuple[Path, ...]:
         """Return managed directories containing atomic plaintext env writes."""
@@ -1090,14 +1342,14 @@ class SystemdTransientServiceExecutor:
             return "unavailable", None, detail or "systemctl show did not return a loaded unit"
         if properties.get("LoadState") != "loaded":
             # A unit systemd declined to load fully -- ``bad-setting``, ``error``
-            # -- still reports its ActiveState, and a terminal ActiveState is
-            # direct evidence about the workload rather than a failure to
-            # observe one. Discarding it cost a live v5p-16 its preemption: the
-            # unit sat at ``bad-setting failed failed`` with no container
-            # running, Eyvan called that unreadable, and the stop phase could
-            # never verify, so the victim stayed in CHECKPOINTING and the
-            # preemptor never got the capacity it had been promised.
-            if properties.get("ActiveState", "").lower() in _DEFINITIVE_ACTIVE_STATES:
+            # -- still reports its live runtime properties, and a terminal state
+            # is direct evidence about the workload rather than a failure to
+            # observe one. Discarding ``failed``/``inactive`` cost a live v5p-16
+            # its preemption, and discarding a cleanly exited ``RemainAfterExit``
+            # unit (``ActiveState=active``, ``SubState=exited``, ``Result=success``,
+            # ``ExecMainCode=1``, ``ExecMainStatus=0``) left a completed v6e-8
+            # job stuck in RUNNING forever.
+            if _is_definitive_unloadable_unit(properties):
                 return "present", properties, detail
             return "unavailable", None, detail or "systemctl show did not return a loaded unit"
         return "present", properties, detail
@@ -1311,6 +1563,7 @@ class SystemdTransientServiceExecutor:
                 runtime_absent=runtime_absent,
                 environment_consumed=environment_consumed,
             )
+            self._remove_setup_files(record, runtime_absent=runtime_absent)
             self._collect_terminal_unit(record)
         finally:
             # Persist sanitization and successful cleanup markers even if a
@@ -1464,7 +1717,11 @@ class SystemdTransientServiceExecutor:
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
         launch_environment = self._resolved_launch_environment({**self._base_environment, **_environment(spec)})
+        notice_path, receipt_path, _mode = self._notice_file_paths(remote_id)
+        launch_environment.setdefault(RECLAIM_NOTICE_PATH_ENV, str(notice_path))
+        launch_environment.setdefault(CHECKPOINT_RECEIPT_PATH_ENV, str(receipt_path))
         _write_environment_file(self._environment_file_path(remote_id), launch_environment, systemd=True)
+        self._stage_setup_file(remote_id, spec)
 
     def _launch_command(
         self,
@@ -1477,19 +1734,29 @@ class SystemdTransientServiceExecutor:
     ) -> tuple[str, ...]:
         """Return the systemd launch command for one durable record."""
 
-        del environment, spec
+        del environment
         remote_id = record.get("remote_id")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
+        entrypoint = self._rewrite_staged_setup_entrypoint(entrypoint, remote_id)
+        raw_grace = spec.get("stop_grace_s")
+        stop_grace_arg: tuple[str, ...] = ()
+        if not isinstance(raw_grace, bool) and isinstance(raw_grace, (int, float)) and raw_grace > 0:
+            stop_grace_arg = (f"--property=TimeoutStopSec={int(raw_grace)}",)
         return (
             "systemd-run",
             "--quiet",
             "--no-block",
             f"--unit={unit_name}",
+            # Explicit specifier-free description: without one, systemd-run
+            # derives Description= from the full command line, which on large
+            # or %-bearing commands triggers unit_full_printf errors on reload.
+            f"--description=Eyvan workload {unit_name}",
             "--service-type=exec",
             *(("--property=ExitType=cgroup",) if self._use_exit_type_cgroup else ()),
             "--property=RemainAfterExit=yes",
             "--property=KillMode=control-group",
+            *stop_grace_arg,
             "--property=StandardOutput=journal",
             "--property=StandardError=journal",
             "--property=LimitMEMLOCK=infinity",
@@ -1505,7 +1772,7 @@ class SystemdTransientServiceExecutor:
             ),
             "/bin/sh",
             "-c",
-            entrypoint,
+            _escape_systemd_exec_arg(entrypoint),
         )
 
     def _runtime_status(self, record: JsonObject) -> tuple[ExecutionWorkloadStatus, str] | None:
@@ -1543,6 +1810,7 @@ class SystemdTransientServiceExecutor:
         try:
             self._retire_terminal_runtime(record)
             self._remove_environment_files(record)
+            self._remove_setup_files(record)
         except Exception:
             _atomic_write_json(record_path, record)
             raise
@@ -1595,6 +1863,7 @@ class SystemdTransientServiceExecutor:
                 # Rewrite records from older agents without their secret
                 # scaffolding. Terminal replays also retry plaintext cleanup.
                 self._remove_environment_files(existing)
+                self._remove_setup_files(existing)
                 _atomic_write_json(record_path, existing)
                 if existing.get("retire_cleanup_pending") is True:
                     self._complete_retirement(record_path, existing)
@@ -1611,6 +1880,7 @@ class SystemdTransientServiceExecutor:
                 if existing is not None:
                     self._validate_fence(remote_id, existing, context)
                     self._remove_environment_files(existing)
+                    self._remove_setup_files(existing)
                     _atomic_write_json(record_path, existing)
                     if existing.get("retire_cleanup_pending") is True:
                         self._complete_retirement(record_path, existing)
@@ -1717,6 +1987,7 @@ class SystemdTransientServiceExecutor:
                     _atomic_write_json(record_path, record)
                     try:
                         self._remove_environment_files(record)
+                        self._remove_setup_files(record)
                     finally:
                         _atomic_write_json(record_path, record)
                     raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {detail}") from None
@@ -1734,6 +2005,7 @@ class SystemdTransientServiceExecutor:
                     _atomic_write_json(record_path, record)
                     try:
                         self._remove_environment_files(record)
+                        self._remove_setup_files(record)
                     finally:
                         _atomic_write_json(record_path, record)
                     raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {detail}") from None
@@ -1768,6 +2040,7 @@ class SystemdTransientServiceExecutor:
                 if outcome == "missing":
                     try:
                         self._remove_environment_files(record)
+                        self._remove_setup_files(record)
                     finally:
                         _atomic_write_json(record_path, record)
             raise RuntimeError(f"failed to launch systemd execution {remote_id!r}: {launch_detail}")
@@ -2033,6 +2306,62 @@ class SystemdTransientServiceExecutor:
         outcome, _properties, _detail = self._show_unit(unit_name)
         return outcome == "missing"
 
+    def notify_reclaim(
+        self,
+        remote_id: str,
+        *,
+        notice: tp.Mapping[str, JsonValue],
+        grace_s: int,
+        context: MutationContext,
+    ) -> None:
+        """Write an atomic reclaim notice file and send ``SIGUSR1`` to the unit."""
+
+        record_path = self._record_path(remote_id)
+        notice_path, _receipt_path, notice_mode = self._notice_file_paths(remote_id)
+        with _file_lock(_record_lock_path(record_path)):
+            record = _load_json(record_path)
+            if record is None:
+                return
+            self._validate_fence(remote_id, record, context)
+            if _known_persisted_status(record) in _TERMINAL_STATES:
+                return
+            unit_name = record.get("unit_name")
+            if not isinstance(unit_name, str) or not unit_name:
+                return
+            if notice_mode == 0o600:
+                _ensure_private_directory(notice_path.parent)
+            else:
+                notice_path.parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(notice_path.parent, 0o755)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{notice_path.name}.", dir=notice_path.parent)
+            temporary = Path(temporary_name)
+            try:
+                os.fchmod(descriptor, notice_mode)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(dict(notice), stream, sort_keys=True, separators=(",", ":"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, notice_path)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+            record["reclaim_notified"] = True
+            record["stop_grace_s"] = max(int(grace_s), 1)
+            record["message"] = "systemd graceful reclaim notice delivered"
+            record["updated_at"] = _utcnow()
+            _atomic_write_json(record_path, record)
+        self._run(("systemctl", "kill", "--signal=SIGUSR1", "--kill-who=all", unit_name))
+
+    def read_checkpoint_uri(self, remote_id: str) -> str | None:
+        """Return any checkpoint URI written to this run's checkpoint receipt file."""
+
+        _notice_path, receipt_path, _mode = self._notice_file_paths(remote_id)
+        receipt = read_checkpoint_receipt(receipt_path)
+        if receipt is None:
+            return None
+        uri = receipt.get("checkpoint_uri")
+        return uri.strip() if isinstance(uri, str) and uri.strip() else None
+
     def retire(self, remote_id: str, context: MutationContext) -> None:
         """Stop a superseded cgroup and wait for a verified terminal record."""
 
@@ -2296,7 +2625,7 @@ class SystemdTransientServiceExecutor:
         ]
         invocation.extend(f"--setenv={name}={value}" for name, value in sorted(environment.items()))
         invocation.append("--")
-        invocation.extend(arguments)
+        invocation.extend(_escape_systemd_exec_arg(part) for part in arguments)
         result = self._run(tuple(invocation))
         document: JsonObject = {
             "remote_id": remote_id,

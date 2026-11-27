@@ -42,12 +42,18 @@ TokenRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 Clock = Callable[[], datetime]
 
 
-def _token_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def _token_runner(args: Sequence[str], *, account: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run the installed gcloud CLI only to obtain an active access token."""
 
     timeout_s = max(float(os.getenv("EYVAN_GCLOUD_QUOTA_TIMEOUT_S", "60")), 1.0)
+    overrides = {"CLOUDSDK_CORE_ACCOUNT": account} if account else None
     return subprocess.run(
-        ["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s, env=provider_cli_env()
+        ["gcloud", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        env=provider_cli_env(overrides=overrides),
     )
 
 
@@ -96,17 +102,23 @@ class GcpTpuQuotaUsageDiscovery:
     def __init__(
         self,
         *,
-        token_runner: TokenRunner = _token_runner,
+        token_runner: TokenRunner | None = None,
         client: httpx.Client | None = None,
         clock: Clock = _utc_now,
         lookback: timedelta = _DEFAULT_LOOKBACK,
         concurrency: int = _DEFAULT_CONCURRENCY,
+        account: str | None = None,
     ) -> None:
         if lookback <= timedelta(0):
             raise ValueError("lookback must be positive")
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise ValueError("concurrency must be a positive integer")
-        self._token_runner = token_runner
+        if token_runner is not None:
+            self._token_runner: TokenRunner = token_runner
+        elif account:
+            self._token_runner = lambda args: _token_runner(args, account=account)
+        else:
+            self._token_runner = _token_runner
         self._client = client
         self._clock = clock
         self._lookback = lookback

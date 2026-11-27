@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Built-in setup step that installs EasyDeL from a git branch, tag or commit."""
+"""Built-in setup step that installs EasyDeL from a git branch, tag, or commit."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from eyvan.records import WorkloadSetup
 #: The bash step shipped inline with every job that uses ``EasyDeLSetup``.
 SCRIPT_PATH = Path(__file__).with_name("easydel_setup.sh")
 DEFAULT_REPO = "erfanzar/EasyDeL"
-DEFAULT_BRANCH = "vnext-into-main"
+DEFAULT_BRANCH = "main"
 ACCELERATORS = ("tpu", "cuda", "cpu")
 
 _COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -139,11 +139,11 @@ class EasyDeLSetup:
         return repository_url(self.repo)
 
     def to_workload_setup(self) -> WorkloadSetup:
-        """Resolve ``branch`` to a commit and return the setup step every host runs."""
+        """Resolve ``branch`` and return the setup step every host runs."""
 
         repository = self.repository_url
         commit = resolve_commit(repository, self.branch)
-        args = ("--repo", repository, "--ref", commit, "--accelerator", self.accelerator)
+        args: tuple[str, ...] = ("--repo", repository, "--ref", commit, "--accelerator", self.accelerator)
         if self.torch_cpu:
             args += ("--torch-cpu",)
         return WorkloadSetup(script=SCRIPT_PATH.read_text(encoding="utf-8"), args=args)

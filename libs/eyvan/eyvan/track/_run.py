@@ -41,7 +41,45 @@ from pathlib import Path
 
 from eyvan.track import _format as fmt
 from eyvan.track import _rich
-from eyvan.track._store import TrackingStore, store_for_uri
+from eyvan.track._names import generate_run_name
+from eyvan.track._store import TrackingStore, TrackingStoreError, store_for_uri
+
+
+class _UnavailableTrackingStore:
+    """Fallback store used when a local path cannot be opened at ``start()`` time.
+
+    Preserves the core guarantee that a monitoring channel never crashes the job
+    it monitors: writes fail cleanly inside the background writer, spilling if a
+    spill directory is writable and otherwise counting dropped records.
+    """
+
+    def __init__(self, root: str, reason: str) -> None:
+        self._root = root
+        self._reason = reason
+
+    @property
+    def root(self) -> str:
+        return self._root
+
+    def put(self, key: str, data: bytes) -> None:
+        del key, data
+        raise TrackingStoreError(f"tracking store {self._root!r} is unavailable: {self._reason}")
+
+    def get(self, key: str) -> bytes:
+        del key
+        raise TrackingStoreError(f"tracking store {self._root!r} is unavailable: {self._reason}")
+
+    def list(self, prefix: str = "") -> list[str]:
+        del prefix
+        raise TrackingStoreError(f"tracking store {self._root!r} is unavailable: {self._reason}")
+
+
+def _safe_hostname() -> str:
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "unknown"
+
 
 #: Local store used when a run starts outside an Eyvan job with no ``uri``.
 DEFAULT_LOCAL_STORE = "~/.eyvan/tracking"
@@ -453,7 +491,7 @@ class Run:
                     "workload_id": workload_id,
                     "attempt": attempt,
                     "rank": rank,
-                    "host": socket.gethostname(),
+                    "host": _safe_hostname(),
                     "pid": os.getpid(),
                 }
             )
@@ -1482,17 +1520,22 @@ def start(
     store: TrackingStore | None = None,
     environment: tp.Mapping[str, str] | None = None,
     clock: Clock | None = None,
+    auto_name: bool | None = None,
 ) -> Run:
     """Start (or resume) a tracked run.
 
     Inside an Eyvan workload the run id is derived from the workload id, so a
     retry or a Spot preemption resumes the same run, and the scope root comes
-    from ``EYVAN_TRACKING_URI``. Outside Eyvan the run writes to
-    ``~/.eyvan/tracking/default/<project>`` unless ``uri`` says otherwise.
+    from ``EYVAN_TRACKING_URI``. Outside Eyvan, when ``uri`` and ``store`` are
+    omitted (and ``environment`` is not overridden), Eyvan checks for a
+    configured default monitoring bucket in ``~/.eyvan/storage.json`` before
+    falling back to ``~/.eyvan/tracking/default/<project>``.
 
     Args:
-        name: Human-readable run name; defaults to the run id.
-        project: Local scope used only outside Eyvan when ``uri`` is unset.
+        name: Human-readable run name. When omitted on a fresh standalone run
+            (no explicit ``run_id`` or ``EYVAN_WORKLOAD_ID``), a readable
+            W&B-style name is generated via :func:`generate_run_name`.
+        project: Scope name used when ``uri`` and ``EYVAN_TRACKING_URI`` are unset.
         group: Optional group such as a sweep name.
         tags: Short labels.
         config: Initial configuration, same as calling :meth:`Run.config`.
@@ -1509,6 +1552,10 @@ def start(
         store: Explicit store, for embedding and tests; overrides ``uri``.
         environment: Environment to read, for tests. Defaults to ``os.environ``.
         clock: Wall-clock source, for tests. Defaults to ``time.time``.
+        auto_name: Controls automatic W&B-style naming when ``name`` is ``None``.
+            ``None`` (default) generates a name for fresh runs with no explicit
+            ``run_id`` or workload id; ``True`` always generates a name when
+            ``name`` is ``None``; ``False`` preserves ``name = run_id``.
 
     Returns:
         The run handle.
@@ -1526,30 +1573,60 @@ def start(
         raise ValueError(f"name must be a non-empty string of at most {_MAX_NAME} characters")
     if group is not None and (not isinstance(group, str) or not group.strip() or len(group) > _MAX_NAME):
         raise ValueError(f"group must be a non-empty string of at most {_MAX_NAME} characters")
+    if auto_name is not None and not isinstance(auto_name, bool):
+        raise ValueError("auto_name must be a boolean or None")
     tag_list = tuple(tags)
     if len(tag_list) > _MAX_TAGS or any(not isinstance(tag, str) or not tag or len(tag) > 64 for tag in tag_list):
         raise ValueError(f"tags must be at most {_MAX_TAGS} non-empty strings of at most 64 characters")
     if not isinstance(flush_interval_s, int | float) or isinstance(flush_interval_s, bool) or flush_interval_s <= 0:
         raise ValueError("flush_interval_s must be a positive number")
     workload_id = env.get("EYVAN_WORKLOAD_ID") or None
+    effective_name = name
+    if effective_name is None:
+        use_auto_name = (run_id is None and workload_id is None) if auto_name is None else auto_name
+        if use_auto_name:
+            effective_name = generate_run_name()
     if run_id is not None:
         resolved_id = fmt.validate_run_id(run_id)
     elif workload_id is not None:
         resolved_id = fmt.run_id_for_workload(workload_id)
     else:
-        resolved_id = _fresh_run_id(name)
+        resolved_id = _fresh_run_id(effective_name)
     attempt = _env_int(env, ("EYVAN_ATTEMPT",), 1, fmt.MAX_ATTEMPT)
     rank = _env_int(env, ("EYVAN_DISTRIBUTED_PROCESS_ID", "JAX_PROCESS_ID"), 0, fmt.MAX_RANK)
     if store is None:
         root = uri or env.get(fmt.TRACKING_URI_ENV)
+        from_default_storage = False
         if not root:
             scope = fmt.validate_run_id(project or "default")
-            root = f"{DEFAULT_LOCAL_STORE}/{DEFAULT_ORG}/{scope}"
-        store = store_for_uri(root)
-    spill_root = Path(spill_dir if spill_dir is not None else DEFAULT_SPILL_DIR).expanduser()
+            if environment is None:
+                try:
+                    from eyvan.storage import resolve_default_tracking_uri
+
+                    root = resolve_default_tracking_uri(project=scope, org=DEFAULT_ORG)
+                except OSError:
+                    root = None
+                from_default_storage = root is not None
+            if not root:
+                root = f"{DEFAULT_LOCAL_STORE}/{DEFAULT_ORG}/{scope}"
+        if from_default_storage and root.startswith("gs://"):
+            from eyvan.storage import default_gcp_token_provider
+            from eyvan.track._gcs import GcsTrackingStore
+
+            store = GcsTrackingStore(root, token_provider=default_gcp_token_provider())
+        else:
+            try:
+                store = store_for_uri(root)
+            except (OSError, RuntimeError) as exc:
+                store = _UnavailableTrackingStore(root, str(exc))
+    raw_spill = spill_dir if spill_dir is not None else DEFAULT_SPILL_DIR
+    try:
+        spill_root = Path(raw_spill).expanduser()
+    except (OSError, RuntimeError):
+        spill_root = Path(raw_spill)
     run = Run(
         run_id=resolved_id,
-        name=name or resolved_id,
+        name=effective_name or resolved_id,
         group=group,
         tags=tag_list,
         store=store,

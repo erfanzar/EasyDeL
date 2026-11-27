@@ -17,6 +17,20 @@ from eyvan.artifacts.managed import (
     ManagedArtifactStore,
     parse_managed_uri,
 )
+from eyvan.artifacts.managed import result_uri as managed_result_uri
+
+
+def progress_report_uri(workload_id: str, generation: int) -> str:
+    """Return the generation-bound managed URI used to scope progress-report tokens.
+
+    Managed ``eyvan://`` callables already receive this exact URI from
+    ``result_spec_for_generation``. External-result callables (``gs://``,
+    ``s3://``) share this signing scope so retries revoke superseded attempt
+    tokens identically while ``authorize_current_result_target`` continues to
+    refuse managed result uploads unless ``execution.result_uri`` matches.
+    """
+
+    return managed_result_uri(f"{workload_id}-g{generation}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +168,40 @@ class ManagedArtifactAccess:
             expires=False,
         )
 
+    def progress_report_transfer(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        workload_id: str,
+        generation: int,
+        result_uri: str | None = None,
+    ) -> ManagedArtifactTransfer:
+        """Issue a generation-revoked progress-report transfer for one workload attempt.
+
+        Managed ``eyvan://results/...`` URIs bind to that exact URI (matching
+        ``result_upload_transfer``). External result URIs (such as ``gs://``)
+        bind to :func:`progress_report_uri` so the progress route verifies and
+        generation-revokes them without requiring managed artifact storage.
+        """
+
+        if result_uri is not None and result_uri.startswith("eyvan://"):
+            scope_uri = parse_managed_uri(result_uri).uri
+        else:
+            scope_uri = progress_report_uri(workload_id, generation)
+        token = self.signer.issue(
+            ArtifactAction.WRITE,
+            scope_uri,
+            org_id=org_id,
+            project_id=project_id,
+            workload_id=workload_id,
+            expires=False,
+        )
+        return ManagedArtifactTransfer(
+            url=self.progress_report_url(workload_id=workload_id, org_id=org_id, project_id=project_id),
+            token=token,
+        )
+
     def progress_report_url(self, *, workload_id: str, org_id: str, project_id: str) -> str:
         """Return the address a running attempt posts its own progress to.
 
@@ -169,4 +217,4 @@ class ManagedArtifactAccess:
         return f"{self.public_url}/api/v1/workloads/{quote(workload_id, safe='')}/progress-reports?{query}"
 
 
-__all__ = ("ManagedArtifactAccess", "ManagedArtifactTransfer")
+__all__ = ("ManagedArtifactAccess", "ManagedArtifactTransfer", "progress_report_uri")

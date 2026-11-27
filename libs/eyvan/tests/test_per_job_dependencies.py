@@ -99,7 +99,7 @@ def test_old_requirement_only_cache_is_not_reused(tmp_path, monkeypatch) -> None
     assert built != old
     paths = list(built.rglob(dependency_entry.PARENT_PATH_FILE))
     assert len(paths) == 1
-    assert paths[0].read_text() == f"{parent}\n"
+    assert paths[0].read_text() == f"import site; site.addsitedir({str(parent)!r})\n"
     assert (old / dependency_entry.COMPLETE_MARKER).read_text() == "flax"
     assert list(old.iterdir()) == [old / dependency_entry.COMPLETE_MARKER]
 
@@ -545,14 +545,30 @@ def test_a_callable_dispatch_installs_before_the_worker_starts() -> None:
 # --------------------------------------------------------------------------- where the packages land
 
 
-def test_an_unwritable_host_path_falls_back_to_the_working_directory(tmp_path, monkeypatch, capsys) -> None:
-    """A laptop's cell agent cannot write /var/lib, and the job still has to run.
+def test_an_unwritable_host_path_prefers_user_home_over_cwd(tmp_path, monkeypatch, capsys) -> None:
+    """Local cells without /var/lib write access cache under ~/.eyvan instead of polluting cwd."""
 
-    Failing here would mean `--with` worked only on a root-owned cell, which is
-    every fleet except the one somebody tries first.
-    """
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.delenv("EYVAN_RUNTIME_ENV_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(dependency_entry, "DEFAULT_CACHE_ROOT", Path("/proc/eyvan-cannot-write-here"))
+    monkeypatch.chdir(repo)
+
+    resolved = dependency_entry.cache_root()
+
+    assert resolved == home / ".eyvan" / "runtime-envs"
+    assert not (repo / dependency_entry.FALLBACK_CACHE_DIR).exists()
+    assert str(resolved) in capsys.readouterr().err
+
+
+def test_an_unwritable_host_path_falls_back_to_the_working_directory(tmp_path, monkeypatch, capsys) -> None:
+    """When neither /var/lib nor HOME is usable, fall back to the working directory so the job still runs."""
 
     monkeypatch.delenv("EYVAN_RUNTIME_ENV_DIR", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
     monkeypatch.setattr(dependency_entry, "DEFAULT_CACHE_ROOT", Path("/proc/eyvan-cannot-write-here"))
     monkeypatch.chdir(tmp_path)
 
@@ -568,6 +584,7 @@ def test_the_fallback_says_which_later_runs_reuse_the_install(tmp_path, monkeypa
     """
 
     monkeypatch.delenv("EYVAN_RUNTIME_ENV_DIR", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
     monkeypatch.setattr(dependency_entry, "DEFAULT_CACHE_ROOT", Path("/proc/eyvan-cannot-write-here"))
     monkeypatch.chdir(tmp_path)
 
@@ -640,3 +657,49 @@ def test_a_real_job_environment_can_import_eyvan_and_the_parent_environment(tmp_
     parents = (environment / "lib").glob(f"python*/site-packages/{dependency_entry.PARENT_PATH_FILE}")
     assert list(parents), "the parent environment is linked explicitly, not by accident"
     assert own_first == "1", "a package the job pins must win over the parent environment's copy"
+
+
+def test_child_environment_inherits_pep660_editable_pth_packages(tmp_path, monkeypatch) -> None:
+    """PEP 660 editable installs in the parent site-packages stay importable in child envs.
+
+    Bare directory lines in a ``.pth`` file are appended to ``sys.path`` without
+    evaluating ``.pth`` files inside them, breaking editable installs such as
+    ``uv sync``. Emitting ``site.addsitedir(...)`` evaluates parent ``.pth``
+    files while keeping packages pinned in the child environment ahead of them.
+    """
+
+    import subprocess
+
+    editable_src = tmp_path / "editable-src"
+    (editable_src / "editable_pkg").mkdir(parents=True)
+    (editable_src / "editable_pkg" / "__init__.py").write_text("VALUE = 'from-editable'\n", encoding="utf-8")
+
+    parent_site = tmp_path / "parent-site"
+    parent_site.mkdir()
+    (parent_site / "editable_pkg.pth").write_text(f"{editable_src}\n", encoding="utf-8")
+    (parent_site / "pinned_pkg.py").write_text("ORIGIN = 'parent'\n", encoding="utf-8")
+
+    child_venv = tmp_path / "child-venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(child_venv)], check=True, timeout=120)
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    child_site = child_venv / "lib" / version / "site-packages"
+    (child_site / "pinned_pkg.py").write_text("ORIGIN = 'child'\n", encoding="utf-8")
+
+    monkeypatch.setattr(dependency_entry.site, "getsitepackages", lambda: [str(parent_site)])
+    monkeypatch.setattr(dependency_entry.site, "ENABLE_USER_SITE", False)
+    dependency_entry._inherit_running_environment(child_venv)
+
+    probe = subprocess.run(
+        [
+            str(child_venv / "bin" / "python"),
+            "-I",
+            "-c",
+            "import editable_pkg, pinned_pkg; print(editable_pkg.VALUE, pinned_pkg.ORIGIN)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "from-editable child"

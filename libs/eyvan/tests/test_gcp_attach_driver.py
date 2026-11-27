@@ -444,7 +444,8 @@ def test_observed_capacity_class_is_the_nodes_class(tmp_path, scheduling, expect
     assert capabilities.executor == "eyvan-native"
     assert capabilities.capacity_classes == ("spot", "on-demand", "reserved")
     assert capabilities.capacity_backends == ("gcp-attach",)
-    assert capabilities.supports_callables and capabilities.supports_checkpoint and capabilities.supports_exec
+    assert capabilities.supports_callables and capabilities.supports_checkpoint
+    assert capabilities.supports_exec is False
 
 
 def test_drain_release_are_local_even_while_provider_is_unreachable(tmp_path):
@@ -598,6 +599,38 @@ def test_known_host_accelerator_descriptor_is_published(tmp_path):
     assert observation.metadata[CELL_ACCELERATOR_METADATA_KEY]["kind"] == "tpu"
 
 
+def test_attach_driver_supports_exec_follows_settings_and_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("EYVAN_CAPACITY_SUPPORTS_EXEC", raising=False)
+    assert _driver(tmp_path / "default", Substrate()).capabilities().supports_exec is False
+
+    monkeypatch.setenv("EYVAN_CAPACITY_SUPPORTS_EXEC", "true")
+    assert _driver(tmp_path / "env-on", Substrate()).capabilities().supports_exec is True
+
+    monkeypatch.setenv("EYVAN_CAPACITY_SUPPORTS_EXEC", "false")
+    state = FleetStateStore(LocalBackend(tmp_path / "override" / "fleet.json"))
+    driver = GcpAttachCapacityDriver(state, api=Substrate().api, supports_exec=True)
+    assert driver.capabilities().supports_exec is True
+
+
+def test_apply_capacity_performs_provider_lookup_outside_mutation_lock(tmp_path):
+    substrate = Substrate()
+    lock_free_during_lookup: list[bool] = []
+    driver = _driver(tmp_path, substrate)
+    original_get = substrate.api.get_node
+
+    def observed_get(project: str, zone: str, name: str):
+        acquired = driver._mutation_lock.acquire(blocking=False)
+        if acquired:
+            driver._mutation_lock.release()
+        lock_free_during_lookup.append(acquired)
+        return original_get(project, zone, name)
+
+    substrate.api.get_node = observed_get  # type: ignore[method-assign]
+    observation = driver.apply_capacity("cell", _desired(), _context())
+    assert observation.state is CapacityStatus.HEALTHY
+    assert lock_free_during_lookup == [True]
+
+
 def test_no_endpoints_is_provisioning(tmp_path):
     substrate = Substrate()
     substrate.document["networkEndpoints"] = []
@@ -748,10 +781,10 @@ async def test_refused_initial_attach_apply_is_not_reissued_forever(tmp_path):
         command = (await tx.list_outbox())[0]
         assert cell.state is CellState.UNAVAILABLE
         assert cell.provider_failure_code is CapacityProviderFailureCode.CONFIGURATION
-        assert command.state is OutboxState.FAILED
+        assert command.state is OutboxState.DISCARDED
         assert "no longer exists" in command.last_error
         await tx.put_outbox(command.model_copy(update={"available_at": utcnow()}))
-    assert await controller.dispatch_outbox_once() == 1
+    assert await controller.dispatch_outbox_once() == 0
     async with repository.transaction() as tx:
         settled = await tx.get_outbox(command.id)
     assert settled.state is OutboxState.DISCARDED

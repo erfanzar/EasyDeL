@@ -62,14 +62,17 @@ def pool_workload_request(
     dependencies: tuple[str, ...] = (),
     tpu_chips: TpuChipRequest | None = None,
     setup: WorkloadSetup | None = None,
+    reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
 ) -> PoolWorkloadSubmitRequest:
     """Build the shared pool-command request payload."""
 
-    chip_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
+    optional_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
     if setup is not None:
-        chip_fields["setup"] = setup
+        optional_fields["setup"] = setup
+    if reclaim_policy is not None and "reclaim_policy" in PoolWorkloadSubmitRequest.model_fields:
+        optional_fields["reclaim_policy"] = reclaim_policy
     return PoolWorkloadSubmitRequest(
-        **chip_fields,
+        **optional_fields,
         org_id=org_id,
         project_id=project_id,
         command=command,
@@ -124,6 +127,7 @@ def pool_callable_request(
     atomic: bool = False,
     tpu_chips: TpuChipRequest | None = None,
     setup: WorkloadSetup | None = None,
+    reclaim_policy: tp.Literal["requeue", "stop"] | None = None,
 ) -> PoolCallableSubmitRequest:
     """Build the shared pool-callable request payload.
 
@@ -134,11 +138,13 @@ def pool_callable_request(
 
     reject_remote_callable_signature(execution.signature)
     reject_remote_callable_signing_environment(environment)
-    chip_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
+    optional_fields: dict[str, tp.Any] = {"tpu_chips": tpu_chips} if tpu_chips is not None else {}
     if setup is not None:
-        chip_fields["setup"] = setup
+        optional_fields["setup"] = setup
+    if reclaim_policy is not None and "reclaim_policy" in PoolCallableSubmitRequest.model_fields:
+        optional_fields["reclaim_policy"] = reclaim_policy
     return PoolCallableSubmitRequest(
-        **chip_fields,
+        **optional_fields,
         org_id=org_id,
         project_id=project_id,
         accelerator_type=accelerator_type,

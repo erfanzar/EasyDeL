@@ -28,12 +28,17 @@ def restore_process_state():
 
     cwd = Path.cwd()
     paths = sys.path[:]
+    pythonpath = os.environ.get("PYTHONPATH")
     anchor = protocol._WORKSPACE_BASE_ANCHOR
     try:
         yield
     finally:
         os.chdir(cwd)
         sys.path[:] = paths
+        if pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = pythonpath
         protocol._WORKSPACE_BASE_ANCHOR = anchor
 
 

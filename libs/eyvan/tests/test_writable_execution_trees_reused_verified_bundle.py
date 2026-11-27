@@ -55,7 +55,9 @@ def test_a_verified_bundle_gets_a_fresh_execution_tree(tmp_path: Path, monkeypat
     signature = hmac.new(key, bundle.payload, hashlib.sha256).hexdigest() if key else None
     original_cwd = Path.cwd()
     original_path = list(sys.path)
+    original_pythonpath = os.environ.get("PYTHONPATH")
     monkeypatch.setattr(callable_protocol, "_WORKSPACE_BASE_ANCHOR", None)
+    monkeypatch.setattr(callable_protocol, "_ACTIVE_WORKSPACE_PYTHON_PATHS", ())
 
     def materialize() -> Path:
         common = dict(sha256=bundle.sha256, signature=signature, signing_key=key)
@@ -80,6 +82,10 @@ def test_a_verified_bundle_gets_a_fresh_execution_tree(tmp_path: Path, monkeypat
     finally:
         os.chdir(original_cwd)
         sys.path[:] = original_path
+        if original_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = original_pythonpath
 
 
 def test_concurrent_command_invocations_own_disjoint_trees(tmp_path: Path) -> None:

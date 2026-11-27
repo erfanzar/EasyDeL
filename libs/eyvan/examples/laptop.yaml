@@ -31,4 +31,4 @@ pools:
       memory_gib: 4
     min_workers: 1
     max_workers: 2
-    agent_endpoint: http://127.0.0.1:8095
+    agent_endpoint: http://127.0.0.1:8091

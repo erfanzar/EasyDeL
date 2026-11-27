@@ -184,6 +184,46 @@ def _emit(as_json: bool, payload: tp.Any, text: str) -> None:
         click.echo(text)
 
 
+def _extract_invite_token(raw: str) -> str:
+    """Return the raw invite token from either a token string or a full invite URL."""
+
+    cleaned = raw.strip()
+    marker = "/accept-invite/"
+    if marker in cleaned:
+        cleaned = cleaned.split(marker, 1)[1]
+        for separator in ("?", "#", "/"):
+            if separator in cleaned:
+                cleaned = cleaned.split(separator, 1)[0]
+        cleaned = cleaned.strip()
+    if not cleaned:
+        raise click.BadParameter("invite token must not be empty", param_hint="--invite")
+    return cleaned
+
+
+def _account_summary(me: tp.Any, user: tp.Any, outcome: tp.Any) -> dict[str, tp.Any]:
+    """Extract tier, TPU quota rules, and ready fleets for the post-login connection banner."""
+
+    user_view = me.get("user") if is_json_object(me) and is_json_object(me.get("user")) else user
+    tier = (
+        (me.get("tier") if is_json_object(me) else None)
+        or (user_view.get("tier") if is_json_object(user_view) else None)
+        or ("admin" if is_json_object(me) and me.get("fleet_admin") else "user")
+    )
+    rules = user_view.get("rules") if is_json_object(user_view) and is_json_object(user_view.get("rules")) else {}
+    guaranteed = rules.get("guaranteed_tpu_units")
+    max_tpu = rules.get("max_tpu_units")
+    can_borrow = user_view.get("can_borrow") if is_json_object(user_view) else None
+    target = getattr(outcome, "target", None)
+    fleets = tuple(str(name) for name in (getattr(target, "fleets", ()) or ()))
+    return {
+        "tier": str(tier),
+        "guaranteed_tpu_units": guaranteed,
+        "max_tpu_units": max_tpu,
+        "can_borrow": can_borrow,
+        "fleets": fleets,
+    }
+
+
 # ------------------------------------------------------------------- login
 
 
@@ -194,6 +234,15 @@ def _emit(as_json: bool, payload: tp.Any, text: str) -> None:
     "--email",
     "email",
     help="Your user name or the email from your invite (prompted when omitted).",
+)
+@click.option(
+    "--invite",
+    help="One-time invite token or invite URL: redeem the invite, sign in, and save context in one command.",
+)
+@click.option(
+    "--display-name",
+    default="",
+    help="Optional display name when redeeming an --invite.",
 )
 @click.option("--password-stdin", is_flag=True, help="Read the password from stdin instead of prompting.")
 @click.option("--fleet", help="Fleet to make active when the plane has more than one.")
@@ -212,6 +261,8 @@ def login(
     session: CliSession,
     url: str,
     email: str | None,
+    invite: str | None,
+    display_name: str,
     password_stdin: bool,
     fleet: str | None,
     ca_file: str | None,
@@ -220,12 +271,17 @@ def login(
 ) -> None:
     """Sign in to a team Eyvan plane and remember a personal token for it.
 
-    URL may be a host, host:port or full URL. Afterwards every command and
-    init() on this machine targets that plane and is authenticated as you.
+    URL may be a host, host:port or full URL. Pass ``--invite TOKEN`` to redeem
+    a one-time invite, set your password, mint a personal CLI token, and save
+    the active plane context in a single command. Afterwards every command and
+    ``eyvan.init()`` on this machine targets that plane authenticated as you.
     """
 
     if ca_file is not None and fingerprint is not None:
         raise click.UsageError("pass --ca-file or --fingerprint, not both")
+    if invite is not None and email is not None:
+        raise click.UsageError("pass --invite or --email/--username, not both")
+    invite_token = _extract_invite_token(invite) if invite is not None else None
     try:
         base = resolve_url(url, None)
     except ValueError as exc:
@@ -250,11 +306,31 @@ def login(
                 f"{base} does not run team accounts (start it with `eyvan-server --team` or set `team: true` "
                 "in its platform config); use `eyvan connect` instead"
             )
-        address = email or click.prompt("User name or email")
-        if password_stdin:
-            password = sys.stdin.readline().rstrip("\n")
+        if invite_token is not None:
+            preview_response = client.post("/api/v1/team/invites/preview", json={"token": invite_token})
+            if preview_response.status_code != 200:
+                raise click.ClickException(f"invite check failed: {_detail(preview_response)}")
+            preview = _object(preview_response.json())
+            address = str(preview.get("email") or preview.get("subject") or "")
+            invited_subject = str(preview.get("subject") or address)
+            if not as_json:
+                click.echo(f"redeeming invite for {invited_subject} ({address})", err=True)
+            if password_stdin:
+                password = sys.stdin.readline().rstrip("\n")
+            else:
+                password = click.prompt("Set password", hide_input=True, confirmation_prompt=True)
+            accept_response = client.post(
+                "/api/v1/team/invites/accept",
+                json={"token": invite_token, "password": password, "display_name": display_name},
+            )
+            if accept_response.status_code != 200:
+                raise click.ClickException(f"could not accept invite: {_detail(accept_response)}")
         else:
-            password = click.prompt("Password", hide_input=True)
+            address = email or click.prompt("User name or email")
+            if password_stdin:
+                password = sys.stdin.readline().rstrip("\n")
+            else:
+                password = click.prompt("Password", hide_input=True)
         token_name = f"cli-{socket.gethostname()}"[:64] or "cli"
         response = client.post(
             "/api/v1/team/login", json={"email": address, "password": password, "token_name": token_name}
@@ -297,7 +373,19 @@ def login(
         saved_context, _ = session.save_plane_context(endpoint.url, org_id=org_id, project_id=project_id)
         notes = [note for note in notes if "eyvan connect" not in note and "re-run with --fleet" not in note]
         notes.append("later commands target this plane; pick a fleet with `eyvan use FLEET` when it has several")
+    summary = _account_summary(me, user, outcome)
+    tier = summary["tier"]
+    guaranteed = summary["guaranteed_tpu_units"]
+    max_tpu = summary["max_tpu_units"]
+    ready_fleets = summary["fleets"]
+    guaranteed_label = "none" if guaranteed is None else f"{guaranteed} TPU units"
+    max_label = "no limit" if max_tpu is None else f"{max_tpu} TPU units"
+    fleets_label = ", ".join(ready_fleets) if ready_fleets else "none yet"
     lines = [f"signed in to {endpoint.url} as {credential.subject} ({credential.email})"]
+    if invite_token is not None:
+        lines.append("  invite redeemed; account created and personal CLI token issued")
+    lines.append(f"  tier: {tier} | guaranteed TPU: {guaranteed_label} | max TPU: {max_label}")
+    lines.append(f"  ready fleets: {fleets_label}")
     lines.append(f"  token {credential.token_id} saved in {_store().path} (owner-only)")
     if trust is not None:
         lines.append(
@@ -311,6 +399,11 @@ def login(
         {
             "url": endpoint.url,
             "subject": credential.subject,
+            "tier": tier,
+            "guaranteed_tpu_units": guaranteed,
+            "max_tpu_units": max_tpu,
+            "fleets": list(ready_fleets),
+            "invite_redeemed": invite_token is not None,
             "token_id": credential.token_id,
             "saved_context": saved_context,
             "scope": {"org_id": session.org_id, "project_id": session.project_id},
@@ -374,6 +467,16 @@ def users_me(session: CliSession, as_json: bool) -> None:
     _emit(as_json, payload, f"{payload.get('subject')}  roles: {roles or 'none'}")
 
 
+def _borrow_override(row: tp.Mapping[str, tp.Any]) -> bool | None:
+    """Return an account's explicit ``can_borrow`` override, or ``None`` when using tier defaults."""
+
+    rules = row.get("rules")
+    if is_json_object(rules) and isinstance(rules.get("can_borrow"), bool):
+        return rules["can_borrow"]
+    value = row.get("can_borrow")
+    return value if isinstance(value, bool) else None
+
+
 @users.command("list")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
@@ -382,11 +485,16 @@ def users_list(session: CliSession, as_json: bool) -> None:
 
     payload = session.client.request("GET", "/api/v1/team/users")
     rows = _objects(payload.get("users", [])) if isinstance(payload, dict) else []
-    text = "\n".join(
-        f"{row['subject']:<20} {row['email']:<32} {row.get('tier') or '-'!s:<8} "
-        f"{'disabled' if row['disabled'] else 'active'}"
-        for row in rows
-    )
+
+    def _format_row(row: dict[str, tp.Any]) -> str:
+        borrow = _borrow_override(row)
+        borrow_tag = "  can-borrow" if borrow is True else "  no-borrow" if borrow is False else ""
+        return (
+            f"{row['subject']:<20} {row['email']:<32} {row.get('tier') or '-'!s:<8} "
+            f"{'disabled' if row['disabled'] else 'active'}{borrow_tag}"
+        )
+
+    text = "\n".join(_format_row(row) for row in rows)
     _emit(as_json, payload, text or "no accounts yet; invite someone with `eyvan users invite`")
 
 
@@ -439,11 +547,18 @@ def users_invite(
         if role.startswith("project_"):
             body["project_id"] = scope.project_id
     payload = _object(session.client.request("POST", "/api/v1/team/invites", json=body))
-    _emit(
-        as_json,
-        payload,
-        f"invited {email} as {name}\n  link (shown once, send it privately): {payload['url']}",
-    )
+    invite_url = str(payload["url"])
+    invite_lines = [
+        f"invited {email} as {name}",
+        f"  link (shown once, send it privately): {invite_url}",
+    ]
+    raw_token = payload.get("token")
+    if isinstance(raw_token, str) and raw_token:
+        plane_url = (
+            invite_url.split("/#/accept-invite/", 1)[0] if "/#/accept-invite/" in invite_url else session.base_url
+        )
+        invite_lines.append(f"  cli (one-command login): eyvan login {plane_url} --invite {raw_token}")
+    _emit(as_json, payload, "\n".join(invite_lines))
 
 
 @users.command("tier")
@@ -532,6 +647,12 @@ def users_revoke_invite(session: CliSession, invite_id: str) -> None:
 )
 @click.option("--max-cpu", type=click.FloatRange(0, 1_000_000), help="Hard cap on CPU units (fractions allowed).")
 @click.option("--max-gpu", type=click.IntRange(0, 1_000_000), help="Hard cap on GPU units in use or queued.")
+@click.option(
+    "--can-borrow/--no-can-borrow",
+    "can_borrow",
+    default=None,
+    help="Allow or forbid borrowing idle TPU capacity above the guarantee; omit to keep the current setting.",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def users_rules(
@@ -543,37 +664,44 @@ def users_rules(
     max_tpu: int | None,
     max_cpu: float | None,
     max_gpu: int | None,
+    can_borrow: bool | None,
     as_json: bool,
 ) -> None:
-    """Replace one account's governance rules (fleet admins); options left out are cleared."""
+    """Replace one account's governance rules (fleet admins); options left out are cleared (except --can-borrow)."""
 
+    body: dict[str, tp.Any] = {
+        "allowed_fleets": list(fleets) if fleets else None,
+        "approval_tpu_threshold": approval_threshold,
+        "guaranteed_tpu_units": guarantee,
+        "max_tpu_units": max_tpu,
+        "max_cpu_units": max_cpu,
+        "max_gpu_units": max_gpu,
+    }
+    if can_borrow is not None:
+        body["can_borrow"] = can_borrow
     payload = _object(
         session.client.request(
             "PUT",
             f"/api/v1/team/users/{subject}/rules",
-            json={
-                "allowed_fleets": list(fleets) if fleets else None,
-                "approval_tpu_threshold": approval_threshold,
-                "guaranteed_tpu_units": guarantee,
-                "max_tpu_units": max_tpu,
-                "max_cpu_units": max_cpu,
-                "max_gpu_units": max_gpu,
-            },
+            json=body,
         )
     )
     rules = _object(payload.get("rules", {}))
     threshold = rules.get("approval_tpu_threshold")
     guaranteed = rules.get("guaranteed_tpu_units")
+    borrow = _borrow_override(payload)
     caps = []
     for resource in ("tpu", "cpu", "gpu"):
         cap = rules.get(f"max_{resource}_units")
         caps.append(f"max {resource.upper()} {cap if cap is not None else 'no limit'}")
     allowed = rules.get("allowed_fleets")
     fleet_label = "any" if allowed is None else (", ".join(allowed) or "none")
+    borrow_label = "allowed" if borrow is True else "denied" if borrow is False else "tier default"
     text = (
         f"{subject}: fleets {fleet_label}; "
         f"approval above {threshold if threshold is not None else 'never'}; "
         f"guarantee {guaranteed if guaranteed is not None else 'none'}; "
+        f"borrow {borrow_label}; "
         f"{'; '.join(caps)}"
     )
     _emit(as_json, payload, text)

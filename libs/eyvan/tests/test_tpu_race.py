@@ -397,3 +397,298 @@ def test_the_module_never_runs_gcloud_config() -> None:
     for path in (Path(tpu_race.__file__), Path(race_command.__file__)):
         text = path.read_text(encoding="utf-8")
         assert '"config", "set"' not in text and "config set account" not in text.replace("`", "")
+
+
+def test_sweep_accepts_receipt_inherits_account_and_lists_zones_when_omitted(cli, tmp_path) -> None:
+    race_command, queue, accounts = cli
+    run_id = "deadbeef"
+    queue.requests[("us-east5-b", f"eyvan-race-{run_id}-us-east5-b")] = {"states": ["ACTIVE"], "refuse_deletes": 0}
+    receipt = tmp_path / "race.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "project": PROJECT,
+                "account": "receipt@example.com",
+                "zones": [{"zone": "us-east5-b"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res1 = CliRunner().invoke(race_command.race, ["sweep", "--receipt", str(receipt)])
+    assert res1.exit_code == 0, res1.output
+    assert json.loads(res1.stdout)["clean"] is True
+    assert accounts == ["receipt@example.com"]
+    assert queue.requests == {}
+
+    # Printed recovery hint (`eyvan race sweep <run_id> --project <project>` without --zone) uses list_zones.
+    run_id2 = "cafebabe"
+    queue.requests[("us-east5-b", f"eyvan-race-{run_id2}-us-east5-b")] = {"states": ["ACTIVE"], "refuse_deletes": 0}
+    res2 = CliRunner().invoke(race_command.race, ["sweep", run_id2, "--project", PROJECT])
+    assert res2.exit_code == 0, res2.output
+    assert json.loads(res2.stdout)["clean"] is True
+    assert queue.requests == {}
+
+
+def test_cleaner_sweep_waits_for_async_node_deletion_until_404() -> None:
+    queue = FakeQueue({"us-east5-b": {"states": ["ACTIVE"]}})
+    run_id = "11223344"
+    node_name = f"eyvan-race-{run_id}-us-east5-b"
+    remaining_polls = [2]
+    node_deleted: list[str] = []
+
+    def list_nodes(project, zone):
+        del project
+        return 200, [node_name] if zone == "us-east5-b" and remaining_polls[0] > 0 else []
+
+    def delete_node(project, zone, name):
+        del project, zone
+        node_deleted.append(name)
+        return 200, {"name": "operations/delete-node"}
+
+    def get_node(project, zone, name):
+        del project, zone, name
+        if remaining_polls[0] > 0:
+            remaining_polls[0] -= 1
+            return 200, {"state": "DELETING"}
+        return 404, {}
+
+    queue.list_nodes = list_nodes  # type: ignore[method-assign]
+    queue.delete_node = delete_node  # type: ignore[method-assign]
+    queue.get_node = get_node  # type: ignore[attr-defined]
+
+    sweep = tpu_race.sweep_race(queue, project=PROJECT, run_id=run_id, zones=["us-east5-b"], timing=FAST)
+    assert node_deleted == [node_name]
+    assert remaining_polls == [0]
+    assert sweep.clean is True
+
+
+def test_cleaner_delete_reissues_promptly_after_leaving_provisioning() -> None:
+    import time
+
+    queue = FakeQueue({"us-east5-b": {"states": ["PROVISIONING", "WAITING_FOR_RESOURCES"], "refuse_deletes": 1}})
+    get_calls = [0]
+    original_get = queue.get
+
+    def counting_get(project, zone, name):
+        get_calls[0] += 1
+        return original_get(project, zone, name)
+
+    queue.get = counting_get  # type: ignore[method-assign]
+    queue.requests[("us-east5-b", "eyvan-race-aaaa1111-us-east5-b")] = {
+        "states": ["PROVISIONING", "WAITING_FOR_RESOURCES"],
+        "refuse_deletes": 1,
+    }
+    cleaner = tpu_race._Cleaner(queue, PROJECT, FAST, time.monotonic)
+    status = cleaner.delete("us-east5-b", "eyvan-race-aaaa1111-us-east5-b")
+    assert status == "deleted"
+    assert len(queue.refused_deletes) == 1
+    assert get_calls[0] <= 4, f"expected prompt re-DELETE after leaving PROVISIONING, saw {get_calls[0]} get calls"
+
+
+def test_race_zone_fails_fast_on_non_200_operation_poll() -> None:
+    queue = FakeQueue({"us-east5-b": {"states": ["ACTIVE"]}})
+    queue.operation = lambda name: (403, {"error": {"code": 7, "message": "operation poll forbidden"}})  # type: ignore[method-assign]
+    report = _race(queue, zones=["us-east5-b"]).run()
+    [zone] = report.zones
+    assert zone.outcome is RaceOutcome.ERROR
+    assert "403" in (zone.error or "") or "forbidden" in (zone.error or "")
+
+
+def test_tpu7x_default_runtime_version() -> None:
+    from eyvan.capacity.providers.gcp.queued_resources import default_runtime_version
+
+    assert default_runtime_version("tpu7x-4") == "v2-alpha-tpuv7x"
+
+
+def test_rest_call_skips_retries_on_permanent_quota_429_and_retries_rate_limit_429() -> None:
+    import httpx
+
+    # Permanent quota exhaustion (Limit: 0) must return immediately with zero retry sleeps.
+    perm_calls = [0]
+    perm_sleeps: list[float] = []
+
+    def perm_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        perm_calls[0] += 1
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": "Quota limit 'tpu-v6e-preemptible' has been exceeded. Limit: 0",
+                }
+            },
+        )
+
+    rest_perm = tpu_race.TpuQueueRest(
+        token_source=lambda: "tok",
+        transport=httpx.MockTransport(perm_handler),
+        sleep=perm_sleeps.append,
+    )
+    status, doc = rest_perm.create(PROJECT, "us-east5-b", "eyvan-race-12345678-us-east5-b", {})
+    assert status == 429
+    assert perm_calls == [1] and perm_sleeps == []
+    assert "Limit: 0" in tpu_race.error_text(doc)
+
+    # Transient rate-limit 429 still retries and succeeds on the next attempt.
+    rate_calls = [0]
+    rate_sleeps: list[float] = []
+
+    def rate_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        rate_calls[0] += 1
+        if rate_calls[0] == 1:
+            return httpx.Response(
+                429,
+                json={
+                    "error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Rate limit exceeded per minute"}
+                },
+            )
+        return httpx.Response(200, json={"name": "operations/ok", "done": True})
+
+    rest_rate = tpu_race.TpuQueueRest(
+        token_source=lambda: "tok",
+        transport=httpx.MockTransport(rate_handler),
+        sleep=rate_sleeps.append,
+    )
+    status2, doc2 = rest_rate.create(PROJECT, "us-east5-b", "eyvan-race-12345678-us-east5-b", {})
+    assert status2 == 200 and doc2["done"] is True
+    assert rate_calls == [2] and rate_sleeps == [5.0]
+
+    # Google APIs can pair ErrorInfo reason="QUOTA_EXCEEDED" with a per-minute rate limit; must still retry.
+    paired_calls = [0]
+    paired_sleeps: list[float] = []
+
+    def paired_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        paired_calls[0] += 1
+        if paired_calls[0] == 1:
+            return httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "Read requests per minute quota exceeded",
+                        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "QUOTA_EXCEEDED"}],
+                    }
+                },
+            )
+        return httpx.Response(200, json={"name": "operations/ok2", "done": True})
+
+    rest_paired = tpu_race.TpuQueueRest(
+        token_source=lambda: "tok",
+        transport=httpx.MockTransport(paired_handler),
+        sleep=paired_sleeps.append,
+    )
+    status3, doc3 = rest_paired.create(PROJECT, "us-east5-b", "eyvan-race-12345678-us-east5-b", {})
+    assert status3 == 200 and doc3["done"] is True
+    assert paired_calls == [2] and paired_sleeps == [5.0]
+
+
+def test_cleaner_emits_teardown_transitions_and_reissues_delete_immediately_on_suspended() -> None:
+    import time
+
+    events: list[tuple[str, str]] = []
+    delete_calls = [0]
+    get_states = ["SUSPENDING", "SUSPENDED"]
+    get_calls = [0]
+
+    class _SuspendingQueue(FakeQueue):
+        def delete(self, project, zone, name):
+            del project, zone, name
+            delete_calls[0] += 1
+            return 200, {"name": f"operations/del-{delete_calls[0]}"}
+
+        def get(self, project, zone, name):
+            del project, zone, name
+            get_calls[0] += 1
+            if delete_calls[0] >= 2:
+                return 404, {}
+            state = get_states.pop(0) if get_states else "SUSPENDED"
+            return 200, {"state": {"state": state}}
+
+    queue = _SuspendingQueue({"us-east5-b": {}})
+    cleaner = tpu_race._Cleaner(queue, PROJECT, FAST, time.monotonic, on_event=lambda z, m: events.append((z, m)))
+    result = cleaner.delete("us-east5-b", "eyvan-race-aaaa1111-us-east5-b")
+    assert result == "deleted"
+    assert delete_calls == [2]
+    assert get_calls[0] <= 3, f"expected immediate re-DELETE on SUSPENDED, saw {get_calls[0]} get calls"
+    assert events == [("us-east5-b", "deleting: suspending"), ("us-east5-b", "deleting: suspended")]
+
+
+def test_cleaner_stuck_suspended_qr_honors_poll_sleep_and_cleanup_timeout(monkeypatch) -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+    delete_calls = [0]
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    class _StuckSuspendedQueue(FakeQueue):
+        def delete(self, project, zone, name):
+            del project, zone, name
+            delete_calls[0] += 1
+            return 200, {"name": f"operations/del-{delete_calls[0]}"}
+
+        def get(self, project, zone, name):
+            del project, zone, name
+            return 200, {"state": {"state": "SUSPENDED"}}
+
+    monkeypatch.setattr(tpu_race.time, "sleep", fake_sleep)
+    timing = RaceTiming(timeout_s=5.0, cleanup_timeout_s=0.05, poll_s=0.02, operation_poll_s=0.01, stagger_s=0.0)
+    cleaner = tpu_race._Cleaner(_StuckSuspendedQueue({"us-east5-b": {}}), PROJECT, timing, lambda: now[0])
+    outcome = cleaner.delete("us-east5-b", "eyvan-race-bbbb2222-us-east5-b")
+    assert outcome.startswith("delete_timeout"), outcome
+    assert sleeps == [0.02, 0.02, 0.02]
+    assert delete_calls[0] <= 5, f"expected bounded deletes honoring poll_s and timeout, got {delete_calls[0]}"
+
+
+def test_ai_zone_suffix_accepted_and_summary_condenses_long_not_offered_list(capsys) -> None:
+    from eyvan.sdk.commands import race as race_command
+
+    queue = FakeQueue({"us-south1-ai1b": {"states": ["ACTIVE"]}})
+    race = TpuRace(queue, project=PROJECT, accelerator_type="v6e-4", zones=["us-south1-ai1b"], timing=FAST)
+    report = race.run()
+    assert [z.zone for z in report.zones] == ["us-south1-ai1b"] and report.clean
+
+    report.not_offered = [f"us-central{i}-a" for i in range(15)]
+    race_command._summary(report)
+    out = capsys.readouterr().out
+    assert "not offered in 15 zones (full list in receipt / --json)" in out
+    assert "us-central14-a" not in out
+
+
+def test_race_enables_external_ips_by_default_and_honors_internal_ips_flag(cli, tmp_path) -> None:
+    race_command, queue, _ = cli
+
+    res_default = CliRunner().invoke(
+        race_command.race,
+        ["tpu", "v6e-8", "--project", PROJECT, "--zone", "us-east5-b", "--yes", "--receipt", str(tmp_path / "r1.json")],
+    )
+    assert res_default.exit_code == 0, res_default.output
+    default_node = queue.created[-1][2]["tpu"]["nodeSpec"][0]["node"]
+    assert default_node["networkConfig"] == {"enableExternalIps": True}
+
+    res_internal = CliRunner().invoke(
+        race_command.race,
+        [
+            "tpu",
+            "v6e-8",
+            "--project",
+            PROJECT,
+            "--zone",
+            "us-east5-b",
+            "--internal-ips",
+            "--yes",
+            "--receipt",
+            str(tmp_path / "r2.json"),
+        ],
+    )
+    assert res_internal.exit_code == 0, res_internal.output
+    internal_node = queue.created[-1][2]["tpu"]["nodeSpec"][0]["node"]
+    assert "networkConfig" not in internal_node

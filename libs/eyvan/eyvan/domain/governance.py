@@ -178,6 +178,7 @@ class UserRules:
     max_tpu_units: int | None = None
     max_gpu_units: int | None = None
     max_cpu_units: float | None = None
+    can_borrow: bool | None = None
 
     @property
     def caps(self) -> Mapping[str, int | Fraction | None]:
@@ -192,6 +193,8 @@ class UserRules:
         return (
             self.allowed_fleets is None
             and self.approval_tpu_threshold is None
+            and self.guaranteed_tpu_units is None
+            and self.can_borrow is None
             and all(cap is None for cap in self.caps.values())
         )
 
@@ -236,6 +239,46 @@ class UserRules:
                 unit = name.upper()
                 return f"{unit} quota: you have {used} of {cap} {unit} units in use or queued; this job asks for {extra}"
         return None
+
+
+def effective_can_borrow(rules: UserRules, tier: TeamTier) -> bool:
+    """Return whether an account may borrow idle TPU capacity above its guarantee.
+
+    * Explicit ``rules.can_borrow`` (``True`` or ``False``) always wins.
+    * When ``None``: ``admin`` and ``trusted`` tiers may borrow idle capacity.
+    * A plain ``user`` with a positive ``guaranteed_tpu_units`` stays within
+      their own guarantee unless granted ``can_borrow=True`` or an explicit
+      ``max_tpu_units > guaranteed_tpu_units``.
+    * A plain ``user`` with no ``guaranteed_tpu_units`` (``None``) keeps the
+      existing unrestricted borrowing behaviour (bounded only by ``max_tpu_units``).
+    """
+
+    if rules.can_borrow is not None:
+        return rules.can_borrow
+    if tier in {TeamTier.ADMIN, TeamTier.TRUSTED}:
+        return True
+    if rules.guaranteed_tpu_units is not None and rules.guaranteed_tpu_units > 0:
+        return rules.max_tpu_units is not None and rules.max_tpu_units > rules.guaranteed_tpu_units
+    return True
+
+
+def borrow_cap_refusal(
+    rules: UserRules,
+    tier: TeamTier,
+    in_use: QuotaUnits,
+    requested: QuotaUnits,
+) -> str | None:
+    """Return why a TPU request exceeds non-borrowing guaranteed capacity, or ``None``."""
+
+    if requested.tpu <= 0 or effective_can_borrow(rules, tier):
+        return None
+    guarantee = rules.guaranteed_tpu_units or 0
+    if in_use.tpu + requested.tpu > guarantee:
+        return (
+            f"TPU borrowing disabled: you have {in_use.tpu} of {guarantee} guaranteed TPU units "
+            f"in use or queued; this job asks for {requested.tpu}"
+        )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +349,10 @@ class RunningJob:
     """Higher means started later; ties broken by ``workload_id``."""
     reclaimable: bool = True
     """Counts toward usage either way; only a running job can actually be taken."""
+    pool_ids: tuple[str, ...] | None = None
+    """Capacity pool IDs currently backing this running job, if known."""
+    accelerator_type: str | None = None
+    """Accelerator shape currently backing this running job, if known."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,11 +375,31 @@ def usage_by_subject(jobs: Iterable[RunningJob]) -> dict[str, int]:
     return usage
 
 
+def _job_matches_target(
+    job: RunningJob,
+    *,
+    compatible_pools: frozenset[str] | None,
+    required_accel: str | None,
+) -> bool:
+    """Return whether reclaiming ``job`` frees capacity compatible with the requester's shape."""
+
+    if compatible_pools is not None:
+        job_pools = job.pool_ids or ()
+        return any(pool_id in compatible_pools for pool_id in job_pools)
+    if required_accel is not None:
+        job_accel = (job.accelerator_type or "").strip().lower()
+        return job_accel == required_accel
+    return True
+
+
 def plan_reclaim(
     requester: str,
     needed_tpu_units: int,
     jobs: Sequence[RunningJob],
     guarantees: Mapping[str, int],
+    *,
+    compatible_pool_ids: Iterable[str] | None = None,
+    required_accelerator_type: str | None = None,
 ) -> ReclaimPlan:
     """Return the deterministic reclaim plan for ``requester`` asking for ``needed_tpu_units``.
 
@@ -345,6 +412,9 @@ def plan_reclaim(
       within their own guarantee. Reclaiming never lets anyone exceed theirs.
     * Only borrowed capacity is taken, and never from the requester. A
       borrower is never pushed below their own guarantee.
+    * When ``compatible_pool_ids`` or ``required_accelerator_type`` is supplied,
+      only borrowed victims running on compatible pools/accelerators are
+      selected so reclaiming capacity can actually place the requester's shape.
     * Victims come from the most-over-guarantee borrower first; within a
       borrower, the lowest priority band, then the most recently started job,
       then the workload id. Same inputs, same plan.
@@ -375,6 +445,16 @@ def plan_reclaim(
             own_usage,
             guarantee,
         )
+    compat_pools: frozenset[str] | None = None
+    if compatible_pool_ids is not None:
+        normalized_pools = frozenset(pool_id.strip() for pool_id in compatible_pool_ids if pool_id and pool_id.strip())
+        if normalized_pools:
+            compat_pools = normalized_pools
+    req_accel = (
+        required_accelerator_type.strip().lower()
+        if isinstance(required_accelerator_type, str) and required_accelerator_type.strip()
+        else None
+    )
     borrowed = {
         subject: used - guarantees.get(subject, 0)
         for subject, used in usage.items()
@@ -386,7 +466,14 @@ def plan_reclaim(
     freed = 0
     for subject in order:
         candidates = sorted(
-            (job for job in jobs if job.subject == subject and job.tpu_units > 0 and job.reclaimable),
+            (
+                job
+                for job in jobs
+                if job.subject == subject
+                and job.tpu_units > 0
+                and job.reclaimable
+                and _job_matches_target(job, compatible_pools=compat_pools, required_accel=req_accel)
+            ),
             key=lambda job: (_BAND_RANK.get(job.priority_band, 0), -job.started_order, job.workload_id),
         )
         for job in candidates:
@@ -401,10 +488,11 @@ def plan_reclaim(
         if freed >= needed_tpu_units:
             break
     if freed < needed_tpu_units:
+        scope_note = " on compatible pools" if compat_pools is not None or req_accel is not None else ""
         return ReclaimPlan(
             False,
-            f"only {freed} borrowed TPU units can be reclaimed without pushing anyone below their guarantee; "
-            f"{needed_tpu_units} were asked for",
+            f"only {freed} borrowed TPU units{scope_note} can be reclaimed without pushing anyone below "
+            f"their guarantee; {needed_tpu_units} were asked for",
             (),
             0,
             own_usage,
@@ -429,6 +517,8 @@ __all__ = (
     "RunningJob",
     "UserRules",
     "admission_verdict",
+    "borrow_cap_refusal",
+    "effective_can_borrow",
     "enabled_fleet_admins",
     "has_approval_gate",
     "plan_reclaim",

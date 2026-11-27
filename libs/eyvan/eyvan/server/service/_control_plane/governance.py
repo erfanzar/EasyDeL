@@ -32,6 +32,8 @@ from eyvan.domain.governance import (
     RunningJob,
     UserRules,
     admission_verdict,
+    borrow_cap_refusal,
+    effective_can_borrow,
     has_approval_gate,
     plan_reclaim,
     requested_tpu_units,
@@ -92,6 +94,7 @@ def user_rules(user: UserRecord) -> UserRules:
         max_tpu_units=user.max_tpu_units,
         max_cpu_units=user.max_cpu_units,
         max_gpu_units=user.max_gpu_units,
+        can_borrow=user.can_borrow,
     )
 
 
@@ -145,7 +148,11 @@ class GovernanceMixin:
         """
 
         rules = user_rules(user)
-        if not any(cap is not None and getattr(requested, name) > 0 for name, cap in rules.caps.items()):
+        has_dimension_cap = any(cap is not None and getattr(requested, name) > 0 for name, cap in rules.caps.items())
+        needs_borrow_check = requested.tpu > 0 and (
+            rules.can_borrow is not None or (rules.guaranteed_tpu_units is not None and rules.guaranteed_tpu_units > 0)
+        )
+        if not has_dimension_cap and not needs_borrow_check:
             return
         running = _USAGE_IN_TX.setdefault(tx, {}) if exclude_id is None else None
         in_use = running.get(user.subject) if running is not None else None
@@ -155,6 +162,11 @@ class GovernanceMixin:
         refusal = rules.cap_refusal(in_use, requested)
         if refusal is not None:
             raise ConflictError(prefix + refusal)
+        if needs_borrow_check:
+            tier = await self._team_tier_in(tx, user)
+            borrow_refusal = borrow_cap_refusal(rules, tier, in_use, requested)
+            if borrow_refusal is not None:
+                raise ConflictError(prefix + borrow_refusal)
         if running is not None:
             running[user.subject] = in_use + requested
 
@@ -257,6 +269,7 @@ class GovernanceMixin:
         max_tpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
         max_gpu_units: int | None | RuleUnchanged = RULE_UNCHANGED,
         max_cpu_units: float | None | RuleUnchanged = RULE_UNCHANGED,
+        can_borrow: bool | None | RuleUnchanged = RULE_UNCHANGED,
     ) -> UserRecord:
         """Update one account's rules (fleet admins only).
 
@@ -286,6 +299,7 @@ class GovernanceMixin:
                 "max_tpu_units": user.max_tpu_units if isinstance(max_tpu_units, RuleUnchanged) else max_tpu_units,
                 "max_cpu_units": user.max_cpu_units if isinstance(max_cpu_units, RuleUnchanged) else max_cpu_units,
                 "max_gpu_units": user.max_gpu_units if isinstance(max_gpu_units, RuleUnchanged) else max_gpu_units,
+                "can_borrow": user.can_borrow if isinstance(can_borrow, RuleUnchanged) else can_borrow,
             }
             try:
                 updated = UserRecord.model_validate(
@@ -319,6 +333,11 @@ class GovernanceMixin:
                         **(
                             {"max_gpu_units": updated.max_gpu_units}
                             if updated.max_gpu_units is not None or not isinstance(max_gpu_units, RuleUnchanged)
+                            else {}
+                        ),
+                        **(
+                            {"can_borrow": updated.can_borrow}
+                            if updated.can_borrow is not None or not isinstance(can_borrow, RuleUnchanged)
                             else {}
                         ),
                     },
@@ -463,19 +482,46 @@ class GovernanceMixin:
     async def _reclaim_inputs(
         self, tx: RepositorySession
     ) -> tuple[list[RunningJob], dict[str, int], dict[str, WorkloadRecord]]:
-        active = [workload for workload in await tx.list_workloads() if workload.state in _ACTIVE_STATES]
-        ordered = sorted(active, key=lambda item: (item.created_at, item.id))
-        jobs = [
-            RunningJob(
-                workload_id=workload.id,
-                subject=workload.created_by,
-                tpu_units=requested_tpu_units(workload.spec),
-                priority_band=workload.spec.priority_band.value,
-                started_order=index,
-                reclaimable=workload.state is WorkloadState.RUNNING,
-            )
-            for index, workload in enumerate(ordered)
+        active = [
+            workload
+            for workload in await tx.list_workloads()
+            if workload.state in _ACTIVE_STATES and workload.coordination_kind is None
         ]
+        ordered = sorted(active, key=lambda item: (item.created_at, item.id))
+        leases_by_id = {lease.id: lease for lease in await tx.list_leases()}
+        cells_by_id = {cell.id: cell for cell in await tx.list_cells()}
+        jobs: list[RunningJob] = []
+        for index, workload in enumerate(ordered):
+            lease_ids = workload.lease_ids or ((workload.lease_id,) if workload.lease_id else ())
+            pool_ids_list: list[str] = []
+            accel: str | None = None
+            for lease_id in lease_ids:
+                lease = leases_by_id.get(lease_id)
+                if lease is None:
+                    continue
+                cell = cells_by_id.get(lease.cell_id)
+                if cell is None:
+                    continue
+                if cell.pool_id:
+                    pool_ids_list.append(cell.pool_id)
+                if accel is None and cell.accelerator_type:
+                    accel = cell.accelerator_type
+            if not pool_ids_list:
+                pool_ids_list.extend(targeted_pool_ids(workload.spec))
+            if accel is None:
+                accel = workload.spec.accelerator_type
+            jobs.append(
+                RunningJob(
+                    workload_id=workload.id,
+                    subject=workload.created_by,
+                    tpu_units=requested_tpu_units(workload.spec),
+                    priority_band=workload.spec.priority_band.value,
+                    started_order=index,
+                    reclaimable=workload.state is WorkloadState.RUNNING,
+                    pool_ids=tuple(dict.fromkeys(pool_ids_list)),
+                    accelerator_type=accel,
+                )
+            )
         guarantees = {
             user.subject: user.guaranteed_tpu_units
             for user in await tx.list_users()
@@ -483,17 +529,38 @@ class GovernanceMixin:
         }
         return jobs, guarantees, {workload.id: workload for workload in active}
 
-    async def plan_reclaim_for(self, principal: Principal, *, tpu_units: int) -> ReclaimPlan:
+    async def plan_reclaim_for(
+        self,
+        principal: Principal,
+        *,
+        tpu_units: int,
+        compatible_pool_ids: tp.Iterable[str] | None = None,
+        required_accelerator_type: str | None = None,
+    ) -> ReclaimPlan:
         """Return the deterministic plan for ``principal`` reclaiming ``tpu_units`` (read-only)."""
 
         if not getattr(self, "governance_enabled", False):
             raise NotFoundError("governance is not enabled on this plane")
         async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
             jobs, guarantees, _ = await self._reclaim_inputs(tx)
-        return plan_reclaim(principal.subject, tpu_units, jobs, guarantees)
+        return plan_reclaim(
+            principal.subject,
+            tpu_units,
+            jobs,
+            guarantees,
+            compatible_pool_ids=compatible_pool_ids,
+            required_accelerator_type=required_accelerator_type,
+        )
 
     async def reclaim_borrowed(
-        self, principal: Principal, *, tpu_units: int, reason: str, idempotency_key: str
+        self,
+        principal: Principal,
+        *,
+        tpu_units: int,
+        reason: str,
+        idempotency_key: str,
+        compatible_pool_ids: tp.Iterable[str] | None = None,
+        required_accelerator_type: str | None = None,
     ) -> tuple[ReclaimPlan, list[str]]:
         """Reclaim borrowed capacity for ``principal`` by the deterministic rule.
 
@@ -508,7 +575,12 @@ class GovernanceMixin:
         (its capacity is already free) rather than failing the whole request.
         """
 
-        plan = await self.plan_reclaim_for(principal, tpu_units=tpu_units)
+        plan = await self.plan_reclaim_for(
+            principal,
+            tpu_units=tpu_units,
+            compatible_pool_ids=compatible_pool_ids,
+            required_accelerator_type=required_accelerator_type,
+        )
         if not plan.allowed:
             raise ConflictError(plan.reason)
         reason = reason.strip() or "borrowed capacity reclaimed"
@@ -524,11 +596,109 @@ class GovernanceMixin:
                     workload_id,
                     idempotency_key=f"{idempotency_key}:{workload_id}",
                     reason=f"{reason} (for {principal.subject})"[:500],
+                    requested_by=principal.subject,
                 )
             except ConflictError:
                 continue
             issued.append(workload_id)
         return plan, issued
+
+    async def governance_summary(self, principal: Principal) -> dict[str, tp.Any]:
+        """Return plane-wide team quota, borrowing, and active reclaim summary (fleet admins)."""
+
+        if not self.authorizer.allows(principal, Permission.MANAGE_FLEET):  # type: ignore[attr-defined]
+            raise AuthorizationError(f"{principal.subject!r} may not read governance summary")
+        enabled = bool(getattr(self, "governance_enabled", False))
+        if not enabled:
+            return {
+                "enabled": False,
+                "total_guaranteed_tpu_units": 0,
+                "total_in_use_tpu_units": 0,
+                "total_borrowed_tpu_units": 0,
+                "users": [],
+                "active_reclaims": [],
+            }
+        async with self.repository.transaction() as tx:  # type: ignore[attr-defined]
+            users = await tx.list_users()
+            workloads = await tx.list_workloads()
+            leases = await tx.list_leases()
+            active_tpu_by_subject: dict[str, int] = {}
+            for workload in workloads:
+                if workload.state in _ACTIVE_STATES and workload.coordination_kind is None:
+                    tpu = requested_tpu_units(workload.spec)
+                    if tpu > 0:
+                        active_tpu_by_subject[workload.created_by] = (
+                            active_tpu_by_subject.get(workload.created_by, 0) + tpu
+                        )
+            leases_by_workload: dict[str, list[tp.Any]] = {}
+            for lease in leases:
+                leases_by_workload.setdefault(lease.workload_id, []).append(lease)
+
+            guarantees: dict[str, int] = {}
+            user_rows: list[dict[str, tp.Any]] = []
+            for user in sorted(users, key=lambda item: item.subject):
+                tier = await self._team_tier_in(tx, user)
+                rules = user_rules(user)
+                guarantee = user.guaranteed_tpu_units or 0
+                if user.guaranteed_tpu_units is not None:
+                    guarantees[user.subject] = user.guaranteed_tpu_units
+                in_use = active_tpu_by_subject.get(user.subject, 0)
+                borrowed = max(0, in_use - guarantee)
+                user_rows.append(
+                    {
+                        "subject": user.subject,
+                        "tier": tier.value,
+                        "guaranteed_tpu_units": user.guaranteed_tpu_units,
+                        "max_tpu_units": user.max_tpu_units,
+                        "can_borrow": effective_can_borrow(rules, tier),
+                        "in_use_tpu_units": in_use,
+                        "borrowed_tpu_units": borrowed,
+                    }
+                )
+
+            active_reclaims: list[dict[str, tp.Any]] = []
+            for workload in sorted(workloads, key=lambda item: (item.created_at, item.id)):
+                if workload.state not in {WorkloadState.CHECKPOINTING, WorkloadState.CANCELLING}:
+                    continue
+                wl_leases = leases_by_workload.get(workload.id, ())
+                is_reclaiming = (
+                    workload.reclaim_deadline_at is not None
+                    or workload.reclaim_requested_by is not None
+                    or (
+                        workload.preemption_id is None
+                        and any(lease.revocation_reason == "preemption" for lease in wl_leases)
+                    )
+                )
+                if not is_reclaiming:
+                    continue
+                active_reclaims.append(
+                    {
+                        "workload_id": workload.id,
+                        "owner": workload.created_by,
+                        "requested_by": workload.reclaim_requested_by,
+                        "deadline_at": (
+                            workload.reclaim_deadline_at.isoformat()
+                            if workload.reclaim_deadline_at is not None
+                            else None
+                        ),
+                        "policy": workload.spec.reclaim_policy,
+                        "state": workload.state.value,
+                    }
+                )
+
+            total_guaranteed = sum(user.guaranteed_tpu_units or 0 for user in users)
+            total_in_use = sum(active_tpu_by_subject.values())
+            total_borrowed = sum(
+                max(0, used - guarantees.get(subject, 0)) for subject, used in active_tpu_by_subject.items()
+            )
+            return {
+                "enabled": True,
+                "total_guaranteed_tpu_units": total_guaranteed,
+                "total_in_use_tpu_units": total_in_use,
+                "total_borrowed_tpu_units": total_borrowed,
+                "users": user_rows,
+                "active_reclaims": active_reclaims,
+            }
 
 
 __all__ = ("HELD_WORKLOAD_KEY", "GovernanceMixin", "user_rules")

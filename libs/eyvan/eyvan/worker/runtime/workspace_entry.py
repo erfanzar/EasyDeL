@@ -28,11 +28,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import json
 import os
 import shutil
 import sys
 import tempfile
 import typing as tp
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -53,11 +55,43 @@ DEFAULT_WORKSPACE_DIRNAME = ".eyvan-workspace"
 COMPLETE_MARKER = ".eyvan-extraction-complete"
 
 
+_METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+
+
+def _fetch_gcs(uri: str) -> bytes:
+    """Download one ``gs://bucket/object`` bundle using GCE metadata credentials."""
+
+    remainder = uri.removeprefix("gs://")
+    bucket_name, sep, object_name = remainder.partition("/")
+    if not sep or not bucket_name or not object_name:
+        raise ValueError(f"invalid GCS workspace URI: {uri}")
+    token_request = urllib.request.Request(
+        _METADATA_TOKEN_URL,
+        headers={"Metadata-Flavor": "Google"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(token_request, timeout=10) as token_response:
+        if token_response.headers.get("Metadata-Flavor", "") != "Google":
+            raise RuntimeError("the metadata token reply did not identify itself as the Google metadata service")
+        token_payload = json.loads(token_response.read().decode("utf-8"))
+    access_token = token_payload["access_token"]
+    url = (
+        "https://storage.googleapis.com/storage/v1/b/"
+        f"{urllib.parse.quote(bucket_name, safe='')}/o/"
+        f"{urllib.parse.quote(object_name, safe='')}?alt=media"
+    )
+    object_request = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+    with urllib.request.urlopen(object_request, timeout=60) as response:
+        return tp.cast(bytes, response.read())
+
+
 def _fetch(uri: str, *, token: str | None) -> bytes:
-    """Return the bundle bytes for a local path or an HTTP(S) managed URL."""
+    """Return the bundle bytes for a local path, GCS URI, or HTTP(S) managed URL."""
 
     if "://" not in uri or uri.startswith("file://"):
         return Path(uri.removeprefix("file://")).read_bytes()
+    if uri.startswith("gs://"):
+        return _fetch_gcs(uri)
     request = urllib.request.Request(uri)
     if not uri.startswith(("http://", "https://")):
         raise ValueError(f"unsupported workspace URI scheme: {uri}")
@@ -112,6 +146,33 @@ def materialize(
     return destination
 
 
+def _default_workspace_base() -> Path:
+    """Return where extracted workspaces land when ``EYVAN_WORKSPACE_DIR`` is unset.
+
+    Prefers an explicit workspace or agent state directory, then
+    ``~/.eyvan/workspaces`` when ``HOME`` is set and writable so local runs do
+    not create untracked directories inside the user's working tree, and falls
+    back to ``./.eyvan-workspace`` when no user home is available (e.g. ``env -i``
+    in an isolated container).
+    """
+
+    configured = os.environ.get("EYVAN_WORKSPACE_DIR")
+    if configured:
+        return Path(configured)
+    agent_state = os.environ.get("EYVAN_AGENT_STATE_DIR")
+    if agent_state:
+        return Path(agent_state).expanduser() / "workspaces"
+    home = os.environ.get("HOME")
+    if home:
+        candidate = Path(home).expanduser() / ".eyvan" / "workspaces"
+        probe = candidate
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        if probe.is_dir() and os.access(probe, os.W_OK | os.X_OK):
+            return candidate
+    return Path.cwd() / DEFAULT_WORKSPACE_DIRNAME
+
+
 def main(argv: tp.Sequence[str] | None = None) -> int:
     """Materialize the workspace named by the arguments, then exec the command."""
 
@@ -145,7 +206,7 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
 
     signing_key_value = os.environ.get("EYVAN_CALLABLE_SIGNING_KEY")
     signing_key = signing_key_value.encode() if signing_key_value else None
-    base = Path(os.environ.get("EYVAN_WORKSPACE_DIR") or (Path.cwd() / DEFAULT_WORKSPACE_DIRNAME))
+    base = _default_workspace_base()
 
     workspace = materialize(
         _fetch(uri, token=token),
@@ -154,6 +215,17 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         signing_key=signing_key,
         base=base,
     )
+    if __package__:
+        from eyvan._internal.workspace import discover_workspace_python_paths, prepend_pythonpath
+    else:  # staged standalone copy: the hardened workspace helpers are a sibling file
+        from workspace import (  # type: ignore[import-not-found,no-redef]
+            discover_workspace_python_paths,
+            prepend_pythonpath,
+        )
+
+    # Resolve workspace import paths before chdir in case ``base`` was relative.
+    python_paths = discover_workspace_python_paths(workspace)
+    os.environ["PYTHONPATH"] = prepend_pythonpath(python_paths, os.environ.get("PYTHONPATH"))
     os.chdir(workspace)
     # `exec` rather than spawn: the workload must keep the PID systemd started,
     # or signals, exit status and process introspection all describe a wrapper

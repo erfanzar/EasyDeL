@@ -38,7 +38,7 @@ When it finishes it prints:
 2. a **one-time invite link** for the first admin. It is shown only once and
    is not logged anywhere else. Open it privately and choose a password;
 3. the login command for your own machine, for example
-   `eyvan login https://203.0.113.7:8443 --username erfan --fingerprint SHA256:AB:CD:...`;
+   `eyvan login https://203.0.113.7:8443 --username operator --fingerprint SHA256:AB:CD:...`;
 4. the `gcloud` commands that would open the port. They are **not** run: open
    the port only to the networks your team uses.
 

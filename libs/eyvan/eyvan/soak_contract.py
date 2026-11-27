@@ -26,12 +26,25 @@ SAFE_CAPACITY_BACKENDS: tp.Final[tuple[str, ...]] = (
     "local",
     "manual",
     "gcp",
+    "gcp-attach",
     "gcp-compute",
     "gcp-tpu",
+    "onprem-ssh",
+    "aws-ec2",
+    "azure-vm",
     "kubernetes",
     "other",
 )
-SAFE_PROVIDERS: tp.Final[tuple[str, ...]] = ("local", "manual", "gcp", "kubernetes", "other")
+SAFE_PROVIDERS: tp.Final[tuple[str, ...]] = (
+    "local",
+    "manual",
+    "gcp",
+    "onprem-ssh",
+    "aws",
+    "azure",
+    "kubernetes",
+    "other",
+)
 SAFE_RESOURCE_CLASSES: tp.Final[tuple[str, ...]] = ("cpu", "gpu", "tpu", "other")
 SAFE_CAPACITY_CLASSES: tp.Final[tuple[str, ...]] = ("reserved", "on_demand", "spot", "other")
 SAFE_FAILURE_CATEGORIES: tp.Final[tuple[str, ...]] = (

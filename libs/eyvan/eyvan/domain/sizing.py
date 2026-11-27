@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
+from eyvan.domain.accelerators import parse_tpu_accelerator_type
 
 GIB = 1024**3
 FP32_BYTES = 4
@@ -46,11 +46,13 @@ DEFAULT_HEADROOM = 0.85
 MAX_REPORTED_FITS = 5
 
 TPU_HBM_GIB: Mapping[str, float] = MappingProxyType(
-    {"v4": 32.0, "v5e": 16.0, "v5litepod": 16.0, "v5p": 95.0, "v6e": 32.0}
+    {"v4": 32.0, "v5e": 16.0, "v5litepod": 16.0, "v5p": 95.0, "v6e": 32.0, "tpu7x": 192.0}
 )
 # The parser returns public suffix units, not chips. These are the same unit
 # conversions documented by capacity.hardware_catalog and autoscale.profiles.
-TPU_SUFFIX_UNITS_PER_CHIP: Mapping[str, int] = MappingProxyType({"v4": 2, "v5p": 2, "v5e": 1, "v5litepod": 1, "v6e": 1})
+TPU_SUFFIX_UNITS_PER_CHIP: Mapping[str, int] = MappingProxyType(
+    {"v4": 2, "v5p": 2, "v5e": 1, "v5litepod": 1, "v6e": 1, "tpu7x": 1}
+)
 DEFAULT_CANDIDATE_TYPES: tuple[str, ...] = tuple(
     f"{generation}-{size}"
     for generation, sizes in (

@@ -92,7 +92,7 @@ def test_something_that_is_not_a_config_is_still_rejected() -> None:
     """Widening the gate must not remove it."""
 
     with pytest.raises(TypeError, match="TpuConfig, GpuConfig, or CpuConfig instance"):
-        execute("v5p-8")  # type: ignore[arg-type]
+        execute(123)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

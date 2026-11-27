@@ -17,7 +17,7 @@
   "launch": {
    "model": "Base/policy model name_or_path (HF id or gs:// EasyDeL checkpoint) and its dtype.",
    "dataset": "Training data: HF dataset id or files, split, and the columns the trainer expects.",
-   "sharding": "Mesh axis_dims over (dp, fsdp, ep, tp, sp); must multiply to the slice's chip count (-1 fills one axis)."
+   "sharding": "Mesh axis_dims over (pp, dp, fsdp, ep, tp, sp); must multiply to the slice's chip count (-1 fills one axis)."
   }
  },
  "trainers": {

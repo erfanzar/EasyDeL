@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -233,3 +235,55 @@ def test_a_missing_container_is_unobserved_rather_than_inherited_from_the_unit(t
     assert status["observed"] is False
     # An absent container yields no process facts at all -- not the unit's.
     assert "main_pid" not in status
+
+
+def test_control_plane_process_status_maps_unsupported_capability_to_501(tmp_path: Path) -> None:
+    """A backend without process introspection must return HTTP 501, never an unhandled 500."""
+
+    from eyvan.config import EyvanSettings
+    from eyvan.records import CapacityClass, CommandExecution, WorkloadDefinition
+    from eyvan.server.api.app import create_app
+    from eyvan.worker.agent.client import CellAgentUnsupportedCapabilityError
+
+    app = create_app(
+        settings=EyvanSettings(
+            dev_auth_enabled=True,
+            artifact_store_uri=str(tmp_path / "artifacts"),
+        )
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = {
+            "X-Eyvan-User": "alice",
+            "X-Eyvan-Org": "acme",
+            "X-Eyvan-Project": "research",
+            "X-Eyvan-Roles": "fleet_admin",
+        }
+        submitted = client.post(
+            "/api/v1/workloads",
+            headers={**headers, "Idempotency-Key": "submit-process-status-501"},
+            json={
+                "org_id": "acme",
+                "project_id": "research",
+                "spec": WorkloadDefinition(
+                    name="local-job",
+                    execution=CommandExecution(command="echo hi"),
+                    capacity_class=CapacityClass.ON_DEMAND,
+                ).model_dump(mode="json"),
+            },
+        )
+        assert submitted.status_code == 201, submitted.text
+        workload_id = submitted.json()["id"]
+
+        async def unsupported(_workload_id: str):
+            raise CellAgentUnsupportedCapabilityError(
+                "execution backend 'native-local' does not expose process introspection"
+            )
+
+        app.state.controller.workload_process_status = unsupported
+        response = client.get(f"/api/v1/workloads/{workload_id}/process-status", headers=headers)
+
+    assert response.status_code == 501, response.text
+    assert response.json() == {
+        "detail": "execution backend 'native-local' does not expose process introspection",
+        "code": "unsupported_capability",
+    }

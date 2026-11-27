@@ -27,7 +27,6 @@ from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 
 MAIN = "090a03b2e0b3606bd38e0e3fcfdc640cd7e6e246"  # pragma: allowlist secret
 BRANCH = "580a86a72ba7fe9c7ee6b040d2672c55089dfad6"  # pragma: allowlist secret
-VNEXT = "17513c559175ba0eb61ac98b1a8ce2f0d2a2a54f"  # pragma: allowlist secret
 TAG_OBJECT = "1" * 40
 TAG_COMMIT = "2" * 40
 
@@ -45,7 +44,6 @@ _ADVERTISEMENT = (
     + _pkt(f"{MAIN} HEAD\0multi_ack side-band-64k symref=HEAD:refs/heads/main\n")
     + _pkt(f"{MAIN} refs/heads/main\n")
     + _pkt(f"{BRANCH} refs/heads/ragged-kda-inference-optimizations\n")
-    + _pkt(f"{VNEXT} refs/heads/vnext-into-main\n")
     + _pkt(f"{TAG_OBJECT} refs/tags/v0.3.0\n")
     + _pkt(f"{TAG_COMMIT} refs/tags/v0.3.0^{{}}\n")
     + b"0000"
@@ -77,17 +75,17 @@ def test_a_non_git_answer_is_refused_rather_than_guessed() -> None:
         easydel_setup.parse_advertised_refs(b"<html>login</html>")
 
 
-def test_defaults_are_vnext_into_main_of_erfanzar_easydel(fake_remote) -> None:
+def test_defaults_are_main_of_erfanzar_easydel(fake_remote) -> None:
     setup = EasyDeLSetup()
 
     assert (setup.branch, setup.repo, setup.accelerator, setup.torch_cpu) == (
-        "vnext-into-main",
+        "main",
         "erfanzar/EasyDeL",
         "tpu",
         False,
     )
     wire = setup.to_workload_setup()
-    assert wire.args == ("--repo", "https://github.com/erfanzar/EasyDeL.git", "--ref", VNEXT, "--accelerator", "tpu")
+    assert wire.args == ("--repo", "https://github.com/erfanzar/EasyDeL.git", "--ref", MAIN, "--accelerator", "tpu")
     assert wire.script == easydel_setup.SCRIPT_PATH.read_text(encoding="utf-8")
     assert fake_remote == ["https://github.com/erfanzar/EasyDeL.git"]
 
@@ -239,6 +237,7 @@ def test_libs_without_a_workspace_lock_are_all_installed_from_one_checkout(tmp_p
     assert completed.returncode == 0, completed.stderr
     assert len(installs) == 1, installs
     line = installs[0]
+    assert "--no-sources" in line
     assert "easydel[tpu] @ file://" in line and "/libs/easydel" in line
     assert "ejkernel[tpu] @ file://" in line
     assert "eformer @ file://" in line and "spectrax-lib @ file://" in line
@@ -251,6 +250,9 @@ def test_a_uv_workspace_is_installed_from_its_own_lock_into_the_job_python(tmp_p
 
     `pip install .` of that root would take the members from PyPI, so the lock is
     exported instead: every member by path, every other dependency at its pin.
+    Even when eyvan is not stripped from the lock, `--no-deps` and `--no-sources`
+    must be passed so uv never re-resolves `[tool.uv.sources]` into editable
+    `.pth` pointers into the temporary checkout.
     """
 
     repo = tmp_path / "repo"
@@ -268,9 +270,11 @@ def test_a_uv_workspace_is_installed_from_its_own_lock_into_the_job_python(tmp_p
 
     assert completed.returncode == 0, completed.stderr
     export, install = calls
-    assert export.startswith("export --frozen --all-packages --no-dev --no-editable")
+    assert export.startswith("export --frozen --package easydel --no-dev --no-editable")
     assert "--extra tpu" in export
     assert install.startswith("pip install --python ") and " -r " in install
+    assert "--no-deps" in install
+    assert "--no-sources" in install
     installed = (tmp_path / "uv.log.requirements").read_text(encoding="utf-8").splitlines()
     assert "." not in installed, "the empty root meta-package was installed"
     assert {"./libs/easydel", "./libs/eformer", "numpy==2.0.0"} <= set(installed)
@@ -306,3 +310,297 @@ def test_the_script_ships_inside_the_package() -> None:
 
     assert easydel_setup.SCRIPT_PATH.is_file()
     assert easydel_setup.SCRIPT_PATH.parent == Path(easydel_setup.__file__).parent
+
+
+@pytest.mark.skipif(not _have_tools(), reason="needs bash and git")
+def test_workspace_with_cargo_member_finds_home_cargo_or_bootstraps_rustup(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    commit = _commit_repo(
+        repo,
+        {
+            "pyproject.toml": '[project]\nname = "easydel-foundation"\n\n[tool.uv.workspace]\nmembers = ["libs/*"]\n',
+            "uv.lock": "version = 1\n",
+            "libs/easydel/pyproject.toml": '[project]\nname = "easydel"\n',
+            "libs/surgecore/pyproject.toml": '[project]\nname = "surgecore"\n',
+            "libs/surgecore/Cargo.toml": '[package]\nname = "surgecore"\nversion = "0.1.0"\n',
+        },
+    )
+
+    def _run_with_surgecore_export(run_dir: Path, curl_script: str) -> subprocess.CompletedProcess:
+        binaries = run_dir / "bin"
+        binaries.mkdir(exist_ok=True)
+        uv = binaries / "uv"
+        uv.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = "--version" ] && exit 0\n'
+            'prev=""; out=""\n'
+            'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+            'if [ "$1" = "export" ]; then\n'
+            "  printf '.\\n./libs/easydel\\n./libs/surgecore\\n' > \"$out\"\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        uv.chmod(0o755)
+        python = binaries / "jobpython"
+        python.write_text(
+            '#!/bin/sh\nif [ "$2" = "-" ]; then cat >/dev/null; echo verified; exit 0; fi\n'
+            f'exec "{sys.executable}" "$@"\n',
+            encoding="utf-8",
+        )
+        python.chmod(0o755)
+        curl = binaries / "curl"
+        curl.write_text(curl_script, encoding="utf-8")
+        curl.chmod(0o755)
+        return subprocess.run(
+            ["bash", str(easydel_setup.SCRIPT_PATH), "--repo", str(repo), "--ref", commit],
+            env={
+                "PATH": f"{binaries}{os.pathsep}/usr/bin{os.pathsep}/bin",
+                "EYVAN_PYTHON": str(python),
+                "TMPDIR": str(run_dir),
+                "HOME": str(run_dir),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    # Case 1: cargo exists under $HOME/.cargo/bin (not initially on PATH).
+    run1 = tmp_path / "run1"
+    run1.mkdir()
+    cargo_bin = run1 / ".cargo" / "bin"
+    cargo_bin.mkdir(parents=True)
+    cargo = cargo_bin / "cargo"
+    cargo.write_text("#!/bin/sh\necho cargo 1.85.0\n", encoding="utf-8")
+    cargo.chmod(0o755)
+    curl_log1 = run1 / "curl.log"
+    completed1 = _run_with_surgecore_export(run1, f'#!/bin/sh\necho "$*" >> "{curl_log1}"\nexit 1\n')
+    assert completed1.returncode == 0, completed1.stderr
+    assert not curl_log1.exists(), "rustup must not be fetched when $HOME/.cargo/bin/cargo already exists"
+
+    # Case 2: cargo is absent everywhere; stub curl writes a tiny rustup installer to -o.
+    run2 = tmp_path / "run2"
+    run2.mkdir()
+    curl_log2 = run2 / "curl.log"
+    completed2 = _run_with_surgecore_export(
+        run2,
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{curl_log2}"\n'
+        'prev=""; out=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+        "cat <<'EOF' > \"$out\"\n"
+        "#!/bin/sh\n"
+        'mkdir -p "$HOME/.cargo/bin"\n'
+        'printf "#!/bin/sh\\necho cargo 1.85.0\\n" > "$HOME/.cargo/bin/cargo"\n'
+        'chmod +x "$HOME/.cargo/bin/cargo"\n'
+        "EOF\n",
+    )
+    assert completed2.returncode == 0, completed2.stderr
+    assert "https://sh.rustup.rs" in curl_log2.read_text(encoding="utf-8")
+    assert (run2 / ".cargo" / "bin" / "cargo").is_file()
+
+
+@pytest.mark.skipif(not _have_tools(), reason="needs bash and git")
+def test_workspace_lock_skips_eyvan_when_installed_and_scopes_metadata_check(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    commit = _commit_repo(
+        repo,
+        {
+            "pyproject.toml": '[project]\nname = "easydel-foundation"\n\n[tool.uv.workspace]\nmembers = ["libs/*"]\n',
+            "uv.lock": "version = 1\n",
+            "libs/easydel/pyproject.toml": '[project]\nname = "easydel"\n',
+            "libs/eformer/pyproject.toml": '[project]\nname = "eformer"\n',
+            "libs/eyvan/pyproject.toml": '[project]\nname = "eyvan"\n',
+        },
+    )
+    binaries = tmp_path / "bin"
+    binaries.mkdir(exist_ok=True)
+    log = tmp_path / "uv.log"
+    verified_log = tmp_path / "verified.log"
+    uv = binaries / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "--version" ] && exit 0\n'
+        'printf "%s\\n" "$*" >> "$UV_LOG"\n'
+        'prev=""; out=""; reqs=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; [ "$prev" = "-r" ] && reqs="$a"; prev="$a"; done\n'
+        'if [ "$1" = "export" ]; then\n'
+        "  printf '.\\n./libs/easydel\\n./libs/eformer\\n./libs/eyvan\\nnumpy==2.0.0\\n' > \"$out\"\n"
+        "fi\n"
+        '[ -n "$reqs" ] && cat "$reqs" > "$UV_LOG.requirements"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    python = binaries / "jobpython"
+    probe_log = tmp_path / "eyvan-probe.log"
+    python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-I" ] && [ "$2" = "-c" ] && printf "%s" "$3" | grep -q \'m.version("eyvan")\'; then\n'
+        f'  echo probed >> "{probe_log}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$2" = "-" ]; then\n'
+        "  cat >/dev/null\n"
+        "  shift 2\n"
+        f'  printf "%s\\n" "$@" > "{verified_log}"\n'
+        "  echo verified\n"
+        "  exit 0\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    env = {
+        "PATH": f"{binaries}{os.pathsep}/usr/bin{os.pathsep}/bin",
+        "UV_LOG": str(log),
+        "EYVAN_PYTHON": str(python),
+        "TMPDIR": str(tmp_path),
+        "HOME": str(tmp_path),
+    }
+    completed = subprocess.run(
+        ["bash", str(easydel_setup.SCRIPT_PATH), "--repo", str(repo), "--ref", commit],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert probe_log.read_text(encoding="utf-8").strip() == "probed"
+    calls = log.read_text(encoding="utf-8").splitlines()
+    install_call = next(line for line in calls if line.startswith("pip install "))
+    assert "--no-deps" in install_call
+    assert "--no-sources" in install_call
+    installed = (tmp_path / "uv.log.requirements").read_text(encoding="utf-8").splitlines()
+    assert "./libs/eyvan" not in installed
+    assert {"./libs/easydel", "./libs/eformer", "numpy==2.0.0"} <= set(installed)
+    checked_paths = verified_log.read_text(encoding="utf-8").splitlines()
+    assert any(p.endswith("/libs/easydel/pyproject.toml") for p in checked_paths)
+    assert any(p.endswith("/libs/eformer/pyproject.toml") for p in checked_paths)
+    assert not any(p.endswith("/libs/eyvan/pyproject.toml") for p in checked_paths)
+
+
+@pytest.mark.skipif(not _have_tools(), reason="needs bash and git")
+def test_setup_script_succeeds_with_home_unset(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    commit = _commit_repo(repo, {"pyproject.toml": '[project]\nname = "easydel"\n'})
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    uv = binaries / "uv"
+    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    uv.chmod(0o755)
+    python = binaries / "jobpython"
+    python.write_text(
+        f'#!/bin/sh\nif [ "$2" = "-" ]; then cat >/dev/null; echo verified; exit 0; fi\nexec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    # Deliberately omit HOME from the subprocess environment.
+    completed = subprocess.run(
+        ["bash", str(easydel_setup.SCRIPT_PATH), "--repo", str(repo), "--ref", commit],
+        env={
+            "PATH": f"{binaries}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "EYVAN_PYTHON": str(python),
+            "TMPDIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _run_real_verification_check(tmp_path: Path, *, mode: str) -> subprocess.CompletedProcess[str]:
+    """Run the bundled script with its real post-install Python verifier against a temp venv."""
+
+    repo = tmp_path / f"repo-{mode}"
+    commit = _commit_repo(
+        repo,
+        {
+            "pyproject.toml": '[project]\nname = "easydel-foundation"\n\n[tool.uv.workspace]\nmembers = ["libs/*"]\n',
+            "uv.lock": "version = 1\n",
+            "libs/easydel/pyproject.toml": '[project]\nname = "easydel"\n',
+            "libs/eformer/pyproject.toml": '[project]\nname = "eformer"\n',
+        },
+    )
+    run_dir = tmp_path / f"run-{mode}"
+    run_dir.mkdir()
+    venv = run_dir / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    site_packages = next((venv / "lib").glob("python*/site-packages"))
+    binaries = run_dir / "bin"
+    binaries.mkdir()
+    uv = binaries / "uv"
+    # Simulate uv writing installed metadata into the real venv's site-packages
+    # while cwd is $SRC (inside $WORK), then let the script's real verification
+    # snippet run unmodified against that venv.
+    uv.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "--version" ] && exit 0\n'
+        'prev=""; out=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+        'if [ "$1" = "export" ]; then\n'
+        "  printf '.\\n./libs/easydel\\n./libs/eformer\\n' > \"$out\"\n"
+        "  exit 0\n"
+        "fi\n"
+        f'"{sys.executable}" - "$PWD" "{site_packages}" "{mode}" <<\'PY\'\n'
+        "import json, pathlib, sys\n"
+        "src = pathlib.Path(sys.argv[1]).resolve()\n"
+        "sp = pathlib.Path(sys.argv[2])\n"
+        "mode = sys.argv[3]\n"
+        "for pkg in ('easydel', 'eformer'):\n"
+        "    dist_info = sp / f'{pkg}-0.1.0.dist-info'\n"
+        "    dist_info.mkdir(parents=True, exist_ok=True)\n"
+        "    (dist_info / 'METADATA').write_text(f'Metadata-Version: 2.1\\nName: {pkg}\\nVersion: 0.1.0\\n')\n"
+        "    record_lines = [f'{pkg}-0.1.0.dist-info/METADATA,,', f'{pkg}-0.1.0.dist-info/RECORD,,']\n"
+        "    target = src / 'libs' / pkg\n"
+        "    if mode == 'non_editable':\n"
+        "        du = {'dir_info': {}, 'url': target.as_uri()}\n"
+        "        (dist_info / 'direct_url.json').write_text(json.dumps(du))\n"
+        "        record_lines.append(f'{pkg}-0.1.0.dist-info/direct_url.json,,')\n"
+        "    elif mode == 'editable_direct_url' and pkg == 'eformer':\n"
+        "        du = {'dir_info': {'editable': True}, 'url': target.as_uri()}\n"
+        "        (dist_info / 'direct_url.json').write_text(json.dumps(du))\n"
+        "        record_lines.append(f'{pkg}-0.1.0.dist-info/direct_url.json,,')\n"
+        "    elif mode == 'pth_leak' and pkg == 'eformer':\n"
+        "        (sp / 'eformer.pth').write_text(str(target) + '\\n')\n"
+        "        record_lines.append('eformer.pth,,')\n"
+        "    (dist_info / 'RECORD').write_text('\\n'.join(record_lines) + '\\n')\n"
+        "PY\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    return subprocess.run(
+        ["bash", str(easydel_setup.SCRIPT_PATH), "--repo", str(repo), "--ref", commit],
+        env={
+            "PATH": f"{binaries}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "EYVAN_PYTHON": str(venv / "bin" / "python"),
+            "TMPDIR": str(run_dir),
+            "HOME": str(run_dir),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(not _have_tools(), reason="needs bash and git")
+def test_post_install_verification_rejects_editable_or_pth_references_into_work_and_allows_non_editable(
+    tmp_path: Path,
+) -> None:
+    """Catch editable direct_url.json or .pth pointers into $WORK before the EXIT trap deletes $WORK."""
+
+    editable = _run_real_verification_check(tmp_path, mode="editable_direct_url")
+    assert editable.returncode != 0
+    assert "eformer" in editable.stderr
+    assert "editable" in editable.stderr
+
+    pth_leak = _run_real_verification_check(tmp_path, mode="pth_leak")
+    assert pth_leak.returncode != 0
+    assert "eformer" in pth_leak.stderr
+    assert "eformer.pth" in pth_leak.stderr
+
+    clean = _run_real_verification_check(tmp_path, mode="non_editable")
+    assert clean.returncode == 0, clean.stderr
+    assert "easydel setup: easydel 0.1.0" in clean.stdout
+    assert "easydel setup: eformer 0.1.0" in clean.stdout

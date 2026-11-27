@@ -108,6 +108,30 @@ DEFERRED_ROUTES: dict[str, str] = {
         "rarely, from the plane they are standing on, and the response is a ledger row whose "
         "fence must be kept by whoever may resolve a later inconclusive rotation"
     ),
+    "POST /api/v1/capacity-pools": (
+        "capacity pools are declared as part of a fleet document via PUT /api/v1/fleets/{fleet} "
+        "(eyvan fleet apply / eyvan up); an imperative single-pool CLI upsert would bypass fleet ownership"
+    ),
+    "POST /api/v1/cells": (
+        "cells are provisioned and registered by capacity drivers and cell agents during reconciliation; "
+        "hand-creating cells from the CLI would bypass driver ownership, observation, and lease fencing"
+    ),
+    "GET /api/v1/mcp": (
+        "MCP Streamable HTTP transport SSE stream spoken by external MCP clients configured via "
+        "`eyvan mcp` (sdk/commands/mcp.py), not by the Eyvan Python HTTP client"
+    ),
+    "POST /api/v1/mcp": (
+        "MCP Streamable HTTP JSON-RPC endpoint spoken by external MCP clients configured via "
+        "`eyvan mcp` (sdk/commands/mcp.py), not by the Eyvan Python HTTP client"
+    ),
+    "DELETE /api/v1/mcp": (
+        "MCP Streamable HTTP session termination endpoint spoken by external MCP clients configured via "
+        "`eyvan mcp` (sdk/commands/mcp.py), not by the Eyvan Python HTTP client"
+    ),
+    "GET /api/v1/governance/summary": (
+        "admin console governance overview route consumed by the Eyvan web dashboard UsersPage; "
+        "CLI governance uses /api/v1/team/users and /api/v1/team/reclaim/plan"
+    ),
 }
 
 
@@ -130,23 +154,108 @@ def _routes() -> set[tuple[str, str]]:
     return found
 
 
-def _requested_paths(root: pathlib.Path) -> set[str]:
-    """Every API path spelled as a literal or an f-string under ``root``."""
+_HTTP_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+_METHOD_FIRST_CALLS = frozenset(
+    {"request", "request_checked", "mutate", "request_text", "request_bytes", "stream_lines", "_mutating_request"}
+)
 
-    found: set[str] = set()
+
+def _normalize_api_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        candidate = node.value
+    elif isinstance(node, ast.JoinedStr):
+        candidate = "".join(
+            value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else "{}"
+            for value in node.values
+        )
+    else:
+        return None
+    if candidate.startswith("/api/v1"):
+        return re.sub(r"\{[^}]*\}", "{}", candidate)
+    return None
+
+
+def _resolve_api_path(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    direct = _normalize_api_string(node)
+    if direct is not None:
+        return direct
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    return None
+
+
+def _resolve_http_verb(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        verb = node.value.upper()
+        if verb in _HTTP_VERBS:
+            return verb
+    return None
+
+
+def _collect_string_bindings(tree: ast.AST) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            normalized = _normalize_api_string(node.value)
+            if normalized is not None:
+                bindings[node.targets[0].id] = normalized
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            normalized = _normalize_api_string(node.value)
+            if normalized is not None:
+                bindings[node.target.id] = normalized
+    return bindings
+
+
+def _requested_routes(root: pathlib.Path) -> set[tuple[str, str]]:
+    """Every ``(METHOD, /api/v1/...)`` request spelled under ``root``."""
+
+    found: set[tuple[str, str]] = set()
     for path in root.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                candidate = node.value
-            elif isinstance(node, ast.JoinedStr):
-                candidate = "".join(
-                    value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else "{}"
-                    for value in node.values
-                )
-            else:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        bindings = _collect_string_bindings(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
                 continue
-            if candidate.startswith("/api/v1"):
-                found.add(re.sub(r"\{[^}]*\}", "{}", candidate))
+            func_name = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else (node.func.id if isinstance(node.func, ast.Name) else "")
+            )
+            keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
+
+            if func_name.upper() in _HTTP_VERBS and node.args:
+                resolved = _resolve_api_path(node.args[0], bindings)
+                if resolved is not None:
+                    found.add((func_name.upper(), resolved))
+                continue
+
+            if func_name == "read" and node.args:
+                resolved = _resolve_api_path(node.args[0], bindings)
+                if resolved is not None:
+                    found.add(("GET", resolved))
+                continue
+
+            if func_name == "_put" and len(node.args) >= 2:
+                resolved = _resolve_api_path(node.args[1], bindings)
+                if resolved is not None:
+                    found.add(("PUT", resolved))
+                continue
+
+            if func_name == "ResourceSpec":
+                for key in ("list_path", "get_path"):
+                    if key in keywords:
+                        resolved = _resolve_api_path(keywords[key], bindings)
+                        if resolved is not None:
+                            found.add(("GET", resolved))
+                continue
+
+            if func_name in _METHOD_FIRST_CALLS or len(node.args) >= 2 or ("method" in keywords and "path" in keywords):
+                method_node = node.args[0] if len(node.args) >= 1 else keywords.get("method")
+                path_node = node.args[1] if len(node.args) >= 2 else keywords.get("path")
+                verb = _resolve_http_verb(method_node) if method_node is not None else None
+                resolved = _resolve_api_path(path_node, bindings) if path_node is not None else None
+                if verb is not None and resolved is not None:
+                    found.add((verb, resolved))
     return found
 
 
@@ -163,12 +272,12 @@ def test_every_route_is_reachable_or_classified() -> None:
     """
 
     classified = {*CAPABILITY_ROUTES, *BROWSER_ROUTES, *DYNAMIC_ROUTES, *DEFERRED_ROUTES}
-    reachable = _requested_paths(_package_root() / "sdk")
+    reachable = _requested_routes(_package_root() / "sdk")
 
     unreachable = sorted(
         f"{method} {path}"
         for method, path in _routes()
-        if path not in reachable and f"{method} {path}" not in classified
+        if (method, path) not in reachable and f"{method} {path}" not in classified
     )
 
     assert not unreachable, (

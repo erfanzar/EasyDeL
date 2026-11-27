@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import typing as tp
+from datetime import timedelta
 
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
 from eyvan.records import (
@@ -32,8 +33,10 @@ from eyvan.server.service.state import ensure_workload_transition
 from eyvan.worker.agent.client import CellAgentClient, CellAgentStaleMutationError
 from eyvan.worker.agent.models import (
     CheckpointRequest,
+    GangReclaimNoticeRequest,
     GangWorkloadMutationRequest,
     MutationModel,
+    ReclaimNoticeRequest,
     WorkloadMutationRequest,
 )
 
@@ -125,20 +128,31 @@ class _ControllerReclaim:
 
     async def _dispatch_reclaim(self, command: OutboxRecord) -> None:
         workload, members = await self._load_reclaim_state(command)
+        status, message, observed_uri = await self._reclaim_remote_status(workload, members)
+        if status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
+            # Finished on its own before notice/hook ran: settle that outcome.
+            await self._settle_reclaim(command, status, message, checkpoint_uri=observed_uri)
+            return
+
+        grace_s = self._reclaim_grace_seconds(command, workload)
+        notice_delivered = await self._deliver_reclaim_notice(command, workload, members, grace_s=grace_s)
+
         if workload.state is WorkloadState.CHECKPOINTING:
-            status, message = await self._reclaim_remote_status(workload, members)
-            if status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
-                # Finished on its own before the hook ran: settle that outcome.
-                await self._settle_reclaim(command, status, message)
-                return
             checkpoint_uri = await self._run_reclaim_checkpoint(command, workload, members)
             workload = await self._record_reclaim_checkpoint(command, checkpoint_uri)
 
-        status, message = await self._reclaim_remote_status(workload, members)
+        status, message, observed_uri = await self._reclaim_remote_status(workload, members)
         if status not in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
-            await self._stop_reclaimed_workload(command, workload, members)
-            status, message = await self._wait_for_reclaim_terminal(workload, members)
-        await self._settle_reclaim(command, status, message)
+            if notice_delivered:
+                status, message, observed_uri, exited = await self._wait_for_graceful_reclaim_exit(
+                    workload, members, timeout_s=grace_s
+                )
+            else:
+                exited = False
+            if not exited and status not in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
+                await self._stop_reclaimed_workload(command, workload, members)
+                status, message, observed_uri = await self._wait_for_reclaim_terminal(workload, members)
+        await self._settle_reclaim(command, status, message, checkpoint_uri=observed_uri)
 
     # ------------------------------------------------------------- ownership
 
@@ -203,9 +217,102 @@ class _ControllerReclaim:
 
     # ------------------------------------------------------------ remote I/O
 
+    def _reclaim_grace_seconds(self, command: OutboxRecord, workload: WorkloadRecord) -> int:
+        for key in ("reclaim_grace_seconds", "grace_period_seconds"):
+            raw = command.payload.get(key)
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+                return raw
+        if workload.spec.checkpoint_grace_seconds > 0:
+            return workload.spec.checkpoint_grace_seconds
+        default_grace = self.settings.default_reclaim_grace_s
+        return default_grace if default_grace > 0 else 600
+
+    async def _deliver_reclaim_notice(
+        self,
+        command: OutboxRecord,
+        workload: WorkloadRecord,
+        members: _Members,
+        *,
+        grace_s: int,
+    ) -> bool:
+        """Deliver an atomic JSON reclaim notice and graceful signal to single or gang members."""
+
+        remote_id = str(workload.remote_id)
+        now = utcnow()
+        deadline_at_dt = workload.reclaim_deadline_at or (now + timedelta(seconds=grace_s))
+        raw_deadline = command.payload.get("reclaim_deadline_at")
+        deadline_at = raw_deadline if isinstance(raw_deadline, str) and raw_deadline else deadline_at_dt.isoformat()
+        raw_epoch = command.payload.get("reclaim_deadline_epoch_s")
+        deadline_epoch_s = (
+            float(raw_epoch)
+            if isinstance(raw_epoch, (int, float)) and not isinstance(raw_epoch, bool)
+            else deadline_at_dt.timestamp()
+        )
+        raw_policy = command.payload.get("reclaim_policy") or workload.spec.reclaim_policy
+        policy: tp.Literal["requeue", "stop"] = "stop" if raw_policy == "stop" else "requeue"
+        raw_requested_by = command.payload.get("requested_by") or workload.reclaim_requested_by
+        requested_by = raw_requested_by if isinstance(raw_requested_by, str) and raw_requested_by else None
+        reason = str(command.payload.get("reason") or "reclaim requested")[:500]
+        checkpoint_uri = workload.spec.checkpoint_output_uri or workload.checkpoint_uri
+
+        if len(members) > 1:
+            ordered = self._ordered_gang_member_pairs(members)
+            coordinator_lease, coordinator_cell = ordered[0]
+            agent = self._agent_factory(coordinator_cell)
+            notifier = getattr(agent, "reclaim_notice_gang", None)
+            if not callable(notifier):
+                return False
+            gang_request = GangReclaimNoticeRequest(
+                members=self._gang_members(
+                    ordered,
+                    idempotency_prefix=f"{command.idempotency_key}:notice",
+                    correlation_id=command.correlation_id,
+                ),
+                reason=reason,
+                requested_by=requested_by,
+                deadline_at=deadline_at,
+                deadline_epoch_s=deadline_epoch_s,
+                grace_seconds=grace_s,
+                policy=policy,
+                checkpoint_uri=checkpoint_uri,
+                workload_id=workload.id,
+            )
+            observation = await asyncio.to_thread(
+                notifier,
+                coordinator_lease.cell_id,
+                workload.id,
+                remote_id,
+                gang_request,
+            )
+            return observation is not None
+
+        lease, cell = members[0]
+        agent = self._agent_factory(cell)
+        notifier = getattr(agent, "reclaim_notice", None)
+        if not callable(notifier):
+            return False
+        request = ReclaimNoticeRequest(
+            mutation=MutationModel(
+                idempotency_key=f"{command.idempotency_key}:{lease.id}:notice",
+                generation=lease.generation,
+                fencing_token=lease.fencing_token,
+                correlation_id=command.correlation_id,
+            ),
+            reason=reason,
+            requested_by=requested_by,
+            deadline_at=deadline_at,
+            deadline_epoch_s=deadline_epoch_s,
+            grace_seconds=grace_s,
+            policy=policy,
+            checkpoint_uri=checkpoint_uri,
+            workload_id=workload.id,
+        )
+        observation = await asyncio.to_thread(notifier, cell.id, remote_id, request)
+        return observation is not None
+
     async def _reclaim_remote_status(
         self, workload: WorkloadRecord, members: _Members
-    ) -> tuple[ExecutionWorkloadStatus, str | None]:
+    ) -> tuple[ExecutionWorkloadStatus, str | None, str | None]:
         remote_id = str(workload.remote_id)
         if len(members) > 1:
             coordinator_lease, coordinator_cell = self._ordered_gang_member_pairs(members)[0]
@@ -218,36 +325,91 @@ class _ControllerReclaim:
         else:
             _lease, cell = members[0]
             observation = await asyncio.to_thread(self._agent_factory(cell).workload, cell.id, remote_id)
-        return observation.status, observation.message
+        return observation.status, observation.message, observation.checkpoint_uri
+
+    async def _wait_for_graceful_reclaim_exit(
+        self,
+        workload: WorkloadRecord,
+        members: _Members,
+        *,
+        timeout_s: int,
+    ) -> tuple[ExecutionWorkloadStatus, str | None, str | None, bool]:
+        """Poll for a graceful checkpoint-and-exit until the reclaim grace deadline expires."""
+
+        loop = asyncio.get_running_loop()
+        poll_s = 0.05 if timeout_s <= 5 else 1.0
+        deadline = loop.time() + max(timeout_s, 1)
+        while True:
+            status, message, checkpoint_uri = await self._reclaim_remote_status(workload, members)
+            if status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
+                return status, message, checkpoint_uri, True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return status, message, checkpoint_uri, False
+            await asyncio.sleep(min(poll_s, remaining))
 
     async def _wait_for_reclaim_terminal(
         self, workload: WorkloadRecord, members: _Members
-    ) -> tuple[ExecutionWorkloadStatus, str | None]:
+    ) -> tuple[ExecutionWorkloadStatus, str | None, str | None]:
         timeout_s = self.settings.preemption_stop_grace_s
         deadline = asyncio.get_running_loop().time() + max(timeout_s, 1)
         while True:
-            status, message = await self._reclaim_remote_status(workload, members)
+            status, message, checkpoint_uri = await self._reclaim_remote_status(workload, members)
             if status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
-                return status, message
+                return status, message, checkpoint_uri
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError(f"reclaimed workload {workload.id!r} did not stop within {timeout_s}s grace")
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1 if timeout_s <= 5 else 1.0)
 
     async def _run_reclaim_checkpoint(self, command: OutboxRecord, workload: WorkloadRecord, members: _Members) -> str:
         """Run the hook and wait for it; on any failure abort the reclaim and raise."""
 
         hook = command.payload.get("hook")
         output_uri = command.payload.get("output_uri")
-        if len(members) != 1 or not isinstance(hook, str) or not hook:
-            raise StaleOutboxCommand("reclaim checkpoint phase requires one cell and a hook")
+        if not members or not isinstance(hook, str) or not hook:
+            raise StaleOutboxCommand("reclaim checkpoint phase requires at least one cell and a hook")
         if output_uri is not None and not isinstance(output_uri, str):
             raise StaleOutboxCommand("reclaim checkpoint output URI must be a string when set")
         grace = command.payload.get("grace_period_seconds")
         timeout_s = grace if isinstance(grace, int) and not isinstance(grace, bool) and grace > 0 else 0
         timeout_s = timeout_s or self.settings.checkpoint_grace_s
+        remote_id = str(workload.remote_id)
+        if len(members) > 1:
+            ordered = self._ordered_gang_member_pairs(members)
+            coordinator_lease, coordinator_cell = ordered[0]
+            agent = self._agent_factory(coordinator_cell)
+            checkpoint_gang = getattr(agent, "checkpoint_gang", None)
+            if not callable(checkpoint_gang):
+                raise StaleOutboxCommand("reclaim gang checkpoint hook is not supported by cell agent")
+            try:
+                gang_members = self._gang_members(
+                    ordered,
+                    idempotency_prefix=f"{command.idempotency_key}:checkpoint",
+                    correlation_id=command.correlation_id,
+                )
+                observation = await asyncio.to_thread(
+                    checkpoint_gang,
+                    coordinator_lease.cell_id,
+                    workload.id,
+                    remote_id,
+                    gang_members,
+                    hook=hook,
+                    output_uri=output_uri,
+                )
+                await self._wait_for_checkpoint(
+                    agent, coordinator_lease.cell_id, observation.remote_id, timeout_s=timeout_s
+                )
+            except (StaleOutboxCommand, CellAgentStaleMutationError):
+                raise
+            except Exception as exc:
+                reason = f"checkpoint failed: {exc}"
+                if await self._abort_reclaim(command, reason):
+                    raise StaleOutboxCommand(f"reclaim aborted: {reason}") from exc
+                raise StaleOutboxCommand("reclaim lost ownership during its checkpoint phase") from exc
+            return observation.checkpoint_uri or output_uri or ""
+
         lease, cell = members[0]
         agent = self._agent_factory(cell)
-        remote_id = str(workload.remote_id)
         hook_id: str | None = None
         try:
             request = CheckpointRequest(
@@ -377,6 +539,8 @@ class _ControllerReclaim:
                 update={
                     "state": WorkloadState.RUNNING,
                     "scheduling_reason": f"reclaim aborted: {reason}"[:1000],
+                    "reclaim_deadline_at": None,
+                    "reclaim_requested_by": None,
                     "updated_at": now,
                 }
             )
@@ -412,14 +576,45 @@ class _ControllerReclaim:
             )
             return True
 
-    async def _settle_reclaim(self, command: OutboxRecord, status: ExecutionWorkloadStatus, message: str | None) -> None:
-        """Settle the stopped attempt: requeue, or record the outcome it reached itself."""
+    async def _clear_reclaim_markers(
+        self,
+        workload_id: str,
+        *,
+        expected_generation: int | None = None,
+        scheduling_reason: str | None = None,
+    ) -> None:
+        async with self.repository.transaction() as tx:
+            current = await tx.get_workload(workload_id)
+            if current is None:
+                return
+            if expected_generation is not None and current.generation != expected_generation:
+                return
+            updates: dict[str, tp.Any] = {
+                "reclaim_deadline_at": None,
+                "reclaim_requested_by": None,
+                "updated_at": utcnow(),
+            }
+            if scheduling_reason is not None:
+                updates["scheduling_reason"] = scheduling_reason
+            await tx.put_workload(current.model_copy(update=updates))
+
+    async def _settle_reclaim(
+        self,
+        command: OutboxRecord,
+        status: ExecutionWorkloadStatus,
+        message: str | None,
+        *,
+        checkpoint_uri: str | None = None,
+    ) -> None:
+        """Settle the stopped attempt: requeue, stop cleanly, or record the outcome it reached itself."""
 
         outcome = self._preemption_outcome(status)
         workload, members = await self._load_reclaim_state(command)
         lease = members[0][0]
+        effective_checkpoint_uri = checkpoint_uri or workload.checkpoint_uri
         if outcome is _PreemptionVictimOutcome.SUCCEEDED:
             await self._release_terminal(workload, lease, WorkloadState.SUCCEEDED, "workload.succeeded_during_reclaim")
+            await self._clear_reclaim_markers(workload.id, expected_generation=workload.generation)
             return
         if outcome is _PreemptionVictimOutcome.FAILED:
             await self._release_terminal(
@@ -429,13 +624,32 @@ class _ControllerReclaim:
                 "workload.failed_during_reclaim",
                 failure_reason=message or "execution backend reported failure during reclaim",
             )
+            await self._clear_reclaim_markers(workload.id, expected_generation=workload.generation)
             return
         actor = str(command.payload.get("actor") or "an administrator")
         reason = str(command.payload.get("reason") or "no reason given")
-        await self.service.settle_preempted_workload(
+        policy = str(command.payload.get("reclaim_policy") or workload.spec.reclaim_policy or "requeue")
+        if policy == "stop":
+            await self.service.settle_terminal_workload(
+                self._principal,
+                workload.id,
+                WorkloadState.CANCELLED,
+                action="workload.reclaimed_stopped",
+                checkpoint_uri=effective_checkpoint_uri,
+                expected_generation=command.generation,
+                expected_lease_id=lease.id,
+                expected_state=workload.state,
+            )
+            await self._clear_reclaim_markers(
+                workload.id,
+                expected_generation=command.generation,
+                scheduling_reason=f"reclaimed by {actor}: {reason}; stopped with checkpoint preserved",
+            )
+            return
+        resumed, _lease, _budget = await self.service.settle_preempted_workload(
             self._principal,
             workload.id,
-            checkpoint_uri=workload.checkpoint_uri,
+            checkpoint_uri=effective_checkpoint_uri,
             scheduling_reason=f"reclaimed by {actor}: {reason}; waiting to resume",
             action="workload.reclaimed",
             expected_generation=command.generation,
@@ -444,6 +658,7 @@ class _ControllerReclaim:
             require_preemption_owner=True,
             provider_preempted=True,
         )
+        await self._clear_reclaim_markers(resumed.id, expected_generation=resumed.generation)
 
     async def _recover_stale_reclaim_command(self, command: OutboxRecord, *, diagnostic: str) -> None:
         """Handle an agent fence conflict the way cancel/checkpoint commands do.

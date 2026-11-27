@@ -5,6 +5,17 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
+from eyvan.domain import SchedulingResult
+from eyvan.domain.governance import requested_tpu_units
+from eyvan.records import (
+    CapacityClass,
+    LeaseRecord,
+    LeaseState,
+    ResourceGang,
+    ResourceVector,
+)
 from eyvan.server.service._control_plane.shared import (
     _LIVE_OUTBOX_STATES,
     CandidateZone,
@@ -28,6 +39,33 @@ from eyvan.server.service._control_plane.shared import (
     utcnow,
 )
 
+#: States whose active TPU usage counts against a user's guaranteed capacity
+#: when deciding whether a pending workload is guaranteed or borrowing.
+_GUARANTEE_USAGE_STATES = frozenset(
+    {
+        WorkloadState.ADMITTED,
+        WorkloadState.LEASED,
+        WorkloadState.RUNNING,
+        WorkloadState.CHECKPOINTING,
+        WorkloadState.CANCELLING,
+    }
+)
+
+
+def _provisional_resource_vector(resources: tp.Any) -> ResourceVector:
+    values = resources.as_dict() if hasattr(resources, "as_dict") else {}
+    return ResourceVector(
+        cpu=float(values.get("cpu", 0.0)),
+        memory_gib=float(values.get("memory_gib", 0.0)),
+        gpu=float(values.get("gpu", 0.0)),
+        tpu=float(values.get("tpu", 0.0)),
+        custom={
+            key: float(amount)
+            for key, amount in values.items()
+            if key not in {"cpu", "memory_gib", "gpu", "tpu"} and float(amount) > 0
+        },
+    )
+
 
 class SchedulingMixin:
     """Transactional scheduling operations."""
@@ -44,7 +82,7 @@ class SchedulingMixin:
                 for workload in await tx.list_workloads()
                 if workload.state is not WorkloadState.PENDING or workload.preemption_id is None
             ]
-            cells = await tx.list_cells()
+            cells = [cell for cell in await tx.list_cells() if cell.state is not CellState.DELETED]
             leases = await tx.list_leases()
             budgets = await tx.list_budgets()
             quotas = await tx.list_quotas()
@@ -54,6 +92,63 @@ class SchedulingMixin:
             # workload may run -- so a grant was recorded and licensed nothing.
             grants = await tx.list_budget_grants() if self.plane_id else []
             quota_grants = await tx.list_quota_grants() if self.plane_id else []
+            users = await tx.list_users() if self.governance_enabled else []
+
+        if self.governance_enabled and users:
+            guaranteed_by_user = {
+                user.subject: user.guaranteed_tpu_units
+                for user in users
+                if user.guaranteed_tpu_units is not None and user.guaranteed_tpu_units > 0
+            }
+            if guaranteed_by_user:
+                non_pending: list[WorkloadRecord] = []
+                pending: list[WorkloadRecord] = []
+                in_use_tpu: dict[str, int] = {}
+                for workload in workloads:
+                    if workload.state is WorkloadState.PENDING and workload.schedulable:
+                        pending.append(workload)
+                    else:
+                        non_pending.append(workload)
+                        if workload.state in _GUARANTEE_USAGE_STATES:
+                            units = requested_tpu_units(workload.spec)
+                            if units > 0:
+                                in_use_tpu[workload.created_by] = in_use_tpu.get(workload.created_by, 0) + units
+
+                claimed_tpu: dict[str, int] = {}
+                non_borrowing_pending: list[WorkloadRecord] = []
+                borrowing_pending: list[WorkloadRecord] = []
+                ordered_pending = sorted(
+                    pending,
+                    key=lambda item: (item.reclaim_deadline_at is None, item.created_at, item.id),
+                )
+                for workload in ordered_pending:
+                    units = requested_tpu_units(workload.spec)
+                    if units <= 0:
+                        non_borrowing_pending.append(workload)
+                        continue
+                    guarantee = guaranteed_by_user.get(workload.created_by, 0)
+                    used = in_use_tpu.get(workload.created_by, 0) + claimed_tpu.get(workload.created_by, 0)
+                    if guarantee > 0 and used + units <= guarantee:
+                        claimed_tpu[workload.created_by] = claimed_tpu.get(workload.created_by, 0) + units
+                        non_borrowing_pending.append(workload)
+                    else:
+                        borrowing_pending.append(workload)
+
+                has_guaranteed_tpu_pending = any(requested_tpu_units(w.spec) > 0 for w in non_borrowing_pending)
+                if has_guaranteed_tpu_pending and borrowing_pending:
+                    return self._schedule_guaranteed_before_borrowed(
+                        non_pending=non_pending,
+                        guaranteed_pending=non_borrowing_pending,
+                        borrowing_pending=borrowing_pending,
+                        cells=cells,
+                        leases=leases,
+                        budgets=budgets,
+                        quotas=quotas,
+                        policies=policies,
+                        grants=grants,
+                        quota_grants=quota_grants,
+                    )
+
         return self.scheduler.schedule(
             workloads,
             cells,
@@ -64,6 +159,103 @@ class SchedulingMixin:
             grants=grants,
             quota_grants=quota_grants,
             plane_id=self.plane_id,
+        )
+
+    def _schedule_guaranteed_before_borrowed(
+        self,
+        *,
+        non_pending: list[WorkloadRecord],
+        guaranteed_pending: list[WorkloadRecord],
+        borrowing_pending: list[WorkloadRecord],
+        cells: list[tp.Any],
+        leases: list[LeaseRecord],
+        budgets: list[tp.Any],
+        quotas: list[tp.Any],
+        policies: list[tp.Any],
+        grants: list[tp.Any],
+        quota_grants: list[tp.Any],
+    ) -> SchedulingResult:
+        """Place guaranteed owners before borrowing jobs so reclaimed cells cannot ping-pong."""
+
+        assert self.scheduler is not None
+        first_pass = self.scheduler.schedule(
+            [*non_pending, *guaranteed_pending],
+            cells,
+            leases=leases,
+            budgets=budgets,
+            quotas=quotas,
+            policies=policies,
+            grants=grants,
+            quota_grants=quota_grants,
+            plane_id=self.plane_id,
+        )
+        guaranteed_by_id = {workload.id: workload for workload in guaranteed_pending}
+        cell_by_id = {cell.id: cell for cell in cells}
+        provisional_workloads: list[WorkloadRecord] = []
+        provisional_leases: list[LeaseRecord] = []
+        claimed_cells: set[str] = {plan.cell_id for plan in first_pass.preemptions}
+        now = utcnow()
+        for decision in first_pass.placements:
+            workload = guaranteed_by_id.get(decision.workload_id)
+            if workload is None:
+                continue
+            # Mark provisionally placed guaranteed workloads non-revocable in pass 2
+            # so a borrowing workload can never preempt a cell just granted to its owner.
+            protected_spec = workload.spec.model_copy(
+                update={
+                    "capacity_class": CapacityClass.ON_DEMAND,
+                    "checkpointable": False,
+                }
+            )
+            provisional_workloads.append(
+                workload.model_copy(update={"state": WorkloadState.LEASED, "spec": protected_spec})
+            )
+            for proposed in decision.all_leases:
+                cell = cell_by_id.get(proposed.cell_id)
+                if cell is None:
+                    continue
+                claimed_cells.add(proposed.cell_id)
+                provisional_leases.append(
+                    LeaseRecord(
+                        id=proposed.lease_id,
+                        workload_id=workload.id,
+                        cell_id=proposed.cell_id,
+                        cell_generation=cell.generation,
+                        org_id=workload.org_id,
+                        project_id=workload.project_id,
+                        resources=ResourceGang(
+                            replicas=workload.spec.gang.replicas,
+                            per_replica=workload.spec.gang.per_replica,
+                            required_topology=workload.spec.gang.required_topology,
+                        ),
+                        state=LeaseState.ACTIVE,
+                        hourly_cost=float(proposed.hourly_cost),
+                        reserved_cost=float(proposed.reserved_cost),
+                        resource_hours_reserved=_provisional_resource_vector(proposed.resource_hours_reserved),
+                        generation=workload.generation,
+                        fencing_token="provisional",
+                        tpu_chips=proposed.tpu_chips or None,
+                        expires_at=now + timedelta(seconds=60),
+                    )
+                )
+
+        second_pass = self.scheduler.schedule(
+            [*non_pending, *provisional_workloads, *borrowing_pending],
+            cells,
+            leases=[*leases, *provisional_leases],
+            budgets=budgets,
+            quotas=quotas,
+            policies=policies,
+            grants=grants,
+            quota_grants=quota_grants,
+            plane_id=self.plane_id,
+        )
+        return SchedulingResult(
+            placements=first_pass.placements + second_pass.placements,
+            preemptions=first_pass.preemptions
+            + tuple(plan for plan in second_pass.preemptions if plan.cell_id not in claimed_cells),
+            infeasibilities=first_pass.infeasibilities + second_pass.infeasibilities,
+            considered_order=first_pass.considered_order + second_pass.considered_order,
         )
 
     @staticmethod
@@ -138,7 +330,7 @@ class SchedulingMixin:
                 for candidate in await tx.list_workloads()
                 if candidate.state is not WorkloadState.PENDING or candidate.preemption_id is None
             ]
-            cells = await tx.list_cells()
+            cells = [cell for cell in await tx.list_cells() if cell.state is not CellState.DELETED]
             leases = await tx.list_leases()
             budgets = await tx.list_budgets()
             quotas = await tx.list_quotas()
@@ -259,7 +451,7 @@ class SchedulingMixin:
                     candidates.append(workload.model_copy(update={"schedulable": True}))
                 elif workload.state is not WorkloadState.PENDING or workload.preemption_id is None:
                     candidates.append(workload)
-            cells = await tx.list_cells()
+            cells = [cell for cell in await tx.list_cells() if cell.state is not CellState.DELETED]
             leases = await tx.list_leases()
             budgets = await tx.list_budgets()
             quotas = await tx.list_quotas()

@@ -19,6 +19,7 @@ service lives in ``eyvan.track.tracker`` and is deliberately not imported here.
 """
 
 from eyvan.track._format import run_id_for_workload
+from eyvan.track._names import generate_run_name
 from eyvan.track._run import (
     DEFAULT_LOCAL_STORE,
     DEFAULT_SPILL_DIR,
@@ -35,6 +36,7 @@ __all__ = (
     "ReplayResult",
     "Run",
     "TrackLimits",
+    "generate_run_name",
     "replay_spill",
     "run_id_for_workload",
     "start",

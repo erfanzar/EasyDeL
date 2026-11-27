@@ -21,15 +21,45 @@ from pathlib import Path
 from urllib.parse import quote
 
 import click
+import httpx
 
 import eyvan
 from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.commands.state import CliSession
+from eyvan.server.local.daemon import (
+    LocalDaemonError,
+    LocalDaemonResult,
+    LocalDaemonState,
+    ensure_loopback_control_plane,
+)
+from eyvan.server.local.tracker import LocalTrackerError, TrackerRecord, ensure_local_tracker
 
 #: Written by ``eyvan runtime init`` for a loopback control plane in
 #: LOOPBACK_DEFAULT auth mode, which 401s every request without it.
 DEFAULT_LOCAL_CREDENTIAL_PATH = Path("~/.eyvan/local-development-credential")
+
+
+def _ensure_loopback_plane(endpoint: ControlPlaneEndpoint) -> LocalDaemonResult:
+    """Start or adopt the local loopback control plane; injectable in tests."""
+
+    return ensure_loopback_control_plane(endpoint)
+
+
+def _ensure_local_tracker() -> tuple[TrackerRecord, bool]:
+    """Ensure the optional local run tracker is healthy; injectable in tests."""
+
+    return ensure_local_tracker()
+
+
+def _missing_dashboard_error(base_url: str) -> click.ClickException:
+    return click.ClickException(
+        f"the control plane at {base_url} serves its API but hosts no dashboard. "
+        "A head installed from a wheel carries no UI bundle: re-run `eyvan head up` from a checkout "
+        "that has built one (npm --prefix dashboard run build), or use the container deployment, "
+        "which builds it. `eyvan dashboard-dev` runs the UI locally against this plane."
+    )
 
 
 def _dashboard_root() -> Path:
@@ -56,9 +86,70 @@ def _local_credential(path: Path) -> str | None:
 
 @click.command("dashboard")
 @click.option("--open/--no-open", "open_browser", default=True, help="Open the hosted dashboard in a browser.")
+@click.option(
+    "--auto-start/--no-auto-start",
+    "auto_start",
+    default=True,
+    show_default=True,
+    help="Automatically start the local control plane and run tracker for loopback endpoints.",
+)
 @click.pass_obj
-def dashboard(session: CliSession, open_browser: bool) -> None:
+def dashboard(session: CliSession, open_browser: bool, auto_start: bool) -> None:
     """Open the dashboard hosted by the configured control plane."""
+
+    endpoint = ControlPlaneEndpoint.parse(session.base_url)
+    # Probe before opening a browser so we can:
+    # 1. Surface wheel-installed planes that host no UI bundle (404) instead of
+    #    sending the operator to a bare browser 404.
+    # 2. Auto-bootstrap an unreachable loopback control plane (and local run
+    #    tracker) when ``--auto-start`` is enabled.
+    #
+    # ``request`` decodes JSON and reports failures by raising, so a 200 HTML
+    # page raises EyvanApiError(200, "non-JSON ...") while an unreachable plane
+    # raises EyvanUnavailableError / httpx.ConnectError.
+    unreachable = False
+    try:
+        session.client.request("GET", "/")
+    except EyvanApiError as error:
+        if error.status_code == 404:
+            raise _missing_dashboard_error(session.base_url) from error
+    except (EyvanUnavailableError, httpx.ConnectError, httpx.ConnectTimeout):
+        unreachable = True
+    except Exception:
+        pass
+
+    if endpoint.is_loopback and auto_start:
+        if unreachable:
+            try:
+                daemon_result = _ensure_loopback_plane(endpoint)
+            except (LocalDaemonError, OSError, ValueError) as exc:
+                raise click.ClickException(
+                    f"could not start the local control plane at {endpoint.url}: {exc} "
+                    "(pass --no-auto-start to open the URL without auto-starting)"
+                ) from exc
+            if daemon_result.state is LocalDaemonState.STARTED:
+                click.echo(f"Started local Eyvan control plane at {endpoint.url}")
+            elif daemon_result.state is LocalDaemonState.REUSED:
+                click.echo(f"Using local Eyvan control plane at {endpoint.url}")
+            session.refresh_loopback_identity()
+            try:
+                session.client.request("GET", "/")
+            except EyvanApiError as error:
+                if error.status_code == 404:
+                    raise _missing_dashboard_error(session.base_url) from error
+            except Exception:
+                pass
+        if not os.environ.get("EYVAN_TRACKER_URL"):
+            try:
+                tracker_record, tracker_started = _ensure_local_tracker()
+            except (LocalTrackerError, LocalDaemonError, OSError, ValueError) as exc:
+                click.echo(
+                    f"Warning: could not start local run tracker ({exc}); continuing without local tracking.",
+                    err=True,
+                )
+            else:
+                if tracker_started:
+                    click.echo(f"Started local Eyvan run tracker at {tracker_record.url}")
 
     dashboard_url = f"{session.base_url.rstrip('/')}/"
     # A loopback plane demands its owner-only development credential from every
@@ -68,7 +159,6 @@ def dashboard(session: CliSession, open_browser: bool) -> None:
     # in a `Referer`, and the page strips this one from its address bar on
     # arrival. The credential never leaves this machine: a remote plane gets a
     # plain URL, and no local credential is ever printed for one.
-    endpoint = ControlPlaneEndpoint.parse(session.base_url)
     local_credential = session.identity.local_development_credential if endpoint.is_loopback else None
     if local_credential:
         # The fragment parameter name is a wire contract with the page that
@@ -76,31 +166,7 @@ def dashboard(session: CliSession, open_browser: bool) -> None:
         # ``dashboard/src/auth/oidc.ts``. It is stated once per side and each
         # side names the other, the same discipline as the refusal detail.
         dashboard_url = f"{dashboard_url}#eyvan-local-credential={quote(local_credential)}"
-    # Asked before a browser is opened, because a control plane installed from a
-    # wheel may serve no UI at all: the dashboard is a Node build tree that
-    # cannot travel inside a Python distribution. This command used to open that
-    # URL regardless and hand the operator a bare 404, with nothing to say which
-    # half was missing -- the plane, the route, or their own credentials.
-    #
-    # Only a 404 is treated as "no dashboard here". Any other answer, including a
-    # transport failure, leaves the old behaviour alone: guessing that a plane
-    # hosts nothing because one probe was unhappy would be its own wrong answer.
-    #
-    # ``request`` decodes JSON and reports failures by raising, so a status is
-    # only ever visible on the raised error -- the probe used to read
-    # ``.status_code`` off a decoded document and could never see the 404.
-    try:
-        session.client.request("GET", "/")
-    except EyvanApiError as error:
-        if error.status_code == 404:
-            raise click.ClickException(
-                f"the control plane at {session.base_url} serves its API but hosts no dashboard. "
-                "A head installed from a wheel carries no UI bundle: re-run `eyvan head up` from a checkout "
-                "that has built one (npm --prefix dashboard run build), or use the container deployment, "
-                "which builds it. `eyvan dashboard-dev` runs the UI locally against this plane."
-            ) from error
-    except Exception:
-        pass
+
     click.echo(f"Eyvan dashboard: {dashboard_url}")
     if open_browser:
         click.launch(dashboard_url)

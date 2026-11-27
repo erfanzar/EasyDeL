@@ -971,12 +971,18 @@ def test_stop_ends_a_recorded_cell_agent_and_refuses_foreign_processes(tmp_path:
         process_killer=AgentProcessKiller(),
     )
 
-    supervisor.stop()
+    # A mismatched profile filter leaves the live agent and its record untouched.
+    other_profile = (tmp_path / "runtime" / "other-runtime.json").resolve()
+    assert supervisor.stop(runtime_profile_path=other_profile) is None
+    assert graceful == []
+    assert read_owner_only_record(record_path) is not None
+
+    assert supervisor.stop(runtime_profile_path=Path(profile_id)) == 9177
 
     assert graceful == [9177], "the recorded agent must be gracefully terminated, exactly once"
     assert read_owner_only_record(record_path) is None, "stopping must clear the record it owned"
     # A cleared record makes a second stop a silent no-op, not an error.
-    supervisor.stop()
+    assert supervisor.stop() is None
 
     # A foreign command under a recorded PID is refused, not killed.
     write_owner_only_record(record_path, LocalDaemonRecord(endpoint=endpoint, pid=9178, runtime_profile_path=profile_id))

@@ -234,11 +234,11 @@ For EasyDeL there is a built-in step, `EasyDeLSetup`:
 ```python
 from eyvan import EasyDeLSetup, TpuConfig
 
-easydel = EasyDeLSetup(branch="vnext-into-main", repo="erfanzar/EasyDeL")
+easydel = EasyDeLSetup(branch="main", repo="erfanzar/EasyDeL")
 TpuConfig("v6e-8", setup=easydel)
 ```
 
-`branch` defaults to `vnext-into-main` and `repo` to `erfanzar/EasyDeL`; `repo`
+`branch` defaults to `main` and `repo` to `erfanzar/EasyDeL`; `repo`
 also accepts an `https://` git URL. `branch` may be a branch, a tag or a full
 commit. It is resolved to one commit when the job is submitted, not when the
 decorator runs, so every host installs the same code and a host's cached

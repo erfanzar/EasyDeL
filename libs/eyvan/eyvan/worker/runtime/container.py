@@ -47,6 +47,7 @@ from eyvan.worker.runtime.systemd_transient import (
     _durable_unlink,
     _ensure_private_directory,
     _environment,
+    _escape_systemd_exec_arg,
     _file_lock,
     _load_json,
     _record_lock_path,
@@ -380,6 +381,21 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         # writes only Docker's env file today. Missing paths are idempotent.
         return (*super()._environment_file_paths(remote_id), self._container_env_file_path(remote_id))
 
+    def _setup_file_paths(self, remote_id: str) -> tuple[Path, Path, int, int]:
+        """Stage large or ``%``-bearing setup JSON inside the read-only OCI bridge mount."""
+
+        filename = f"{hashlib.sha256(remote_id.encode('utf-8')).hexdigest()}.json"
+        host_path = self.state_dir / _OCI_CALLABLE_RUNNER_DIRECTORY_NAME / "setup" / filename
+        container_path = Path(OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY) / "setup" / filename
+        return host_path, container_path, 0o755, 0o644
+
+    def _setup_file_host_paths(self, remote_id: str) -> tuple[Path, ...]:
+        filename = f"{hashlib.sha256(remote_id.encode('utf-8')).hexdigest()}.json"
+        return (
+            *super()._setup_file_host_paths(remote_id),
+            self.state_dir / _OCI_CALLABLE_RUNNER_DIRECTORY_NAME / "setup" / filename,
+        )
+
     def _environment_temporary_directories(self) -> tuple[Path, ...]:
         """Include Docker's owner-only env directory in construction recovery."""
 
@@ -488,6 +504,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         # neither the unit argv nor the Docker command line exposes values.
         launch_environment = self._resolved_launch_environment(self._container_environment(_environment(spec)))
         _write_environment_file(self._container_env_file_path(remote_id), launch_environment)
+        self._stage_setup_file(remote_id, spec)
 
     def _launch_command(
         self,
@@ -498,7 +515,6 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         record: tp.Mapping[str, JsonValue],
         spec: tp.Mapping[str, JsonValue],
     ) -> tuple[str, ...]:
-        entrypoint = self._container_entrypoint(entrypoint)
         container_name = record.get("container_name")
         cidfile = record.get("container_cidfile")
         remote_id = record.get("remote_id")
@@ -508,6 +524,8 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             raise RuntimeError("native OCI execution record has no container cidfile")
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("native OCI execution record has no remote ID")
+        entrypoint = self._rewrite_staged_setup_entrypoint(entrypoint, remote_id)
+        entrypoint = self._container_entrypoint(entrypoint)
         gpu_requested, tpu_requested = _gang_accelerators(spec)
         if tpu_requested and not self._runtime.privileged:
             raise ValueError("native OCI TPU workloads require runtime.container.privileged=true")
@@ -519,6 +537,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             "--quiet",
             "--no-block",
             f"--unit={unit_name}",
+            f"--description=Eyvan workload {unit_name}",
             "--service-type=exec",
             *(("--property=ExitType=cgroup",) if self._use_exit_type_cgroup else ()),
             "--property=RemainAfterExit=yes",
@@ -557,7 +576,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             "/bin/sh",
             self._runtime.image,
             "-c",
-            entrypoint,
+            _escape_systemd_exec_arg(entrypoint),
         )
 
     def submit(self, spec: tp.Mapping[str, JsonValue], context: MutationContext) -> str:

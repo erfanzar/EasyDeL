@@ -52,6 +52,7 @@ from eyvan.capacity.providers.gcp.tpu_nodes import (
     validate_node_name,
 )
 from eyvan.capacity.providers.gcp.tpu_ssh import SshTpuNodeReader, attach_tunnel_spec
+from eyvan.config import EyvanSettings
 
 if tp.TYPE_CHECKING:
     from eyvan.capacity.providers.gcp.native_worker_ingress import NativeWorkerPublicIngress
@@ -95,11 +96,14 @@ class GcpAttachCapacityDriver:
         ssh_reader_factory: tp.Callable[[SshDestination], TpuNodeReader] | None = None,
         tunnels: SshTunnelManager | None = None,
         native_worker_public_ingress: NativeWorkerPublicIngress | None = None,
+        supports_exec: bool | None = None,
     ) -> None:
         if not _valid_port(native_worker_port):
             raise ValueError("native_worker_port must be a TCP port between 1 and 65535")
+        settings = EyvanSettings.from_env()
         self.state = state or FleetStateStore.from_uri(None)
         self.api = api or TpuNodeApi()
+        self.supports_exec = settings.capacity_supports_exec if supports_exec is None else supports_exec
         self.native_worker_port = native_worker_port
         # A node the operator's own credential cannot list is read through one of
         # its hosts instead; which reader applies is recorded per claim, not fixed.
@@ -123,7 +127,7 @@ class GcpAttachCapacityDriver:
             capacity_backends=(ATTACH_CAPACITY_BACKEND,),
             supports_callables=True,
             supports_checkpoint=True,
-            supports_exec=True,
+            supports_exec=self.supports_exec,
             max_gang_replicas=1,
             resource_enforcement="none",
         )
@@ -477,6 +481,7 @@ class GcpAttachCapacityDriver:
         project, zone, accelerator, capacity_class, name, node_id, mode = self._validate_desired(desired)
         access = self._access_options(self._nested_options(desired), mode)
         entry = tp.cast("str | None", access.get(OPTION_SSH_ENTRY))
+        # Phase 1: fast-fail stale generation/fences without touching the provider.
         with self._mutation_lock, self.state.exclusive():
             existing = self.state.get(cell_id)
             if existing is not None:
@@ -485,26 +490,35 @@ class GcpAttachCapacityDriver:
             fenced_generation = tombstone.get("generation") if tombstone else None
             if isinstance(fenced_generation, int) and context.generation <= fenced_generation:
                 raise StaleMutationError(f"cell {cell_id!r} was already drained or released at this generation")
-            node = self._node(project, zone, name, entry)
-            if node is None:
-                raise CapacityProviderError(
-                    "attached TPU no longer exists; re-run eyvan gcp connect",
-                    code=CapacityProviderFailureCode.CONFIGURATION,
-                    retryable=False,
-                )
-            if node.node_id != node_id:
-                raise CapacityProviderError(
-                    "TPU was recreated under the same name; re-run eyvan gcp connect",
-                    code=CapacityProviderFailureCode.CONFIGURATION,
-                    retryable=False,
-                )
-            if node.accelerator_type != accelerator or node.capacity_class.value.replace("_", "-") != capacity_class:
-                raise CapacityProviderError(
-                    "attached TPU accelerator_type or capacity_class does not match the provider",
-                    code=CapacityProviderFailureCode.CONFIGURATION,
-                    retryable=False,
-                )
-            uid = attach_management_uid(project=project, zone=zone, name=name, node_id=node_id)
+
+        # Phase 2: live provider REST/SSH probe runs outside fleet-state locks.
+        node = self._node(project, zone, name, entry)
+        if node is None:
+            raise CapacityProviderError(
+                "attached TPU no longer exists; re-run eyvan gcp connect",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+                retryable=False,
+            )
+        if node.node_id != node_id:
+            raise CapacityProviderError(
+                "TPU was recreated under the same name; re-run eyvan gcp connect",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+                retryable=False,
+            )
+        if node.accelerator_type != accelerator or node.capacity_class.value.replace("_", "-") != capacity_class:
+            raise CapacityProviderError(
+                "attached TPU accelerator_type or capacity_class does not match the provider",
+                code=CapacityProviderFailureCode.CONFIGURATION,
+                retryable=False,
+            )
+        uid = attach_management_uid(project=project, zone=zone, name=name, node_id=node_id)
+
+        # Phase 3: re-check fences and persist atomically under lock (no I/O).
+        with self._mutation_lock, self.state.exclusive():
+            tombstone = self.state.cell_tombstone(cell_id)
+            fenced_generation = tombstone.get("generation") if tombstone else None
+            if isinstance(fenced_generation, int) and context.generation <= fenced_generation:
+                raise StaleMutationError(f"cell {cell_id!r} was already drained or released at this generation")
 
             def mutate(record: FleetCellRecord) -> None:
                 if record.metadata.get("capacity_kind") not in (None, self.capacity_kind):

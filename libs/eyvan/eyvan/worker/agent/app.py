@@ -35,9 +35,11 @@ from eyvan.worker.agent.models import (
     CellStageActionResult,
     CheckpointRequest,
     ExecRequest,
+    GangReclaimNoticeRequest,
     GangWorkloadMutationRequest,
     GangWorkloadRequest,
     MutationConflictCode,
+    ReclaimNoticeRequest,
     WorkloadMutationRequest,
     WorkloadObservation,
     WorkloadRequest,
@@ -319,6 +321,22 @@ def create_agent_app(
     @app.post("/api/v1/cells/{cell_id}/workloads/{remote_id}/checkpoint", dependencies=[Depends(authenticate)])
     def checkpoint(cell_id: str, remote_id: str, body: CheckpointRequest) -> WorkloadObservation:
         return service.checkpoint(cell_id, remote_id, body)
+
+    @app.post("/api/v1/cells/{cell_id}/workloads/{remote_id}/reclaim-notice", dependencies=[Depends(authenticate)])
+    def reclaim_notice(cell_id: str, remote_id: str, body: ReclaimNoticeRequest) -> WorkloadObservation:
+        return service.reclaim_notice(cell_id, remote_id, body)
+
+    @app.post(
+        "/api/v1/cells/{cell_id}/workload-gangs/{workload_id}/{remote_id}/reclaim-notice",
+        dependencies=[Depends(authenticate)],
+    )
+    def reclaim_notice_gang(
+        cell_id: str,
+        workload_id: str,
+        remote_id: str,
+        body: GangReclaimNoticeRequest,
+    ) -> WorkloadObservation:
+        return service.reclaim_notice_gang(cell_id, workload_id, remote_id, body)
 
     @app.get(
         "/api/v1/cells/{cell_id}/workloads/{remote_id}/logs",

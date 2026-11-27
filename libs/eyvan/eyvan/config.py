@@ -169,6 +169,9 @@ class EyvanSettings:
 
     checkpoint_grace_s: int = 300
     preemption_stop_grace_s: int = 300
+    #: Default graceful checkpoint window (10 minutes) granted to a borrowed
+    #: workload before forced termination when capacity is reclaimed.
+    default_reclaim_grace_s: int = 600
     outbox_claim_ttl_s: int = 90
     #: How many durable commands one replica may deliver at once. Delivery used
     #: to be strictly serial, so a single preemption's checkpoint-and-stop --
@@ -586,7 +589,12 @@ class EyvanSettings:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.lease_ttl_s <= 0:
             raise ValueError("lease_ttl_s must be positive")
-        for name in ("checkpoint_grace_s", "preemption_stop_grace_s", "indeterminate_execution_grace_s"):
+        for name in (
+            "checkpoint_grace_s",
+            "preemption_stop_grace_s",
+            "default_reclaim_grace_s",
+            "indeterminate_execution_grace_s",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -773,6 +781,7 @@ class EyvanSettings:
             lease_ttl_s=int(os.getenv("EYVAN_LEASE_TTL_S", defaults.lease_ttl_s)),
             checkpoint_grace_s=int(os.getenv("EYVAN_CHECKPOINT_GRACE_S", defaults.checkpoint_grace_s)),
             preemption_stop_grace_s=int(os.getenv("EYVAN_PREEMPTION_STOP_GRACE_S", defaults.preemption_stop_grace_s)),
+            default_reclaim_grace_s=int(os.getenv("EYVAN_DEFAULT_RECLAIM_GRACE_S", defaults.default_reclaim_grace_s)),
             outbox_claim_ttl_s=int(os.getenv("EYVAN_OUTBOX_CLAIM_TTL_S", defaults.outbox_claim_ttl_s)),
             outbox_dispatch_concurrency=int(
                 os.getenv("EYVAN_OUTBOX_DISPATCH_CONCURRENCY", defaults.outbox_dispatch_concurrency)

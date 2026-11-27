@@ -343,3 +343,26 @@ class LocalTrackerSupervisor:
             record = read_tracker_record(self.directory)
             if record is not None:
                 self._stop(record)
+
+
+def ensure_local_tracker(
+    *,
+    store_uri: str | None = None,
+    port: int = 8095,
+    timeout_s: float = 15.0,
+    directory: Path | None = None,
+) -> tuple[TrackerRecord, bool]:
+    """Ensure a healthy local run tracker is running, returning ``(record, started)``.
+
+    Reuses an already-running owned local tracker when ``store_uri`` is omitted,
+    even if it was launched on a custom port or store. Otherwise starts one via
+    :class:`LocalTrackerSupervisor`.
+    """
+
+    supervisor = LocalTrackerSupervisor(directory=directory)
+    if store_uri is None and supervisor.status().get("status") == "running":
+        existing = read_tracker_record(supervisor.directory)
+        if existing is not None:
+            return existing, False
+    record = supervisor.up(store_uri=store_uri, port=port, timeout_s=timeout_s)
+    return record, True

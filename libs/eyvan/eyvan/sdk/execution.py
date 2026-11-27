@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import inspect
 import os
+import re
 import threading
 import typing as tp
 import uuid
@@ -49,9 +50,14 @@ from eyvan.sdk.client.jobs import (
     GpuConfig,
     JobBackend,
     JobCompletion,
+    ReclaimPolicy,
     SetupScript,
+    SetupValue,
     TpuConfig,
+    format_reclaim_status,
+    placement_error_labels,
     reject_remote_callable_signing_key,
+    with_reclaim_options,
 )
 from eyvan.sdk.client.transport import EyvanHTTPError, EyvanUnavailableError
 from eyvan.sdk.contexts import (
@@ -172,18 +178,22 @@ def _ensure_fleet_applied(client: tp.Any, fleet: str | None, cache_dir: Path | N
     transport = getattr(client, "_transport", None)
     if transport is None:
         return
+    applied: tp.Any = None
     try:
         response = transport.request_checked("GET", f"/api/v1/fleets/{fleet}")
         applied = response.json()
-    except EyvanHTTPError:
-        # No such fleet, or this caller may not read it. Submission reports both
-        # far better than a setup helper can.
-        return
-    pools = applied.get("pools") if isinstance(applied, dict) else None
-    if not isinstance(pools, list):
-        return
-    if any(isinstance(pool, dict) and pool.get("enabled") for pool in pools):
-        return
+    except EyvanHTTPError as exc:
+        # 404 means the fleet has not been applied yet -- fall through to apply
+        # any cached autoscale config for it. Other errors (such as 403) are
+        # left to submission, which reports them far better than a setup helper.
+        if exc.status_code != 404:
+            return
+    if applied is not None:
+        pools = applied.get("pools") if isinstance(applied, dict) else None
+        if not isinstance(pools, list):
+            return
+        if any(isinstance(pool, dict) and pool.get("enabled") for pool in pools):
+            return
 
     from eyvan.capacity.autoscale.cache import GeneratedAutoscaleCache
     from eyvan.sdk.commands.fleets import FleetCommandService
@@ -219,7 +229,17 @@ def _fleet_exists(transport: tp.Any, fleet: str) -> bool | None:
     return True
 
 
-def _run_connect(base_url: str, project: str, zone: str, name: str) -> int:
+def _run_connect(
+    base_url: str,
+    project: str,
+    zone: str,
+    name: str,
+    *,
+    org_id: str | None = None,
+    project_id: str | None = None,
+    token: str | None = None,
+    dev_user: str | None = None,
+) -> int:
     """Run ``eyvan gcp connect`` for one discovered TPU, its progress shown on stderr."""
 
     import subprocess
@@ -233,20 +253,34 @@ def _run_connect(base_url: str, project: str, zone: str, name: str) -> int:
         "eyvan.sdk.cli",
         "--url",
         base_url,
-        "gcp",
-        "connect",
-        "--tpu",
-        name,
-        "--project",
-        project,
-        "--zone",
-        zone,
     ]
+    if org_id:
+        argv.extend(["--org", org_id])
+    if project_id:
+        argv.extend(["--project", project_id])
+    if dev_user:
+        argv.extend(["--user", dev_user])
+    argv.extend(
+        [
+            "gcp",
+            "connect",
+            "--tpu",
+            name,
+            "--project",
+            project,
+            "--zone",
+            zone,
+        ]
+    )
+    env = provider_cli_env()
+    if token:
+        # Pass bearer credentials via environment rather than process argv.
+        env["EYVAN_TOKEN"] = token
     try:
         stdout: tp.Any = sys.stderr.fileno()
     except (AttributeError, OSError, ValueError):
         stdout = None
-    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=stdout, env=provider_cli_env(), check=False).returncode
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=stdout, env=env, check=False).returncode
 
 
 def _connect_discovered_tpu(
@@ -539,7 +573,18 @@ def init(
         if runtime_profile is not None:
             from eyvan.capacity.providers.gcp.tpu_discovery import refresh_in_background
 
-            configured_fleet = _connect_discovered_tpu(client, configured_fleet, endpoint.url)
+            configured_fleet = _connect_discovered_tpu(
+                client,
+                configured_fleet,
+                endpoint.url,
+                connect=functools.partial(
+                    _run_connect,
+                    org_id=configured_org,
+                    project_id=configured_project,
+                    token=identity.token,
+                    dev_user=identity.dev_user,
+                ),
+            )
             refresh_in_background()
         _ensure_fleet_applied(
             client,
@@ -623,10 +668,13 @@ def _resolve_fleet_from_tpu(context: ExecutionContext[tp.Any], tpu: AcceleratorC
             pool for pool in pools if pool.capacity_class is CapacityClass.RESERVED
         ]
     if not pools:
+        accelerator_label, config_name = placement_error_labels(tpu)
         raise EyvanPlacementError(
             requested_accelerator_type=tpu.type,
             available_accelerator_types=(),
             scope=f"{context.org_id}/{context.project_id} with capacity class {tpu.capacity_class.value!r}",
+            accelerator_label=accelerator_label,
+            config_name=config_name,
         )
     for pool in pools:
         if pool.max_cells >= tpu.pods:
@@ -666,11 +714,13 @@ class Executable(tp.Generic[P, R]):
         config: AcceleratorConfig,
         context: ExecutionContext[R] | None,
         workspace: str | os.PathLike[str] | bool | None = None,
+        fleet: str | None = None,
     ):
         self._fn = fn
         self._config = config
         self._context = context
         self._workspace = workspace
+        self._fleet = fleet
         functools.update_wrapper(self, fn)
 
     @property
@@ -678,6 +728,12 @@ class Executable(tp.Generic[P, R]):
         """Return this callable's immutable TPU request."""
 
         return self._config
+
+    @property
+    def fleet(self) -> str | None:
+        """Return the explicit fleet override for this callable, or ``None``."""
+
+        return self._fleet
 
     def submit(self, *args: P.args, **kwargs: P.kwargs) -> EyvanJob[R]:
         """Serialize and submit one invocation, returning its durable handle."""
@@ -706,7 +762,7 @@ class Executable(tp.Generic[P, R]):
         bound = _zero_arg_invocation(self._fn, *args, **kwargs)
         artifact = context.artifact_store.put(dump_callable(bound, signing_key=context.signing_key))
         invocation_id = f"call-{uuid.uuid4().hex}"
-        fleet = context.fleet
+        fleet = self._fleet if self._fleet is not None else context.fleet
         if fleet is None:
             fleet = _resolve_fleet_from_tpu(context, self._config)
         workspace_uri: str | None = None
@@ -774,18 +830,56 @@ class Executable(tp.Generic[P, R]):
         return self.submit(*args, **kwargs).result()
 
 
+_TPU_MULTISLICE_SHORTHAND = re.compile(r"^(?P<type>(?:v[0-9]|tpu[0-9])[a-z0-9]*-[1-9][0-9]*)[xX](?P<pods>[0-9]+)$")
+
+
+def _parse_tpu_shorthand(shape: str) -> tuple[str, int]:
+    """Parse ``"v5p-128"``, ``"v6e-8"``, or ``"v6e-8x4"`` into ``(accelerator_type, pods)``."""
+
+    normalized = shape.strip()
+    matched = _TPU_MULTISLICE_SHORTHAND.fullmatch(normalized)
+    if matched is not None:
+        return matched.group("type"), int(matched.group("pods"))
+    return normalized, 1
+
+
+def _resolve_capacity_class(value: CapacityClass | str) -> CapacityClass:
+    """Normalize a ``CapacityClass`` enum or string name (e.g. ``"spot"`` or ``"reserved"``)."""
+
+    if isinstance(value, CapacityClass):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        try:
+            return CapacityClass(normalized)
+        except ValueError as error:
+            valid = ", ".join(item.value for item in CapacityClass)
+            raise ValueError(f"capacity_class must be a CapacityClass or one of {valid}") from error
+    raise ValueError("capacity_class must be a CapacityClass or string name")
+
+
 def execute(
-    config: AcceleratorConfig,
+    config: AcceleratorConfig | str,
     *,
     context: ExecutionContext[R] | None = None,
     workspace: str | os.PathLike[str] | bool | None = None,
+    setup: SetupValue = None,
+    packages: tp.Sequence[str] = (),
+    capacity_class: CapacityClass | str | None = None,
+    fleet: str | None = None,
+    reclaim_grace_seconds: int | None = None,
+    reclaim_policy: ReclaimPolicy | None = None,
 ) -> tp.Callable[[tp.Callable[P, R]], Executable[P, R]]:
     """Decorate a function for durable, scale-from-zero Eyvan execution.
 
-    Takes any ``AcceleratorConfig`` -- ``TpuConfig``, ``GpuConfig`` or
-    ``CpuConfig``. The GPU and CPU classes were complete, validated and exported
-    while this one entry point refused them, so the only hardware the decorator
-    could reach was TPU; everything below it has always been shape-agnostic.
+    Takes either an ``AcceleratorConfig`` -- ``TpuConfig``, ``GpuConfig`` or
+    ``CpuConfig`` -- or a TPU shape string shorthand such as ``"v5p-128"``,
+    ``"v6e-8"``, or ``"v6e-8x4"`` (multislice ``<type>x<pods>``). When a string
+    is passed, ``setup``, ``packages``, ``capacity_class``,
+    ``reclaim_grace_seconds``, and ``reclaim_policy`` are forwarded into
+    ``TpuConfig``; passing ``setup``, ``packages``, or ``capacity_class``
+    alongside an already-constructed ``AcceleratorConfig`` raises ``ValueError``
+    to prevent ambiguous overrides.
 
     ``workspace`` ships a working directory alongside the callable, so
     application modules travel with the job instead of having to be baked
@@ -798,19 +892,72 @@ def execute(
     to submitting without a workspace, with a warning naming what was lost,
     because a callable that needs nothing local must not die at submission.
     ``workspace=False`` is the explicit refusal of all of the above.
+
+    ``fleet`` pins the target fleet for this callable, overriding
+    ``context.fleet`` when provided.
+
+    ``reclaim_grace_seconds`` and ``reclaim_policy`` override the config's
+    reclaim settings when provided (defaulting to a 600-second checkpoint
+    grace window and ``"requeue"`` policy).
     """
 
-    # A class object satisfies the protocol's attribute check as readily as an
-    # instance does, so ``@execute(TpuConfig)`` -- the missing parentheses --
-    # would pass a bare protocol test and fail much later with an error naming
-    # none of this. Rejecting the type here is what keeps that a one-line fix.
-    if isinstance(config, type) or not isinstance(config, AcceleratorConfig):
-        raise TypeError("execute requires a TpuConfig, GpuConfig, or CpuConfig instance")
+    normalized_fleet: str | None = None
+    if fleet is not None:
+        if not isinstance(fleet, str) or not fleet.strip():
+            raise ValueError("fleet must be a non-empty string")
+        normalized_fleet = fleet.strip()
+
+    if isinstance(config, str):
+        if isinstance(packages, (str, bytes)) or not isinstance(packages, tp.Sequence):
+            raise ValueError("packages must be a sequence of package requirement strings")
+        tpu_type, pods = _parse_tpu_shorthand(config)
+        tpu_kwargs: dict[str, tp.Any] = {
+            "type": tpu_type,
+            "pods": pods,
+            "dependencies": tuple(packages),
+            "setup": setup,
+        }
+        if capacity_class is not None:
+            tpu_kwargs["capacity_class"] = _resolve_capacity_class(capacity_class)
+        if reclaim_grace_seconds is not None:
+            tpu_kwargs["reclaim_grace_seconds"] = reclaim_grace_seconds
+        if reclaim_policy is not None:
+            tpu_kwargs["reclaim_policy"] = reclaim_policy
+        resolved_config = tp.cast(AcceleratorConfig, TpuConfig(**tpu_kwargs))
+    else:
+        # A class object satisfies the protocol's attribute check as readily as an
+        # instance does, so ``@execute(TpuConfig)`` -- the missing parentheses --
+        # would pass a bare protocol test and fail much later with an error naming
+        # none of this. Rejecting the type here is what keeps that a one-line fix.
+        if isinstance(config, type) or not isinstance(config, AcceleratorConfig):
+            raise TypeError(
+                "execute requires a TpuConfig, GpuConfig, or CpuConfig instance, or a TPU shape string like 'v5p-128'"
+            )
+        if setup is not None:
+            raise ValueError(
+                "setup= cannot be combined with an already-constructed AcceleratorConfig; "
+                "pass setup= to TpuConfig/GpuConfig/CpuConfig or pass a TPU shape string to execute()"
+            )
+        if isinstance(packages, (str, bytes)) or (isinstance(packages, tp.Sequence) and len(packages) > 0) or packages:
+            raise ValueError(
+                "packages= cannot be combined with an already-constructed AcceleratorConfig; "
+                "pass dependencies= to TpuConfig/GpuConfig/CpuConfig or pass a TPU shape string to execute()"
+            )
+        if capacity_class is not None:
+            raise ValueError(
+                "capacity_class= cannot be combined with an already-constructed AcceleratorConfig; "
+                "pass capacity_class= to TpuConfig/GpuConfig/CpuConfig or pass a TPU shape string to execute()"
+            )
+        resolved_config = with_reclaim_options(
+            config,
+            reclaim_grace_seconds=reclaim_grace_seconds,
+            reclaim_policy=reclaim_policy,
+        )
 
     def decorate(fn: tp.Callable[P, R]) -> Executable[P, R]:
         if not callable(fn):
             raise TypeError("execute can only decorate callable objects")
-        return Executable(fn, config, context, workspace)
+        return Executable(fn, resolved_config, context, workspace, fleet=normalized_fleet)
 
     return decorate
 
@@ -830,9 +977,11 @@ __all__ = (
     "GpuConfig",
     "JobBackend",
     "JobCompletion",
+    "ReclaimPolicy",
     "SetupScript",
     "TpuConfig",
     "execute",
+    "format_reclaim_status",
     "get_context",
     "init",
 )

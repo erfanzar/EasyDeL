@@ -452,12 +452,16 @@ class NodeTypeBase(FleetConfigModel):
             worker_value = normalized[worker_field]
             if worker_field == "max_workers" and not isinstance(worker_value, bool) and worker_value == 0:
                 worker_value = _MAX_POOL_WORKERS
-                warnings.warn(
-                    f"max_workers: 0 means unbounded and was normalized to the maximum pool ceiling of "
-                    f"{_MAX_POOL_WORKERS} cells; spell max_workers: {_MAX_POOL_WORKERS} to silence this warning",
-                    UserWarning,
-                    stacklevel=2,
+                bounded_by_quota_group = (
+                    bool(normalized.get("quota_group")) and normalized.get("quota_limit") is not None
                 )
+                if not bounded_by_quota_group:
+                    warnings.warn(
+                        f"max_workers: 0 means unbounded and was normalized to the maximum pool ceiling of "
+                        f"{_MAX_POOL_WORKERS} cells; spell max_workers: {_MAX_POOL_WORKERS} to silence this warning",
+                        UserWarning,
+                        stacklevel=2,
+                    )
             if cell_field in normalized and normalized[cell_field] != worker_value:
                 raise ValueError(f"{worker_field} conflicts with {cell_field}")
             normalized[cell_field] = worker_value

@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -36,6 +37,15 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
+from eyvan.worker.runtime.log_records import LogPage, LogRecord
+from eyvan.worker.runtime.preemption import (
+    CHECKPOINT_RECEIPT_PATH_ENV,
+    RECLAIM_NOTICE_PATH_ENV,
+    read_checkpoint_receipt,
+)
+
+_LOCAL_LOG_CURSOR = re.compile(r"^b(0|[1-9][0-9]*)$")
+_LOCAL_LOG_PAGE_MAX_BYTES = 8 * 1024 * 1024
 
 _TERMINAL_STATES = frozenset(
     {
@@ -77,6 +87,11 @@ class _LocalExecutionRecord(BaseModel):
     command_pid: int | None = None
     command_start_marker: str | None = None
     group_quiescent: bool = False
+    notice_path: str | None = None
+    receipt_path: str | None = None
+    stop_grace_s: float | None = None
+    reclaim_notified: bool = False
+    checkpoint_uri: str | None = None
 
 
 class _LogicalWorkloadFence(BaseModel):
@@ -543,6 +558,47 @@ def _validate_gang(spec: tp.Mapping[str, JsonValue]) -> None:
         raise ValueError("native-local execution does not support topology constraints")
 
 
+def _trim_incomplete_utf8_tail(data: bytes) -> bytes:
+    """Drop a trailing incomplete UTF-8 sequence so force-split chunks do not corrupt codepoints."""
+
+    if not data:
+        return data
+    end = len(data)
+    index = end - 1
+    continuations = 0
+    while index >= 0 and continuations < 3 and (data[index] & 0xC0) == 0x80:
+        index -= 1
+        continuations += 1
+    if index < 0:
+        return data
+    lead = data[index]
+    if lead < 0x80:
+        return data
+    if (lead & 0xE0) == 0xC0:
+        expected = 2
+    elif (lead & 0xF0) == 0xE0:
+        expected = 3
+    elif (lead & 0xF8) == 0xF0:
+        expected = 4
+    else:
+        return data
+    if end - index < expected and index > 0:
+        return data[:index]
+    return data
+
+
+def _strip_line_ending(raw_line: bytes, *, force_split: bool) -> bytes:
+    """Remove a single line terminator without dropping payload bytes from force-split chunks."""
+
+    if raw_line.endswith(b"\r\n"):
+        return raw_line[:-2]
+    if raw_line.endswith(b"\n"):
+        return raw_line[:-1]
+    if force_split:
+        return raw_line
+    return raw_line.rstrip(b"\r\n")
+
+
 class LocalProcessExecutor:
     """Run fenced workloads as durable, detached processes on one host.
 
@@ -557,7 +613,15 @@ class LocalProcessExecutor:
         self.logs_dir = self.state_dir / "logs"
         self.owners_dir = self.state_dir / "owners"
         self.workloads_dir = self.state_dir / "workloads"
-        for directory in (self.state_dir, self.jobs_dir, self.logs_dir, self.owners_dir, self.workloads_dir):
+        self.notices_dir = self.state_dir / "notices"
+        for directory in (
+            self.state_dir,
+            self.jobs_dir,
+            self.logs_dir,
+            self.owners_dir,
+            self.workloads_dir,
+            self.notices_dir,
+        ):
             create_private_directory(directory)
             directory.chmod(0o700)
         self._lock = RLock()
@@ -570,6 +634,10 @@ class LocalProcessExecutor:
     def _paths(self, remote_id: str) -> tuple[Path, Path, Path]:
         name = _record_name(remote_id)
         return self.jobs_dir / f"{name}.json", self.logs_dir / f"{name}.log", self.owners_dir / f"{name}.lock"
+
+    def _notice_paths(self, remote_id: str) -> tuple[Path, Path]:
+        name = _record_name(remote_id)
+        return self.notices_dir / f"{name}.reclaim.json", self.notices_dir / f"{name}.checkpoint.json"
 
     def _workload_fence_path(self, workload_id: str) -> Path:
         return self.workloads_dir / f"{_record_name(workload_id)}.json"
@@ -687,6 +755,20 @@ class LocalProcessExecutor:
             raise ValueError("native-local workloads require a non-empty entrypoint")
         _validate_gang(spec)
         environment = _environment(spec)
+        # Keep per-job runtime environments and unpacked workspaces under the
+        # executor's own state directory (or the operator's explicit override)
+        # instead of letting dependency_entry / workspace_entry fall back into
+        # whatever git repository the agent was launched from.
+        runtime_env_dir = os.environ.get("EYVAN_RUNTIME_ENV_DIR")
+        environment.setdefault(
+            "EYVAN_RUNTIME_ENV_DIR",
+            runtime_env_dir if runtime_env_dir else str(self.state_dir / "runtime-envs"),
+        )
+        workspace_dir = os.environ.get("EYVAN_WORKSPACE_DIR")
+        environment.setdefault(
+            "EYVAN_WORKSPACE_DIR",
+            workspace_dir if workspace_dir else str(self.state_dir / "workspaces"),
+        )
         submitted_remote_id = spec.get("submission_id")
         if submitted_remote_id is None:
             remote_id = context.idempotency_key.strip()
@@ -702,6 +784,9 @@ class LocalProcessExecutor:
         workload_id = self._logical_workload_id(metadata)
 
         record_path, log_path, owner_path = self._paths(remote_id)
+        notice_path, receipt_path = self._notice_paths(remote_id)
+        environment.setdefault(RECLAIM_NOTICE_PATH_ENV, str(notice_path))
+        environment.setdefault(CHECKPOINT_RECEIPT_PATH_ENV, str(receipt_path))
         with self._lock, ExitStack() as publication_locks:
             # Reject a generation that reuses an existing attempt ID before
             # advancing the logical high watermark. Otherwise a rejected
@@ -745,6 +830,8 @@ class LocalProcessExecutor:
                     finished_at=None,
                     log_path=str(log_path),
                     owner_path=str(owner_path),
+                    notice_path=str(notice_path),
+                    receipt_path=str(receipt_path),
                 )
                 record = model_json(new_record)
                 _atomic_write_json(record_path, record)
@@ -960,6 +1047,69 @@ class LocalProcessExecutor:
             if _owner_active(owner_path):
                 _signal_tracked_worker(record, signal.SIGTERM)
 
+    def notify_reclaim(
+        self,
+        remote_id: str,
+        *,
+        notice: tp.Mapping[str, JsonValue],
+        grace_s: int,
+        context: MutationContext,
+    ) -> None:
+        """Write an atomic reclaim notice file and deliver a graceful signal."""
+
+        record_path, _log_path, owner_path = self._paths(remote_id)
+        default_notice_path, _default_receipt_path = self._notice_paths(remote_id)
+        with self._lock:
+            record = _read_record(record_path)
+            if record is None:
+                return
+            self._validate_fence(remote_id, record, context)
+            if _persisted_status(remote_id, record) in _TERMINAL_STATES:
+                return
+            raw_notice_path = record.get("notice_path")
+            notice_path = (
+                Path(raw_notice_path)
+                if isinstance(raw_notice_path, str) and raw_notice_path.strip()
+                else default_notice_path
+            )
+            _atomic_write_json(notice_path, notice)
+            effective_grace = float(max(grace_s, 1))
+
+            def record_reclaim_notice(current: JsonObject) -> None:
+                current["stop_grace_s"] = effective_grace
+                current["reclaim_notified"] = True
+                current["stop_requested"] = True
+                current["message"] = "native-local graceful reclaim notice delivered"
+
+            record = _mutate_record(record_path, record_reclaim_notice) or record
+            if _owner_active(owner_path):
+                graceful_signal = getattr(signal, "SIGUSR1", signal.SIGTERM)
+                _signal_tracked_worker(record, graceful_signal)
+
+    def read_checkpoint_uri(self, remote_id: str) -> str | None:
+        """Return any checkpoint URI persisted by the worker or acknowledged by the job."""
+
+        record_path, _log_path, _owner_path = self._paths(remote_id)
+        _default_notice_path, default_receipt_path = self._notice_paths(remote_id)
+        record = _read_record(record_path)
+        if record is not None:
+            stored = record.get("checkpoint_uri")
+            if isinstance(stored, str) and stored.strip():
+                return stored.strip()
+            raw_receipt_path = record.get("receipt_path")
+            receipt_path = (
+                Path(raw_receipt_path)
+                if isinstance(raw_receipt_path, str) and raw_receipt_path.strip()
+                else default_receipt_path
+            )
+        else:
+            receipt_path = default_receipt_path
+        receipt = read_checkpoint_receipt(receipt_path)
+        if receipt is None:
+            return None
+        uri = receipt.get("checkpoint_uri")
+        return uri.strip() if isinstance(uri, str) and uri.strip() else None
+
     def retire(self, remote_id: str, context: MutationContext) -> None:
         """Stop a superseded execution and wait until its process group exits."""
 
@@ -1039,6 +1189,98 @@ class LocalProcessExecutor:
             return log_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return ""
+
+    def log_page(self, remote_id: str, *, after: str = "", limit: int = 200) -> LogPage:
+        """Return one byte-offset resumable page of log lines for a local execution.
+
+        Uses ``b<byte_offset>`` cursors so live following, ``eyvan run``, and
+        settlement log archiving stream incrementally from ``log_path`` without
+        colliding with the legacy ``rank=`` / ``attempt:`` delimiter grammar.
+        """
+
+        record_path, log_path, _owner_path = self._paths(remote_id)
+        record = _read_record(record_path)
+        if record is None:
+            return LogPage(unavailable=True, detail="no durable execution record")
+        if not after:
+            offset = 0
+        else:
+            match = _LOCAL_LOG_CURSOR.fullmatch(after)
+            if match is None:
+                return LogPage(unavailable=True, detail=f"invalid local log cursor {after!r}")
+            offset = int(match.group(1))
+        raw_pid = record.get("command_pid")
+        pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0 else None
+        is_terminal = _persisted_status(remote_id, record) in _TERMINAL_STATES
+        max_lines = max(1, limit)
+        try:
+            with log_path.open("rb") as stream:
+                size = os.fstat(stream.fileno()).st_size
+                if offset > size:
+                    return LogPage(
+                        unavailable=True,
+                        detail=f"local log cursor {after!r} exceeds log size ({size} bytes)",
+                    )
+                if offset == size:
+                    return LogPage(records=(), next_cursor=after)
+                stream.seek(offset)
+                records: list[LogRecord] = []
+                bytes_read = 0
+                while len(records) < max_lines and bytes_read < _LOCAL_LOG_PAGE_MAX_BYTES:
+                    remaining = _LOCAL_LOG_PAGE_MAX_BYTES - bytes_read
+                    raw_line = stream.readline(remaining)
+                    if not raw_line:
+                        break
+                    force_split = False
+                    if not raw_line.endswith(b"\n"):
+                        at_eof = offset + len(raw_line) >= size
+                        if at_eof:
+                            # Hold back a partial trailing line while the workload is still
+                            # running so live polling does not split one line across records.
+                            if not is_terminal:
+                                break
+                        elif records:
+                            # This line crosses the page byte budget; stop here so the next
+                            # page reads it cleanly from its start instead of splitting it.
+                            break
+                        else:
+                            # Single line reaches or exceeds _LOCAL_LOG_PAGE_MAX_BYTES.
+                            # Consume an immediately adjacent line terminator so exact-boundary
+                            # lines do not emit a phantom blank line on the next page.
+                            peek = stream.read(2)
+                            if raw_line.endswith(b"\r") and peek.startswith(b"\n"):
+                                raw_line += b"\n"
+                            elif peek.startswith(b"\r\n"):
+                                raw_line += b"\r\n"
+                            elif peek.startswith(b"\n"):
+                                raw_line += b"\n"
+                            else:
+                                raw_line = _trim_incomplete_utf8_tail(raw_line)
+                                if raw_line.endswith(b"\r") and len(raw_line) > 1:
+                                    raw_line = raw_line[:-1]
+                                force_split = True
+                    offset += len(raw_line)
+                    bytes_read += len(raw_line)
+                    payload = _strip_line_ending(raw_line, force_split=force_split)
+                    records.append(
+                        LogRecord(
+                            message=payload.decode("utf-8", "replace"),
+                            stream="unknown",
+                            cursor=f"b{offset}",
+                            rank=0,
+                            pid=pid,
+                        )
+                    )
+                    if force_split:
+                        break
+        except FileNotFoundError:
+            if offset > 0:
+                return LogPage(unavailable=True, detail="local workload log file is missing")
+            return LogPage(records=(), next_cursor=after)
+        except OSError as exc:
+            return LogPage(unavailable=True, detail=f"could not read local workload log: {exc}")
+        next_cursor = records[-1].cursor if records else after
+        return LogPage(records=tuple(records), next_cursor=next_cursor)
 
 
 __all__ = ("LocalProcessExecutor",)

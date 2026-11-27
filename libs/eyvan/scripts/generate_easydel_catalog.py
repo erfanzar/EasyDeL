@@ -53,8 +53,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE_DIR = REPO_ROOT / "eyvan" / "assistant_knowledge"
 CATALOG_PATH = KNOWLEDGE_DIR / "easydel_trainers.json"
 ESSENTIALS_PATH = KNOWLEDGE_DIR / "easydel_essentials.json"
-#: A sibling EasyDeL checkout next to this repository (the maintainer layout).
-DEFAULT_SOURCE = REPO_ROOT.parent / "EasyDeL" / "libs" / "easydel" / "easydel" / "trainers"
+
+
+#: Locate the sibling EasyDeL trainer sources: monorepo layout (``libs/easydel``)
+#: first, then a standalone sibling checkout next to this repository.
+def _default_source() -> Path:
+    monorepo = REPO_ROOT.parent / "easydel" / "easydel" / "trainers"
+    if monorepo.is_dir():
+        return monorepo
+    return REPO_ROOT.parent / "EasyDeL" / "libs" / "easydel" / "easydel" / "trainers"
+
+
+DEFAULT_SOURCE = _default_source()
 GENERATED_BY = "scripts/generate_easydel_catalog.py"
 BASE_CLASS = "TrainingArguments"
 #: Auxiliary model blocks the eLarge YAML runner understands (``<role>_model``).
@@ -671,9 +681,33 @@ def _revision(source: Path) -> str:
     git = shutil.which("git")
     if git is None:
         return "unknown"
+    resolved = source.resolve()
+    package_root = resolved.parent
+    tracked = [
+        str(path)
+        for path in (
+            resolved,
+            package_root / "infra" / "elarge" / "types" / "training.py",
+            package_root / "infra" / "etils.py",
+        )
+        if path.exists()
+    ]
+    if tracked:
+        try:
+            scoped = subprocess.run(
+                [git, "-C", str(resolved), "log", "-n", "1", "--abbrev=9", "--format=%h", "--", *tracked],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if scoped.returncode == 0 and scoped.stdout.strip():
+                return scoped.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
     try:
         result = subprocess.run(
-            [git, "-C", str(source), "rev-parse", "--short=9", "HEAD"],
+            [git, "-C", str(resolved), "rev-parse", "--short=9", "HEAD"],
             capture_output=True,
             text=True,
             timeout=20,

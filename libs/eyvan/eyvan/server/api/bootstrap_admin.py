@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
+import os
 import sys
 import typing as tp
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from eyvan._internal.platform import load_platform_config, refuse_removed_team_variable, resolve_team_mode
 from eyvan.config import EyvanSettings, RepositoryBackend
@@ -95,6 +98,23 @@ async def bootstrap_admin(
     }
 
 
+def _is_loopback_url(url: str) -> bool:
+    """Return whether ``url`` addresses a literal loopback host or localhost."""
+
+    try:
+        hostname = (urlsplit(url.strip()).hostname or "").strip().lower()
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def main(argv: tp.Sequence[str] | None = None) -> int:
     """Run ``eyvan-server bootstrap-admin``; returns a process exit status."""
 
@@ -102,7 +122,7 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         prog="eyvan-server bootstrap-admin",
         description="Create the first fleet-admin invite on a team-mode plane that has no accounts yet.",
     )
-    parser.add_argument("--username", required=True, help="User name for the admin account (e.g. erfan).")
+    parser.add_argument("--username", required=True, help="User name for the admin account (e.g. operator).")
     parser.add_argument(
         "--email",
         help="Label stored on the account; nobody is emailed. Defaults to USERNAME@localhost.invalid.",
@@ -111,8 +131,8 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--local-state-path",
         type=Path,
-        help="State document of a local-backend plane (the server's own --local-state-path; "
-        "default ~/.eyvan/control-plane.json).",
+        help="State document of a local-backend plane (default ~/.eyvan/control-plane.json, or a "
+        "supervised daemon profile's control-plane.json).",
     )
     parser.add_argument(
         "--team",
@@ -132,8 +152,24 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"bootstrap-admin: {exc}", file=sys.stderr)
         return 1
+    backend_configured = "EYVAN_REPOSITORY_BACKEND" in os.environ
     if args.local_state_path is not None:
-        settings = replace(settings, local_state_path=args.local_state_path.expanduser())
+        if backend_configured and settings.repository_backend is not RepositoryBackend.LOCAL:
+            print(
+                f"bootstrap-admin: --local-state-path conflicts with "
+                f"EYVAN_REPOSITORY_BACKEND={settings.repository_backend.value}",
+                file=sys.stderr,
+            )
+            return 1
+        settings = replace(
+            settings,
+            repository_backend=RepositoryBackend.LOCAL,
+            local_state_path=args.local_state_path.expanduser(),
+        )
+    elif not backend_configured and _is_loopback_url(args.public_url or settings.public_url):
+        # Match eyvan-server's loopback startup default (server_startup.py):
+        # an unconfigured loopback plane persists to local JSON, not memory.
+        settings = replace(settings, repository_backend=RepositoryBackend.LOCAL)
     try:
         result = asyncio.run(bootstrap_admin(settings, email=email, username=username, public_url=args.public_url))
     except BootstrapError as exc:

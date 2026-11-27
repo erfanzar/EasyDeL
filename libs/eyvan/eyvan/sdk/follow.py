@@ -16,6 +16,7 @@ from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.records import WorkloadRecord, WorkloadState
 from eyvan.sdk.client.sync import UNREACHABLE_GRACE_S
 from eyvan.sdk.client.transport import EyvanUnavailableError
+from eyvan.sdk.commands.http import EyvanApiError
 from eyvan.sdk.job_receipt import JobLifecycleUpdate, JobTerminalOutput
 from eyvan.sdk.lifecycle import TERMINAL_STATES, workload_lifecycle_update
 from eyvan.worker.runtime.log_records import routine_unit_chatter
@@ -178,7 +179,7 @@ class _Transport(tp.Protocol):
 
 
 def _ray_style_prefix(rank: int, provenance: tuple[int | None, str | None]) -> str:
-    """Ray's worker-log prefix: ``(Worker pid=4102, ip=10.130.0.138) ``.
+    """Ray's worker-log prefix: ``(Worker pid=4102, ip=198.51.100.10) ``.
 
     Whatever the archive reports goes in; what it does not is left out rather
     than invented -- a rank with no pid reads ``(rank 2)``, bare if neither.
@@ -232,6 +233,8 @@ class WorkloadFollower:
     _last_update: JobLifecycleUpdate | None = None
     _rank_prefixes: bool = False
     _reported_notes: set[str] = field(default_factory=set)
+    _use_plain_logs: bool = False
+    _plain_log_lines: int = 0
 
     def follow(self, workload_id: str) -> FollowOutcome:
         """Stream one workload to completion and report how it ended."""
@@ -256,7 +259,7 @@ class WorkloadFollower:
             terminal = workload is not None and workload.state in TERMINAL_STATES
             # Live polls are fair to lifecycle updates; terminal and one-shot
             # reads have no later poll to recover output left behind a budget.
-            self._drain(workload_id, bounded=not terminal)
+            self._drain(workload_id, bounded=not terminal, terminal=terminal)
             if terminal:
                 assert workload is not None
                 # Settlement archives this attempt's remaining output *before*
@@ -284,13 +287,15 @@ class WorkloadFollower:
         except Exception:
             return None
 
-    def _drain(self, workload_id: str, *, bounded: bool = False) -> bool:
+    def _drain(self, workload_id: str, *, bounded: bool = False, terminal: bool = True) -> bool:
         """Read available output, returning whether the page stream was exhausted.
 
         The one-shot CLI caller uses an exhaustive drain by default. Live
         following explicitly bounds each batch so progress is still polled.
         """
 
+        if self._use_plain_logs:
+            return self._drain_plain_logs(workload_id, terminal=terminal)
         pages = 0
         seen_cursors: set[str] = set()
         while not bounded or pages < self.max_pages_per_poll:
@@ -299,12 +304,24 @@ class WorkloadFollower:
                 return False
             seen_cursors.add(self._cursor)
             pages += 1
-            window = _LogWindow.parse(
-                self._request(
+            try:
+                page_payload = self._request(
                     f"/api/v1/workloads/{workload_id}/log-page",
                     params={"after": self._cursor, "limit": self.page_limit},
                 )
-            )
+            except EyvanApiError as error:
+                if error.status_code == 501:
+                    self._use_plain_logs = True
+                    return self._drain_plain_logs(workload_id, terminal=terminal)
+                raise
+            window = _LogWindow.parse(page_payload)
+            if (
+                window.unavailable
+                and not window.raw_record_count
+                and "does not expose structured logs" in window.detail.lower()
+            ):
+                self._use_plain_logs = True
+                return self._drain_plain_logs(workload_id, terminal=terminal)
             if window.attempt_changed:
                 # A retry. The previous attempt's positions address journals
                 # that belong to an execution that no longer exists, so the
@@ -347,6 +364,48 @@ class WorkloadFollower:
             if not window.raw_record_count:
                 return not window.unavailable
         return False
+
+    def _drain_plain_logs(self, workload_id: str, *, terminal: bool) -> bool:
+        """Fall back to plain-text ``/logs`` when structured log pages are unsupported."""
+
+        text = self._request_text(f"/api/v1/workloads/{workload_id}/logs")
+        if text is None or not text:
+            return True
+        if text.startswith("[eyvan] this workload has not been dispatched to a cell yet"):
+            return True
+        lines = text.splitlines()
+        if not terminal and not text.endswith("\n") and lines:
+            lines = lines[:-1]
+        if len(lines) < self._plain_log_lines:
+            self._plain_log_lines = 0
+        for line in lines[self._plain_log_lines :]:
+            if routine_unit_chatter(line):
+                continue
+            self._settle_output()
+            self.write(line)
+        self._plain_log_lines = len(lines)
+        return True
+
+    def _request_text(self, path: str) -> str | None:
+        """Read a plain-text log response under the same transport-outage grace."""
+
+        request_text = getattr(self.client, "request_text", None)
+        if not callable(request_text):
+            payload = self._request(path)
+            return payload if isinstance(payload, str) else None
+        unreachable_since: float | None = None
+        while True:
+            try:
+                value = request_text("GET", path)
+                return value if isinstance(value, str) else None
+            except EyvanUnavailableError:
+                now = time.monotonic()
+                if unreachable_since is None:
+                    unreachable_since = now
+                remaining = UNREACHABLE_GRACE_S - (now - unreachable_since)
+                if remaining <= 0:
+                    raise
+                self.sleep(min(self.poll_interval, remaining))
 
     def _request(
         self, path: str, *, params: tp.Mapping[str, str | int | float | bool | None] | None = None

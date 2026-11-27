@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
 import tempfile
+import time
 import typing as tp
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -26,8 +28,10 @@ from eyvan.capacity.autoscale import AutoscaleConfigCache
 from eyvan.sdk.commands.state import CliSession
 from eyvan.server.local.daemon import LocalDaemonError
 from eyvan.server.local.tracker import LocalTrackerError, LocalTrackerSupervisor
+from eyvan.storage import StorageConfigStore, StorageError, default_gcp_token_provider, validate_scope_segment
 from eyvan.track._format import validate_run_id, validate_sha256
-from eyvan.track._store import store_for_uri
+from eyvan.track._gcs import GcsTrackingStore
+from eyvan.track._store import LocalTrackingStore, TrackingStore, TrackingStoreError, store_for_uri
 
 
 def run_command(argv: tuple[str, ...]) -> None:
@@ -159,6 +163,247 @@ def track_sync(spill_dir: Path, store_uri: str | None) -> None:
     click.echo(json.dumps(payload, sort_keys=True, indent=2, default=str))
     if getattr(result, "failed", 0):
         raise click.ClickException("some segments remain unsynced; inspect the replay result and retry")
+
+
+def _open_pull_store(uri: str) -> TrackingStore:
+    """Open a tracking store for ``eyvan track pull``; injectable in tests."""
+
+    value = uri.strip()
+    if value.startswith("gs://"):
+        return GcsTrackingStore(value, token_provider=default_gcp_token_provider())
+    return store_for_uri(value)
+
+
+def _matches_run_filter(key: str, run_id: str) -> bool:
+    parts = key.split("/")
+    if not parts:
+        return False
+    if parts[0] == run_id:
+        return True
+    return len(parts) >= 3 and parts[2] == run_id
+
+
+#: Injectable sleeper used by ``eyvan track pull --watch`` in tests.
+_watch_sleep: tp.Callable[[float], None] = time.sleep
+
+
+def _pull_once(
+    source_store: TrackingStore,
+    dest_store: LocalTrackingStore,
+    *,
+    prefix: str,
+    validated_run: str | None,
+    prefix_parts: list[str],
+    existing_keys: set[str],
+) -> tuple[int, int, int, int, list[str]]:
+    """Run one incremental pull pass, updating ``existing_keys`` in place."""
+
+    remote_keys = source_store.list(prefix)
+    if validated_run is not None and len(prefix_parts) < 2:
+        remote_keys = [key for key in remote_keys if _matches_run_filter(key, validated_run)]
+
+    downloaded = 0
+    skipped = 0
+    failed = 0
+    total_bytes = 0
+    errors: list[str] = []
+
+    for key in remote_keys:
+        if key in existing_keys:
+            skipped += 1
+            continue
+        try:
+            data = source_store.get(key)
+            dest_store.put(key, data)
+        except (FileNotFoundError, OSError, TrackingStoreError, ValueError) as exc:
+            failed += 1
+            errors.append(f"{key}: {exc}")
+        else:
+            existing_keys.add(key)
+            downloaded += 1
+            total_bytes += len(data)
+    return downloaded, skipped, failed, total_bytes, errors
+
+
+@track.command("pull")
+@click.option(
+    "--store",
+    "store_uri",
+    help="Source tracking store URI (defaults to the configured Eyvan monitoring bucket).",
+)
+@click.option(
+    "--dest",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("~/.eyvan/tracking"),
+    show_default=True,
+    help="Local tracking directory to pull immutable segments into.",
+)
+@click.option("--org", help="Limit pull to this organization scope segment.")
+@click.option("--project", help="Limit pull to this project scope segment (defaults --org to 'default').")
+@click.option("--run", "run_id", help="Limit pull to one run ID.")
+@click.option(
+    "--watch",
+    "watch_interval",
+    type=float,
+    default=None,
+    help="Continuously poll every N seconds until interrupted (Ctrl+C).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print pull counts as JSON.")
+def track_pull(
+    store_uri: str | None,
+    dest: Path,
+    org: str | None,
+    project: str | None,
+    run_id: str | None,
+    watch_interval: float | None,
+    as_json: bool,
+) -> None:
+    """Pull immutable tracking segments from the monitoring bucket into a local tracking directory."""
+
+    if watch_interval is not None and (not math.isfinite(watch_interval) or watch_interval <= 0):
+        raise click.ClickException("--watch must be a positive number of seconds")
+
+    try:
+        resolved_source = store_uri
+        if not resolved_source:
+            storage_cfg = StorageConfigStore().load()
+            if storage_cfg.monitoring is None:
+                raise click.ClickException(
+                    "no default monitoring bucket configured; pass --store gs://... or run `eyvan storage init`"
+                )
+            resolved_source = storage_cfg.monitoring.uri
+
+        prefix_parts: list[str] = []
+        if project is not None and org is None:
+            org = "default"
+        if org is not None:
+            prefix_parts.append(validate_scope_segment(org, field_name="org"))
+        if project is not None:
+            prefix_parts.append(validate_scope_segment(project, field_name="project"))
+        validated_run = validate_run_id(run_id) if run_id is not None else None
+        if validated_run is not None and len(prefix_parts) == 2:
+            prefix_parts.append(validated_run)
+        prefix = "/".join(prefix_parts)
+
+        source_store = _open_pull_store(resolved_source)
+        dest_store = LocalTrackingStore(dest.expanduser())
+        existing_keys = set(dest_store.list(prefix))
+    except click.ClickException:
+        raise
+    except (OSError, StorageError, TrackingStoreError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if watch_interval is None:
+        try:
+            downloaded, skipped, failed, total_bytes, errors = _pull_once(
+                source_store,
+                dest_store,
+                prefix=prefix,
+                validated_run=validated_run,
+                prefix_parts=prefix_parts,
+                existing_keys=existing_keys,
+            )
+        except (OSError, StorageError, TrackingStoreError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        summary = {
+            "source": source_store.root,
+            "dest": str(dest_store.directory),
+            "prefix": prefix,
+            "downloaded": downloaded,
+            "skipped": skipped,
+            "failed": failed,
+            "bytes": total_bytes,
+            "errors": errors,
+        }
+        if as_json:
+            click.echo(json.dumps(summary, sort_keys=True, indent=2))
+        else:
+            click.echo(
+                f"Pulled {downloaded} file(s) ({total_bytes} bytes), skipped {skipped} existing "
+                f"from {source_store.root} -> {dest_store.directory}"
+            )
+            for err in errors:
+                click.echo(f"  error: {err}", err=True)
+        if failed:
+            raise click.ClickException(f"{failed} tracking file(s) failed to pull")
+        return
+
+    polls = 0
+    total_downloaded = 0
+    total_skipped = 0
+    total_failed = 0
+    total_bytes_all = 0
+    if not as_json:
+        click.echo(
+            f"Watching {source_store.root} -> {dest_store.directory} every {watch_interval:g}s (Ctrl+C to stop)..."
+        )
+    try:
+        while True:
+            polls += 1
+            try:
+                downloaded, skipped, failed, batch_bytes, errors = _pull_once(
+                    source_store,
+                    dest_store,
+                    prefix=prefix,
+                    validated_run=validated_run,
+                    prefix_parts=prefix_parts,
+                    existing_keys=existing_keys,
+                )
+            except (OSError, StorageError, TrackingStoreError, ValueError) as exc:
+                downloaded, skipped, failed, batch_bytes, errors = 0, 0, 1, 0, [str(exc)]
+
+            total_downloaded += downloaded
+            total_skipped += skipped
+            total_failed += failed
+            total_bytes_all += batch_bytes
+
+            if polls == 1 or downloaded > 0 or failed > 0:
+                if as_json:
+                    click.echo(
+                        json.dumps(
+                            {
+                                "poll": polls,
+                                "source": source_store.root,
+                                "dest": str(dest_store.directory),
+                                "prefix": prefix,
+                                "downloaded": downloaded,
+                                "skipped": skipped,
+                                "failed": failed,
+                                "bytes": batch_bytes,
+                                "errors": errors,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                else:
+                    click.echo(
+                        f"[poll {polls}] Pulled {downloaded} file(s) ({batch_bytes} bytes), skipped {skipped} existing"
+                    )
+                    for err in errors:
+                        click.echo(f"  error: {err}", err=True)
+            _watch_sleep(watch_interval)
+    except KeyboardInterrupt:
+        pass
+
+    final_summary = {
+        "stopped": True,
+        "polls": polls,
+        "source": source_store.root,
+        "dest": str(dest_store.directory),
+        "prefix": prefix,
+        "downloaded": total_downloaded,
+        "skipped": total_skipped,
+        "failed": total_failed,
+        "bytes": total_bytes_all,
+    }
+    if as_json:
+        click.echo(json.dumps(final_summary, sort_keys=True))
+    else:
+        click.echo(
+            f"Stopped watching after {polls} poll(s): pulled {total_downloaded} file(s) "
+            f"({total_bytes_all} bytes), {total_failed} error(s)."
+        )
 
 
 @click.group("runs")

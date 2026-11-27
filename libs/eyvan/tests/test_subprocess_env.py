@@ -65,6 +65,24 @@ def test_provider_cli_env_defaults_to_the_process_environment(monkeypatch) -> No
     assert environment["EYVAN_PROJECT"] == "default"
 
 
+def test_provider_cli_env_applies_overrides_without_reintroducing_interpreter_steering() -> None:
+    base = {"PATH": "/usr/bin", "PYTHONPATH": "libs/easydel"}
+
+    environment = provider_cli_env(
+        base,
+        overrides={
+            "CLOUDSDK_CORE_ACCOUNT": "alice@example.com",
+            "PYTHONPATH": "/tmp/sneaky",
+        },
+    )
+
+    assert environment == {
+        "PATH": "/usr/bin",
+        "CLOUDSDK_CORE_ACCOUNT": "alice@example.com",
+    }
+    assert "CLOUDSDK_CORE_ACCOUNT" not in base
+
+
 def _captured_env_run(
     captured: dict[str, tp.Any],
 ) -> tp.Callable[..., subprocess.CompletedProcess[str]]:

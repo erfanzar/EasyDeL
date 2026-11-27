@@ -128,3 +128,86 @@ def test_eyvan_server_bootstrap_admin_runs_as_a_real_process(tmp_path: Path) -> 
     second = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=60)
     assert second.returncode == 1
     assert "already has team accounts" in second.stderr and "eyvinv_" not in second.stdout + second.stderr
+
+
+def test_eyvan_server_bootstrap_admin_resolves_local_backend_without_env_var(tmp_path: Path) -> None:
+    """Passing --local-state-path or using the loopback default resolves RepositoryBackend.LOCAL."""
+
+    from eyvan.server.api.bootstrap_admin import main as bootstrap_main
+
+    base_env = {key: value for key, value in os.environ.items() if not key.startswith("EYVAN_") and key != "PYTHONPATH"}
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # 1. Explicit --local-state-path works without EYVAN_REPOSITORY_BACKEND even with a remote public URL.
+    explicit_state = tmp_path / "explicit.json"
+    env_explicit = {
+        **base_env,
+        "HOME": str(home),
+        "EYVAN_PUBLIC_URL": "https://plane.example.com",
+        "EYVAN_PLATFORM_CONFIG_PATH": str(tmp_path / "absent-platform.yaml"),
+    }
+    proc_explicit = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from eyvan.server.api.app import main; main()",
+            "bootstrap-admin",
+            "--team",
+            "--local-state-path",
+            str(explicit_state),
+            "--username",
+            "localadmin",
+            "--json",
+        ],
+        env=env_explicit,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc_explicit.returncode == 0, proc_explicit.stderr
+    assert json.loads(proc_explicit.stdout)["username"] == "localadmin"
+    assert explicit_state.is_file()
+
+    # 2. Loopback default works without --local-state-path or EYVAN_REPOSITORY_BACKEND.
+    env_loopback = {
+        **base_env,
+        "HOME": str(home),
+        "EYVAN_PLATFORM_CONFIG_PATH": str(tmp_path / "absent-platform.yaml"),
+    }
+    proc_loopback = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from eyvan.server.api.app import main; main()",
+            "bootstrap-admin",
+            "--team",
+            "--username",
+            "loopadmin",
+            "--json",
+        ],
+        env=env_loopback,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc_loopback.returncode == 0, proc_loopback.stderr
+    assert json.loads(proc_loopback.stdout)["username"] == "loopadmin"
+    assert (home / ".eyvan" / "control-plane.json").is_file()
+
+    # 3. Conflicting explicit EYVAN_REPOSITORY_BACKEND=postgres with --local-state-path is refused cleanly.
+    # 4. Malformed IPv6 --public-url does not raise an unhandled ValueError traceback.
+    saved_env = dict(os.environ)
+    try:
+        for key in list(os.environ):
+            if key.startswith("EYVAN_"):
+                os.environ.pop(key)
+        os.environ["EYVAN_REPOSITORY_BACKEND"] = "postgres"
+        os.environ["EYVAN_PLATFORM_CONFIG_PATH"] = str(tmp_path / "absent-platform.yaml")
+        assert bootstrap_main(["--team", "--username", "a", "--local-state-path", str(tmp_path / "conflict.json")]) == 1
+
+        os.environ.pop("EYVAN_REPOSITORY_BACKEND", None)
+        assert bootstrap_main(["--team", "--username", "a", "--public-url", "http://[::1"]) == 1
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)

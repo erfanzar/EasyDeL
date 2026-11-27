@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from eyvan.capacity.hardware_catalog import shape_for
 from eyvan.domain.tpu_chips import chip_request_error
 from eyvan.records import ResourceVector, TpuChipRequest, WorkloadSetup
@@ -95,6 +97,7 @@ class CallableSubmissionMixin:
         priority_band: PriorityBand = PriorityBand.INTERACTIVE,
         intra_band_priority: int = 0,
         checkpoint_grace_seconds: int = 0,
+        reclaim_policy: Literal["requeue", "stop"] = "requeue",
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
@@ -171,6 +174,7 @@ class CallableSubmissionMixin:
                 **({"tpu_chips": tpu_chips.model_dump(mode="json")} if tpu_chips is not None else {}),
                 # Likewise: a different setup step is a different job.
                 **({"setup": setup.model_dump(mode="json")} if setup is not None else {}),
+                **({"reclaim_policy": reclaim_policy} if reclaim_policy != "requeue" else {}),
             }
         )
         async with self.repository.transaction() as tx:
@@ -361,6 +365,7 @@ class CallableSubmissionMixin:
                 priority_band=priority_band,
                 intra_band_priority=intra_band_priority,
                 checkpoint_grace_seconds=checkpoint_grace_seconds,
+                reclaim_policy=reclaim_policy,
                 estimated_duration_seconds=estimated_duration_seconds,
                 named_assets=named_assets,
                 dependencies=dependencies,
@@ -607,6 +612,7 @@ class CallableSubmissionMixin:
         priority_band: PriorityBand = PriorityBand.INTERACTIVE,
         intra_band_priority: int = 0,
         checkpoint_grace_seconds: int = 0,
+        reclaim_policy: Literal["requeue", "stop"] = "requeue",
         estimated_duration_seconds: int = 3600,
         named_assets: tuple[str, ...] = (),
         dependencies: tuple[str, ...] = (),
@@ -675,6 +681,7 @@ class CallableSubmissionMixin:
             priority_band=priority_band,
             intra_band_priority=intra_band_priority,
             checkpoint_grace_seconds=checkpoint_grace_seconds,
+            reclaim_policy=reclaim_policy,
             estimated_duration_seconds=estimated_duration_seconds,
             named_assets=named_assets,
             dependencies=dependencies,

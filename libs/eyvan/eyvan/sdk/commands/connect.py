@@ -136,32 +136,106 @@ def probe(
                     "the control plane is up but refused this identity; ask whoever runs it for a token "
                     "and pass --token",
                 )
-            # The route filters by ``fleet_name`` alone and ignores every
-            # other query parameter, so the scope here is declarative -- the
-            # probe names the org and project it is asking about -- rather
-            # than something the route requires. An earlier comment claimed
-            # the route mandated these and answered 422 without them; neither
-            # was ever true of the server.
+            # Fleet admins can list all capacity pools directly; non-admin
+            # team accounts lack MANAGE_FLEET and get 403 here, so fall back to
+            # the submitter-scoped /capacity (and /fleets) endpoints using the
+            # caller's scope or the submit-capable scopes reported by /session.
             pools = client.get(
                 f"{base}/api/v1/capacity-pools",
                 headers=headers,
                 params={"org_id": org_id, "project_id": project_id},
             )
+            if pools.status_code == 200:
+                fleets = _fleet_names(pools)
+                pool_count = _count(pools)
+            elif pools.status_code in (401, 403):
+                fleets, pool_count = _discover_submit_capacity(
+                    client,
+                    base,
+                    headers=headers,
+                    session=session,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+            else:
+                fleets = ()
+                pool_count = 0
     except httpx.HTTPError as error:
         return ConnectTarget(url, False, f"could not reach {base}: {error}")
 
-    # Fleets are read off the pools rather than from /fleets. A fleet with no
-    # pool is not something anybody can submit to, and this command exists to
-    # answer "what can I use here" -- so the list is the set of fleets that
-    # actually own capacity.
+    # Fleets are read off the pools (or submit-scoped capacity/fleets for
+    # non-admins). A fleet with no enabled capacity is not something anybody
+    # can submit to, and this command exists to answer "what can I use here".
     return ConnectTarget(
         url=base,
         reachable=True,
-        fleets=_fleet_names(pools),
-        pools=_count(pools),
+        fleets=fleets,
+        pools=pool_count,
         subject=_subject(session),
         roles=_roles(session),
     )
+
+
+def _candidate_submit_scopes(session: object, org_id: str, project_id: str) -> tuple[tuple[str, str], ...]:
+    """Return ordered deduplicated (org_id, project_id) scopes to try for submit capacity discovery."""
+
+    scopes: list[tuple[str, str]] = []
+
+    def add(org: object, project: object) -> None:
+        if isinstance(org, str) and org and isinstance(project, str) and project:
+            pair = (org, project)
+            if pair not in scopes:
+                scopes.append(pair)
+
+    add(org_id, project_id)
+    payload = _json(session)
+    if not is_json_object(payload):
+        return tuple(scopes)
+    session_scopes = payload.get("scopes")
+    if isinstance(session_scopes, list):
+        for scope in session_scopes:
+            if not is_json_object(scope):
+                continue
+            permissions = scope.get("permissions")
+            if isinstance(permissions, list) and "submit" not in permissions:
+                continue
+            add(scope.get("org_id"), scope.get("project_id"))
+    grants = payload.get("grants")
+    if isinstance(grants, list):
+        for grant in grants:
+            if not is_json_object(grant) or grant.get("role") == "project_viewer":
+                continue
+            grant_org = grant.get("org_id")
+            grant_project = grant.get("project_id")
+            if grant_project:
+                add(grant_org, grant_project)
+            elif grant_org:
+                add(grant_org, project_id or DEFAULT_PROJECT_ID)
+    return tuple(scopes)
+
+
+def _discover_submit_capacity(
+    client: tp.Any,
+    base: str,
+    *,
+    headers: tp.Mapping[str, str],
+    session: object,
+    org_id: str,
+    project_id: str,
+) -> tuple[tuple[str, ...], int]:
+    """Discover ready fleets and pool count for non-admin principals via /capacity (fallback /fleets)."""
+
+    for scope_org, scope_project in _candidate_submit_scopes(session, org_id, project_id):
+        params = {"org_id": scope_org, "project_id": scope_project}
+        capacity = client.get(f"{base}/api/v1/capacity", headers=headers, params=params)
+        if capacity.status_code == 200:
+            return _fleet_names(capacity), _count(capacity)
+        if capacity.status_code in (401, 403):
+            continue
+        fleets_response = client.get(f"{base}/api/v1/fleets", headers=headers, params=params)
+        if fleets_response.status_code == 200:
+            return _fleet_names(fleets_response), _count(fleets_response)
+    return (), 0
 
 
 def _json(response: object) -> object:
@@ -171,19 +245,41 @@ def _json(response: object) -> object:
         return None
 
 
-def _fleet_names(response: object) -> tuple[str, ...]:
-    """Return the distinct fleets owning the pools in this response."""
+def _pool_items(payload: object) -> list[dict[str, tp.Any]] | None:
+    """Extract pool dicts from `/capacity-pools` (list) or `/capacity` (`{"pools": [...]}`)."""
 
-    payload = _json(response)
-    if not isinstance(payload, list):
+    if isinstance(payload, list):
+        if payload and not any(is_json_object(item) for item in payload):
+            return None
+        return [item for item in payload if is_json_object(item)]
+    if is_json_object(payload):
+        pools = payload.get("pools")
+        if isinstance(pools, list):
+            return [item for item in pools if is_json_object(item)]
+    return None
+
+
+def _fleet_names(response: object) -> tuple[str, ...]:
+    """Return the distinct fleets reported by `/capacity-pools`, `/capacity`, or `/fleets`."""
+
+    if getattr(response, "status_code", 200) != 200:
         return ()
-    names = [item.get("fleet_name") for item in payload if is_json_object(item)]
-    return tuple(sorted({name for name in names if isinstance(name, str) and name}))
+    payload = _json(response)
+    items = _pool_items(payload)
+    if items is not None:
+        names = [item.get("fleet_name") or item.get("fleet") for item in items]
+        return tuple(sorted({name for name in names if isinstance(name, str) and name}))
+    if isinstance(payload, list):
+        return tuple(sorted({name for name in payload if isinstance(name, str) and name}))
+    return ()
 
 
 def _count(response: object) -> int:
+    if getattr(response, "status_code", 200) != 200:
+        return 0
     payload = _json(response)
-    return len(payload) if isinstance(payload, list) else 0
+    items = _pool_items(payload)
+    return len(items) if items is not None else 0
 
 
 def _subject(response: object) -> str | None:

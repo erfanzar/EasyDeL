@@ -332,8 +332,18 @@ def test_headroom_boundary_and_utilization_are_exact() -> None:
 
 
 def test_bad_unknown_and_fractional_chip_types_are_skipped() -> None:
-    fits = fitting_slices(_memory(GIB), ("bad", "gpu-8", "tpu7x-8", "v9z-4", "v4-1", "v5p-3", "v6e-1"))
+    fits = fitting_slices(_memory(GIB), ("bad", "gpu-8", "v9z-4", "v4-1", "v5p-3", "v6e-1"))
     assert [fit.accelerator_type for fit in fits] == ["v6e-1"]
+
+
+def test_tpu7x_uses_192_gib_per_chip_and_chip_count_suffix() -> None:
+    fits = fitting_slices(_memory(150 * GIB), ("tpu7x-4", "tpu7x-8"))
+    by_type = {fit.accelerator_type: fit for fit in fits}
+    assert by_type["tpu7x-4"].chips == 4
+    assert by_type["tpu7x-4"].hbm_per_chip_gib == 192.0
+    assert by_type["tpu7x-4"].fits is True
+    assert by_type["tpu7x-8"].chips == 8
+    assert TPU_HBM_GIB["tpu7x"] == 192.0
 
 
 def test_default_candidates_are_parseable_and_have_known_hbm() -> None:

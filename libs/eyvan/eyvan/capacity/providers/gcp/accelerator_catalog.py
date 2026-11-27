@@ -53,14 +53,17 @@ class AcceleratorCatalogError(RuntimeError):
     """The accelerator catalogue could not be read over the API."""
 
 
-def gcloud_access_token(timeout_s: float = 30.0) -> str:
+def gcloud_access_token(timeout_s: float = 30.0, *, account: str | None = None) -> str:
     """Mint a bearer token from whatever credentials gcloud already holds.
 
     Deliberately not a credentials library. The operator has already logged in
     for every other Eyvan GCP operation, and introducing a second way to
     authenticate would mean two things to configure and two ways to be broken.
+    When ``account`` is supplied, ``CLOUDSDK_CORE_ACCOUNT`` scopes this one
+    process without modifying gcloud's active configuration.
     """
 
+    overrides = {"CLOUDSDK_CORE_ACCOUNT": account} if account else None
     try:
         result = subprocess.run(
             ["gcloud", "auth", "print-access-token"],
@@ -68,7 +71,7 @@ def gcloud_access_token(timeout_s: float = 30.0) -> str:
             capture_output=True,
             text=True,
             timeout=timeout_s,
-            env=provider_cli_env(),
+            env=provider_cli_env(overrides=overrides),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AcceleratorCatalogError(f"could not run gcloud to mint a token: {exc}") from exc

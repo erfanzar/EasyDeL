@@ -75,7 +75,7 @@ or `team: true`.
   job's environment with `EYVAN_PYTHON` naming its interpreter; it is cached per
   host by script content and arguments, its output goes to the job log, and a
   non-zero exit fails the job. Unset, requests and records are unchanged.
-- `EasyDeLSetup(branch="vnext-into-main", repo="erfanzar/EasyDeL")`: a built-in
+- `EasyDeLSetup(branch="main", repo="erfanzar/EasyDeL")`: a built-in
   setup step that resolves the branch to one commit at submission and installs
   every `libs/` package of EasyDeL's uv workspace from that checkout at the
   versions its `uv.lock` pins.

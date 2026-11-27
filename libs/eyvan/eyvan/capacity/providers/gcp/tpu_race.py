@@ -42,11 +42,59 @@ NAME_PREFIX = "eyvan-race-"
 #: Where receipts land when the caller names no path; ``eyvan race sweep`` reads them.
 RECEIPT_DIRECTORY = Path("~/.eyvan/races")
 
-_ZONE = re.compile(r"^[a-z]+-[a-z]+[0-9]+-[a-z]$")
+_ZONE = re.compile(r"^[a-z]+-[a-z]+[0-9]+-[a-z][a-z0-9]*$")
 _ACCELERATOR = re.compile(r"^[a-z0-9]+-[0-9]+$")
 _RUN_ID = re.compile(r"^[0-9a-f]{8}$")
 _RETRYABLE = frozenset({429, 500, 502, 503, 504})
 _PAGE_SIZE = 500
+
+#: Substrings identifying transient rate-limit 429s that should still be retried.
+_TRANSIENT_RATE_LIMIT_PHRASES = (
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "queries per",
+    "requests per",
+    "per minute",
+    "per second",
+)
+
+#: Substrings identifying permanent quota exhaustion on HTTP 429 (e.g. Limit: 0).
+_PERMANENT_QUOTA_429_PHRASES = (
+    "limit: 0",
+    "quota limit",
+    "quota exceeded",
+    "exceeded quota",
+    "insufficient quota",
+)
+
+
+def _is_permanent_quota_429(document: JsonObject) -> bool:
+    """Return whether an HTTP 429 response represents permanent quota exhaustion rather than a transient rate limit."""
+
+    text = error_text(document).lower()
+    if any(phrase in text for phrase in _TRANSIENT_RATE_LIMIT_PHRASES):
+        return False
+    error = document.get("error")
+    if is_json_object(error):
+        details = error.get("details")
+        if isinstance(details, list):
+            for entry in details:
+                if not is_json_object(entry):
+                    continue
+                reason = entry.get("reason")
+                if isinstance(reason, str):
+                    upper = reason.upper()
+                    if "RATE_LIMIT" in upper:
+                        return False
+                    if upper == "QUOTA_EXCEEDED":
+                        return True
+    if any(phrase in text for phrase in _PERMANENT_QUOTA_429_PHRASES):
+        return True
+    if is_json_object(error) and str(error.get("status", "")).upper() == "RESOURCE_EXHAUSTED" and "quota" in text:
+        return True
+    return False
+
 
 #: Queued-resource states after which the request will never become ACTIVE.
 _ENDED_STATES = frozenset({"FAILED", "SUSPENDING", "SUSPENDED", "DELETING"})
@@ -165,14 +213,17 @@ class TpuQueueRest:
             if response.status_code == 401 and not reminted:
                 token, reminted = self._bearer(token), True
                 continue
+            try:
+                raw_document = response.json() if response.content else {}
+            except ValueError:
+                raw_document = {"error": {"message": response.text[:300]}}
+            document: JsonObject = raw_document if is_json_object(raw_document) else {}
             if response.status_code in _RETRYABLE and attempt < 3:
+                if response.status_code == 429 and _is_permanent_quota_429(document):
+                    return response.status_code, document
                 self.sleep(5.0 * (attempt + 1))
                 continue
-            try:
-                document = response.json() if response.content else {}
-            except ValueError:
-                document = {"error": {"message": response.text[:300]}}
-            return response.status_code, document if is_json_object(document) else {}
+            return response.status_code, document
         return 599, {"error": {"message": f"network: {failure}"}}
 
     @staticmethod
@@ -240,6 +291,9 @@ class TpuQueueRest:
     def delete_node(self, project: str, zone: str, name: str) -> tuple[int, JsonObject]:
         return self._call("DELETE", f"{self._parent(project, zone)}/nodes/{name}")
 
+    def get_node(self, project: str, zone: str, name: str) -> tuple[int, JsonObject]:
+        return self._call("GET", f"{self._parent(project, zone)}/nodes/{name}")
+
 
 def error_text(document: JsonObject) -> str:
     """The provider's own words for a failure, as ``"<code> <message>"``."""
@@ -263,19 +317,32 @@ def request_name(run_id: str, zone: str) -> str:
 
 
 def request_body(
-    *, project: str, zone: str, name: str, accelerator_type: str, runtime_version: str, spot: bool, run_id: str
+    *,
+    project: str,
+    zone: str,
+    name: str,
+    accelerator_type: str,
+    runtime_version: str,
+    spot: bool,
+    run_id: str,
+    enable_external_ips: bool = True,
 ) -> JsonObject:
+    node: JsonObject = {
+        "acceleratorType": accelerator_type,
+        "runtimeVersion": runtime_version,
+        "labels": {RACE_LABEL: run_id},
+    }
+    if enable_external_ips:
+        # Cloud TPU v2alpha1 defaults external IPs to false; match gcloud's default
+        # so --keep-first grants are reachable and healthy for `eyvan gcp connect`.
+        node["networkConfig"] = {"enableExternalIps": True}
     body: JsonObject = {
         "tpu": {
             "nodeSpec": [
                 {
                     "parent": f"projects/{project}/locations/{zone}",
                     "nodeId": name,
-                    "node": {
-                        "acceleratorType": accelerator_type,
-                        "runtimeVersion": runtime_version,
-                        "labels": {RACE_LABEL: run_id},
-                    },
+                    "node": node,
                 }
             ]
         }
@@ -350,28 +417,89 @@ class RaceTiming:
 class _Cleaner:
     """Deletes requests and sweeps zones, waiting out states the API will not delete from."""
 
-    def __init__(self, api: TpuQueueApi, project: str, timing: RaceTiming, clock: tp.Callable[[], float]):
-        self.api, self.project, self.timing, self.clock = api, project, timing, clock
+    def __init__(
+        self,
+        api: TpuQueueApi,
+        project: str,
+        timing: RaceTiming,
+        clock: tp.Callable[[], float],
+        on_event: tp.Callable[[str, str], None] = lambda zone, message: None,
+    ):
+        self.api, self.project, self.timing, self.clock, self.on_event = api, project, timing, clock, on_event
 
     def delete(self, zone: str, name: str) -> str:
         """Delete one queued resource (force: its node goes with it) and wait until it is gone."""
 
         deadline = self.clock() + self.timing.cleanup_timeout_s
         last = ""
+        last_state: str | None = None
+        first_attempt = True
         while True:
+            if not first_attempt and self.clock() >= deadline:
+                return f"delete_timeout ({last or 'still present'})"
+            first_attempt = False
             status, document = self.api.delete(self.project, zone, name)
             if status == 404:
                 return "deleted"
-            if status >= 300:
-                # Typically FAILED_PRECONDITION while PROVISIONING: wait, then ask again.
+            rejected = status >= 300
+            if rejected:
+                # Typically FAILED_PRECONDITION while PROVISIONING: wait for it
+                # to leave PROVISIONING, then re-issue DELETE promptly.
                 last = f"http {status}: {error_text(document)}"
             for _ in range(6):
-                gone, _ = self.api.get(self.project, zone, name)
+                if rejected:
+                    if self.clock() >= deadline:
+                        return f"delete_timeout ({last or 'still present'})"
+                    time.sleep(self.timing.poll_s)
+                gone, qr_doc = self.api.get(self.project, zone, name)
                 if gone == 404:
                     return "deleted"
-                if self.clock() >= deadline:
-                    return f"delete_timeout ({last or 'still present'})"
-                time.sleep(self.timing.poll_s)
+                redelete_after_poll = False
+                if gone == 200:
+                    state_doc = qr_doc.get("state")
+                    qr_state = state_doc.get("state") if is_json_object(state_doc) else None
+                    if isinstance(qr_state, str):
+                        prev_state = last_state
+                        if qr_state != last_state:
+                            last_state = qr_state
+                            self.on_event(zone, f"deleting: {qr_state.lower()}")
+                        if rejected and qr_state != "PROVISIONING":
+                            break
+                        if not rejected and qr_state == "SUSPENDED":
+                            if prev_state != "SUSPENDED":
+                                # Fresh transition into SUSPENDED from ACTIVE/SUSPENDING:
+                                # re-issue DELETE promptly without waiting 60s.
+                                break
+                            # Already SUSPENDED (e.g. async DELETE in flight): sleep poll_s
+                            # and enforce cleanup_timeout_s before re-issuing DELETE.
+                            redelete_after_poll = True
+                if not rejected:
+                    if self.clock() >= deadline:
+                        return f"delete_timeout ({last or 'still present'})"
+                    time.sleep(self.timing.poll_s)
+                    if redelete_after_poll:
+                        break
+
+    def _delete_node(self, zone: str, name: str) -> None:
+        """Delete one stray TPU node and wait until the API confirms it is gone."""
+
+        deadline = self.clock() + self.timing.cleanup_timeout_s
+        status, _ = self.api.delete_node(self.project, zone, name)
+        if status == 404:
+            return
+        get_node = getattr(self.api, "get_node", None)
+        while True:
+            if callable(get_node):
+                gone, _ = get_node(self.project, zone, name)
+                if gone == 404:
+                    return
+            else:
+                list_status, current_nodes = self.api.list_nodes(self.project, zone)
+                if list_status == 200 and name not in current_nodes:
+                    return
+            if self.clock() >= deadline:
+                return
+            time.sleep(self.timing.poll_s)
 
     def sweep(self, zones: tp.Iterable[str], run_id: str, *, keep: tp.Collection[str] = ()) -> SweepResult:
         """Delete everything this race left in ``zones`` (except ``keep``), then list again."""
@@ -392,7 +520,7 @@ class _Cleaner:
                 continue
             for name in nodes:
                 if name.startswith(prefix) and name not in keep:
-                    self.api.delete_node(self.project, zone, name)
+                    self._delete_node(zone, name)
             # Listed again, not assumed: a delete that was accepted is not a delete that happened.
             left: list[str] = []
             for kind, lister in (("queuedResource", self.api.list_requests), ("node", self.api.list_nodes)):
@@ -466,6 +594,7 @@ class TpuRace:
         zones: tp.Sequence[str] = (),
         spot: bool = True,
         keep_first: bool = False,
+        enable_external_ips: bool = True,
         runtime_version: str | None = None,
         account: str | None = None,
         timing: RaceTiming = RaceTiming(),
@@ -489,6 +618,7 @@ class TpuRace:
         self.requested_zones = tuple(dict.fromkeys(zones))
         self.spot = spot
         self.keep_first = keep_first
+        self.enable_external_ips = enable_external_ips
         self.runtime_version = runtime_version or default_runtime_version(accelerator_type)
         self.timing = timing
         self.on_event = on_event
@@ -507,7 +637,7 @@ class TpuRace:
         self.stop = threading.Event()
         self._lock = threading.Lock()
         self._receipt_lock = threading.Lock()
-        self._cleaner = _Cleaner(api, project, timing, clock)
+        self._cleaner = _Cleaner(api, project, timing, clock, on_event=on_event)
 
     # ------------------------------------------------------------------ planning
 
@@ -563,6 +693,7 @@ class TpuRace:
                 runtime_version=self.runtime_version,
                 spot=self.spot,
                 run_id=self.run_id,
+                enable_external_ips=self.enable_external_ips,
             )
             started = self.clock()
             status, document = self.api.create(self.project, result.zone, result.name, body)
@@ -582,7 +713,16 @@ class TpuRace:
                 if self.clock() - started >= self.timing.timeout_s or self.stop.wait(self.timing.operation_poll_s):
                     result.outcome = RaceOutcome.CANCELLED if self.stop.is_set() else RaceOutcome.WAITING
                     return
-                _, document = self.api.operation(operation)
+                op_status, document = self.api.operation(operation)
+                if op_status >= 300:
+                    if op_status in _RETRYABLE or op_status == 599:
+                        document = {}
+                        continue
+                    result.outcome = RaceOutcome.ERROR
+                    result.error = error_text(document) or f"operation poll http {op_status}"
+                    result.error_code = error_code(document)
+                    self.on_event(result.zone, f"operation error: {result.error}")
+                    return
             if document.get("error"):
                 result.outcome = RaceOutcome.REFUSED
                 result.error, result.error_code = error_text(document), error_code(document)
@@ -674,12 +814,13 @@ def sweep_race(
     run_id: str,
     keep: tp.Collection[str] = (),
     timing: RaceTiming = RaceTiming(),
+    on_event: tp.Callable[[str, str], None] = lambda zone, message: None,
 ) -> SweepResult:
     """Delete whatever race ``run_id`` left in ``zones``; the standalone ``eyvan race sweep``."""
 
     if not _RUN_ID.match(run_id):
         raise ValueError("a race id is 8 lowercase hex characters")
-    return _Cleaner(api, project, timing, time.monotonic).sweep(zones, run_id, keep=keep)
+    return _Cleaner(api, project, timing, time.monotonic, on_event=on_event).sweep(zones, run_id, keep=keep)
 
 
 def default_receipt(run_id: str) -> Path:

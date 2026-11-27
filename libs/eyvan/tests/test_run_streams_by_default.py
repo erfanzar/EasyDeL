@@ -396,3 +396,86 @@ def test_since_without_follow_dumps_the_window_once(monkeypatch) -> None:
     # One drain, no state polling: following the workload would read
     # /api/v1/workloads/wl-1 and wait for it to stop.
     assert "/api/v1/workloads/wl-1" not in plane.paths
+
+
+def test_follower_falls_back_to_plain_logs_on_501_and_streams_without_replaying() -> None:
+    """When /log-page returns 501, fall back to /logs so stdout/stderr are not dropped."""
+
+    from eyvan.sdk.commands.http import EyvanApiError
+
+    class _PlainLogsPlane:
+        def __init__(self) -> None:
+            self.states = [_record(WorkloadState.RUNNING), _record(WorkloadState.SUCCEEDED)]
+            self.log_snapshots = ["line one\npartial", "line one\npartial finished\nline two\n"]
+            self.log_page_calls = 0
+
+        def request(self, method: str, path: str, *, params=None, json=None, headers=None) -> JsonValue:
+            del method, params, json, headers
+            if path.endswith("/log-page"):
+                self.log_page_calls += 1
+                raise EyvanApiError(501, "execution backend 'native-local' does not expose structured logs")
+            return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+
+        def request_text(self, method: str, path: str, *, params=None, headers=None) -> str:
+            del method, params, headers
+            assert path.endswith("/logs")
+            return self.log_snapshots.pop(0) if len(self.log_snapshots) > 1 else self.log_snapshots[0]
+
+    plane = _PlainLogsPlane()
+    stdout: list[str] = []
+    stderr: list[str] = []
+    follower = WorkloadFollower(
+        client=plane,
+        output=JobTerminalOutput(writer=stderr.append),
+        write=stdout.append,
+        sleep=lambda _seconds: None,
+    )
+
+    outcome = follower.follow("wl-1")
+
+    assert outcome.exit_code == EXIT_SUCCEEDED
+    assert stdout == ["line one", "partial finished", "line two"]
+    assert plane.log_page_calls == 1
+    assert not any("logs are unavailable" in line for line in stderr)
+
+
+def test_follower_falls_back_to_plain_logs_when_log_page_reports_unsupported_backend() -> None:
+    """When the controller wraps an agent's 501 into an unavailable page, still fall back to /logs."""
+
+    class _WrappedUnsupportedPlane:
+        def __init__(self) -> None:
+            self.states = [_record(WorkloadState.SUCCEEDED)]
+
+        def request(self, method: str, path: str, *, params=None, json=None, headers=None) -> JsonValue:
+            del method, params, json, headers
+            if path.endswith("/log-page"):
+                return {
+                    "attempt": 1,
+                    "attempt_changed": False,
+                    "records": [],
+                    "next_cursor": "",
+                    "unavailable": True,
+                    "detail": "execution backend 'native-local' does not expose structured logs",
+                    "truncated_ranks": [0],
+                }
+            return self.states[0]
+
+        def request_text(self, method: str, path: str, *, params=None, headers=None) -> str:
+            del method, params, headers
+            assert path.endswith("/logs")
+            return "RUN_HUMANIZE=4.1 kB\n"
+
+    stdout: list[str] = []
+    stderr: list[str] = []
+    follower = WorkloadFollower(
+        client=_WrappedUnsupportedPlane(),
+        output=JobTerminalOutput(writer=stderr.append),
+        write=stdout.append,
+        sleep=lambda _seconds: None,
+    )
+
+    outcome = follower.follow("wl-1")
+
+    assert outcome.exit_code == EXIT_SUCCEEDED
+    assert stdout == ["RUN_HUMANIZE=4.1 kB"]
+    assert not any("logs are unavailable" in line for line in stderr)

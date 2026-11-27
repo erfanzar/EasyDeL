@@ -20,7 +20,12 @@ from eyvan import assistant_knowledge as ak
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATOR = REPO_ROOT / "scripts" / "generate_easydel_catalog.py"
-EASYDEL_SOURCE = REPO_ROOT.parent / "EasyDeL" / "libs" / "easydel" / "easydel" / "trainers"
+_MONOREPO_EASYDEL = REPO_ROOT.parent / "easydel" / "easydel" / "trainers"
+EASYDEL_SOURCE = (
+    _MONOREPO_EASYDEL
+    if _MONOREPO_EASYDEL.is_dir()
+    else REPO_ROOT.parent / "EasyDeL" / "libs" / "easydel" / "easydel" / "trainers"
+)
 
 
 def _run_generator(*args: str) -> subprocess.CompletedProcess[str]:
@@ -259,3 +264,31 @@ def test_generator_check_skips_without_source(tmp_path: Path) -> None:
     result = _run_generator("--check", "--source", str(tmp_path / "missing"))
     assert result.returncode == 0
     assert result.stdout.startswith("skip:")
+
+
+def test_default_sharding_uses_six_easydel_axes_and_torch_version_matches() -> None:
+    assert ak.DEFAULT_SHARDING == {
+        "axis_dims": [1, 1, -1, 1, 1, 1],
+        "axis_names": ["pp", "dp", "fsdp", "ep", "tp", "sp"],
+        "auto_shard_model": True,
+    }
+    assert ak.TORCH_CPU_VERSION == "2.8.0"
+
+    launch = ak.render_launch("sft", {"learning_rate": 1e-4}, model="m", dataset="d", num_devices=8)
+    assert launch["runnable"] is True, launch["blocking"]
+    assert launch["config"]["sharding"] == {
+        "axis_dims": [1, 1, -1, 1, 1, 1],
+        "axis_names": ["pp", "dp", "fsdp", "ep", "tp", "sp"],
+        "auto_shard_model": True,
+    }
+
+    legacy = ak.render_launch(
+        "sft",
+        {"learning_rate": 1e-4},
+        model="m",
+        dataset="d",
+        sharding={"axis_dims": [1, -1, 1, 1, 1]},
+        num_devices=8,
+    )
+    assert legacy["runnable"] is True, legacy["blocking"]
+    assert legacy["config"]["sharding"]["axis_names"] == ["dp", "fsdp", "ep", "tp", "sp"]

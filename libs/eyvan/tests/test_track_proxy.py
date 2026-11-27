@@ -203,6 +203,17 @@ def test_proxy_unreachable_does_not_expose_token(app) -> None:
         response = client.get("/api/v1/tracking/health", headers={"Authorization": "Bearer u"})
     assert response.status_code == 502
     assert "secret" not in response.text
+    assert "eyvan track status" in response.json()["detail"]
+
+    def timed_out(request):
+        raise httpx.ReadTimeout("secret-timeout", request=request)
+
+    app.state.tracking_transport = httpx.MockTransport(timed_out)
+    with TestClient(app) as client:
+        timeout_resp = client.get("/api/v1/tracking/health", headers={"Authorization": "Bearer u"})
+    assert timeout_resp.status_code == 502
+    assert "secret" not in timeout_resp.text
+    assert "timed out" in timeout_resp.json()["detail"]
 
 
 @pytest.mark.parametrize("token", ["local-secret", ""])

@@ -45,7 +45,8 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfileStore,
 )
 from eyvan.config import EyvanSettings
-from eyvan.server.local.daemon import serving_runtime_profile_path
+from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonTarget, serving_runtime_profile_path
 
 #: One check result as the doctor service consumes it:
 #: (name, status, detail, remedy). Kept positional so the service maps them
@@ -134,11 +135,36 @@ def check_secret_manager_bind() -> PreflightOutcome:
     )
 
 
-def check_artifact_store(settings: EyvanSettings) -> PreflightOutcome:
+def effective_artifact_store_uri(settings: EyvanSettings, base_url: str | None = None) -> str:
+    """Resolve the managed artifact store URI for ``base_url``.
+
+    An explicit ``EYVAN_ARTIFACT_STORE_URI`` or non-default ``settings`` always
+    wins. Otherwise, a literal HTTP loopback plane uses the same profile-scoped
+    ``managed-artifacts`` directory that :class:`LocalDaemonPaths` hands to a
+    supervised daemon for that port (``~/.eyvan/managed-artifacts`` on the
+    default port and ``~/.eyvan/profiles/<id>/managed-artifacts`` on custom
+    ports).
+    """
+
+    if "EYVAN_ARTIFACT_STORE_URI" in os.environ or settings.artifact_store_uri != EyvanSettings().artifact_store_uri:
+        return settings.artifact_store_uri
+    if base_url:
+        try:
+            endpoint = ControlPlaneEndpoint.parse(base_url)
+        except ValueError:
+            endpoint = None
+        if endpoint is not None:
+            target = LocalDaemonTarget.from_endpoint(endpoint)
+            if target is not None:
+                return LocalDaemonPaths().profile(target).artifact_store_uri
+    return settings.artifact_store_uri
+
+
+def check_artifact_store(settings: EyvanSettings, base_url: str | None = None) -> PreflightOutcome:
     """Preflight the configured artifact store: gs:// reachability or local writability."""
 
     name = "artifact-store"
-    uri = settings.artifact_store_uri
+    uri = effective_artifact_store_uri(settings, base_url)
     try:
         parsed = urlsplit(uri)
     except ValueError:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import math
 import os
 import signal
 import subprocess
@@ -29,11 +30,24 @@ from eyvan.worker.runtime.local_process import (
     _unreaped_process_is_running,
     _utcnow,
 )
+from eyvan.worker.runtime.preemption import read_checkpoint_receipt
 
-# Grace period between a SIGTERM stop request and the SIGKILL escalation. The
-# executor scrubs EYVAN_* from the worker environment, so this stays a plain
-# constant rather than environment configuration.
+# Default grace period between a SIGTERM stop request and SIGKILL escalation
+# when the durable execution record does not declare a per-job ``stop_grace_s``.
 _STOP_GRACE_S = 30.0
+
+
+def _resolve_stop_grace_s(record_path: Path, *, default: float = _STOP_GRACE_S) -> float:
+    """Return the per-job graceful stop window from the durable record, or ``default``."""
+
+    current = _read_record(record_path)
+    if current is None:
+        return default
+    raw = current.get("stop_grace_s")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return default
+    value = float(raw)
+    return value if math.isfinite(value) and value > 0 else default
 
 
 def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str) -> int:
@@ -44,13 +58,23 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
     child: subprocess.Popen[bytes] | None = None
     command_quiescent = False
     stop_requested = False
+    reclaim_signaled = False
+    escalated_stop = False
 
-    def request_stop(_signum: int, _frame: FrameType | None) -> None:
-        nonlocal stop_requested
+    def request_stop(signum: int, _frame: FrameType | None) -> None:
+        nonlocal stop_requested, reclaim_signaled, escalated_stop
         stop_requested = True
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None and signum == sigusr1:
+            reclaim_signaled = True
+            forward_sig = sigusr1
+        else:
+            if reclaim_signaled:
+                escalated_stop = True
+            forward_sig = signal.SIGTERM
         if child is not None and not command_quiescent:
             try:
-                os.killpg(child.pid, signal.SIGTERM)
+                os.killpg(child.pid, forward_sig)
             except ProcessLookupError:
                 pass
             except PermissionError:
@@ -59,6 +83,8 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, request_stop)
     try:
         record = None
         # The parent persists this worker PID immediately after ``Popen``.
@@ -163,15 +189,20 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
                 os.close(gate_read)
                 os.close(gate_write)
             if stop_requested:
-                request_stop(signal.SIGTERM, None)
-            stop_deadline = time.monotonic() + _STOP_GRACE_S if stop_requested else None
+                request_stop(getattr(signal, "SIGUSR1", signal.SIGTERM) if reclaim_signaled else signal.SIGTERM, None)
+            stop_deadline = time.monotonic() + _resolve_stop_grace_s(record_path) if stop_requested else None
             # Do not poll/wait the leader yet: retaining it unreaped pins the
             # process-group identity through descendant TERM/KILL cleanup.
             while _unreaped_process_is_running(child.pid):
                 if stop_requested:
                     if stop_deadline is None:
-                        stop_deadline = time.monotonic() + _STOP_GRACE_S
-                    elif time.monotonic() >= stop_deadline:
+                        stop_deadline = time.monotonic() + _resolve_stop_grace_s(record_path)
+                    elif escalated_stop:
+                        # Controller explicitly escalated to SIGTERM after the
+                        # reclaim grace window elapsed; bound remaining wait.
+                        stop_deadline = min(stop_deadline, time.monotonic() + 2.0)
+                        escalated_stop = False
+                    if time.monotonic() >= stop_deadline:
                         break
                 time.sleep(0.05)
             if not _quiesce_process_group(child.pid):
@@ -179,8 +210,17 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
             command_quiescent = True
             exit_code = child.wait()
 
+        acknowledged_uri: str | None = None
+        raw_receipt_path = record.get("receipt_path")
+        if isinstance(raw_receipt_path, str) and raw_receipt_path.strip():
+            receipt = read_checkpoint_receipt(raw_receipt_path)
+            if receipt is not None:
+                raw_uri = receipt.get("checkpoint_uri")
+                if isinstance(raw_uri, str) and raw_uri.strip():
+                    acknowledged_uri = raw_uri.strip()
+
         def finished(current: JsonObject) -> None:
-            stopped = stop_requested or bool(current.get("stop_requested"))
+            stopped = stop_requested or reclaim_signaled or bool(current.get("stop_requested"))
             current["status"] = (
                 ExecutionWorkloadStatus.STOPPED.value
                 if stopped
@@ -195,6 +235,8 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
                 if exit_code == 0
                 else f"native-local command exited with code {exit_code}"
             )
+            if acknowledged_uri is not None:
+                current["checkpoint_uri"] = acknowledged_uri
             current["exit_code"] = exit_code
             current["finished_at"] = _utcnow()
             current["group_quiescent"] = True

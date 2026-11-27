@@ -50,6 +50,10 @@ from pathlib import Path
 #: work; the per-attempt working directory would defeat exactly that.
 DEFAULT_CACHE_ROOT = Path("/var/lib/eyvan/runtime-envs")
 
+#: Host-wide shared cache root for cross-environment assets (uv wheel cache,
+#: bare git mirrors, layered base virtualenvs, pre-built Rust wheels).
+DEFAULT_SHARED_CACHE_ROOT = DEFAULT_CACHE_ROOT.parent
+
 #: Where environments go when the host path is not writable -- a laptop, or any
 #: cell whose agent does not run as root. Named rather than inlined because it
 #: appears in a working tree somebody is version-controlling, and the .gitignore
@@ -72,7 +76,7 @@ def environment_key(requirements: tp.Sequence[str], setup_identity: str | None =
     """
 
     identity: dict[str, tp.Any] = {
-        "format": 2,
+        "format": 3,
         "interpreter": os.path.realpath(sys.executable),
         "version": list(sys.version_info),
         "parent_sites": _parent_site_packages(),
@@ -148,7 +152,7 @@ def resolve_setup(document: tp.Mapping[str, tp.Any]) -> SetupStep:
     return SetupStep(script=str(script), args=args)
 
 
-def _run_setup(environment: Path, setup: SetupStep) -> None:
+def _run_setup(environment: Path, setup: SetupStep, *, env_root: Path | None = None) -> None:
     """Run the setup step inside ``environment``, streaming its output into the job's log."""
 
     script_path = environment / ".eyvan-setup.sh"
@@ -156,6 +160,11 @@ def _run_setup(environment: Path, setup: SetupStep) -> None:
     shell = shutil.which("bash") or "/bin/sh"
     child_environment = activate(environment)
     child_environment[SETUP_PYTHON_ENV] = str(environment / "bin" / "python")
+    resolved_root = env_root if env_root is not None else environment.parent
+    child_environment.setdefault("EYVAN_RUNTIME_ENV_DIR", str(resolved_root))
+    uv_cache = uv_cache_dir(resolved_root)
+    if uv_cache is not None:
+        child_environment.setdefault("UV_CACHE_DIR", str(uv_cache))
     # The multi-host join belongs to the job. With the marker present, any
     # Python the step starts (``$EYVAN_PYTHON -m pip`` is enough) would load the
     # multi-host ``sitecustomize`` and try to join the gang from here -- the
@@ -171,27 +180,107 @@ def _run_setup(environment: Path, setup: SetupStep) -> None:
         raise RuntimeError(f"the setup step exited with status {completed.returncode}")
 
 
+def _user_cache_root() -> Path | None:
+    """Return the user-scoped runtime-env cache when ``HOME`` is explicitly set."""
+
+    home = os.environ.get("HOME")
+    if not home:
+        return None
+    return Path(home).expanduser() / ".eyvan" / "runtime-envs"
+
+
+def _probe_writable_directory(path: Path) -> None:
+    """Ensure ``path`` exists and is writable by the current process."""
+
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / ".writable"
+    probe.touch()
+    probe.unlink()
+
+
+def shared_cache_root(env_root: Path | None = None) -> Path | None:
+    """Return a writable persistent directory shared across per-job environments.
+
+    When ``env_root`` is named ``runtime-envs`` (e.g. ``/var/lib/eyvan/runtime-envs``
+    or ``~/.eyvan/runtime-envs``), its parent hosts sibling shared caches
+    (``uv-cache``, ``git-mirrors``, ``base-envs``, ``wheel-cache``). Otherwise a
+    writable ``.shared-cache`` subdirectory under ``env_root`` is used before
+    falling back to ``/var/lib/eyvan`` and ``~/.eyvan``.
+    """
+
+    candidates: list[Path] = []
+    if env_root is not None:
+        if env_root.name == "runtime-envs":
+            candidates.append(env_root.parent)
+        candidates.append(env_root / ".shared-cache")
+    candidates.append(DEFAULT_SHARED_CACHE_ROOT)
+    user_root = _user_cache_root()
+    if user_root is not None:
+        candidates.append(user_root.parent)
+    for candidate in candidates:
+        try:
+            _probe_writable_directory(candidate)
+            return candidate
+        except OSError:
+            continue
+    return None
+
+
+def uv_cache_dir(env_root: Path | None = None) -> Path | None:
+    """Return a writable shared ``UV_CACHE_DIR`` so wheels download once per host."""
+
+    configured = os.environ.get("UV_CACHE_DIR")
+    if configured:
+        return Path(configured)
+    shared = shared_cache_root(env_root)
+    if shared is None:
+        return None
+    target = shared / "uv-cache"
+    try:
+        _probe_writable_directory(target)
+    except OSError:
+        return None
+    return target
+
+
+def _installer_environment(env_root: Path) -> dict[str, str]:
+    """Return process environment for package installation with shared ``UV_CACHE_DIR``."""
+
+    env = dict(os.environ)
+    uv_cache = uv_cache_dir(env_root)
+    if uv_cache is not None:
+        env.setdefault("UV_CACHE_DIR", str(uv_cache))
+    return env
+
+
 def cache_root() -> Path:
     """Return a writable directory for cached environments.
 
-    Falls back to the working directory when the host path is not writable,
-    which is the ordinary case for a developer running a local cell. The
-    fallback is reported rather than silent: it changes *which* later runs reuse
-    this install -- only ones starting from the same directory, so a retry that
-    materialises a fresh workspace installs again -- and a job whose minutes go
-    to a reinstall should say where they went.
+    Prefers ``EYVAN_RUNTIME_ENV_DIR``, then the host-wide ``DEFAULT_CACHE_ROOT``,
+    then ``~/.eyvan/runtime-envs`` when ``HOME`` is set (so local runs reuse
+    cached environments without polluting a git working tree), and falls back to
+    the working directory only when none of those locations is writable.
     """
 
     configured = os.environ.get("EYVAN_RUNTIME_ENV_DIR")
     if configured:
         return Path(configured)
     try:
-        DEFAULT_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        probe = DEFAULT_CACHE_ROOT / ".writable"
-        probe.touch()
-        probe.unlink()
+        _probe_writable_directory(DEFAULT_CACHE_ROOT)
         return DEFAULT_CACHE_ROOT
     except OSError as error:
+        user_root = _user_cache_root()
+        if user_root is not None:
+            try:
+                _probe_writable_directory(user_root)
+                print(
+                    f"eyvan: {DEFAULT_CACHE_ROOT} is not writable ({error}); caching this job's packages "
+                    f"in {user_root} instead",
+                    file=sys.stderr,
+                )
+                return user_root
+            except OSError:
+                pass
         print(
             f"eyvan: {DEFAULT_CACHE_ROOT} is not writable ({error}); caching this job's packages "
             f"in ./{FALLBACK_CACHE_DIR} instead, so only a later run from this same "
@@ -289,7 +378,15 @@ def _inherit_running_environment(environment: Path) -> None:
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
     purelib = environment / "lib" / version / "site-packages"
     purelib.mkdir(parents=True, exist_ok=True)
-    (purelib / PARENT_PATH_FILE).write_text("".join(f"{path}\n" for path in parents), encoding="utf-8")
+    # Use site.addsitedir() rather than bare path lines: CPython's
+    # site.addpackage() appends bare paths to sys.path without processing .pth
+    # files inside them, which breaks PEP 660 editable installs (e.g. uv sync).
+    # Because the job venv's own site-packages is already on sys.path before
+    # this .pth runs, packages pinned by the job still take precedence.
+    (purelib / PARENT_PATH_FILE).write_text(
+        "".join(f"import site; site.addsitedir({path!r})\n" for path in parents),
+        encoding="utf-8",
+    )
 
 
 def prepare(requirements: tp.Sequence[str], *, root: Path | None = None, setup: SetupStep | None = None) -> Path:
@@ -321,8 +418,9 @@ def prepare(requirements: tp.Sequence[str], *, root: Path | None = None, setup: 
             # An earlier attempt died mid-install. Its directory is unusable and
             # indistinguishable from a good one except by the missing marker.
             shutil.rmtree(environment, ignore_errors=True)
+        install_env = _installer_environment(base)
         for index, command in enumerate(_install_commands(environment, requirements)):
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = subprocess.run(command, env=install_env, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 shutil.rmtree(environment, ignore_errors=True)
                 detail = (completed.stderr or completed.stdout or "").strip()
@@ -336,7 +434,7 @@ def prepare(requirements: tp.Sequence[str], *, root: Path | None = None, setup: 
             # After the packages, so the step can build on them; before the
             # marker, so a step that failed or was killed is rerun, not trusted.
             try:
-                _run_setup(environment, setup)
+                _run_setup(environment, setup, env_root=base)
             except BaseException:
                 shutil.rmtree(environment, ignore_errors=True)
                 raise
@@ -365,6 +463,7 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="eyvan-dependency-entry")
     parser.add_argument("--require", action="append", default=[], metavar="REQUIREMENT")
     parser.add_argument("--setup", default=None, metavar="JSON")
+    parser.add_argument("--setup-file", default=None, metavar="PATH")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -377,18 +476,30 @@ def main(argv: tp.Sequence[str] | None = None) -> int:
         del command[0]
     if not command:
         parser.error("a command to execute is required")
-    if not arguments.require and arguments.setup is None:
+    if arguments.setup is not None and arguments.setup_file is not None:
+        parser.error("pass at most one of --setup and --setup-file")
+    if not arguments.require and arguments.setup is None and arguments.setup_file is None:
         parser.error("at least one --require or a --setup is needed; without one this wrapper does nothing")
 
     try:
         setup = None
+        raw_setup: str | None = None
+        setup_source = "--setup"
         if arguments.setup is not None:
+            raw_setup = arguments.setup
+        elif arguments.setup_file is not None:
+            setup_source = "--setup-file"
             try:
-                document = json.loads(arguments.setup)
+                raw_setup = Path(arguments.setup_file).read_text(encoding="utf-8")
+            except OSError as error:
+                raise RuntimeError(f"could not read --setup-file {arguments.setup_file!r}: {error}") from error
+        if raw_setup is not None:
+            try:
+                document = json.loads(raw_setup)
             except ValueError as error:
-                raise RuntimeError(f"--setup is not valid JSON: {error}") from error
+                raise RuntimeError(f"{setup_source} is not valid JSON: {error}") from error
             if not isinstance(document, dict):
-                raise RuntimeError("--setup must be a JSON object")
+                raise RuntimeError(f"{setup_source} must be a JSON object")
             setup = resolve_setup(document)
         environment = prepare(arguments.require, setup=setup)
     except RuntimeError as error:

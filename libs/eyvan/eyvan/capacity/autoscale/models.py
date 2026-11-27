@@ -21,7 +21,7 @@ from eyvan.capacity.fleet_config import EyvanFleetConfig, validate_fleet_name
 from eyvan.capacity.providers.gcp.tpu_types import parse_tpu_accelerator_type
 from eyvan.records import CapacityClass
 
-_ZONE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?-[a-z]$")
+_ZONE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?-[a-z][a-z0-9]*$")
 _GCP_PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 
 DEFAULT_AUTOSCALE_CACHE_ROOT = Path("~/.eyvan/autoscale")

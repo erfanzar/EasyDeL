@@ -25,7 +25,23 @@ if tp.TYPE_CHECKING:
         execute,
         init,
     )
+    from eyvan.storage import (
+        StorageHandle,
+        configure_storage,
+        get_monitoring_storage,
+        get_storage,
+        monitoring_path,
+        storage_path,
+    )
     from eyvan.worker.runtime.in_job import in_job_context, submit_child
+    from eyvan.worker.runtime.preemption import (
+        PreemptionNotice,
+        acknowledge_checkpoint,
+        install_preemption_handler,
+        preemption_notice,
+        reclaim_requested,
+        resume_checkpoint_uri,
+    )
     from eyvan.worker.runtime.progress import report_progress
 
 __all__ = (
@@ -43,12 +59,24 @@ __all__ = (
     "EyvanSettings",
     "EyvanUnavailableError",
     "GpuConfig",
+    "PreemptionNotice",
     "SetupScript",
+    "StorageHandle",
     "TpuConfig",
+    "acknowledge_checkpoint",
+    "configure_storage",
     "execute",
+    "get_monitoring_storage",
+    "get_storage",
     "in_job_context",
     "init",
+    "install_preemption_handler",
+    "monitoring_path",
+    "preemption_notice",
+    "reclaim_requested",
     "report_progress",
+    "resume_checkpoint_uri",
+    "storage_path",
     "submit_child",
 )
 from eyvan._version import __version__
@@ -145,12 +173,37 @@ def __getattr__(name: str):
         from eyvan.sdk.execution import init
 
         return _cache_export(name, init)
+    if name in {
+        "StorageHandle",
+        "configure_storage",
+        "get_monitoring_storage",
+        "get_storage",
+        "monitoring_path",
+        "storage_path",
+    }:
+        # Standard-library-only storage helpers: safe to import inside training
+        # jobs without pulling in the SDK client or server dependencies.
+        from eyvan import storage as _storage
+
+        return _cache_export(name, getattr(_storage, name))
     if name in {"in_job_context", "submit_child"}:
         # Same reasoning as report_progress: this runs *inside* the job, so it
         # must not drag the client in behind it.
         from eyvan.worker.runtime import in_job
 
         return _cache_export(name, getattr(in_job, name))
+    if name in {
+        "PreemptionNotice",
+        "acknowledge_checkpoint",
+        "install_preemption_handler",
+        "preemption_notice",
+        "reclaim_requested",
+        "resume_checkpoint_uri",
+    }:
+        # Standard-library-only in-job preemption/reclaim notice helpers.
+        from eyvan.worker.runtime import preemption as _preemption
+
+        return _cache_export(name, getattr(_preemption, name))
     if name == "report_progress":
         # Not from the SDK: this one runs *inside* the job, which is the path the
         # rest of this table exists to keep free of the client and its optional

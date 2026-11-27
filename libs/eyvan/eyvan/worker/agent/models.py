@@ -206,6 +206,32 @@ class CheckpointRequest(WorkloadMutationRequest):
     output_uri: str | None = None
 
 
+class ReclaimNoticeRequest(WorkloadMutationRequest):
+    """Fenced graceful reclaim notice delivered to one running workload."""
+
+    reason: str = Field(min_length=1, max_length=500)
+    requested_by: str | None = Field(default=None, max_length=256)
+    deadline_at: str | None = Field(default=None, max_length=128)
+    deadline_epoch_s: float | None = Field(default=None, ge=0)
+    grace_seconds: int = Field(default=600, ge=1, le=86_400)
+    policy: tp.Literal["requeue", "stop"] = "requeue"
+    checkpoint_uri: str | None = Field(default=None, max_length=2048)
+    workload_id: str | None = Field(default=None, max_length=96)
+
+
+class GangReclaimNoticeRequest(GangWorkloadMutationRequest):
+    """Fenced graceful reclaim notice delivered across every member of a gang."""
+
+    reason: str = Field(min_length=1, max_length=500)
+    requested_by: str | None = Field(default=None, max_length=256)
+    deadline_at: str | None = Field(default=None, max_length=128)
+    deadline_epoch_s: float | None = Field(default=None, ge=0)
+    grace_seconds: int = Field(default=600, ge=1, le=86_400)
+    policy: tp.Literal["requeue", "stop"] = "requeue"
+    checkpoint_uri: str | None = Field(default=None, max_length=2048)
+    workload_id: str | None = Field(default=None, max_length=96)
+
+
 class ExecRequest(AgentModel):
     """One diagnostic command to run beside a live workload.
 

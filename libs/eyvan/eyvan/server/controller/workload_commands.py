@@ -784,11 +784,36 @@ class _ControllerWorkloadCommands:
             tx=transaction,
         )
 
+    def _progress_callback_permitted(self, *, cell_provider: str | None) -> bool:
+        """Return whether an optional progress callback can reach this plane safely.
+
+        Unlike managed artifact transfers or secrets, progress reporting is
+        advisory: when the plane advertises a loopback URL to a remote worker,
+        or plain HTTP without explicit opt-in, omit ``EYVAN_PROGRESS_URL`` so
+        ``eyvan.report_progress()`` returns ``False`` immediately instead of
+        stalling training steps or sending a capability token in clear text.
+        """
+
+        if self.artifact_access is None:
+            return False
+        parsed = urlparse(self.artifact_access.public_url)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        if host in _LOOPBACK_HOSTS and (cell_provider is None or cell_provider not in _LOCAL_PROVIDERS):
+            return False
+        if parsed.scheme == "http" and not (
+            self.settings.dev_auth_enabled or self.settings.allow_insecure_artifact_http
+        ):
+            return False
+        return True
+
     def _render_execution(
         self,
         workload: WorkloadRecord,
         *,
         runtime_environment: tp.Mapping[str, str],
+        cell_provider: str | None = None,
     ) -> tuple[str, dict[str, str]]:
         """Return the entrypoint and environment for one workload dispatch.
 
@@ -957,6 +982,18 @@ class _ControllerWorkloadCommands:
             )
         elif result_uri:
             parts.extend(("--result-uri", result_uri))
+            if self.artifact_access is not None and self._progress_callback_permitted(cell_provider=cell_provider):
+                transfer = self.artifact_access.progress_report_transfer(
+                    org_id=workload.org_id,
+                    project_id=workload.project_id,
+                    workload_id=workload.id,
+                    generation=workload.generation,
+                    result_uri=result_uri,
+                )
+                environment["EYVAN_MANAGED_RESULT_TOKEN"] = transfer.token
+                environment["EYVAN_PROGRESS_URL"] = transfer.url
+                if self.artifact_access.public_url.startswith("http://"):
+                    environment["EYVAN_ALLOW_INSECURE_ARTIFACT_HTTP"] = "1"
         if (
             managed_transfer
             and self.artifact_access is not None
@@ -1202,7 +1239,11 @@ class _ControllerWorkloadCommands:
                 reservation,
             )
             await self._persist_attempt_topology(transaction, reserved, (cell,))
-            entrypoint, environment = self._render_execution(reserved, runtime_environment=cell.runtime.env)
+            entrypoint, environment = self._render_execution(
+                reserved,
+                runtime_environment=cell.runtime.env,
+                cell_provider=cell.provider,
+            )
             submission_id = f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}"
             if lease.tpu_chips:
                 submission_id, chip_environment = _chip_share_dispatch(submission_id, lease.tpu_chips, cell)
@@ -1318,7 +1359,11 @@ class _ControllerWorkloadCommands:
                 reservation,
             )
             await self._persist_attempt_topology(transaction, reserved, concrete_cells)
-            entrypoint, environment = self._render_execution(reserved, runtime_environment=leader_cell.runtime.env)
+            entrypoint, environment = self._render_execution(
+                reserved,
+                runtime_environment=leader_cell.runtime.env,
+                cell_provider=leader_cell.provider,
+            )
             spec = {
                 "entrypoint": entrypoint,
                 "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",

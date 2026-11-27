@@ -27,12 +27,15 @@ import click
 
 from eyvan._internal.json_types import JsonValue, is_json_object
 from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
+from eyvan.capacity.providers.gcp.quota_discovery import GcloudQuotaError, GcpTpuQuotaDiscovery
 from eyvan.domain.accelerators import sort_accelerator_types
-from eyvan.records import CapacityClass
+from eyvan.records import CapacityClass, utcnow
+from eyvan.sdk.client.transport import EyvanUnavailableError
 from eyvan.sdk.commands.common import JsonRenderer
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.contexts import DEFAULT_ORG_ID, DEFAULT_PROJECT_ID
 from eyvan.sdk.shapes import summarize_shapes
+from eyvan.server.api.schemas import TpuQuotaEntry, TpuQuotaFailure, TpuQuotaSnapshot, TpuQuotaStatus
 
 
 def _emit(payload: object, *, as_json: bool, renderer: JsonRenderer) -> None:
@@ -348,6 +351,47 @@ def _parse_fits(value: str) -> tuple[str, int]:
     return accelerator_type, count
 
 
+def _direct_quota_snapshot(
+    *,
+    project: str,
+    zones: tuple[str, ...],
+    account: str | None = None,
+) -> dict[str, tp.Any]:
+    """Read TPU quota directly from GCP when the plane is unavailable or ``--account`` is specified."""
+
+    discovery = GcpTpuQuotaDiscovery(account=account) if account else GcpTpuQuotaDiscovery()
+    observed_at = utcnow()
+    entries: list[TpuQuotaEntry] = []
+    failures: list[TpuQuotaFailure] = []
+    for capacity_class in (CapacityClass.SPOT, CapacityClass.ON_DEMAND):
+        try:
+            rows = discovery.discover(
+                project=project,
+                zones=zones,
+                preemptible=capacity_class is CapacityClass.SPOT,
+            )
+        except (GcloudQuotaError, ValueError) as exc:
+            failures.append(TpuQuotaFailure.from_reason(capacity_class=capacity_class, reason=str(exc), project=project))
+            continue
+        entries.extend(
+            TpuQuotaEntry.from_availability(row, capacity_class=capacity_class, observed_at=observed_at) for row in rows
+        )
+    entries.sort(key=lambda entry: (entry.zone, entry.accelerator_type, entry.capacity_class))
+    snapshot = TpuQuotaSnapshot(
+        observed_at=observed_at,
+        project=project,
+        available_projects=[project],
+        status=TpuQuotaStatus.UNAVAILABLE if len(failures) == 2 else TpuQuotaStatus.OK,
+        refreshed_at=observed_at,
+        age_s=0.0,
+        cached=False,
+        ttl_s=0.0,
+        entries=entries,
+        failures=failures,
+    )
+    return snapshot.model_dump(mode="json")
+
+
 @capacity.command("quota")
 @click.option("--project", help="GCP project to read. Defaults to the one this fleet's pools declare.")
 @click.option("--zone", "zones", multiple=True, help="Restrict the provider read to these zones.")
@@ -360,6 +404,11 @@ def _parse_fits(value: str) -> tuple[str, int]:
 )
 @click.option("--fits", help="Only zones that fit TYPE or TYPE:COUNT, for example v6e-8:2.")
 @click.option("--refresh", is_flag=True, help="Re-read the provider instead of reusing a cached reading.")
+@click.option(
+    "--account",
+    metavar="EMAIL",
+    help="gcloud account for direct provider quota reads; gcloud config is not changed.",
+)
 @click.option(
     "--cache-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -375,6 +424,7 @@ def capacity_quota(
     capacity_classes: tuple[str, ...],
     fits: str | None,
     refresh: bool,
+    account: str | None,
     cache_dir: Path | None,
     as_json: bool,
 ) -> None:
@@ -390,12 +440,27 @@ def capacity_quota(
     fit", and only one of them should stop you trying.
     """
 
-    params: dict[str, str | list[str]] = {"refresh": "true" if refresh else "false"}
-    if project:
-        params["project"] = project
-    if zones:
-        params["zone"] = list(zones)
-    payload = session.client.request("GET", "/api/v1/capacity/quota", params=params)
+    payload: JsonValue
+    if account:
+        if not project:
+            raise click.UsageError("--project is required when passing --account for direct GCP quota discovery")
+        payload = _direct_quota_snapshot(project=project, zones=zones, account=account)
+    else:
+        params: dict[str, str | list[str]] = {"refresh": "true" if refresh else "false"}
+        if project:
+            params["project"] = project
+        if zones:
+            params["zone"] = list(zones)
+        try:
+            payload = session.client.request("GET", "/api/v1/capacity/quota", params=params)
+        except EyvanUnavailableError:
+            if not project:
+                raise
+            click.echo(
+                f"control plane unavailable at {session.base_url}; reading TPU quota directly from GCP for {project}",
+                err=True,
+            )
+            payload = _direct_quota_snapshot(project=project, zones=zones)
     if not isinstance(payload, dict):
         raise click.ClickException(
             f"control plane at {session.base_url} returned an unexpected quota response; "
@@ -455,7 +520,11 @@ def capacity_quota(
     click.echo(f"TPU quota for {project_name or 'the configured project'} -- provider read {age} ({source})")
     for failure in payload.get("failures") or []:
         if isinstance(failure, dict):
-            click.echo(f"  {failure.get('capacity_class', 'capacity')} quota could not be read: {failure.get('reason')}")
+            summary = failure.get("summary") or failure.get("reason")
+            click.echo(f"  {failure.get('capacity_class', 'capacity')} quota could not be read: {summary}")
+            remediation = failure.get("remediation")
+            if isinstance(remediation, str) and remediation.strip():
+                click.echo(f"    hint: {remediation}")
     if status == "unavailable":
         raise click.ClickException("no TPU quota could be read for this project")
 
@@ -476,14 +545,16 @@ def _echo_quota_rows(heading: str, rows: list[dict[str, object]]) -> None:
         return
     click.echo(f"\n{heading}:")
     click.echo(f"  {'ZONE':18} {'TYPE':14} {'CLASS':10} {'LIMIT':>8} {'IN USE':>8} {'FREE':>8} {'SLICES':>7}  USAGE")
-    for row in sorted(
-        rows,
-        key=lambda item: (
-            -(item.get("free_chips") if isinstance(item.get("free_chips"), int) else -1),
+
+    def _row_sort_key(item: dict[str, object]) -> tuple[int, str, str]:
+        free = item.get("free_chips")
+        return (
+            -(free if isinstance(free, int) and not isinstance(free, bool) else -1),
             str(item.get("zone")),
             str(item.get("accelerator_type")),
-        ),
-    ):
+        )
+
+    for row in sorted(rows, key=_row_sort_key):
         click.echo(
             f"  {row.get('zone', '-')!s:18} {row.get('accelerator_type', '-')!s:14} "
             f"{row.get('capacity_class', '-')!s:10} "
@@ -640,9 +711,23 @@ def _entry(row: JsonValue) -> dict[str, tp.Any]:
 
 
 @capacity.command("fleets")
+@click.option("--org", "org_id", help="Organization scope (default: active context).")
+@click.option("--project", "project_id", help="Project scope (default: active context).")
+@click.option(
+    "--all",
+    "include_all",
+    is_flag=True,
+    help="List every fleet across all tenants, including drained pools (requires fleet_admin).",
+)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def fleets(session: CliSession, as_json: bool) -> None:
+def fleets(
+    session: CliSession,
+    org_id: str | None,
+    project_id: str | None,
+    include_all: bool,
+    as_json: bool,
+) -> None:
     """List the fleets this project can submit to, and what each provides.
 
     `capacity list` answers per pool, which is the right grain for choosing a
@@ -651,19 +736,23 @@ def fleets(session: CliSession, as_json: bool) -> None:
     commonest placement failure is a zone typed where a fleet name belongs.
     """
 
-    pools = session.client.request(
-        "GET",
-        "/api/v1/capacity-pools",
-        params={
-            "org_id": session.org_id or DEFAULT_ORG_ID,
-            "project_id": session.project_id or DEFAULT_PROJECT_ID,
-        },
-    )
+    if include_all:
+        pools: JsonValue = session.client.request("GET", "/api/v1/capacity-pools")
+    else:
+        payload = session.client.request(
+            "GET",
+            "/api/v1/capacity",
+            params={
+                "org_id": org_id or session.org_id or DEFAULT_ORG_ID,
+                "project_id": project_id or session.project_id or DEFAULT_PROJECT_ID,
+            },
+        )
+        pools = payload.get("pools") if is_json_object(payload) else payload
     grouped: dict[str, dict[str, object]] = {}
     for pool in pools if isinstance(pools, list) else []:
         if not is_json_object(pool):
             continue
-        name = str(pool.get("fleet_name") or "")
+        name = str(pool.get("fleet") or pool.get("fleet_name") or "")
         row = grouped.setdefault(name, {"fleet": name, "pools": 0, "shapes": set(), "zones": set(), "disabled": 0})
         row["pools"] = int(row["pools"]) + 1  # type: ignore[call-overload]
         shape = pool.get("accelerator_type")
@@ -794,6 +883,35 @@ def get_pool(session: CliSession, pool_id: str, as_json: bool) -> None:
 
     payload = session.client.request("GET", f"/api/v1/capacity-pools/{pool_id}")
     _emit(payload, as_json=as_json, renderer=JsonRenderer())
+
+
+@pool.command("disable")
+@click.argument("pool_id")
+@click.option("-y", "--yes", is_flag=True, help="Do not ask for confirmation.")
+@click.option("--idempotency-key", help="Reuse one key only when retrying the same disable operation.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def disable_pool(
+    session: CliSession,
+    pool_id: str,
+    yes: bool,
+    idempotency_key: str | None,
+    as_json: bool,
+) -> None:
+    """Disable one capacity pool so no new workloads place on it."""
+
+    from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
+    from eyvan.sdk.commands.common import emit_result
+
+    if not yes:
+        click.confirm(f"Disable capacity pool {pool_id!r}?", abort=True)
+    key = IdempotencyKeyFactory(prefix="cli").create("pool-disable", idempotency_key)
+    payload = session.client.request(
+        "DELETE",
+        f"/api/v1/capacity-pools/{pool_id}",
+        headers={"Idempotency-Key": key},
+    )
+    emit_result(JsonRenderer(), payload, f"Disabled pool {pool_id}", as_json=as_json)
 
 
 @capacity.group("cell")

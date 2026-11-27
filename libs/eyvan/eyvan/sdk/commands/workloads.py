@@ -34,10 +34,14 @@ from eyvan.records import (
     WorkloadDefinition,
     WorkloadExplanation,
     WorkloadRecord,
+    WorkloadSetup,
     WorkloadState,
     WorkspaceRef,
 )
+from eyvan.sdk.client.easydel_setup import DEFAULT_BRANCH as EASYDEL_DEFAULT_BRANCH
+from eyvan.sdk.client.easydel_setup import EasyDeLSetup
 from eyvan.sdk.client.idempotency import IdempotencyKeyFactory
+from eyvan.sdk.client.jobs import SetupScript
 from eyvan.sdk.client.requests import pool_workload_request
 from eyvan.sdk.commands.common import JsonRenderer, emit_result, parse_environment, shell_command
 from eyvan.sdk.commands.state import CliSession, RunTarget, WorkloadScope
@@ -45,8 +49,12 @@ from eyvan.sdk.follow import WorkloadFollower, parse_duration
 from eyvan.sdk.job_receipt import JobSubmissionReceipt, JobTerminalOutput
 from eyvan.sdk.spend import RunSpend
 from eyvan.sdk.spend import render as spend_render
+from eyvan.sdk.tables import Column
+from eyvan.sdk.tables import field as table_field
+from eyvan.sdk.tables import render as render_table
 from eyvan.sdk.terminal import stream_is_terminal
 from eyvan.sdk.timeline import render, timeline
+from eyvan.sdk.workload_summary import format_user_progress
 from eyvan.sdk.workload_summary import render as summarize_workload
 from eyvan.server.api.schemas import (
     BatchSubmitRequest,
@@ -67,6 +75,50 @@ _ACTION_HEADLINES: dict[str, str] = {
     "checkpoint": "Asked for a checkpoint of",
     "retry": "Retrying",
 }
+
+
+def _resolve_cli_setup(
+    *,
+    setup: str | None,
+    setup_url: str | None,
+    easydel: bool = False,
+    easydel_branch: str | None = None,
+    accelerator: str = "tpu",
+) -> WorkloadSetup | None:
+    """Resolve ``--setup`` / ``--setup-url`` / ``--easydel`` into one ``WorkloadSetup``."""
+
+    resolved_branch = easydel_branch if easydel_branch is not None else (EASYDEL_DEFAULT_BRANCH if easydel else None)
+    provided = [
+        flag
+        for flag, value in (
+            ("--setup", setup),
+            ("--setup-url", setup_url),
+            ("--easydel", resolved_branch),
+        )
+        if value is not None
+    ]
+    if len(provided) > 1:
+        raise click.UsageError(f"pass at most one of {', '.join(provided)}")
+    if not provided:
+        return None
+    try:
+        if setup is not None:
+            stripped = setup.strip()
+            is_local_file = False
+            if stripped and "\n" not in stripped:
+                try:
+                    is_local_file = Path(stripped).expanduser().is_file()
+                except OSError:
+                    is_local_file = False
+            if is_local_file:
+                return SetupScript(stripped).to_workload_setup()
+            return WorkloadSetup(script=setup)
+        if setup_url is not None:
+            return WorkloadSetup(url=setup_url)
+        assert resolved_branch is not None
+        return EasyDeLSetup(branch=resolved_branch, accelerator=accelerator).to_workload_setup()
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 def _chip_request(chips: int | None, chip_indexes: tp.Sequence[int]) -> TpuChipRequest | None:
@@ -230,7 +282,73 @@ class WorkloadCommandService:
             f"multiple fleets are applied: {available}; run `eyvan use FLEET` once or use FLEET/TYPE"
         )
 
-    def _upload_workspace(self, root: Path, scope: WorkloadScope) -> WorkspaceRef:
+    def _remote_workspace_artifact_root(
+        self,
+        scope: WorkloadScope,
+        *,
+        fleet_name: str | None = None,
+        prefer_remote: bool | None = None,
+    ) -> str | None:
+        """Return a remote GCS artifact root when a loopback plane submits to remote workers.
+
+        A loopback control plane's ``eyvan://`` artifact URL resolves to ``127.0.0.1``,
+        which remote GCP TPU/GPU hosts cannot reach. When a native GCP runtime profile is
+        configured for this loopback plane and the target is remote, stage workspaces in
+        its GCS bucket just like callable submissions do.
+        """
+
+        from eyvan.capacity.providers.gcp.runtime.profile import (
+            GcpNativeRuntimeProfileError,
+            GcpNativeRuntimeProfileStore,
+        )
+        from eyvan.capacity.providers.gcp.runtime.supervisor import runtime_profile_path_for
+        from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+
+        try:
+            endpoint = ControlPlaneEndpoint.parse(self.session.base_url)
+        except ValueError:
+            return None
+        if not endpoint.is_loopback:
+            return None
+        try:
+            profile = GcpNativeRuntimeProfileStore(runtime_profile_path_for(endpoint)).load()
+        except (FileNotFoundError, GcpNativeRuntimeProfileError):
+            return None
+        artifact_root = (profile.artifact_root_uri or "").strip()
+        if not artifact_root:
+            return None
+        if prefer_remote is not None:
+            return artifact_root if prefer_remote else None
+        if not fleet_name:
+            return None
+        try:
+            payload = self.session.client.request(
+                "GET",
+                "/api/v1/capacity",
+                params={"org_id": scope.org_id, "project_id": scope.project_id},
+                headers=self.session.workload_headers(scope),
+            )
+        except Exception:
+            return None
+        pools = payload.get("pools") if is_json_object(payload) else None
+        if not isinstance(pools, list):
+            return None
+        matched = [p for p in pools if is_json_object(p) and p.get("fleet") == fleet_name]
+        if not matched:
+            return None
+        has_remote_pool = any(
+            isinstance(p.get("region"), str) and p["region"].strip() not in ("", "local") for p in matched
+        )
+        return artifact_root if has_remote_pool else None
+
+    def _upload_workspace(
+        self,
+        root: Path,
+        scope: WorkloadScope,
+        *,
+        fleet_name: str | None = None,
+        prefer_remote: bool | None = None,
+    ) -> WorkspaceRef:
         """Package the working tree and store it content-addressed, once.
 
         The digest *is* the storage key, so re-running an unchanged tree uploads
@@ -241,6 +359,17 @@ class WorkloadCommandService:
             bundle = build_workspace(root)
         except WorkspaceError as exc:
             raise click.ClickException(str(exc)) from exc
+        remote_root = self._remote_workspace_artifact_root(
+            scope,
+            fleet_name=fleet_name,
+            prefer_remote=prefer_remote,
+        )
+        if remote_root is not None:
+            from eyvan.artifacts import artifact_store_from_uri
+
+            uri = artifact_store_from_uri(remote_root).put_workspace(bundle.payload, bundle.sha256)
+            click.echo(f"  workspace  {bundle.file_count} files, {bundle.size_bytes / 1e6:.1f} MB ({uri})", err=True)
+            return WorkspaceRef(uri=uri, sha256=bundle.sha256)
         self.session.client.request(
             "PUT",
             f"/api/v1/artifacts/workspaces/{bundle.sha256}",
@@ -279,6 +408,8 @@ class WorkloadCommandService:
         wait: bool = True,
         chips: int | None = None,
         chip_indexes: tuple[int, ...] = (),
+        secret_mounts: tuple[str, ...] = (),
+        setup: WorkloadSetup | None = None,
     ) -> int:
         """Submit one pool-targeted command using context and fleet defaults.
 
@@ -288,16 +419,22 @@ class WorkloadCommandService:
         """
 
         scope = self.session.workload_scope(org_id=org_id, project_id=project_id)
-        workspace_ref = self._upload_workspace(workspace, scope) if workspace is not None else None
         default_fleet = None if "/" in target_value else self.default_fleet(scope)
         try:
             target = RunTarget.parse(target_value, default_fleet=default_fleet)
+        except (ValidationError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        workspace_ref = (
+            self._upload_workspace(workspace, scope, fleet_name=target.fleet) if workspace is not None else None
+        )
+        try:
             request = pool_workload_request(
                 org_id=scope.org_id,
                 project_id=scope.project_id,
                 command=shell_command(command),
                 name=name,
                 environment=parse_environment(environment),
+                secret_mounts=parse_environment(secret_mounts, option="--secret"),
                 metadata=None,
                 max_retries=max_retries,
                 max_failure_retries=max_failure_retries,
@@ -315,6 +452,7 @@ class WorkloadCommandService:
                 zone=zone,
                 dependencies=dependencies,
                 tpu_chips=_chip_request(chips, chip_indexes),
+                setup=setup,
             )
         except (ValidationError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -825,6 +963,38 @@ class WorkloadCommandService:
 @click.option("--project", "project_id")
 @click.option("--name")
 @click.option("--env", "environment", multiple=True, metavar="KEY=VALUE")
+@click.option(
+    "--secret",
+    "secret_mounts",
+    multiple=True,
+    metavar="NAME=REFERENCE",
+    help="Mount a secret as an environment variable by reference (resolved at dispatch, never stored as a value).",
+)
+@click.option(
+    "--setup",
+    "setup_script",
+    help="Bash setup step run on each host before the command (inline script or path to a local script file).",
+)
+@click.option(
+    "--setup-url",
+    "setup_url",
+    metavar="HTTPS_URL",
+    help="HTTPS URL of a bash setup script fetched and run on each host before the command.",
+)
+@click.option(
+    "--easydel",
+    "install_easydel",
+    is_flag=True,
+    default=False,
+    help=f"Install EasyDeL before running (defaults to {EASYDEL_DEFAULT_BRANCH!r}; override with --easydel-branch).",
+)
+@click.option(
+    "--easydel-branch",
+    "easydel_branch",
+    default=None,
+    metavar="REF",
+    help="EasyDeL branch, tag, or commit to install before running (implies --easydel).",
+)
 @click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, show_default=True)
 @click.option(
     "--max-failure-retries",
@@ -912,6 +1082,11 @@ def run_workload(
     project_id: str | None,
     name: str | None,
     environment: tuple[str, ...],
+    secret_mounts: tuple[str, ...],
+    setup_script: str | None,
+    setup_url: str | None,
+    install_easydel: bool,
+    easydel_branch: str | None,
     max_retries: int,
     max_failure_retries: int,
     idempotency_key: str | None,
@@ -958,6 +1133,14 @@ def run_workload(
     if not command:
         raise click.UsageError("Missing argument 'COMMAND...'.")
     declared = _requirements(dependencies, requirements_file)
+    setup_accel = "cuda" if gpu_type is not None else "cpu" if cpu_only else "tpu"
+    resolved_setup = _resolve_cli_setup(
+        setup=setup_script,
+        setup_url=setup_url,
+        easydel=install_easydel,
+        easydel_branch=easydel_branch,
+        accelerator=setup_accel,
+    )
     exit_code = WorkloadCommandService(session).run(
         target_value=target,
         org_id=org_id,
@@ -984,6 +1167,8 @@ def run_workload(
         wait=not no_wait,
         chips=chips,
         chip_indexes=chip_indexes,
+        secret_mounts=secret_mounts,
+        setup=resolved_setup,
     )
     if exit_code:
         # The job's outcome is this command's outcome, so `eyvan run ... && ...`
@@ -1025,8 +1210,12 @@ def exec_in_workload(
         emit_result(service.renderer, response, "Exec not available", as_json=as_json)
         click.echo("exec is not available for workloads with secret mounts; nothing ran", err=True)
         raise SystemExit(1)
-    where = "every rank" if rank is None else f"rank {rank}"
-    emit_result(service.renderer, response, f"Ran {' '.join(command)} on {where}", as_json=as_json)
+    if as_json:
+        service.renderer.emit(response)
+    else:
+        where = "every rank" if rank is None else f"rank {rank}"
+        click.echo(f"Ran {' '.join(command)} on {where}")
+        _render_exec_results(response)
     failed = _failed_exec_ranks(response)
     if failed:
         # The document above is complete either way; the exit status is what a
@@ -1034,6 +1223,63 @@ def exec_in_workload(
         # can distinguish it from success without parsing the body.
         click.echo(f"exec failed on rank(s) {', '.join(str(index) for index in failed)}", err=True)
         raise SystemExit(1)
+
+
+def _render_exec_entry(label: str, entry: JsonValue) -> None:
+    """Render one rank/host exec answer with exit status, error, stdout, and stderr."""
+
+    if not is_json_object(entry):
+        return
+    if entry.get("output_suppressed") is True:
+        click.echo(f"[{label}] output suppressed")
+        return
+    error = entry.get("error")
+    if error is not None:
+        click.echo(f"[{label}] error: {error}", err=True)
+        return
+    if entry.get("observed") is False:
+        detail = entry.get("detail") or "unobserved"
+        click.echo(f"[{label}] unobserved: {detail}", err=True)
+        return
+    exit_code = entry.get("exit_code")
+    has_code = isinstance(exit_code, int) and not isinstance(exit_code, bool)
+    header = f"[{label}] exit={exit_code}" if has_code else f"[{label}]"
+    click.echo(header)
+    stdout = entry.get("stdout")
+    if isinstance(stdout, str) and stdout:
+        click.echo(stdout, nl=not stdout.endswith("\n"))
+    stderr = entry.get("stderr")
+    if isinstance(stderr, str) and stderr:
+        click.echo(stderr, err=True, nl=not stderr.endswith("\n"))
+
+
+def _render_exec_results(response: JsonValue) -> None:
+    """Print per-rank command outputs for ``eyvan workload exec`` human mode."""
+
+    if not is_json_object(response):
+        return
+    results = response.get("results")
+    if not isinstance(results, list):
+        return
+    for index, item in enumerate(results):
+        if not is_json_object(item):
+            continue
+        rank = item.get("rank")
+        rank_label = f"rank {rank if isinstance(rank, int) and not isinstance(rank, bool) else index}"
+        hosts = item.get("ranks")
+        if isinstance(hosts, list) and hosts:
+            for host_index, host in enumerate(hosts):
+                if not is_json_object(host):
+                    continue
+                sub_rank = host.get("rank")
+                host_label = (
+                    f"{rank_label}.{sub_rank}"
+                    if isinstance(sub_rank, int) and not isinstance(sub_rank, bool)
+                    else f"{rank_label}.{host_index}"
+                )
+                _render_exec_entry(host_label, host.get("result"))
+        else:
+            _render_exec_entry(rank_label, item)
 
 
 def _failed_exec_ranks(response: JsonValue) -> list[int]:
@@ -1080,10 +1326,45 @@ def workload() -> None:
     """Submit and operate whole workloads."""
 
 
+def _render_progress_lines(response: dict[str, JsonValue]) -> list[str]:
+    """Render one ``WorkloadProgress`` payload as a concise multi-line summary."""
+
+    wid = str(response.get("workload_id") or "")
+    state = str(response.get("workload_state") or "unknown")
+    phase = str(response.get("phase") or "")
+    header = f"{wid}  {state}" if not phase else f"{wid}  {state}  ({phase})"
+    lines = [header]
+    pool = response.get("pool")
+    if is_json_object(pool):
+        pool_id = pool.get("pool_id") or pool.get("fleet_name") or pool.get("id")
+        pool_state = pool.get("state") or pool.get("status")
+        if pool_id:
+            suffix = f" ({pool_state})" if pool_state else ""
+            lines.append(f"  pool      {pool_id}{suffix}")
+    capacity = response.get("capacity")
+    if is_json_object(capacity):
+        ready = capacity.get("ready_cells")
+        total = capacity.get("total_cells")
+        if isinstance(ready, int) and isinstance(total, int):
+            lines.append(f"  capacity  {ready}/{total} ready cells")
+    for label, key in (
+        ("reason", "scheduling_reason"),
+        ("failure", "failure_reason"),
+        ("blocked", "autoscale_block_reason"),
+    ):
+        value = response.get(key)
+        if isinstance(value, str) and value:
+            lines.append(f"  {label:<8}  {value}")
+    for entry in format_user_progress(response.get("user_progress")):
+        lines.append(f"  progress  {entry}")
+    return lines
+
+
 @workload.command("children")
 @click.argument("workload_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the child workload records as JSON.")
 @click.pass_obj
-def list_children(session: CliSession, workload_id: str) -> None:
+def list_children(session: CliSession, workload_id: str, as_json: bool) -> None:
     """List the workloads one workload submitted or fanned out to.
 
     The only view of a job tree. Without it a batch, a DAG or an in-job fan-out
@@ -1091,13 +1372,26 @@ def list_children(session: CliSession, workload_id: str) -> None:
     listing, indistinguishable from work a human submitted.
     """
 
-    JsonRenderer().emit(session.client.request("GET", f"/api/v1/workloads/{workload_id}/children"))
+    response = session.client.request("GET", f"/api/v1/workloads/{workload_id}/children")
+    if as_json or not isinstance(response, list):
+        JsonRenderer().emit(response)
+        return
+    columns = (
+        Column("id", table_field("id")),
+        Column("name", table_field("spec", "name")),
+        Column("state", table_field("state")),
+        Column("attempt", table_field("attempt"), align=">"),
+        Column("pool", table_field("assigned_pool_id")),
+    )
+    for line in render_table(response, columns, empty=f"No child workloads for {workload_id}."):
+        click.echo(line)
 
 
 @workload.command("endpoints")
 @click.argument("workload_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the endpoint records as JSON.")
 @click.pass_obj
-def list_endpoints(session: CliSession, workload_id: str) -> None:
+def list_endpoints(session: CliSession, workload_id: str, as_json: bool) -> None:
     """List the addresses a service's replicas registered.
 
     Registration is the readiness signal -- an app says it can serve *after* it
@@ -1105,7 +1399,42 @@ def list_endpoints(session: CliSession, workload_id: str) -> None:
     other view gives.
     """
 
-    JsonRenderer().emit(session.client.request("GET", f"/api/v1/workloads/{workload_id}/endpoints"))
+    response = session.client.request("GET", f"/api/v1/workloads/{workload_id}/endpoints")
+    if as_json or not isinstance(response, list):
+        JsonRenderer().emit(response)
+        return
+    columns = (
+        Column("workload", table_field("workload_id")),
+        Column("endpoint", table_field("endpoint")),
+        Column("revision", table_field("revision")),
+    )
+    for line in render_table(response, columns, empty=f"No active endpoints for {workload_id}."):
+        click.echo(line)
+
+
+@workload.command("progress")
+@click.argument("workload_id")
+@click.option("--org", "org_id")
+@click.option("--project", "project_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the progress document as JSON.")
+@click.pass_obj
+def workload_progress(
+    session: CliSession,
+    workload_id: str,
+    org_id: str | None,
+    project_id: str | None,
+    as_json: bool,
+) -> None:
+    """Show autoscaling, worker, and in-job progress for WORKLOAD_ID."""
+
+    service = WorkloadCommandService(session)
+    resolved = service.resolve(workload_id, org_id=org_id, project_id=project_id)
+    response = session.client.request("GET", f"/api/v1/workloads/{resolved}/progress")
+    if as_json or not is_json_object(response):
+        service.renderer.emit(response)
+        return
+    for line in _render_progress_lines(response):
+        click.echo(line)
 
 
 @workload.command("log-page")
@@ -1304,6 +1633,53 @@ def estimate_workload(
     help="Restarts allowed after the provider reclaims the capacity. Separate from --max-retries because a spot "
     "reclamation is expected and cheap to retry, while a stockout means the pool is empty.",
 )
+@click.option("--env", "environment", multiple=True, metavar="KEY=VALUE", help="Environment variable (repeatable).")
+@click.option(
+    "--with",
+    "dependencies",
+    multiple=True,
+    metavar="PACKAGE",
+    help="Install this package on the host before the command runs (repeatable).",
+)
+@click.option(
+    "--with-requirements",
+    "requirements_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Read packages from a local requirements file and install them like --with.",
+)
+@click.option(
+    "--workspace",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    is_flag=False,
+    flag_value=".",
+    default=None,
+    help="Upload this directory (respecting .gitignore) and run the command inside it. Bare --workspace means '.'.",
+)
+@click.option(
+    "--setup",
+    "setup_script",
+    help="Bash setup step run on each host before the command (inline script or path to a local script file).",
+)
+@click.option(
+    "--setup-url",
+    "setup_url",
+    metavar="HTTPS_URL",
+    help="HTTPS URL of a bash setup script fetched and run on each host before the command.",
+)
+@click.option(
+    "--easydel",
+    "install_easydel",
+    is_flag=True,
+    default=False,
+    help=f"Install EasyDeL before running (defaults to {EASYDEL_DEFAULT_BRANCH!r}; override with --easydel-branch).",
+)
+@click.option(
+    "--easydel-branch",
+    "easydel_branch",
+    default=None,
+    metavar="REF",
+    help="EasyDeL branch, tag, or commit to install before running (implies --easydel).",
+)
 @click.option(
     "--secret",
     "secret_mounts",
@@ -1356,14 +1732,51 @@ def submit_workload(
     max_retries: int,
     max_failure_retries: int,
     max_preemption_retries: int,
+    environment: tuple[str, ...],
+    dependencies: tuple[str, ...],
+    requirements_file: Path | None,
+    workspace: Path | None,
+    setup_script: str | None,
+    setup_url: str | None,
+    install_easydel: bool,
+    easydel_branch: str | None,
     secret_mounts: tuple[str, ...],
     can_submit_children: bool,
     idempotency_key: str | None,
 ) -> None:
     """Submit a workload with explicit resource and placement intent."""
 
+    service = WorkloadCommandService(session)
     scope = session.workload_scope(org_id=org_id, project_id=project_id)
     mounts = parse_environment(secret_mounts, option="--secret")
+    env_map = parse_environment(environment)
+    declared = _requirements(dependencies, requirements_file)
+    setup_accel = "tpu" if tpu > 0 else "cuda" if gpu > 0 else "cpu"
+    resolved_setup = _resolve_cli_setup(
+        setup=setup_script,
+        setup_url=setup_url,
+        easydel=install_easydel,
+        easydel_branch=easydel_branch,
+        accelerator=setup_accel,
+    )
+    workspace_ref = (
+        service._upload_workspace(
+            workspace,
+            scope,
+            prefer_remote=bool(provider == "gcp" or tpu > 0 or gpu > 0),
+        )
+        if workspace is not None
+        else None
+    )
+    optional_fields: dict[str, tp.Any] = {}
+    if workspace_ref is not None:
+        optional_fields["workspace"] = workspace_ref
+    if env_map:
+        optional_fields["environment"] = env_map
+    if declared:
+        optional_fields["dependencies"] = declared
+    if resolved_setup is not None:
+        optional_fields["setup"] = resolved_setup
     try:
         request = WorkloadSubmitRequest(
             org_id=scope.org_id,
@@ -1395,11 +1808,12 @@ def submit_workload(
                 max_preemption_retries=max_preemption_retries,
                 secret_mounts=mounts,
                 can_submit_children=can_submit_children,
+                **optional_fields,
             ),
         )
     except (ValidationError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    WorkloadCommandService(session).submit(request, scope=scope, idempotency_key=idempotency_key)
+    service.submit(request, scope=scope, idempotency_key=idempotency_key)
 
 
 @workload.command("submit-batch")
@@ -1822,9 +2236,15 @@ def kick_workload(
             for match in matches:
                 click.echo(f"  {match.id}  {match.state.value:<12}{match.spec.name}", err=True)
             raise click.ClickException(f"kick would apply to {len(matches)} workloads; pass --yes to confirm")
+        responses: list[JsonValue] = []
         for match in matches:
             response = session.client.request("POST", f"/api/v1/workloads/{match.id}/kick")
-            emit_result(service.renderer, response, f"Kicked {match.id}", as_json=as_json)
+            if as_json:
+                responses.append(response)
+            else:
+                emit_result(service.renderer, response, f"Kicked {match.id}", as_json=False)
+        if as_json:
+            service.renderer.emit(responses)
         return
     if workload_id is None:
         raise click.UsageError("give a workload id, or --prefix to match several")

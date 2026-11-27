@@ -35,6 +35,7 @@ RUNTIME_VERSION_BY_FAMILY = {
     "v5litepod": "v2-alpha-tpuv5-lite",
     "v5p": "v2-alpha-tpuv5",
     "v6e": "v2-alpha-tpuv6e",
+    "tpu7x": "v2-alpha-tpuv7x",
 }
 #: How a native worker VM reaches Eyvan's artifacts and control plane. There is
 #: no default: each choice needs infrastructure the operator has to have built

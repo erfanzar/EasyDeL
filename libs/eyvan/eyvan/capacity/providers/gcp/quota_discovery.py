@@ -24,6 +24,7 @@ from eyvan._internal.subprocess_env import provider_cli_env
 from eyvan.capacity.providers.gcp.accelerator_catalog import (
     AcceleratorCatalogError,
     ApiAcceleratorCatalog,
+    gcloud_access_token,
 )
 from eyvan.capacity.providers.gcp.quota_catalog import ApiQuotaCatalog, QuotaCatalogError
 from eyvan.capacity.providers.gcp.quota_usage import GcpQuotaUsageError, GcpTpuQuotaUsageDiscovery, TpuQuotaUsage
@@ -61,10 +62,16 @@ class TpuQuotaUsageDiscovery(Protocol):
         ...
 
 
-def _runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def _runner(args: Sequence[str], *, account: str | None = None) -> subprocess.CompletedProcess[str]:
     timeout_s = max(float(os.getenv("EYVAN_GCLOUD_QUOTA_TIMEOUT_S", "60")), 1.0)
+    overrides = {"CLOUDSDK_CORE_ACCOUNT": account} if account else None
     return subprocess.run(
-        ["gcloud", *args], check=False, capture_output=True, text=True, timeout=timeout_s, env=provider_cli_env()
+        ["gcloud", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        env=provider_cli_env(overrides=overrides),
     )
 
 
@@ -297,12 +304,13 @@ class GcpTpuQuotaDiscovery:
     def __init__(
         self,
         *,
-        runner: Runner = _runner,
+        runner: Runner | None = None,
         lookup_concurrency: int = 8,
         usage_discovery: TpuQuotaUsageDiscovery | None = None,
         catalog: ApiAcceleratorCatalog | None = None,
         quota_catalog: ApiQuotaCatalog | None = None,
         quota_response_ttl_s: float = _QUOTA_RESPONSE_TTL_S,
+        account: str | None = None,
     ):
         if isinstance(lookup_concurrency, bool) or not isinstance(lookup_concurrency, int) or lookup_concurrency < 1:
             raise ValueError("lookup_concurrency must be a positive integer")
@@ -312,17 +320,30 @@ class GcpTpuQuotaDiscovery:
             or quota_response_ttl_s < 0
         ):
             raise ValueError("quota_response_ttl_s must be a non-negative number")
-        self._runner = runner
+        normalized_account = account.strip() if isinstance(account, str) and account.strip() else None
+        self.account: str | None = normalized_account
+        self._account_discoveries: dict[str, GcpTpuQuotaDiscovery] = {}
+        if runner is not None:
+            self._runner: Runner = runner
+        elif normalized_account:
+            self._runner = lambda args: _runner(args, account=normalized_account)
+        else:
+            self._runner = _runner
         self.lookup_concurrency = lookup_concurrency
+        token_source = (
+            (lambda: gcloud_access_token(account=normalized_account)) if normalized_account else gcloud_access_token
+        )
         # The fast path. One subprocess per zone was 1.4s of Python startup
         # before any network work, so a project seeing 122 zones spent its
         # whole deadline spawning gcloud. Set to ``False`` to force the
         # subprocess path; ``None`` means build the default reader.
-        self._catalog = ApiAcceleratorCatalog() if catalog is None else catalog
+        self._catalog = ApiAcceleratorCatalog(token_source=token_source) if catalog is None else catalog
         # The other fast path. `gcloud beta quotas info list` is ~4s of the same
         # interpreter startup for a single response; the API answers it in one
         # request. ``None`` builds the default reader, as with the catalogue.
-        self._quota_catalog = ApiQuotaCatalog(_TPU_QUOTA_SERVICE) if quota_catalog is None else quota_catalog
+        self._quota_catalog = (
+            ApiQuotaCatalog(_TPU_QUOTA_SERVICE, token_source=token_source) if quota_catalog is None else quota_catalog
+        )
         #: One provider response per project, expiring after
         #: ``quota_response_ttl_s``. Within a single discovery every capacity
         #: class shares the read; across a longer interval the response is
@@ -331,7 +352,7 @@ class GcpTpuQuotaDiscovery:
         self._quota_response_cache: dict[str, tuple[float, JsonValue]] = {}
         self._quota_response_ttl_s = float(quota_response_ttl_s)
         self._usage_discovery: TpuQuotaUsageDiscovery = (
-            usage_discovery if usage_discovery is not None else GcpTpuQuotaUsageDiscovery()
+            usage_discovery if usage_discovery is not None else GcpTpuQuotaUsageDiscovery(account=normalized_account)
         )
 
     def discover(
@@ -342,6 +363,7 @@ class GcpTpuQuotaDiscovery:
         generations: Iterable[str] = (),
         accelerator_types: Iterable[str] = (),
         preemptible: bool = True,
+        account: str | None = None,
     ) -> tuple[TpuQuotaAvailability, ...]:
         """Return quota-backed accelerator candidates for the requested filters.
 
@@ -353,6 +375,24 @@ class GcpTpuQuotaDiscovery:
         zone can be queried; discovery raises an aggregate error only when all
         matching zone lookups fail.
         """
+
+        requested_account = account.strip() if isinstance(account, str) and account.strip() else None
+        if requested_account is not None and requested_account != self.account:
+            child = self._account_discoveries.get(requested_account)
+            if child is None:
+                child = GcpTpuQuotaDiscovery(
+                    lookup_concurrency=self.lookup_concurrency,
+                    quota_response_ttl_s=self._quota_response_ttl_s,
+                    account=requested_account,
+                )
+                self._account_discoveries[requested_account] = child
+            return child.discover(
+                project=project,
+                zones=zones,
+                generations=generations,
+                accelerator_types=accelerator_types,
+                preemptible=preemptible,
+            )
 
         normalized_project = project.strip()
         if not normalized_project:

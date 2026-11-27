@@ -27,10 +27,14 @@ from eyvan.records import (
     WorkloadState,
 )
 from eyvan.sdk.client.jobs import (
+    DEFAULT_RECLAIM_GRACE_SECONDS,
+    AcceleratorConfig,
     CallableSubmission,
     EyvanJob,
     EyvanPlacementError,
     JobCompletion,
+    format_reclaim_status,
+    placement_error_labels,
     reject_remote_callable_signature,
     reject_remote_callable_signing_key,
 )
@@ -195,19 +199,26 @@ def _existing_hardware_class(error: EyvanHTTPError, request: CallableSubmission)
         return None
 
 
-def _placement_error(error: EyvanHTTPError) -> EyvanPlacementError | None:
+def _placement_error(
+    error: EyvanHTTPError,
+    *,
+    config: AcceleratorConfig | None = None,
+) -> EyvanPlacementError | None:
     """Translate the typed no-pool API response into the public SDK error."""
 
     try:
         response = NoMatchingCapacityPoolErrorResponse.model_validate_json(error.response.content)
     except ValidationError:
         return None
+    accelerator_label, config_name = placement_error_labels(config)
     return EyvanPlacementError(
         fleet=response.context.fleet,
         requested_accelerator_type=response.context.requested_accelerator_type,
         available_accelerator_types=response.context.available_enabled_accelerator_types,
         fleets_providing_requested_type=response.context.fleets_providing_requested_type,
         available_fleets=response.context.available_fleets,
+        accelerator_label=accelerator_label,
+        config_name=config_name,
     )
 
 
@@ -241,6 +252,7 @@ class _CallableProgressRenderer:
                 self._queue_admission_recorder.record_workload(workload)
             self._emit(self._terminal_workload_update(workload))
             return
+        reclaim_status = format_reclaim_status(workload)
         try:
             progress = self._client.get_workload_progress(workload.id)
         except EyvanHTTPError as error:
@@ -249,18 +261,38 @@ class _CallableProgressRenderer:
                 raise
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)
-            self._emit(self._fallback_or_terminal_update(workload))
+            self._emit(self._with_reclaim_status(self._fallback_or_terminal_update(workload), reclaim_status))
             return
         except EyvanUnavailableError:
             if self._queue_admission_recorder is not None:
                 self._queue_admission_recorder.record_workload(workload)
-            self._emit(self._fallback_or_terminal_update(workload))
+            self._emit(self._with_reclaim_status(self._fallback_or_terminal_update(workload), reclaim_status))
             self._drain_output(workload.id)
             return
         if self._queue_admission_recorder is not None:
             self._queue_admission_recorder.record_workload(workload)
-        self._emit(self._progress_update(progress, placement=workload.spec.placement))
+        self._emit(
+            self._with_reclaim_status(
+                self._progress_update(progress, placement=workload.spec.placement),
+                reclaim_status,
+            )
+        )
         self._drain_output(workload.id)
+
+    @staticmethod
+    def _with_reclaim_status(update: JobLifecycleUpdate, reclaim_status: str | None) -> JobLifecycleUpdate:
+        """Overlay live reclaim/checkpoint countdown messaging onto ``update`` when active."""
+
+        if reclaim_status is None:
+            return update
+        if update.state in {
+            JobLifecycleState.REQUESTING,
+            JobLifecycleState.QUEUED,
+            JobLifecycleState.READY,
+            JobLifecycleState.CHECKPOINTING,
+        }:
+            return replace(update, summary=reclaim_status)
+        return replace(update, diagnostic=reclaim_status)
 
     def _emit(self, update: JobLifecycleUpdate) -> None:
         if update == self._last_update:
@@ -589,6 +621,23 @@ class _SdkJobBackend:
             self._queue_admission_recorder.record_workload(workload)
         return self._completion(workload)
 
+    def wait_with_reclaim_updates(self, job_id: str, timeout: float | None = None) -> JobCompletion:
+        """Wait for terminal state while surfacing live reclaim notices on stderr."""
+
+        last_reclaim_message: str | None = None
+
+        def on_update(workload: WorkloadRecord) -> None:
+            nonlocal last_reclaim_message
+            message = format_reclaim_status(workload)
+            if message is not None and message != last_reclaim_message:
+                self._terminal_output.note(message)
+                last_reclaim_message = message
+
+        workload = self.client.wait_workload(job_id, timeout=timeout, on_update=on_update)
+        if self._queue_admission_recorder is not None:
+            self._queue_admission_recorder.record_workload(workload)
+        return self._completion(workload)
+
     def wait_with_progress(self, job_id: str, timeout: float | None = None) -> JobCompletion:
         """Wait for a callable workload while rendering durable lifecycle transitions.
 
@@ -731,6 +780,8 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 checkpointable=request.tpu.checkpointable,
                 checkpoint_hook=request.tpu.checkpoint_hook,
                 checkpoint_output_uri=request.tpu.checkpoint_output_uri,
+                checkpoint_grace_seconds=getattr(request.tpu, "reclaim_grace_seconds", DEFAULT_RECLAIM_GRACE_SECONDS),
+                reclaim_policy=getattr(request.tpu, "reclaim_policy", None),
                 can_submit_children=request.tpu.can_submit_children,
                 dependencies=tuple(request.tpu.dependencies),
                 atomic=getattr(request.tpu, "atomic", False),
@@ -742,7 +793,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
         try:
             return submit(request.tpu.capacity_class, key)
         except EyvanHTTPError as error:
-            if _placement_error(error) is not None:
+            if _placement_error(error, config=request.tpu) is not None:
                 raise
             substitute = self._reserved_substitute(request, error)
             if substitute is None:
@@ -763,7 +814,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
         try:
             workload = self._create_workload(request, request.invocation_id)
         except EyvanHTTPError as error:
-            placement_error = _placement_error(error)
+            placement_error = _placement_error(error, config=request.tpu)
             if placement_error is None:
                 raise
             # A name with pools of its own is a real fleet lacking this type,
@@ -781,7 +832,7 @@ class EyvanCallableSubmitter(tp.Generic[R]):
                 # request carries its own key rather than replaying the refused one.
                 workload = self._create_workload(request, f"{request.invocation_id}:fleet")
             except EyvanHTTPError as retry_error:
-                retried = _placement_error(retry_error)
+                retried = _placement_error(retry_error, config=request.tpu)
                 if retried is None:
                     raise
                 raise retried from None

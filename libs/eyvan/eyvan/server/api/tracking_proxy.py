@@ -60,7 +60,8 @@ def register_tracking_routes(
             payload = response.json()
         except ValueError:
             raise HTTPException(
-                status_code=502, detail="Tracker is unreachable or returned invalid JSON; check its status."
+                status_code=502,
+                detail="Run tracker returned an invalid JSON response; check `eyvan track status` or its logs.",
             ) from None
         return JSONResponse(status_code=response.status_code, content=payload)
 
@@ -137,9 +138,17 @@ def register_tracking_routes(
                     return httpx.Response(
                         response.status_code, content=bytes(content), headers={"Content-Type": content_type}
                     )
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=502,
+                detail="Run tracker timed out before responding; check `eyvan track status` or retry shortly.",
+            ) from None
         except httpx.HTTPError:
             raise HTTPException(
-                status_code=502, detail="Tracker is unreachable or returned invalid JSON; check its status."
+                status_code=502,
+                detail=(
+                    "Run tracker is unreachable; check `eyvan track status` or restart with `eyvan track up --local`."
+                ),
             ) from None
 
     @app.get("/api/v1/tracking/health", tags=["tracking"])

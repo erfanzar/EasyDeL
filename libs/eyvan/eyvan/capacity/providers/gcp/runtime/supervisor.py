@@ -51,6 +51,7 @@ from eyvan.server.local.daemon import (
     owner_only_startup_lock,
     process_is_alive,
     read_owner_only_record,
+    runtime_profile_identifier,
     serving_runtime_profile_path,
     serving_source_digest,
     stop_owned_process,
@@ -475,7 +476,7 @@ class LocalAgentSupervisor:
                 log_path=log_path,
             )
 
-    def stop(self) -> None:
+    def stop(self, *, runtime_profile_path: Path | None = None) -> int | None:
         """Stop the cell agent this profile recorded for this supervisor's endpoint.
 
         The counterpart to :meth:`ensure` for callers that own the profile
@@ -487,19 +488,33 @@ class LocalAgentSupervisor:
         recycled PID naming an unrelated process is refused rather than
         killed. A missing record stops nothing: an agent this supervisor
         cannot prove it owns is not this supervisor's to stop.
+
+        Args:
+            runtime_profile_path: Optional runtime profile that the recorded
+                agent must belong to in order to be stopped. When supplied and
+                the recorded agent belongs to a different profile, the agent
+                and its record are left untouched and ``None`` is returned.
+
+        Returns:
+            The PID of the live cell agent that was stopped, or ``None`` when
+            no matching live cell agent was running.
         """
 
         target = self._target()
         record_path = self.paths.agent_record_path(target)
         log_path = self.paths.agent_log_path(target)
+        expected_profile_id = runtime_profile_identifier(runtime_profile_path)
         with owner_only_startup_lock(self.paths.agent_lock_path(target)):
             record = read_owner_only_record(record_path)
             if record is None:
-                return
+                return None
             if record.endpoint != self.endpoint:
                 raise LocalAgentConfigurationError(
                     f"the recorded Eyvan cell-agent endpoint does not match {self.endpoint.url}; refusing to stop it"
                 )
+            if expected_profile_id is not None and record.runtime_profile_path != expected_profile_id:
+                return None
+            stopped_pid: int | None = None
             if self.process_liveness(record.pid):
                 if record.runtime_profile_path is None:
                     raise LocalAgentConfigurationError(
@@ -512,7 +527,9 @@ class LocalAgentSupervisor:
                     log_path=log_path,
                     expected_runtime_profile_path=record.runtime_profile_path,
                 )
+                stopped_pid = record.pid
             clear_owner_only_record(record_path, pid=record.pid)
+            return stopped_pid
 
     @staticmethod
     def _prepared_profile(

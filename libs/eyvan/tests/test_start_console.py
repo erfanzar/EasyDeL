@@ -261,3 +261,73 @@ def test_the_local_snippet_pins_the_selected_plane_over_saved_defaults() -> None
 
     assert f'eyvan.init("{LOCAL_URL}")' in snippet
     assert "eyvan.init()" not in snippet
+
+
+def test_start_cli_honors_url_env_and_active_loopback_context(monkeypatch, tmp_path) -> None:
+    """`eyvan start` probes the configured loopback URL instead of hardcoding 127.0.0.1:8080."""
+
+    import json
+
+    from click.testing import CliRunner
+
+    from eyvan.sdk import cli
+    from eyvan.sdk.commands import start as start_module
+    from eyvan.sdk.contexts import EyvanContext, EyvanContextConfig, FileContextStore
+
+    probed: list[str] = []
+
+    def fake_probe(url: str, timeout_s: float = 3.0) -> bool:
+        del timeout_s
+        probed.append(url)
+        return url in {"http://127.0.0.1:18080", "http://127.0.0.1:18081", "http://127.0.0.1:18082"}
+
+    monkeypatch.setattr(start_module, "_probe", fake_probe)
+    monkeypatch.setattr(start_module, "configured_project", lambda _runner=None: None)
+    context_file = tmp_path / "contexts.json"
+    monkeypatch.setenv("EYVAN_CONFIG_FILE", str(context_file))
+    monkeypatch.delenv("EYVAN_URL", raising=False)
+
+    # 1. Explicit --url on custom loopback port.
+    by_flag = CliRunner().invoke(cli.main, ["--url", "http://127.0.0.1:18080", "start", "--json"])
+    assert by_flag.exit_code == 0, by_flag.output
+    payload = json.loads(by_flag.output)
+    assert payload["local_reachable"] is True
+    assert payload["local_url"] == "http://127.0.0.1:18080"
+
+    # 2. EYVAN_URL env var on custom loopback port.
+    monkeypatch.setenv("EYVAN_URL", "http://127.0.0.1:18081")
+    by_env = CliRunner().invoke(cli.main, ["start", "--json"])
+    assert by_env.exit_code == 0, by_env.output
+    assert json.loads(by_env.output)["local_reachable"] is True
+    assert json.loads(by_env.output)["local_url"] == "http://127.0.0.1:18081"
+    monkeypatch.delenv("EYVAN_URL", raising=False)
+
+    # 3. Saved active loopback context.
+    FileContextStore(context_file).save(
+        EyvanContextConfig(
+            active_context="laptop",
+            contexts={
+                "laptop": EyvanContext(
+                    fleet="laptop",
+                    base_url="http://127.0.0.1:18082",
+                    org_id="local",
+                    project_id="default",
+                )
+            },
+        )
+    )
+    by_context = CliRunner().invoke(cli.main, ["start", "--json"])
+    assert by_context.exit_code == 0, by_context.output
+    assert json.loads(by_context.output)["local_reachable"] is True
+    assert json.loads(by_context.output)["local_url"] == "http://127.0.0.1:18082"
+
+    # 4. Remote --url still probes LOCAL_URL for "this machine".
+    remote = CliRunner().invoke(cli.main, ["--url", "http://192.0.2.10:8080", "start", "--json"])
+    assert remote.exit_code == 0, remote.output
+    assert json.loads(remote.output)["local_url"] == LOCAL_URL
+    assert probed == [
+        "http://127.0.0.1:18080",
+        "http://127.0.0.1:18081",
+        "http://127.0.0.1:18082",
+        LOCAL_URL,
+    ]

@@ -194,3 +194,130 @@ def test_a_group_readable_credential_file_is_refused(tmp_path) -> None:
     os.chmod(path, 0o644)
     with pytest.raises(TeamCredentialError, match="readable by other users"):
         TeamCredentialStore(path).get(PLANE)
+
+
+def test_loopback_team_token_suppresses_development_fleet_admin_banner(plane, monkeypatch) -> None:
+    """A signed-in non-admin team user on localhost must never see 'acting as fleet_admin'."""
+
+    monkeypatch.setattr(cli, "stream_is_terminal", lambda _stream: True)
+
+    # First login on a loopback TTY must not print the dev fleet_admin banner either.
+    login_result = _login()
+    assert login_result.exit_code == 0, login_result.output
+    assert "acting as" not in login_result.output
+    assert "fleet_admin" not in login_result.output
+
+    # Subsequent commands with the saved team token suppress the banner — both allowed and 403 paths.
+    me = CliRunner().invoke(cli.main, ["users", "me"])
+    assert me.exit_code == 0, me.output
+    assert "acting as" not in me.output
+    assert "fleet_admin" not in me.output
+    assert "development plane" not in me.output
+
+    denied = CliRunner().invoke(cli.main, ["users", "list"])
+    assert denied.exit_code != 0
+    assert "acting as" not in denied.output
+    assert "fleet_admin" not in denied.output
+    assert "development plane" not in denied.output
+
+    # After logout (no team token left), loopback development auth banner returns normally.
+    assert CliRunner().invoke(cli.main, ["logout", PLANE]).exit_code == 0
+    back_to_dev = CliRunner().invoke(cli.main, ["users", "list"])
+    assert back_to_dev.exit_code == 0, back_to_dev.output
+    assert "development plane" in back_to_dev.output
+    assert "fleet_admin" in back_to_dev.output
+
+
+@pytest.mark.parametrize("tier", ["trusted", "user"])
+def test_login_with_invite_discovers_ready_fleet_and_saves_context_for_non_admin(
+    tmp_path, monkeypatch, tier: str
+) -> None:
+    """End-to-end login --invite using real connect/probe against a team plane with a ready fleet."""
+
+    import asyncio
+    import json
+
+    import httpx
+
+    from eyvan.records import CapacityPoolRecord, Principal, Role, RoleGrant
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    contexts_path = tmp_path / "contexts.json"
+    monkeypatch.setenv("EYVAN_CONFIG_FILE", str(contexts_path))
+    monkeypatch.setattr(cli, "stream_is_terminal", lambda _stream: True)
+
+    settings = EyvanSettings(
+        dev_auth_enabled=True, team_mode=True, controller_enabled=False, artifact_token_key="k" * 32
+    )
+    app = create_app(settings=settings)
+    admin_principal = Principal(subject="root", grants=(RoleGrant(role=Role.FLEET_ADMIN),))
+    pool = CapacityPoolRecord(
+        id="research/v5p-8",
+        fleet_name="research",
+        node_type="v5p-8",
+        provider="gcp",
+        capacity_backend="gcp-compute",
+        provider_project="project-a",
+        region="us-central1",
+        zone="us-central1-a",
+        capacity={"cpu": 4, "memory_gib": 16, "tpu": 8},
+        allocatable={"cpu": 4, "memory_gib": 16, "tpu": 8},
+        executor="native-local",
+        agent_endpoint="http://agent:8090",
+        provider_options={"kind": "cpu", "machine_type": "n2-standard-4"},
+        min_cells=0,
+        max_cells=2,
+        enabled=True,
+    )
+    asyncio.run(app.state.service.upsert_capacity_pool(admin_principal, pool, idempotency_key="seed-fleet"))
+
+    admin_http = TestClient(app, base_url=PLANE)
+    invite = admin_http.post(
+        "/api/v1/team/invites",
+        json={
+            "email": f"{tier}@example.com",
+            "subject": tier,
+            "tier": tier,
+            "org_id": "acme",
+            "project_id": "research",
+        },
+        headers=ADMIN,
+    ).json()
+
+    class _NoLifespan:
+        def __init__(self, url: str, trust: object = None) -> None:
+            self.client = TestClient(app, base_url=url)
+
+        def __enter__(self) -> TestClient:
+            return self.client
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    real_client = httpx.Client
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        resp = admin_http.request(
+            request.method, str(request.url), headers=dict(request.headers), content=request.content
+        )
+        return httpx.Response(resp.status_code, headers=resp.headers, content=resp.content)
+
+    monkeypatch.setattr(team_commands, "_http", _NoLifespan)
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs))
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["login", PLANE, "--invite", invite["token"], "--password-stdin"],
+        input=f"{PASSWORD}\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "acting as" not in result.output
+    assert "ready fleets: research" in result.output
+    assert "ready fleets: none yet" not in result.output
+    assert "active context: research (acme/research)" in result.output
+
+    saved = json.loads(contexts_path.read_text(encoding="utf-8"))
+    assert saved["active_context"] == "research"
+    assert saved["contexts"]["research"]["fleet"] == "research"
+    assert saved["contexts"]["research"]["org_id"] == "acme"
+    assert saved["contexts"]["research"]["project_id"] == "research"

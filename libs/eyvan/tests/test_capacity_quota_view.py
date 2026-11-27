@@ -268,12 +268,15 @@ def test_one_unreadable_purchase_class_does_not_hide_the_other() -> None:
 
     assert payload["status"] == "ok"
     assert [row["capacity_class"] for row in payload["entries"]] == ["on_demand"]
-    assert payload["failures"] == [
-        {
-            "capacity_class": "spot",
-            "reason": "gcloud beta quotas info list failed: PERMISSION_DENIED",
-        }
-    ]
+    assert len(payload["failures"]) == 1
+    failure = payload["failures"][0]
+    assert failure["capacity_class"] == "spot"
+    assert failure["reason"] == "gcloud beta quotas info list failed: PERMISSION_DENIED"
+    assert failure["code"] == "permission_denied"
+    assert failure["summary"] is not None
+    assert "gcp-project" in failure["summary"]
+    assert failure["remediation"] is not None
+    assert "roles/cloudquotas.viewer" in failure["remediation"]
 
 
 def test_a_snapshot_with_nothing_readable_says_so_instead_of_looking_empty() -> None:
@@ -770,3 +773,234 @@ def test_an_unreadable_refusal_cache_does_not_break_the_quota_view(monkeypatch, 
 
     assert result.exit_code == 0, result.output
     assert "us-central2-b" in result.output
+
+
+def _apply_two_gcp_projects(client: TestClient, *, first: str, second: str) -> None:
+    for idx, project in enumerate((first, second), start=1):
+        applied = client.put(
+            f"/api/v1/fleets/fleet-{idx}",
+            headers={**_headers(), "Idempotency-Key": f"fleet-{project}-{idx}"},
+            json={
+                "pools": [
+                    {
+                        "id": f"v6e-pool-{idx}",
+                        "fleet_name": f"fleet-{idx}",
+                        "node_type": "v6e-workers",
+                        "provider": "gcp",
+                        "capacity_backend": "gcp-tpu",
+                        "provider_project": project,
+                        "region": "us-central2",
+                        "zone": "us-central2-b",
+                        "capacity": {"cpu": 180, "memory_gib": 720, "tpu": 8},
+                        "allocatable": {"cpu": 180, "memory_gib": 720, "tpu": 8},
+                        "accelerator_type": "v6e-8",
+                        "capacity_class": "spot",
+                        "executor": "native-local",
+                        "agent_endpoint": "http://agent:8090",
+                        "min_cells": 0,
+                        "max_cells": 4,
+                    }
+                ]
+            },
+        )
+        assert applied.status_code == 200, applied.text
+
+
+def test_quota_defaults_to_active_operator_project_instead_of_alphabetical_first(monkeypatch, tmp_path) -> None:
+    """Prefer the operator's active project from ~/.eyvan config when multiple fleet projects exist."""
+
+    import json
+
+    from eyvan.storage import StorageConfig, StorageConfigStore, clear_gcp_context_cache
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    clear_gcp_context_cache()
+
+    discovery = FakeDiscovery(spot=(_availability(),))
+    client = _client(discovery)
+    _apply_two_gcp_projects(client, first="example-project-a", second="example-project-b")
+
+    # 1. Native runtime profile selects example-project-b over alphabetical example-project-a.
+    runtime_file = tmp_path / ".eyvan" / "gcp-native-runtime.json"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text(json.dumps({"project_id": "example-project-b"}), encoding="utf-8")
+
+    resp = client.get("/api/v1/capacity/quota", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["project"] == "example-project-b"
+    assert payload["available_projects"] == ["example-project-a", "example-project-b"]
+
+    # 2. Removing native runtime falls back to storage.json project when present in available_projects.
+    runtime_file.unlink()
+    StorageConfigStore(tmp_path / ".eyvan" / "storage.json").save(StorageConfig(project="example-project-b"))
+    clear_gcp_context_cache()
+
+    resp2 = client.get("/api/v1/capacity/quota", headers=_headers())
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["project"] == "example-project-b"
+
+    # 3. Explicit ?project= always wins over the smart default.
+    resp3 = client.get("/api/v1/capacity/quota", headers=_headers(), params={"project": "example-project-a"})
+    assert resp3.status_code == 200, resp3.text
+    assert resp3.json()["project"] == "example-project-a"
+
+
+def test_tpu_quota_failure_parses_protobuf_permission_denied_wall_and_all_codes() -> None:
+    """Raw gcloud ErrorInfo walls become clean 1-sentence diagnostics with actionable remediation."""
+
+    from eyvan.server.api.schemas import TpuQuotaFailure
+
+    raw_gcloud_wall = (
+        "gcloud beta quotas info list failed: ERROR: (gcloud.beta.quotas.info.list) PERMISSION_DENIED: "
+        "Permission 'cloudquotas.quotas.get' denied on resource "
+        "'//cloudquotas.googleapis.com/projects/example-project-a/locations/global/services/tpu.googleapis.com'. "
+        "This command is authenticated as alice@example.com which is the active account specified by the "
+        "[core/account] property.\n"
+        "- '@type': type.googleapis.com/google.rpc.ErrorInfo\n"
+        "  domain: iam.googleapis.com\n"
+        "  metadata:\n"
+        "    permission: cloudquotas.quotas.get\n"
+        "    resource: projects/example-project-a\n"
+        "  reason: IAM_PERMISSION_DENIED\n"
+        "- '@type': type.googleapis.com/google.iam.v1.logging.AuditData\n"
+        "  error_info_id: Cg5pYW0uZ29vZ2xlYXBpcy5jb21BQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWjAxMjM0NTY3ODk=\n"
+        "  troubleshooter_url: https://console.cloud.google.com/iam-admin/troubleshooter;permissions=cloudquotas.quotas.get\n"
+    )
+    failure = TpuQuotaFailure.from_reason(capacity_class=CapacityClass.SPOT, reason=raw_gcloud_wall)
+    assert failure.code == "permission_denied"
+    assert failure.permission == "cloudquotas.quotas.get"
+    assert failure.account == "alice@example.com"
+    assert failure.summary is not None
+    assert "alice@example.com" in failure.summary
+    assert "cloudquotas.quotas.get" in failure.summary
+    assert "example-project-a" in failure.summary
+    for noise in ("@type", "type.googleapis.com", "error_info_id", "troubleshooter_url", "Cg5pYW0"):
+        assert noise not in failure.summary
+    assert failure.remediation is not None
+    assert "roles/cloudquotas.viewer" in failure.remediation
+    assert "--member=user:alice@example.com" in failure.remediation
+    assert failure.reason.startswith("gcloud beta quotas info list failed:")
+
+    auth_failure = TpuQuotaFailure.from_reason(
+        capacity_class=CapacityClass.SPOT,
+        reason="gcloud auth token lookup failed: UNAUTHENTICATED: no credentials found",
+        project="my-proj",
+    )
+    assert auth_failure.code == "auth_required"
+    assert auth_failure.remediation is not None and "gcloud auth login" in auth_failure.remediation
+
+    disabled_failure = TpuQuotaFailure.from_reason(
+        capacity_class=CapacityClass.ON_DEMAND,
+        reason=(
+            "PERMISSION_DENIED: Cloud Quotas API has not been used in project my-proj before or it is disabled. "
+            "Enable it by visiting https://console.developers.google.com/apis/api/cloudquotas.googleapis.com"
+        ),
+        project="my-proj",
+    )
+    assert disabled_failure.code == "api_disabled"
+    assert disabled_failure.remediation is not None
+    assert "gcloud services enable cloudquotas.googleapis.com --project=my-proj" in disabled_failure.remediation
+
+    not_found = TpuQuotaFailure.from_reason(
+        capacity_class=CapacityClass.SPOT,
+        reason="ERROR: NOT_FOUND: Requested project 'ghost-proj' does not exist.",
+    )
+    assert not_found.code == "project_not_found"
+    assert not_found.summary is not None and "ghost-proj" in not_found.summary
+
+    timed_out = TpuQuotaFailure.from_reason(
+        capacity_class=CapacityClass.SPOT,
+        reason="provider quota discovery for 'my-proj' did not answer within 25s",
+    )
+    assert timed_out.code == "timeout"
+
+    missing_cli = TpuQuotaFailure.from_reason(
+        capacity_class=CapacityClass.SPOT,
+        reason="gcloud beta quotas info list failed: [Errno 2] No such file or directory: 'gcloud'",
+    )
+    assert missing_cli.code == "gcloud_missing"
+
+    generic = TpuQuotaFailure.from_reason(
+        capacity_class=CapacityClass.SPOT,
+        reason=(
+            "gcloud beta quotas info list failed: unexpected upstream gateway error\n"
+            "- '@type': type.googleapis.com/google.rpc.DebugInfo\n"
+            "  error_info_id: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ),
+        project="my-proj",
+    )
+    assert generic.code == "quota_read_failed"
+    assert generic.summary is not None
+    assert "@type" not in generic.summary
+    assert "error_info_id" not in generic.summary
+
+
+def test_storage_status_endpoint_and_backend_error_handlers(monkeypatch, tmp_path) -> None:
+    """Verify GET /api/v1/storage/status auth/payload and clean 503 handlers for storage/cell errors."""
+
+    from eyvan.storage import (
+        MonitoringBucketConfig,
+        RegionalBucketConfig,
+        StorageConfig,
+        StorageConfigStore,
+        clear_gcp_context_cache,
+    )
+    from eyvan.worker.agent.client import CellAgentUnavailableError
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    clear_gcp_context_cache()
+
+    cfg_path = tmp_path / ".eyvan" / "storage.json"
+    StorageConfigStore(cfg_path).save(
+        StorageConfig(
+            project="example-project-a",
+            auto_create=True,
+            monitoring=MonitoringBucketConfig(
+                bucket="eyvan_monitoring_example-project-a",
+                location="us-central1",
+                prefix="tracking",
+            ),
+            regional={
+                "us-central2": RegionalBucketConfig(
+                    bucket="eyvan_us-central2",
+                    location="us-central2",
+                )
+            },
+        )
+    )
+
+    app = create_app(settings=EyvanSettings(dev_auth_enabled=True, controller_enabled=False))
+    app.state.storage_config_path = cfg_path
+    with TestClient(app) as client:
+        unauth = client.get("/api/v1/storage/status")
+        assert unauth.status_code == 401
+
+        resp = client.get("/api/v1/storage/status", headers=_headers("project_viewer"))
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["configured"] is True
+        assert data["auto_create"] is True
+        assert data["config_path"] == str(cfg_path)
+        assert data["project"] == "example-project-a"
+        assert data["monitoring"]["bucket"] == "eyvan_monitoring_example-project-a"
+        assert data["monitoring"]["uri"] == "gs://eyvan_monitoring_example-project-a/tracking"
+        assert data["regional"]["us-central2"]["bucket"] == "eyvan_us-central2"
+        assert set(data["context"]) >= {"on_gcp", "project", "zone", "region", "accelerator_type", "source"}
+
+        # Corrupt storage config yields clean 503 JSON instead of a 500 traceback.
+        cfg_path.write_text("{corrupt", encoding="utf-8")
+        corrupt = client.get("/api/v1/storage/status", headers=_headers())
+        assert corrupt.status_code == 503
+        assert corrupt.json()["code"] == "storage_unavailable"
+
+        # Unhandled CellAgentUnavailableError returns clean 503 JSON without leaking secrets.
+        async def unreachable_orphans():
+            raise CellAgentUnavailableError("connect refused with bearer super-secret-token")
+
+        monkeypatch.setattr(app.state.controller, "capacity_orphans", unreachable_orphans)
+        cell_err = client.get("/api/v1/capacity/orphans", headers=_headers())
+        assert cell_err.status_code == 503
+        assert cell_err.headers.get("retry-after") == "5"
+        assert cell_err.json()["code"] == "cell_agent_unavailable"
+        assert "super-secret-token" not in cell_err.text

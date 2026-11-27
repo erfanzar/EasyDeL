@@ -67,10 +67,10 @@ _MAX_CONSTRAINTS = 10
 #: The eLarge YAML runner: ``easydel/scripts/elarge.py`` (``python -m easydel.scripts.elarge --config``).
 ELARGE_MODULE = "easydel.scripts.elarge"
 DEFAULT_CONFIG_PATH = "easydel-launch.yaml"
-#: Mesh used by EasyDeL's own eLarge CLI examples (docs/scripts/elarge_cli.md): FSDP over every chip.
+#: Mesh used by EasyDeL's eLarge defaults (6-axis): FSDP over every chip.
 DEFAULT_SHARDING: dict[str, Any] = {
-    "axis_dims": [1, -1, 1, 1, 1],
-    "axis_names": ["dp", "fsdp", "ep", "tp", "sp"],
+    "axis_dims": [1, 1, -1, 1, 1, 1],
+    "axis_names": ["pp", "dp", "fsdp", "ep", "tp", "sp"],
     "auto_shard_model": True,
 }
 _HEREDOC = "EASYDEL_ELARGE_CONFIG_EOF"
@@ -82,7 +82,7 @@ _AUX_ROLES = ("reference_model", "reward_model", "teacher_model", "target_model"
 #: hold a couple of GB free. One wheel per supported worker interpreter and
 #: architecture; the PEP 508 markers let the worker's own installer pick the
 #: one matching *its* Python, which the plane drafting the job cannot know.
-TORCH_CPU_VERSION = "2.15.0"
+TORCH_CPU_VERSION = "2.8.0"
 _TORCH_CPU_PYTHONS = ("3.11", "3.12", "3.13")
 _TORCH_CPU_MACHINES = ("x86_64", "aarch64")
 
@@ -853,10 +853,15 @@ def render_launch(
     config["loader"] = {"dtype": dtype, "param_dtype": dtype}
     if sharding is None:
         mesh: dict[str, Any] = copy.deepcopy(DEFAULT_SHARDING)
-        assumptions.append("sharding not given: default mesh dp=1, fsdp=-1 (all chips), ep=tp=sp=1.")
+        assumptions.append("sharding not given: default mesh pp=1, dp=1, fsdp=-1 (all chips), ep=tp=sp=1.")
     else:
         mesh = json.loads(json.dumps(dict(sharding)))
-        mesh.setdefault("axis_names", list(DEFAULT_SHARDING["axis_names"]))
+        if "axis_names" not in mesh:
+            dims = mesh.get("axis_dims")
+            if isinstance(dims, list) and len(dims) == 5:
+                mesh["axis_names"] = ["dp", "fsdp", "ep", "tp", "sp"]
+            else:
+                mesh["axis_names"] = list(DEFAULT_SHARDING["axis_names"])
         mesh.setdefault("auto_shard_model", True)
     blocking.extend(_sharding_problems(mesh, num_devices))
     config["sharding"] = mesh

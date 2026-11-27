@@ -45,6 +45,7 @@ import os
 import stat
 import subprocess
 import tarfile
+import tomllib
 import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
@@ -565,6 +566,167 @@ def extract_workspace(
     return written
 
 
+def _expand_workspace_member_patterns(root: Path, patterns: tp.Sequence[object]) -> list[Path]:
+    """Expand relative glob patterns strictly within ``root``, rejecting traversal."""
+
+    matched: set[Path] = set()
+    for raw in patterns:
+        if not isinstance(raw, str):
+            continue
+        pattern = raw.strip().replace("\\", "/").rstrip("/")
+        if not pattern or pattern == "." or "\x00" in pattern:
+            continue
+        candidate_pattern = Path(pattern)
+        if candidate_pattern.is_absolute() or candidate_pattern.drive or candidate_pattern.root:
+            continue
+        if any(part == ".." for part in candidate_pattern.parts):
+            continue
+        try:
+            candidates = root.glob(pattern)
+        except (OSError, ValueError, NotImplementedError):
+            continue
+        for candidate in candidates:
+            if not candidate.is_dir():
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if not resolved.is_relative_to(root):
+                continue
+            matched.add(resolved)
+    return sorted(matched)
+
+
+def _is_eyvan_member(member: Path) -> bool:
+    """Return whether ``member`` ships the ``eyvan`` package itself."""
+
+    if (member / "eyvan" / "__init__.py").is_file() or (member / "src" / "eyvan" / "__init__.py").is_file():
+        return True
+    member_pyproject = member / "pyproject.toml"
+    if member_pyproject.is_file():
+        try:
+            document = tomllib.loads(member_pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            document = None
+        if isinstance(document, dict):
+            project = document.get("project")
+            if isinstance(project, dict):
+                name = project.get("name")
+                if isinstance(name, str) and name.strip().lower() == "eyvan":
+                    return True
+    return False
+
+
+def _is_native_extension_member(member: Path) -> bool:
+    """Return whether ``member`` is a compiled native crate (e.g. Rust/C++)."""
+
+    return (member / "Cargo.toml").is_file() or (member / "CMakeLists.txt").is_file()
+
+
+def _has_python_code(directory: Path) -> bool:
+    """Return whether ``directory`` contains top-level Python modules or packages."""
+
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.is_file() and entry.suffix == ".py":
+            return True
+        if entry.is_dir() and (entry / "__init__.py").is_file():
+            return True
+    return False
+
+
+def discover_workspace_python_paths(root: str | Path) -> list[Path]:
+    """Return ordered Python import roots discovered inside an extracted workspace.
+
+    Handles flat repos, ``src/``-layout projects, and ``uv`` workspace monorepos
+    (``[tool.uv.workspace].members`` in ``pyproject.toml``) without executing any
+    project code:
+
+    - Always includes ``root`` first.
+    - Includes ``root / "src"`` when it is a directory contained within ``root``.
+    - Expands ``[tool.uv.workspace].members`` strictly within ``root`` (rejecting
+      absolute paths, ``..`` segments, and symlink escapes) in deterministic
+      sorted order, respecting ``[tool.uv.workspace].exclude`` when present.
+    - Skips any member that provides ``eyvan`` (so the worker's runtime ``eyvan``
+      is never shadowed) and any compiled native crate (``Cargo.toml`` or
+      ``CMakeLists.txt``, so prebuilt ``.so`` extensions load cleanly from host
+      site-packages).
+    - For each remaining member, includes ``member / "src"`` when it exists as a
+      directory, else ``member`` when it contains a Python package or ``.py``
+      module.
+    """
+
+    root_resolved = Path(root).expanduser().resolve()
+    paths: list[Path] = [root_resolved]
+    seen: set[Path] = {root_resolved}
+
+    def _add(candidate: Path) -> None:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if resolved.is_relative_to(root_resolved) and resolved not in seen:
+            seen.add(resolved)
+            paths.append(resolved)
+
+    root_src = root_resolved / "src"
+    if root_src.is_dir():
+        _add(root_src)
+
+    pyproject = root_resolved / "pyproject.toml"
+    if not pyproject.is_file():
+        return paths
+
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return paths
+
+    tool = document.get("tool")
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    workspace = uv.get("workspace") if isinstance(uv, dict) else None
+    raw_members = workspace.get("members") if isinstance(workspace, dict) else None
+    if not isinstance(raw_members, list):
+        return paths
+
+    raw_excludes = workspace.get("exclude") if isinstance(workspace, dict) else None
+    excluded = (
+        set(_expand_workspace_member_patterns(root_resolved, raw_excludes)) if isinstance(raw_excludes, list) else set()
+    )
+
+    for member in _expand_workspace_member_patterns(root_resolved, raw_members):
+        if member == root_resolved or member in excluded:
+            continue
+        if _is_eyvan_member(member) or _is_native_extension_member(member):
+            continue
+        member_src = member / "src"
+        if member_src.is_dir():
+            _add(member_src)
+        elif _has_python_code(member):
+            _add(member)
+
+    return paths
+
+
+def prepend_pythonpath(
+    paths: tp.Sequence[str | os.PathLike[str]],
+    existing: str | None = None,
+) -> str:
+    """Prepend ``paths`` ahead of ``existing`` ``PYTHONPATH`` entries, deduplicated in order."""
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for entry in (*(os.fspath(item) for item in paths), *((existing or "").split(os.pathsep))):
+        if entry and entry not in seen:
+            seen.add(entry)
+            ordered.append(entry)
+    return os.pathsep.join(ordered)
+
+
 __all__ = (
     "DEFAULT_EXCLUDED_DIRECTORY_SUFFIXES",
     "DEFAULT_EXCLUDED_SUFFIXES",
@@ -575,7 +737,9 @@ __all__ = (
     "WorkspaceError",
     "build_workspace",
     "create_private_directory",
+    "discover_workspace_python_paths",
     "extract_workspace",
+    "prepend_pythonpath",
 )
 
 

@@ -827,8 +827,9 @@ def test_cell_agent_client_preserves_an_unsupported_capability_as_terminal() -> 
         mutation=MutationModel(idempotency_key="ckpt-1", generation=1, fencing_token="cell:1")
     )
 
-    with pytest.raises(CellAgentUnsupportedCapabilityError, match="cannot run checkpoint hooks"):
+    with pytest.raises(CellAgentUnsupportedCapabilityError, match="cannot run checkpoint hooks") as caught:
         client.stop("cell-a", "wl-1", request)
+    assert str(caught.value) == "the manual backend cannot run checkpoint hooks"
     http_client.close()
 
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import statistics
 from datetime import UTC
 
 from eyvan.server.service._control_plane.shared import (
@@ -346,7 +347,7 @@ class ReportingMixin:
                     pool_id=pool.id,
                     accelerator_type=pool.accelerator_type,
                     p95_seconds=p95_latency(samples),
-                    median_seconds=samples[len(samples) // 2] if samples else None,
+                    median_seconds=statistics.median(samples) if samples else None,
                     slowest_seconds=samples[-1] if samples else None,
                     samples=len(samples),
                     cells_in_cooldown=sum(

@@ -53,7 +53,7 @@ from eyvan.artifacts.managed import (
     workspace_uri,
 )
 from eyvan.artifacts.secret_capability import SecretCapabilitySigner
-from eyvan.artifacts.transfers import ManagedArtifactAccess
+from eyvan.artifacts.transfers import ManagedArtifactAccess, progress_report_uri
 from eyvan.artifacts.workload_capability import WorkloadCapabilitySigner
 from eyvan.capacity.autoscale.service import TpuQuotaDiscovery
 from eyvan.capacity.providers.gcp.quota_discovery import (
@@ -149,6 +149,7 @@ from eyvan.server.api.schemas import (
     FleetApplyRequest,
     FleetInitScriptRequest,
     FleetStatusResponse,
+    GovernanceSummaryResponse,
     GroupSubmitRequest,
     GroupSubmitResponse,
     HealthResponse,
@@ -171,6 +172,7 @@ from eyvan.server.api.schemas import (
     ServiceEndpointRequest,
     ServiceHealthResponse,
     SessionResponse,
+    StorageStatusResponse,
     TpuQuotaEntry,
     TpuQuotaFailure,
     TpuQuotaSnapshot,
@@ -249,7 +251,8 @@ from eyvan.soak_contract import (
     safe_scope_id,
 )
 from eyvan.soak_evidence import MAX_EVIDENCE_BODY_BYTES, ExternalEvidenceSample, SoakEvidenceStore
-from eyvan.worker.agent.client import CellAgentUnavailableError
+from eyvan.storage import StorageError, select_preferred_gcp_project, storage_status
+from eyvan.worker.agent.client import CellAgentUnavailableError, CellAgentUnsupportedCapabilityError
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +382,7 @@ def _read_tpu_quota(
     project: str,
     zones: tuple[str, ...],
     capacity_class: CapacityClass,
+    account: str | None = None,
 ) -> _TpuQuotaReading:
     """Read one purchase class, turning a provider failure into a stated reason.
 
@@ -387,8 +391,19 @@ def _read_tpu_quota(
     cannot talk to the provider". The reason is carried instead.
     """
 
+    import inspect
+
+    kwargs: dict[str, tp.Any] = {
+        "project": project,
+        "zones": zones,
+        "preemptible": capacity_class is CapacityClass.SPOT,
+    }
+    if account is not None:
+        params = inspect.signature(discovery.discover).parameters
+        if "account" in params or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            kwargs["account"] = account
     try:
-        rows = discovery.discover(project=project, zones=zones, preemptible=capacity_class is CapacityClass.SPOT)
+        rows = discovery.discover(**kwargs)
     except (GcloudQuotaError, OSError, ValueError) as exc:
         return _TpuQuotaReading(capacity_class=capacity_class, refreshed_at=utcnow(), failure=str(exc))
     return _TpuQuotaReading(capacity_class=capacity_class, refreshed_at=utcnow(), rows=tuple(rows))
@@ -411,8 +426,8 @@ class TpuQuotaCache:
             raise ValueError("deadline_s must be positive")
         self.ttl_s = ttl_s
         self.deadline_s = deadline_s
-        self._readings: dict[tuple[str, tuple[str, ...], CapacityClass], _TpuQuotaReading] = {}
-        self._inflight: dict[tuple[str, tuple[str, ...], CapacityClass], asyncio.Task[_TpuQuotaReading]] = {}
+        self._readings: dict[tuple[str, tuple[str, ...], CapacityClass, str | None], _TpuQuotaReading] = {}
+        self._inflight: dict[tuple[str, tuple[str, ...], CapacityClass, str | None], asyncio.Task[_TpuQuotaReading]] = {}
         self._lock = asyncio.Lock()
 
     async def read(
@@ -423,10 +438,12 @@ class TpuQuotaCache:
         zones: tuple[str, ...],
         capacity_class: CapacityClass,
         refresh: bool = False,
+        account: str | None = None,
     ) -> _TpuQuotaReading:
         """Return a fresh reading, a shared in-flight one, or a dated older one."""
 
-        key = (project, zones, capacity_class)
+        normalized_account = account.strip() if isinstance(account, str) and account.strip() else None
+        key = (project, zones, capacity_class, normalized_account)
         async with self._lock:
             reading = self._readings.get(key)
             if reading is not None and not refresh and (utcnow() - reading.refreshed_at).total_seconds() < self.ttl_s:
@@ -440,6 +457,7 @@ class TpuQuotaCache:
                         project=project,
                         zones=zones,
                         capacity_class=capacity_class,
+                        account=normalized_account,
                     )
                 )
                 self._inflight[key] = task
@@ -462,12 +480,13 @@ class TpuQuotaCache:
 
     async def _refresh(
         self,
-        key: tuple[str, tuple[str, ...], CapacityClass],
+        key: tuple[str, tuple[str, ...], CapacityClass, str | None],
         *,
         discovery: TpuQuotaDiscovery,
         project: str,
         zones: tuple[str, ...],
         capacity_class: CapacityClass,
+        account: str | None = None,
     ) -> _TpuQuotaReading:
         """Perform one blocking provider read off the event loop and retain it."""
 
@@ -477,6 +496,7 @@ class TpuQuotaCache:
             project=project,
             zones=zones,
             capacity_class=capacity_class,
+            account=account,
         )
         async with self._lock:
             self._readings[key] = reading
@@ -595,14 +615,19 @@ def create_app(
         server_bind = server_startup.bind
     server_bind = server_bind or ServerBindPolicy.from_host("127.0.0.1")
     quota_cache = TpuQuotaCache(ttl_s=TPU_QUOTA_CACHE_TTL_S, deadline_s=TPU_QUOTA_READ_DEADLINE_S)
-    resolved_quota_discovery: list[TpuQuotaDiscovery] = [quota_discovery] if quota_discovery is not None else []
+    resolved_quota_discoveries: dict[str | None, TpuQuotaDiscovery] = {}
 
-    def resolve_quota_discovery() -> TpuQuotaDiscovery:
-        """Return the injected provider reader, or build the default one once."""
+    def resolve_quota_discovery(account: str | None = None) -> TpuQuotaDiscovery:
+        """Return the injected provider reader, or build one cached reader per GCP account."""
 
-        if not resolved_quota_discovery:
-            resolved_quota_discovery.append(GcpTpuQuotaDiscovery())
-        return resolved_quota_discovery[0]
+        if quota_discovery is not None:
+            return quota_discovery
+        normalized = account.strip() if isinstance(account, str) and account.strip() else None
+        instance = resolved_quota_discoveries.get(normalized)
+        if instance is None:
+            instance = GcpTpuQuotaDiscovery(account=normalized)
+            resolved_quota_discoveries[normalized] = instance
+        return instance
 
     if automatic_loopback_auth:
         if settings is None:
@@ -684,6 +709,7 @@ def create_app(
         # Assistant provider keys are sealed under a key derived from this same
         # server secret, so they need no second secret and no new setting.
         service.assistant_sealer = AssistantKeySealer(token_key)
+    service.default_reclaim_grace_s = settings.default_reclaim_grace_s
     # Secret and child capabilities are control-plane delivery mechanisms, not
     # properties of the injected artifact-store adapter.  Constructing them only
     # while constructing that adapter made an otherwise valid injection silently
@@ -1061,6 +1087,42 @@ def create_app(
             content={"detail": str(exc)},
         )
 
+    @app.exception_handler(CellAgentUnsupportedCapabilityError)
+    async def handle_unsupported_capability_error(
+        request: Request, exc: CellAgentUnsupportedCapabilityError
+    ) -> JSONResponse:
+        del request
+        logger.info("Eyvan API operation unsupported by cell backend: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            content={"detail": str(exc), "code": "unsupported_capability"},
+        )
+
+    @app.exception_handler(CellAgentUnavailableError)
+    async def handle_cell_agent_unavailable_error(request: Request, exc: CellAgentUnavailableError) -> JSONResponse:
+        del request
+        logger.warning("Eyvan cell agent unreachable: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "5"},
+            content={
+                "detail": (
+                    "The cell agent could not be reached right now; check cell health on the Fleet page "
+                    "or retry in a few seconds."
+                ),
+                "code": "cell_agent_unavailable",
+            },
+        )
+
+    @app.exception_handler(StorageError)
+    async def handle_storage_error(request: Request, exc: StorageError) -> JSONResponse:
+        del request
+        logger.warning("Eyvan storage configuration error: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": str(exc), "code": "storage_unavailable"},
+        )
+
     @app.get("/healthz", response_model=HealthResponse, tags=["system"])
     @app.get("/api/v1/health", response_model=HealthResponse, tags=["system"])
     async def health() -> HealthResponse:
@@ -1392,15 +1454,18 @@ def create_app(
             raise
 
     async def current_result_uri(workload_id: str) -> str:
-        """Return the managed result URI this workload's current attempt owns.
+        """Return the signing scope URI this workload's current attempt owns.
 
-        Read live rather than passed in by the caller: ``result_spec_for_generation``
-        mints a new URI per attempt, so a caller-supplied one would let a retried
-        attempt keep reporting against the address its predecessor held.
+        Read live rather than passed in by the caller: managed ``eyvan://``
+        attempts receive a fresh URI per generation from
+        ``result_spec_for_generation``, and external-result attempts (such as
+        ``gs://``) derive ``progress_report_uri(workload.id, workload.generation)``
+        so a retried attempt's bumped generation revokes its predecessor's token
+        identically.
 
         Raises:
-            AuthorizationError: If the workload has no managed result, which is
-                the case for every command workload -- those have no artifact
+            AuthorizationError: If the workload has no result destination, which
+                is the case for every command workload -- those have no artifact
                 token either, so there is nothing this route could verify.
         """
 
@@ -1408,9 +1473,11 @@ def create_app(
             workload = await transaction.get_workload(workload_id)
         execution = workload.spec.execution if workload is not None else None
         uri = getattr(execution, "result_uri", None)
-        if not isinstance(uri, str) or not uri:
+        if workload is None or not isinstance(uri, str) or not uri:
             raise AuthorizationError("this workload has no managed result to authenticate against")
-        return uri
+        if uri.startswith("eyvan://"):
+            return uri
+        return progress_report_uri(workload.id, workload.generation)
 
     async def authorize_current_result_target(
         uri: str,
@@ -1589,7 +1656,13 @@ def create_app(
                 if pool.provider == "gcp" and pool.provider_project is not None and pool.provider_project.strip()
             }
         )
-        selected = (project or "").strip() or (projects[0] if projects else None)
+        explicit_project = (project or "").strip()
+        if explicit_project:
+            selected: str | None = explicit_project
+        elif len(projects) > 1:
+            selected = await asyncio.to_thread(select_preferred_gcp_project, projects)
+        else:
+            selected = projects[0] if projects else None
         moment = utcnow()
         if selected is None:
             return TpuQuotaSnapshot(
@@ -1600,6 +1673,17 @@ def create_app(
                 ttl_s=TPU_QUOTA_CACHE_TTL_S,
             )
         zones = tuple(sorted({value.strip() for value in (zone or []) if value.strip()}))
+        selected_account = next(
+            (
+                pool.provider_account.strip()
+                for pool in pools
+                if pool.provider == "gcp"
+                and pool.provider_project == selected
+                and pool.provider_account is not None
+                and pool.provider_account.strip()
+            ),
+            None,
+        )
         # Concurrently, so the deadline the cache states is the deadline this
         # endpoint honours. Awaited in sequence, two independent provider reads
         # each bounded at 25s made the worst case 50s -- and a bound a caller
@@ -1609,11 +1693,12 @@ def create_app(
             await asyncio.gather(
                 *(
                     quota_cache.read(
-                        discovery=resolve_quota_discovery(),
+                        discovery=resolve_quota_discovery(account=selected_account),
                         project=selected,
                         zones=zones,
                         capacity_class=capacity_class,
                         refresh=refresh,
+                        account=selected_account,
                     )
                     for capacity_class in (CapacityClass.SPOT, CapacityClass.ON_DEMAND)
                 )
@@ -1627,7 +1712,11 @@ def create_app(
         ]
         entries.sort(key=lambda entry: (entry.zone, entry.accelerator_type, entry.capacity_class))
         failures = [
-            TpuQuotaFailure(capacity_class=reading.capacity_class, reason=reading.failure)
+            TpuQuotaFailure.from_reason(
+                capacity_class=reading.capacity_class,
+                reason=reading.failure,
+                project=selected,
+            )
             for reading in readings
             if reading.failure is not None
         ]
@@ -1646,6 +1735,33 @@ def create_app(
             entries=entries,
             failures=failures,
         )
+
+    @app.get("/api/v1/storage/status", response_model=StorageStatusResponse, tags=["storage"])
+    async def get_storage_status(
+        request: Request,
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> StorageStatusResponse:
+        """Return non-secret Eyvan storage configuration and detected GCP context.
+
+        Authenticated like ``/api/v1/build`` and ``/api/v1/tracking/health``:
+        exposes configured bucket names, locations, and detected GCP region so
+        the dashboard Settings and Overview pages can display active storage
+        without revealing any credentials or tenant data.
+        """
+
+        del principal
+        config_path = getattr(request.app.state, "storage_config_path", None)
+        payload = await asyncio.to_thread(storage_status, config_path=config_path)
+        return StorageStatusResponse.model_validate(payload)
+
+    @app.get("/api/v1/governance/summary", response_model=GovernanceSummaryResponse, tags=["governance"])
+    async def get_governance_summary(
+        principal: tp.Annotated[Principal, Depends(authenticated_principal)],
+    ) -> GovernanceSummaryResponse:
+        """Return plane-wide team quota, borrowing, and active reclaim summary (fleet admins)."""
+
+        payload = await service.governance_summary(principal)
+        return GovernanceSummaryResponse.model_validate(payload)
 
     @app.get("/api/v1/artifacts", response_model=list[ManagedArtifactRecord], tags=["artifacts"])
     async def list_managed_artifacts(
@@ -2648,6 +2764,7 @@ def create_app(
             priority_band=request.priority_band,
             intra_band_priority=request.intra_band_priority,
             checkpoint_grace_seconds=request.checkpoint_grace_seconds,
+            reclaim_policy=request.reclaim_policy,
             estimated_duration_seconds=request.estimated_duration_seconds,
             named_assets=request.named_assets,
             dependencies=request.dependencies,
@@ -2704,6 +2821,7 @@ def create_app(
             priority_band=request.priority_band,
             intra_band_priority=request.intra_band_priority,
             checkpoint_grace_seconds=request.checkpoint_grace_seconds,
+            reclaim_policy=request.reclaim_policy,
             estimated_duration_seconds=request.estimated_duration_seconds,
             named_assets=request.named_assets,
             dependencies=request.dependencies,
@@ -2869,7 +2987,7 @@ def create_app(
     @app.get("/api/v1/capacity/orphans", tags=["capacity"], response_model=None)
     async def capacity_orphans(
         principal: tp.Annotated[Principal, Depends(authenticated_principal)],
-    ) -> list[dict[str, str | int | None]]:
+    ) -> dict[str, object]:
         """List cells an agent still holds that no control-plane record claims."""
 
         service.authorizer.require(principal, Permission.MANAGE_FLEET)

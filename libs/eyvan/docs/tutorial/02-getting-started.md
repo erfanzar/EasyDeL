@@ -40,12 +40,13 @@ First start a matching agent in a separate terminal:
 
 ```bash
 EYVAN_CAPACITY_BACKEND=local EYVAN_EXECUTION_BACKEND=native-local \
-  uv run eyvan-agent --host 127.0.0.1 --port 8095 --allow-unauthenticated
+  uv run eyvan-agent --host 127.0.0.1 --port 8091 --allow-unauthenticated
 ```
 
 This unauthenticated agent is for loopback development only. The YAML requires
-`local` capacity, the `native-local` executor, and port `8095`; the agent's
-GCP/native defaults on port `8090` do not match it. For an authenticated setup,
+`local` capacity, the `native-local` executor, and port `8091`; the agent's
+GCP/native defaults on port `8090` do not match it, and port `8095` is reserved
+for the local experiment tracker (`eyvan track up --local`). For an authenticated setup,
 configure the same `EYVAN_AGENT_SHARED_SECRET` on the plane and agent instead of
 using `--allow-unauthenticated`.
 

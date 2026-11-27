@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import typing as tp
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 
@@ -45,13 +45,26 @@ from eyvan.capacity.providers.gcp.runtime.profile import (
     GcpNativeRuntimeProfileStore,
     default_artifact_root_uri,
 )
-from eyvan.capacity.providers.gcp.runtime.supervisor import LocalAgentState, LocalAgentSupervisor
+from eyvan.capacity.providers.gcp.runtime.supervisor import (
+    DEFAULT_LOCAL_GCP_AGENT_URL,
+    GcpRuntimeError,
+    LocalAgentState,
+    LocalAgentSupervisor,
+)
 from eyvan.sdk.client.endpoint import DEFAULT_CONTROL_PLANE_URL, ControlPlaneEndpoint
 from eyvan.sdk.commands.autoscale import autoscale_console, gcloud_default_project, is_interactive
 from eyvan.sdk.commands.deployment import stale_components
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.terminal import print_block
-from eyvan.server.local.daemon import LocalDaemonError, LocalDaemonResult, LocalDaemonSupervisor
+from eyvan.server.local.daemon import (
+    LocalDaemonConfigurationError,
+    LocalDaemonError,
+    LocalDaemonResult,
+    LocalDaemonSupervisor,
+    LocalDaemonTarget,
+    read_owner_only_record,
+    runtime_profile_identifier,
+)
 
 _DEFAULT_BUILD_TIMEOUT_S = 300.0
 _VALIDATION_AGENT_SECRET = "a" * 32
@@ -1120,6 +1133,186 @@ def deploy_runtime(context: click.Context, profile_path: Path | None, yes: bool,
         console.print("[green]every local component now runs the current source[/]")
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeStopResult:
+    """Non-secret result of stopping a locally supervised control plane and cell agent."""
+
+    endpoint: ControlPlaneEndpoint
+    control_plane: LocalDaemonResult
+    stopped_pid: int | None = None
+    running_unsupervised: bool = False
+    agent_endpoint: ControlPlaneEndpoint = field(
+        default_factory=lambda: ControlPlaneEndpoint.parse(DEFAULT_LOCAL_GCP_AGENT_URL)
+    )
+    agent_stopped_pid: int | None = None
+    agent_skipped_other_profile: bool = False
+
+    @property
+    def control_plane_stopped(self) -> bool:
+        """Return whether a live supervised control plane was stopped."""
+
+        return self.stopped_pid is not None
+
+    @property
+    def agent_stopped(self) -> bool:
+        """Return whether a live supervised cell agent was stopped."""
+
+        return self.agent_stopped_pid is not None
+
+    @property
+    def stopped(self) -> bool:
+        """Return whether any live supervised local runtime daemon was stopped."""
+
+        return self.control_plane_stopped or self.agent_stopped
+
+    def as_document(self) -> JsonObject:
+        """Return automation-safe stop output without profile credentials."""
+
+        if self.agent_stopped:
+            agent_state = "stopped"
+        elif self.agent_skipped_other_profile:
+            agent_state = "skipped"
+        else:
+            agent_state = "not_running"
+        return {
+            "agent": {
+                "endpoint": self.agent_endpoint.url,
+                "pid": self.agent_stopped_pid,
+                "state": agent_state,
+            },
+            "control_plane": {
+                "endpoint": self.control_plane.endpoint.url,
+                "pid": self.stopped_pid,
+                "state": "stopped" if self.control_plane_stopped else "not_running",
+            },
+            "endpoint": self.endpoint.url,
+            "running_unsupervised": self.running_unsupervised,
+            "stopped": self.stopped,
+        }
+
+
+def _stop_local_runtime(
+    *,
+    endpoint: ControlPlaneEndpoint,
+    profile_path: Path | None = None,
+) -> RuntimeStopResult:
+    """Stop the supervised loopback control plane for ``endpoint`` and its matching local cell agent."""
+
+    supervisor = LocalDaemonSupervisor()
+    target = LocalDaemonTarget.from_endpoint(endpoint)
+    requested_profile_id = runtime_profile_identifier(profile_path)
+    stopped_pid: int | None = None
+    recorded_profile_id: str | None = None
+    if target is not None:
+        record = read_owner_only_record(supervisor.paths.record_path(target))
+        if record is not None and record.endpoint == endpoint:
+            recorded_profile_id = record.runtime_profile_path
+            if supervisor.process_liveness(record.pid):
+                if requested_profile_id is not None and recorded_profile_id not in {None, requested_profile_id}:
+                    raise LocalDaemonConfigurationError(
+                        f"the local Eyvan control plane at {endpoint.url} (pid {record.pid}) belongs to "
+                        f"native GCP runtime profile {recorded_profile_id}, not the selected "
+                        f"{requested_profile_id}; refusing to stop it"
+                    )
+                stopped_pid = record.pid
+    control_plane = supervisor.stop(endpoint)
+    running_unsupervised = stopped_pid is None and supervisor.health_probe(endpoint)
+
+    if requested_profile_id is not None:
+        agent_profile_path: Path | None = Path(requested_profile_id)
+    elif recorded_profile_id is not None:
+        agent_profile_path = Path(recorded_profile_id)
+    elif stopped_pid is not None:
+        # A live control plane started without a native GCP runtime profile does
+        # not own a profile-scoped local cell agent.
+        agent_profile_path = None
+    else:
+        # When no live control plane is recorded (for example, it already stopped
+        # or crashed), fall back to the default profile so an orphaned default
+        # cell agent is still cleaned up.
+        agent_profile_path = DEFAULT_GCP_NATIVE_RUNTIME_PROFILE_PATH
+
+    agent_supervisor = LocalAgentSupervisor()
+    agent_endpoint = agent_supervisor.endpoint
+    agent_stopped_pid: int | None = None
+    agent_skipped_other_profile = False
+    if agent_profile_path is not None:
+        agent_stopped_pid = agent_supervisor.stop(runtime_profile_path=agent_profile_path)
+    if agent_stopped_pid is None:
+        agent_target = LocalDaemonTarget.from_endpoint(agent_endpoint)
+        if agent_target is not None:
+            agent_record = read_owner_only_record(agent_supervisor.paths.agent_record_path(agent_target))
+            if (
+                agent_record is not None
+                and agent_record.endpoint == agent_endpoint
+                and agent_record.runtime_profile_path is not None
+                and agent_supervisor.process_liveness(agent_record.pid)
+            ):
+                agent_skipped_other_profile = True
+
+    return RuntimeStopResult(
+        endpoint=endpoint,
+        control_plane=control_plane,
+        stopped_pid=stopped_pid,
+        running_unsupervised=running_unsupervised,
+        agent_endpoint=agent_endpoint,
+        agent_stopped_pid=agent_stopped_pid,
+        agent_skipped_other_profile=agent_skipped_other_profile,
+    )
+
+
+def _render_runtime_stopped(console: Console, result: RuntimeStopResult) -> None:
+    """Render a completed local control-plane and cell-agent stop."""
+
+    if result.control_plane_stopped:
+        console.print(f"[green]Stopped supervised control plane at {result.endpoint.url} (pid {result.stopped_pid}).[/]")
+    elif result.running_unsupervised:
+        console.print(
+            f"[yellow]No supervised control plane is recorded for {result.endpoint.url}, "
+            "but an unsupervised control plane is answering there and was left running.[/]"
+        )
+    else:
+        console.print(f"[dim]No supervised control plane is running at {result.endpoint.url}.[/]")
+
+    if result.agent_stopped:
+        console.print(
+            f"[green]Stopped supervised cell agent at {result.agent_endpoint.url} (pid {result.agent_stopped_pid}).[/]"
+        )
+    elif result.agent_skipped_other_profile:
+        console.print(
+            f"[yellow]Supervised cell agent at {result.agent_endpoint.url} belongs to a different runtime profile "
+            "and was left running; pass --profile to stop it.[/]"
+        )
+    else:
+        console.print(f"[dim]No supervised cell agent is running at {result.agent_endpoint.url}.[/]")
+
+
+@runtime_group.command("stop")
+@click.option(
+    "--profile",
+    "profile_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Override the private ~/.eyvan/gcp-native-runtime.json profile path.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the stop result as JSON.")
+@click.pass_context
+def stop_runtime(context: click.Context, profile_path: Path | None, as_json: bool) -> None:
+    """Stop the locally supervised Eyvan control plane and cell agent."""
+
+    console = autoscale_console(err=as_json)
+    endpoint = _runtime_restart_endpoint(context)
+    try:
+        result = _stop_local_runtime(endpoint=endpoint, profile_path=profile_path)
+    except GcpRuntimeError as exc:
+        raise click.ClickException(f"could not stop local cell agent: {exc}") from exc
+    except LocalDaemonError as exc:
+        raise click.ClickException(f"could not stop local control plane: {exc}") from exc
+    if as_json:
+        click.echo(json.dumps(result.as_document(), indent=2, sort_keys=True))
+    else:
+        _render_runtime_stopped(console, result)
+
+
 def register_runtime_commands(group: click.Group) -> None:
     """Attach native GCP runtime setup commands to the root CLI."""
 
@@ -1137,6 +1330,7 @@ __all__ = (
     "RuntimeDeployResult",
     "RuntimeInitializationResult",
     "RuntimeRestartResult",
+    "RuntimeStopResult",
     "UvNativeWorkerWheelBuilder",
     "initialize_runtime",
     "installed_eyvan_distribution",
@@ -1145,5 +1339,6 @@ __all__ = (
     "register_runtime_commands",
     "restart_runtime",
     "runtime_group",
+    "stop_runtime",
     "suggested_runtime_project",
 )

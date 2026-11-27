@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import collections
 import ipaddress
+import re
 import socket
 import typing as tp
 from datetime import datetime
@@ -259,6 +260,8 @@ class PoolWorkloadSubmitRequest(ApiModel):
     intra_band_priority: int = Field(default=0, ge=0)
     #: Seconds the checkpoint hook is given before the job is stopped.
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
+    #: Settlement policy when reclaimed: requeue for resume or stop with checkpoint preserved.
+    reclaim_policy: tp.Literal["requeue", "stop"] = "requeue"
     #: How long the job is expected to run. Every cost figure is an estimate
     #: over this number, so a pool submission that could not state it was
     #: estimated at the default hour whatever it actually was.
@@ -276,6 +279,8 @@ class PoolWorkloadSubmitRequest(ApiModel):
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
         document = handler(self)
+        if self.reclaim_policy == "requeue":
+            document.pop("reclaim_policy", None)
         if self.tpu_chips is None:
             document.pop("tpu_chips", None)
         if self.setup is None:
@@ -336,6 +341,8 @@ class PoolCallableSubmitRequest(ApiModel):
     intra_band_priority: int = Field(default=0, ge=0)
     #: Seconds the checkpoint hook is given before the job is stopped.
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
+    #: Settlement policy when reclaimed: requeue for resume or stop with checkpoint preserved.
+    reclaim_policy: tp.Literal["requeue", "stop"] = "requeue"
     #: How long the job is expected to run. Every cost figure is an estimate
     #: over this number, so a pool submission that could not state it was
     #: estimated at the default hour whatever it actually was.
@@ -413,6 +420,7 @@ class CapacityPoolUpsertRequest(ApiModel):
     provider: str = Field(min_length=1)
     capacity_backend: str | None = None
     provider_project: str | None = None
+    provider_account: str | None = Field(default=None, max_length=320)
     region: str = Field(min_length=1)
     zone: str | None = None
     capacity: ResourceLimits
@@ -461,6 +469,8 @@ class CapacityPoolUpsertRequest(ApiModel):
         document = handler(self)
         if not self.chip_sharing:
             document.pop("chip_sharing", None)
+        if self.provider_account is None:
+            document.pop("provider_account", None)
         return document
 
     @model_validator(mode="after")
@@ -672,6 +682,292 @@ class TpuQuotaEntry(ApiModel):
         )
 
 
+#: Maximum character length accepted on ``TpuQuotaFailure.reason``.
+TPU_QUOTA_FAILURE_REASON_MAX_LENGTH = 2048
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_QUOTA_PERMISSION_PATTERNS = (
+    re.compile(r"Permission\s+['\"]([a-z0-9_.-]+\.[a-z0-9_.-]+)['\"]\s+denied", re.IGNORECASE),
+    re.compile(r"\bpermission\s*[:=]\s*['\"]?([a-z0-9_.-]+\.[a-z0-9_.-]+)['\"]?", re.IGNORECASE),
+    re.compile(r"\bmissing\s+['\"]?([a-z0-9_.-]+\.[a-z0-9_.-]+)['\"]?", re.IGNORECASE),
+)
+_QUOTA_ACCOUNT_PATTERNS = (
+    re.compile(r"authenticated as\s+['\"]?([^\s,;)'\"]+@[^\s,;)'\"]+)['\"]?", re.IGNORECASE),
+    re.compile(r"active account(?:\s+specified by[^\n]*?)?\s+['\"]?([^\s,;)'\"]+@[^\s,;)'\"]+)['\"]?", re.IGNORECASE),
+    re.compile(r"\baccount\s+['\"]([^\s'\"]+@[^\s'\"]+)['\"]", re.IGNORECASE),
+)
+_QUOTA_PROJECT_PATTERNS = (
+    re.compile(r"projects/([a-z][a-z0-9-]{4,61}[a-z0-9])"),
+    re.compile(r"--project[=\s]+['\"]?([a-z][a-z0-9-]{4,61}[a-z0-9])['\"]?"),
+    re.compile(r"\bproject\s+['\"]([a-z][a-z0-9-]{4,61}[a-z0-9])['\"]", re.IGNORECASE),
+)
+_QUOTA_SERVICE_RE = re.compile(r"\b([a-z0-9-]+\.googleapis\.com)\b", re.IGNORECASE)
+_NOISE_LINE_PREFIXES = (
+    "- '@type':",
+    "'@type':",
+    '"@type":',
+    "error_info_id:",
+    "troubleshooter_url:",
+    "domain:",
+    "metadata:",
+    "reason:",
+    "detail:",
+    "details:",
+    "[original error]",
+)
+_INLINE_NOISE_RE = re.compile(
+    r"(?:troubleshooter_url\S*|error_info_id\S*|type\.googleapis\.com/\S+|https?://console\.cloud\.google\.com/iam-admin/troubleshooter\S*|[A-Za-z0-9+/=_-]{48,})",
+    re.IGNORECASE,
+)
+
+
+def _bound_text(value: str, limit: int) -> str:
+    cleaned = " ".join(value.split()).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3].rstrip() + "..."
+
+
+def _extract_quota_permission(text: str) -> str | None:
+    for pattern in _QUOTA_PERMISSION_PATTERNS:
+        match = pattern.search(text)
+        if match is not None:
+            return _bound_text(match.group(1), 128)
+    return None
+
+
+def _extract_quota_account(text: str) -> str | None:
+    for pattern in _QUOTA_ACCOUNT_PATTERNS:
+        match = pattern.search(text)
+        if match is not None:
+            return _bound_text(match.group(1).rstrip("."), 256)
+    return None
+
+
+def _extract_quota_project(text: str, explicit_project: str | None) -> str | None:
+    if explicit_project and explicit_project.strip():
+        return explicit_project.strip()
+    for pattern in _QUOTA_PROJECT_PATTERNS:
+        match = pattern.search(text)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _role_for_quota_permission(permission: str | None) -> str:
+    if permission:
+        lowered = permission.lower()
+        if lowered.startswith("monitoring."):
+            return "roles/monitoring.viewer"
+        if lowered.startswith("tpu."):
+            return "roles/tpu.viewer"
+    return "roles/cloudquotas.viewer"
+
+
+def _clean_quota_fallback_summary(text: str) -> str:
+    """Strip raw protobuf/ErrorInfo/base64/troubleshooter noise to one plain sentence."""
+
+    plain = _ANSI_ESCAPE_RE.sub("", text)
+    kept_lines: list[str] = []
+    for raw_line in plain.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(lowered.startswith(prefix) for prefix in _NOISE_LINE_PREFIXES):
+            break
+        if "type.googleapis.com/" in lowered or "error_info_id" in lowered or "troubleshooter_url" in lowered:
+            continue
+        kept_lines.append(stripped)
+        if len(" ".join(kept_lines)) >= 240:
+            break
+    candidate = " ".join(kept_lines) if kept_lines else plain.splitlines()[0]
+    candidate = _INLINE_NOISE_RE.sub("", candidate)
+    candidate = re.sub(r"^gcloud\s+beta\s+quotas\s+info\s+list\s+failed:\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"^ERROR:\s*(?:\([^)]+\)\s*)?", "", candidate, flags=re.IGNORECASE)
+    candidate = " ".join(candidate.split()).strip(" :-")
+    if not candidate:
+        return "Provider TPU quota lookup failed."
+    if not candidate.endswith((".", "!", "?")):
+        candidate = f"{candidate}."
+    return _bound_text(candidate, 320)
+
+
+def _diagnose_tpu_quota_failure(
+    raw_reason: str,
+    *,
+    project: str | None = None,
+) -> tuple[str, str, str | None, str | None, str | None]:
+    """Classify one provider quota failure into structured, human-readable diagnostics.
+
+    Returns:
+        Tuple of ``(code, summary, permission, account, remediation)``.
+    """
+
+    plain = _ANSI_ESCAPE_RE.sub("", raw_reason)
+    lowered = plain.lower()
+    permission = _extract_quota_permission(plain)
+    account = _extract_quota_account(plain)
+    resolved_project = _extract_quota_project(plain, project)
+    project_clause = f" on project {resolved_project}" if resolved_project else ""
+
+    if (
+        "no such file or directory" in lowered
+        or "executable file not found" in lowered
+        or "filenotfounderror" in lowered
+        or "winerror 2" in lowered
+        or "gcloud: command not found" in lowered
+        or ("gcloud" in lowered and "not found" in lowered and "project" not in lowered and "location" not in lowered)
+    ):
+        return (
+            "gcloud_missing",
+            "The gcloud CLI is not installed or not on PATH on the control-plane host.",
+            permission,
+            account,
+            "Install the Google Cloud CLI on the control-plane host and authenticate with: gcloud auth login",
+        )
+
+    if (
+        "did not answer within" in lowered
+        or "timed out" in lowered
+        or "timeoutexpired" in lowered
+        or "deadline_exceeded" in lowered
+        or "connecttimeout" in lowered
+        or "readtimeout" in lowered
+    ):
+        return (
+            "timeout",
+            _bound_text(
+                f"TPU quota lookup{project_clause} timed out before GCP responded; "
+                "a background read may still complete.",
+                512,
+            ),
+            permission,
+            account,
+            "Retry in a few seconds, or filter to a single zone to narrow the provider read.",
+        )
+
+    if (
+        "service_disabled" in lowered
+        or "has not been used in project" in lowered
+        or "is disabled" in lowered
+        or "not enabled for project" in lowered
+        or "enable it by visiting" in lowered
+    ):
+        service_match = _QUOTA_SERVICE_RE.search(plain)
+        service = service_match.group(1) if service_match else "cloudquotas.googleapis.com"
+        target_flag = f" --project={resolved_project}" if resolved_project else ""
+        return (
+            "api_disabled",
+            _bound_text(f"Required GCP API ({service}) is disabled{project_clause}.", 512),
+            permission,
+            account,
+            _bound_text(f"Enable the API: gcloud services enable {service}{target_flag}", 512),
+        )
+
+    if (
+        "unauthenticated" in lowered
+        or "no credentials" in lowered
+        or "not logged in" in lowered
+        or "reauthentication" in lowered
+        or "invalid_grant" in lowered
+        or "token lookup failed" in lowered
+        or "could not obtain" in lowered
+        or "credentials were not found" in lowered
+        or "refresherror" in lowered
+        or "gcloud auth login" in lowered
+        or "answered 401" in lowered
+        or "status 401" in lowered
+    ):
+        acct_clause = f" for {account}" if account else ""
+        login_cmd = f"gcloud auth login {account}" if account else "gcloud auth login"
+        return (
+            "auth_required",
+            _bound_text(
+                f"GCP credentials{acct_clause} are missing or expired, "
+                f"so Eyvan could not read TPU quotas{project_clause}.",
+                512,
+            ),
+            permission,
+            account,
+            _bound_text(f"Sign in on the control-plane host with: {login_cmd}", 512),
+        )
+
+    if (
+        "permission_denied" in lowered
+        or "iam_permission_denied" in lowered
+        or "does not have permission" in lowered
+        or "caller does not have" in lowered
+        or "is not authorized" in lowered
+        or "answered 403" in lowered
+        or "status 403" in lowered
+        or permission is not None
+    ):
+        role = _role_for_quota_permission(permission)
+        if account and permission:
+            summary = f"Account {account} lacks '{permission}' permission to read TPU quotas{project_clause}."
+        elif account:
+            summary = f"Account {account} does not have permission to read TPU quotas{project_clause}."
+        elif permission:
+            summary = f"Missing '{permission}' permission to read TPU quotas{project_clause}."
+        else:
+            summary = f"Permission denied while reading TPU quotas{project_clause}."
+        if resolved_project and account:
+            member_kind = "serviceAccount" if account.endswith(".gserviceaccount.com") else "user"
+            remediation = (
+                f"Switch to an authorized project or account, or grant {role}: "
+                f"gcloud projects add-iam-policy-binding {resolved_project} "
+                f"--member={member_kind}:{account} --role={role}"
+            )
+        elif resolved_project:
+            remediation = (
+                f"Switch to an authorized project or grant {role} on {resolved_project}: "
+                f"gcloud projects add-iam-policy-binding {resolved_project} "
+                f"--member=user:<EMAIL> --role={role}"
+            )
+        else:
+            remediation = f"Switch to an authorized project or gcloud account, or grant {role} on the target project."
+        return (
+            "permission_denied",
+            _bound_text(summary, 512),
+            permission,
+            account,
+            _bound_text(remediation, 512),
+        )
+
+    if (
+        "not_found" in lowered
+        or "unknown project" in lowered
+        or "invalid project" in lowered
+        or "project not found" in lowered
+        or "does not exist" in lowered
+        or "answered 404" in lowered
+        or "status 404" in lowered
+    ):
+        proj_label = f"'{resolved_project}'" if resolved_project else "requested"
+        return (
+            "project_not_found",
+            _bound_text(f"GCP project {proj_label} was not found or is inaccessible.", 512),
+            permission,
+            account,
+            "Verify available GCP projects with: gcloud projects list",
+        )
+
+    fallback_remediation = (
+        "Verify access directly with: "
+        f"gcloud beta quotas info list --service=tpu.googleapis.com --project={resolved_project}"
+        if resolved_project
+        else "Verify gcloud authentication and network access to Cloud Quotas and Cloud Monitoring APIs."
+    )
+    return (
+        "quota_read_failed",
+        _clean_quota_fallback_summary(plain),
+        permission,
+        account,
+        _bound_text(fallback_remediation, 512),
+    )
+
+
 class TpuQuotaFailure(ApiModel):
     """One purchase class whose provider read did not succeed.
 
@@ -682,7 +978,41 @@ class TpuQuotaFailure(ApiModel):
     """
 
     capacity_class: CanonicalCapacityClass
-    reason: str = Field(min_length=1, max_length=2048)
+    reason: str = Field(min_length=1, max_length=TPU_QUOTA_FAILURE_REASON_MAX_LENGTH)
+    #: Machine-readable failure classification for clean UI/CLI presentation.
+    code: str = Field(default="quota_read_failed", min_length=1, max_length=64)
+    #: Concise 1-sentence plain-English diagnosis stripped of protobuf noise.
+    summary: str | None = Field(default=None, max_length=512)
+    #: Missing IAM permission when extracted from the provider error.
+    permission: str | None = Field(default=None, max_length=128)
+    #: Active GCP account named by the provider error, if any.
+    account: str | None = Field(default=None, max_length=256)
+    #: Concrete actionable next step or CLI command for the operator.
+    remediation: str | None = Field(default=None, max_length=512)
+
+    @classmethod
+    def from_reason(
+        cls,
+        *,
+        capacity_class: CapacityClass,
+        reason: str,
+        project: str | None = None,
+    ) -> TpuQuotaFailure:
+        """Build a failure record, truncating raw provider text and populating structured diagnostics."""
+
+        normalized = reason.strip() or "provider quota discovery failed"
+        if len(normalized) > TPU_QUOTA_FAILURE_REASON_MAX_LENGTH:
+            normalized = normalized[: TPU_QUOTA_FAILURE_REASON_MAX_LENGTH - 3].rstrip() + "..."
+        code, summary, permission, account, remediation = _diagnose_tpu_quota_failure(normalized, project=project)
+        return cls(
+            capacity_class=capacity_class,
+            reason=normalized,
+            code=code,
+            summary=summary,
+            permission=permission,
+            account=account,
+            remediation=remediation,
+        )
 
 
 class TpuQuotaSnapshot(ApiModel):
@@ -1163,3 +1493,77 @@ class CapacityClassUnavailableErrorResponse(ErrorResponse):
 
     code: tp.Literal[ServiceErrorCode.CAPACITY_CLASS_UNAVAILABLE] = ServiceErrorCode.CAPACITY_CLASS_UNAVAILABLE
     context: CapacityClassUnavailableErrorContext
+
+
+class StorageContextResponse(ApiModel):
+    """Detected GCP/TPU runtime context returned by ``GET /api/v1/storage/status``."""
+
+    on_gcp: bool = False
+    project: str | None = None
+    zone: str | None = None
+    region: str | None = None
+    accelerator_type: str | None = None
+    source: str = "none"
+
+
+class StorageMonitoringBucketResponse(ApiModel):
+    """Configured default monitoring bucket for Eyvan run tracking."""
+
+    bucket: str
+    uri: str
+    location: str
+    prefix: str = "tracking"
+
+
+class StorageRegionalBucketResponse(ApiModel):
+    """Configured regional GCS bucket for checkpoints and datasets."""
+
+    bucket: str
+    uri: str
+    location: str
+
+
+class StorageStatusResponse(ApiModel):
+    """Non-secret Eyvan storage configuration and detected GCP context."""
+
+    configured: bool
+    auto_create: bool
+    config_path: str
+    project: str | None = None
+    monitoring: StorageMonitoringBucketResponse | None = None
+    regional: dict[str, StorageRegionalBucketResponse] = Field(default_factory=dict)
+    context: StorageContextResponse
+
+
+class GovernanceSummaryUser(ApiModel):
+    """Per-user quota, guarantee, borrowing, and live usage snapshot."""
+
+    subject: str
+    tier: str
+    guaranteed_tpu_units: int | None = None
+    max_tpu_units: int | None = None
+    can_borrow: bool
+    in_use_tpu_units: int = Field(default=0, ge=0)
+    borrowed_tpu_units: int = Field(default=0, ge=0)
+
+
+class GovernanceActiveReclaim(ApiModel):
+    """One currently active graceful reclaim window across the fleet."""
+
+    workload_id: str
+    owner: str
+    requested_by: str | None = None
+    deadline_at: str | None = None
+    policy: tp.Literal["requeue", "stop"] = "requeue"
+    state: str
+
+
+class GovernanceSummaryResponse(ApiModel):
+    """Plane-wide team quota, borrowing, and active reclaim summary."""
+
+    enabled: bool
+    total_guaranteed_tpu_units: int = Field(default=0, ge=0)
+    total_in_use_tpu_units: int = Field(default=0, ge=0)
+    total_borrowed_tpu_units: int = Field(default=0, ge=0)
+    users: list[GovernanceSummaryUser] = Field(default_factory=list)
+    active_reclaims: list[GovernanceActiveReclaim] = Field(default_factory=list)

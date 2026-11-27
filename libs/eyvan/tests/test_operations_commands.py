@@ -144,6 +144,41 @@ def test_cells_renders_a_table_for_a_person(tmp_path: Path) -> None:
     assert '"id"' not in result.output, "the record is what --json is for"
 
 
+def test_cells_table_hides_deleted_history_unless_all_is_passed(tmp_path: Path) -> None:
+    cells = [
+        {"id": "cell-active", "state": "ready", "zone": "us-east5-a"},
+        {"id": "cell-old", "state": "deleted", "zone": "us-east5-a"},
+    ]
+    default_client = FakeOperationsClient(responses=[cells])
+    default_result = CliRunner().invoke(list_cells, [], obj=_session(tmp_path, default_client))
+    assert default_result.exit_code == 0, default_result.output
+    assert "cell-active" in default_result.output
+    assert "cell-old" not in default_result.output
+
+    all_client = FakeOperationsClient(responses=[cells])
+    all_result = CliRunner().invoke(list_cells, ["--all"], obj=_session(tmp_path, all_client))
+    assert all_result.exit_code == 0, all_result.output
+    assert "cell-active" in all_result.output
+    assert "cell-old" in all_result.output
+
+    json_client = FakeOperationsClient(responses=[cells])
+    json_result = CliRunner().invoke(list_cells, ["--json"], obj=_session(tmp_path, json_client))
+    assert json_result.exit_code == 0, json_result.output
+    assert json.loads(json_result.output) == cells
+
+
+def test_cells_table_reports_deleted_only_fleet_with_all_hint(tmp_path: Path) -> None:
+    deleted_only = [{"id": "cell-old", "state": "deleted", "zone": "us-east5-a"}]
+    client = FakeOperationsClient(responses=[deleted_only])
+
+    result = CliRunner().invoke(list_cells, [], obj=_session(tmp_path, client))
+
+    assert result.exit_code == 0, result.output
+    assert "no active cells" in result.output
+    assert "--all" in result.output
+    assert "cell-old" not in result.output
+
+
 def test_cell_drain_posts_with_a_generated_operation_scoped_idempotency_key(tmp_path: Path) -> None:
     client = FakeOperationsClient(responses=[{"id": "cell-9", "state": "draining"}])
 

@@ -627,6 +627,187 @@ def test_no_eyvan_module_imports_ray(tmp_path: Path) -> None:
     assert offenders == []
 
 
+def test_local_process_forwards_or_defaults_runtime_env_and_workspace_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """native-local sets cache/workspace dirs inside its state_dir or forwards explicit overrides."""
+
+    repo_cwd = tmp_path / "repo"
+    repo_cwd.mkdir()
+    monkeypatch.chdir(repo_cwd)
+    monkeypatch.delenv("EYVAN_RUNTIME_ENV_DIR", raising=False)
+    monkeypatch.delenv("EYVAN_WORKSPACE_DIR", raising=False)
+
+    state_dir = tmp_path / "state"
+    executor = LocalProcessExecutor(state_dir)
+    remote_id = executor.submit(
+        _spec(
+            _command("import os; print(os.environ['EYVAN_RUNTIME_ENV_DIR']); print(os.environ['EYVAN_WORKSPACE_DIR'])"),
+            submission_id="defaults-job",
+        ),
+        _context(key="defaults-job"),
+    )
+    assert _wait_for(executor, remote_id, {ExecutionWorkloadStatus.SUCCEEDED}) is ExecutionWorkloadStatus.SUCCEEDED
+    lines = executor.logs(remote_id).splitlines()
+    assert lines == [str(state_dir / "runtime-envs"), str(state_dir / "workspaces")]
+    assert not (repo_cwd / ".eyvan-runtime-envs").exists()
+    assert not (repo_cwd / ".eyvan-workspace").exists()
+
+    custom_envs = tmp_path / "custom-envs"
+    custom_ws = tmp_path / "custom-ws"
+    monkeypatch.setenv("EYVAN_RUNTIME_ENV_DIR", str(custom_envs))
+    monkeypatch.setenv("EYVAN_WORKSPACE_DIR", str(custom_ws))
+    forwarded_id = executor.submit(
+        _spec(
+            _command("import os; print(os.environ['EYVAN_RUNTIME_ENV_DIR']); print(os.environ['EYVAN_WORKSPACE_DIR'])"),
+            submission_id="forwarded-job",
+        ),
+        _context(key="forwarded-job"),
+    )
+    assert _wait_for(executor, forwarded_id, {ExecutionWorkloadStatus.SUCCEEDED}) is ExecutionWorkloadStatus.SUCCEEDED
+    assert executor.logs(forwarded_id).splitlines() == [str(custom_envs), str(custom_ws)]
+
+
+def test_local_process_log_page_streams_incrementally_with_byte_offset_cursors(tmp_path: Path) -> None:
+    """LocalProcessExecutor satisfies StructuredLogExecutionDriver with byte-offset pagination."""
+
+    from eyvan.worker.runtime.registry import StructuredLogExecutionDriver
+
+    executor = LocalProcessExecutor(tmp_path)
+    assert isinstance(executor, StructuredLogExecutionDriver)
+
+    missing = executor.log_page("never-submitted")
+    assert missing.unavailable is True
+    assert "no durable execution record" in missing.detail
+
+    remote_id = executor.submit(
+        _spec(
+            _command(
+                "import sys; "
+                "print('line-0'); print('line-1', file=sys.stderr); "
+                "print('line-2'); sys.stdout.write('tail-no-newline')"
+            ),
+            submission_id="paged-job",
+        ),
+        _context(key="paged-job"),
+    )
+    assert _wait_for(executor, remote_id, {ExecutionWorkloadStatus.SUCCEEDED}) is ExecutionWorkloadStatus.SUCCEEDED
+
+    first = executor.log_page(remote_id, limit=2)
+    assert first.unavailable is False
+    assert [record.message for record in first.records] == ["line-0", "line-1"]
+    assert first.next_cursor.startswith("b")
+
+    second = executor.log_page(remote_id, after=first.next_cursor, limit=10)
+    assert second.unavailable is False
+    assert [record.message for record in second.records] == ["line-2", "tail-no-newline"]
+    assert second.next_cursor != first.next_cursor
+
+    exhausted = executor.log_page(remote_id, after=second.next_cursor, limit=10)
+    assert exhausted.unavailable is False
+    assert exhausted.records == ()
+    assert exhausted.next_cursor == second.next_cursor
+
+    bad_cursor = executor.log_page(remote_id, after="not-a-cursor")
+    assert bad_cursor.unavailable is True
+    assert "invalid local log cursor" in bad_cursor.detail
+
+
+def test_local_process_log_page_preserves_utf8_crlf_running_tail_and_eof_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Page byte budgets never split lines/UTF-8/CRLF, hold back live tails, and flag past-EOF cursors."""
+
+    from eyvan.worker.runtime import local_process as lp
+
+    executor = LocalProcessExecutor(tmp_path)
+
+    def _seed(remote_id: str, payload: bytes, *, terminal: bool) -> Path:
+        record_path, log_path, _owner_path = executor._paths(remote_id)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(
+            json.dumps(
+                {
+                    "remote_id": remote_id,
+                    "status": "succeeded" if terminal else "running",
+                    "command_pid": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        log_path.write_bytes(payload)
+        return log_path
+
+    monkeypatch.setattr(lp, "_LOCAL_LOG_PAGE_MAX_BYTES", 20)
+    monkeypatch.setattr(
+        lp,
+        "_persisted_status",
+        lambda _rid, rec: (
+            ExecutionWorkloadStatus.SUCCEEDED if rec["status"] == "succeeded" else ExecutionWorkloadStatus.RUNNING
+        ),
+    )
+
+    # 1. Multi-line page crossing the byte budget on multibyte UTF-8 leaves the full line for page 2.
+    _seed("utf8-multiline", b"a" * 14 + b"\n" + "hi 🚀 ok\n".encode(), terminal=True)
+    p1 = executor.log_page("utf8-multiline", limit=200)
+    assert p1.unavailable is False
+    assert [r.message for r in p1.records] == ["a" * 14]
+    assert p1.next_cursor == "b15"
+    p2 = executor.log_page("utf8-multiline", after=p1.next_cursor, limit=200)
+    assert p2.unavailable is False
+    assert [r.message for r in p2.records] == ["hi 🚀 ok"]
+    assert "\ufffd" not in p2.records[0].message
+
+    # 2. Single line exceeding the byte budget trims incomplete UTF-8 cleanly before splitting.
+    _seed("utf8-oversize", b"a" * 18 + "🚀tail\n".encode(), terminal=True)
+    o1 = executor.log_page("utf8-oversize", limit=200)
+    assert o1.unavailable is False
+    assert [r.message for r in o1.records] == ["a" * 18]
+    assert o1.next_cursor == "b18"
+    o2 = executor.log_page("utf8-oversize", after=o1.next_cursor, limit=200)
+    assert o2.unavailable is False
+    assert [r.message for r in o2.records] == ["🚀tail"]
+
+    # 3. CRLF crossing the byte budget (both multi-line and single-line boundary) produces no phantom blank line.
+    _seed("crlf-multiline", b"a" * 14 + b"\n" + b"12345\r\nnext\n", terminal=True)
+    c1 = executor.log_page("crlf-multiline", limit=200)
+    c2 = executor.log_page("crlf-multiline", after=c1.next_cursor, limit=200)
+    assert [r.message for r in c1.records] == ["a" * 14]
+    assert [r.message for r in c2.records] == ["12345", "next"]
+
+    _seed("crlf-exact-boundary", b"1234567890123456789\r\nnext\n", terminal=True)
+    ce1 = executor.log_page("crlf-exact-boundary", limit=200)
+    ce2 = executor.log_page("crlf-exact-boundary", after=ce1.next_cursor, limit=200)
+    assert [r.message for r in ce1.records] == ["1234567890123456789"]
+    assert [r.message for r in ce2.records] == ["next"]
+
+    # 4. Non-terminal workload whose unflushed trailing line crosses the byte budget is held back.
+    _seed("live-partial", b"a" * 14 + b"\npartial", terminal=False)
+    live1 = executor.log_page("live-partial", limit=200)
+    assert [r.message for r in live1.records] == ["a" * 14]
+    assert live1.next_cursor == "b15"
+    live2 = executor.log_page("live-partial", after=live1.next_cursor, limit=200)
+    assert live2.unavailable is False
+    assert live2.records == ()
+    assert live2.next_cursor == "b15"
+
+    # 5. Cursor past EOF and vanished log file after progress are surfaced as unavailable, never silently empty.
+    log_path = _seed("eof-bounds", b"hello\n", terminal=True)
+    past_eof = executor.log_page("eof-bounds", after="b999")
+    assert past_eof.unavailable is True
+    assert "exceeds log size" in past_eof.detail
+
+    log_path.unlink()
+    missing_at_start = executor.log_page("eof-bounds", after="")
+    assert missing_at_start.unavailable is False
+    assert missing_at_start.records == ()
+    missing_after_progress = executor.log_page("eof-bounds", after="b6")
+    assert missing_after_progress.unavailable is True
+    assert "missing" in missing_after_progress.detail
+
+
 #: Integration-scale (see the "slow" marker in pyproject.toml): excluded from
 #: the fast iteration subset, `pytest tests -m "not slow"`.
 pytestmark = pytest.mark.slow

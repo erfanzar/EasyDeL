@@ -379,24 +379,43 @@ def _call_arguments(environment: tp.Mapping[str, str]) -> tuple[list[JsonValue],
     return tp.cast(list[JsonValue], raw_args), tp.cast(dict[str, JsonValue], raw_kwargs)
 
 
-def _workspace_extractor() -> tp.Callable[..., int]:
-    """Return ``extract_workspace`` from whichever context this module runs in.
+def _workspace_helpers() -> tuple[
+    tp.Callable[..., int],
+    tp.Callable[[str | os.PathLike[str]], list[Path]],
+    tp.Callable[[tp.Sequence[str | os.PathLike[str]], str | None], str],
+]:
+    """Return the hardened workspace helpers from whichever context this module runs in.
 
     This file is executed two ways: as ``eyvan.worker.runtime.callable_protocol`` on a
-    native worker, and as a bare sibling module staged next to
-    ``workspace.py`` inside an OCI image. Importing the hardened extractor
-    rather than reimplementing it keeps exactly one copy of the tar-slip
-    defence.
+    native worker, and as a bare sibling module staged next to ``workspace.py`` inside
+    an OCI image. Checking ``__package__`` keeps native workers safe from a user-shipped
+    ``workspace.py`` and keeps staged OCI workers from touching a blocked ``eyvan``
+    package.
     """
 
-    try:
-        from eyvan._internal.workspace import extract_workspace
-    except ImportError:  # staged OCI layout: siblings on sys.path, no package
-        from workspace import extract_workspace  # type: ignore[no-redef]
-    return extract_workspace
+    if __package__:
+        from eyvan._internal.workspace import (
+            discover_workspace_python_paths,
+            extract_workspace,
+            prepend_pythonpath,
+        )
+    else:  # staged OCI layout: siblings on sys.path, no package
+        from workspace import (  # type: ignore[import-not-found,no-redef]
+            discover_workspace_python_paths,
+            extract_workspace,
+            prepend_pythonpath,
+        )
+    return extract_workspace, discover_workspace_python_paths, prepend_pythonpath
+
+
+def _workspace_extractor() -> tp.Callable[..., int]:
+    """Return ``extract_workspace`` from whichever context this module runs in."""
+
+    return _workspace_helpers()[0]
 
 
 _WORKSPACE_BASE_ANCHOR: Path | None = None
+_ACTIVE_WORKSPACE_PYTHON_PATHS: tuple[str, ...] = ()
 
 
 def _materialize_workspace(
@@ -411,9 +430,11 @@ def _materialize_workspace(
 
     Both checks run *before* extraction, and extraction runs before the
     workspace is put on ``sys.path``. The ordering is the point: this directory
-    becomes ``sys.path[0]`` and the process cwd, so anything it contains can
-    shadow a module the signed callable resolves by reference. Verifying the
-    bundle after unpacking it would already be too late.
+    (along with any ``src/`` directory or pure-Python ``uv`` workspace members)
+    becomes the front of ``sys.path`` and ``PYTHONPATH``, and the process cwd,
+    so anything it contains can shadow a module the signed callable resolves by
+    reference. Verifying the bundle after unpacking it would already be too
+    late.
     """
 
     digest = hashlib.sha256(payload).hexdigest()
@@ -428,7 +449,7 @@ def _materialize_workspace(
             raise ValueError("workspace bundle signature mismatch")
     # The anchor survives os.chdir below: an in-process retry must land in the
     # same base, not nest a workspace inside the previous one.
-    global _WORKSPACE_BASE_ANCHOR
+    global _ACTIVE_WORKSPACE_PYTHON_PATHS, _WORKSPACE_BASE_ANCHOR
     explicit = environment.get("EYVAN_WORKSPACE_DIR")
     if explicit:
         base = Path(explicit)
@@ -445,6 +466,7 @@ def _materialize_workspace(
     # Concurrent invocations never write, reuse, or remove each other's tree.
     _ensure_private_dir(base)
     destination = Path(tempfile.mkdtemp(dir=base, prefix=f"{sha256[:12]}-"))
+    _, discover_workspace_python_paths, prepend_pythonpath = _workspace_helpers()
     try:
         _workspace_extractor()(payload, destination)
         (destination / ".eyvan-extraction-complete").write_text(sha256, encoding="utf-8")
@@ -453,12 +475,28 @@ def _materialize_workspace(
         # entered or added to sys.path yet, so removing it is safe.
         _remove_tree(destination)
         raise
+    # Resolve import paths before chdir in case ``destination`` is relative.
+    python_paths = discover_workspace_python_paths(destination)
+    workspace_entries = [str(path) for path in python_paths]
     # Completed trees may still be cwd/sys.path of live workloads or children.
     # Without an execution ownership ledger, never evict a sibling here.
     # Enter the workspace so relative paths behave as they did for the caller,
-    # and make its modules importable by the unpickling that follows.
+    # and make its modules importable by the unpickling and child processes that
+    # follow. Replace any entries this helper previously injected into sys.path
+    # and PYTHONPATH so an in-process retry cannot leak modules written into an
+    # earlier writable tree.
     os.chdir(destination)
-    sys.path.insert(0, str(destination))
+    stale_entries = set(_ACTIVE_WORKSPACE_PYTHON_PATHS)
+    remaining = [entry for entry in sys.path if entry not in workspace_entries and entry not in stale_entries]
+    sys.path[:] = [*workspace_entries, *remaining]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath and stale_entries:
+        cleaned_entries = [
+            entry for entry in existing_pythonpath.split(os.pathsep) if entry and entry not in stale_entries
+        ]
+        existing_pythonpath = os.pathsep.join(cleaned_entries) if cleaned_entries else None
+    os.environ["PYTHONPATH"] = prepend_pythonpath(python_paths, existing_pythonpath)
+    _ACTIVE_WORKSPACE_PYTHON_PATHS = tuple(workspace_entries)
     return destination
 
 

@@ -29,6 +29,7 @@ import ipaddress
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from urllib.parse import urlsplit
 
 import click
 import httpx
@@ -47,6 +48,7 @@ from eyvan.sdk.commands.doctor_preflights import (
     check_gcloud_authentication,
     check_runtime_profile,
     check_secret_manager_bind,
+    effective_artifact_store_uri,
     serving_or_default_runtime_profile,
 )
 from eyvan.sdk.commands.http import EyvanApiError
@@ -85,6 +87,23 @@ def _positive_resource(document: dict[str, JsonValue], name: str) -> bool:
         and value > 0
         and (not isinstance(value, float) or math.isfinite(value))
     )
+
+
+def _pool_uses_gcp(pool: dict[str, JsonValue]) -> bool:
+    """Return whether one capacity pool row targets GCP capacity."""
+
+    provider = pool.get("provider")
+    if isinstance(provider, str) and provider.strip().lower().startswith("gcp"):
+        return True
+    capacity_backend = pool.get("capacity_backend")
+    if isinstance(capacity_backend, str) and capacity_backend.strip().lower().replace("_", "-") in {
+        "gcp",
+        "gcp-tpu",
+        "gcp-attach",
+        "tpu",
+    }:
+        return True
+    return False
 
 
 def _pool_advertises_accelerator(pool: dict[str, JsonValue]) -> bool:
@@ -796,7 +815,7 @@ class DoctorCommandService:
         outcomes = (
             check_gcloud_authentication(),
             check_secret_manager_bind(),
-            check_artifact_store(settings),
+            check_artifact_store(settings, self.session.base_url),
             check_runtime_profile(self.session.base_url),
             check_control_plane_port(self.session.base_url),
         )
@@ -805,6 +824,55 @@ class DoctorCommandService:
         for name, status, detail, remedy in outcomes:
             results.append(CheckResult(name, status_by_name[status], detail, remedy))
         return tuple(results)
+
+    def _is_loopback_endpoint(self) -> bool:
+        """Return whether the configured control-plane URL targets loopback."""
+
+        if not self.session.base_url:
+            return False
+        host = (urlsplit(self.session.base_url).hostname or "").strip().lower()
+        if host == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    def _reconcile_local_gcloud_checks(self, report: DoctorReport) -> None:
+        """Mark gcloud checks not applicable on pure local/loopback fleets.
+
+        A developer running a laptop fleet (``examples/laptop.yaml``) with
+        ``gcloud`` installed on PATH but unauthenticated has no GCP runtime
+        profile, no ``gs://`` artifact store, and only local capacity pools.
+        Hard-failing ``gcloud-authentication`` there turns a healthy local plane
+        red when nothing in the fleet uses GCP.
+        """
+
+        if not self._is_loopback_endpoint():
+            return
+        if serving_or_default_runtime_profile(self.session.base_url).expanduser().exists():
+            return
+        try:
+            settings = EyvanSettings.from_env()
+        except ValueError:
+            return
+        if effective_artifact_store_uri(settings, self.session.base_url).startswith("gs://"):
+            return
+        try:
+            pools = self.session.client.request("GET", "/api/v1/capacity-pools")
+        except Exception:
+            return
+        if not isinstance(pools, list):
+            return
+        enabled_pools = [pool for pool in pools if is_json_object(pool) and pool.get("enabled") is not False]
+        if not enabled_pools or any(_pool_uses_gcp(pool) for pool in enabled_pools):
+            return
+        detail = "not applicable: this loopback plane runs only local pools and has no GCP runtime profile"
+        for index, check in enumerate(report.checks):
+            if check.name in {"gcloud-authentication", "secret-manager-bind-permission"} and (
+                check.status is not CheckStatus.PASS
+            ):
+                report.checks[index] = CheckResult(check.name, CheckStatus.PASS, detail, "")
 
     def report(self) -> DoctorReport:
         """Run every check in dependency order and collect the outcomes."""
@@ -832,6 +900,7 @@ class DoctorCommandService:
             report.checks.append(CheckResult("identity-scope", CheckStatus.SKIP, "control plane is unreachable"))
             report.checks.append(CheckResult("submittable-fleet", CheckStatus.SKIP, "control plane is unreachable"))
             return report
+        self._reconcile_local_gcloud_checks(report)
         report.checks.append(self._controller_check(health))
         report.checks.append(self._identity_check())
         report.checks.append(self._fleet_check())

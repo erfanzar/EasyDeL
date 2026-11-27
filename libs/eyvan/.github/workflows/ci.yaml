@@ -319,7 +319,7 @@ jobs:
           uv venv --python 3.12 .smoke
           uv pip install --python .smoke/bin/python --require-hashes -r requirements-docker.txt
           uv pip install --python .smoke/bin/python --no-deps dist/*.whl
-          for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate; do
+          for entry in eyvan eyvan-server eyvan-agent eyvan-native-worker eyvan-migrate eyvan-tracker; do
             .smoke/bin/"$entry" --help >/dev/null
           done
           .smoke/bin/python -c "import eyvan; print(eyvan.__version__)"

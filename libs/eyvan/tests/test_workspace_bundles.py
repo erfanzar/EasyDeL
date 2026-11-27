@@ -47,13 +47,18 @@ class _MemoryTransfer:
 
 @pytest.fixture
 def restore_process_state():
-    """execute_callable chdirs and mutates sys.path; undo that for other tests."""
+    """execute_callable chdirs and mutates sys.path / PYTHONPATH; undo that for other tests."""
 
     cwd = Path.cwd()
     path = list(sys.path)
+    pythonpath = os.environ.get("PYTHONPATH")
     yield
     os.chdir(cwd)
     sys.path[:] = path
+    if pythonpath is None:
+        os.environ.pop("PYTHONPATH", None)
+    else:
+        os.environ["PYTHONPATH"] = pythonpath
 
 
 def _shipped_workspace(root: Path) -> Path:
@@ -647,7 +652,7 @@ def test_a_preemption_retry_serves_the_callable_from_the_cell_cache(
         )
 
 
-def test_a_rerun_of_the_same_bundle_uses_a_private_extraction(tmp_path, monkeypatch) -> None:
+def test_a_rerun_of_the_same_bundle_uses_a_private_extraction(tmp_path, monkeypatch, restore_process_state) -> None:
     """Retries never trust a writable cwd or remove another execution's tree."""
 
     from eyvan.worker.runtime.callable_protocol import _materialize_workspace
@@ -821,7 +826,9 @@ def test_two_races_to_extract_the_same_bundle_both_succeed(tmp_path: Path) -> No
     assert set(base.iterdir()) == set(results)
 
 
-def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path: Path, monkeypatch, no_execvp) -> None:
+def test_the_workload_command_keeps_its_own_end_of_options_marker(
+    tmp_path: Path, monkeypatch, no_execvp, restore_process_state
+) -> None:
     """`python tool.py -- --fast` must not exec as `python tool.py --fast`.
 
     The wrapper consumes only its own `--`; stripping every bare double dash
@@ -850,3 +857,31 @@ def test_the_workload_command_keeps_its_own_end_of_options_marker(tmp_path: Path
     assert len(workspaces) == 2
     assert Path.cwd() in workspaces
     assert all((workspace / "helper.py").read_text() == "VALUE = 1\n" for workspace in workspaces)
+
+
+def test_workspace_entry_defaults_to_user_home_away_from_cwd(tmp_path: Path, monkeypatch) -> None:
+    """Unconfigured workspace_entry prefers ~/.eyvan/workspaces over polluting a repo cwd."""
+
+    import eyvan.worker.runtime.workspace_entry as workspace_entry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("EYVAN_WORKSPACE_DIR", raising=False)
+    monkeypatch.delenv("EYVAN_AGENT_STATE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+
+    assert workspace_entry._default_workspace_base() == home / ".eyvan" / "workspaces"
+
+    monkeypatch.setenv("EYVAN_AGENT_STATE_DIR", str(tmp_path / "agent"))
+    assert workspace_entry._default_workspace_base() == tmp_path / "agent" / "workspaces"
+
+    monkeypatch.setenv("EYVAN_WORKSPACE_DIR", str(tmp_path / "explicit"))
+    assert workspace_entry._default_workspace_base() == tmp_path / "explicit"
+
+    monkeypatch.delenv("EYVAN_WORKSPACE_DIR", raising=False)
+    monkeypatch.delenv("EYVAN_AGENT_STATE_DIR", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    assert workspace_entry._default_workspace_base() == repo / workspace_entry.DEFAULT_WORKSPACE_DIRNAME

@@ -1639,11 +1639,12 @@ class _ControllerObservation:
                 state = CellState.READY
                 unavailable_reason = None
                 provider_failure_code = None
+                first_ready = cell.billing_started_at is None and not cell.availability.provision_latencies_s
                 availability = (
                     self._observe_capacity_belief(
                         cell,
                         ProvisionOutcome.SUCCESS,
-                        latency_s=max(0.0, (now - cell.created_at).total_seconds()),
+                        latency_s=max(0.0, (now - cell.created_at).total_seconds()) if first_ready else None,
                     )
                     if cell.state is not CellState.READY
                     else cell.availability

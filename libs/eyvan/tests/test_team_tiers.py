@@ -588,3 +588,62 @@ def test_cli_users_invite_tier_and_rules_max_tpu(monkeypatch) -> None:
     assert fake.calls[0][2]["max_tpu_units"] == 8 and "max TPU 8" in rules.output
     assert fake.calls[0][2]["max_gpu_units"] == 0 and "max GPU 0" in rules.output
     assert fake.calls[0][2]["max_cpu_units"] == 0.5 and "max CPU 0.5" in rules.output
+    assert "can_borrow" not in fake.calls[0][2]
+    assert "borrow tier default" in rules.output
+
+
+def test_cli_users_rules_can_borrow_flags_and_preserves_stored_value_when_omitted(tmp_path, monkeypatch) -> None:
+    """`eyvan users rules` toggles --can-borrow / --no-can-borrow, preserves it when omitted, and surfaces it."""
+
+    from eyvan.sdk.commands.http import EyvanApiError
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("EYVAN_CONFIG_FILE", str(tmp_path / "contexts.json"))
+    http = _http()
+
+    class _ForwardingClient:
+        def __init__(self, _url: str, *, headers: tp.Mapping[str, str]) -> None:
+            self.headers = dict(headers)
+
+        def request(self, method: str, path: str, *, params=None, json=None, headers=None) -> tp.Any:
+            resp = http.request(method, path, params=params, json=json, headers={**self.headers, **(headers or {})})
+            if resp.status_code >= 400:
+                raise EyvanApiError(resp.status_code, resp.text)
+            return resp.json()
+
+    monkeypatch.setattr(cli, "EyvanClient", _ForwardingClient)
+
+    def run(*argv: str):
+        return CliRunner().invoke(cli.main, ["--user", "root", "--role", "fleet_admin", *argv])
+
+    # Enable borrowing explicitly.
+    enabled = run("users", "rules", "alice", "--guarantee", "64", "--can-borrow")
+    assert enabled.exit_code == 0, enabled.output
+    assert "guarantee 64" in enabled.output
+    assert "borrow allowed" in enabled.output
+
+    listed = run("users", "list")
+    assert listed.exit_code == 0, listed.output
+    assert "can-borrow" in listed.output
+
+    # Omitting --can-borrow / --no-can-borrow must NOT overwrite the stored can_borrow=True.
+    kept = run("users", "rules", "alice", "--guarantee", "128")
+    assert kept.exit_code == 0, kept.output
+    assert "guarantee 128" in kept.output
+    assert "borrow allowed" in kept.output
+
+    # Explicitly disabling borrowing flips it to False and surfaces in both rules and users list.
+    disabled = run("users", "rules", "alice", "--guarantee", "128", "--no-can-borrow")
+    assert disabled.exit_code == 0, disabled.output
+    assert "borrow denied" in disabled.output
+
+    listed_after = run("users", "list")
+    assert listed_after.exit_code == 0, listed_after.output
+    assert "no-borrow" in listed_after.output
+
+    # JSON output carries can_borrow in both top-level user doc and rules.
+    as_json = run("users", "rules", "alice", "--guarantee", "128", "--can-borrow", "--json")
+    assert as_json.exit_code == 0, as_json.output
+    parsed = json.loads(as_json.output)
+    assert parsed["can_borrow"] is True
+    assert parsed["rules"]["can_borrow"] is True

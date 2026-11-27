@@ -296,3 +296,96 @@ def test_local_preflights_run_even_when_the_plane_is_unreachable() -> None:
         "control-plane-port",
     ):
         assert expected in names
+
+
+def test_pure_local_loopback_fleet_does_not_fail_gcloud_authentication(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A laptop fleet with no GCP runtime profile or GCP pools stays green without gcloud auth."""
+
+    monkeypatch.setattr(preflights.shutil, "which", lambda _name: "/usr/bin/gcloud")
+    monkeypatch.setattr(preflights, "gcloud_run", lambda _argv: (False, "reauth required"))
+
+    def local_fleet_handler(path: str) -> tp.Any:
+        if path.endswith("/health"):
+            return {"status": "ok", "controller": "active"}
+        if path.endswith("/capacity-pools"):
+            return [
+                {
+                    "id": "laptop/cpu",
+                    "fleet_name": "laptop",
+                    "node_type": "cpu",
+                    "provider": "local",
+                    "capacity_backend": "local",
+                    "executor": "native-local",
+                    "enabled": True,
+                    "capacity": {"cpu": 2.0, "memory_gib": 4.0},
+                    "allocatable": {"cpu": 2.0, "memory_gib": 4.0},
+                    "agent_endpoint": "http://127.0.0.1:8091",
+                }
+            ]
+        if path.endswith("/cells"):
+            return []
+        return [{"name": "laptop"}]
+
+    report = DoctorCommandService(_session(handler=local_fleet_handler)).report()
+
+    gcloud_check = _check(report.checks, "gcloud-authentication")
+    assert gcloud_check.status is CheckStatus.PASS
+    assert "not applicable" in gcloud_check.detail
+    assert report.ok is True
+
+
+def test_gcp_pool_still_fails_unauthenticated_gcloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A loopback plane with a GCP pool still requires gcloud credentials."""
+
+    monkeypatch.setattr(preflights.shutil, "which", lambda _name: "/usr/bin/gcloud")
+    monkeypatch.setattr(preflights, "gcloud_run", lambda _argv: (False, "reauth required"))
+
+    def gcp_fleet_handler(path: str) -> tp.Any:
+        if path.endswith("/health"):
+            return {"status": "ok", "controller": "active"}
+        if path.endswith("/capacity-pools"):
+            return [
+                {
+                    "id": "research/v5p-8",
+                    "fleet_name": "research",
+                    "node_type": "v5p-8",
+                    "provider": "gcp",
+                    "capacity_backend": "gcp-tpu",
+                    "executor": "eyvan-native",
+                    "enabled": True,
+                    "capacity": {"cpu": 32.0, "memory_gib": 64.0, "tpu": 4.0},
+                    "allocatable": {"cpu": 32.0, "memory_gib": 64.0, "tpu": 4.0},
+                    "agent_endpoint": "http://127.0.0.1:8090",
+                }
+            ]
+        if path.endswith("/cells"):
+            return []
+        return [{"name": "research"}]
+
+    report = DoctorCommandService(_session(handler=gcp_fleet_handler)).report()
+
+    gcloud_check = _check(report.checks, "gcloud-authentication")
+    assert gcloud_check.status is CheckStatus.FAIL
+    assert report.ok is False
+
+
+def test_custom_port_loopback_plane_checks_profile_scoped_artifact_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Custom-port loopback planes inspect ~/.eyvan/profiles/<id>/managed-artifacts."""
+
+    from eyvan.sdk.client.endpoint import ControlPlaneEndpoint
+    from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonTarget
+
+    monkeypatch.delenv("EYVAN_ARTIFACT_STORE_URI", raising=False)
+    custom_url = "http://127.0.0.1:18080"
+    target = LocalDaemonTarget.from_endpoint(ControlPlaneEndpoint.parse(custom_url))
+    assert target is not None
+    expected_path = LocalDaemonPaths().profile(target).artifact_store_path
+    expected_path.mkdir(parents=True)
+
+    check = _check(DoctorCommandService(_session(base_url=custom_url)).report().checks, "artifact-store")
+
+    assert check.status is CheckStatus.PASS
+    assert str(expected_path) in check.detail
+    assert "profiles" in check.detail

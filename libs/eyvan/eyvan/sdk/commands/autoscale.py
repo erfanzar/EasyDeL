@@ -11,7 +11,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import click
@@ -351,7 +351,8 @@ def _prompt_autoscale_defaults(
             if 0 <= max_workers <= 10_000 and (max_workers == 0 or max_workers >= min_workers):
                 break
             console.print("[bold red]Worker ceiling must be 0 or at least the warm-worker count.[/]")
-        defaults = AutoscaleDefaults(
+        defaults = replace(
+            current,
             project=project,
             fleet_prefix=fleet_prefix,
             bootstrap_egress=bootstrap_egress,
@@ -541,11 +542,13 @@ def generate_autoscale_entries(
     zones: tuple[str, ...],
     generations: tuple[str, ...],
     persist: bool = True,
+    account: str | None = None,
 ) -> AutoscaleGenerationResult:
     """Generate one zone fleet for every accessible Spot TPU quota zone."""
 
+    discovery = GcpTpuQuotaDiscovery(account=account) if account else GcpTpuQuotaDiscovery()
     try:
-        return AutoscaleGenerationService(GcpTpuQuotaDiscovery()).generate(
+        return AutoscaleGenerationService(discovery).generate(
             cache=cache,
             defaults=defaults,
             zones=zones,
@@ -614,12 +617,18 @@ def initialize_autoscale(defaults_path: Path | None, cache_dir: Path | None, as_
     help="Compatibility flag; generated TPU fleets are always quota-backed and preemptible.",
 )
 @click.option("--cache-dir", type=click.Path(path_type=Path, file_okay=False), help="Override ~/.eyvan/autoscale.")
+@click.option(
+    "--account",
+    metavar="EMAIL",
+    help="gcloud account for quota discovery; gcloud config is not changed.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit generated config and quota details as JSON.")
 def generate_autoscale(
     zones: tuple[str, ...],
     generations: tuple[str, ...],
     defaults_path: Path | None,
     cache_dir: Path | None,
+    account: str | None,
     as_json: bool,
 ) -> None:
     """Cache one valid Spot TPU fleet YAML file per discovered GCP zone."""
@@ -631,6 +640,7 @@ def generate_autoscale(
         defaults=defaults,
         zones=zones,
         generations=generations,
+        account=account,
     )
     payload = generation.as_dict()
     del payload["cached"]

@@ -66,6 +66,15 @@ def _is_safe_provider_diagnostic(value: str) -> bool:
     # is not a rejection by a provider that may never have been asked.
     if normalized.startswith("the cell agent could not be reached"):
         return True
+    # Preserve Eyvan's own IAM / Secret Manager preflight refusal sentences so
+    # operators see the exact missing permission and grant command.
+    if (
+        "secretmanager.secrets." in normalized
+        or "testiampermissions" in normalized
+        or "cannot bind native-worker secrets" in normalized
+        or ("missing:" in normalized and ("grant roles/" in normalized or "--role=roles/" in normalized))
+    ):
+        return True
     return (
         normalized.startswith("error:")
         or "spot preemption" in normalized

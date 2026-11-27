@@ -854,6 +854,11 @@ class UserRecord(EyvanModel):
     max_tpu_units: int | None = Field(default=None, ge=0, le=1_000_000)
     max_gpu_units: int | None = Field(default=None, ge=0, le=1_000_000, strict=True)
     max_cpu_units: float | None = Field(default=None, ge=0, le=1_000_000, strict=True)
+    #: Explicit override for whether this account may borrow idle TPU capacity
+    #: above ``guaranteed_tpu_units``. ``None`` defers to tier defaults (admins
+    #: and trusted users may borrow; plain users with a positive guarantee stay
+    #: within their guarantee unless granted higher ``max_tpu_units``).
+    can_borrow: bool | None = Field(default=None, strict=True)
 
     @model_serializer(mode="wrap")
     def _wire_document(self, handler):
@@ -867,6 +872,7 @@ class UserRecord(EyvanModel):
             "max_tpu_units",
             "max_cpu_units",
             "max_gpu_units",
+            "can_borrow",
         ):
             if getattr(self, name) is None:
                 document.pop(name, None)
@@ -1624,6 +1630,10 @@ class WorkloadDefinition(EyvanModel):
     checkpoint_hook: str | None = None
     checkpoint_output_uri: str | None = None
     checkpoint_grace_seconds: int = Field(default=0, ge=0)
+    #: What happens after a graceful reclaim checkpoint completes: ``requeue``
+    #: (default) returns the workload to PENDING to auto-resume elsewhere;
+    #: ``stop`` settles cleanly as CANCELLED with its checkpoint preserved.
+    reclaim_policy: tp.Literal["requeue", "stop"] = "requeue"
     max_retries: int = Field(default=0, ge=0, le=100)
     max_failure_retries: int = Field(default=0, ge=0, le=100)
     #: Restarts allowed after the *provider* reclaimed the capacity, separate
@@ -1677,6 +1687,8 @@ class WorkloadDefinition(EyvanModel):
             document.pop("tpu_chips", None)
         if self.setup is None:
             document.pop("setup", None)
+        if self.reclaim_policy == "requeue":
+            document.pop("reclaim_policy", None)
         return document
 
     @model_validator(mode="after")
@@ -2140,6 +2152,11 @@ class WorkloadRecord(EyvanModel):
     autoscale_block_reason: AutoscaleBlockReason | None = None
     queue_admission_denial: GcpQueueAdmissionDenialTarget | None = None
     preemption_id: str | None = Field(default=None, max_length=96)
+    #: Graceful reclaim deadline (UTC) while this workload is checkpointing for
+    #: reclaim or waiting for borrowed capacity to be reclaimed.
+    reclaim_deadline_at: datetime | None = None
+    #: Subject whose reclaim request owns the active reclaim window.
+    reclaim_requested_by: str | None = Field(default=None, max_length=256)
     #: Parent in a job tree. A child is an ordinary workload that competes as a
     #: normal sibling under the same (org, project, principal) fair-share leaf --
     #: job structure is a relation and a cancellation cascade, not a fourth
@@ -2166,6 +2183,15 @@ class WorkloadRecord(EyvanModel):
     created_by: str = Field(max_length=256)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+    @model_serializer(mode="wrap")
+    def _wire_document(self, handler):
+        document = handler(self)
+        if self.reclaim_deadline_at is None:
+            document.pop("reclaim_deadline_at", None)
+        if self.reclaim_requested_by is None:
+            document.pop("reclaim_requested_by", None)
+        return document
 
     @model_validator(mode="after")
     def validate_identity(self) -> WorkloadRecord:
@@ -2505,6 +2531,10 @@ class CapacityPoolRecord(EyvanModel):
     provider: str
     capacity_backend: str | None = None
     provider_project: str | None = None
+    #: Optional cloud account email (for example a gcloud account or service
+    #: account) used when querying quotas and managing capacity in this pool's
+    #: provider project. Omitted from the wire document when unset.
+    provider_account: str | None = Field(default=None, max_length=320)
     region: str
     zone: str | None = None
     capacity: CanonicalResourceLimits
@@ -2582,6 +2612,8 @@ class CapacityPoolRecord(EyvanModel):
         document = handler(self)
         if not self.chip_sharing:
             document.pop("chip_sharing", None)
+        if self.provider_account is None:
+            document.pop("provider_account", None)
         return document
 
     @model_validator(mode="after")
@@ -2607,6 +2639,10 @@ class CapacityPoolRecord(EyvanModel):
         if not _SAFE_FLEET_COMPONENT.fullmatch(self.node_type):
             raise ValueError("node type must contain only lowercase letters, digits, and hyphens")
         _validate_string(self.provider_project, field_name="provider project", optional=True)
+        if self.provider_account is not None:
+            _validate_string(self.provider_account, field_name="provider account")
+            if re.fullmatch(_EMAIL_PATTERN, self.provider_account) is None:
+                raise ValueError("provider account must be a valid email or service account address")
         _validate_string(self.capacity_backend, field_name="capacity backend", optional=True)
         _validate_string(self.zone, field_name="capacity zone", optional=True)
         _validate_string(self.accelerator_type, field_name="accelerator type", optional=True)
@@ -2675,23 +2711,23 @@ class CapacityPoolRecord(EyvanModel):
     def template_fingerprint(self) -> str:
         """Return the immutable capacity identity used to pin new workloads during rollouts."""
 
-        payload = self.model_dump(
-            mode="json",
-            include={
-                "provider",
-                "capacity_backend",
-                "provider_project",
-                "region",
-                "zone",
-                "capacity",
-                "accelerator_type",
-                "capacity_class",
-                "executor",
-                "agent_endpoint",
-                "provider_options",
-                "runtime",
-            },
-        )
+        include_fields = {
+            "provider",
+            "capacity_backend",
+            "provider_project",
+            "region",
+            "zone",
+            "capacity",
+            "accelerator_type",
+            "capacity_class",
+            "executor",
+            "agent_endpoint",
+            "provider_options",
+            "runtime",
+        }
+        if self.provider_account is not None:
+            include_fields.add("provider_account")
+        payload = self.model_dump(mode="json", include=include_fields)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
         return hashlib.sha256(encoded).hexdigest()
 

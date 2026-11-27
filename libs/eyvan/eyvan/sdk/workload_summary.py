@@ -121,6 +121,44 @@ def _blocked(record: JsonObject) -> str | None:
     return None
 
 
+def format_user_progress(reports: object) -> tuple[str, ...]:
+    """Render self-reported ``UserProgressReport`` entries as compact human lines."""
+
+    if not isinstance(reports, list):
+        return ()
+    valid = [entry for entry in reports if is_json_object(entry)]
+    if not valid:
+        return ()
+    multi_rank = len(valid) > 1
+    lines: list[str] = []
+    for entry in valid:
+        parts: list[str] = []
+        step = entry.get("step")
+        total = entry.get("total")
+        if isinstance(step, int) and not isinstance(step, bool):
+            if isinstance(total, int) and not isinstance(total, bool) and total > 0:
+                pct = min(100, round(step / total * 100))
+                parts.append(f"step {step}/{total} ({pct}%)")
+            else:
+                parts.append(f"step {step}")
+        metrics = entry.get("metrics")
+        if is_json_object(metrics) and metrics:
+            formatted = ", ".join(
+                f"{key}={val:g}" if isinstance(val, (int, float)) and not isinstance(val, bool) else f"{key}={val}"
+                for key, val in sorted(metrics.items())
+            )
+            parts.append(formatted)
+        message = _text(entry.get("message"))
+        if message:
+            parts.append(message)
+        if not parts:
+            continue
+        rank = entry.get("rank")
+        prefix = f"rank {rank}: " if multi_rank and isinstance(rank, int) and not isinstance(rank, bool) else ""
+        lines.append(f"{prefix}{' · '.join(parts)}")
+    return tuple(lines)
+
+
 def summarize(record: JsonObject) -> tuple[str, ...]:
     """Render one workload record as aligned lines, or nothing if unreadable."""
 
@@ -186,6 +224,8 @@ def summarize(record: JsonObject) -> tuple[str, ...]:
     ]
     row("retries", ", ".join(part for part in counts if part))
 
+    for line in format_user_progress(record.get("user_progress")):
+        row("progress", line)
     row("submitted", _text(record.get("created_by")))
     row("at", _text(record.get("created_at")))
     return tuple(lines)
@@ -197,7 +237,7 @@ def render(record: object) -> tuple[str, ...]:
     return summarize(record) if is_json_object(record) else ()
 
 
-__all__ = ("render", "summarize")
+__all__ = ("format_user_progress", "render", "summarize")
 
 
 if tp.TYPE_CHECKING:  # pragma: no cover - import-time typing only

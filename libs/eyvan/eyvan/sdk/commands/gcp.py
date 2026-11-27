@@ -21,6 +21,7 @@ from rich.table import Table
 from eyvan._internal.ssh import SshDestination
 from eyvan.capacity.autoscale.cache import AutoscaleConfigCache
 from eyvan.capacity.autoscale.models import AutoscaleDefaults
+from eyvan.capacity.providers.gcp.accelerator_catalog import gcloud_access_token
 from eyvan.capacity.providers.gcp.runtime.profile import GcpNativeRuntimeProfileStore
 from eyvan.capacity.providers.gcp.runtime.supervisor import runtime_profile_path_for
 from eyvan.capacity.providers.gcp.tpu_nodes import GcpProject, TpuApiError, TpuNode, TpuNodeApi, TpuNodeParseError
@@ -29,6 +30,17 @@ from eyvan.sdk.commands.gcp_connect import AttachError, AttachPlan, GcpConnector
 from eyvan.sdk.commands.gcp_host_access import resolve_attach_runtime
 from eyvan.sdk.commands.state import CliSession
 from eyvan.sdk.terminal import print_block
+
+
+def _tpu_node_api(account: str | None) -> TpuNodeApi:
+    """Build a :class:`TpuNodeApi`, scoped to ``account`` when requested."""
+
+    if account is None:
+        return TpuNodeApi()
+    return TpuNodeApi(
+        token_source=lambda: gcloud_access_token(account=account),
+        account_source=lambda: account,
+    )
 
 
 def _project(session: CliSession, api: TpuNodeApi, explicit: str | None) -> str:
@@ -146,12 +158,13 @@ def gcp() -> None:
 
 @gcp.command("browse")
 @click.option("--project", "project_id", help="List only this GCP project; otherwise list all visible projects.")
+@click.option("--account", metavar="EMAIL", help="gcloud account to use; gcloud config is not changed.")
 @click.option("--json", "as_json", is_flag=True, help="List only; never prompt or modify hardware.")
 @click.pass_obj
-def browse(session: CliSession, project_id: str | None, as_json: bool) -> None:
+def browse(session: CliSession, project_id: str | None, account: str | None, as_json: bool) -> None:
     """List projects and TPU VMs; in a terminal optionally pick one to connect."""
 
-    api = TpuNodeApi()
+    api = _tpu_node_api(account)
     try:
         projects = (GcpProject(project_id, None, None),) if project_id else api.list_projects()
         nodes: list[TpuNode] = []
@@ -203,7 +216,7 @@ def browse(session: CliSession, project_id: str | None, as_json: bool) -> None:
         return
     selected = click.prompt("Select TPU to connect", type=click.IntRange(1, len(nodes)))
     node = nodes[selected - 1]
-    connector = GcpConnector(session, api=api)
+    connector = GcpConnector(session, api=api, account=account)
     try:
         plan = connector.plan_tpu(node)
         if not click.confirm(
@@ -227,6 +240,7 @@ def browse(session: CliSession, project_id: str | None, as_json: bool) -> None:
 )
 @click.option("--project", "project_id", metavar="P", help="GCP project; defaults to the local native-runtime profile.")
 @click.option("--zone", metavar="Z", help="TPU zone; required when its name is ambiguous across zones.")
+@click.option("--account", metavar="EMAIL", help="gcloud account to use; gcloud config is not changed.")
 @click.option("--fleet", metavar="NAME", help="Fleet name; default is deterministic for this node/host.")
 @click.option(
     "--endpoint-mode",
@@ -290,6 +304,7 @@ def connect(
     ssh_host: str | None,
     project_id: str | None,
     zone: str | None,
+    account: str | None,
     fleet: str | None,
     endpoint_mode: str | None,
     cpus: float | None,
@@ -311,7 +326,7 @@ def connect(
         raise click.UsageError("choose exactly one of --tpu NAME or --ssh USER@HOST")
     if not math.isfinite(timeout) or timeout <= 0:
         raise click.UsageError("--timeout must be a positive finite number")
-    connector = GcpConnector(session)
+    connector = GcpConnector(session, account=account)
     try:
         connector.runtime = resolve_attach_runtime(
             defaults=_load_runtime_defaults(defaults_path),
@@ -326,7 +341,7 @@ def connect(
             # An address that belongs to one of the operator's TPU VMs is attached as
             # that TPU: its shape, hosts and purchase class come from the TPU API, and
             # nothing has to be typed. Anything else is a plain SSH host.
-            api = TpuNodeApi()
+            api = _tpu_node_api(account)
             connector.api = api
             tpu_node, found_mode, notes = connector.find_tpu_by_address(ssh_host, project=project_id, zone=zone)
             discovered = None
@@ -382,7 +397,7 @@ def connect(
         else:
             if cpus is not None or memory_gib is not None or capacity_class != "reserved" or region != "onprem":
                 raise click.UsageError("--cpus, --memory-gib, --capacity-class and --region apply only to --ssh")
-            api = TpuNodeApi()
+            api = _tpu_node_api(account)
             connector.api = api
             project = _project(session, api, project_id)
             node = connector.resolve(project=project, name=tp.cast(str, tpu_name), zone=zone)
@@ -406,9 +421,10 @@ def connect(
 
 @gcp.command("sync")
 @click.option("--project", "project_ids", multiple=True, help="Only these GCP projects (repeatable); default all.")
+@click.option("--account", metavar="EMAIL", help="gcloud account to use; gcloud config is not changed.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the discovery index as JSON.")
 @click.pass_obj
-def sync(session: CliSession, project_ids: tuple[str, ...], as_json: bool) -> None:
+def sync(session: CliSession, project_ids: tuple[str, ...], account: str | None, as_json: bool) -> None:
     """List every TPU VM your gcloud account can see and give each a ready fleet name.
 
     Read-only: nothing is installed, tagged or opened. A TPU is connected the
@@ -418,7 +434,8 @@ def sync(session: CliSession, project_ids: tuple[str, ...], as_json: bool) -> No
     from eyvan.capacity.providers.gcp.tpu_discovery import DiscoveryIndex
 
     try:
-        snapshot = DiscoveryIndex().refresh(projects=project_ids or None)
+        api = _tpu_node_api(account) if account is not None else None
+        snapshot = DiscoveryIndex().refresh(api=api, projects=project_ids or None)
     except (TpuApiError, TpuNodeParseError, ValueError) as exc:
         raise click.ClickException(f"eyvan gcp sync: could not list GCP projects: {exc}") from exc
     connected = set(_connected_fleets(session))

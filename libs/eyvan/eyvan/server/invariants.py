@@ -184,18 +184,10 @@ _EXECUTION_VALID_CELL_STATES: tp.Final[frozenset[CellState]] = frozenset({CellSt
 
 
 def _execution_identity(workload: tp.Any, lease: tp.Any, cell: tp.Any) -> ExecutionIdentity:
-    executor_aliases = {
-        "local": "native-local",
-        "local-process": "native-local",
-        "native": "eyvan-native",
-        "native-remote": "eyvan-native",
-        "native-worker": "eyvan-native",
-        "eyvan": "eyvan-native",
-        "ray": "ray-jobs",
-        "rayjobs": "ray-jobs",
-    }
+    from eyvan.capacity.drivers.base import canonical_execution_backend
+
     backend_aliases = {"k8s": "kubernetes", "compute": "gcp-compute", "tpu": "gcp-tpu"}
-    provider_aliases = {"k8s": "kubernetes", "gcp-compute": "gcp", "gcp-tpu": "gcp"}
+    provider_aliases = {"k8s": "kubernetes", "gcp-compute": "gcp", "gcp-tpu": "gcp", "gcp-attach": "gcp"}
     resources = lease.resources.per_replica
     if resources.tpu > 0:
         resource_class = "tpu"
@@ -205,15 +197,24 @@ def _execution_identity(workload: tp.Any, lease: tp.Any, cell: tp.Any) -> Execut
         resource_class = "cpu"
     else:
         resource_class = "other"
+    required_exec = (
+        canonical_execution_backend(workload.spec.required_executor)
+        if isinstance(workload.spec.required_executor, str) and workload.spec.required_executor.strip()
+        else workload.spec.required_executor
+    )
+    cell_exec = (
+        canonical_execution_backend(cell.executor)
+        if isinstance(cell.executor, str) and cell.executor.strip()
+        else cell.executor
+    )
     return ExecutionIdentity(
         capability=CapabilityIdentity(
             execution=safe_enum(workload.spec.execution.kind, SAFE_EXECUTION_KINDS),
             checkpointable=workload.spec.checkpointable,
             coordination=safe_enum(workload.coordination_kind, SAFE_COORDINATION_KINDS, missing="none"),
             required_executor=safe_enum(
-                workload.spec.required_executor,
+                required_exec,
                 SAFE_EXECUTORS,
-                aliases=executor_aliases,
                 missing="any",
             ),
         ),
@@ -223,7 +224,7 @@ def _execution_identity(workload: tp.Any, lease: tp.Any, cell: tp.Any) -> Execut
                 SAFE_CAPACITY_BACKENDS,
                 aliases=backend_aliases,
             ),
-            executor=safe_enum(cell.executor, SAFE_EXECUTORS, aliases=executor_aliases),
+            executor=safe_enum(cell_exec, SAFE_EXECUTORS),
         ),
         provider=ProviderIdentity(
             provider=safe_enum(cell.provider, SAFE_PROVIDERS, aliases=provider_aliases),

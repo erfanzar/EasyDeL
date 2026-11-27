@@ -16,11 +16,13 @@ from eyvan._internal.identifiers import stable_id
 from eyvan._internal.json_types import JsonObject, model_json
 from eyvan.capacity.acquisition_backoff import is_acquisition_backoff_reason
 from eyvan.domain import (
+    InfeasibilityCode,
     PlacementDecision,
     PreemptionActionKind,
     PreemptionPlan,
     SchedulingResult,
 )
+from eyvan.domain.governance import requested_tpu_units, targeted_pool_ids
 from eyvan.records import (
     AuditEvent,
     AutoscaleBlockReason,
@@ -29,7 +31,10 @@ from eyvan.records import (
     LeaseState,
     OutboxRecord,
     OutboxState,
+    Principal,
     ResourceGang,
+    Role,
+    RoleGrant,
     WorkloadRecord,
     WorkloadState,
     utcnow,
@@ -42,8 +47,19 @@ from eyvan.server.controller._support import (
 )
 from eyvan.server.persistence.base import RepositorySession
 from eyvan.server.service.control_plane import storage_scope
-from eyvan.server.service.errors import InputError
+from eyvan.server.service.errors import ConflictError, InputError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES
+
+#: Infeasibility codes where reclaiming borrowed capacity on compatible cells can
+#: unblock a guaranteed owner's pending workload.
+_AUTO_RECLAIM_INFEASIBILITY_CODES = frozenset(
+    {
+        InfeasibilityCode.NO_CELLS,
+        InfeasibilityCode.INSUFFICIENT_CAPACITY,
+        InfeasibilityCode.HARD_CONSTRAINT,
+        InfeasibilityCode.PREEMPTION_UNSAFE,
+    }
+)
 
 
 class _ControllerScheduling:
@@ -95,6 +111,8 @@ class _ControllerScheduling:
             record,
             idempotency_key=f"schedule:{record.id}:{record.generation}",
         )
+        if workload.reclaim_deadline_at is not None or workload.reclaim_requested_by is not None:
+            await self._clear_waiting_reclaim_markers(workload.id)
 
     async def _commit_group_placement(self, decision: PlacementDecision) -> None:
         """Persist every member of a spread-cell pod placement atomically."""
@@ -148,6 +166,25 @@ class _ControllerScheduling:
             tuple(records),
             idempotency_key=f"schedule-group:{group_id}",
         )
+        if workload.reclaim_deadline_at is not None or workload.reclaim_requested_by is not None:
+            await self._clear_waiting_reclaim_markers(workload.id)
+
+    async def _clear_waiting_reclaim_markers(self, workload_id: str) -> None:
+        async with self.repository.transaction() as transaction:
+            current = await transaction.get_workload(workload_id)
+            if current is None:
+                return
+            if current.reclaim_deadline_at is None and current.reclaim_requested_by is None:
+                return
+            await transaction.put_workload(
+                current.model_copy(
+                    update={
+                        "reclaim_deadline_at": None,
+                        "reclaim_requested_by": None,
+                        "updated_at": utcnow(),
+                    }
+                )
+            )
 
     async def _commit_preemption(self, plan: PreemptionPlan) -> None:
         now = utcnow()
@@ -340,11 +377,175 @@ class _ControllerScheduling:
                 )
             )
 
+    async def _auto_reclaim_for_infeasible_owners(self, result: SchedulingResult) -> set[str]:
+        """Automatically trigger graceful reclaim for guaranteed owners blocked by borrowers."""
+
+        if not getattr(self.service, "governance_enabled", False):
+            return set()
+        reclaimed_waiting: set[str] = set()
+        now = utcnow()
+        for failure in result.infeasibilities:
+            if failure.code not in _AUTO_RECLAIM_INFEASIBILITY_CODES:
+                continue
+            async with self.repository.transaction() as transaction:
+                workload = await transaction.get_workload(failure.workload_id)
+                if (
+                    workload is None
+                    or workload.state is not WorkloadState.PENDING
+                    or not workload.schedulable
+                    or workload.coordination_kind is not None
+                    or workload.preemption_id is not None
+                ):
+                    continue
+                if workload.reclaim_deadline_at is not None and workload.reclaim_deadline_at > now:
+                    reclaimed_waiting.add(workload.id)
+                    continue
+                needed_tpu = requested_tpu_units(workload.spec)
+                if needed_tpu <= 0:
+                    continue
+                owner = await transaction.get_user(workload.created_by)
+                if (
+                    owner is None
+                    or owner.disabled
+                    or owner.guaranteed_tpu_units is None
+                    or owner.guaranteed_tpu_units <= 0
+                ):
+                    continue
+                # If a reclaim requested by this owner is already in flight, reuse its
+                # deadline on the waiting workload instead of issuing a second reclaim.
+                active_for_owner = [
+                    candidate
+                    for candidate in await transaction.list_workloads()
+                    if candidate.state in {WorkloadState.CHECKPOINTING, WorkloadState.CANCELLING}
+                    and candidate.reclaim_requested_by == workload.created_by
+                    and candidate.reclaim_deadline_at is not None
+                    and candidate.reclaim_deadline_at > now
+                ]
+                if active_for_owner:
+                    deadline_at = max(
+                        candidate.reclaim_deadline_at
+                        for candidate in active_for_owner
+                        if candidate.reclaim_deadline_at is not None
+                    )
+                    borrowers = sorted({candidate.created_by for candidate in active_for_owner})
+                    remaining_s = max(1, round((deadline_at - now).total_seconds()))
+                    borrower_label = ", ".join(borrowers) or "borrowed job"
+                    reason_text = (
+                        f"Reclaiming borrowed capacity from {borrower_label} — "
+                        f"checkpoint deadline in {remaining_s}s ({deadline_at.isoformat()})"
+                    )
+                    await transaction.put_workload(
+                        workload.model_copy(
+                            update={
+                                "scheduling_reason": reason_text,
+                                "reclaim_deadline_at": deadline_at,
+                                "reclaim_requested_by": workload.created_by,
+                                "updated_at": now,
+                            }
+                        )
+                    )
+                    reclaimed_waiting.add(workload.id)
+                    continue
+                pinned_pools = targeted_pool_ids(workload.spec)
+                pools = await transaction.list_capacity_pools()
+                compatible_pool_ids: tuple[str, ...] | None = None
+                required_accel: str | None = None
+                if pinned_pools:
+                    compatible_pool_ids = pinned_pools
+                elif workload.spec.accelerator_type or workload.spec.allowed_accelerator_types:
+                    allowed_accels = (
+                        {workload.spec.accelerator_type.strip().lower()}
+                        if workload.spec.accelerator_type
+                        else {item.strip().lower() for item in workload.spec.allowed_accelerator_types if item.strip()}
+                    )
+                    matching_pools = tuple(
+                        pool.id
+                        for pool in pools
+                        if pool.enabled
+                        and pool.accelerator_type is not None
+                        and pool.accelerator_type.strip().lower() in allowed_accels
+                        and (workload.spec.region is None or pool.region == workload.spec.region)
+                    )
+                    if matching_pools:
+                        compatible_pool_ids = matching_pools
+                    else:
+                        required_accel = workload.spec.accelerator_type
+
+            owner_principal = Principal(subject=workload.created_by)
+            plan = await self.service.plan_reclaim_for(
+                owner_principal,
+                tpu_units=needed_tpu,
+                compatible_pool_ids=compatible_pool_ids,
+                required_accelerator_type=required_accel,
+            )
+            if not plan.allowed or not plan.victims:
+                continue
+
+            actor = Principal(
+                subject=f"reclaim:{workload.created_by}",
+                grants=(RoleGrant(role=Role.FLEET_ADMIN),),
+            )
+            reclaimed_victims: list[WorkloadRecord] = []
+            for victim_id in plan.victims:
+                async with self.repository.transaction() as tx:
+                    victim_record = await tx.get_workload(victim_id)
+                if victim_record is None or victim_record.state is not WorkloadState.RUNNING:
+                    continue
+                victim_grace = victim_record.spec.checkpoint_grace_seconds or self.settings.default_reclaim_grace_s
+                victim_grace = victim_grace if victim_grace > 0 else 600
+                try:
+                    updated_victim, _replayed = await self.service.reclaim_workload(
+                        actor,
+                        victim_id,
+                        idempotency_key=f"auto-reclaim:{workload.id}:{workload.generation}:{victim_id}",
+                        reason=f"reclaiming borrowed capacity for {workload.created_by} (workload {workload.id})"[:500],
+                        grace_seconds=victim_grace,
+                        requested_by=workload.created_by,
+                    )
+                except ConflictError:
+                    continue
+                reclaimed_victims.append(updated_victim)
+
+            if not reclaimed_victims:
+                continue
+            deadlines = [v.reclaim_deadline_at for v in reclaimed_victims if v.reclaim_deadline_at is not None]
+            deadline_at = (
+                max(deadlines) if deadlines else utcnow() + timedelta(seconds=self.settings.default_reclaim_grace_s)
+            )
+            borrowers = sorted({victim.created_by for victim in reclaimed_victims})
+            remaining_s = max(1, round((deadline_at - utcnow()).total_seconds()))
+            borrower_label = ", ".join(borrowers) or "borrowed job"
+            reason_text = (
+                f"Reclaiming borrowed capacity from {borrower_label} — "
+                f"checkpoint deadline in {remaining_s}s ({deadline_at.isoformat()})"
+            )
+            async with self.repository.transaction() as transaction:
+                current_owner = await transaction.get_workload(workload.id)
+                if current_owner is not None and current_owner.state is WorkloadState.PENDING:
+                    await transaction.put_workload(
+                        current_owner.model_copy(
+                            update={
+                                "scheduling_reason": reason_text,
+                                "reclaim_deadline_at": deadline_at,
+                                "reclaim_requested_by": current_owner.created_by,
+                                "updated_at": utcnow(),
+                            }
+                        )
+                    )
+            reclaimed_waiting.add(workload.id)
+        return reclaimed_waiting
+
     async def _record_infeasibilities(self, result: SchedulingResult) -> None:
+        reclaimed_waiting = await self._auto_reclaim_for_infeasible_owners(result)
+        now = utcnow()
         async with self.repository.transaction() as transaction:
             for failure in result.infeasibilities:
                 workload = await transaction.get_workload(failure.workload_id)
                 if workload is None or workload.state is not WorkloadState.PENDING:
+                    continue
+                if workload.id in reclaimed_waiting:
+                    continue
+                if workload.reclaim_deadline_at is not None and workload.reclaim_deadline_at > now:
                     continue
                 if workload.autoscale_block_reason is not None:
                     continue

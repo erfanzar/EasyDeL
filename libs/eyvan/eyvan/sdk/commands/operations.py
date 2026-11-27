@@ -67,13 +67,26 @@ CELL_COLUMNS = (
 
 @click.command("cells")
 @click.option("--json", "as_json", is_flag=True, help="Emit the durable records instead of a table.")
+@click.option("--all", "include_all", is_flag=True, help="Include historical deleted cells in table output.")
 @click.pass_obj
-def list_cells(session: CliSession, as_json: bool) -> None:
+def list_cells(session: CliSession, as_json: bool, include_all: bool) -> None:
     """List the machines this fleet currently holds."""
 
     payload = session.client.request("GET", "/api/v1/cells")
     if as_json or not isinstance(payload, list):
         JsonRenderer().emit(payload)
+        return
+    if not include_all:
+        active = [
+            cell for cell in payload if not (isinstance(cell, dict) and str(cell.get("state", "")).lower() == "deleted")
+        ]
+        empty = (
+            "This fleet holds no active cells (pass --all to include deleted history)."
+            if payload
+            else "This fleet holds no cells."
+        )
+        for line in render(active, CELL_COLUMNS, empty=empty):
+            click.echo(line)
         return
     for line in render(payload, CELL_COLUMNS, empty="This fleet holds no cells."):
         click.echo(line)
