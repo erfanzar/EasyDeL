@@ -21,7 +21,9 @@ from types import FrameType
 from eyvan._internal.json_types import JsonObject
 from eyvan._internal.workspace import create_private_directory
 from eyvan.capacity.drivers.base import ExecutionWorkloadStatus
+from eyvan.storage._region_guard import CROSS_REGION_TRANSFER_BANNED_EXIT_CODE
 from eyvan.worker.runtime.local_process import (
+    _format_cross_region_ban_message,
     _group_has_live_members,
     _mutate_record,
     _process_start_marker,
@@ -233,6 +235,8 @@ def _run(record_path: Path, log_path: Path, owner_path: Path, worker_token: str)
                 if stopped
                 else "native-local command completed"
                 if exit_code == 0
+                else _format_cross_region_ban_message(log_path)
+                if exit_code == CROSS_REGION_TRANSFER_BANNED_EXIT_CODE
                 else f"native-local command exited with code {exit_code}"
             )
             if acknowledged_uri is not None:

@@ -595,6 +595,33 @@ def _read_cached(
     return payload
 
 
+def _arm_cross_region_guard_if_configured(environment: tp.Mapping[str, str]) -> None:
+    """Arm the cross-region GCS guard when policy env vars are set and the guard is importable.
+
+    Uses ``importlib.import_module`` rather than an explicit ``from eyvan...`` import so
+    the flattened OCI callable runner (which stages only its declared sibling modules)
+    satisfies the stager import boundary and degrades cleanly if no guard module is present.
+    """
+
+    policy = (environment.get("EYVAN_CROSS_REGION_POLICY") or "").strip().lower()
+    if not policy or policy == "allow":
+        return
+    import importlib
+
+    for module_name in ("eyvan_region_guard", "eyvan.storage._region_guard"):
+        try:
+            guard_module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        is_active = getattr(guard_module, "is_cross_region_guard_active", None)
+        if callable(is_active) and is_active():
+            return
+        arm = getattr(guard_module, "arm_cross_region_guard_from_environment", None)
+        if callable(arm):
+            arm(environment)
+            return
+
+
 def execute_callable(
     argv: tp.Sequence[str] | None,
     *,
@@ -623,6 +650,8 @@ def execute_callable(
     parser.add_argument("--workspace-sha256")
     parser.add_argument("--workspace-signature")
     args = parser.parse_args(None if argv is None else list(argv))
+
+    _arm_cross_region_guard_if_configured(environment)
 
     signing_key_value = environment.get("EYVAN_CALLABLE_SIGNING_KEY")
     signing_key = signing_key_value.encode() if signing_key_value else None

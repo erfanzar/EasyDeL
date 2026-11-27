@@ -21,6 +21,28 @@ import time
 import typing as tp
 
 
+def _arm_cross_region_guard(environment: tp.Mapping[str, str]) -> None:
+    """Arm Eyvan's cross-region GCS transfer guard when policy env vars are present.
+
+    Tries the staged sibling module name first (TPU/GPU hosts where ``eyvan`` is
+    not on the workload site path), falling back to ``eyvan.storage._region_guard``.
+    """
+
+    policy = (environment.get("EYVAN_CROSS_REGION_POLICY") or "").strip().lower()
+    if not policy or policy == "allow":
+        return
+    try:
+        from eyvan_region_guard import (  # type: ignore[import-not-found]
+            arm_cross_region_guard_from_environment,
+        )
+    except ImportError:
+        try:
+            from eyvan.storage._region_guard import arm_cross_region_guard_from_environment
+        except ImportError:
+            return
+    arm_cross_region_guard_from_environment(environment)
+
+
 def _scrub_gce_topology_overrides(environment: tp.MutableMapping[str, str]) -> None:
     """Drop topology values that must come from GCE TPU metadata discovery.
 
@@ -81,6 +103,12 @@ FATAL_INITIALIZATION_ENV = "EYVAN_JAX_INIT_FATAL"
 #: code is imported.
 GANG_INITIALIZATION_DEADLINE_EXIT_CODE = 93
 GANG_INITIALIZATION_ERROR_EXIT_CODE = 94
+
+#: Exit code, stderr marker, and stable failure-reason prefix for Eyvan's
+#: runtime cross-region GCS transfer ban.
+CROSS_REGION_TRANSFER_BANNED_EXIT_CODE = 95
+CROSS_REGION_TRANSFER_BANNED_MARKER = "eyvan-cross-region-transfer-banned"
+CROSS_REGION_TRANSFER_BANNED_REASON = "cross-region-transfer-banned"
 
 #: Single-line markers written to this rank's stderr, which systemd journals and
 #: Eyvan's log page serves. The failure marker carries the *observed* wait; the
@@ -404,7 +432,7 @@ def _initialize_distributed(
 
 
 def initialize_worker_runtime(environment: tp.MutableMapping[str, str] | None = None) -> None:
-    """Prepare the environment and initialize JAX, in that order.
+    """Arm locality guards, prepare the environment, and initialize JAX, in that order.
 
     The order is the point and it used to live in a generated shell heredoc,
     where it could only ever be asserted as a *string*. Under ``gcetpu``
@@ -414,6 +442,7 @@ def initialize_worker_runtime(environment: tp.MutableMapping[str, str] | None = 
     """
 
     target = os.environ if environment is None else environment
+    _arm_cross_region_guard(target)
     if target.get("EYVAN_JAX_CLUSTER_DETECTION") == "gcetpu":
         _scrub_gce_topology_overrides(target)
     initialize_from_environment()
@@ -512,6 +541,9 @@ def initialize_from_environment() -> None:
 
 
 __all__ = (
+    "CROSS_REGION_TRANSFER_BANNED_EXIT_CODE",
+    "CROSS_REGION_TRANSFER_BANNED_MARKER",
+    "CROSS_REGION_TRANSFER_BANNED_REASON",
     "DEFAULT_GANG_INITIALIZATION",
     "DEFAULT_HEARTBEAT_TIMEOUT_S",
     "DEFAULT_INITIALIZATION_TIMEOUT_S",

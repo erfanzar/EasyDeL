@@ -42,6 +42,13 @@ from eyvan.storage._naming import (
     validate_zone,
     zone_to_region,
 )
+from eyvan.storage._region_guard import (
+    BucketLocation,
+    CrossRegionTransferError,
+    _bypass_region_guard,
+    _infer_location_type,
+    enforce_gcs_access,
+)
 
 #: HTTP transport callable: ``(method, url, headers, body) -> (status, response_headers, response_bytes)``.
 Transport = tp.Callable[[str, str, dict[str, str], bytes | None], tuple[int, tp.Mapping[str, str], bytes]]
@@ -102,6 +109,8 @@ class BucketInfo:
     storage_class: str = "STANDARD"
     uniform_access: bool = True
     created: bool = False
+    location_type: str = "region"
+    data_locations: tuple[str, ...] = ()
 
 
 @tp.runtime_checkable
@@ -762,7 +771,7 @@ class GcsBucketBackend:
                 status, response_headers, payload = _urllib_transport(
                     method, url, headers, body, timeout_s=self._timeout_s
                 )
-        except StorageBackendError:
+        except (CrossRegionTransferError, StorageBackendError):
             raise
         except Exception:
             raise StorageBackendError(f"GCS {method} request failed due to transport error") from None
@@ -808,7 +817,8 @@ class GcsBucketBackend:
 
         norm_bucket = validate_bucket_name(bucket)
         url = f"{_GCS_API_ROOT}/b/{quote(norm_bucket, safe='')}"
-        status, _, payload = self._authed_request("GET", url)
+        with _bypass_region_guard():
+            status, _, payload = self._authed_request("GET", url)
         if status == 404:
             return None
         if status == 403:
@@ -817,7 +827,18 @@ class GcsBucketBackend:
             )
         if status != 200:
             raise StorageBackendError(f"GCS bucket lookup for {norm_bucket!r} returned HTTP {status}")
-        return _parse_bucket_info(norm_bucket, payload, created=False)
+        info = _parse_bucket_info(norm_bucket, payload, created=False)
+        enforce_gcs_access(
+            f"gs://{info.name}",
+            operation="gcs_backend.get_bucket",
+            bucket_location=BucketLocation(
+                bucket=info.name,
+                location=info.location,
+                location_type=info.location_type,
+                data_locations=info.data_locations,
+            ),
+        )
+        return info
 
     def create_bucket(
         self,
@@ -839,6 +860,16 @@ class GcsBucketBackend:
         if not isinstance(uniform_access, bool):
             raise ValueError("uniform_access must be a boolean")
 
+        enforce_gcs_access(
+            f"gs://{norm_bucket}",
+            operation="gcs_backend.create_bucket",
+            bucket_location=BucketLocation(
+                bucket=norm_bucket,
+                location=norm_location,
+                location_type=_infer_location_type(norm_location),
+            ),
+        )
+
         query = urlencode({"project": norm_project})
         url = f"{_GCS_API_ROOT}/b?{query}"
         request_body = json.dumps(
@@ -852,12 +883,13 @@ class GcsBucketBackend:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        status, _, payload = self._authed_request(
-            "POST",
-            url,
-            extra_headers={"Content-Type": "application/json"},
-            body=request_body,
-        )
+        with _bypass_region_guard():
+            status, _, payload = self._authed_request(
+                "POST",
+                url,
+                extra_headers={"Content-Type": "application/json"},
+                body=request_body,
+            )
         if status in {200, 201}:
             return _parse_bucket_info(norm_bucket, payload, created=True)
         if status == 409:
@@ -896,6 +928,19 @@ def _parse_bucket_info(expected_name: str, payload: bytes, *, created: bool) -> 
         ubla = iam.get("uniformBucketLevelAccess")
         if isinstance(ubla, dict) and isinstance(ubla.get("enabled"), bool):
             ubla_enabled = ubla["enabled"]
+    data_locations: tuple[str, ...] = ()
+    custom_placement = decoded.get("customPlacementConfig")
+    if isinstance(custom_placement, dict):
+        raw_data_locations = custom_placement.get("dataLocations")
+        if isinstance(raw_data_locations, (list, tuple)):
+            data_locations = tuple(
+                item.strip().lower() for item in raw_data_locations if isinstance(item, str) and item.strip()
+            )
+    raw_location_type = decoded.get("locationType")
+    if isinstance(raw_location_type, str) and raw_location_type.strip():
+        location_type = raw_location_type.strip().lower()
+    else:
+        location_type = _infer_location_type(norm_location, data_locations)
     return BucketInfo(
         name=norm_name,
         location=norm_location,
@@ -903,6 +948,8 @@ def _parse_bucket_info(expected_name: str, payload: bytes, *, created: bool) -> 
         storage_class=str(storage_class) if isinstance(storage_class, str) else "STANDARD",
         uniform_access=ubla_enabled,
         created=created,
+        location_type=location_type,
+        data_locations=data_locations,
     )
 
 

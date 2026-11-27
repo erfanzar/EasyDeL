@@ -664,6 +664,9 @@ def build_native_worker_startup_script(
             'print(module.__file__)")',
             f'install -m 0644 "${{distributed_environment_module}}" '
             f"{multihost_site_directory}/eyvan_distributed_environment.py",
+            f'region_guard_module=$({venv_python} -c "import eyvan.storage._region_guard as module; '
+            'print(module.__file__)")',
+            f'install -m 0644 "${{region_guard_module}}" {multihost_site_directory}/eyvan_region_guard.py',
             f"cat >{multihost_site_directory}/sitecustomize.py <<'EYVAN_MULTIHOST_SITECUSTOMIZE'",
             # Scrub-then-initialize lives in eyvan_multihost.initialize_worker_runtime,
             # not here: ordering expressed in a heredoc can only be asserted as a

@@ -40,6 +40,7 @@ DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES = frozenset(
     {
         "EYVAN_DISTRIBUTED_PROCESS_COUNT",
         "EYVAN_DISTRIBUTED_PROCESS_ID",
+        "EYVAN_HOST_REGION",
         "EYVAN_JAX_CLUSTER_DETECTION",
         "EYVAN_JAX_MULTIHOST",
         "EYVAN_REPLICA_COUNT",
@@ -113,9 +114,11 @@ RUNTIME_OWNED_ENVIRONMENT_NAMES = frozenset(
 
 
 def is_distributed_topology_environment_name(name: str) -> bool:
-    """Return whether Eyvan, JAX, or GCP owns a topology variable."""
+    """Return whether Eyvan, JAX, or GCP owns a topology or locality-policy variable."""
 
-    return name in DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES or name.startswith(("EYVAN_JAX_", "MEGASCALE_"))
+    return name in DISTRIBUTED_TOPOLOGY_ENVIRONMENT_NAMES or name.startswith(
+        ("EYVAN_CROSS_REGION_", "EYVAN_JAX_", "MEGASCALE_")
+    )
 
 
 def is_runtime_owned_environment_name(name: str) -> bool:

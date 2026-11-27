@@ -37,6 +37,11 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
+from eyvan.storage._region_guard import (
+    CROSS_REGION_TRANSFER_BANNED_EXIT_CODE,
+    CROSS_REGION_TRANSFER_BANNED_MARKER,
+    CROSS_REGION_TRANSFER_BANNED_REASON,
+)
 from eyvan.worker.runtime.log_records import LogPage, LogRecord
 from eyvan.worker.runtime.preemption import (
     CHECKPOINT_RECEIPT_PATH_ENV,
@@ -46,6 +51,43 @@ from eyvan.worker.runtime.preemption import (
 
 _LOCAL_LOG_CURSOR = re.compile(r"^b(0|[1-9][0-9]*)$")
 _LOCAL_LOG_PAGE_MAX_BYTES = 8 * 1024 * 1024
+_CROSS_REGION_BAN_LOG_TAIL_BYTES = 64 * 1024
+_CROSS_REGION_BAN_DETAIL_LIMIT = 400
+
+
+def _extract_cross_region_ban_detail(log_path: Path | None) -> str | None:
+    """Read the tail of a local workload log and extract the cross-region ban marker detail."""
+
+    if log_path is None:
+        return None
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - _CROSS_REGION_BAN_LOG_TAIL_BYTES))
+            tail = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        idx = line.find(CROSS_REGION_TRANSFER_BANNED_MARKER)
+        if idx != -1:
+            detail = line[idx + len(CROSS_REGION_TRANSFER_BANNED_MARKER) :].strip()
+            detail = detail.replace("\r", " ").replace("\n", " ")[:_CROSS_REGION_BAN_DETAIL_LIMIT]
+            return detail or CROSS_REGION_TRANSFER_BANNED_MARKER
+    return None
+
+
+def _format_cross_region_ban_message(log_path: Path | None) -> str:
+    """Render the canonical terminal failure message for exit code 95."""
+
+    detail = _extract_cross_region_ban_detail(log_path)
+    if detail:
+        return f"{CROSS_REGION_TRANSFER_BANNED_REASON}: {detail}"
+    return (
+        f"{CROSS_REGION_TRANSFER_BANNED_REASON}: workload terminated with exit code "
+        f"{CROSS_REGION_TRANSFER_BANNED_EXIT_CODE}"
+    )
+
 
 _TERMINAL_STATES = frozenset(
     {
@@ -1010,7 +1052,7 @@ class LocalProcessExecutor:
     def status(self, remote_id: str) -> ExecutionWorkloadObservation:
         """Return a canonical status derived from durable worker state."""
 
-        record_path, _log_path, owner_path = self._paths(remote_id)
+        record_path, log_path, owner_path = self._paths(remote_id)
         record = self._normalize_abandoned(remote_id, record_path, owner_path)
         if record is None:
             return ExecutionWorkloadObservation(
@@ -1021,10 +1063,19 @@ class LocalProcessExecutor:
         status = _persisted_status(remote_id, record)
         if status in _TERMINAL_STATES:
             self._release_worker_process(remote_id)
+        message = _persisted_message(remote_id, record)
+        if (
+            status is ExecutionWorkloadStatus.FAILED
+            and record.get("exit_code") == CROSS_REGION_TRANSFER_BANNED_EXIT_CODE
+            and not message.startswith(f"{CROSS_REGION_TRANSFER_BANNED_REASON}:")
+        ):
+            raw_log = record.get("log_path")
+            resolved_log = Path(raw_log) if isinstance(raw_log, str) and raw_log.strip() else log_path
+            message = _format_cross_region_ban_message(resolved_log)
         return ExecutionWorkloadObservation(
             remote_id=remote_id,
             status=status,
-            message=_persisted_message(remote_id, record),
+            message=message,
         )
 
     def stop(self, remote_id: str, context: MutationContext) -> None:

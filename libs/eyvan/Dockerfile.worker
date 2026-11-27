@@ -59,6 +59,8 @@ RUN uv pip install --no-build-isolation --no-deps ./src && \
         /opt/eyvan-native/multihost/eyvan_multihost.py && \
     install -m 0644 "$(python -c 'import eyvan.worker.distributed_environment as m; print(m.__file__)')" \
         /opt/eyvan-native/multihost/eyvan_distributed_environment.py && \
+    install -m 0644 "$(python -c 'import eyvan.storage._region_guard as m; print(m.__file__)')" \
+        /opt/eyvan-native/multihost/eyvan_region_guard.py && \
     printf '%s\n\n%s\n' 'from eyvan_multihost import initialize_worker_runtime' \
         'initialize_worker_runtime()' >/opt/eyvan-native/multihost/sitecustomize.py && \
     chmod 0644 /opt/eyvan-native/multihost/sitecustomize.py
