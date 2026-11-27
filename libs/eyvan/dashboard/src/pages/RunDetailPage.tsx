@@ -3,13 +3,25 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { ArrowLeft, ChevronsDownUp, ChevronsUpDown, Columns2, Columns3, RefreshCw, Search, X } from "lucide-react";
+import {
+  ArrowLeft,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  Columns2,
+  Columns3,
+  GitCompareArrows,
+  RefreshCw,
+  Search,
+  Star,
+  X,
+} from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ApiError } from "../api/client";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorCard } from "../components/ErrorCard";
 import { MetricGroupSection, resolveVisibleGroupKeys } from "../components/MetricGroupSection";
 import { LoadingState } from "../components/PageState";
+import { TeamNotesPanel } from "../components/TeamNotesPanel";
 import { TrackingState } from "../components/TrackingState";
 import {
   filterMetricGroups,
@@ -20,13 +32,24 @@ import {
 } from "../lib/metricGrouping";
 import { useVisibilityPolling } from "../lib/useVisibilityPolling";
 import { navigate, type RunTab } from "../routing";
-import type { RunDetail, RunSeries, RunSeriesOptions, RunSeriesResponse } from "../types";
+import type {
+  CollaborationNote,
+  CollaborationNoteInput,
+  ExperimentRecord,
+  RunCollaborationOverlay,
+  RunDetail,
+  RunSeries,
+  RunSeriesOptions,
+  RunSeriesResponse,
+  RunSharingPatch,
+  RunVisibility,
+} from "../types";
 import { RunCompletions, type CompletionLoaders } from "./RunCompletions";
 import { RunEpisodes, type EpisodeLoaders } from "./RunEpisodes";
 import { RunHistograms, type HistogramLoader } from "./RunHistograms";
 import { RunMedia, type MediaLoaders } from "./RunMedia";
 import { RunRollouts, type RolloutLoaders } from "./RunRollouts";
-import { RunStatusBadge } from "./RunsPage";
+import { RunStatusBadge, RunVisibilityBadge } from "./RunsPage";
 
 interface RunDetailPageProps
   extends Partial<EpisodeLoaders>,
@@ -41,6 +64,16 @@ interface RunDetailPageProps
   loadSeries: (runId: string, options: RunSeriesOptions, signal: AbortSignal) => Promise<RunSeriesResponse>;
   onBack: () => void;
   onOpenWorkload: (workloadId: string) => void;
+  currentSubject?: string | null;
+  canAdminister?: boolean;
+  loadExperiments?: (signal: AbortSignal) => Promise<ExperimentRecord[]>;
+  onUpdateRunSharing?: (runId: string, patch: RunSharingPatch) => Promise<RunCollaborationOverlay>;
+  onCompareWith?: (runIds: string[]) => void;
+  onOpenExperiment?: (experimentId: string) => void;
+  loadNotes?: (targetType: "run" | "experiment", targetId: string, signal: AbortSignal) => Promise<CollaborationNote[]>;
+  onCreateNote?: (input: CollaborationNoteInput) => Promise<CollaborationNote>;
+  onDeleteNote?: (noteId: string) => Promise<void>;
+  onNotify?: (message: string) => void;
   refreshRevision?: number;
 }
 
@@ -134,10 +167,24 @@ export function RunDetailPage({
   loadBlob,
   onBack,
   onOpenWorkload,
+  currentSubject,
+  canAdminister = false,
+  loadExperiments,
+  onUpdateRunSharing,
+  onCompareWith,
+  onOpenExperiment,
+  loadNotes,
+  onCreateNote,
+  onDeleteNote,
+  onNotify,
   refreshRevision = 0,
 }: RunDetailPageProps) {
   const tabId = useId();
   const [run, setRun] = useState<RunDetail | null>(null);
+  const [experiments, setExperiments] = useState<ExperimentRecord[]>([]);
+  const [sharedWithInput, setSharedWithInput] = useState("");
+  const [sharingBusy, setSharingBusy] = useState(false);
+  const [sharingError, setSharingError] = useState<string | null>(null);
   const [error, setError] = useState<{ runId: string; error: Error } | null>(null);
   const [seriesError, setSeriesError] = useState<{ scopeKey: string; error: Error } | null>(null);
   const [revision, setRevision] = useState(0);
@@ -176,6 +223,7 @@ export function RunDetailPage({
       .then((value) => {
         if (!controller.signal.aborted) {
           setRun(value);
+          setSharedWithInput((value.shared_with ?? []).join(", "));
           setError(null);
         }
       })
@@ -185,6 +233,19 @@ export function RunDetailPage({
       });
     return () => controller.abort();
   }, [runId, loadRun, revision, refreshRevision]);
+
+  useEffect(() => {
+    if (!loadExperiments) return;
+    const controller = new AbortController();
+    loadExperiments(controller.signal)
+      .then((items) => {
+        if (!controller.signal.aborted) setExperiments(items);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setExperiments([]);
+      });
+    return () => controller.abort();
+  }, [loadExperiments, refreshRevision]);
 
   const allGroups = useMemo(() => (activeRun ? groupMetricKeys(activeRun.keys) : []), [activeRun]);
   const filteredGroups = useMemo(() => filterMetricGroups(allGroups, metricSearch), [allGroups, metricSearch]);
@@ -441,6 +502,218 @@ export function RunDetailPage({
           )}
         </div>
       </section>
+
+      {(onUpdateRunSharing || onCompareWith || activeRun.owner || activeRun.visibility || activeRun.experiment) && (
+        <section className="panel collab-sharing-bar" aria-label="Run collaboration and sharing">
+          <div className="collab-sharing-items">
+            <div className="collab-sharing-item">
+              <span className="collab-sharing-label">Researcher</span>
+              {activeRun.owner ? (
+                <span className="collab-owner-pill">{activeRun.owner}</span>
+              ) : (
+                <span className="muted">—</span>
+              )}
+            </div>
+
+            <div className="collab-sharing-item">
+              <span className="collab-sharing-label">Visibility</span>
+              {onUpdateRunSharing &&
+              (canAdminister || !activeRun.owner || !currentSubject || activeRun.owner === currentSubject) ? (
+                <label className="select-field collab-compact-select">
+                  <span className="sr-only">Run visibility</span>
+                  <select
+                    aria-label="Run visibility"
+                    value={activeRun.visibility ?? "team"}
+                    disabled={sharingBusy}
+                    onChange={async (event) => {
+                      const nextVis = event.target.value as RunVisibility;
+                      setSharingBusy(true);
+                      setSharingError(null);
+                      try {
+                        const updated = await onUpdateRunSharing(activeRun.run_id, { visibility: nextVis });
+                        setRun((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                visibility: updated.visibility,
+                                shared_with: updated.shared_with,
+                              }
+                            : prev,
+                        );
+                        onNotify?.(`Visibility set to ${updated.visibility}`);
+                      } catch (err) {
+                        setSharingError(err instanceof Error ? err.message : "Unable to update visibility");
+                      } finally {
+                        setSharingBusy(false);
+                      }
+                    }}
+                  >
+                    <option value="team">Team</option>
+                    <option value="shared">Shared</option>
+                    <option value="private">Private</option>
+                  </select>
+                </label>
+              ) : (
+                <RunVisibilityBadge visibility={activeRun.visibility} sharedWith={activeRun.shared_with} />
+              )}
+            </div>
+
+            {(activeRun.visibility === "shared" || (activeRun.shared_with?.length ?? 0) > 0) &&
+              onUpdateRunSharing &&
+              (canAdminister || !activeRun.owner || !currentSubject || activeRun.owner === currentSubject) && (
+                <form
+                  className="collab-sharing-item collab-shared-with-form"
+                  onSubmit={async (event) => {
+                    event.preventDefault();
+                    const subjects = sharedWithInput
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    setSharingBusy(true);
+                    setSharingError(null);
+                    try {
+                      const updated = await onUpdateRunSharing(activeRun.run_id, {
+                        visibility: "shared",
+                        shared_with: subjects,
+                      });
+                      setRun((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              visibility: updated.visibility,
+                              shared_with: updated.shared_with,
+                            }
+                          : prev,
+                      );
+                      setSharedWithInput(updated.shared_with.join(", "));
+                      onNotify?.("Shared collaborators updated");
+                    } catch (err) {
+                      setSharingError(err instanceof Error ? err.message : "Unable to update shared collaborators");
+                    } finally {
+                      setSharingBusy(false);
+                    }
+                  }}
+                >
+                  <label className="collab-inline-field">
+                    <span>Shared with</span>
+                    <input
+                      type="text"
+                      aria-label="Shared with subjects"
+                      placeholder="alice, bob"
+                      value={sharedWithInput}
+                      disabled={sharingBusy}
+                      onChange={(event) => setSharedWithInput(event.target.value)}
+                    />
+                  </label>
+                  <button type="submit" className="button button-secondary" disabled={sharingBusy}>
+                    Save
+                  </button>
+                </form>
+              )}
+
+            {(experiments.length > 0 || activeRun.experiment) && (
+              <div className="collab-sharing-item">
+                <span className="collab-sharing-label">Experiment</span>
+                {onUpdateRunSharing &&
+                experiments.length > 0 &&
+                (canAdminister || !activeRun.owner || !currentSubject || activeRun.owner === currentSubject) ? (
+                  <label className="select-field collab-compact-select">
+                    <span className="sr-only">Linked experiment</span>
+                    <select
+                      aria-label="Linked experiment"
+                      value={activeRun.experiment_id ?? ""}
+                      disabled={sharingBusy}
+                      onChange={async (event) => {
+                        const nextExpId = event.target.value || null;
+                        setSharingBusy(true);
+                        setSharingError(null);
+                        try {
+                          const updated = await onUpdateRunSharing(activeRun.run_id, { experiment_id: nextExpId });
+                          const linked = experiments.find((item) => item.id === updated.experiment_id);
+                          setRun((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  experiment_id: updated.experiment_id,
+                                  experiment: linked?.name ?? null,
+                                }
+                              : prev,
+                          );
+                          onNotify?.(linked ? `Linked to ${linked.name}` : "Unlinked from experiment");
+                        } catch (err) {
+                          setSharingError(err instanceof Error ? err.message : "Unable to link experiment");
+                        } finally {
+                          setSharingBusy(false);
+                        }
+                      }}
+                    >
+                      <option value="">None</option>
+                      {experiments.map((exp) => (
+                        <option key={exp.id} value={exp.id}>
+                          {exp.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : activeRun.experiment && activeRun.experiment_id && onOpenExperiment ? (
+                  <button
+                    type="button"
+                    className="collab-exp-chip"
+                    onClick={() => onOpenExperiment(activeRun.experiment_id!)}
+                  >
+                    {activeRun.experiment}
+                  </button>
+                ) : (
+                  <span className="collab-exp-chip">{activeRun.experiment ?? "—"}</span>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="collab-sharing-actions">
+            {onUpdateRunSharing &&
+              (canAdminister || !activeRun.owner || !currentSubject || activeRun.owner === currentSubject) && (
+                <button
+                  type="button"
+                  className={`button button-secondary${activeRun.pinned ? " collab-pin-active" : ""}`}
+                  aria-pressed={Boolean(activeRun.pinned)}
+                  disabled={sharingBusy}
+                  onClick={async () => {
+                    setSharingBusy(true);
+                    setSharingError(null);
+                    try {
+                      const updated = await onUpdateRunSharing(activeRun.run_id, { pinned: !activeRun.pinned });
+                      setRun((prev) => (prev ? { ...prev, pinned: updated.pinned } : prev));
+                      onNotify?.(updated.pinned ? "Pinned as baseline" : "Unpinned baseline");
+                    } catch (err) {
+                      setSharingError(err instanceof Error ? err.message : "Unable to update pin state");
+                    } finally {
+                      setSharingBusy(false);
+                    }
+                  }}
+                >
+                  <Star size={12} fill={activeRun.pinned ? "currentColor" : "none"} aria-hidden="true" />
+                  {activeRun.pinned ? "Pinned baseline" : "Pin baseline"}
+                </button>
+              )}
+            {onCompareWith && (
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => onCompareWith([activeRun.run_id])}
+              >
+                <GitCompareArrows size={13} aria-hidden="true" />
+                Compare with…
+              </button>
+            )}
+          </div>
+          {sharingError && (
+            <div className="form-error collab-sharing-error" role="alert">
+              {sharingError}
+            </div>
+          )}
+        </section>
+      )}
       <div className="tabs run-tabs" role="tablist" aria-label="Run views">
         {tabs.map((value, index) => (
           <button
@@ -718,6 +991,21 @@ export function RunDetailPage({
                   </p>
                 ))}
               </section>
+            )}
+            {loadNotes && (
+              <TeamNotesPanel
+                targetType="run"
+                targetId={activeRun.run_id}
+                loadNotes={loadNotes}
+                onCreateNote={onCreateNote}
+                onDeleteNote={onDeleteNote}
+                currentSubject={currentSubject}
+                canAdminister={canAdminister}
+                availableMetrics={activeRun.keys}
+                collapsible
+                defaultOpen={(activeRun.notes_count ?? 0) > 0}
+                refreshRevision={effectiveRevision}
+              />
             )}
           </>
         )}

@@ -8,11 +8,12 @@ import { useEffect, useState } from "react";
 
 import { ErrorCard } from "../components/ErrorCard";
 import { AssistantProvidersSettings, type AssistantSettingsClient } from "./AssistantProvidersSettings";
+import { GovernanceSettingsCard, type GovernanceSettingsClient } from "./GovernanceSettingsCard";
 import { StorageTrackingSettings, type StorageSettingsClient } from "./StorageTrackingSettings";
 import { UsersPage, type TeamClient } from "./UsersPage";
 
 interface SettingsPageProps {
-  client: TeamClient & AssistantSettingsClient & StorageSettingsClient;
+  client: TeamClient & AssistantSettingsClient & StorageSettingsClient & GovernanceSettingsClient;
   /** Accounts, invites and tokens exist only on a team-mode plane. */
   teamMode: boolean;
   /** Fleet admins configure the assistant's providers. */
@@ -107,6 +108,14 @@ export function SettingsPage({
       )}
       {canManageFleet && (
         <AssistantProvidersSettings client={client} onChanged={onProvidersChanged} assignLocation={assignLocation} />
+      )}
+      {canManageFleet && (client.listWebhooks || client.listProjects || client.listRoleGrants) && (
+        <GovernanceSettingsCard
+          client={client}
+          defaultOrg={defaultOrg}
+          defaultProject={defaultProject}
+          onNotify={onNotify}
+        />
       )}
       {teamMode && (
         <UsersPage

@@ -7,6 +7,7 @@ export type Section =
   | "overview"
   | "workloads"
   | "runs"
+  | "experiments"
   | "research"
   | "fleet"
   | "capacity"
@@ -21,7 +22,9 @@ export type RunTab = "charts" | "episodes" | "histograms" | "rollouts" | "comple
 export type Route =
   | { section: Section }
   | { section: "workloads"; workloadId: string }
+  | { section: "runs"; compareIds: string[] }
   | { section: "runs"; runId: string; tab?: RunTab }
+  | { section: "experiments"; experimentId: string }
   | { section: "research"; planId: string };
 
 export type SectionAvailability = Partial<Record<Section, boolean>>;
@@ -33,9 +36,41 @@ export function accessibleRoute(route: Route, availability: SectionAvailability)
 
 export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
   // A query after the route (`#/settings?assistant=...`) is a notice for the
-  // page, never part of the route itself.
-  const path = hash.replace(/^#\/?/, "").split("?")[0];
+  // page, never part of the route itself, except `#/runs/compare?ids=...`.
+  const raw = hash.replace(/^#\/?/, "");
+  const queryIdx = raw.indexOf("?");
+  const path = queryIdx === -1 ? raw : raw.slice(0, queryIdx);
+  const query = queryIdx === -1 ? "" : raw.slice(queryIdx + 1);
   const [section, id, tab] = path.split("/");
+  if (section === "runs" && id === "compare") {
+    const params = new URLSearchParams(query);
+    const idsParam = params.get("ids") ?? "";
+    const compareIds = [
+      ...new Set(
+        idsParam
+          .split(",")
+          .map((item) => {
+            const trimmed = item.trim();
+            if (!trimmed) return "";
+            try {
+              return decodeURIComponent(trimmed);
+            } catch {
+              return trimmed;
+            }
+          })
+          .filter(Boolean),
+      ),
+    ];
+    return { section: "runs", compareIds };
+  }
+  if (section === "experiments" && id) {
+    try {
+      return { section: "experiments", experimentId: decodeURIComponent(id) };
+    } catch (error) {
+      if (!(error instanceof URIError)) throw error;
+      return { section: "experiments" };
+    }
+  }
   if (section === "research" && id) {
     try {
       return { section: "research", planId: decodeURIComponent(id) };
@@ -75,6 +110,7 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
     [
       "workloads",
       "runs",
+      "experiments",
       "research",
       "fleet",
       "capacity",
@@ -93,9 +129,16 @@ export function parseRoute(hash = globalThis.location?.hash ?? ""): Route {
 }
 
 export function routeHash(route: Route): string {
+  if ("compareIds" in route) {
+    const ids = route.compareIds.map((id) => encodeURIComponent(id)).join(",");
+    return ids ? `#/runs/compare?ids=${ids}` : "#/runs/compare";
+  }
   if ("runId" in route) {
     const suffix = route.tab && route.tab !== "charts" ? `/${route.tab}` : "";
     return `#/runs/${encodeURIComponent(route.runId)}${suffix}`;
+  }
+  if ("experimentId" in route) {
+    return `#/experiments/${encodeURIComponent(route.experimentId)}`;
   }
   if ("workloadId" in route) {
     return `#/workloads/${encodeURIComponent(route.workloadId)}`;

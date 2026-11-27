@@ -463,6 +463,12 @@ export interface AssistantConversation {
 
 export type RunStatus = "running" | "finished" | "failed" | "crashed" | "cancelled" | "killed" | "aborted" | "unknown";
 
+export type RunVisibility = "private" | "shared" | "team";
+
+export type ExperimentKind = "experiment" | "speedrun";
+
+export type ExperimentGoal = "min" | "max";
+
 /** Tracker wire types intentionally retain the store's snake_case field names. */
 export interface RunSummary {
   run_id: string;
@@ -479,6 +485,210 @@ export interface RunSummary {
   last_step: number | null;
   keys_count: number;
   summary: Record<string, unknown>;
+  /** Additive collaboration & metric breakdown fields from newer control planes/trackers. */
+  owner?: string | null;
+  visibility?: RunVisibility;
+  shared_with?: string[];
+  experiment_id?: string | null;
+  experiment?: string | null;
+  pinned?: boolean;
+  notes_count?: number;
+  duration_s?: number | null;
+  latest_metrics?: Record<string, number>;
+}
+
+export interface RunCollaborationOverlay {
+  org_id: string;
+  project_id: string;
+  run_id: string;
+  owner?: string | null;
+  visibility: RunVisibility;
+  shared_with: string[];
+  experiment_id: string | null;
+  pinned: boolean;
+  updated_at: string;
+  updated_by: string;
+}
+
+export interface RunSharingPatch {
+  visibility?: RunVisibility;
+  shared_with?: string[];
+  experiment_id?: string | null;
+  pinned?: boolean;
+  owner?: string | null;
+}
+
+export interface RunCompareInput {
+  runIds: string[];
+  keys?: string[];
+  x?: string;
+  points?: number;
+}
+
+export interface RunCompareSeriesData {
+  x: number[];
+  y: Array<number | null>;
+  min?: Array<number | null>;
+  max?: Array<number | null>;
+}
+
+export interface RunCompareConfigDiffRow {
+  key: string;
+  values: Record<string, unknown>;
+  differs: boolean;
+}
+
+export interface RunCompareMetricSummaryValue {
+  latest: number | null;
+  min: number | null;
+  max: number | null;
+  last_step: number | null;
+}
+
+export interface RunCompareMetricSummaryRow {
+  key: string;
+  values: Record<string, RunCompareMetricSummaryValue>;
+}
+
+export interface RunCompareResponse {
+  org_id: string;
+  project_id: string;
+  x: string;
+  runs: RunDetail[];
+  common_keys: string[];
+  all_keys: string[];
+  selected_keys: string[];
+  series_by_key: Record<string, Record<string, RunCompareSeriesData>>;
+  config_diff: RunCompareConfigDiffRow[];
+  metric_summary: RunCompareMetricSummaryRow[];
+}
+
+export interface ExperimentRecord {
+  id: string;
+  org_id: string;
+  project_id: string;
+  name: string;
+  subject: string;
+  kind: ExperimentKind;
+  description: string;
+  metric_key: string | null;
+  goal: ExperimentGoal;
+  target_value: number | null;
+  group_filter: string | null;
+  tag_filter: string[];
+  visibility: RunVisibility;
+  shared_with: string[];
+  owner: string;
+  pinned_baseline_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+  notes_count?: number;
+  run_count?: number;
+  running_count?: number;
+  leader_run_id?: string | null;
+  leader_owner?: string | null;
+  leader_value?: number | null;
+}
+
+export interface ExperimentCreateInput {
+  name: string;
+  subject?: string;
+  kind?: ExperimentKind;
+  description?: string;
+  metric_key?: string | null;
+  goal?: ExperimentGoal;
+  target_value?: number | null;
+  group_filter?: string | null;
+  tag_filter?: string[];
+  visibility?: RunVisibility;
+  shared_with?: string[];
+  pinned_baseline_run_id?: string | null;
+}
+
+export type ExperimentUpdatePatch = Partial<ExperimentCreateInput>;
+
+export interface ExperimentLeaderboardEntry {
+  rank: number;
+  run_id: string;
+  name: string;
+  owner: string | null;
+  status: RunStatus | string;
+  visibility?: RunVisibility;
+  pinned?: boolean;
+  is_baseline?: boolean;
+  is_record: boolean;
+  best_value: number | null;
+  latest_value: number | null;
+  delta_vs_baseline: number | null;
+  reached_target: boolean;
+  steps_to_target: number | null;
+  time_to_target_s: number | null;
+  last_step: number | null;
+  duration_s: number | null;
+  updated_at: number;
+  tags?: string[];
+  group?: string | null;
+}
+
+export interface ExperimentResearcherBreakdown {
+  owner: string;
+  run_count: number;
+  best_value: number | null;
+  reached_target_count: number;
+  running_count: number;
+}
+
+export interface ExperimentLeaderboardResponse {
+  experiment: ExperimentRecord;
+  metric_key: string | null;
+  goal: ExperimentGoal;
+  target_value: number | null;
+  baseline_run_id: string | null;
+  baseline_value: number | null;
+  tracker_available: boolean;
+  entries: ExperimentLeaderboardEntry[];
+  researcher_breakdown: ExperimentResearcherBreakdown[];
+  notes_count: number;
+}
+
+export interface CollaborationNote {
+  id: string;
+  org_id: string;
+  project_id: string;
+  target_type: "run" | "experiment";
+  target_id: string;
+  author: string;
+  body: string;
+  metric_ref: string | null;
+  step_ref: number | null;
+  created_at: string;
+}
+
+export interface CollaborationNoteInput {
+  target_type: "run" | "experiment";
+  target_id: string;
+  body: string;
+  metric_ref?: string | null;
+  step_ref?: number | null;
+}
+
+export interface CollaborationResearcherSummary {
+  owner: string;
+  total_runs: number;
+  running_runs: number;
+  shared_runs: number;
+  last_active_at: number | null;
+}
+
+export interface CollaborationFeedResponse {
+  org_id?: string;
+  project_id?: string;
+  tracker_available: boolean;
+  active_runs: RunSummary[];
+  recent_runs: RunSummary[];
+  experiments: ExperimentRecord[];
+  recent_notes: CollaborationNote[];
+  researchers: CollaborationResearcherSummary[];
 }
 
 export interface RunDetail extends RunSummary {
@@ -1116,6 +1326,18 @@ export interface Budget {
   forecast?: number;
   period: string;
   enforcement: "hard" | "soft";
+  alertThresholds?: number[];
+  acceleratorHourLimits?: Record<string, number>;
+}
+
+export interface BudgetPutInput {
+  orgId: string;
+  projectId: string;
+  limit: number;
+  period: string;
+  hardLimit: boolean;
+  alertThresholds?: number[];
+  acceleratorHourLimits?: Record<string, number>;
 }
 
 export type CrossRegionTransferPolicy = "allow" | "warn" | "ban";
@@ -1154,6 +1376,12 @@ export interface PolicyUpdatePatch {
   crossRegionTransferPolicy?: CrossRegionTransferPolicy;
   crossRegionAllowedBuckets?: string[];
   crossRegionAllowMultiregion?: boolean;
+  allowedProviders?: string[];
+  allowedRegions?: string[];
+  allowedCapacityClasses?: string[];
+  deniedAcceleratorTypes?: string[];
+  allowedSecretReferences?: string[];
+  maxPriority?: number;
 }
 
 export interface SchedulingPolicy {
@@ -1464,6 +1692,108 @@ export interface StorageStatus {
   monitoring: StorageMonitoringBucket | null;
   regional: Record<string, StorageRegionalBucket>;
   context: StorageGcpContext;
+}
+
+export interface StorageRegionCheckInput {
+  uri: string;
+  region?: string;
+  strict?: boolean;
+  allowed_buckets?: string[];
+}
+
+export interface StorageRegionCheckResult {
+  uri: string;
+  bucket: string;
+  host_region: string;
+  bucket_location: string | null;
+  location_type: string | null;
+  allowed: boolean;
+  allowlisted: boolean;
+  reason: string;
+}
+
+export interface WebhookSubscription {
+  id: string;
+  org_id: string;
+  project_id: string;
+  url: string;
+  secret?: string;
+  entity_types: string[];
+  actions: string[];
+  enabled?: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface WebhookCreateInput {
+  url: string;
+  secret: string;
+  entity_types?: string[];
+  actions?: string[];
+}
+
+export interface ManagedArtifact {
+  uri: string;
+  kind: string;
+  org_id: string;
+  project_id: string;
+  state: string;
+  record_generation: number;
+  size_bytes: number;
+  sha256: string | null;
+  object_version: string | null;
+  created_at: string;
+  updated_at: string;
+  quarantine_reason?: string | null;
+}
+
+export interface ProjectRecord {
+  org_id: string;
+  id: string;
+  display_name: string;
+  owner: string;
+  labels?: Record<string, string>;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+  created_by?: string;
+}
+
+export interface ProjectRegisterInput {
+  orgId: string;
+  projectId: string;
+  displayName: string;
+  owner: string;
+  enabled?: boolean;
+  labels?: Record<string, string>;
+}
+
+export interface DurableRoleGrant {
+  subject: string;
+  grant: {
+    role: string;
+    org_id: string | null;
+    project_id: string | null;
+  };
+  expires_at?: string | null;
+  reason?: string;
+  granted_by?: string;
+  granted_at?: string;
+}
+
+export interface RoleGrantIssueInput {
+  subject: string;
+  role: string;
+  orgId?: string | null;
+  projectId?: string | null;
+  reason?: string;
+}
+
+export interface RoleGrantRevokeInput {
+  subject: string;
+  role: string;
+  orgId?: string;
+  projectId?: string;
 }
 
 /** A fleet's dashboard-managed bash init script, as the init-script route answers. */

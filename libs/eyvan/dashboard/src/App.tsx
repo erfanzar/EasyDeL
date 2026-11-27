@@ -33,8 +33,11 @@ import { AuditPage } from "./pages/AuditPage";
 import { BillingPage } from "./pages/BillingPage";
 import { BudgetsPage } from "./pages/BudgetsPage";
 import { CapacityPage } from "./pages/CapacityPage";
+import { ExperimentDetailPage } from "./pages/ExperimentDetailPage";
+import { ExperimentsPage } from "./pages/ExperimentsPage";
 import { FleetPage } from "./pages/FleetPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { RunComparePage } from "./pages/RunComparePage";
 import { RunsPage } from "./pages/RunsPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
 import { ResearchPage, ResearchPlanPage } from "./pages/ResearchPage";
@@ -46,9 +49,15 @@ import { WorkloadsPage } from "./pages/WorkloadsPage";
 import { accessibleRoute, navigate, parseRoute, type Route, type Section, type SectionAvailability } from "./routing";
 import type {
   AvailableShape,
+  BudgetPutInput,
+  CollaborationNoteInput,
   DashboardData,
   EffectiveProjectScope,
+  ExperimentCreateInput,
+  ExperimentUpdatePatch,
   PolicyUpdatePatch,
+  RunCompareInput,
+  RunSharingPatch,
   SchedulingPolicy,
   SessionAuthority,
   SessionPermission,
@@ -650,7 +659,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
 
   const sectionAvailability: SectionAvailability = {
     workloads: canReadSelectedScope || capabilities.submitWorkloads,
-    runs: canReadSelectedScope,
+    // Project submitters (--tier user) collaborate on runs and experiments in their project.
+    runs: canReadSelectedScope || capabilities.submitWorkloads,
+    experiments: canReadSelectedScope || capabilities.submitWorkloads,
     // A plan is approved by someone who may submit in its project.
     research: canReadSelectedScope || capabilities.submitWorkloads,
     budgets: canReadSelectedScope,
@@ -878,6 +889,49 @@ export default function App({ client = apiClient, identityProvider = currentIden
     await refreshFleet();
   };
 
+  const deleteCell = async (cellId: string) => {
+    if (!capabilitiesForResource(snapshotRef.current.authority, fleetScope.orgId, fleetScope.projectId).manageFleet) {
+      throw new ApiError("This session may not manage fleet capacity", 403);
+    }
+    await withAuthorityRefresh(() => client.deleteCell(cellId, scopeOperationAbortRef.current.signal));
+    await refreshFleet();
+  };
+
+  const saveBudget = async (input: BudgetPutInput) => {
+    const current = snapshotRef.current;
+    if (!current.selectedScope) throw new ApiError("No project scope is selected");
+    const immutableScope = scopeSnapshot(current.selectedScope);
+    const currentCapabilities = capabilitiesForResource(
+      current.authority,
+      immutableScope.orgId,
+      immutableScope.projectId,
+    );
+    if (!currentCapabilities.manageProject) throw new ApiError("This scope is read-only", 403);
+    const epoch = scopeEpochRef.current;
+    try {
+      const saved = await client.putBudget(
+        { ...input, orgId: immutableScope.orgId, projectId: immutableScope.projectId },
+        scopeOperationAbortRef.current.signal,
+      );
+      if (mutationIsCurrent(epoch, immutableScope)) {
+        updateSnapshot((latest) => ({
+          ...latest,
+          data: latest.data
+            ? {
+                ...latest.data,
+                budgets: [saved, ...latest.data.budgets.filter((item) => item.id !== saved.id)],
+              }
+            : latest.data,
+        }));
+        setToast({ message: `Budget saved for ${saved.owner}` });
+      }
+      return saved;
+    } catch (budgetError) {
+      await refreshAuthorityAfterForbidden(budgetError, mutationIsCurrent(epoch, immutableScope));
+      throw budgetError;
+    }
+  };
+
   const stopFleet = async (fleetName: string) => {
     // Same re-check as drainCell, for the same reason: authority is refreshed
     // on every sweep, and this one turns off a whole fleet rather than a cell.
@@ -910,7 +964,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
           data: latest.data
             ? {
                 ...latest.data,
-                policies: latest.data.policies.map((item) => (item.id === updated.id ? updated : item)),
+                policies: latest.data.policies.some((item) => item.id === updated.id)
+                  ? latest.data.policies.map((item) => (item.id === updated.id ? updated : item))
+                  : [...latest.data.policies, updated],
               }
             : latest.data,
         }));
@@ -1018,6 +1074,51 @@ export default function App({ client = apiClient, identityProvider = currentIden
   // Keep them in Runs instead of fencing otherwise valid plane authority.
   const loadRuns = useCallback(
     (signal: AbortSignal) => client.listRuns({}, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadCollaborationFeed = useCallback(
+    (signal: AbortSignal) => client.getCollaborationFeed(30, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const compareRuns = useCallback(
+    (input: RunCompareInput, signal: AbortSignal) => client.compareRuns(input, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const updateRunSharing = useCallback(
+    (runId: string, patch: RunSharingPatch) => client.updateRunSharing(runId, patch, fleetScope),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadExperiments = useCallback(
+    (signal: AbortSignal) => client.listExperiments({}, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const createExperiment = useCallback(
+    (input: ExperimentCreateInput) => client.createExperiment(input, fleetScope),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const updateExperiment = useCallback(
+    (expId: string, patch: ExperimentUpdatePatch) => client.updateExperiment(expId, patch, fleetScope),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const deleteExperiment = useCallback(
+    (expId: string) => client.deleteExperiment(expId, fleetScope),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadExperimentLeaderboard = useCallback(
+    (expId: string, signal: AbortSignal) => client.getExperimentLeaderboard(expId, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const loadNotes = useCallback(
+    (targetType: "run" | "experiment", targetId: string, signal: AbortSignal) =>
+      client.listNotes(targetType, targetId, fleetScope, signal),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const createNote = useCallback(
+    (input: CollaborationNoteInput) => client.createNote(input, fleetScope),
+    [client, fleetScope.orgId, fleetScope.projectId],
+  );
+  const deleteNote = useCallback(
+    (noteId: string) => client.deleteNote(noteId, fleetScope),
     [client, fleetScope.orgId, fleetScope.projectId],
   );
   // Research plans are owner-scoped rather than project-scoped: the route
@@ -1214,7 +1315,17 @@ export default function App({ client = apiClient, identityProvider = currentIden
     switch (activeRoute.section) {
       case "runs":
         content =
-          "runId" in activeRoute ? (
+          "compareIds" in activeRoute ? (
+            <RunComparePage
+              runIds={activeRoute.compareIds}
+              onChangeRunIds={(compareIds) => navigate({ section: "runs", compareIds })}
+              compareRuns={compareRuns}
+              loadRuns={loadRuns}
+              onBack={() => goToSection("runs")}
+              onOpenRun={(runId) => navigate({ section: "runs", runId })}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          ) : "runId" in activeRoute ? (
             <RunDetailPage
               key={activeRoute.runId}
               runId={activeRoute.runId}
@@ -1236,11 +1347,56 @@ export default function App({ client = apiClient, identityProvider = currentIden
               loadBlob={loadBlob}
               onBack={() => goToSection("runs")}
               onOpenWorkload={openWorkload}
+              currentSubject={authority?.subject}
+              canAdminister={capabilities.manageProject || capabilities.manageFleet}
+              loadExperiments={typeof client.listExperiments === "function" ? loadExperiments : undefined}
+              onUpdateRunSharing={typeof client.updateRunSharing === "function" ? updateRunSharing : undefined}
+              onCompareWith={(compareIds) => navigate({ section: "runs", compareIds })}
+              onOpenExperiment={(experimentId) => navigate({ section: "experiments", experimentId })}
+              loadNotes={typeof client.listNotes === "function" ? loadNotes : undefined}
+              onCreateNote={typeof client.createNote === "function" ? createNote : undefined}
+              onDeleteNote={typeof client.deleteNote === "function" ? deleteNote : undefined}
+              onNotify={(message) => setToast({ message })}
               refreshRevision={auxiliaryRefreshRevision}
             />
           ) : (
             <RunsPage
               loadRuns={loadRuns}
+              loadFeed={typeof client.getCollaborationFeed === "function" ? loadCollaborationFeed : undefined}
+              onOpenRun={(runId) => navigate({ section: "runs", runId })}
+              onCompareRuns={(compareIds) => navigate({ section: "runs", compareIds })}
+              onOpenExperiment={(experimentId) => navigate({ section: "experiments", experimentId })}
+              currentSubject={authority?.subject}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          );
+        break;
+      case "experiments":
+        content =
+          "experimentId" in activeRoute ? (
+            <ExperimentDetailPage
+              key={activeRoute.experimentId}
+              experimentId={activeRoute.experimentId}
+              loadLeaderboard={loadExperimentLeaderboard}
+              onUpdateExperiment={updateExperiment}
+              onDeleteExperiment={deleteExperiment}
+              loadNotes={loadNotes}
+              onCreateNote={createNote}
+              onDeleteNote={deleteNote}
+              onBack={() => goToSection("experiments")}
+              onOpenRun={(runId) => navigate({ section: "runs", runId })}
+              onCompareRuns={(compareIds) => navigate({ section: "runs", compareIds })}
+              currentSubject={authority?.subject}
+              canAdminister={capabilities.manageProject || capabilities.manageFleet}
+              onNotify={(message) => setToast({ message })}
+              refreshRevision={auxiliaryRefreshRevision}
+            />
+          ) : (
+            <ExperimentsPage
+              loadExperiments={loadExperiments}
+              loadFeed={typeof client.getCollaborationFeed === "function" ? loadCollaborationFeed : undefined}
+              onCreateExperiment={createExperiment}
+              onOpenExperiment={(experimentId) => navigate({ section: "experiments", experimentId })}
               onOpenRun={(runId) => navigate({ section: "runs", runId })}
               refreshRevision={auxiliaryRefreshRevision}
             />
@@ -1289,6 +1445,7 @@ export default function App({ client = apiClient, identityProvider = currentIden
             loadBilling={loadBilling}
             loadLaunchLatency={loadLaunchLatency}
             onDrainCell={capabilities.manageFleet ? drainCell : undefined}
+            onDeleteCell={capabilities.manageFleet ? deleteCell : undefined}
             onStopFleet={capabilities.manageFleet ? stopFleet : undefined}
             attachmentClient={
               capabilities.manageFleet && (client.forceDemo || localAttachmentsAvailable()) ? client : undefined
@@ -1327,6 +1484,9 @@ export default function App({ client = apiClient, identityProvider = currentIden
               updatePolicy(policy, { crossRegionTransferPolicy })
             }
             onPolicyUpdate={(policy, patch) => updatePolicy(policy, patch)}
+            onSaveBudget={saveBudget}
+            orgId={fleetScope.orgId}
+            projectId={fleetScope.projectId}
             canManageProject={capabilities.manageProject}
           />
         );

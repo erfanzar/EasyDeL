@@ -3,8 +3,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Edit3, Shield, ShieldAlert } from "lucide-react";
-import { useState } from "react";
+import { AlertCircle, Edit3, Plus, Shield, ShieldAlert, X } from "lucide-react";
+import { useEffect, useState, type FormEvent } from "react";
 
 import { EmptyState } from "../components/EmptyState";
 import { ErrorCard } from "../components/ErrorCard";
@@ -13,7 +13,7 @@ import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
 import { crossRegionPolicyLabel, normalizeCrossRegionTransferPolicy } from "../lib/crossRegionPolicy";
 import { formatDateTime, formatMoney, percent } from "../lib/format";
-import type { Budget, CrossRegionTransferPolicy, PolicyUpdatePatch, SchedulingPolicy } from "../types";
+import type { Budget, BudgetPutInput, CrossRegionTransferPolicy, PolicyUpdatePatch, SchedulingPolicy } from "../types";
 
 interface BudgetsPageProps {
   budgets: Budget[];
@@ -24,7 +24,476 @@ interface BudgetsPageProps {
     crossRegionTransferPolicy: CrossRegionTransferPolicy,
   ) => Promise<SchedulingPolicy>;
   onPolicyUpdate?: (policy: SchedulingPolicy, patch: PolicyUpdatePatch) => Promise<SchedulingPolicy>;
+  onSaveBudget?: (input: BudgetPutInput) => Promise<Budget>;
+  orgId?: string;
+  projectId?: string;
   canManageProject: boolean;
+}
+
+function splitCsv(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function formatHourLimits(limits?: Record<string, number>): string {
+  if (!limits) return "";
+  return Object.entries(limits)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(", ");
+}
+
+function parseHourLimits(raw: string): Record<string, number> | null {
+  const out: Record<string, number> = {};
+  const parts = splitCsv(raw);
+  for (const part of parts) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) return null;
+    const key = part.slice(0, eq).trim();
+    const num = Number(part.slice(eq + 1).trim());
+    if (!key || !Number.isFinite(num) || num < 0) return null;
+    out[key] = num;
+  }
+  return out;
+}
+
+interface BudgetModalProps {
+  open: boolean;
+  orgId: string;
+  projectId: string;
+  initial?: Budget | null;
+  onClose: () => void;
+  onSave: (input: BudgetPutInput) => Promise<void>;
+}
+
+function BudgetFormModal({ open, orgId, projectId, initial, onClose, onSave }: BudgetModalProps) {
+  const [limit, setLimit] = useState(initial ? String(initial.limit) : "10000");
+  const [period, setPeriod] = useState(
+    initial && ["monthly", "weekly", "daily"].includes(initial.period) ? initial.period : "monthly",
+  );
+  const [hardLimit, setHardLimit] = useState(initial ? initial.enforcement === "hard" : true);
+  const [thresholds, setThresholds] = useState(
+    initial?.alertThresholds?.length ? initial.alertThresholds.join(", ") : "0.5, 0.8, 0.95",
+  );
+  const [hourLimits, setHourLimits] = useState(formatHourLimits(initial?.acceleratorHourLimits));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setLimit(initial ? String(initial.limit) : "10000");
+    setPeriod(initial && ["monthly", "weekly", "daily"].includes(initial.period) ? initial.period : "monthly");
+    setHardLimit(initial ? initial.enforcement === "hard" : true);
+    setThresholds(initial?.alertThresholds?.length ? initial.alertThresholds.join(", ") : "0.5, 0.8, 0.95");
+    setHourLimits(formatHourLimits(initial?.acceleratorHourLimits));
+    setError(null);
+  }, [open, initial]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    globalThis.addEventListener("keydown", onKeyDown);
+    return () => globalThis.removeEventListener("keydown", onKeyDown);
+  }, [open, busy, onClose]);
+
+  if (!open) return null;
+
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    const parsedLimit = Number(limit);
+    if (!Number.isFinite(parsedLimit) || parsedLimit < 0) {
+      setError("Budget limit must be a non-negative number.");
+      return;
+    }
+    const parsedThresholds: number[] = [];
+    for (const token of splitCsv(thresholds)) {
+      const val = Number(token);
+      if (!Number.isFinite(val) || val <= 0 || val > 1) {
+        setError("Alert thresholds must be fractions in (0, 1], e.g. 0.5, 0.8, 0.95.");
+        return;
+      }
+      parsedThresholds.push(val);
+    }
+    const parsedHours = parseHourLimits(hourLimits);
+    if (parsedHours === null) {
+      setError("Accelerator hour limits must use key=hours pairs, e.g. tpu=500, gpu=100.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await onSave({
+        orgId,
+        projectId,
+        limit: parsedLimit,
+        period,
+        hardLimit,
+        alertThresholds: parsedThresholds,
+        acceleratorHourLimits: parsedHours,
+      });
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to save budget");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-layer" role="presentation">
+      <button
+        className="modal-scrim"
+        type="button"
+        aria-label="Close budget dialog"
+        disabled={busy}
+        onClick={onClose}
+      />
+      <div className="modal modal-narrow" role="dialog" aria-modal="true" aria-labelledby="budget-modal-title">
+        <div className="modal-header">
+          <div>
+            <h2 id="budget-modal-title">{initial ? `Edit budget (${initial.owner})` : "Configure project budget"}</h2>
+            <p>
+              Scope:{" "}
+              <span className="monospace">
+                {orgId}/{projectId}
+              </span>
+            </p>
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="Close budget dialog"
+            disabled={busy}
+            onClick={onClose}
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
+        <form onSubmit={(event) => void handleSubmit(event)}>
+          <div className="modal-body collab-form-grid">
+            {error && (
+              <div className="form-error" role="alert">
+                <AlertCircle size={15} aria-hidden="true" />
+                {error}
+              </div>
+            )}
+            <div className="collab-form-row">
+              <label className="field">
+                <span>Limit (USD)</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  required
+                  value={limit}
+                  disabled={busy}
+                  onChange={(event) => setLimit(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Period</span>
+                <select value={period} disabled={busy} onChange={(event) => setPeriod(event.target.value)}>
+                  <option value="monthly">Monthly</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="daily">Daily</option>
+                </select>
+              </label>
+            </div>
+            <label className="collab-checkbox-field">
+              <input
+                type="checkbox"
+                checked={hardLimit}
+                disabled={busy}
+                onChange={(event) => setHardLimit(event.target.checked)}
+              />
+              <span>Hard limit (reject new workload admission when budget is exhausted)</span>
+            </label>
+            <label className="field">
+              <span>Alert thresholds (0–1, comma-separated)</span>
+              <input
+                type="text"
+                placeholder="0.5, 0.8, 0.95"
+                value={thresholds}
+                disabled={busy}
+                onChange={(event) => setThresholds(event.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>Accelerator hour limits (optional key=hours)</span>
+              <input
+                type="text"
+                placeholder="tpu=500, gpu=120"
+                value={hourLimits}
+                disabled={busy}
+                onChange={(event) => setHourLimits(event.target.value)}
+              />
+            </label>
+          </div>
+          <div className="modal-footer">
+            <button className="button button-secondary" type="button" disabled={busy} onClick={onClose}>
+              Cancel
+            </button>
+            <button className="button button-primary" type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save budget"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+interface PolicyModalProps {
+  open: boolean;
+  orgId: string;
+  projectId: string;
+  initial?: SchedulingPolicy | null;
+  onClose: () => void;
+  onSave: (target: SchedulingPolicy, patch: PolicyUpdatePatch) => Promise<void>;
+}
+
+function PolicyFormModal({ open, orgId, projectId, initial, onClose, onSave }: PolicyModalProps) {
+  const cfg = initial?.configuration;
+  const [allowedRegions, setAllowedRegions] = useState((cfg?.allowedRegions ?? []).join(", "));
+  const [allowedProviders, setAllowedProviders] = useState((cfg?.allowedProviders ?? []).join(", "));
+  const [allowedClasses, setAllowedClasses] = useState((cfg?.allowedCapacityClasses ?? []).join(", "));
+  const [deniedAccelerators, setDeniedAccelerators] = useState((cfg?.deniedAcceleratorTypes ?? []).join(", "));
+  const [maxPriority, setMaxPriority] = useState(String(cfg?.maxPriority ?? 1000));
+  const [preemptionEnabled, setPreemptionEnabled] = useState(initial?.preemptionEnabled ?? true);
+  const [crossRegionPolicy, setCrossRegionPolicy] = useState<CrossRegionTransferPolicy>(
+    normalizeCrossRegionTransferPolicy(initial?.crossRegionTransferPolicy),
+  );
+  const [allowedBuckets, setAllowedBuckets] = useState((initial?.crossRegionAllowedBuckets ?? []).join(", "));
+  const [allowMultiregion, setAllowMultiregion] = useState(initial?.crossRegionAllowMultiregion ?? true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const c = initial?.configuration;
+    setAllowedRegions((c?.allowedRegions ?? []).join(", "));
+    setAllowedProviders((c?.allowedProviders ?? []).join(", "));
+    setAllowedClasses((c?.allowedCapacityClasses ?? []).join(", "));
+    setDeniedAccelerators((c?.deniedAcceleratorTypes ?? []).join(", "));
+    setMaxPriority(String(c?.maxPriority ?? 1000));
+    setPreemptionEnabled(initial?.preemptionEnabled ?? true);
+    setCrossRegionPolicy(normalizeCrossRegionTransferPolicy(initial?.crossRegionTransferPolicy));
+    setAllowedBuckets((initial?.crossRegionAllowedBuckets ?? []).join(", "));
+    setAllowMultiregion(initial?.crossRegionAllowMultiregion ?? true);
+    setError(null);
+  }, [open, initial]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    globalThis.addEventListener("keydown", onKeyDown);
+    return () => globalThis.removeEventListener("keydown", onKeyDown);
+  }, [open, busy, onClose]);
+
+  if (!open) return null;
+
+  const handleSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    const parsedPriority = Number.parseInt(maxPriority, 10);
+    if (!Number.isFinite(parsedPriority) || parsedPriority < 0) {
+      setError("Max priority must be a non-negative integer.");
+      return;
+    }
+    const target: SchedulingPolicy = initial ?? {
+      id: `${orgId}/${projectId}`,
+      name: `Placement policy (${projectId})`,
+      scope: projectId,
+      type: "placement",
+      summary: "",
+      preemptionEnabled,
+      crossRegionTransferPolicy: crossRegionPolicy,
+      crossRegionAllowedBuckets: splitCsv(allowedBuckets),
+      crossRegionAllowMultiregion: allowMultiregion,
+      updatedAt: new Date().toISOString(),
+      configuration: {
+        allowedProviders: splitCsv(allowedProviders),
+        allowedRegions: splitCsv(allowedRegions),
+        allowedCapacityClasses: splitCsv(allowedClasses),
+        deniedAcceleratorTypes: splitCsv(deniedAccelerators),
+        allowedSecretReferences: [],
+        maxPriority: parsedPriority,
+      },
+    };
+    setBusy(true);
+    setError(null);
+    try {
+      await onSave(target, {
+        allowedRegions: splitCsv(allowedRegions),
+        allowedProviders: splitCsv(allowedProviders),
+        allowedCapacityClasses: splitCsv(allowedClasses),
+        deniedAcceleratorTypes: splitCsv(deniedAccelerators),
+        maxPriority: parsedPriority,
+        preemptionEnabled,
+        crossRegionTransferPolicy: crossRegionPolicy,
+        crossRegionAllowedBuckets: splitCsv(allowedBuckets),
+        crossRegionAllowMultiregion: allowMultiregion,
+      });
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to save scheduling policy");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-layer" role="presentation">
+      <button
+        className="modal-scrim"
+        type="button"
+        aria-label="Close scheduling policy dialog"
+        disabled={busy}
+        onClick={onClose}
+      />
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="policy-modal-title">
+        <div className="modal-header">
+          <div>
+            <h2 id="policy-modal-title">{initial ? `Edit ${initial.name}` : "Configure project scheduling policy"}</h2>
+            <p>
+              Scope:{" "}
+              <span className="monospace">
+                {orgId}/{projectId}
+              </span>
+            </p>
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="Close scheduling policy dialog"
+            disabled={busy}
+            onClick={onClose}
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
+        <form onSubmit={(event) => void handleSubmit(event)}>
+          <div className="modal-body collab-form-grid">
+            {error && (
+              <div className="form-error" role="alert">
+                <AlertCircle size={15} aria-hidden="true" />
+                {error}
+              </div>
+            )}
+            <div className="collab-form-row">
+              <label className="field">
+                <span>Allowed regions (comma-separated)</span>
+                <input
+                  type="text"
+                  placeholder="e.g. europe-west4, us-central2"
+                  value={allowedRegions}
+                  disabled={busy}
+                  onChange={(event) => setAllowedRegions(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Allowed providers (comma-separated)</span>
+                <input
+                  type="text"
+                  placeholder="e.g. gcp"
+                  value={allowedProviders}
+                  disabled={busy}
+                  onChange={(event) => setAllowedProviders(event.target.value)}
+                />
+              </label>
+            </div>
+            <div className="collab-form-row">
+              <label className="field">
+                <span>Allowed capacity classes</span>
+                <input
+                  type="text"
+                  placeholder="spot, on_demand, reserved"
+                  value={allowedClasses}
+                  disabled={busy}
+                  onChange={(event) => setAllowedClasses(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Denied accelerator types</span>
+                <input
+                  type="text"
+                  placeholder="e.g. v4"
+                  value={deniedAccelerators}
+                  disabled={busy}
+                  onChange={(event) => setDeniedAccelerators(event.target.value)}
+                />
+              </label>
+            </div>
+            <div className="collab-form-row">
+              <label className="field">
+                <span>Max priority</span>
+                <input
+                  type="number"
+                  min={0}
+                  required
+                  value={maxPriority}
+                  disabled={busy}
+                  onChange={(event) => setMaxPriority(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Cross-region transfer policy</span>
+                <select
+                  value={crossRegionPolicy}
+                  disabled={busy}
+                  onChange={(event) => setCrossRegionPolicy(event.target.value as CrossRegionTransferPolicy)}
+                >
+                  <option value="allow">Allow</option>
+                  <option value="warn">Warn</option>
+                  <option value="ban">Ban &amp; kill</option>
+                </select>
+              </label>
+            </div>
+            <label className="field">
+              <span>Cross-region allowlisted buckets (comma-separated)</span>
+              <input
+                type="text"
+                placeholder="example-monitoring-bucket, example-shared-bucket"
+                value={allowedBuckets}
+                disabled={busy}
+                onChange={(event) => setAllowedBuckets(event.target.value)}
+              />
+            </label>
+            <label className="collab-checkbox-field">
+              <input
+                type="checkbox"
+                checked={preemptionEnabled}
+                disabled={busy}
+                onChange={(event) => setPreemptionEnabled(event.target.checked)}
+              />
+              <span>Preemption enabled for workloads in this project</span>
+            </label>
+            <label className="collab-checkbox-field">
+              <input
+                type="checkbox"
+                checked={allowMultiregion}
+                disabled={busy}
+                onChange={(event) => setAllowMultiregion(event.target.checked)}
+              />
+              <span>Allow continental multi-region buckets (uncheck for strict same-region)</span>
+            </label>
+          </div>
+          <div className="modal-footer">
+            <button className="button button-secondary" type="button" disabled={busy} onClick={onClose}>
+              Cancel
+            </button>
+            <button className="button button-primary" type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save policy"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
 }
 
 export function BudgetsPage({
@@ -33,10 +502,21 @@ export function BudgetsPage({
   onPolicyToggle,
   onCrossRegionPolicyChange,
   onPolicyUpdate,
+  onSaveBudget,
+  orgId = "default",
+  projectId = "default",
   canManageProject,
 }: BudgetsPageProps) {
   const [pendingPolicy, setPendingPolicy] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  const [budgetModal, setBudgetModal] = useState<{ open: boolean; target: Budget | null }>({
+    open: false,
+    target: null,
+  });
+  const [policyModal, setPolicyModal] = useState<{ open: boolean; target: SchedulingPolicy | null }>({
+    open: false,
+    target: null,
+  });
   const orgBudget = budgets.find((budget) => budget.scope === "organization") ?? budgets[0];
   const hardBudgets = budgets.filter((budget) => budget.enforcement === "hard");
   const overForecast = budgets.filter((budget) => budget.forecast !== undefined && budget.forecast > budget.limit);
@@ -71,6 +551,9 @@ export function BudgetsPage({
       setPendingPolicy(null);
     }
   };
+
+  const canEditBudget = canManageProject && Boolean(onSaveBudget);
+  const canEditFullPolicy = canManageProject && Boolean(onPolicyUpdate);
 
   return (
     <div className="page-stack">
@@ -111,12 +594,22 @@ export function BudgetsPage({
               <h2>Budget scopes</h2>
               <p>Current spend, forecast, and admission enforcement</p>
             </div>
+            {canEditBudget && (
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => setBudgetModal({ open: true, target: budgets[0] ?? null })}
+              >
+                <Plus size={14} aria-hidden="true" />
+                Configure budget
+              </button>
+            )}
           </div>
           {budgets.length === 0 ? (
             <section className="panel">
               <EmptyState
                 title="No budgets configured for this scope"
-                detail="Define project or organization budgets via the Eyvan CLI or API to enforce spend limits."
+                detail="Define project or organization budgets to enforce spend limits and alert thresholds."
               />
             </section>
           ) : (
@@ -130,25 +623,34 @@ export function BudgetsPage({
                     <div className="budget-card-heading">
                       <span className="budget-scope">{budget.scope}</span>
                       <StatusBadge value={budget.enforcement} tone={budget.enforcement} dot={false} chip />
-                      <span title="Budget changes are available through the Eyvan API and SDK">
+                      {canEditBudget ? (
                         <button
                           className="icon-button icon-button-small"
                           type="button"
-                          aria-label={`Editing ${budget.owner} budget is unavailable in the dashboard`}
-                          disabled
+                          aria-label={`Edit ${budget.owner} budget`}
+                          title={`Edit ${budget.owner} budget`}
+                          onClick={() => setBudgetModal({ open: true, target: budget })}
                         >
-                          <Edit3 size={14} />
+                          <Edit3 size={14} aria-hidden="true" />
                         </button>
-                      </span>
+                      ) : (
+                        <span title="Project admin role required to edit budgets">
+                          <button
+                            className="icon-button icon-button-small"
+                            type="button"
+                            aria-label={`Editing ${budget.owner} budget is unavailable`}
+                            disabled
+                          >
+                            <Edit3 size={14} aria-hidden="true" />
+                          </button>
+                        </span>
+                      )}
                     </div>
                     <div className="budget-owner">{budget.owner}</div>
                     <div className="budget-amount-row">
                       <strong>{formatMoney(budget.spent)}</strong>
                       <span>of {formatMoney(budget.limit)}</span>
                     </div>
-                    {/* The forecast is a tick above the bar, not a second fill:
-                        it has not been spent, and a filled track would say it
-                        has. */}
                     <div className="dual-progress">
                       <ProgressBar
                         value={spentPercent}
@@ -241,6 +743,16 @@ export function BudgetsPage({
             <h2>Scheduling policies</h2>
             <p>Versioned rules applied by admission and placement</p>
           </div>
+          {canEditFullPolicy && (
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={() => setPolicyModal({ open: true, target: policies[0] ?? null })}
+            >
+              <Plus size={14} aria-hidden="true" />
+              Configure policy
+            </button>
+          )}
         </div>
         {mutationError && (
           <div className="panel-alert-wrap">
@@ -269,6 +781,7 @@ export function BudgetsPage({
                   <th>Cross-region transfer</th>
                   <th>Updated</th>
                   <th>Preemptible</th>
+                  {canEditFullPolicy && <th aria-label="Edit policy" />}
                 </tr>
               </thead>
               <tbody>
@@ -352,6 +865,20 @@ export function BudgetsPage({
                           <span className="muted">Read only</span>
                         )}
                       </td>
+                      {canEditFullPolicy && (
+                        <td className="numeric">
+                          <button
+                            className="button button-ghost"
+                            type="button"
+                            aria-label={`Edit ${policy.name}`}
+                            disabled={isPending}
+                            onClick={() => setPolicyModal({ open: true, target: policy })}
+                          >
+                            <Edit3 size={13} aria-hidden="true" />
+                            Edit
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   );
                 })}
@@ -360,6 +887,32 @@ export function BudgetsPage({
           </div>
         )}
       </section>
+
+      {canEditBudget && onSaveBudget && (
+        <BudgetFormModal
+          open={budgetModal.open}
+          orgId={orgId}
+          projectId={projectId}
+          initial={budgetModal.target}
+          onClose={() => setBudgetModal({ open: false, target: null })}
+          onSave={async (input) => {
+            await onSaveBudget(input);
+          }}
+        />
+      )}
+
+      {canEditFullPolicy && onPolicyUpdate && (
+        <PolicyFormModal
+          open={policyModal.open}
+          orgId={orgId}
+          projectId={projectId}
+          initial={policyModal.target}
+          onClose={() => setPolicyModal({ open: false, target: null })}
+          onSave={async (target, patch) => {
+            await onPolicyUpdate(target, patch);
+          }}
+        />
+      )}
     </div>
   );
 }

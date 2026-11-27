@@ -3,18 +3,46 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Check, Copy, Database, HardDrive, RefreshCw, Terminal } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Database,
+  HardDrive,
+  Package,
+  RefreshCw,
+  ShieldCheck,
+  Terminal,
+} from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
 import { ApiError } from "../api/client";
 import type { AuthScope } from "../auth/oidc";
 import { ErrorCard } from "../components/ErrorCard";
 import { StatusBadge } from "../components/StatusBadge";
-import type { RunSummary, StorageStatus } from "../types";
+import { formatDateTime } from "../lib/format";
+import type {
+  ManagedArtifact,
+  RunSummary,
+  StorageRegionCheckInput,
+  StorageRegionCheckResult,
+  StorageStatus,
+} from "../types";
 
 export interface StorageSettingsClient {
   getStorageStatus?: (signal?: AbortSignal) => Promise<StorageStatus | null>;
   listRuns?: (options?: { limit?: number }, scope?: AuthScope, signal?: AbortSignal) => Promise<RunSummary[]>;
+  checkStorageRegion?: (input: StorageRegionCheckInput, signal?: AbortSignal) => Promise<StorageRegionCheckResult>;
+  listManagedArtifacts?: (scope?: AuthScope, signal?: AbortSignal) => Promise<ManagedArtifact[]>;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
 interface StorageTrackingSettingsProps {
@@ -96,6 +124,20 @@ export function StorageTrackingSettings({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
 
+  // Interactive cross-region URI checker state.
+  const [checkUri, setCheckUri] = useState("");
+  const [checkRegion, setCheckRegion] = useState("");
+  const [checkStrict, setCheckStrict] = useState(false);
+  const [checkingRegion, setCheckingRegion] = useState(false);
+  const [checkResult, setCheckResult] = useState<StorageRegionCheckResult | null>(null);
+  const [checkError, setCheckError] = useState<string | null>(null);
+
+  // Collapsible managed artifacts table state.
+  const [artifactsOpen, setArtifactsOpen] = useState(false);
+  const [artifacts, setArtifacts] = useState<ManagedArtifact[] | null>(null);
+  const [artifactsLoading, setArtifactsLoading] = useState(false);
+  const [artifactsError, setArtifactsError] = useState<string | null>(null);
+
   useEffect(
     () => () => {
       if (timerRef.current !== null) globalThis.clearTimeout(timerRef.current);
@@ -162,6 +204,51 @@ export function StorageTrackingSettings({
       });
     return () => controller.abort();
   }, [client, defaultOrg, defaultProject, revision]);
+
+  useEffect(() => {
+    if (!artifactsOpen || !client.listManagedArtifacts) return;
+    const controller = new AbortController();
+    setArtifactsLoading(true);
+    setArtifactsError(null);
+    client
+      .listManagedArtifacts({ orgId: defaultOrg, projectId: defaultProject }, controller.signal)
+      .then((items) => {
+        if (!controller.signal.aborted) setArtifacts(items);
+      })
+      .catch((failure: unknown) => {
+        if (controller.signal.aborted) return;
+        setArtifactsError(failure instanceof Error ? failure.message : "Unable to load managed artifacts");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setArtifactsLoading(false);
+      });
+    return () => controller.abort();
+  }, [artifactsOpen, client, defaultOrg, defaultProject, revision]);
+
+  const handleCheckRegion = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!client.checkStorageRegion) return;
+    const uri = checkUri.trim();
+    if (!uri) {
+      setCheckError("Enter a gs:// URI to check.");
+      return;
+    }
+    setCheckingRegion(true);
+    setCheckError(null);
+    setCheckResult(null);
+    try {
+      const result = await client.checkStorageRegion({
+        uri,
+        region: checkRegion.trim() || status?.context.region || undefined,
+        strict: checkStrict,
+      });
+      setCheckResult(result);
+    } catch (failure) {
+      setCheckError(failure instanceof Error ? failure.message : "Unable to check storage region locality");
+    } finally {
+      setCheckingRegion(false);
+    }
+  };
 
   const handleCopy = async (id: string, value: string, message: string) => {
     const ok = await copyText(value);
@@ -363,6 +450,158 @@ export function StorageTrackingSettings({
                   })}
                 </tbody>
               </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {client.checkStorageRegion && (
+        <div className="storage-region-checker" aria-label="Cross-region URI checker">
+          <div className="storage-subhead">
+            <ShieldCheck size={13} aria-hidden="true" />
+            <span>Cross-region URI checker</span>
+          </div>
+          <form className="storage-checker-form" onSubmit={(event) => void handleCheckRegion(event)}>
+            <label className="field storage-checker-uri">
+              <span>GCS URI</span>
+              <input
+                type="text"
+                aria-label="GCS URI to check"
+                placeholder="gs://example-bucket/checkpoints"
+                value={checkUri}
+                disabled={checkingRegion}
+                onChange={(event) => setCheckUri(event.target.value)}
+              />
+            </label>
+            <label className="field storage-checker-region">
+              <span>Target TPU region</span>
+              <input
+                type="text"
+                aria-label="Target TPU region"
+                placeholder={status?.context.region ?? "e.g. europe-west4"}
+                value={checkRegion}
+                disabled={checkingRegion}
+                onChange={(event) => setCheckRegion(event.target.value)}
+              />
+            </label>
+            <label className="collab-checkbox-field storage-checker-strict">
+              <input
+                type="checkbox"
+                checked={checkStrict}
+                disabled={checkingRegion}
+                onChange={(event) => setCheckStrict(event.target.checked)}
+              />
+              <span>Strict same-region</span>
+            </label>
+            <button className="button button-primary" type="submit" disabled={checkingRegion}>
+              {checkingRegion ? "Checking…" : "Check region"}
+            </button>
+          </form>
+          {checkError && (
+            <div className="storage-panel-pad">
+              <div className="form-error" role="alert">
+                {checkError}
+              </div>
+            </div>
+          )}
+          {checkResult && (
+            <div
+              className={`storage-check-verdict ${checkResult.allowed ? "storage-check-allowed" : "storage-check-blocked"}`}
+              role="status"
+            >
+              <div className="storage-check-verdict-head">
+                <StatusBadge
+                  value={checkResult.allowed ? "Allowed" : "Blocked"}
+                  tone={checkResult.allowed ? "healthy" : "critical"}
+                  chip
+                />
+                {checkResult.allowlisted && <StatusBadge value="Allowlisted" tone="info" dot={false} chip />}
+                <span className="monospace">
+                  {checkResult.bucket} ({checkResult.bucket_location ?? "unknown"}
+                  {checkResult.location_type ? ` · ${checkResult.location_type}` : ""}) → {checkResult.host_region}
+                </span>
+              </div>
+              <p>{checkResult.reason}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {client.listManagedArtifacts && (
+        <div className="storage-artifacts-section" aria-label="Managed artifacts">
+          <div className="storage-subhead">
+            <button
+              type="button"
+              className="metric-group-toggle"
+              aria-expanded={artifactsOpen}
+              onClick={() => setArtifactsOpen((open) => !open)}
+            >
+              {artifactsOpen ? (
+                <ChevronDown size={13} aria-hidden="true" />
+              ) : (
+                <ChevronRight size={13} aria-hidden="true" />
+              )}
+              <Package size={13} aria-hidden="true" />
+              <span>Managed artifacts ({artifacts?.length ?? "click to load"})</span>
+            </button>
+          </div>
+          {artifactsOpen && (
+            <div className="storage-artifacts-body">
+              {artifactsLoading && (
+                <p className="panel-note" role="status">
+                  Loading managed artifacts…
+                </p>
+              )}
+              {artifactsError && (
+                <div className="storage-panel-pad">
+                  <div className="form-error" role="alert">
+                    {artifactsError}
+                  </div>
+                </div>
+              )}
+              {!artifactsLoading && !artifactsError && artifacts && artifacts.length === 0 && (
+                <p className="panel-note">
+                  No managed artifacts recorded for {defaultOrg}/{defaultProject}.
+                </p>
+              )}
+              {!artifactsLoading && !artifactsError && artifacts && artifacts.length > 0 && (
+                <div className="table-scroll">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>URI</th>
+                        <th>Kind</th>
+                        <th>State</th>
+                        <th className="numeric">Size</th>
+                        <th className="numeric">Gen</th>
+                        <th>Updated</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {artifacts.map((art) => (
+                        <tr key={`${art.uri}:${art.record_generation}`}>
+                          <td className="monospace" title={art.uri}>
+                            {art.uri}
+                          </td>
+                          <td>{art.kind}</td>
+                          <td>
+                            <StatusBadge
+                              value={art.state}
+                              tone={
+                                art.state === "active" ? "healthy" : art.state === "deleted" ? "expired" : "warning"
+                              }
+                              dot={false}
+                            />
+                          </td>
+                          <td className="numeric">{formatBytes(art.size_bytes)}</td>
+                          <td className="numeric">v{art.record_generation}</td>
+                          <td className="nowrap">{formatDateTime(art.updated_at)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
         </div>

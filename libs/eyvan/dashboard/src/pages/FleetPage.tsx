@@ -15,6 +15,7 @@ import {
   Plus,
   RefreshCw,
   Timer,
+  Trash2,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -50,6 +51,8 @@ interface FleetPageProps {
   loadLaunchLatency: (signal: AbortSignal) => Promise<LaunchLatencyReport>;
   /** Absent unless this principal may manage the fleet, which hides the control. */
   onDrainCell?: (cellId: string) => Promise<void>;
+  /** Delete a drained, maintenance, or degraded cell record from fleet inventory. */
+  onDeleteCell?: (cellId: string) => Promise<void>;
   /**
    * Stop a whole fleet: every pool off, ceiling zero, autoscaler releases what
    * is running. Absent for a principal who may not manage the fleet.
@@ -102,6 +105,7 @@ export function FleetPage({
   loadBilling,
   loadLaunchLatency,
   onDrainCell,
+  onDeleteCell,
   refreshRevision = 0,
   attachmentClient,
   initScriptClient,
@@ -133,6 +137,10 @@ export function FleetPage({
   const [drainBusy, setDrainBusy] = useState(false);
   const [drainError, setDrainError] = useState<string | null>(null);
   const [drained, setDrained] = useState<string | null>(null);
+  const [deletingCell, setDeletingCell] = useState<Cell | null>(null);
+  const [deleteCellBusy, setDeleteCellBusy] = useState(false);
+  const [deleteCellError, setDeleteCellError] = useState<string | null>(null);
+  const [deletedCell, setDeletedCell] = useState<string | null>(null);
   const regions = useMemo(() => Array.from(new Set(cells.map((cell) => cell.region))), [cells]);
   const visibleCells = region === "all" ? cells : cells.filter((cell) => cell.region === region);
   const activeLeases = leases.filter((lease) => ["active", "activating"].includes(lease.state));
@@ -157,6 +165,21 @@ export function FleetPage({
       setDrainError(error instanceof Error ? error.message : "Unable to drain this cell");
     } finally {
       setDrainBusy(false);
+    }
+  };
+
+  const deleteCellConfirmed = async () => {
+    if (!deletingCell || !onDeleteCell) return;
+    setDeleteCellBusy(true);
+    setDeleteCellError(null);
+    try {
+      await onDeleteCell(deletingCell.id);
+      setDeletingCell(null);
+      setDeletedCell(deletingCell.name);
+    } catch (error) {
+      setDeleteCellError(error instanceof Error ? error.message : "Unable to delete this cell");
+    } finally {
+      setDeleteCellBusy(false);
     }
   };
 
@@ -585,25 +608,46 @@ export function FleetPage({
                   </span>
                   <span>Heartbeat {formatDateTime(cell.lastHeartbeat)}</span>
                 </div>
-                {onDrainCell && (
+                {(onDrainCell || onDeleteCell) && (
                   <div className="cell-card-actions">
-                    <button
-                      className="button button-secondary"
-                      type="button"
-                      // Already on its way out, and asking again says nothing
-                      // new. The request is idempotent, so this is not about
-                      // safety -- it is about not offering a gesture whose only
-                      // effect would be to look like it did something.
-                      disabled={cell.status === "maintenance"}
-                      onClick={() => {
-                        setDrainError(null);
-                        setDrained(null);
-                        setDraining(cell);
-                      }}
-                    >
-                      <MinusCircle size={15} aria-hidden="true" />
-                      {cell.status !== "maintenance" ? "Drain" : cell.state === "deleting" ? "Releasing" : "Draining"}
-                    </button>
+                    {onDrainCell && (
+                      <button
+                        className="button button-secondary"
+                        type="button"
+                        // Already on its way out, and asking again says nothing
+                        // new. The request is idempotent, so this is not about
+                        // safety -- it is about not offering a gesture whose only
+                        // effect would be to look like it did something.
+                        disabled={cell.status === "maintenance"}
+                        onClick={() => {
+                          setDrainError(null);
+                          setDrained(null);
+                          setDraining(cell);
+                        }}
+                      >
+                        <MinusCircle size={15} aria-hidden="true" />
+                        {cell.status !== "maintenance" ? "Drain" : cell.state === "deleting" ? "Releasing" : "Draining"}
+                      </button>
+                    )}
+                    {onDeleteCell &&
+                      cell.status !== "healthy" &&
+                      cell.status !== "starting" &&
+                      (cell.status === "maintenance" || cell.status === "degraded" || cell.state === "draining") && (
+                        <button
+                          className="button button-secondary"
+                          type="button"
+                          aria-label={`Delete cell ${cell.name}`}
+                          disabled={cell.state === "deleting"}
+                          onClick={() => {
+                            setDeleteCellError(null);
+                            setDeletedCell(null);
+                            setDeletingCell(cell);
+                          }}
+                        >
+                          <Trash2 size={14} aria-hidden="true" />
+                          Delete cell
+                        </button>
+                      )}
                   </div>
                 )}
               </article>
@@ -1108,6 +1152,30 @@ export function FleetPage({
       {drained && (
         <div className="inline-notice" role="status">
           {drained} is draining. It stops accepting work now and releases once its leases end.
+        </div>
+      )}
+      <ConfirmDialog
+        open={deletingCell !== null}
+        title={`Delete cell ${deletingCell?.name ?? ""}?`}
+        confirmLabel="Delete cell"
+        destructive
+        busy={deleteCellBusy}
+        error={deleteCellError}
+        consequence={
+          <p>
+            Permanently marks cell <strong>{deletingCell?.name}</strong> deleted in fleet inventory. Only drained,
+            maintenance, or degraded cells without active leases can be deleted.
+          </p>
+        }
+        onConfirm={() => void deleteCellConfirmed()}
+        onCancel={() => {
+          setDeletingCell(null);
+          setDeleteCellError(null);
+        }}
+      />
+      {deletedCell && (
+        <div className="inline-notice" role="status">
+          {deletedCell} was removed from active fleet inventory.
         </div>
       )}
     </div>

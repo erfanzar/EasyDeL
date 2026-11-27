@@ -12,9 +12,27 @@ import type {
   Budget,
   CapacityLease,
   Cell,
+  CollaborationFeedResponse,
+  CollaborationNote,
+  CollaborationNoteInput,
   DashboardData,
   DiscoveredTpus,
+  DurableRoleGrant,
+  ExperimentCreateInput,
+  ExperimentLeaderboardEntry,
+  ExperimentLeaderboardResponse,
+  ExperimentRecord,
+  ExperimentUpdatePatch,
   LogEntry,
+  ManagedArtifact,
+  ProjectRecord,
+  ProjectRegisterInput,
+  RoleGrantIssueInput,
+  RunCollaborationOverlay,
+  RunCompareInput,
+  RunCompareMetricSummaryRow,
+  RunCompareResponse,
+  RunCompareSeriesData,
   RunDetail,
   BlobRef,
   RunRollout,
@@ -24,6 +42,7 @@ import type {
   RunCompletionsOptions,
   RunCompletionsResponse,
   CompletionStatsResponse,
+  RunSharingPatch,
   RunTableOptions,
   RunTableResponse,
   RunMediaOptions,
@@ -41,8 +60,12 @@ import type {
   RunSeriesResponse,
   RunSummary,
   SchedulingPolicy,
+  StorageRegionCheckInput,
+  StorageRegionCheckResult,
   SubmitWorkloadInput,
   TimelineEvent,
+  WebhookCreateInput,
+  WebhookSubscription,
   WorkloadDetail,
   WorkloadSummary,
 } from "../types";
@@ -893,6 +916,15 @@ export const mockRuns: RunSummary[] = [
     last_step: 330,
     keys_count: 4,
     summary: { best_return: 21, "loss/policy": 0.031 },
+    owner: "alice",
+    visibility: "team",
+    shared_with: [],
+    experiment_id: "exp-pong-speedrun",
+    experiment: "Atari Pong Speedrun",
+    pinned: true,
+    notes_count: 2,
+    duration_s: 4200,
+    latest_metrics: { "loss/policy": 0.031, "reward/mean": 20.4, "system/sps": 9120 },
   },
   {
     run_id: "grpo-math",
@@ -909,6 +941,15 @@ export const mockRuns: RunSummary[] = [
     last_step: 260,
     keys_count: 4,
     summary: { mean_reward: 0.71 },
+    owner: "bob",
+    visibility: "team",
+    shared_with: [],
+    experiment_id: "exp-grpo-math",
+    experiment: "GRPO Math Reasoning",
+    pinned: false,
+    notes_count: 1,
+    duration_s: 4200,
+    latest_metrics: { "reward/mean": 0.71, "policy/kl": 0.018 },
   },
   {
     run_id: "pong-seed-1",
@@ -925,6 +966,15 @@ export const mockRuns: RunSummary[] = [
     last_step: 400,
     keys_count: 4,
     summary: { best_return: 21 },
+    owner: "bob",
+    visibility: "shared",
+    shared_with: ["alice"],
+    experiment_id: "exp-pong-speedrun",
+    experiment: "Atari Pong Speedrun",
+    pinned: false,
+    notes_count: 0,
+    duration_s: 3600,
+    latest_metrics: { "loss/policy": 0.038, "reward/mean": 21.0, "system/sps": 8940 },
   },
   {
     run_id: "diverged",
@@ -941,6 +991,15 @@ export const mockRuns: RunSummary[] = [
     last_step: 118,
     keys_count: 4,
     summary: { reason: "KL guard crossed" },
+    owner: "carol",
+    visibility: "team",
+    shared_with: [],
+    experiment_id: "exp-pong-speedrun",
+    experiment: "Atari Pong Speedrun",
+    pinned: false,
+    notes_count: 1,
+    duration_s: 2400,
+    latest_metrics: { "loss/policy": 0.89, "reward/mean": -14.2 },
   },
   {
     run_id: "offline-eval",
@@ -957,6 +1016,15 @@ export const mockRuns: RunSummary[] = [
     last_step: null,
     keys_count: 0,
     summary: {},
+    owner: "alice",
+    visibility: "private",
+    shared_with: [],
+    experiment_id: null,
+    experiment: null,
+    pinned: false,
+    notes_count: 0,
+    duration_s: 1200,
+    latest_metrics: {},
   },
 ];
 
@@ -1456,4 +1524,580 @@ export function getMockRunMedia(run: RunDetail, options: RunMediaOptions = {}): 
 export function getMockRunBlob(run: RunDetail, digest: string): Blob | undefined {
   if (!run.media_keys?.length || digest !== demoBlob.sha256) return undefined;
   return new Blob([Uint8Array.from(atob(DEMO_PNG), (char) => char.charCodeAt(0))], { type: "image/png" });
+}
+
+export const mockExperiments: ExperimentRecord[] = [
+  {
+    id: "exp-pong-speedrun",
+    org_id: "demo",
+    project_id: "rl",
+    name: "Atari Pong Speedrun",
+    subject: "rl-speedrun",
+    kind: "speedrun",
+    description: "Fastest wall-clock and step count to reach mean reward >= 20.0 on Pong-v5.",
+    metric_key: "reward/mean",
+    goal: "max",
+    target_value: 20.0,
+    group_filter: "sweep-3",
+    tag_filter: [],
+    visibility: "team",
+    shared_with: [],
+    owner: "alice",
+    pinned_baseline_run_id: "pong-seed-3",
+    created_at: "2026-07-08T10:00:00Z",
+    updated_at: "2026-07-10T08:30:00Z",
+    notes_count: 2,
+    run_count: 3,
+    running_count: 1,
+    leader_run_id: "pong-seed-1",
+    leader_owner: "bob",
+    leader_value: 21.0,
+  },
+  {
+    id: "exp-grpo-math",
+    org_id: "demo",
+    project_id: "rl",
+    name: "GRPO Math Reasoning",
+    subject: "post-training",
+    kind: "experiment",
+    description: "Reward shaping and KL penalty sweeps for 7B math reasoning checkpoints.",
+    metric_key: "reward/mean",
+    goal: "max",
+    target_value: null,
+    group_filter: "grpo-math",
+    tag_filter: ["grpo"],
+    visibility: "team",
+    shared_with: [],
+    owner: "bob",
+    pinned_baseline_run_id: null,
+    created_at: "2026-07-09T14:20:00Z",
+    updated_at: "2026-07-10T08:10:00Z",
+    notes_count: 1,
+    run_count: 1,
+    running_count: 1,
+    leader_run_id: "grpo-math",
+    leader_owner: "bob",
+    leader_value: 0.71,
+  },
+];
+
+export const mockNotes: CollaborationNote[] = [
+  {
+    id: "note-1",
+    org_id: "demo",
+    project_id: "rl",
+    target_type: "experiment",
+    target_id: "exp-pong-speedrun",
+    author: "alice",
+    body: "Pinned pong-seed-3 as baseline. Cosine LR decay shaved 180s off time-to-20.",
+    metric_ref: "reward/mean",
+    step_ref: 280,
+    created_at: "2026-07-10T07:55:00Z",
+  },
+  {
+    id: "note-2",
+    org_id: "demo",
+    project_id: "rl",
+    target_type: "run",
+    target_id: "pong-seed-3",
+    author: "bob",
+    body: "Value loss stabilizes cleanly after attempt 2 resume.",
+    metric_ref: "loss/policy",
+    step_ref: 220,
+    created_at: "2026-07-10T08:15:00Z",
+  },
+];
+
+export const mockWebhooks: WebhookSubscription[] = [
+  {
+    id: "whk-demo-1",
+    org_id: "demo",
+    project_id: "rl",
+    url: "https://hooks.example.org/eyvan/events",
+    entity_types: ["workload", "budget"],
+    actions: ["workload.failed", "budget.threshold_crossed"],
+    enabled: true,
+    created_at: "2026-07-08T12:00:00Z",
+    updated_at: "2026-07-08T12:00:00Z",
+  },
+];
+
+export const mockManagedArtifacts: ManagedArtifact[] = [
+  {
+    uri: "gs://example-bucket/workspaces/sha256-a1b2c3d4.tar.gz",
+    kind: "workspace",
+    org_id: "demo",
+    project_id: "rl",
+    state: "active",
+    record_generation: 1,
+    size_bytes: 18_420_112,
+    sha256: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    object_version: "1720601000000",
+    created_at: "2026-07-10T06:00:00Z",
+    updated_at: "2026-07-10T06:00:00Z",
+  },
+];
+
+export const mockProjects: ProjectRecord[] = [
+  {
+    org_id: "demo",
+    id: "rl",
+    display_name: "RL Research",
+    owner: "alice",
+    enabled: true,
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+  },
+  {
+    org_id: "demo",
+    id: "foundation-models",
+    display_name: "Foundation Models",
+    owner: "bob",
+    enabled: true,
+    created_at: "2026-07-02T00:00:00Z",
+    updated_at: "2026-07-02T00:00:00Z",
+  },
+];
+
+export const mockRoleGrants: DurableRoleGrant[] = [
+  {
+    subject: "alice",
+    grant: { role: "project_admin", org_id: "demo", project_id: "rl" },
+    reason: "Lead researcher",
+    granted_by: "admin",
+    granted_at: "2026-07-01T00:00:00Z",
+  },
+  {
+    subject: "bob",
+    grant: { role: "project_operator", org_id: "demo", project_id: "rl" },
+    reason: "Contributor",
+    granted_by: "alice",
+    granted_at: "2026-07-03T00:00:00Z",
+  },
+];
+
+function flattenConfig(input: Record<string, unknown>, prefix = ""): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input)) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      Object.assign(out, flattenConfig(v as Record<string, unknown>, key));
+    } else {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+export function getMockCompareRuns(input: RunCompareInput, orgId = "demo", projectId = "rl"): RunCompareResponse {
+  const uniqueIds = [...new Set(input.runIds)];
+  const runs = uniqueIds.map((id) => getMockRun(id)).filter((item): item is RunDetail => Boolean(item));
+  const x = input.x ?? "step";
+  const points = input.points ?? 200;
+  const allKeySet = new Set<string>();
+  for (const run of runs) {
+    for (const k of run.keys) allKeySet.add(k);
+  }
+  const allKeys = [...allKeySet].sort();
+  const commonKeys = runs.length ? allKeys.filter((key) => runs.every((run) => run.keys.includes(key))) : [];
+  const selectedKeys = input.keys?.length
+    ? input.keys.filter((key) => allKeySet.has(key))
+    : (commonKeys.length ? commonKeys : allKeys).slice(0, 12);
+
+  const seriesByKey: Record<string, Record<string, RunCompareSeriesData>> = {};
+  const metricSummary: RunCompareMetricSummaryRow[] = [];
+  for (const key of selectedKeys) {
+    const perRun: Record<string, RunCompareSeriesData> = {};
+    const summaryValues: RunCompareMetricSummaryRow["values"] = {};
+    for (let idx = 0; idx < runs.length; idx++) {
+      const run = runs[idx];
+      if (!run.keys.includes(key)) continue;
+      const resp = getMockRunSeries(run, [key], x, points);
+      const item = resp.series[0];
+      if (!item) continue;
+      // Slight deterministic offset per run index so overlaid curves remain visually distinct in demo mode.
+      const shift = idx * 0.05;
+      const xs = item.points.map((pt) => pt[0]);
+      const ys = item.points.map((pt) => (pt[1] === null ? null : Number((pt[1] * (1 - shift)).toFixed(4))));
+      perRun[run.run_id] = { x: xs, y: ys };
+      const finite = ys.filter((v): v is number => v !== null && Number.isFinite(v));
+      summaryValues[run.run_id] = {
+        latest: finite.length ? finite[finite.length - 1] : null,
+        min: finite.length ? Math.min(...finite) : null,
+        max: finite.length ? Math.max(...finite) : null,
+        last_step: run.last_step,
+      };
+    }
+    seriesByKey[key] = perRun;
+    metricSummary.push({ key, values: summaryValues });
+  }
+
+  const flattenedByRun = new Map(runs.map((run) => [run.run_id, flattenConfig(run.config)]));
+  const configKeys = [...new Set(runs.flatMap((run) => Object.keys(flattenedByRun.get(run.run_id) ?? {})))].sort();
+  const configDiff = configKeys
+    .map((key) => {
+      const values: Record<string, unknown> = {};
+      const serialized = new Set<string>();
+      for (const run of runs) {
+        const val = flattenedByRun.get(run.run_id)?.[key];
+        values[run.run_id] = val;
+        serialized.add(JSON.stringify(val));
+      }
+      return { key, values, differs: serialized.size > 1 };
+    })
+    .sort((a, b) => Number(b.differs) - Number(a.differs) || a.key.localeCompare(b.key));
+
+  return {
+    org_id: orgId,
+    project_id: projectId,
+    x,
+    runs,
+    common_keys: commonKeys,
+    all_keys: allKeys,
+    selected_keys: selectedKeys,
+    series_by_key: seriesByKey,
+    config_diff: configDiff,
+    metric_summary: metricSummary,
+  };
+}
+
+export function updateMockRunSharing(
+  runId: string,
+  patch: RunSharingPatch,
+  orgId = "demo",
+  projectId = "rl",
+): RunCollaborationOverlay {
+  const run = mockRuns.find((item) => item.run_id === runId);
+  if (run) {
+    if (patch.visibility !== undefined) run.visibility = patch.visibility;
+    if (patch.shared_with !== undefined) run.shared_with = [...patch.shared_with];
+    if ("experiment_id" in patch) {
+      run.experiment_id = patch.experiment_id ?? null;
+      const exp = mockExperiments.find((candidate) => candidate.id === run.experiment_id);
+      run.experiment = exp ? exp.name : null;
+    }
+    if (patch.pinned !== undefined) run.pinned = patch.pinned;
+    if (patch.owner !== undefined) run.owner = patch.owner;
+  }
+  return {
+    org_id: orgId,
+    project_id: projectId,
+    run_id: runId,
+    owner: run?.owner ?? patch.owner ?? "alice",
+    visibility: run?.visibility ?? patch.visibility ?? "team",
+    shared_with: [...(run?.shared_with ?? patch.shared_with ?? [])],
+    experiment_id: run?.experiment_id ?? patch.experiment_id ?? null,
+    pinned: Boolean(run?.pinned ?? patch.pinned),
+    updated_at: new Date().toISOString(),
+    updated_by: "dashboard-demo",
+  };
+}
+
+export function createMockExperiment(input: ExperimentCreateInput, orgId = "demo", projectId = "rl"): ExperimentRecord {
+  const now = new Date().toISOString();
+  const created: ExperimentRecord = {
+    id: `exp-${Math.random().toString(16).slice(2, 10)}`,
+    org_id: orgId,
+    project_id: projectId,
+    name: input.name,
+    subject: input.subject ?? "",
+    kind: input.kind ?? "experiment",
+    description: input.description ?? "",
+    metric_key: input.metric_key ?? null,
+    goal: input.goal ?? "min",
+    target_value: input.target_value ?? null,
+    group_filter: input.group_filter ?? null,
+    tag_filter: [...(input.tag_filter ?? [])],
+    visibility: input.visibility ?? "team",
+    shared_with: [...(input.shared_with ?? [])],
+    owner: "alice",
+    pinned_baseline_run_id: input.pinned_baseline_run_id ?? null,
+    created_at: now,
+    updated_at: now,
+    notes_count: 0,
+    run_count: 0,
+    running_count: 0,
+  };
+  mockExperiments.unshift(created);
+  return cloneMock(created);
+}
+
+export function updateMockExperiment(expId: string, patch: ExperimentUpdatePatch): ExperimentRecord | undefined {
+  const existing = mockExperiments.find((item) => item.id === expId);
+  if (!existing) return undefined;
+  Object.assign(existing, {
+    ...patch,
+    updated_at: new Date().toISOString(),
+  });
+  return cloneMock(existing);
+}
+
+export function deleteMockExperiment(expId: string): boolean {
+  const index = mockExperiments.findIndex((item) => item.id === expId);
+  if (index === -1) return false;
+  mockExperiments.splice(index, 1);
+  return true;
+}
+
+export function getMockExperimentLeaderboard(expId: string): ExperimentLeaderboardResponse | undefined {
+  const exp = mockExperiments.find((item) => item.id === expId);
+  if (!exp) return undefined;
+  const matched = mockRuns.filter(
+    (run) =>
+      run.experiment_id === exp.id ||
+      (exp.group_filter && run.group === exp.group_filter) ||
+      (exp.tag_filter.length > 0 && exp.tag_filter.every((tag) => run.tags.includes(tag))) ||
+      run.experiment === exp.name,
+  );
+  const metricKey = exp.metric_key;
+  const rawEntries = matched.map((run) => {
+    const val =
+      metricKey && run.latest_metrics && typeof run.latest_metrics[metricKey] === "number"
+        ? run.latest_metrics[metricKey]
+        : metricKey && typeof run.summary[metricKey] === "number"
+          ? (run.summary[metricKey] as number)
+          : null;
+    const reached =
+      val !== null &&
+      exp.target_value !== null &&
+      (exp.goal === "min" ? val <= exp.target_value : val >= exp.target_value);
+    const stepsToTarget = reached && run.last_step !== null ? Math.max(1, Math.round(run.last_step * 0.78)) : null;
+    const timeToTarget = reached && run.duration_s ? Math.round(run.duration_s * 0.72) : null;
+    return {
+      run,
+      best_value: val,
+      latest_value: val,
+      reached_target: reached,
+      steps_to_target: stepsToTarget,
+      time_to_target_s: timeToTarget,
+    };
+  });
+
+  rawEntries.sort((a, b) => {
+    if (exp.target_value !== null && a.reached_target !== b.reached_target) return a.reached_target ? -1 : 1;
+    if (exp.target_value !== null && a.reached_target && b.reached_target) {
+      const ta = a.time_to_target_s ?? Number.POSITIVE_INFINITY;
+      const tb = b.time_to_target_s ?? Number.POSITIVE_INFINITY;
+      if (ta !== tb) return ta - tb;
+    }
+    if (a.best_value === null && b.best_value === null) return b.run.updated_at - a.run.updated_at;
+    if (a.best_value === null) return 1;
+    if (b.best_value === null) return -1;
+    return exp.goal === "min" ? a.best_value - b.best_value : b.best_value - a.best_value;
+  });
+
+  const baselineRunId = exp.pinned_baseline_run_id ?? matched.find((r) => r.pinned)?.run_id ?? null;
+  const baselineEntry = baselineRunId ? rawEntries.find((item) => item.run.run_id === baselineRunId) : undefined;
+  const baselineValue = baselineEntry?.best_value ?? null;
+
+  const entries: ExperimentLeaderboardEntry[] = rawEntries.map((item, idx) => ({
+    rank: idx + 1,
+    run_id: item.run.run_id,
+    name: item.run.name,
+    owner: item.run.owner ?? null,
+    status: item.run.status,
+    visibility: item.run.visibility,
+    pinned: Boolean(item.run.pinned),
+    is_baseline: item.run.run_id === baselineRunId,
+    is_record: idx === 0 && item.best_value !== null,
+    best_value: item.best_value,
+    latest_value: item.latest_value,
+    delta_vs_baseline:
+      item.best_value !== null && baselineValue !== null ? Number((item.best_value - baselineValue).toFixed(4)) : null,
+    reached_target: item.reached_target,
+    steps_to_target: item.steps_to_target,
+    time_to_target_s: item.time_to_target_s,
+    last_step: item.run.last_step,
+    duration_s: item.run.duration_s ?? null,
+    updated_at: item.run.updated_at,
+    tags: item.run.tags,
+    group: item.run.group,
+  }));
+
+  const byOwner = new Map<
+    string,
+    { owner: string; run_count: number; best_value: number | null; reached_target_count: number; running_count: number }
+  >();
+  for (const entry of entries) {
+    const owner = entry.owner ?? "unassigned";
+    const cur = byOwner.get(owner) ?? {
+      owner,
+      run_count: 0,
+      best_value: null,
+      reached_target_count: 0,
+      running_count: 0,
+    };
+    cur.run_count += 1;
+    if (entry.status === "running") cur.running_count += 1;
+    if (entry.reached_target) cur.reached_target_count += 1;
+    if (entry.best_value !== null) {
+      cur.best_value =
+        cur.best_value === null
+          ? entry.best_value
+          : exp.goal === "min"
+            ? Math.min(cur.best_value, entry.best_value)
+            : Math.max(cur.best_value, entry.best_value);
+    }
+    byOwner.set(owner, cur);
+  }
+
+  return cloneMock({
+    experiment: exp,
+    metric_key: exp.metric_key,
+    goal: exp.goal,
+    target_value: exp.target_value,
+    baseline_run_id: baselineRunId,
+    baseline_value: baselineValue,
+    tracker_available: true,
+    entries,
+    researcher_breakdown: [...byOwner.values()],
+    notes_count: mockNotes.filter((n) => n.target_type === "experiment" && n.target_id === exp.id).length,
+  });
+}
+
+export function getMockCollaborationFeed(limit = 30, orgId = "demo", projectId = "rl"): CollaborationFeedResponse {
+  const runs = cloneMock(mockRuns).slice(0, limit);
+  const active = runs.filter((run) => run.status === "running");
+  const researchersMap = new Map<
+    string,
+    { owner: string; total_runs: number; running_runs: number; shared_runs: number; last_active_at: number | null }
+  >();
+  for (const run of runs) {
+    const owner = run.owner ?? "unassigned";
+    const cur = researchersMap.get(owner) ?? {
+      owner,
+      total_runs: 0,
+      running_runs: 0,
+      shared_runs: 0,
+      last_active_at: null,
+    };
+    cur.total_runs += 1;
+    if (run.status === "running") cur.running_runs += 1;
+    if (run.visibility === "team" || run.visibility === "shared") cur.shared_runs += 1;
+    if (cur.last_active_at === null || run.updated_at > cur.last_active_at) cur.last_active_at = run.updated_at;
+    researchersMap.set(owner, cur);
+  }
+  return {
+    org_id: orgId,
+    project_id: projectId,
+    tracker_available: true,
+    active_runs: active,
+    recent_runs: runs,
+    experiments: cloneMock(mockExperiments),
+    recent_notes: cloneMock(mockNotes).slice(0, limit),
+    researchers: [...researchersMap.values()],
+  };
+}
+
+export function createMockNote(input: CollaborationNoteInput, orgId = "demo", projectId = "rl"): CollaborationNote {
+  const note: CollaborationNote = {
+    id: `note-${Math.random().toString(16).slice(2, 10)}`,
+    org_id: orgId,
+    project_id: projectId,
+    target_type: input.target_type,
+    target_id: input.target_id,
+    author: "alice",
+    body: input.body,
+    metric_ref: input.metric_ref ?? null,
+    step_ref: input.step_ref ?? null,
+    created_at: new Date().toISOString(),
+  };
+  mockNotes.unshift(note);
+  return cloneMock(note);
+}
+
+export function deleteMockNote(noteId: string): boolean {
+  const index = mockNotes.findIndex((item) => item.id === noteId);
+  if (index === -1) return false;
+  mockNotes.splice(index, 1);
+  return true;
+}
+
+export function checkMockStorageRegion(input: StorageRegionCheckInput): StorageRegionCheckResult {
+  const match = /^gs:\/\/([^/]+)/i.exec(input.uri.trim());
+  const bucket = match ? match[1] : "";
+  const hostRegion = input.region?.trim() || "us-central2";
+  const allowlisted = Boolean(bucket && input.allowed_buckets?.includes(bucket));
+  const bucketLocation = bucket.includes("eu")
+    ? "europe-west4"
+    : bucket.includes("multi") || bucket.includes("us-multi")
+      ? "us"
+      : "us-central2";
+  const locationType = bucketLocation === "us" ? "multi-region" : "region";
+  const isSame =
+    bucketLocation === hostRegion || (!input.strict && locationType === "multi-region" && hostRegion.startsWith("us-"));
+  const allowed = allowlisted || isSame;
+  return {
+    uri: input.uri,
+    bucket,
+    host_region: hostRegion,
+    bucket_location: bucketLocation,
+    location_type: locationType,
+    allowed,
+    allowlisted,
+    reason: allowlisted
+      ? `Bucket ${bucket} is explicitly allowlisted`
+      : allowed
+        ? `Bucket ${bucket} (${bucketLocation}) is local to ${hostRegion}`
+        : `Cross-region transfer: bucket ${bucket} is in ${bucketLocation}, outside ${hostRegion}`,
+  };
+}
+
+export function createMockWebhook(input: WebhookCreateInput, orgId = "demo", projectId = "rl"): WebhookSubscription {
+  const record: WebhookSubscription = {
+    id: `whk-${Math.random().toString(16).slice(2, 8)}`,
+    org_id: orgId,
+    project_id: projectId,
+    url: input.url,
+    entity_types: [...(input.entity_types ?? [])],
+    actions: [...(input.actions ?? [])],
+    enabled: true,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  mockWebhooks.unshift(record);
+  return cloneMock(record);
+}
+
+export function registerMockProject(input: ProjectRegisterInput): ProjectRecord {
+  const now = new Date().toISOString();
+  const existing = mockProjects.find((p) => p.org_id === input.orgId && p.id === input.projectId);
+  const record: ProjectRecord = {
+    org_id: input.orgId,
+    id: input.projectId,
+    display_name: input.displayName,
+    owner: input.owner,
+    labels: input.labels ?? {},
+    enabled: input.enabled ?? true,
+    created_at: existing?.created_at ?? now,
+    updated_at: now,
+    created_by: "dashboard-demo",
+  };
+  if (existing) Object.assign(existing, record);
+  else mockProjects.push(record);
+  return cloneMock(record);
+}
+
+export function issueMockRoleGrant(input: RoleGrantIssueInput): DurableRoleGrant {
+  const grant: DurableRoleGrant = {
+    subject: input.subject,
+    grant: {
+      role: input.role,
+      org_id: input.role === "fleet_admin" ? null : (input.orgId ?? null),
+      project_id: input.role === "fleet_admin" || input.role === "org_admin" ? null : (input.projectId ?? null),
+    },
+    reason: input.reason ?? "",
+    granted_by: "dashboard-demo",
+    granted_at: new Date().toISOString(),
+  };
+  const idx = mockRoleGrants.findIndex(
+    (g) =>
+      g.subject === grant.subject &&
+      g.grant.role === grant.grant.role &&
+      g.grant.org_id === grant.grant.org_id &&
+      g.grant.project_id === grant.grant.project_id,
+  );
+  if (idx >= 0) mockRoleGrants[idx] = grant;
+  else mockRoleGrants.unshift(grant);
+  return cloneMock(grant);
 }

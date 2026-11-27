@@ -4,11 +4,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
+  checkMockStorageRegion,
   cloneMock,
   createMockAttachment,
+  createMockExperiment,
+  createMockNote,
+  createMockWebhook,
+  deleteMockExperiment,
+  deleteMockNote,
+  getMockCollaborationFeed,
+  getMockCompareRuns,
+  getMockExperimentLeaderboard,
+  issueMockRoleGrant,
   mockAttachmentJobs,
   mockAttachmentPlan,
   mockDiscoveredTpus,
+  mockExperiments,
+  mockManagedArtifacts,
+  mockNotes,
+  mockProjects,
+  mockRoleGrants,
+  mockWebhooks,
   createMockWorkload,
   getMockWorkload,
   getMockRun,
@@ -33,6 +49,9 @@ import {
   mockLeases,
   mockPolicies,
   mockWorkloads,
+  registerMockProject,
+  updateMockExperiment,
+  updateMockRunSharing,
 } from "./mockData";
 import {
   apiAuthHeaders,
@@ -90,16 +109,34 @@ import type {
   CapacityPoolSummary,
   ProjectUsage,
   Budget,
+  BudgetPutInput,
   CapacityLease,
   Cell,
+  CollaborationFeedResponse,
+  CollaborationNote,
+  CollaborationNoteInput,
   ControlPlaneHealth,
+  DurableRoleGrant,
   EffectiveProjectScope,
+  ExperimentCreateInput,
+  ExperimentKind,
+  ExperimentLeaderboardResponse,
+  ExperimentRecord,
+  ExperimentUpdatePatch,
   LaunchLatencyReport,
   LogEntry,
+  ManagedArtifact,
   OverviewData,
   PolicyPutRequest,
   PolicyUpdatePatch,
   PriorityBand,
+  ProjectRecord,
+  ProjectRegisterInput,
+  RoleGrantIssueInput,
+  RoleGrantRevokeInput,
+  RunCollaborationOverlay,
+  RunCompareInput,
+  RunCompareResponse,
   RunDetail,
   RunRollout,
   RunRolloutsOptions,
@@ -109,6 +146,7 @@ import type {
   RunCompletionsResponse,
   CompletionStatsOptions,
   CompletionStatsResponse,
+  RunSharingPatch,
   RunTableOptions,
   RunTableResponse,
   RunMediaOptions,
@@ -128,10 +166,14 @@ import type {
   SchedulingPolicy,
   SessionAuthority,
   SessionPermission,
+  StorageRegionCheckInput,
+  StorageRegionCheckResult,
   StorageStatus,
   SubmitWorkloadInput,
   TpuQuotaSnapshot,
   WarmthReport,
+  WebhookCreateInput,
+  WebhookSubscription,
   WorkloadExplanation,
   WorkloadProcessStatus,
   WorkloadSpend,
@@ -260,6 +302,7 @@ interface RawBudget {
   limit: number;
   period: string;
   hard_limit: boolean;
+  alert_thresholds?: number[];
   accelerator_hour_limits: Record<string, number>;
   accelerator_hours_spent: Record<string, number>;
   currency: string;
@@ -787,10 +830,18 @@ export class EyvanApiClient {
     return this.requestBody(path, init, timeoutMs, async (response) => (await response.json()) as T);
   }
 
+  private requestEmpty(path: string, init: RequestInit = {}, timeoutMs = CONTROL_PLANE_TIMEOUT_MS): Promise<void> {
+    return this.requestBody(path, init, timeoutMs, async () => undefined);
+  }
+
   private attachmentRequest<T>(path: string, init: RequestInit = {}, timeoutMs?: number): Promise<T> {
     // Public literal paths keep the browser route inventory auditable; the
     // shared requester still applies the configured API base and auth headers.
     return this.request<T>(path.replace(/^\/api\/v1/, ""), init, timeoutMs);
+  }
+
+  private attachmentRequestEmpty(path: string, init: RequestInit = {}, timeoutMs?: number): Promise<void> {
+    return this.requestEmpty(path.replace(/^\/api\/v1/, ""), init, timeoutMs);
   }
 
   async planAttachment(input: AttachmentInput, signal?: AbortSignal): Promise<AttachmentPlan> {
@@ -2283,6 +2334,11 @@ export class EyvanApiClient {
       forecast: forecasts[index],
       period: budget.period,
       enforcement: budget.hard_limit ? "hard" : "soft",
+      alertThresholds: Array.isArray(budget.alert_thresholds) ? [...budget.alert_thresholds] : undefined,
+      acceleratorHourLimits:
+        budget.accelerator_hour_limits && Object.keys(budget.accelerator_hour_limits).length
+          ? { ...budget.accelerator_hour_limits }
+          : undefined,
     }));
   }
 
@@ -2558,26 +2614,59 @@ export class EyvanApiClient {
     ];
     const nextCrossRegionAllowMultiregion =
       patch.crossRegionAllowMultiregion ?? policy.crossRegionAllowMultiregion ?? true;
+    const baseConfig = policy.configuration;
+    const nextConfig = baseConfig
+      ? {
+          allowedProviders: patch.allowedProviders ?? baseConfig.allowedProviders,
+          allowedRegions: patch.allowedRegions ?? baseConfig.allowedRegions,
+          allowedCapacityClasses: patch.allowedCapacityClasses ?? baseConfig.allowedCapacityClasses,
+          deniedAcceleratorTypes: patch.deniedAcceleratorTypes ?? baseConfig.deniedAcceleratorTypes,
+          allowedSecretReferences: patch.allowedSecretReferences ?? baseConfig.allowedSecretReferences ?? [],
+          maxPriority: patch.maxPriority ?? baseConfig.maxPriority,
+        }
+      : patch.allowedProviders !== undefined ||
+          patch.allowedRegions !== undefined ||
+          patch.allowedCapacityClasses !== undefined ||
+          patch.deniedAcceleratorTypes !== undefined ||
+          patch.maxPriority !== undefined
+        ? {
+            allowedProviders: patch.allowedProviders ?? [],
+            allowedRegions: patch.allowedRegions ?? [],
+            allowedCapacityClasses: patch.allowedCapacityClasses ?? [],
+            deniedAcceleratorTypes: patch.deniedAcceleratorTypes ?? [],
+            allowedSecretReferences: patch.allowedSecretReferences ?? [],
+            maxPriority: patch.maxPriority ?? 1000,
+          }
+        : undefined;
     if (this.forceDemo) {
-      return {
+      const updated: SchedulingPolicy = {
         ...cloneMock(policy),
         preemptionEnabled: nextPreemptionEnabled,
         crossRegionTransferPolicy: nextCrossRegionTransferPolicy,
         crossRegionAllowedBuckets: nextCrossRegionAllowedBuckets,
         crossRegionAllowMultiregion: nextCrossRegionAllowMultiregion,
         updatedAt: new Date().toISOString(),
+        ...(nextConfig ? { configuration: nextConfig } : {}),
       };
+      if (nextConfig) {
+        const constraints = [
+          nextConfig.allowedRegions.join(", ") || "all regions",
+          nextConfig.allowedCapacityClasses.join(", ") || "all capacity classes",
+          nextConfig.allowedProviders.join(", ") || "all providers",
+        ].join("; ");
+        updated.summary = `${constraints}; preemption ${nextPreemptionEnabled ? "enabled" : "disabled"}`;
+      }
+      return updated;
     }
     const requestScope = this.scopeSnapshot(scope);
-    const configuration = policy.configuration;
-    if (!configuration) throw new ApiError(`Policy ${policy.id} is missing its editable configuration`);
+    if (!nextConfig) throw new ApiError(`Policy ${policy.id} is missing its editable configuration`);
     const payload: PolicyPutRequest = {
-      allowed_providers: configuration.allowedProviders,
-      allowed_regions: configuration.allowedRegions,
-      allowed_capacity_classes: configuration.allowedCapacityClasses,
-      denied_accelerator_types: configuration.deniedAcceleratorTypes,
-      allowed_secret_references: configuration.allowedSecretReferences ?? [],
-      max_priority: configuration.maxPriority,
+      allowed_providers: nextConfig.allowedProviders,
+      allowed_regions: nextConfig.allowedRegions,
+      allowed_capacity_classes: nextConfig.allowedCapacityClasses,
+      denied_accelerator_types: nextConfig.deniedAcceleratorTypes,
+      allowed_secret_references: nextConfig.allowedSecretReferences,
+      max_priority: nextConfig.maxPriority,
       preemption_enabled: nextPreemptionEnabled,
       cross_region_transfer_policy: nextCrossRegionTransferPolicy,
       cross_region_allowed_buckets: nextCrossRegionAllowedBuckets,
@@ -2605,6 +2694,406 @@ export class EyvanApiClient {
     signal?: AbortSignal,
   ): Promise<SchedulingPolicy> {
     return this.updatePolicy(policy, patch, scope, signal);
+  }
+
+  async putBudget(input: BudgetPutInput, signal?: AbortSignal): Promise<Budget> {
+    if (this.forceDemo) {
+      const id = `${input.orgId}/${input.projectId}`;
+      const existing = mockBudgets.find((b) => b.id === id || b.owner === input.projectId);
+      const updated: Budget = {
+        id,
+        owner: input.projectId,
+        scope: "project",
+        spent: existing?.spent ?? 0,
+        limit: input.limit,
+        forecast: existing?.forecast,
+        period: input.period,
+        enforcement: input.hardLimit ? "hard" : "soft",
+        alertThresholds: input.alertThresholds ? [...input.alertThresholds] : undefined,
+        acceleratorHourLimits: input.acceleratorHourLimits ? { ...input.acceleratorHourLimits } : undefined,
+      };
+      const idx = mockBudgets.findIndex((b) => b.id === id || b.owner === input.projectId);
+      if (idx >= 0) mockBudgets[idx] = updated;
+      else mockBudgets.push(updated);
+      return cloneMock(updated);
+    }
+    const payload = {
+      limit: input.limit,
+      period: input.period,
+      hard_limit: input.hardLimit,
+      alert_thresholds: input.alertThresholds ?? [],
+      accelerator_hour_limits: input.acceleratorHourLimits ?? {},
+      currency: "USD",
+    };
+    const raw = await this.request<RawBudget>(
+      `/budgets/${encodeURIComponent(input.orgId)}/${encodeURIComponent(input.projectId)}`,
+      {
+        method: "PUT",
+        headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+        body: JSON.stringify(payload),
+        signal,
+      },
+    );
+    return {
+      id: `${raw.org_id}/${raw.project_id}`,
+      owner: raw.project_id,
+      scope: "project",
+      spent: raw.spent,
+      limit: raw.limit,
+      period: raw.period,
+      enforcement: raw.hard_limit ? "hard" : "soft",
+      alertThresholds: Array.isArray(raw.alert_thresholds) ? [...raw.alert_thresholds] : undefined,
+      acceleratorHourLimits:
+        raw.accelerator_hour_limits && Object.keys(raw.accelerator_hour_limits).length
+          ? { ...raw.accelerator_hour_limits }
+          : undefined,
+    };
+  }
+
+  async deleteCell(cellId: string, signal?: AbortSignal): Promise<{ id: string; state: string }> {
+    if (this.forceDemo) throw new ApiError("Demo mode has no fleet cell to delete", 400);
+    const raw = await this.request<RawCell>(`/cells/${encodeURIComponent(cellId)}`, {
+      method: "DELETE",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      signal,
+    });
+    return { id: raw.id, state: raw.state };
+  }
+
+  async listWebhooks(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<WebhookSubscription[]> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return cloneMock(mockWebhooks);
+    return this.request<WebhookSubscription[]>(this.scope("/webhooks", immutableScope), { signal });
+  }
+
+  async createWebhook(
+    input: WebhookCreateInput,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<WebhookSubscription> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return createMockWebhook(input, immutableScope.orgId, immutableScope.projectId);
+    return this.request<WebhookSubscription>("/webhooks", {
+      method: "POST",
+      body: JSON.stringify({
+        org_id: immutableScope.orgId,
+        project_id: immutableScope.projectId,
+        url: input.url,
+        secret: input.secret,
+        entity_types: input.entity_types ?? [],
+        actions: input.actions ?? [],
+      }),
+      signal,
+    });
+  }
+
+  async deleteWebhook(webhookId: string, signal?: AbortSignal): Promise<WebhookSubscription> {
+    if (this.forceDemo) {
+      const idx = mockWebhooks.findIndex((item) => item.id === webhookId);
+      if (idx === -1) throw new ApiError("Webhook not found", 404);
+      const [removed] = mockWebhooks.splice(idx, 1);
+      return cloneMock(removed);
+    }
+    return this.request<WebhookSubscription>(`/webhooks/${encodeURIComponent(webhookId)}`, {
+      method: "DELETE",
+      signal,
+    });
+  }
+
+  async checkStorageRegion(input: StorageRegionCheckInput, signal?: AbortSignal): Promise<StorageRegionCheckResult> {
+    if (this.forceDemo) return checkMockStorageRegion(input);
+    return this.attachmentRequest<StorageRegionCheckResult>("/api/v1/storage/check-region", {
+      method: "POST",
+      body: JSON.stringify({
+        uri: input.uri,
+        ...(input.region ? { region: input.region } : {}),
+        strict: Boolean(input.strict),
+        allowed_buckets: input.allowed_buckets ?? [],
+      }),
+      signal,
+    });
+  }
+
+  async listManagedArtifacts(scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<ManagedArtifact[]> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return cloneMock(mockManagedArtifacts);
+    return this.request<ManagedArtifact[]>(this.scope("/artifacts", immutableScope), { signal });
+  }
+
+  async listProjects(orgId: string, signal?: AbortSignal): Promise<ProjectRecord[]> {
+    if (this.forceDemo) return cloneMock(mockProjects);
+    return this.request<ProjectRecord[]>(`/organizations/${encodeURIComponent(orgId)}/projects`, { signal });
+  }
+
+  async registerProject(input: ProjectRegisterInput, signal?: AbortSignal): Promise<ProjectRecord> {
+    if (this.forceDemo) return registerMockProject(input);
+    return this.request<ProjectRecord>(
+      `/organizations/${encodeURIComponent(input.orgId)}/projects/${encodeURIComponent(input.projectId)}`,
+      {
+        method: "PUT",
+        headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+        body: JSON.stringify({
+          display_name: input.displayName,
+          owner: input.owner,
+          enabled: input.enabled ?? true,
+          labels: input.labels ?? {},
+        }),
+        signal,
+      },
+    );
+  }
+
+  async listRoleGrants(
+    options: { subject?: string; orgId?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<DurableRoleGrant[]> {
+    if (this.forceDemo) {
+      return cloneMock(mockRoleGrants).filter(
+        (item) =>
+          (!options.subject || item.subject === options.subject) &&
+          (!options.orgId || item.grant.org_id === options.orgId),
+      );
+    }
+    const query = new URLSearchParams();
+    if (options.subject) query.set("subject", options.subject);
+    if (options.orgId) query.set("org_id", options.orgId);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return this.request<DurableRoleGrant[]>(`/grants${suffix}`, { signal });
+  }
+
+  async issueRoleGrant(input: RoleGrantIssueInput, signal?: AbortSignal): Promise<DurableRoleGrant> {
+    if (this.forceDemo) return issueMockRoleGrant(input);
+    const orgId = input.role === "fleet_admin" ? null : (input.orgId ?? null);
+    const projectId = input.role === "fleet_admin" || input.role === "org_admin" ? null : (input.projectId ?? null);
+    return this.request<DurableRoleGrant>("/grants", {
+      method: "POST",
+      headers: { "Idempotency-Key": globalThis.crypto?.randomUUID?.() ?? `dashboard-${Date.now()}` },
+      body: JSON.stringify({
+        subject: input.subject,
+        grant: { role: input.role, org_id: orgId, project_id: projectId },
+        reason: input.reason ?? "",
+      }),
+      signal,
+    });
+  }
+
+  async revokeRoleGrant(input: RoleGrantRevokeInput, signal?: AbortSignal): Promise<void> {
+    if (this.forceDemo) {
+      const idx = mockRoleGrants.findIndex(
+        (item) =>
+          item.subject === input.subject &&
+          item.grant.role === input.role &&
+          (item.grant.org_id ?? "") === (input.orgId ?? "") &&
+          (item.grant.project_id ?? "") === (input.projectId ?? ""),
+      );
+      if (idx >= 0) mockRoleGrants.splice(idx, 1);
+      return;
+    }
+    const query = new URLSearchParams({
+      subject: input.subject,
+      role: input.role,
+      org_id: input.orgId ?? "",
+      project_id: input.projectId ?? "",
+    });
+    await this.requestEmpty(`/grants?${query.toString()}`, { method: "DELETE", signal });
+  }
+
+  // Collaborative runs, multi-run comparison, experiments & speedruns, team notes & feed.
+
+  async compareRuns(
+    input: RunCompareInput,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunCompareResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return getMockCompareRuns(input, immutableScope.orgId, immutableScope.projectId);
+    return this.attachmentRequest<RunCompareResponse>("/api/v1/tracking/compare", {
+      method: "POST",
+      body: JSON.stringify({
+        org_id: immutableScope.orgId,
+        project_id: immutableScope.projectId,
+        run_ids: input.runIds,
+        keys: input.keys ?? [],
+        x: input.x ?? "step",
+        points: input.points ?? 300,
+      }),
+      signal,
+    });
+  }
+
+  async updateRunSharing(
+    runId: string,
+    patch: RunSharingPatch,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<RunCollaborationOverlay> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return updateMockRunSharing(runId, patch, immutableScope.orgId, immutableScope.projectId);
+    return this.attachmentRequest<RunCollaborationOverlay>(
+      this.scope(`/api/v1/collaboration/runs/${encodeURIComponent(runId)}`, immutableScope),
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+        signal,
+      },
+    );
+  }
+
+  async listExperiments(
+    options: { kind?: ExperimentKind; subject?: string; visibility?: string } = {},
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<ExperimentRecord[]> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      return cloneMock(mockExperiments).filter(
+        (exp) =>
+          (!options.kind || exp.kind === options.kind) &&
+          (!options.subject || exp.subject === options.subject) &&
+          (!options.visibility || exp.visibility === options.visibility),
+      );
+    }
+    const query = new URLSearchParams();
+    if (options.kind) query.set("kind", options.kind);
+    if (options.subject) query.set("subject", options.subject);
+    if (options.visibility) query.set("visibility", options.visibility);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    const resp = await this.attachmentRequest<{ experiments: ExperimentRecord[] }>(
+      this.scope(`/api/v1/collaboration/experiments${suffix}`, immutableScope),
+      { signal },
+    );
+    return resp.experiments;
+  }
+
+  async createExperiment(
+    input: ExperimentCreateInput,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<ExperimentRecord> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return createMockExperiment(input, immutableScope.orgId, immutableScope.projectId);
+    return this.attachmentRequest<ExperimentRecord>("/api/v1/collaboration/experiments", {
+      method: "POST",
+      body: JSON.stringify({
+        org_id: immutableScope.orgId,
+        project_id: immutableScope.projectId,
+        ...input,
+      }),
+      signal,
+    });
+  }
+
+  async updateExperiment(
+    expId: string,
+    patch: ExperimentUpdatePatch,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<ExperimentRecord> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const updated = updateMockExperiment(expId, patch);
+      if (!updated) throw new ApiError("Experiment not found", 404);
+      return updated;
+    }
+    return this.attachmentRequest<ExperimentRecord>(
+      this.scope(`/api/v1/collaboration/experiments/${encodeURIComponent(expId)}`, immutableScope),
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+        signal,
+      },
+    );
+  }
+
+  async deleteExperiment(expId: string, scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<void> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      if (!deleteMockExperiment(expId)) throw new ApiError("Experiment not found", 404);
+      return;
+    }
+    await this.attachmentRequestEmpty(
+      this.scope(`/api/v1/collaboration/experiments/${encodeURIComponent(expId)}`, immutableScope),
+      { method: "DELETE", signal },
+    );
+  }
+
+  async getExperimentLeaderboard(
+    expId: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<ExperimentLeaderboardResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      const board = getMockExperimentLeaderboard(expId);
+      if (!board) throw new ApiError("Experiment not found", 404);
+      return board;
+    }
+    return this.attachmentRequest<ExperimentLeaderboardResponse>(
+      this.scope(`/api/v1/collaboration/experiments/${encodeURIComponent(expId)}/leaderboard`, immutableScope),
+      { signal },
+    );
+  }
+
+  async getCollaborationFeed(
+    limit = 30,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<CollaborationFeedResponse> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return getMockCollaborationFeed(limit, immutableScope.orgId, immutableScope.projectId);
+    const query = new URLSearchParams({ limit: String(limit) });
+    return this.attachmentRequest<CollaborationFeedResponse>(
+      this.scope(`/api/v1/collaboration/feed?${query.toString()}`, immutableScope),
+      { signal },
+    );
+  }
+
+  async listNotes(
+    targetType: "run" | "experiment",
+    targetId: string,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<CollaborationNote[]> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      return cloneMock(mockNotes).filter((note) => note.target_type === targetType && note.target_id === targetId);
+    }
+    const query = new URLSearchParams({ target_type: targetType, target_id: targetId });
+    const resp = await this.attachmentRequest<{ notes: CollaborationNote[] }>(
+      this.scope(`/api/v1/collaboration/notes?${query.toString()}`, immutableScope),
+      { signal },
+    );
+    return resp.notes;
+  }
+
+  async createNote(
+    input: CollaborationNoteInput,
+    scope: AuthScope = this.activeScope,
+    signal?: AbortSignal,
+  ): Promise<CollaborationNote> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) return createMockNote(input, immutableScope.orgId, immutableScope.projectId);
+    return this.attachmentRequest<CollaborationNote>("/api/v1/collaboration/notes", {
+      method: "POST",
+      body: JSON.stringify({
+        org_id: immutableScope.orgId,
+        project_id: immutableScope.projectId,
+        ...input,
+      }),
+      signal,
+    });
+  }
+
+  async deleteNote(noteId: string, scope: AuthScope = this.activeScope, signal?: AbortSignal): Promise<void> {
+    const immutableScope = this.scopeSnapshot(scope);
+    if (this.forceDemo) {
+      if (!deleteMockNote(noteId)) throw new ApiError("Note not found", 404);
+      return;
+    }
+    await this.attachmentRequestEmpty(
+      this.scope(`/api/v1/collaboration/notes/${encodeURIComponent(noteId)}`, immutableScope),
+      { method: "DELETE", signal },
+    );
   }
 }
 

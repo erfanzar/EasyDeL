@@ -39,9 +39,35 @@ describe("hash queries", () => {
 
 describe("every section the rail offers", () => {
   it("parses back to itself, so pressing it and reloading land in the same place", () => {
-    for (const section of ["workloads", "fleet", "capacity", "billing", "budgets", "audit"] as const) {
+    for (const section of [
+      "workloads",
+      "runs",
+      "experiments",
+      "fleet",
+      "capacity",
+      "billing",
+      "budgets",
+      "audit",
+    ] as const) {
       expect(parseRoute(routeHash({ section }))).toEqual({ section });
     }
+  });
+});
+
+describe("multi-run compare and experiment routes", () => {
+  it("parses #/runs/compare?ids=... before generic runId and round trips cleanly", () => {
+    const route = { section: "runs", compareIds: ["run-a", "run/b"] } as const;
+    expect(routeHash(route)).toBe("#/runs/compare?ids=run-a,run%2Fb");
+    expect(parseRoute(routeHash(route))).toEqual(route);
+    expect(parseRoute("#/runs/compare")).toEqual({ section: "runs", compareIds: [] });
+  });
+
+  it("round trips experiment detail routes and enforces section availability", () => {
+    const route = { section: "experiments", experimentId: "exp_123" } as const;
+    expect(routeHash(route)).toBe("#/experiments/exp_123");
+    expect(parseRoute(routeHash(route))).toEqual(route);
+    expect(accessibleRoute(route, { experiments: false })).toEqual({ section: "overview" });
+    expect(accessibleRoute(route, { experiments: true })).toEqual(route);
   });
 });
 

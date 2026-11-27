@@ -25,6 +25,7 @@ import {
   ServerCog,
   Settings,
   Sparkles,
+  Trophy,
   X,
 } from "lucide-react";
 
@@ -71,6 +72,7 @@ const navigation: Array<{
   { section: "overview", label: "Overview", icon: LayoutDashboard },
   { section: "workloads", label: "Workloads", icon: ClipboardList },
   { section: "runs", label: "Runs", icon: ChartNoAxesCombined },
+  { section: "experiments", label: "Experiments", icon: Trophy },
   { section: "research", label: "Research", icon: FlaskConical },
   { section: "fleet", label: "Fleet", icon: ServerCog },
   { section: "capacity", label: "Quota & capacity", icon: Gauge },
@@ -84,6 +86,10 @@ const pageMeta: Record<Section, { title: string; description: string }> = {
   overview: { title: "Operations overview", description: "Global scheduling and capacity state" },
   workloads: { title: "Workloads", description: "Queue, placement, and execution lifecycle" },
   runs: { title: "Runs", description: "Training metrics, evaluation and attempt history" },
+  experiments: {
+    title: "Experiments",
+    description: "Collaborative experiments, speedrun leaderboards, and team notes",
+  },
   research: {
     title: "Research",
     description: "Budgeted research plans the assistant proposed; nothing runs until you approve one",
@@ -151,11 +157,15 @@ export function Shell({
   const detailId =
     "workloadId" in route
       ? route.workloadId
-      : "runId" in route
-        ? route.runId
-        : "planId" in route
-          ? route.planId
-          : undefined;
+      : "compareIds" in route
+        ? `${route.compareIds.length} runs`
+        : "runId" in route
+          ? route.runId
+          : "experimentId" in route
+            ? route.experimentId
+            : "planId" in route
+              ? route.planId
+              : undefined;
   const connected = health?.status === "ok";
   const initials =
     identity?.displayName
@@ -375,11 +385,15 @@ export function Shell({
           <nav className="page-title" aria-label="Breadcrumb">
             <h1>
               {detailId
-                ? route.section === "runs"
-                  ? "Run detail"
-                  : route.section === "research"
-                    ? "Research plan"
-                    : "Workload detail"
+                ? "compareIds" in route
+                  ? "Compare runs"
+                  : route.section === "runs"
+                    ? "Run detail"
+                    : route.section === "experiments"
+                      ? "Experiment"
+                      : route.section === "research"
+                        ? "Research plan"
+                        : "Workload detail"
                 : meta.title}
             </h1>
             {detailId && (

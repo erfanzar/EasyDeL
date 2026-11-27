@@ -65,18 +65,34 @@ describe("Runs navigation and authority integration", () => {
     expect(await screen.findByRole("heading", { name: "Workloads" })).toBeDefined();
   });
 
-  it("does not mount tracking reads for a submit-only identity's run deep link", async () => {
+  it("allows a project submitter (--tier user) to access collaborative Runs and Experiments", async () => {
     const client = new EyvanApiClient("/api/v1", true);
     const authority = await client.getSessionAuthority();
     authority.globalPermissions = [];
     authority.scopes[0].permissions = ["submit"];
     vi.spyOn(client, "getSessionAuthority").mockResolvedValue(authority);
+    window.location.hash = "#/runs/pong-seed-3";
+    render(<App client={client} />);
+    await screen.findByRole("button", { name: "Submit workload" });
+    expect(screen.getByRole("button", { name: "Runs" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Experiments" })).toBeDefined();
+    expect(await screen.findByRole("img", { name: "loss/policy chart" })).toBeDefined();
+  });
+
+  it("does not mount tracking reads for an identity without read or submit access", async () => {
+    const client = new EyvanApiClient("/api/v1", true);
+    const authority = await client.getSessionAuthority();
+    authority.globalPermissions = [];
+    authority.scopes[0].permissions = [];
+    authority.scopes[0].acceptsNewWork = false;
+    vi.spyOn(client, "getSessionAuthority").mockResolvedValue(authority);
     const getRun = vi.spyOn(client, "getRun");
     const listRuns = vi.spyOn(client, "listRuns");
     window.location.hash = "#/runs/pong-seed-3";
     render(<App client={client} />);
-    await screen.findByRole("button", { name: "Submit workload" });
+    await screen.findByRole("heading", { name: "Operations overview" });
     expect(screen.queryByRole("button", { name: "Runs" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Experiments" })).toBeNull();
     expect(getRun).not.toHaveBeenCalled();
     expect(listRuns).not.toHaveBeenCalled();
   });
