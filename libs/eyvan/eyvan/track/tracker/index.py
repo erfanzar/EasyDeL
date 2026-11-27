@@ -44,6 +44,9 @@ from eyvan.track.tracker.records import integer, validate_episode, validate_hist
 
 _METRIC_KEY = re.compile(r"[A-Za-z0-9_./-]{1,128}")
 _DROP_KEYS = ("keys", "rate", "invalid", "queue")
+_VALID_VISIBILITIES = frozenset({"private", "shared", "team"})
+_PRESERVE_IDENTITY_IF_NONE = frozenset({"workload_id", "owner", "visibility", "experiment"})
+_MAX_LATEST_METRICS = 24
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS segments (
     segment TEXT PRIMARY KEY, org TEXT NOT NULL, project TEXT NOT NULL, run TEXT NOT NULL,
@@ -67,6 +70,14 @@ CREATE TABLE IF NOT EXISTS scalars (
     axes TEXT NOT NULL, PRIMARY KEY(segment, line, metric)
 );
 CREATE INDEX IF NOT EXISTS scalar_metric ON scalars(metric, segment, step);
+CREATE TABLE IF NOT EXISTS latest_scalars (
+    org TEXT NOT NULL, project TEXT NOT NULL, run TEXT NOT NULL,
+    metric TEXT NOT NULL, rank INTEGER NOT NULL,
+    step INTEGER NOT NULL, attempt INTEGER NOT NULL, seq INTEGER NOT NULL,
+    line INTEGER NOT NULL, writer TEXT NOT NULL, value REAL NOT NULL,
+    PRIMARY KEY(org, project, run, metric, rank)
+);
+CREATE INDEX IF NOT EXISTS latest_scalars_scope ON latest_scalars(org, project, run, metric, rank);
 CREATE TABLE IF NOT EXISTS scan_state (id INTEGER PRIMARY KEY CHECK(id = 1), last_scan_at REAL);
 """
 
@@ -138,9 +149,13 @@ def _validate_records(stream: str, records: list[dict[str, object]]) -> list[dic
         if op == "start":
             if record.get("fmt", FORMAT_VERSION) != FORMAT_VERSION:
                 raise ValueError("unsupported tracking format version")
-            for field in ("name", "group", "workload_id"):
+            for field in ("name", "group", "workload_id", "owner", "experiment"):
                 if record.get(field) is not None and not isinstance(record[field], str):
                     raise ValueError("invalid run identity metadata")
+            if record.get("visibility") is not None and (
+                not isinstance(record["visibility"], str) or record["visibility"] not in _VALID_VISIBILITIES
+            ):
+                raise ValueError("invalid run visibility metadata")
             if "tags" in record and (
                 not isinstance(record["tags"], list) or not all(isinstance(tag, str) for tag in record["tags"])
             ):
@@ -188,6 +203,33 @@ class TrackingIndex(PhaseThreeIndexMixin):
         self._scan_lock = threading.Lock()
         with self._connection() as db:
             phase3.populate_summaries(db)
+            self._populate_latest_scalars(db)
+
+    @staticmethod
+    def _populate_latest_scalars(db: sqlite3.Connection) -> None:
+        """Backfill ``latest_scalars`` once when opening an index created before the table existed."""
+
+        if db.execute("SELECT 1 FROM latest_scalars LIMIT 1").fetchone() is not None:
+            return
+        if db.execute("SELECT 1 FROM scalars WHERE value IS NOT NULL LIMIT 1").fetchone() is None:
+            return
+        db.execute(
+            """INSERT OR REPLACE INTO latest_scalars
+               (org, project, run, metric, rank, step, attempt, seq, line, writer, value)
+               SELECT org, project, run, metric, rank, step, attempt, seq, line, writer, value
+               FROM (
+                   SELECT s.org, s.project, s.run, v.metric, s.rank, v.step, s.attempt, s.seq,
+                          v.line, s.writer, v.value,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY s.org, s.project, s.run, v.metric, s.rank
+                              ORDER BY v.step DESC, s.attempt DESC, s.seq DESC, v.line DESC, s.writer DESC
+                          ) AS rn
+                   FROM scalars v
+                   JOIN segments s USING(segment)
+                   WHERE v.value IS NOT NULL
+               )
+               WHERE rn = 1"""
+        )
 
     @contextmanager
     def _connection(self) -> tp.Iterator[sqlite3.Connection]:
@@ -247,7 +289,7 @@ class TrackingIndex(PhaseThreeIndexMixin):
                         "INSERT INTO segments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (key, org, project, run, stream, name.attempt, name.rank, name.writer, name.seq, error),
                     )
-                    self._insert_records(db, key, stream, records)
+                    self._insert_records(db, key, stream, records, segment_identity=(org, project, run, name))
                 ingested += 1
                 seen.add(key)
             now = time.time()
@@ -257,7 +299,15 @@ class TrackingIndex(PhaseThreeIndexMixin):
         return ScanResult(ingested, total, errors, now)
 
     @staticmethod
-    def _insert_records(db: sqlite3.Connection, key: str, stream: str, records: list[dict[str, tp.Any]]) -> None:
+    def _insert_records(
+        db: sqlite3.Connection,
+        key: str,
+        stream: str,
+        records: list[dict[str, tp.Any]],
+        *,
+        segment_identity: tuple[str, str, str, SegmentName] | None = None,
+    ) -> None:
+        latest_finite: dict[str, tuple[int, int, float]] = {}
         for line, r in enumerate(records):
             payload = json.dumps(r, allow_nan=False) if stream != "scalars" else ""
             if stream in phase3_records.STREAMS:
@@ -280,21 +330,50 @@ class TrackingIndex(PhaseThreeIndexMixin):
                     "INSERT INTO scalar_records VALUES (?, ?, ?, ?, ?)",
                     (key, line, r["step"], r["t"], json.dumps(r["x"])),
                 )
-                db.executemany(
-                    "INSERT INTO scalars VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            key,
-                            line,
-                            metric,
-                            r["step"],
-                            r["t"],
-                            value if math.isfinite(value) else None,
-                            json.dumps(r["x"]),
-                        )
-                        for metric, value in r["v"].items()
-                    ],
-                )
+                step = r["step"]
+                rows_to_insert = []
+                axes_json = json.dumps(r["x"])
+                for metric, value in r["v"].items():
+                    finite_value = value if math.isfinite(value) else None
+                    rows_to_insert.append((key, line, metric, step, r["t"], finite_value, axes_json))
+                    if finite_value is not None:
+                        previous = latest_finite.get(metric)
+                        if previous is None or (step, line) >= (previous[0], previous[1]):
+                            latest_finite[metric] = (step, line, finite_value)
+                db.executemany("INSERT INTO scalars VALUES (?, ?, ?, ?, ?, ?, ?)", rows_to_insert)
+        if stream == "scalars" and latest_finite and segment_identity is not None:
+            org, project, run, seg_name = segment_identity
+            db.executemany(
+                """INSERT INTO latest_scalars
+                   (org, project, run, metric, rank, step, attempt, seq, line, writer, value)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(org, project, run, metric, rank) DO UPDATE SET
+                       step = excluded.step,
+                       attempt = excluded.attempt,
+                       seq = excluded.seq,
+                       line = excluded.line,
+                       writer = excluded.writer,
+                       value = excluded.value
+                   WHERE (excluded.step, excluded.attempt, excluded.seq, excluded.line, excluded.writer)
+                       >= (latest_scalars.step, latest_scalars.attempt, latest_scalars.seq,
+                           latest_scalars.line, latest_scalars.writer)""",
+                [
+                    (
+                        org,
+                        project,
+                        run,
+                        metric,
+                        seg_name.rank,
+                        step,
+                        seg_name.attempt,
+                        seg_name.seq,
+                        line,
+                        seg_name.writer,
+                        value,
+                    )
+                    for metric, (step, line, value) in latest_finite.items()
+                ],
+            )
 
     def rebuild(self, store: TrackingStore) -> ScanResult:
         """Clear only index data and reconstruct it from the authoritative store."""
@@ -381,7 +460,15 @@ class TrackingIndex(PhaseThreeIndexMixin):
         summary: dict[str, tp.Any] = {}
         config_order: tuple[tp.Any, ...] = ()
         identity_order: dict[str, tuple[tp.Any, ...]] = {}
-        identity: dict[str, tp.Any] = {"name": run, "group": None, "tags": [], "workload_id": None}
+        identity: dict[str, tp.Any] = {
+            "name": run,
+            "group": None,
+            "tags": [],
+            "workload_id": None,
+            "owner": None,
+            "visibility": "team",
+            "experiment": None,
+        }
         writer_stats: dict[tuple[int, int, str], dict[str, tp.Any]] = {}
         for row in meta:
             record = json.loads(row["payload"])
@@ -392,7 +479,7 @@ class TrackingIndex(PhaseThreeIndexMixin):
                 for key in identity:
                     if (
                         key in record
-                        and (record[key] is not None or key != "workload_id")
+                        and (record[key] is not None or key not in _PRESERVE_IDENTITY_IF_NONE)
                         and order > identity_order.get(key, ())
                     ):
                         identity[key] = record[key]
@@ -404,6 +491,8 @@ class TrackingIndex(PhaseThreeIndexMixin):
                 summary.update(record["summary"])
             elif op == "finish":
                 attempts[attempt]["status"] = record["status"]
+                if isinstance(record.get("summary"), dict):
+                    summary.update(record["summary"])
             elif op == "stats":
                 writer_stats[(attempt, row["rank"], row["writer"])] = record
         for attempt, entry in attempts.items():
@@ -419,7 +508,31 @@ class TrackingIndex(PhaseThreeIndexMixin):
             scope,
         ).fetchall()
         keys = [row[0] for row in metric_rows]
+        latest_rows = db.execute(
+            """SELECT ls.metric, ls.value
+               FROM latest_scalars ls
+               WHERE ls.org = ? AND ls.project = ? AND ls.run = ?
+                 AND ls.rank = (
+                     SELECT MIN(rank) FROM latest_scalars
+                     WHERE org = ls.org AND project = ls.project AND run = ls.run AND metric = ls.metric
+                 )
+               ORDER BY ls.metric
+               LIMIT ?""",
+            (*scope, _MAX_LATEST_METRICS),
+        ).fetchall()
+        latest_metrics = {
+            row["metric"]: float(row["value"])
+            for row in latest_rows
+            if isinstance(row["value"], int | float) and math.isfinite(row["value"])
+        }
         last_steps = [r["last_step"] for r in attempts.values() if r["last_step"] is not None]
+        started_at = min(all_times) if all_times else None
+        updated_at = max(all_times) if all_times else None
+        duration_s = (
+            round(updated_at - started_at, 3)
+            if isinstance(started_at, int | float) and isinstance(updated_at, int | float)
+            else None
+        )
         result = {
             "run_id": run,
             "org_id": org,
@@ -427,11 +540,13 @@ class TrackingIndex(PhaseThreeIndexMixin):
             **identity,
             "status": status,
             "attempts": len(attempts),
-            "started_at": min(all_times) if all_times else None,
-            "updated_at": max(all_times) if all_times else None,
+            "started_at": started_at,
+            "updated_at": updated_at,
+            "duration_s": duration_s,
             "last_step": max(last_steps) if last_steps else None,
             "keys_count": len(keys),
             "summary": summary,
+            "latest_metrics": latest_metrics,
         }
         if not include_detail:
             return result

@@ -67,6 +67,7 @@ def test_tracking_dispatch_is_scoped_and_unset_is_byte_identical(callable_job, m
         "RUNTIME": "preserved",
         "USER_VALUE": "unchanged",
         "EYVAN_WORKLOAD_ID": "wl-1",
+        "EYVAN_WORKLOAD_OWNER": "alice",
         "EYVAN_ATTEMPT": "1",
         "EYVAN_RESUME_CHECKPOINT_URI": "",
     }

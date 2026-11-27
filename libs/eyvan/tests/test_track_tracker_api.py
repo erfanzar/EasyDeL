@@ -63,14 +63,19 @@ def test_routes_shapes_and_initial_scan(tracker: tuple[LocalTrackingStore, Track
             "name",
             "group",
             "tags",
+            "owner",
+            "visibility",
+            "experiment",
             "status",
             "workload_id",
             "attempts",
             "started_at",
             "updated_at",
+            "duration_s",
             "last_step",
             "keys_count",
             "summary",
+            "latest_metrics",
         }
         assert summary["name"] == "PPO"
         assert summary["status"] == "running"

@@ -1028,10 +1028,14 @@ class _ControllerWorkloadCommands:
         environment = {
             **runtime_environment,
             **workload.spec.environment,
-            "EYVAN_WORKLOAD_ID": workload.id,
-            "EYVAN_ATTEMPT": str(workload.attempt),
-            "EYVAN_RESUME_CHECKPOINT_URI": workload.checkpoint_uri or "",
         }
+        # Strip any user- or runtime-supplied owner before writing Eyvan-owned identity.
+        environment.pop("EYVAN_WORKLOAD_OWNER", None)
+        environment["EYVAN_WORKLOAD_ID"] = workload.id
+        if workload.created_by:
+            environment["EYVAN_WORKLOAD_OWNER"] = workload.created_by
+        environment["EYVAN_ATTEMPT"] = str(workload.attempt)
+        environment["EYVAN_RESUME_CHECKPOINT_URI"] = workload.checkpoint_uri or ""
         # Strip any user- or runtime-supplied cross-region guard variables before
         # writing Eyvan-owned values (defense in depth alongside distributed_environment).
         for key in list(environment):

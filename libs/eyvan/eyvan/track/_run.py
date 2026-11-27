@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import atexit
 import bisect
+import getpass
 import itertools
 import json
 import math
@@ -79,6 +80,19 @@ def _safe_hostname() -> str:
         return socket.gethostname()
     except OSError:
         return "unknown"
+
+
+def _safe_username() -> str | None:
+    try:
+        user = getpass.getuser()
+    except Exception:
+        return None
+    cleaned = user.strip()
+    return cleaned[:_MAX_NAME] if cleaned else None
+
+
+#: Valid run visibility values accepted by :func:`start`.
+VALID_VISIBILITIES: tuple[str, ...] = ("private", "shared", "team")
 
 
 #: Local store used when a run starts outside an Eyvan job with no ``uri``.
@@ -421,6 +435,9 @@ class Run:
         attempt: int,
         rank: int,
         workload_id: str | None,
+        owner: str | None = None,
+        visibility: str | None = None,
+        experiment: str | None = None,
         active: bool,
         limits: TrackLimits,
         flush_interval_s: float,
@@ -434,6 +451,9 @@ class Run:
         self.attempt = attempt
         self.rank = rank
         self.workload_id = workload_id
+        self.owner = owner
+        self.visibility = visibility
+        self.experiment = experiment
         self.active = active
         #: Episodes may be recorded on ranks that record nothing else (actors).
         self.episodes_active = active if episodes_active is None else episodes_active
@@ -480,21 +500,26 @@ class Run:
         if not self._writing:
             return
         if active:
-            self._buffers[fmt.STREAM_META].append(
-                {
-                    "op": fmt.META_START,
-                    "t": clock(),
-                    "fmt": fmt.FORMAT_VERSION,
-                    "name": name,
-                    "group": group,
-                    "tags": list(tags),
-                    "workload_id": workload_id,
-                    "attempt": attempt,
-                    "rank": rank,
-                    "host": _safe_hostname(),
-                    "pid": os.getpid(),
-                }
-            )
+            start_record: dict[str, object] = {
+                "op": fmt.META_START,
+                "t": clock(),
+                "fmt": fmt.FORMAT_VERSION,
+                "name": name,
+                "group": group,
+                "tags": list(tags),
+                "workload_id": workload_id,
+                "attempt": attempt,
+                "rank": rank,
+                "host": _safe_hostname(),
+                "pid": os.getpid(),
+            }
+            if owner is not None:
+                start_record["owner"] = owner
+            if visibility is not None:
+                start_record["visibility"] = visibility
+            if experiment is not None:
+                start_record["experiment"] = experiment
+            self._buffers[fmt.STREAM_META].append(start_record)
             self._pending = 1
         _install_excepthook()
         atexit.register(self._at_exit)
@@ -1521,6 +1546,9 @@ def start(
     environment: tp.Mapping[str, str] | None = None,
     clock: Clock | None = None,
     auto_name: bool | None = None,
+    owner: str | None = None,
+    visibility: str | None = None,
+    experiment: str | None = None,
 ) -> Run:
     """Start (or resume) a tracked run.
 
@@ -1556,6 +1584,11 @@ def start(
             ``None`` (default) generates a name for fresh runs with no explicit
             ``run_id`` or workload id; ``True`` always generates a name when
             ``name`` is ``None``; ``False`` preserves ``name = run_id``.
+        owner: Researcher or principal attributed to this run; defaults to
+            ``EYVAN_WORKLOAD_OWNER`` or the current system username.
+        visibility: Initial visibility (``"private"``, ``"shared"``, or
+            ``"team"``); when omitted, the tracker treats the run as ``"team"``.
+        experiment: Optional experiment or speedrun name/subject label.
 
     Returns:
         The run handle.
@@ -1575,12 +1608,26 @@ def start(
         raise ValueError(f"group must be a non-empty string of at most {_MAX_NAME} characters")
     if auto_name is not None and not isinstance(auto_name, bool):
         raise ValueError("auto_name must be a boolean or None")
+    if owner is not None and (not isinstance(owner, str) or not owner.strip() or len(owner) > _MAX_NAME):
+        raise ValueError(f"owner must be a non-empty string of at most {_MAX_NAME} characters")
+    if visibility is not None and (not isinstance(visibility, str) or visibility not in VALID_VISIBILITIES):
+        raise ValueError('visibility must be "private", "shared", or "team"')
+    if experiment is not None and (
+        not isinstance(experiment, str) or not experiment.strip() or len(experiment) > _MAX_NAME
+    ):
+        raise ValueError(f"experiment must be a non-empty string of at most {_MAX_NAME} characters")
     tag_list = tuple(tags)
     if len(tag_list) > _MAX_TAGS or any(not isinstance(tag, str) or not tag or len(tag) > 64 for tag in tag_list):
         raise ValueError(f"tags must be at most {_MAX_TAGS} non-empty strings of at most 64 characters")
     if not isinstance(flush_interval_s, int | float) or isinstance(flush_interval_s, bool) or flush_interval_s <= 0:
         raise ValueError("flush_interval_s must be a positive number")
     workload_id = env.get("EYVAN_WORKLOAD_ID") or None
+    if owner is not None:
+        resolved_owner: str | None = owner.strip()
+    else:
+        env_owner = (env.get("EYVAN_WORKLOAD_OWNER") or "").strip()
+        resolved_owner = env_owner[:_MAX_NAME] if env_owner else _safe_username()
+    resolved_experiment = experiment.strip() if experiment is not None else None
     effective_name = name
     if effective_name is None:
         use_auto_name = (run_id is None and workload_id is None) if auto_name is None else auto_name
@@ -1634,6 +1681,9 @@ def start(
         attempt=attempt,
         rank=rank,
         workload_id=workload_id,
+        owner=resolved_owner,
+        visibility=visibility,
+        experiment=resolved_experiment,
         active=ranks == "all" or rank == 0,
         limits=limits or TrackLimits(),
         flush_interval_s=float(flush_interval_s),

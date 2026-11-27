@@ -121,6 +121,7 @@ from eyvan.server.api.auth import (
     TokenVerifier,
     authenticated_principal,
 )
+from eyvan.server.api.collab_routes import register_collaboration_routes
 from eyvan.server.api.dashboard_sessions import (
     DashboardSessionStore,
     register_dashboard_auth_routes,
@@ -210,6 +211,7 @@ from eyvan.server.persistence.local import LocalJsonRepository
 from eyvan.server.persistence.memory import InMemoryRepository
 from eyvan.server.persistence.sqlalchemy import SqlAlchemyRepository, create_schema
 from eyvan.server.service.callable_trust import CallableProjectTrustPolicy
+from eyvan.server.service.collaboration import CollaborationStore
 from eyvan.server.service.control_plane import (
     DEFAULT_ARTIFACT_GRACE_PERIOD_S,
     QUEUE_TREND_MAX_BUCKETS,
@@ -590,6 +592,7 @@ def create_app(
     soak_evidence: SoakEvidenceStore | None = None,
     quota_discovery: TpuQuotaDiscovery | None = None,
     server_startup: ServerStartupSettings | None = None,
+    collaboration_store: CollaborationStore | None = None,
 ) -> FastAPI:
     """Build an application with injectable auth, service, and persistence adapters.
 
@@ -769,6 +772,11 @@ def create_app(
         secret_capability=secret_capability,
     )
     workload_progress = WorkloadProgressResolver(service, repository)
+    if collaboration_store is None:
+        if isinstance(repository, InMemoryRepository) or settings.repository_backend is RepositoryBackend.MEMORY:
+            collaboration_store = CollaborationStore(":memory:")
+        else:
+            collaboration_store = CollaborationStore(Path(settings.local_state_path).parent / "collaboration.sqlite3")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -789,6 +797,7 @@ def create_app(
                 )
         except BaseException:
             await controller.close()
+            collaboration_store.close()
             await repository.close()
             if engine is not None:
                 await engine.dispose()
@@ -838,6 +847,7 @@ def create_app(
                 if unfinished:
                     logger.warning("%d assistant save(s) did not finish before shutdown", len(unfinished))
             await controller.close()
+            collaboration_store.close()
             await repository.close()
             if engine is not None:
                 await engine.dispose()
@@ -858,8 +868,10 @@ def create_app(
     # The dashboard's backend-for-frontend auth: login/callback/logout. The
     # routes self-check the OIDC configuration, so mounting them on a plane
     # without one only makes the endpoints answer 404.
+    app.state.collaboration_store = collaboration_store
     register_dashboard_auth_routes(app, settings=settings, store=dashboard_sessions)
-    register_tracking_routes(app, settings=settings, service=service)
+    register_tracking_routes(app, settings=settings, service=service, collaboration_store=collaboration_store)
+    register_collaboration_routes(app, settings=settings, service=service, store=collaboration_store)
     register_attachment_routes(app, settings=settings, service=service, server_bind=server_bind)
     register_team_routes(app, settings=settings, service=service)
     register_assistant_routes(app, settings=settings, service=service)

@@ -803,8 +803,350 @@ def runs_blob(session: CliSession, run_id: str, sha256: str, output: Path, force
     click.echo(f"Wrote {len(data)} bytes ({media_type or 'unknown type'}) to {output}")
 
 
+@track.command("share")
+@click.argument("run_id")
+@click.option(
+    "--visibility",
+    type=click.Choice(["private", "shared", "team"]),
+    default=None,
+    help="Visibility policy for this run.",
+)
+@click.option(
+    "--with",
+    "shared_with",
+    multiple=True,
+    metavar="USER",
+    help="Grant selective read access to a teammate subject (repeatable).",
+)
+@click.option(
+    "--experiment",
+    "experiment_id",
+    default=None,
+    help="Link this run to an experiment/speedrun ID (pass 'none' to unlink).",
+)
+@click.option("--pin/--unpin", "pinned", default=None, help="Pin or unpin this run as a baseline.")
+@click.option("--json", "as_json", is_flag=True, help="Print the updated overlay as JSON.")
+@click.pass_obj
+def track_share(
+    session: CliSession,
+    run_id: str,
+    visibility: str | None,
+    shared_with: tuple[str, ...],
+    experiment_id: str | None,
+    pinned: bool | None,
+    as_json: bool,
+) -> None:
+    """Update visibility, selective sharing, experiment link, or baseline pin for a run."""
+
+    body: dict[str, object] = {}
+    if visibility is not None:
+        body["visibility"] = visibility
+    elif shared_with:
+        body["visibility"] = "shared"
+    if shared_with:
+        body["shared_with"] = list(shared_with)
+    if experiment_id is not None:
+        cleaned = experiment_id.strip()
+        body["experiment_id"] = None if not cleaned or cleaned.lower() == "none" else cleaned
+    if pinned is not None:
+        body["pinned"] = pinned
+    if not body:
+        raise click.ClickException("specify at least one of --visibility, --with, --experiment, or --pin/--unpin")
+    payload = session.client.request(
+        "PATCH",
+        f"/api/v1/collaboration/runs/{_run_path(run_id)}",
+        params=_scope_params(session),
+        json=body,
+    )
+    if as_json or not isinstance(payload, dict):
+        _emit_json(payload)
+        return
+    shared_list = payload.get("shared_with") or []
+    shared_str = f" (shared with {', '.join(str(u) for u in shared_list)})" if shared_list else ""
+    pin_str = " · pinned" if payload.get("pinned") else ""
+    exp_str = f" · experiment {payload['experiment_id']}" if payload.get("experiment_id") else ""
+    click.echo(
+        f"Run {payload.get('run_id', run_id)} · {payload.get('visibility', 'team')}{shared_str}{exp_str}{pin_str}"
+    )
+
+
+@track.command("compare")
+@click.argument("run_ids", nargs=-1, required=True)
+@click.option("--key", "keys", multiple=True, help="Metric key to compare (repeatable).")
+@click.option("--x", "x_axis", default="step", show_default=True, help="X-axis (step, time, or custom axis).")
+@click.option("--points", type=click.IntRange(1, 2000), default=300, show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Print comparison payload as JSON.")
+@click.pass_obj
+def track_compare(
+    session: CliSession,
+    run_ids: tuple[str, ...],
+    keys: tuple[str, ...],
+    x_axis: str,
+    points: int,
+    as_json: bool,
+) -> None:
+    """Compare multiple runs side by side (metrics summary and hyperparameter diffs)."""
+
+    validated: list[str] = []
+    for rid in run_ids:
+        try:
+            validated.append(validate_run_id(rid))
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    payload = session.client.request(
+        "POST",
+        "/api/v1/tracking/compare",
+        json={
+            **_scope_params(session),
+            "run_ids": validated,
+            "keys": list(keys),
+            "x": x_axis,
+            "points": points,
+        },
+    )
+    if as_json or not isinstance(payload, dict):
+        _emit_json(payload)
+        return
+    runs_list = payload.get("runs") if isinstance(payload.get("runs"), list) else []
+    click.echo(f"Comparing {len(runs_list)} run(s) on x={payload.get('x', x_axis)}:")
+    for run in runs_list:
+        if isinstance(run, dict):
+            click.echo(
+                f"  {run.get('run_id', '-'):24} {run.get('status', 'unknown'):9} "
+                f"owner={run.get('owner') or '-':12} name={run.get('name', '')}"
+            )
+    summaries = payload.get("metric_summary") if isinstance(payload.get("metric_summary"), list) else []
+    if summaries:
+        click.echo("\nMetrics:")
+        for row in summaries:
+            if not isinstance(row, dict):
+                continue
+            vals = row.get("values") if isinstance(row.get("values"), dict) else {}
+            parts = []
+            for rid in validated:
+                stat = vals.get(rid) if isinstance(vals.get(rid), dict) else {}
+                latest = stat.get("latest")
+                parts.append(f"{rid}={'-' if latest is None else f'{latest:.4g}'}")
+            click.echo(f"  {row.get('key', '-'):24} {'  '.join(parts)}")
+    diffs = [
+        item
+        for item in (payload.get("config_diff") if isinstance(payload.get("config_diff"), list) else [])
+        if isinstance(item, dict) and item.get("differs")
+    ]
+    if diffs:
+        click.echo("\nConfig differences:")
+        for item in diffs:
+            vals = item.get("values") if isinstance(item.get("values"), dict) else {}
+            parts = [f"{rid}={vals.get(rid)!r}" for rid in validated]
+            click.echo(f"  {item.get('key', '-'):24} {'  '.join(parts)}")
+
+
+@track.command("note")
+@click.argument("run_id")
+@click.argument("message")
+@click.option("--metric", "metric_ref", default=None, help="Optional metric key referenced by this note.")
+@click.option("--step", "step_ref", type=click.IntRange(0), default=None, help="Optional step number referenced.")
+@click.option("--json", "as_json", is_flag=True, help="Print the created note as JSON.")
+@click.pass_obj
+def track_note(
+    session: CliSession,
+    run_id: str,
+    message: str,
+    metric_ref: str | None,
+    step_ref: int | None,
+    as_json: bool,
+) -> None:
+    """Attach a team note to a tracked run."""
+
+    valid_id = _run_path(run_id)
+    del valid_id
+    payload = session.client.request(
+        "POST",
+        "/api/v1/collaboration/notes",
+        json={
+            **_scope_params(session),
+            "target_type": "run",
+            "target_id": run_id,
+            "body": message,
+            "metric_ref": metric_ref,
+            "step_ref": step_ref,
+        },
+    )
+    if as_json or not isinstance(payload, dict):
+        _emit_json(payload)
+        return
+    ref_parts = []
+    if payload.get("metric_ref"):
+        ref_parts.append(f"metric={payload['metric_ref']}")
+    if payload.get("step_ref") is not None:
+        ref_parts.append(f"step={payload['step_ref']}")
+    suffix = f" ({', '.join(ref_parts)})" if ref_parts else ""
+    click.echo(f"Note {payload.get('id', '-')} added to run {run_id}{suffix}")
+
+
+@click.group("experiments")
+def experiments() -> None:
+    """Manage collaborative experiments, speedruns, and leaderboards."""
+
+
+@experiments.command("list")
+@click.option("--kind", type=click.Choice(["experiment", "speedrun"]), default=None)
+@click.option("--subject", default=None, help="Filter by research subject/topic.")
+@click.option("--visibility", type=click.Choice(["private", "shared", "team"]), default=None)
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def experiments_list(
+    session: CliSession,
+    kind: str | None,
+    subject: str | None,
+    visibility: str | None,
+    as_json: bool,
+) -> None:
+    """List experiments and speedruns in the active project."""
+
+    params: dict[str, str | int] = {**_scope_params(session)}
+    if kind is not None:
+        params["kind"] = kind
+    if subject is not None:
+        params["subject"] = subject
+    if visibility is not None:
+        params["visibility"] = visibility
+    payload = session.client.request("GET", "/api/v1/collaboration/experiments", params=params)
+    rows = payload.get("experiments") if isinstance(payload, dict) else None
+    if as_json or not isinstance(rows, list):
+        _emit_json(payload)
+        return
+    if not rows:
+        click.echo("No experiments or speedruns in this project.")
+        return
+    for exp in rows:
+        if isinstance(exp, dict):
+            metric = exp.get("metric_key") or "-"
+            goal = exp.get("goal") or "min"
+            target = f" target={exp['target_value']}" if exp.get("target_value") is not None else ""
+            click.echo(
+                f"{exp.get('id', '-'):18} {exp.get('kind', 'experiment'):10} "
+                f"{exp.get('visibility', 'team'):7} {exp.get('owner', '-'):12} "
+                f"{exp.get('name', ''):28} {metric} ({goal}){target}"
+            )
+
+
+@experiments.command("create")
+@click.argument("name")
+@click.option("--subject", default="", help="Topic or research area label.")
+@click.option("--speedrun", is_flag=True, help="Create a speedrun leaderboard instead of a general experiment.")
+@click.option("--description", default="", help="Optional description or rules.")
+@click.option("--metric", "metric_key", default=None, help="Primary metric key to rank runs on.")
+@click.option("--goal", type=click.Choice(["min", "max"]), default="min", show_default=True)
+@click.option("--target", "target_value", type=float, default=None, help="Target metric threshold for speedruns.")
+@click.option("--group", "group_filter", default=None, help="Auto-include runs matching this group.")
+@click.option("--tag", "tag_filter", multiple=True, help="Auto-include runs containing these tags (repeatable).")
+@click.option(
+    "--visibility",
+    type=click.Choice(["team", "private", "shared"]),
+    default="team",
+    show_default=True,
+)
+@click.option("--with", "shared_with", multiple=True, metavar="USER", help="Share with subject (repeatable).")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def experiments_create(
+    session: CliSession,
+    name: str,
+    subject: str,
+    speedrun: bool,
+    description: str,
+    metric_key: str | None,
+    goal: str,
+    target_value: float | None,
+    group_filter: str | None,
+    tag_filter: tuple[str, ...],
+    visibility: str,
+    shared_with: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    """Create a new experiment or speedrun leaderboard."""
+
+    payload = session.client.request(
+        "POST",
+        "/api/v1/collaboration/experiments",
+        json={
+            **_scope_params(session),
+            "name": name,
+            "subject": subject,
+            "kind": "speedrun" if speedrun else "experiment",
+            "description": description,
+            "metric_key": metric_key,
+            "goal": goal,
+            "target_value": target_value,
+            "group_filter": group_filter,
+            "tag_filter": list(tag_filter),
+            "visibility": visibility,
+            "shared_with": list(shared_with),
+        },
+    )
+    if as_json or not isinstance(payload, dict):
+        _emit_json(payload)
+        return
+    click.echo(
+        f"Created {payload.get('kind', 'experiment')} {payload.get('id', '-')} · {payload.get('name', name)} "
+        f"({payload.get('visibility', visibility)})"
+    )
+
+
+@experiments.command("leaderboard")
+@click.argument("exp_id")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def experiments_leaderboard(session: CliSession, exp_id: str, as_json: bool) -> None:
+    """Show the ranked leaderboard for an experiment or speedrun."""
+
+    payload = session.client.request(
+        "GET",
+        f"/api/v1/collaboration/experiments/{_run_path(exp_id)}/leaderboard",
+        params=_scope_params(session),
+    )
+    if as_json or not isinstance(payload, dict):
+        _emit_json(payload)
+        return
+    exp = payload.get("experiment") if isinstance(payload.get("experiment"), dict) else {}
+    click.echo(
+        f"{exp.get('name', exp_id)} ({exp.get('kind', 'experiment')}) · "
+        f"metric={payload.get('metric_key') or '-'} ({payload.get('goal', 'min')})"
+        + (f" · target={payload['target_value']}" if payload.get("target_value") is not None else "")
+    )
+    if not payload.get("tracker_available", True):
+        click.echo("Tracker is currently unavailable; no live runs loaded.")
+        return
+    entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+    if not entries:
+        click.echo("No runs matched this experiment yet.")
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        best = entry.get("best_value")
+        delta = entry.get("delta_vs_baseline")
+        target_str = ""
+        if payload.get("target_value") is not None:
+            if entry.get("reached_target"):
+                t_s = entry.get("time_to_target_s")
+                st = entry.get("steps_to_target")
+                target_str = f"  REACHED({t_s}s/{st}steps)"
+            else:
+                target_str = "  in-progress"
+        record_badge = " *RECORD" if entry.get("is_record") else ""
+        delta_str = "" if delta is None else f"  delta={delta:+.4g}"
+        click.echo(
+            f"#{entry.get('rank', '?'):<3} {entry.get('run_id', '-'):24} "
+            f"{entry.get('owner') or '-':12} {entry.get('status', 'unknown'):9} "
+            f"best={'-' if best is None else f'{best:.4g}':>10}{delta_str}{target_str}{record_badge}"
+        )
+
+
 def register_track_commands(main: click.Group) -> None:
-    """Add tracking commands without changing existing CLI defaults or sessions."""
+    """Add tracking and collaboration commands without changing existing CLI defaults or sessions."""
 
     main.add_command(track)
     main.add_command(runs)
+    main.add_command(experiments)
