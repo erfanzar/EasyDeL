@@ -172,5 +172,72 @@ def test_causal_parity_vs_f32_xla_head_dim_and_gqa(num_q_heads, num_kv_heads, he
     assert mean_abs < 5e-3, f"mean abs err {mean_abs} (hd={head_dim}, {num_q_heads}:{num_kv_heads})"
 
 
+@pytest.mark.parametrize("fused_backward", [False, True], ids=["split_bwd", "fused_bwd"])
+@pytest.mark.parametrize("num_q_heads,num_kv_heads", [(24, 4), (4, 1)], ids=["gqa24:4", "gqa4:1"])
+def test_packed_segments_fwd_and_bwd_parity_vs_xla(fused_backward, num_q_heads, num_kv_heads):
+    """Packed multi-document segments (with padding and non-monotonic IDs) match XLA on fwd and dQ/dK/dV."""
+    from ejkernel.ops import BwdParams, FwdParams
+
+    key = jax.random.PRNGKey(123 if not fused_backward else 456)
+    _, kq, kk, kv, kcot = jax.random.split(key, 5)
+
+    batch, seq_len, head_dim = 2, 2048, 128
+    q = jax.random.normal(kq, (batch, num_q_heads, seq_len, head_dim), dtype=jnp.float32) * 0.25
+    k = jax.random.normal(kk, (batch, num_kv_heads, seq_len, head_dim), dtype=jnp.float32) * 0.25
+    v = jax.random.normal(kv, (batch, num_kv_heads, seq_len, head_dim), dtype=jnp.float32) * 0.25
+    cot = jax.random.normal(kcot, (batch, num_q_heads, seq_len, head_dim), dtype=jnp.float32) * 0.25
+
+    # Row 0: 4 packed docs + trailing padding (-1/-2) spanning multiple 256-token blocks
+    # Row 1: non-monotonic segment IDs [3, 0, 2, 1] + leading/trailing padding
+    q_seg = jnp.full((batch, seq_len), -1, dtype=jnp.int32)
+    q_seg = q_seg.at[0, 0:300].set(0)
+    q_seg = q_seg.at[0, 300:900].set(1)
+    q_seg = q_seg.at[0, 900:1450].set(2)
+    q_seg = q_seg.at[0, 1450:1700].set(3)
+    q_seg = q_seg.at[1, 128:600].set(3)
+    q_seg = q_seg.at[1, 600:1100].set(0)
+    q_seg = q_seg.at[1, 1100:1600].set(2)
+    q_seg = q_seg.at[1, 1600:1900].set(1)
+    kv_seg = jnp.where(q_seg < 0, jnp.int32(-2), q_seg)
+    valid = (q_seg >= 0)[:, None, :, None].astype(jnp.float32)
+
+    fwd_p = FwdParams(q_blocksize=256, kv_blocksize=256)
+    bwd_p = BwdParams(q_blocksize=256, kv_blocksize=256)
+
+    def _loss_pallas(qa, ka, va):
+        out = blocksparse_attention(
+            qa,
+            ka,
+            va,
+            q_segment_ids=q_seg,
+            kv_segment_ids=kv_seg,
+            causal=True,
+            fwd_params=fwd_p,
+            bwd_params=bwd_p,
+            fused_backward=fused_backward,
+        )
+        return jnp.sum(out * valid * cot), out
+
+    def _loss_xla(qa, ka, va):
+        out = blocksparse_attention_xla(
+            qa,
+            ka,
+            va,
+            q_segment_ids=q_seg,
+            kv_segment_ids=kv_seg,
+            causal=True,
+        )
+        return jnp.sum(out * valid * cot), out
+
+    (_, out_p), grads_p = jax.value_and_grad(_loss_pallas, argnums=(0, 1, 2), has_aux=True)(q, k, v)
+    (_, out_x), grads_x = jax.value_and_grad(_loss_xla, argnums=(0, 1, 2), has_aux=True)(q, k, v)
+
+    assert jnp.isfinite(out_p).all()
+    assert float(jnp.max(jnp.abs((out_p - out_x) * valid))) < 5e-3
+    for gp, gx in zip(grads_p, grads_x, strict=True):
+        assert jnp.isfinite(gp).all()
+        assert float(jnp.max(jnp.abs(gp - gx))) < 1e-2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -278,9 +278,13 @@ class BlockSparseAttn(OperationImpl):
 
         blocksparse_cfg = self.metadata.get_operation_config("blocksparse")
         if blocksparse_cfg is None and is_tpu:
+            q_blk_fwd = 1024 if query_length % 1024 == 0 else 512
+            k_blk_fwd = 1024 if key_length % 1024 == 0 else 512
+            q_blk_bwd = 1024 if query_length % 1024 == 0 else 512
+            k_blk_bwd = 512 if (query_dim >= 256 or key_length % 1024 != 0) else 1024
             blocksparse_cfg = BlockSparseAttentionConfig(
-                fwd_params=FwdParams(q_blocksize=512, kv_blocksize=512),
-                bwd_params=BwdParams(q_blocksize=512, kv_blocksize=512),
+                fwd_params=FwdParams(q_blocksize=q_blk_fwd, kv_blocksize=k_blk_fwd),
+                bwd_params=BwdParams(q_blocksize=q_blk_bwd, kv_blocksize=k_blk_bwd),
             )
         base_cfg = self.metadata.base_config
         q_block_size = _extract_block_size(

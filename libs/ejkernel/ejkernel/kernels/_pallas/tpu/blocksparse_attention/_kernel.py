@@ -780,6 +780,134 @@ def _next_nonzero(
     return next_j, next_m, is_nonzero, should_not_mask
 
 
+def _fill_next_index(values: jax.Array, active: jax.Array, axis: int) -> jax.Array:
+    """Fill inactive positions along ``axis`` with the next active value (or last active / 0).
+
+    Keeping ``data_next`` and ``mask_next`` constant across consecutive skipped blocks
+    prevents Mosaic from issuing redundant HBM-to-VMEM DMA prefetches.
+    """
+    width = values.shape[axis]
+    idx_shape = [1] * values.ndim
+    idx_shape[axis] = width
+    idx_grid = jnp.arange(width, dtype=jnp.int32).reshape(idx_shape)
+    next_pos = jax.lax.associative_scan(
+        jnp.minimum,
+        jnp.where(active, idx_grid, jnp.int32(width)),
+        axis=axis,
+        reverse=True,
+    )
+    prev_pos = jax.lax.associative_scan(
+        jnp.maximum,
+        jnp.where(active, idx_grid, jnp.int32(-1)),
+        axis=axis,
+        reverse=False,
+    )
+    target_pos = jnp.where(next_pos < width, next_pos, jnp.maximum(prev_pos, jnp.int32(0)))
+    return jnp.take_along_axis(values, target_pos, axis=axis)
+
+
+def _intersect_mask_info_with_segments(
+    mask_info: mask_info_lib.MaskInfo,
+    segment_ids: SegmentIds | None,
+    *,
+    bq: int,
+    bkv: int,
+    is_dkv: bool,
+    preserve_nonempty_rows: bool,
+) -> mask_info_lib.MaskInfo:
+    """Prune block-sparse metadata dynamically using runtime ``segment_ids``.
+
+    Computes an exact zero-false-negative block overlap matrix between Q blocks
+    and KV blocks by checking non-negative and negative segment ID intervals
+    separately (so negative padding sentinels such as ``-1`` vs ``-2`` do not
+    widen positive ranges and are pruned cleanly). Disjoint blocks are zeroed
+    in ``block_mask`` and ``data_next`` / ``mask_next`` are updated so Mosaic
+    skips both compute and DMA transfers for cross-document blocks.
+    """
+    if segment_ids is None or mask_info.block_mask is None or mask_info.data_next is None:
+        return mask_info
+
+    q_seq_len = segment_ids.q.shape[0]
+    kv_seq_len = segment_ids.kv.shape[0]
+    if q_seq_len % bq != 0 or kv_seq_len % bkv != 0:
+        return mask_info
+
+    num_q_blocks = q_seq_len // bq
+    num_kv_blocks = kv_seq_len // bkv
+
+    orig_bm = jnp.asarray(mask_info.block_mask)
+    orig_dn = jnp.asarray(mask_info.data_next)
+    if orig_bm.ndim != 3 or orig_dn.shape != orig_bm.shape:
+        return mask_info
+    if is_dkv and orig_bm.shape[2] != num_kv_blocks:
+        return mask_info
+    if not is_dkv and orig_bm.shape[1] != num_q_blocks:
+        return mask_info
+
+    q_seg = segment_ids.q.astype(jnp.int32).reshape(num_q_blocks, bq)
+    kv_seg = segment_ids.kv.astype(jnp.int32).reshape(num_kv_blocks, bkv)
+
+    int32_max = jnp.int32(np.iinfo(np.int32).max)
+    int32_min = jnp.int32(np.iinfo(np.int32).min)
+
+    q_is_pos = q_seg >= 0
+    kv_is_pos = kv_seg >= 0
+    q_pos_min = jnp.min(jnp.where(q_is_pos, q_seg, int32_max), axis=1)
+    q_pos_max = jnp.max(jnp.where(q_is_pos, q_seg, jnp.int32(-1)), axis=1)
+    kv_pos_min = jnp.min(jnp.where(kv_is_pos, kv_seg, int32_max), axis=1)
+    kv_pos_max = jnp.max(jnp.where(kv_is_pos, kv_seg, jnp.int32(-1)), axis=1)
+    pos_overlap = (
+        (q_pos_max[:, None] >= kv_pos_min[None, :])
+        & (kv_pos_max[None, :] >= q_pos_min[:, None])
+        & (q_pos_max[:, None] >= 0)
+        & (kv_pos_max[None, :] >= 0)
+    )
+
+    q_is_neg = ~q_is_pos
+    kv_is_neg = ~kv_is_pos
+    q_neg_min = jnp.min(jnp.where(q_is_neg, q_seg, jnp.int32(0)), axis=1)
+    q_neg_max = jnp.max(jnp.where(q_is_neg, q_seg, int32_min), axis=1)
+    kv_neg_min = jnp.min(jnp.where(kv_is_neg, kv_seg, jnp.int32(0)), axis=1)
+    kv_neg_max = jnp.max(jnp.where(kv_is_neg, kv_seg, int32_min), axis=1)
+    neg_overlap = (
+        (q_neg_max[:, None] >= kv_neg_min[None, :])
+        & (kv_neg_max[None, :] >= q_neg_min[:, None])
+        & (q_neg_min[:, None] < 0)
+        & (kv_neg_min[None, :] < 0)
+    )
+    overlap = pos_overlap | neg_overlap
+
+    dn_i32 = orig_dn.astype(jnp.int32)
+    if is_dkv:
+        kv_idx = jnp.arange(num_kv_blocks, dtype=jnp.int32)[None, None, :]
+        cell_overlap = overlap[dn_i32, kv_idx]
+    else:
+        q_idx = jnp.arange(num_q_blocks, dtype=jnp.int32)[None, :, None]
+        cell_overlap = overlap[q_idx, dn_i32]
+
+    orig_nz = orig_bm > 0
+    new_nz = orig_nz & cell_overlap
+    if preserve_nonempty_rows and not is_dkv:
+        # Preserve one statically active block on rows that become fully disjoint
+        # (e.g. padded Q rows) so the online softmax denominator stays positive
+        # instead of producing 0/0 NaNs.
+        orig_any = jnp.any(orig_nz, axis=-1, keepdims=True)
+        new_any = jnp.any(new_nz, axis=-1, keepdims=True)
+        first_idx = jnp.argmax(orig_nz, axis=-1, keepdims=True)
+        is_first = jnp.arange(orig_bm.shape[-1], dtype=jnp.int32)[None, None, :] == first_idx
+        new_nz = new_nz | (orig_any & ~new_any & is_first)
+
+    new_bm = jnp.where(new_nz, orig_bm, jnp.zeros_like(orig_bm))
+    scan_axis = 1 if is_dkv else 2
+    new_dn = _fill_next_index(orig_dn, new_nz, axis=scan_axis)
+    new_mn = (
+        _fill_next_index(jnp.asarray(mask_info.mask_next), new_bm == 1, axis=scan_axis)
+        if mask_info.mask_next is not None
+        else None
+    )
+    return mask_info._replace(block_mask=new_bm, data_next=new_dn, mask_next=new_mn)
+
+
 def _apply_mask_and_soft_cap(
     qk: jax.Array,
     mask_value: float,
@@ -897,11 +1025,11 @@ def flash_attention_kernel(
     sinks_ref,
     mask_ref,
     q_sequence_ref,
+    o_ref,
+    logsumexp_ref,
     m_scratch_ref,
     l_scratch_ref,
     o_scratch_ref,
-    o_ref,
-    logsumexp_ref=None,
     *,
     mask_value: float,
     grid_width: int,
@@ -1020,10 +1148,6 @@ def flash_attention_kernel(
             assert logsumexp_ref.shape == (bq, NUM_LANES)
             logsumexp_ref[...] = (jnp.log(l) + m_scratch_ref[...]).astype(logsumexp_ref.dtype)
 
-        m_scratch_ref[...] = jnp.zeros_like(m_scratch_ref)
-        l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-        o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-
 
 @overload
 def _splash_attention_forward(
@@ -1134,6 +1258,14 @@ def _splash_attention_forward(
             raise ValueError(f"Invalid shape for q segment_ids: {segment_ids.q.shape}. Expected: {(q_seq_len,)}")
         if segment_ids.kv.shape != (kv_seq_len,):
             raise ValueError(f"Invalid shape for kv segment_ids: {segment_ids.kv.shape}. Expected: {(kv_seq_len,)}")
+        fwd_mask_info = _intersect_mask_info_with_segments(
+            fwd_mask_info,
+            segment_ids,
+            bq=bq,
+            bkv=bkv,
+            is_dkv=False,
+            preserve_nonempty_rows=(sinks is None),
+        )
 
     q_layout = block_sizes.q_layout
 
@@ -1217,15 +1349,9 @@ def _splash_attention_forward(
     num_scalar_prefetch = 3
 
     out_shapes = [
-        jax.ShapeDtypeStruct((bq, NUM_LANES), jnp.float32),
-        jax.ShapeDtypeStruct((bq, NUM_LANES), jnp.float32),
-        jax.ShapeDtypeStruct((bq, head_dim_v), jnp.float32),
         jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), q.dtype),
     ]
     out_specs = [
-        pl.BlockSpec((bq, NUM_LANES), lambda h, i, j, *_: (0, 0)),
-        pl.BlockSpec((bq, NUM_LANES), lambda h, i, j, *_: (0, 0)),
-        pl.BlockSpec((bq, head_dim_v), lambda h, i, j, *_: (0, 0)),
         pl.BlockSpec((None, bq, head_dim_v), out_index_map),
     ]
     if save_residuals:
@@ -1242,6 +1368,12 @@ def _splash_attention_forward(
     else:
         out_shapes += [None]
         out_specs += [None]
+
+    scratch_shapes = [
+        pltpu.VMEM((bq, NUM_LANES), jnp.float32),
+        pltpu.VMEM((bq, NUM_LANES), jnp.float32),
+        pltpu.VMEM((bq, head_dim_v), jnp.float32),
+    ]
 
     kernel_name = get_kernel_name(
         dataclasses.asdict(block_sizes),
@@ -1277,10 +1409,11 @@ def _splash_attention_forward(
                 num_scalar_prefetch=num_scalar_prefetch,
                 in_specs=in_specs,
                 out_specs=out_specs,
+                scratch_shapes=scratch_shapes,
                 grid=grid,
             ),
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+                dimension_semantics=("parallel", "parallel", "arbitrary"),
             ),
             out_shape=out_shapes,
             name=kernel_name,
@@ -1299,13 +1432,7 @@ def _splash_attention_forward(
             q_sequence,
         )
 
-    (
-        _,
-        _,
-        _,
-        out,
-        lse,
-    ) = all_out
+    out, lse = all_out
 
     if save_residuals:
         assert lse is not None
@@ -1439,8 +1566,8 @@ def _flash_attention_dq_kernel(
     di_ref,
     mask_ref,
     q_sequence_ref,
-    dq_scratch_ref,
     dq_ref,
+    dq_scratch_ref,
     *,
     mask_value: float,
     grid_width: int,
@@ -1519,7 +1646,6 @@ def _flash_attention_dq_kernel(
     @pl.when(j == grid_width - 1)
     def end():
         dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
-        dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
 
 
 def _splash_attention_bwd_dq(
@@ -1571,6 +1697,16 @@ def _splash_attention_bwd_dq(
         raise ValueError(f"{bkv=} must be a multiple of {NUM_LANES}.")
 
     q_heads_per_kv_head = num_q_heads // num_kv_heads
+
+    if segment_ids is not None:
+        mask_info = _intersect_mask_info_with_segments(
+            mask_info,
+            segment_ids,
+            bq=bq,
+            bkv=bkv,
+            is_dkv=False,
+            preserve_nonempty_rows=False,
+        )
 
     if mask_info.data_next is not None:
         grid_width = mask_info.data_next.shape[-1]
@@ -1679,12 +1815,13 @@ def _splash_attention_bwd_dq(
         in_specs.append(None)
 
     out_shapes = [
-        jax.ShapeDtypeStruct((bq, head_dim_qk), jnp.float32),
         jax.ShapeDtypeStruct(q.shape, q.dtype),
     ]
     out_specs = [
-        pl.BlockSpec((bq, head_dim_qk), lambda *_: (0, 0)),
         pl.BlockSpec((None, bq, head_dim_qk), lambda h, i, *_: (h, i, 0)),
+    ]
+    scratch_shapes = [
+        pltpu.VMEM((bq, head_dim_qk), jnp.float32),
     ]
 
     kernel = functools.partial(
@@ -1715,17 +1852,18 @@ def _splash_attention_bwd_dq(
         phase="dq",
     )
     with jax.named_scope(kernel_name):
-        _, dq = pl.pallas_call(
+        (dq,) = pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=num_scalar_prefetch,
                 in_specs=in_specs,
                 out_specs=out_specs,
+                scratch_shapes=scratch_shapes,
                 grid=grid,
             ),
             out_shape=out_shapes,
             compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary", "arbitrary", "arbitrary"),
+                dimension_semantics=("parallel", "parallel", "arbitrary"),
             ),
             name=kernel_name,
             interpret=interpret,
@@ -1763,12 +1901,12 @@ def _flash_attention_dkv_kernel(
     di_ref,
     mask_ref,
     q_sequence_ref,
-    dq_scratch_ref,
-    dk_scratch_ref,
-    dv_scratch_ref,
     dq_ref,
     dk_ref,
     dv_ref,
+    dk_scratch_ref,
+    dv_scratch_ref,
+    dq_scratch_ref=None,
     *,
     num_q_heads: int,
     num_kv_heads: int,
@@ -1784,24 +1922,17 @@ def _flash_attention_dkv_kernel(
     bkv: int,
     mask_function: MaskFunctionType | None,
 ):
-    del sinks_ref
+    del sinks_ref, is_mqa
     HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
-    kv_index, q_head_index, q_index = (
+    kv_head_index, kv_index, q_head_in_group, q_index = (
         pl.program_id(0),
         pl.program_id(1),
         pl.program_id(2),
+        pl.program_id(3),
     )
-    should_initialize = q_index == 0
-
-    q_heads_per_kv_heads = None
-    q_head_index_per_kv_head = None
-
-    if is_mqa:
-        should_initialize = jnp.logical_and(should_initialize, q_head_index == 0)
-    elif num_kv_heads < num_q_heads:
-        q_heads_per_kv_heads = num_q_heads // num_kv_heads
-        q_head_index_per_kv_head = lax.rem(q_head_index, q_heads_per_kv_heads)
-        should_initialize = jnp.logical_and(should_initialize, q_head_index_per_kv_head == 0)
+    q_heads_per_kv_heads = num_q_heads // num_kv_heads
+    q_head_index = kv_head_index * q_heads_per_kv_heads + q_head_in_group
+    should_initialize = jnp.logical_and(q_index == 0, q_head_in_group == 0)
 
     @pl.when(should_initialize)
     def init():
@@ -1899,21 +2030,15 @@ def _flash_attention_dkv_kernel(
         assert dq_ref is not None
         dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
 
-    should_write = q_index == grid_width - 1
-    if is_mqa:
-        should_write = jnp.logical_and(should_write, q_head_index == num_q_heads - 1)
-    elif num_kv_heads < num_q_heads:
-        should_write = jnp.logical_and(should_write, q_head_index_per_kv_head == q_heads_per_kv_heads - 1)
+    should_write = jnp.logical_and(
+        q_index == grid_width - 1,
+        q_head_in_group == q_heads_per_kv_heads - 1,
+    )
 
     @pl.when(should_write)
     def end():
         dk_ref[...] = dk_scratch_ref[...].astype(dk_ref.dtype)
         dv_ref[...] = dv_scratch_ref[...].astype(dv_ref.dtype)
-        if dq_scratch_ref is not None:
-            dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
-
-        dk_scratch_ref[...] = jnp.zeros_like(dk_scratch_ref)
-        dv_scratch_ref[...] = jnp.zeros_like(dv_scratch_ref)
 
 
 def _splash_attention_bwd_dkv(
@@ -1967,25 +2092,38 @@ def _splash_attention_bwd_dkv(
 
     q_heads_per_kv_head = num_q_heads // num_kv_heads
 
+    if segment_ids is not None:
+        mask_info = _intersect_mask_info_with_segments(
+            mask_info,
+            segment_ids,
+            bq=bq,
+            bkv=bkv,
+            is_dkv=True,
+            preserve_nonempty_rows=False,
+        )
+
     if mask_info.data_next is not None:
         grid_width = mask_info.data_next.shape[-2]
     else:
         grid_width = q_seq_len // bq
 
     grid = (
+        num_kv_heads,
         kv_seq_len // bkv,
-        num_q_heads,
+        q_heads_per_kv_head,
         grid_width,
     )
 
     def o_index_map(
+        kv_head_index,
         kv_index,
-        head_index,
+        q_head_in_group,
         q_index,
         data_next_ref,
         block_mask_ref,
         mask_next_ref=None,
     ):
+        head_index = kv_head_index * q_heads_per_kv_head + q_head_in_group
         next_i, *_ = _next_nonzero(
             head_index,
             q_index,
@@ -2000,13 +2138,15 @@ def _splash_attention_bwd_dkv(
     o_spec = pl.BlockSpec((None, bq, head_dim_v), o_index_map)
 
     def q_index_map(
+        kv_head_index,
         kv_index,
-        head_index,
+        q_head_in_group,
         q_index,
         data_next_ref,
         block_mask_ref,
         mask_next_ref=None,
     ):
+        head_index = kv_head_index * q_heads_per_kv_head + q_head_in_group
         next_i, *_ = _next_nonzero(
             head_index,
             q_index,
@@ -2020,8 +2160,8 @@ def _splash_attention_bwd_dkv(
 
     q_spec = pl.BlockSpec(from_head_minor((None, bq, head_dim_qk), q_layout), q_index_map)
 
-    def k_index_map(kv_index, head_index, *_):
-        prefix = () if is_mqa else (_div(head_index, q_heads_per_kv_head),)
+    def k_index_map(kv_head_index, kv_index, *_):
+        prefix = () if is_mqa else (kv_head_index,)
         return from_head_minor((*prefix, kv_index, 0), k_layout)
 
     k_spec = pl.BlockSpec(
@@ -2032,8 +2172,8 @@ def _splash_attention_bwd_dkv(
         k_index_map,
     )
 
-    def v_index_map(kv_index, head_index, *_):
-        prefix = () if is_mqa else (_div(head_index, q_heads_per_kv_head),)
+    def v_index_map(kv_head_index, kv_index, *_):
+        prefix = () if is_mqa else (kv_head_index,)
         return from_head_minor((*prefix, kv_index, 0), v_layout)
 
     v_spec = pl.BlockSpec(
@@ -2046,21 +2186,19 @@ def _splash_attention_bwd_dkv(
 
     if use_fused_bwd_kernel:
 
-        def dq_index_map(kv_index, head_index, q_index, *_):
+        def dq_index_map(kv_head_index, kv_index, q_head_in_group, q_index, *_):
+            head_index = kv_head_index * q_heads_per_kv_head + q_head_in_group
             return (kv_index, head_index, q_index, 0)
 
         dq_spec = pl.BlockSpec((None, None, bq, head_dim_qk), dq_index_map)
         dq_shape = jax.ShapeDtypeStruct((kv_seq_len // bkv, *q.shape), q.dtype)
-        if bkv == bkv_compute:
-            dq_scratch_spec = dq_scratch_shape = None
-        else:
-            dq_scratch_spec = pl.BlockSpec((bq, head_dim_qk), lambda *_: (0, 0))
-            dq_scratch_shape = jax.ShapeDtypeStruct((bq, head_dim_qk), jnp.float32)
+        use_dq_scratch = bkv != bkv_compute
     else:
-        dq_spec = dq_shape = dq_scratch_spec = dq_scratch_shape = None
+        dq_spec = dq_shape = None
+        use_dq_scratch = False
 
-    def dkv_index_map(kv_index, head_index, *_):
-        prefix = () if is_mqa else (_div(head_index, q_heads_per_kv_head),)
+    def dkv_index_map(kv_head_index, kv_index, *_):
+        prefix = () if is_mqa else (kv_head_index,)
         return (*prefix, kv_index, 0)
 
     dk_spec = pl.BlockSpec(
@@ -2074,13 +2212,15 @@ def _splash_attention_bwd_dkv(
     )
 
     def mask_index_map(
+        kv_head_index,
         kv_index,
-        head_index,
+        q_head_in_group,
         q_index,
         data_next_ref,
         block_mask_ref,
-        mask_next_ref,
+        mask_next_ref=None,
     ):
+        head_index = kv_head_index * q_heads_per_kv_head + q_head_in_group
         _, next_m, *_ = _next_nonzero(
             head_index,
             q_index,
@@ -2095,13 +2235,15 @@ def _splash_attention_bwd_dkv(
     mask_spec = pl.BlockSpec((None, bkv, bq), mask_index_map)
 
     def q_segment_ids_index_map(
+        kv_head_index,
         kv_index,
-        head_index,
+        q_head_in_group,
         q_index,
         data_next_ref,
         block_mask_ref,
         mask_next_ref=None,
     ):
+        head_index = kv_head_index * q_heads_per_kv_head + q_head_in_group
         next_i, *_ = _next_nonzero(
             head_index,
             q_index,
@@ -2115,7 +2257,8 @@ def _splash_attention_bwd_dkv(
 
     if segment_ids is not None:
 
-        def kv_segment_ids_index_map(kv_index, *_):
+        def kv_segment_ids_index_map(kv_head_index, kv_index, *_):
+            del kv_head_index
             return kv_index, 0
 
         q_segment_spec = pl.BlockSpec((NUM_SUBLANES, bq), q_segment_ids_index_map)
@@ -2128,7 +2271,7 @@ def _splash_attention_bwd_dkv(
 
     if sinks is not None:
         assert sinks.shape == (num_q_heads,)
-        sinks_spec = pl.BlockSpec((num_q_heads,), lambda kv_index, h, *_: (0,), memory_space=pltpu.SMEM)
+        sinks_spec = pl.BlockSpec((num_q_heads,), lambda *_: (0,), memory_space=pltpu.SMEM)
         sinks = sinks.astype(jnp.float32)
     else:
         sinks_spec = None
@@ -2136,13 +2279,15 @@ def _splash_attention_bwd_dkv(
     do_spec = o_spec
 
     def logsumexp_index_map(
+        kv_head_index,
         kv_index,
-        head_index,
+        q_head_in_group,
         q_index,
         data_next_ref,
         block_mask_ref,
         mask_next_ref=None,
     ):
+        head_index = kv_head_index * q_heads_per_kv_head + q_head_in_group
         next_i, *_ = _next_nonzero(
             head_index,
             q_index,
@@ -2189,21 +2334,21 @@ def _splash_attention_bwd_dkv(
         in_specs.append(None)
 
     out_shapes = [
-        dq_scratch_shape,
-        jax.ShapeDtypeStruct((bkv, head_dim_qk), jnp.float32),
-        jax.ShapeDtypeStruct((bkv, head_dim_v), jnp.float32),
         dq_shape,
         jax.ShapeDtypeStruct(k.shape, k.dtype),
         jax.ShapeDtypeStruct(v.shape, v.dtype),
     ]
     out_specs = [
-        dq_scratch_spec,
-        pl.BlockSpec((bkv, head_dim_qk), lambda *_: (0, 0)),
-        pl.BlockSpec((bkv, head_dim_v), lambda *_: (0, 0)),
         dq_spec,
         dk_spec,
         dv_spec,
     ]
+    scratch_shapes = [
+        pltpu.VMEM((bkv, head_dim_qk), jnp.float32),
+        pltpu.VMEM((bkv, head_dim_v), jnp.float32),
+    ]
+    if use_dq_scratch:
+        scratch_shapes.append(pltpu.VMEM((bq, head_dim_qk), jnp.float32))
 
     kernel = functools.partial(
         _flash_attention_dkv_kernel,
@@ -2238,16 +2383,17 @@ def _splash_attention_bwd_dkv(
         phase="dkv",
     )
     with jax.named_scope(kernel_name):
-        _, _, _, dq_unreduced, dk, dv = pl.pallas_call(
+        dq_unreduced, dk, dv = pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=num_scalar_prefetch,
                 in_specs=in_specs,
                 out_specs=out_specs,
+                scratch_shapes=scratch_shapes,
                 grid=grid,
             ),
             out_shape=out_shapes,
-            compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary", "arbitrary")),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary", "arbitrary")),
             name=kernel_name,
             interpret=interpret,
         )(
@@ -2814,8 +2960,8 @@ def blocksparse_attention(
         block_q_dkv=min(bwd_params.q_blocksize, query_length),
         block_kv_dkv=min(bwd_params.kv_blocksize, kv_length),
         block_kv_dkv_compute=min(bwd_params.kv_blocksize, kv_length),
-        block_q_dq=min(bwd_params.q_blocksize, query_length),
-        block_kv_dq=min(bwd_params.kv_blocksize, kv_length),
+        block_q_dq=None if fused_backward else min(bwd_params.q_blocksize, query_length),
+        block_kv_dq=None if fused_backward else min(bwd_params.kv_blocksize, kv_length),
         use_fused_bwd_kernel=fused_backward,
     )
     if softmax_scale is None:

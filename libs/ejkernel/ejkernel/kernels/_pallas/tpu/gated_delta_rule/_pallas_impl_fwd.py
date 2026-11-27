@@ -97,18 +97,42 @@ def _exact_strict_lower_inv_rows(A, C, strict_lower=None, lower_mask=None):
     return jnp.nan_to_num(inv, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _exact_strict_lower_inv_dyadic(A, C):
+    """Exact ``(I - A)^{-1}`` via dyadic block-diagonal doubling on a power-of-2 tile.
+
+    Doubles the exact block-diagonal inverse from ``2x2`` up to ``CxC`` in
+    ``log2(C) - 1`` pairs of full-tile MXU matmuls, avoiding scalar row loops
+    and non-128-aligned sub-tile layouts while never forming powers ``A^k``
+    that overflow on correlated keys.
+    """
+    idx = jnp.arange(C, dtype=jnp.int32)
+    row = idx[:, None]
+    col = idx[None, :]
+    mask1 = ((row >> 1) == (col >> 1)) & ((row & 1) == 1) & ((col & 1) == 0)
+    inv = jnp.eye(C, dtype=jnp.float32) + jnp.where(mask1, A, 0.0)
+    s = 2
+    shift = 1
+    while s < C:
+        mask_s = (
+            ((row >> (shift + 1)) == (col >> (shift + 1))) & (((row >> shift) & 1) == 1) & (((col >> shift) & 1) == 0)
+        )
+        off_diag = jnp.where(mask_s, A, 0.0)
+        inv = inv + _dot(_dot(inv, off_diag), inv)
+        s <<= 1
+        shift += 1
+    return inv
+
+
 def _exact_strict_lower_inv_block(A, C):
     """Recursively invert ``I - A`` for strict-lower ``A`` using block matmuls."""
+    if 0 < C <= 128 and (C & (C - 1)) == 0:
+        return _exact_strict_lower_inv_dyadic(A, C)
     if C <= 16 or C % 2:
         return _exact_strict_lower_inv_rows(A, C)
     h = C // 2
     top_inv = _exact_strict_lower_inv_block(A[:h, :h], h)
     bottom_inv = _exact_strict_lower_inv_block(A[h:, h:], C - h)
-    lower_left = lax.dot(
-        lax.dot(bottom_inv, A[h:, :h].astype(jnp.float32), precision=lax.Precision.HIGHEST),
-        top_inv,
-        precision=lax.Precision.HIGHEST,
-    )
+    lower_left = _dot(_dot(bottom_inv, A[h:, :h].astype(jnp.float32)), top_inv)
     top = jnp.concatenate([top_inv, jnp.zeros((h, C - h), dtype=jnp.float32)], axis=1)
     bottom = jnp.concatenate([lower_left, bottom_inv], axis=1)
     return jnp.concatenate([top, bottom], axis=0)
@@ -970,9 +994,7 @@ def _run_grouped_segmented_fwd_vmem_scan(
         *out_and_scratch,
     ):
         if save_pre_states:
-            final_state_ref, core_out_ref, state_pre_ref, state_seg_pre_ref, state_scratch, seg_scratch = (
-                out_and_scratch
-            )
+            final_state_ref, core_out_ref, state_pre_ref, state_seg_pre_ref, state_scratch, seg_scratch = out_and_scratch
         else:
             final_state_ref, core_out_ref, state_scratch, seg_scratch = out_and_scratch
             state_pre_ref = state_seg_pre_ref = None

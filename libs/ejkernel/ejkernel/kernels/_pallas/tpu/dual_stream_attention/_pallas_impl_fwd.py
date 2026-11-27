@@ -146,13 +146,22 @@ def dual_stream_attention_tpu(
         gq_s = gkv_s = lq_s = lkv_s = None
 
     # Resolve global-stream SplashAttention block sizes (respecting fwd_params / bwd_params).
-    # For head_dim >= 256, 1024x1024 backward blocks exceed TPU's 16 MiB scoped VMEM limit
-    # (~16.17 MiB); capping default backward blocks at 512 keeps scoped VMEM well under budget.
-    default_bwd_blk = 512 if head_dim >= 256 else 1024
-    bq_g = min(int(getattr(fwd_params, "q_blocksize", None) or 512), loc_seq)
-    bkv_g = min(int(getattr(fwd_params, "kv_blocksize", None) or 512), loc_seq)
-    bq_bwd_g = min(int(getattr(bwd_params, "q_blocksize", None) or default_bwd_blk), loc_seq)
-    bkv_bwd_g = min(int(getattr(bwd_params, "kv_blocksize", None) or default_bwd_blk), loc_seq)
+    # With scratch_shapes VMEM allocation, 1024x1024 fwd and 1024x512 bwd fit comfortably in
+    # TPU's 16 MiB scoped VMEM even at head_dim=256 while cutting grid overhead ~2x-4x vs 512x512.
+    if loc_seq % 1024 == 0:
+        default_fwd_blk = 1024
+    elif loc_seq % 512 == 0:
+        default_fwd_blk = 512
+    elif loc_seq % 256 == 0:
+        default_fwd_blk = 256
+    else:
+        default_fwd_blk = 128
+    default_bwd_q = default_fwd_blk
+    default_bwd_kv = min(default_fwd_blk, 512 if head_dim >= 256 else 1024)
+    bq_g = min(int(getattr(fwd_params, "q_blocksize", None) or default_fwd_blk), loc_seq)
+    bkv_g = min(int(getattr(fwd_params, "kv_blocksize", None) or default_fwd_blk), loc_seq)
+    bq_bwd_g = min(int(getattr(bwd_params, "q_blocksize", None) or default_bwd_q), loc_seq)
+    bkv_bwd_g = min(int(getattr(bwd_params, "kv_blocksize", None) or default_bwd_kv), loc_seq)
     bs_g = splash_k.BlockSizes(
         block_q=bq_g,
         block_kv_compute=bkv_g,
@@ -269,9 +278,7 @@ def dual_stream_attention_tpu(
         @jax.custom_vjp
         def _dual_vjp_seg(q_arg, kg_arg, vg_arg, kl_arg, vl_arg, gq_arg, gkv_arg, lq_arg, lkv_arg):
             q_s = (q_arg * jnp.asarray(scale, dtype=q_arg.dtype)).astype(q_arg.dtype)
-            o_tot, _ = jax.vmap(_single_fwd_seg)(
-                q_s, kg_arg, vg_arg, kl_arg, vl_arg, gq_arg, gkv_arg, lq_arg, lkv_arg
-            )
+            o_tot, _ = jax.vmap(_single_fwd_seg)(q_s, kg_arg, vg_arg, kl_arg, vl_arg, gq_arg, gkv_arg, lq_arg, lkv_arg)
             return o_tot
 
         def _dual_vjp_seg_fwd(q_arg, kg_arg, vg_arg, kl_arg, vl_arg, gq_arg, gkv_arg, lq_arg, lkv_arg):

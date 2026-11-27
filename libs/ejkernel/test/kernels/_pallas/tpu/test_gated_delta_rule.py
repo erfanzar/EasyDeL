@@ -714,3 +714,70 @@ def test_pallas_vmem_scan_fwd_bwd_matches_xla(grouped, segmented, with_decay):
     for idx, (gp, gx) in enumerate(zip(grads_p, grads_x, strict=True)):
         assert jnp.all(jnp.isfinite(gp)), f"grad[{idx}] non-finite"
         assert jnp.allclose(gp, gx, atol=4e-2, rtol=0), f"grad[{idx}] max diff: {jnp.max(jnp.abs(gp - gx))}"
+
+
+@pytest.mark.parametrize("chunk_size", [128, 256])
+def test_pallas_dyadic_inverse_large_chunk_adversarial_matches_xla(chunk_size):
+    """Verify 2x128 hybrid dyadic triangular inverse stays exact on correlated keys (beta~1, small decay)."""
+    import numpy as np
+
+    rng = np.random.default_rng(77 + chunk_size)
+    batch, seq_len, q_heads, v_heads, dim = 1, 512, 2, 6, 128
+    base_k = rng.standard_normal((batch, 1, q_heads, dim))
+    q = jnp.asarray(base_k + 0.1 * rng.standard_normal((batch, seq_len, q_heads, dim)), dtype=jnp.bfloat16)
+    k = jnp.asarray(base_k + 0.05 * rng.standard_normal((batch, seq_len, q_heads, dim)), dtype=jnp.bfloat16)
+    v = jnp.asarray(rng.standard_normal((batch, seq_len, v_heads, dim)) * 0.5, dtype=jnp.bfloat16)
+    beta = jnp.asarray(np.full((batch, seq_len, v_heads), 0.98), dtype=jnp.bfloat16)
+    decay = jnp.asarray(np.full((batch, seq_len, v_heads), -0.001), dtype=jnp.bfloat16)
+    cot = jnp.asarray(rng.standard_normal((batch, seq_len, v_heads, dim)) * 0.1, dtype=jnp.float32)
+    seg_ids = jnp.concatenate(
+        [
+            jnp.zeros((1, 180), dtype=jnp.int32),
+            jnp.ones((1, 210), dtype=jnp.int32),
+            jnp.full((1, 122), -1, dtype=jnp.int32),
+        ],
+        axis=1,
+    )
+    valid = (seg_ids >= 0)[:, :, None, None].astype(jnp.float32)
+
+    def _pallas_fn(qi, ki, vi, bi, di):
+        out, _ = gated_delta_rule_pallas(
+            qi,
+            ki,
+            vi,
+            bi,
+            di,
+            chunk_size=chunk_size,
+            use_qk_l2norm=True,
+            use_chunked=True,
+            seg_ids=seg_ids,
+        )
+        return jnp.sum(out.astype(jnp.float32) * valid * cot), out
+
+    def _xla_fn(qi, ki, vi, bi, di):
+        out, _ = gated_delta_rule_xla(
+            qi,
+            ki,
+            vi,
+            bi,
+            di,
+            chunk_size=128,
+            use_qk_l2norm=True,
+            use_chunked=True,
+            seg_ids=seg_ids,
+        )
+        return jnp.sum(out * valid * cot), out
+
+    (_, out_p), grads_p = jax.value_and_grad(_pallas_fn, argnums=(0, 1, 2, 3, 4), has_aux=True)(q, k, v, beta, decay)
+    (_, out_x), grads_x = jax.value_and_grad(_xla_fn, argnums=(0, 1, 2, 3, 4), has_aux=True)(
+        q.astype(jnp.float32),
+        k.astype(jnp.float32),
+        v.astype(jnp.float32),
+        beta.astype(jnp.float32),
+        decay.astype(jnp.float32),
+    )
+    assert bool(jnp.isfinite(out_p).all())
+    assert float(jnp.max(jnp.abs((out_p.astype(jnp.float32) - out_x) * valid))) < 2e-2
+    for idx, (gp, gx) in enumerate(zip(grads_p, grads_x, strict=True)):
+        assert bool(jnp.isfinite(gp).all()), f"grad[{idx}] non-finite"
+        assert float(jnp.max(jnp.abs(gp.astype(jnp.float32) - gx))) < 5e-2, f"grad[{idx}] drift"
