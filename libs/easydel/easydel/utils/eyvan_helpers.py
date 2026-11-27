@@ -588,6 +588,15 @@ def _reset_fallback_preemption_state() -> None:
                     pass
         _PREV_SIGNAL_HANDLERS.clear()
         _SIGNAL_HANDLERS_INSTALLED = False
+    import sys
+
+    preemption_mod = sys.modules.get("eyvan.worker.runtime.preemption")
+    uninstall = getattr(preemption_mod, "uninstall_preemption_handler", None)
+    if callable(uninstall):
+        try:
+            uninstall()
+        except Exception:
+            pass
 
 
 def preemption_notice(
