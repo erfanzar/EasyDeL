@@ -70,6 +70,17 @@ static assets and compatibility aliases are not a complete part of that schema.
 | DELETE | `/api/v1/cells/{cell_id}` | Delete Cell | 200, 422 |
 | GET | `/api/v1/cells/{cell_id}` | Get Cell | 200, 422 |
 | POST | `/api/v1/cells/{cell_id}/drain` | Drain Cell | 200, 422 |
+| GET | `/api/v1/collaboration/experiments` | List Experiments | 200, 422 |
+| POST | `/api/v1/collaboration/experiments` | Create Experiment | 201, 422 |
+| DELETE | `/api/v1/collaboration/experiments/{exp_id}` | Delete Experiment | 204, 422 |
+| GET | `/api/v1/collaboration/experiments/{exp_id}` | Get Experiment | 200, 422 |
+| PATCH | `/api/v1/collaboration/experiments/{exp_id}` | Update Experiment | 200, 422 |
+| GET | `/api/v1/collaboration/experiments/{exp_id}/leaderboard` | Experiment Leaderboard | 200, 422 |
+| GET | `/api/v1/collaboration/feed` | Collaboration Feed | 200, 422 |
+| GET | `/api/v1/collaboration/notes` | List Notes | 200, 422 |
+| POST | `/api/v1/collaboration/notes` | Create Note | 201, 422 |
+| DELETE | `/api/v1/collaboration/notes/{note_id}` | Delete Note | 204, 422 |
+| PATCH | `/api/v1/collaboration/runs/{run_id}` | Update Run Sharing | 200, 422 |
 | POST | `/api/v1/dags` | Submit Dag | 201, 422 |
 | GET | `/api/v1/dashboard/config` | Dashboard Config | 200 |
 | GET | `/api/v1/events` | List Events | 200, 422 |
@@ -91,6 +102,7 @@ static assets and compatibility aliases are not a complete part of that schema.
 | GET | `/api/v1/fleets/{fleet_name}/init-script` | Get Fleet Init Script | 200, 422 |
 | PUT | `/api/v1/fleets/{fleet_name}/init-script` | Set Fleet Init Script | 200, 422 |
 | POST | `/api/v1/fleets/{fleet_name}/node-types/{node_type}/workloads` | Submit Pool Workload | 201, 422 |
+| GET | `/api/v1/governance/summary` | Get Governance Summary | 200 |
 | DELETE | `/api/v1/grants` | Revoke Role Grant | 204, 422 |
 | GET | `/api/v1/grants` | List Role Grants | 200, 422 |
 | POST | `/api/v1/grants` | Issue Role Grant | 201, 422 |
@@ -122,6 +134,8 @@ static assets and compatibility aliases are not a complete part of that schema.
 | POST | `/api/v1/research/plans/{plan_id}/stop` | Stop Research Plan | 200, 422 |
 | POST | `/api/v1/secrets/rotate` | Rotate Secret Credential | 200, 422 |
 | GET | `/api/v1/session` | Session Authority | 200, 422 |
+| POST | `/api/v1/storage/check-region` | Check Storage Region | 200, 422 |
+| GET | `/api/v1/storage/status` | Get Storage Status | 200 |
 | GET | `/api/v1/system/invariants` | Fleet Invariants | 200 |
 | POST | `/api/v1/system/invariants/soak` | Proof Scoped Fleet Invariants | 200, 422 |
 | POST | `/api/v1/system/reconcile` | Reconcile Once | 200 |
@@ -149,6 +163,7 @@ static assets and compatibility aliases are not a complete part of that schema.
 | PUT | `/api/v1/team/users/{subject}/rules` | Set Team User Rules | 200, 422 |
 | PUT | `/api/v1/team/users/{subject}/tier` | Set Team User Tier | 200, 422 |
 | POST | `/api/v1/team/workloads/{workload_id}/reclaim` | Reclaim Team Workload | 200, 422 |
+| POST | `/api/v1/tracking/compare` | Tracking Compare | 200, 422 |
 | GET | `/api/v1/tracking/health` | Tracking Health | 200 |
 | GET | `/api/v1/tracking/runs` | Tracking Runs | 200, 422 |
 | GET | `/api/v1/tracking/runs/{run_id}` | Tracking Run | 200, 422 |

@@ -726,7 +726,7 @@
             "type": "string"
           },
           "template": {
-            "$ref": "#/components/schemas/WorkloadDefinition"
+            "$ref": "#/components/schemas/WorkloadDefinition-Input"
           }
         },
         "required": [
@@ -1670,6 +1670,18 @@
             "title": "Provider",
             "type": "string"
           },
+          "provider_account": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Account"
+          },
           "provider_options": {
             "additionalProperties": {
               "$ref": "#/components/schemas/JsonValue"
@@ -1747,7 +1759,7 @@
             "type": "string"
           },
           "runtime": {
-            "$ref": "#/components/schemas/NativeRuntimeConfig"
+            "$ref": "#/components/schemas/NativeRuntimeConfig-Output"
           },
           "shrink_stabilization_s": {
             "default": 300.0,
@@ -2040,6 +2052,18 @@
             "title": "Provider",
             "type": "string"
           },
+          "provider_account": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Account"
+          },
           "provider_options": {
             "additionalProperties": {
               "$ref": "#/components/schemas/JsonValue"
@@ -2118,7 +2142,7 @@
             "type": "string"
           },
           "runtime": {
-            "$ref": "#/components/schemas/NativeRuntimeConfig"
+            "$ref": "#/components/schemas/NativeRuntimeConfig-Input"
           },
           "topology": {
             "additionalProperties": {
@@ -2680,7 +2704,7 @@
             "type": "string"
           },
           "runtime": {
-            "$ref": "#/components/schemas/NativeRuntimeConfig"
+            "$ref": "#/components/schemas/NativeRuntimeConfig-Output"
           },
           "runtime_process_count": {
             "default": 1,
@@ -2944,7 +2968,7 @@
             "type": "string"
           },
           "runtime": {
-            "$ref": "#/components/schemas/NativeRuntimeConfig"
+            "$ref": "#/components/schemas/NativeRuntimeConfig-Input"
           },
           "state": {
             "$ref": "#/components/schemas/CellState",
@@ -3191,6 +3215,16 @@
         "title": "CredentialRotationState",
         "type": "string"
       },
+      "CrossRegionTransferPolicy": {
+        "description": "Enforcement mode for cross-region GCS transfers from compute hosts.",
+        "enum": [
+          "allow",
+          "warn",
+          "ban"
+        ],
+        "title": "CrossRegionTransferPolicy",
+        "type": "string"
+      },
       "DagNodeRequest": {
         "additionalProperties": false,
         "description": "One named stage and the sibling stages it waits for.",
@@ -3211,7 +3245,7 @@
             "type": "string"
           },
           "template": {
-            "$ref": "#/components/schemas/WorkloadDefinition"
+            "$ref": "#/components/schemas/WorkloadDefinition-Input"
           }
         },
         "required": [
@@ -3453,6 +3487,310 @@
         "title": "EffectiveQuota",
         "type": "object"
       },
+      "ExperimentCreateRequest": {
+        "additionalProperties": false,
+        "description": "Create a collaborative experiment or speedrun leaderboard.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "goal": {
+            "default": "min",
+            "enum": [
+              "min",
+              "max"
+            ],
+            "title": "Goal",
+            "type": "string"
+          },
+          "group_filter": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Filter"
+          },
+          "kind": {
+            "default": "experiment",
+            "enum": [
+              "experiment",
+              "speedrun"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "metric_key": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Key"
+          },
+          "name": {
+            "maxLength": 160,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Name",
+            "type": "string"
+          },
+          "org_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Org Id",
+            "type": "string"
+          },
+          "pinned_baseline_run_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned Baseline Run Id"
+          },
+          "project_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "shared_with": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Shared With",
+            "type": "array"
+          },
+          "subject": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Subject",
+            "type": "string"
+          },
+          "tag_filter": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Tag Filter",
+            "type": "array"
+          },
+          "target_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Value"
+          },
+          "visibility": {
+            "default": "team",
+            "enum": [
+              "private",
+              "shared",
+              "team"
+            ],
+            "title": "Visibility",
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_id",
+          "project_id",
+          "name"
+        ],
+        "title": "ExperimentCreateRequest",
+        "type": "object"
+      },
+      "ExperimentUpdateRequest": {
+        "additionalProperties": false,
+        "description": "Partial update to an experiment or speedrun.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "enum": [
+                  "min",
+                  "max"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal"
+          },
+          "group_filter": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Filter"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "experiment",
+                  "speedrun"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "metric_key": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Key"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pinned_baseline_run_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned Baseline Run Id"
+          },
+          "shared_with": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shared With"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          },
+          "tag_filter": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag Filter"
+          },
+          "target_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Value"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "enum": [
+                  "private",
+                  "shared",
+                  "team"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visibility"
+          }
+        },
+        "title": "ExperimentUpdateRequest",
+        "type": "object"
+      },
       "FleetApplyRequest": {
         "additionalProperties": false,
         "properties": {
@@ -3570,6 +3908,168 @@
         "title": "GcpQueueAdmissionDenialTarget",
         "type": "object"
       },
+      "GovernanceActiveReclaim": {
+        "additionalProperties": false,
+        "description": "One currently active graceful reclaim window across the fleet.",
+        "properties": {
+          "deadline_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deadline At"
+          },
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "policy": {
+            "default": "requeue",
+            "enum": [
+              "requeue",
+              "stop"
+            ],
+            "title": "Policy",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "workload_id": {
+            "title": "Workload Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workload_id",
+          "owner",
+          "state"
+        ],
+        "title": "GovernanceActiveReclaim",
+        "type": "object"
+      },
+      "GovernanceSummaryResponse": {
+        "additionalProperties": false,
+        "description": "Plane-wide team quota, borrowing, and active reclaim summary.",
+        "properties": {
+          "active_reclaims": {
+            "items": {
+              "$ref": "#/components/schemas/GovernanceActiveReclaim"
+            },
+            "title": "Active Reclaims",
+            "type": "array"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "total_borrowed_tpu_units": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total Borrowed Tpu Units",
+            "type": "integer"
+          },
+          "total_guaranteed_tpu_units": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total Guaranteed Tpu Units",
+            "type": "integer"
+          },
+          "total_in_use_tpu_units": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Total In Use Tpu Units",
+            "type": "integer"
+          },
+          "users": {
+            "items": {
+              "$ref": "#/components/schemas/GovernanceSummaryUser"
+            },
+            "title": "Users",
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "GovernanceSummaryResponse",
+        "type": "object"
+      },
+      "GovernanceSummaryUser": {
+        "additionalProperties": false,
+        "description": "Per-user quota, guarantee, borrowing, and live usage snapshot.",
+        "properties": {
+          "borrowed_tpu_units": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Borrowed Tpu Units",
+            "type": "integer"
+          },
+          "can_borrow": {
+            "title": "Can Borrow",
+            "type": "boolean"
+          },
+          "guaranteed_tpu_units": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guaranteed Tpu Units"
+          },
+          "in_use_tpu_units": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "In Use Tpu Units",
+            "type": "integer"
+          },
+          "max_tpu_units": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tpu Units"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          },
+          "tier": {
+            "title": "Tier",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "tier",
+          "can_borrow"
+        ],
+        "title": "GovernanceSummaryUser",
+        "type": "object"
+      },
       "GrantState": {
         "description": "Lifecycle of one budget or quota grant.",
         "enum": [
@@ -3599,7 +4099,7 @@
             "type": "string"
           },
           "template": {
-            "$ref": "#/components/schemas/WorkloadDefinition"
+            "$ref": "#/components/schemas/WorkloadDefinition-Input"
           }
         },
         "required": [
@@ -4412,7 +4912,70 @@
         "title": "NativeRuntimeArtifact",
         "type": "object"
       },
-      "NativeRuntimeConfig": {
+      "NativeRuntimeConfig-Input": {
+        "additionalProperties": false,
+        "description": "Declarative host setup and workload defaults for Eyvan-native cells.\n\nThe configuration is deliberately host-oriented. ``vm_image`` selects a\nGCP Compute OS image, while ``container`` describes OCI execution handled\nby the Eyvan-native runtime.",
+        "properties": {
+          "artifacts": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/NativeRuntimeArtifact"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "container": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeContainerConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Env",
+            "type": "object"
+          },
+          "init_commands": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Init Commands",
+            "type": "array"
+          },
+          "python": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Python"
+          },
+          "vm_image": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vm Image"
+          }
+        },
+        "title": "NativeRuntimeConfig",
+        "type": "object"
+      },
+      "NativeRuntimeConfig-Output": {
         "additionalProperties": false,
         "description": "Declarative host setup and workload defaults for Eyvan-native cells.\n\nThe configuration is deliberately host-oriented. ``vm_image`` selects a\nGCP Compute OS image, while ``container`` describes OCI execution handled\nby the Eyvan-native runtime.",
         "properties": {
@@ -4540,6 +5103,81 @@
           "context"
         ],
         "title": "NoMatchingCapacityPoolErrorResponse",
+        "type": "object"
+      },
+      "NoteCreateRequest": {
+        "additionalProperties": false,
+        "description": "Create a team note attached to a run or experiment.",
+        "properties": {
+          "body": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Body",
+            "type": "string"
+          },
+          "metric_ref": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Ref"
+          },
+          "org_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Org Id",
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "step_ref": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Ref"
+          },
+          "target_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_type": {
+            "enum": [
+              "run",
+              "experiment"
+            ],
+            "title": "Target Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_id",
+          "project_id",
+          "target_type",
+          "target_id",
+          "body"
+        ],
+        "title": "NoteCreateRequest",
         "type": "object"
       },
       "OrganizationRecord": {
@@ -4777,6 +5415,23 @@
             "title": "Allowed Secret References",
             "type": "array"
           },
+          "cross_region_allow_multiregion": {
+            "default": true,
+            "title": "Cross Region Allow Multiregion",
+            "type": "boolean"
+          },
+          "cross_region_allowed_buckets": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Cross Region Allowed Buckets",
+            "type": "array"
+          },
+          "cross_region_transfer_policy": {
+            "$ref": "#/components/schemas/CrossRegionTransferPolicy",
+            "default": "allow"
+          },
           "denied_accelerator_types": {
             "default": [],
             "items": {
@@ -4836,6 +5491,23 @@
             },
             "title": "Allowed Secret References",
             "type": "array"
+          },
+          "cross_region_allow_multiregion": {
+            "default": true,
+            "title": "Cross Region Allow Multiregion",
+            "type": "boolean"
+          },
+          "cross_region_allowed_buckets": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Cross Region Allowed Buckets",
+            "type": "array"
+          },
+          "cross_region_transfer_policy": {
+            "$ref": "#/components/schemas/CrossRegionTransferPolicy",
+            "default": "allow"
           },
           "denied_accelerator_types": {
             "default": [],
@@ -4949,6 +5621,16 @@
             "title": "Checkpointable",
             "type": "boolean"
           },
+          "cross_region_transfer_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CrossRegionTransferPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "dependencies": {
             "default": [],
             "items": {
@@ -5045,6 +5727,15 @@
             "maxLength": 128,
             "minLength": 1,
             "title": "Project Id",
+            "type": "string"
+          },
+          "reclaim_policy": {
+            "default": "requeue",
+            "enum": [
+              "requeue",
+              "stop"
+            ],
+            "title": "Reclaim Policy",
             "type": "string"
           },
           "secret_mounts": {
@@ -5330,6 +6021,16 @@
             "title": "Command",
             "type": "string"
           },
+          "cross_region_transfer_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CrossRegionTransferPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "dependencies": {
             "default": [],
             "items": {
@@ -5423,6 +6124,15 @@
             "maxLength": 128,
             "minLength": 1,
             "title": "Project Id",
+            "type": "string"
+          },
+          "reclaim_policy": {
+            "default": "requeue",
+            "enum": [
+              "requeue",
+              "stop"
+            ],
+            "title": "Reclaim Policy",
             "type": "string"
           },
           "secret_mounts": {
@@ -6828,6 +7538,17 @@
             ],
             "title": "Approval Tpu Threshold"
           },
+          "can_borrow": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Can Borrow"
+          },
           "guaranteed_tpu_units": {
             "anyOf": [
               {
@@ -6882,6 +7603,138 @@
           }
         },
         "title": "RulesBody",
+        "type": "object"
+      },
+      "RunCompareRequest": {
+        "additionalProperties": false,
+        "description": "Request payload for ``POST /api/v1/tracking/compare``.",
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Keys",
+            "type": "array"
+          },
+          "org_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Org Id",
+            "type": "string"
+          },
+          "points": {
+            "default": 300,
+            "maximum": 2000.0,
+            "minimum": 1.0,
+            "title": "Points",
+            "type": "integer"
+          },
+          "project_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "run_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "minItems": 1,
+            "title": "Run Ids",
+            "type": "array"
+          },
+          "x": {
+            "default": "step",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "X",
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_id",
+          "project_id",
+          "run_ids"
+        ],
+        "title": "RunCompareRequest",
+        "type": "object"
+      },
+      "RunSharingUpdateRequest": {
+        "additionalProperties": false,
+        "description": "Partial update to one run's visibility, selective sharing, experiment link, or pin.",
+        "properties": {
+          "experiment_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experiment Id"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "pinned": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned"
+          },
+          "shared_with": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shared With"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "enum": [
+                  "private",
+                  "shared",
+                  "team"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visibility"
+          }
+        },
+        "title": "RunSharingUpdateRequest",
         "type": "object"
       },
       "ScopeQuota": {
@@ -7583,6 +8436,223 @@
         "title": "StopResearchBody",
         "type": "object"
       },
+      "StorageCheckRegionRequest": {
+        "additionalProperties": false,
+        "description": "Request body for ``POST /api/v1/storage/check-region``.",
+        "properties": {
+          "allowed_buckets": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Allowed Buckets",
+            "type": "array"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "strict": {
+            "default": false,
+            "title": "Strict",
+            "type": "boolean"
+          },
+          "uri": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "title": "StorageCheckRegionRequest",
+        "type": "object"
+      },
+      "StorageContextResponse": {
+        "additionalProperties": false,
+        "description": "Detected GCP/TPU runtime context returned by ``GET /api/v1/storage/status``.",
+        "properties": {
+          "accelerator_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accelerator Type"
+          },
+          "on_gcp": {
+            "default": false,
+            "title": "On Gcp",
+            "type": "boolean"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "source": {
+            "default": "none",
+            "title": "Source",
+            "type": "string"
+          },
+          "zone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Zone"
+          }
+        },
+        "title": "StorageContextResponse",
+        "type": "object"
+      },
+      "StorageMonitoringBucketResponse": {
+        "additionalProperties": false,
+        "description": "Configured default monitoring bucket for Eyvan run tracking.",
+        "properties": {
+          "bucket": {
+            "title": "Bucket",
+            "type": "string"
+          },
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "prefix": {
+            "default": "tracking",
+            "title": "Prefix",
+            "type": "string"
+          },
+          "uri": {
+            "title": "Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket",
+          "uri",
+          "location"
+        ],
+        "title": "StorageMonitoringBucketResponse",
+        "type": "object"
+      },
+      "StorageRegionalBucketResponse": {
+        "additionalProperties": false,
+        "description": "Configured regional GCS bucket for checkpoints and datasets.",
+        "properties": {
+          "bucket": {
+            "title": "Bucket",
+            "type": "string"
+          },
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "uri": {
+            "title": "Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket",
+          "uri",
+          "location"
+        ],
+        "title": "StorageRegionalBucketResponse",
+        "type": "object"
+      },
+      "StorageStatusResponse": {
+        "additionalProperties": false,
+        "description": "Non-secret Eyvan storage configuration and detected GCP context.",
+        "properties": {
+          "auto_create": {
+            "title": "Auto Create",
+            "type": "boolean"
+          },
+          "config_path": {
+            "title": "Config Path",
+            "type": "string"
+          },
+          "configured": {
+            "title": "Configured",
+            "type": "boolean"
+          },
+          "context": {
+            "$ref": "#/components/schemas/StorageContextResponse"
+          },
+          "monitoring": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StorageMonitoringBucketResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "regional": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/StorageRegionalBucketResponse"
+            },
+            "title": "Regional",
+            "type": "object"
+          }
+        },
+        "required": [
+          "configured",
+          "auto_create",
+          "config_path",
+          "context"
+        ],
+        "title": "StorageStatusResponse",
+        "type": "object"
+      },
       "StreamChatBody": {
         "additionalProperties": false,
         "properties": {
@@ -7988,14 +9058,69 @@
         "additionalProperties": false,
         "description": "One purchase class whose provider read did not succeed.\n\nReported beside the rows that did succeed rather than collapsing the whole\nsnapshot: a fleet whose Spot usage is unreadable still has readable\non-demand quota, and hiding one behind the other is how an operator ends up\nbelieving a zone is empty.",
         "properties": {
+          "account": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account"
+          },
           "capacity_class": {
             "$ref": "#/components/schemas/CapacityClass"
+          },
+          "code": {
+            "default": "quota_read_failed",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "permission": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission"
           },
           "reason": {
             "maxLength": 2048,
             "minLength": 1,
             "title": "Reason",
             "type": "string"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remediation"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
           }
         },
         "required": [
@@ -8626,7 +9751,7 @@
         "title": "WorkloadCapacitySummary",
         "type": "object"
       },
-      "WorkloadDefinition": {
+      "WorkloadDefinition-Input": {
         "additionalProperties": false,
         "description": "Execution and placement intent accepted by the public API.",
         "properties": {
@@ -8728,6 +9853,16 @@
             "default": false,
             "title": "Checkpointable",
             "type": "boolean"
+          },
+          "cross_region_transfer_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CrossRegionTransferPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "dependencies": {
             "default": [],
@@ -8853,6 +9988,347 @@
               }
             ],
             "title": "Provider"
+          },
+          "reclaim_policy": {
+            "default": "requeue",
+            "enum": [
+              "requeue",
+              "stop"
+            ],
+            "title": "Reclaim Policy",
+            "type": "string"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "required_executor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Required Executor"
+          },
+          "required_labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Required Labels",
+            "type": "object"
+          },
+          "secret_mounts": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Secret Mounts",
+            "type": "object"
+          },
+          "setup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkloadSetup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tpu_chips": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TpuChipRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "worker_count": {
+            "default": 1,
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Worker Count",
+            "type": "integer"
+          },
+          "worker_resource_scope": {
+            "$ref": "#/components/schemas/WorkerResourceScope",
+            "default": "atomic_cell"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "execution"
+        ],
+        "title": "WorkloadDefinition",
+        "type": "object"
+      },
+      "WorkloadDefinition-Output": {
+        "additionalProperties": false,
+        "description": "Execution and placement intent accepted by the public API.",
+        "properties": {
+          "accelerator_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accelerator Type"
+          },
+          "additional_capacity_classes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CapacityClass"
+            },
+            "title": "Additional Capacity Classes",
+            "type": "array"
+          },
+          "allowed_accelerator_types": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Accelerator Types",
+            "type": "array"
+          },
+          "allowed_regions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Regions",
+            "type": "array"
+          },
+          "allowed_zones": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Zones",
+            "type": "array"
+          },
+          "backend_options": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Backend Options",
+            "type": "object"
+          },
+          "can_submit_children": {
+            "default": false,
+            "title": "Can Submit Children",
+            "type": "boolean"
+          },
+          "capacity_class": {
+            "$ref": "#/components/schemas/CapacityClass",
+            "default": "on_demand"
+          },
+          "cell_group_count": {
+            "default": 1,
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Cell Group Count",
+            "type": "integer"
+          },
+          "checkpoint_grace_seconds": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Checkpoint Grace Seconds",
+            "type": "integer"
+          },
+          "checkpoint_hook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkpoint Hook"
+          },
+          "checkpoint_output_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkpoint Output Uri"
+          },
+          "checkpointable": {
+            "default": false,
+            "title": "Checkpointable",
+            "type": "boolean"
+          },
+          "cross_region_transfer_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CrossRegionTransferPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dependencies": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Dependencies",
+            "type": "array"
+          },
+          "environment": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Environment",
+            "type": "object"
+          },
+          "estimated_duration_seconds": {
+            "default": 3600,
+            "minimum": 1.0,
+            "title": "Estimated Duration Seconds",
+            "type": "integer"
+          },
+          "execution": {
+            "discriminator": {
+              "mapping": {
+                "callable": "#/components/schemas/CallableExecution",
+                "command": "#/components/schemas/CommandExecution"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CommandExecution"
+              },
+              {
+                "$ref": "#/components/schemas/CallableExecution"
+              }
+            ],
+            "title": "Execution"
+          },
+          "gang": {
+            "$ref": "#/components/schemas/ResourceGang"
+          },
+          "intra_band_priority": {
+            "default": 0,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Intra Band Priority",
+            "type": "integer"
+          },
+          "max_failure_retries": {
+            "default": 0,
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Max Failure Retries",
+            "type": "integer"
+          },
+          "max_preemption_retries": {
+            "default": 10,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Max Preemption Retries",
+            "type": "integer"
+          },
+          "max_retries": {
+            "default": 0,
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Max Retries",
+            "type": "integer"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Metadata",
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "named_assets": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Named Assets",
+            "type": "array"
+          },
+          "placement": {
+            "$ref": "#/components/schemas/PlacementMode",
+            "default": "atomic"
+          },
+          "preferred_cells": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Preferred Cells",
+            "type": "array"
+          },
+          "preferred_labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Preferred Labels",
+            "type": "object"
+          },
+          "priority_band": {
+            "$ref": "#/components/schemas/PriorityBand",
+            "default": "interactive"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "reclaim_policy": {
+            "default": "requeue",
+            "enum": [
+              "requeue",
+              "stop"
+            ],
+            "title": "Reclaim Policy",
+            "type": "string"
           },
           "region": {
             "anyOf": [
@@ -9089,7 +10565,7 @@
             "type": "string"
           },
           "spec": {
-            "$ref": "#/components/schemas/WorkloadDefinition"
+            "$ref": "#/components/schemas/WorkloadDefinition-Input"
           }
         },
         "required": [
@@ -9681,6 +11157,30 @@
               }
             ]
           },
+          "reclaim_deadline_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reclaim Deadline At"
+          },
+          "reclaim_requested_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reclaim Requested By"
+          },
           "remote_id": {
             "anyOf": [
               {
@@ -9721,7 +11221,7 @@
             "title": "Service Endpoint"
           },
           "spec": {
-            "$ref": "#/components/schemas/WorkloadDefinition"
+            "$ref": "#/components/schemas/WorkloadDefinition-Output"
           },
           "state": {
             "$ref": "#/components/schemas/WorkloadState",
@@ -9928,7 +11428,7 @@
             "type": "string"
           },
           "spec": {
-            "$ref": "#/components/schemas/WorkloadDefinition"
+            "$ref": "#/components/schemas/WorkloadDefinition-Input"
           }
         },
         "required": [
@@ -12734,6 +14234,761 @@
         ]
       }
     },
+    "/api/v1/collaboration/experiments": {
+      "get": {
+        "description": "List experiments and speedruns visible to the caller.",
+        "operationId": "list_experiments_api_v1_collaboration_experiments_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 120,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Subject"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Visibility"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Experiments",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "description": "Create a collaborative experiment or speedrun leaderboard.",
+        "operationId": "create_experiment_api_v1_collaboration_experiments_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExperimentCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Experiment",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/api/v1/collaboration/experiments/{exp_id}": {
+      "delete": {
+        "description": "Delete an experiment or speedrun (owner or admin only).",
+        "operationId": "delete_experiment_api_v1_collaboration_experiments__exp_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "exp_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Exp Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Experiment",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "get": {
+        "description": "Return one experiment or speedrun record.",
+        "operationId": "get_experiment_api_v1_collaboration_experiments__exp_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "exp_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Exp Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Experiment",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "patch": {
+        "description": "Update mutable fields of an experiment or speedrun (owner or admin only).",
+        "operationId": "update_experiment_api_v1_collaboration_experiments__exp_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "exp_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Exp Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExperimentUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Experiment",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/api/v1/collaboration/experiments/{exp_id}/leaderboard": {
+      "get": {
+        "description": "Rank visible runs belonging to an experiment or speedrun with baseline deltas and researcher stats.",
+        "operationId": "experiment_leaderboard_api_v1_collaboration_experiments__exp_id__leaderboard_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "exp_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Exp Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Experiment Leaderboard",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/api/v1/collaboration/feed": {
+      "get": {
+        "description": "Return combined live runs, enriched experiments/speedruns, recent notes, and researcher stats.",
+        "operationId": "collaboration_feed_api_v1_collaboration_feed_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Collaboration Feed",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/api/v1/collaboration/notes": {
+      "get": {
+        "description": "List visible team notes for a run, experiment, or the whole project.",
+        "operationId": "list_notes_api_v1_collaboration_notes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Notes",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "description": "Create a team note on a visible run or experiment.",
+        "operationId": "create_note_api_v1_collaboration_notes_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NoteCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Note",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/api/v1/collaboration/notes/{note_id}": {
+      "delete": {
+        "description": "Delete a note (author or project/fleet admin only).",
+        "operationId": "delete_note_api_v1_collaboration_notes__note_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "note_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Note Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Note",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/api/v1/collaboration/runs/{run_id}": {
+      "patch": {
+        "description": "Update sharing visibility, selective share list, experiment link, or baseline pin for one run.",
+        "operationId": "update_run_sharing_api_v1_collaboration_runs__run_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Org Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "\\S",
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunSharingUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Run Sharing",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
     "/api/v1/dags": {
       "post": {
         "description": "Submit a small pipeline of dependent workloads in one transaction.\n\nEach node is an ordinary durable workload. A node with predecessors is\ncreated unschedulable and released once every predecessor has succeeded; if\none fails or is cancelled, its dependents are cancelled rather than left\nwaiting forever. Dependencies order execution only -- results travel as\n``eyvan://`` result URIs, not through the control plane.",
@@ -14009,6 +16264,28 @@
         "summary": "Submit Pool Workload",
         "tags": [
           "workloads"
+        ]
+      }
+    },
+    "/api/v1/governance/summary": {
+      "get": {
+        "description": "Return plane-wide team quota, borrowing, and active reclaim summary (fleet admins).",
+        "operationId": "get_governance_summary_api_v1_governance_summary_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GovernanceSummaryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Governance Summary",
+        "tags": [
+          "governance"
         ]
       }
     },
@@ -15618,6 +17895,68 @@
         ]
       }
     },
+    "/api/v1/storage/check-region": {
+      "post": {
+        "description": "Evaluate whether accessing a ``gs://`` URI from a region is local or cross-region.",
+        "operationId": "check_storage_region_api_v1_storage_check_region_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StorageCheckRegionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Storage Region",
+        "tags": [
+          "storage"
+        ]
+      }
+    },
+    "/api/v1/storage/status": {
+      "get": {
+        "description": "Return non-secret Eyvan storage configuration and detected GCP context.\n\nAuthenticated like ``/api/v1/build`` and ``/api/v1/tracking/health``:\nexposes configured bucket names, locations, and detected GCP region so\nthe dashboard Settings and Overview pages can display active storage\nwithout revealing any credentials or tenant data.",
+        "operationId": "get_storage_status_api_v1_storage_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Storage Status",
+        "tags": [
+          "storage"
+        ]
+      }
+    },
     "/api/v1/system/invariants": {
       "get": {
         "description": "Report which durability invariants the fleet is currently violating.\n\nThe point-in-time half only. Budget monotonicity and storage growth are\nstatements about a *sequence* of observations, so a single request\ncannot settle them and this does not pretend to -- a soak run holds the\nprevious snapshot and compares.\n\nAn empty ``violations`` list is a real claim, not a default: every check\nhas a test that makes it fire, so silence here means the checks ran and\nfound nothing rather than that nothing ran.",
@@ -16696,6 +19035,46 @@
         ]
       }
     },
+    "/api/v1/tracking/compare": {
+      "post": {
+        "description": "Compare multiple visible runs: aligned metric series, summary stats, and hyperparameter diff.",
+        "operationId": "tracking_compare_api_v1_tracking_compare_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunCompareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tracking Compare",
+        "tags": [
+          "tracking"
+        ]
+      }
+    },
     "/api/v1/tracking/health": {
       "get": {
         "description": "Read tracker readiness without granting access to any run's data.",
@@ -16718,7 +19097,7 @@
     },
     "/api/v1/tracking/runs": {
       "get": {
-        "description": "List runs visible to a project's readers.",
+        "description": "List runs visible to a project member, enriched with collaboration metadata.",
         "operationId": "tracking_runs_api_v1_tracking_runs_get",
         "parameters": [
           {
@@ -16728,6 +19107,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -16739,8 +19119,95 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Owner"
+            }
+          },
+          {
+            "in": "query",
+            "name": "visibility",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Visibility"
+            }
+          },
+          {
+            "in": "query",
+            "name": "experiment_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Experiment Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "group",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Group"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
             }
           }
         ],
@@ -16772,7 +19239,7 @@
     },
     "/api/v1/tracking/runs/{run_id}": {
       "get": {
-        "description": "Read one run's metadata through its authorized scope.",
+        "description": "Read one run's metadata through its authorized scope and visibility policy.",
         "operationId": "tracking_run_api_v1_tracking_runs__run_id__get",
         "parameters": [
           {
@@ -16792,6 +19259,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -16803,6 +19271,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -16866,6 +19335,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -16877,6 +19347,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -16930,6 +19401,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -16941,6 +19413,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -16994,6 +19467,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17005,6 +19479,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17068,6 +19543,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17079,6 +19555,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17132,6 +19609,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17143,6 +19621,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17196,6 +19675,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17207,6 +19687,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17260,6 +19741,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17271,6 +19753,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17324,6 +19807,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17335,6 +19819,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17388,6 +19873,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17399,6 +19885,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17452,6 +19939,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17463,6 +19951,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17526,6 +20015,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17537,6 +20027,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17590,6 +20081,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17601,6 +20093,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }
@@ -17654,6 +20147,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Org Id",
               "type": "string"
             }
@@ -17665,6 +20159,7 @@
             "schema": {
               "maxLength": 128,
               "minLength": 1,
+              "pattern": "\\S",
               "title": "Project Id",
               "type": "string"
             }

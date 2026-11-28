@@ -10,7 +10,7 @@ daemon configuration is exactly what environments are for. The rule this
 document enforces instead is **no unlisted variable**: a name either
 appears below or must not exist.
 
-224 variables are currently referenced. Names set on workload
+234 variables are currently referenced. Names set on workload
 processes as part of the dispatch envelope (attempt ids, batch indices,
 candidate digests) sit in the same namespace but are transport, not
 configuration; they are listed for completeness because the boundary
@@ -34,11 +34,15 @@ is easier to audit when everything is in one table.
 | `EYVAN_CELL_STAGE_SOURCES` | `eyvan` |
 | `EYVAN_CHILDREN_URL` | `eyvan` |
 | `EYVAN_CORRELATION_ENABLED` | `eyvan` |
+| `EYVAN_CROSS_REGION_` | `eyvan` |
+| `EYVAN_CROSS_REGION_KILL` | `eyvan` |
+| `EYVAN_CROSS_REGION_POLICY` | `eyvan` |
 | `EYVAN_DASHBOARD_DIR` | `eyvan` |
 | `EYVAN_DATABASE_URL` | `eyvan` |
 | `EYVAN_DEV_AUTH_ENABLED` | `eyvan` |
 | `EYVAN_DISTRIBUTED_PROCESS_ID` | `eyvan` |
 | `EYVAN_FLEET_STATE_URI` | `eyvan` |
+| `EYVAN_HOST_REGION` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_BUDGET` | `eyvan` |
 | `EYVAN_HOST_REPLACEMENT_WINDOW_S` | `eyvan` |
 | `EYVAN_KUBERNETES_NAMESPACE` | `eyvan` |
@@ -68,9 +72,11 @@ is easier to audit when everything is in one table.
 | `EYVAN_TLS_KEY_FILE` | `eyvan` |
 | `EYVAN_TOKEN` | `eyvan` |
 | `EYVAN_TRACKER_TOKEN` | `eyvan` |
+| `EYVAN_TRACKER_URL` | `eyvan` |
 | `EYVAN_TRACKING_URI` | `eyvan` |
 | `EYVAN_TRUSTED_CALLABLE_PROJECTS` | `eyvan` |
 | `EYVAN_WORKLOAD_ID` | `eyvan` |
+| `EYVAN_WORKLOAD_OWNER` | `eyvan` |
 | `EYVAN_WORKLOAD_TOKEN` | `eyvan` |
 | `EYVAN_CONTROL_PLANE_CA_B64` | `eyvan/_internal/plane_tls` |
 | `EYVAN_CONTROL_PLANE_CA_FILE` | `eyvan/_internal/plane_tls` |
@@ -122,6 +128,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_CREDENTIAL_ROTATION_OVERLAP_S` | `eyvan/config` |
 | `EYVAN_DASHBOARD_AUTH_TRANSACTION_TTL_S` | `eyvan/config` |
 | `EYVAN_DASHBOARD_SESSION_TTL_S` | `eyvan/config` |
+| `EYVAN_DEFAULT_RECLAIM_GRACE_S` | `eyvan/config` |
 | `EYVAN_EXECUTION_BACKEND` | `eyvan/config` |
 | `EYVAN_EXPANSION_WAVE_SIZE` | `eyvan/config` |
 | `EYVAN_GANG_HEARTBEAT_TIMEOUT_S` | `eyvan/config` |
@@ -166,7 +173,6 @@ is easier to audit when everything is in one table.
 | `EYVAN_SERVICE_RECONCILE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SERVICE_REPLICA_LIFECYCLE_INTERVAL_S` | `eyvan/config` |
 | `EYVAN_SOAK_EVIDENCE_MAX_AGE_S` | `eyvan/config` |
-| `EYVAN_TRACKER_URL` | `eyvan/config` |
 | `EYVAN_TRACKING_STORE_URI` | `eyvan/config` |
 | `EYVAN_WEBHOOK_ALLOW_PRIVATE_TARGETS` | `eyvan/config` |
 | `EYVAN_WEBHOOK_DELIVERY_INTERVAL_S` | `eyvan/config` |
@@ -196,6 +202,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_MANAGED_WORKSPACE_URL` | `eyvan/server/controller/workload_commands` |
 | `EYVAN_BATCH_COUNT` | `eyvan/server/service/batch` |
 | `EYVAN_BATCH_INDEX` | `eyvan/server/service/batch` |
+| `EYVAN_CROSS_REGION_ALLOWED_BUCKETS` | `eyvan/storage/_region_guard` |
+| `EYVAN_CROSS_REGION_ALLOW_MULTIREGION` | `eyvan/storage/_region_guard` |
 | `EYVAN_DISTRIBUTED_PROCESS_COUNT` | `eyvan/worker` |
 | `EYVAN_JAX_CLUSTER_DETECTION` | `eyvan/worker` |
 | `EYVAN_JAX_MULTIHOST` | `eyvan/worker` |
@@ -210,6 +218,7 @@ is easier to audit when everything is in one table.
 | `EYVAN_GPU_MODEL` | `eyvan/worker/distributed_environment` |
 | `EYVAN_JAX_` | `eyvan/worker/distributed_environment` |
 | `EYVAN_CHECKPOINT_URI` | `eyvan/worker/runtime` |
+| `EYVAN_RUNTIME_ENV_DIR` | `eyvan/worker/runtime` |
 | `EYVAN_SOURCE_JOB_ID` | `eyvan/worker/runtime` |
 | `EYVAN_SUPERSEDE_POLL_S` | `eyvan/worker/runtime` |
 | `EYVAN_SUPERSEDE_WAIT_TIMEOUT_S` | `eyvan/worker/runtime` |
@@ -223,7 +232,6 @@ is easier to audit when everything is in one table.
 | `EYVAN_CONTAINER_STOP_POLL_S` | `eyvan/worker/runtime/container` |
 | `EYVAN_CONTAINER_STOP_SETTLE_S` | `eyvan/worker/runtime/container` |
 | `EYVAN_PYTHON` | `eyvan/worker/runtime/dependency_entry` |
-| `EYVAN_RUNTIME_ENV_DIR` | `eyvan/worker/runtime/dependency_entry` |
 | `EYVAN_LOCAL_RUNTIME_DIR` | `eyvan/worker/runtime/local_process` |
 | `EYVAN_LOG_CURSOR_V2_EMISSION_ENABLED` | `eyvan/worker/runtime/log_records` |
 | `EYVAN_MULTIHOST_SITECUSTOMIZE` | `eyvan/worker/runtime/native_bootstrap` |
@@ -236,6 +244,8 @@ is easier to audit when everything is in one table.
 | `EYVAN_NATIVE_WORKLOAD_GROUP` | `eyvan/worker/runtime/native_worker` |
 | `EYVAN_NATIVE_WORKLOAD_USER` | `eyvan/worker/runtime/native_worker` |
 | `EYVAN_SYSTEMD_EXIT_TYPE_CGROUP` | `eyvan/worker/runtime/native_worker` |
+| `EYVAN_CHECKPOINT_RECEIPT_PATH` | `eyvan/worker/runtime/preemption` |
+| `EYVAN_RECLAIM_NOTICE_PATH` | `eyvan/worker/runtime/preemption` |
 | `EYVAN_GPU_RANK_LAYOUT` | `eyvan/worker/runtime/registry` |
 | `EYVAN_CHECKPOINT_BASE_URI` | `eyvan/worker/runtime/systemd_transient` |
 | `EYVAN_CHECKPOINT_RANK` | `eyvan/worker/runtime/systemd_transient` |
