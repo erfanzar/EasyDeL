@@ -2992,7 +2992,7 @@ class AgentFlowTrainer:
             return self._encode_text(rendered)
 
         # Continuation delta (e.g. tool / user response messages): diff against a sentinel prefix so
-        # templates like Qwen3.8 never re-inject a default system block mid-trajectory.
+        # chat templates with default system prompts never re-inject a system block mid-trajectory.
         prefix_msgs: list[dict[str, tp.Any]] = [
             {"role": "system", "content": ""},
             {"role": "user", "content": _TEMPLATE_PROBE},
