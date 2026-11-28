@@ -151,6 +151,33 @@ class EngineLoop:
         self._thread: threading.Thread | None = None
         self._between_steps: collections.deque[_BetweenStepsCall] = collections.deque()
         self._between_steps_lock = threading.Lock()
+        self._idle_cond = threading.Condition()
+        self._is_idle = True
+
+    def _mark_busy(self) -> None:
+        with self._idle_cond:
+            self._is_idle = False
+
+    def _mark_idle(self) -> None:
+        with self._idle_cond:
+            self._is_idle = True
+            self._idle_cond.notify_all()
+
+    def wait_until_idle(self, timeout: float | None = 30.0) -> bool:
+        """Block until the loop finishes any in-flight step and trailing zero-token cleanup (e.g. recurrent slot clears)."""
+        deadline = None if timeout is None else (time.monotonic() + max(0.0, float(timeout)))
+        with self._idle_cond:
+            while self._running:
+                if self._is_idle and self.core.num_running == 0 and self.core.num_waiting == 0:
+                    return True
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return False
+                    self._idle_cond.wait(timeout=min(0.05, remaining))
+                else:
+                    self._idle_cond.wait(timeout=0.05)
+            return True
 
     def run_between_steps(self, fn: typing.Callable[[], typing.Any]) -> typing.Any:
         """Run ``fn`` on the loop thread at a point where no model step is in flight.
@@ -379,6 +406,7 @@ class EngineLoop:
             # The loop no longer runs steps: serve calls queued for a between-steps slot now.
             self._service_between_steps()
             self._running = False
+            self._mark_idle()
             if self._on_stopped is not None:
                 self._on_stopped()
 
@@ -442,9 +470,11 @@ class EngineLoop:
                 if scheduler_output.total_num_scheduled_tokens == 0 and not self._zero_schedule_needs_update(
                     scheduler_output
                 ):
+                    self._mark_idle()
                     self._idle_scheduler_tick()
                     consecutive_errors = 0
                     continue
+                self._mark_busy()
                 prof_dispatch = 0.0
                 prof_phase = time.perf_counter()
                 model_output = coordinator.execute_sync(scheduler_output)
@@ -749,6 +779,7 @@ class EngineLoop:
 
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     if self._zero_schedule_needs_update(scheduler_output):
+                        self._mark_busy()
                         try:
                             _execute_zero_token_schedule(scheduler_output)
                         except self._closed_error:
@@ -763,9 +794,11 @@ class EngineLoop:
                             self._on_fatal(e)
                             break
                     else:
+                        self._mark_idle()
                         self._idle_scheduler_tick()
                         pending_execution = None
                 else:
+                    self._mark_busy()
                     try:
                         pending_execution = _execute_positive_schedule(scheduler_output)
                     except self._closed_error:

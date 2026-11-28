@@ -2618,6 +2618,29 @@ class EasyBridgeMixin(PushToHubMixin):
                         "Skipping %d saved RNG-state leaf(s) during load; using freshly-seeded uint32 rngs instead.",
                         len(rng_state_keys),
                     )
+                # Pre-remap legacy/nested native checkpoint keys (e.g. VLM
+                # ``model.language_model.*`` -> ``model.*`` when loading as
+                # text-only CausalLM) BEFORE fused-layout re-interleaving,
+                # native reform fusions, load-time quantization, and sharding
+                # re-placement so every fused/linear-attention leaf matches its
+                # live module path and sharding rule.
+                _remap_keys = getattr(model, "_remap_legacy_native_keys", None)
+                _remapped_native_keys = False
+                if callable(_remap_keys):
+                    _model_state_raw_pre = spx.export(model)[1].raw()
+                    _expected_pre: dict[tuple[tp.Any, ...], tp.Any] = {}
+                    for _c, _d in _model_state_raw_pre.items():
+                        for _pt, _lf in flatten_dict(_d).items():
+                            _expected_pre[(_c, *_pt)] = _lf
+                    state = _adapt_legacy_checkpoint_collections(state, set(_expected_pre.keys()))
+                    _before_keys = set(state.keys())
+                    state = _remap_keys(state, _expected_pre)
+                    _remapped_native_keys = set(state.keys()) != _before_keys
+                    if _remapped_native_keys:
+                        logger.info(
+                            "Pre-remapped %d nested native checkpoint leaf/leaves before fused-layout re-interleaving.",
+                            len(set(state.keys()) - _before_keys),
+                        )
                 # Mesh-portability: fused params are stored in the save mesh's
                 # interleave with that tp recorded in config.json / the sidecar
                 # marker. Re-interleave from the recorded tp to the live tp,
@@ -2678,7 +2701,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 for label, count in native_fused_counts.items():
                     logger.info("Fused %d native checkpoint %s into runtime merged weights.", count, label)
 
-                if native_fused_counts or native_unfused_count or _cf_saved_tp is not None:
+                if native_fused_counts or native_unfused_count or _cf_saved_tp is not None or _remapped_native_keys:
                     # Leaves synthesized after the rule-based tensorstore read
                     # (native fusions, tp re-interleaves) bypassed the loader's
                     # placement: their sources matched no live-variable rule and

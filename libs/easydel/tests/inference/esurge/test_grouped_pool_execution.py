@@ -367,3 +367,174 @@ def test_grouped_speculative_commit_preserves_rebased_pool_progress(monkeypatch,
     np.testing.assert_array_equal(valid, [True] * 4)
     assert manager.kv_pages == 4 and manager.rng_key == 1
     assert "pp_microbatches" not in metrics
+
+
+def test_grouped_prepare_slices_on_host_and_reuses_parent_device_leaves(monkeypatch):
+    """Cache-group preparation must never slice already-placed arrays or duplicate unchanged parent leaves."""
+    from easydel.inference.esurge.runners.executors import batch_preparer as preparer_module
+
+    manager = _grouped_manager(monkeypatch, version="v3", enable_spec=True)
+    transferred_counts: list[int] = []
+
+    class _NoSliceDeviceArray:
+        """Stand-in device handle that raises if sliced eagerly after device_put."""
+
+        def __init__(self, arr: np.ndarray):
+            self._arr = np.array(arr, copy=True)
+            self.shape = self._arr.shape
+            self.dtype = self._arr.dtype
+
+        def __getitem__(self, item):
+            raise AssertionError(f"Unexpected eager device slice on cache-group leaf: {item!r}")
+
+        def __array__(self, dtype=None, copy=None):
+            return np.asarray(self._arr, dtype=dtype)
+
+    def _tracking_put(value, sharding=None, *, host_payloads_replicated=None):
+        del sharding, host_payloads_replicated
+        if isinstance(value, tuple):
+            transferred_counts.append(len(value))
+            return tuple(_NoSliceDeviceArray(np.asarray(v)) for v in value)
+        transferred_counts.append(1)
+        return _NoSliceDeviceArray(np.asarray(value))
+
+    monkeypatch.setattr(preparer_module, "put_host_payload", _tracking_put)
+    groups = _groups(version=7)
+    batch, *_ = _prepare(manager, groups)
+
+    # First call: parent puts its main payload, each group puts only its 5 minimal leaves (no input_ids/sampling/positions).
+    assert transferred_counts[-2:] == [5, 5]
+    for idx, group in enumerate(groups):
+        payload = batch.cache_groups[idx]
+        assert payload.position_ids is batch.position_ids_buf
+        assert payload.spec_recurrent_commit is batch.spec_recurrent_commit
+        np.testing.assert_array_equal(np.asarray(payload.pages_tables), group.page_table_cpu)
+        np.testing.assert_array_equal(np.asarray(payload.context_lens), [4] * 4)
+        np.testing.assert_array_equal(np.asarray(payload.query_start_loc), [0, 1, 2, 3, 4])
+        np.testing.assert_array_equal(np.asarray(payload.num_seqs), [4])
+        np.testing.assert_array_equal(np.asarray(payload.request_distribution), [4, 4, 4])
+
+    # Second steady-state call with identical page_table_version and unchanged small arrays:
+    # pages_tables is reused by version and all 4 small metadata leaves hit _payload_put_cache -> 0 extra puts per group!
+    before_second = len(transferred_counts)
+    # Mark cached device page tables as jax.Array-like via isinstance bypass not needed here;
+    # verify content cache skips all 4 small leaves so only pages_tables (non-jax.Array stand-in) transfers.
+    batch2, *_ = _prepare(manager, groups)
+    assert transferred_counts[before_second:][-2:] == [1, 1]
+    assert batch2.cache_groups[0].context_lens is batch.cache_groups[0].context_lens
+    assert batch2.cache_groups[1].query_start_loc is batch.cache_groups[1].query_start_loc
+    assert batch2.cache_groups[1].request_distribution is batch.cache_groups[1].request_distribution
+
+
+def test_engine_loop_wait_until_idle_waits_for_trailing_zero_token_cleanup():
+    """EngineLoop.wait_until_idle must block until trailing zero-token cleanup (e.g. recurrent clears) finishes."""
+    import threading
+
+    from easydel.inference.esurge.engine.loop import EngineLoop
+
+    cleanup_started = threading.Event()
+    allow_cleanup_finish = threading.Event()
+    cleanup_finished = threading.Event()
+    request_emitted = threading.Event()
+
+    class _FakeCore:
+        def __init__(self):
+            self.num_running = 1
+            self.num_waiting = 0
+            self._tick = 0
+
+        def schedule(self):
+            self._tick += 1
+            if self._tick == 1:
+                return SimpleNamespace(
+                    total_num_scheduled_tokens=1,
+                    num_scheduled_tokens={"r1": 1},
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=SimpleNamespace(num_reqs=0),
+                    preempted_req_ids=set(),
+                    finished_req_ids=set(),
+                    async_scheduling=False,
+                )
+            if self._tick == 2:
+                return SimpleNamespace(
+                    total_num_scheduled_tokens=0,
+                    num_scheduled_tokens={},
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=SimpleNamespace(num_reqs=0),
+                    preempted_req_ids=set(),
+                    finished_req_ids={"r1"},
+                    async_scheduling=False,
+                )
+            return SimpleNamespace(
+                total_num_scheduled_tokens=0,
+                num_scheduled_tokens={},
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(num_reqs=0),
+                preempted_req_ids=set(),
+                finished_req_ids=set(),
+                async_scheduling=False,
+            )
+
+        def commit(self, sched_out, model_out):
+            del model_out
+            if sched_out.total_num_scheduled_tokens > 0:
+                self.num_running = 0
+                return {"finished": True}
+            return {}
+
+    class _FakeCoordinator:
+        overlap_supported = False
+        has_worker_pool = False
+
+        def check_health(self):
+            return None
+
+        def execute_sync(self, sched_out):
+            if sched_out.total_num_scheduled_tokens == 0 and sched_out.finished_req_ids:
+                cleanup_started.set()
+                assert allow_cleanup_finish.wait(timeout=5.0)
+                cleanup_finished.set()
+            return SimpleNamespace()
+
+    core = _FakeCore()
+    loop = EngineLoop(
+        core=core,
+        runner=SimpleNamespace(),
+        coordinator=_FakeCoordinator(),
+        scheduler_lock=threading.RLock(),
+        emit_outputs=lambda out: request_emitted.set() if out.get("finished") else None,
+        drain_parser_stops=lambda: None,
+        on_fatal=lambda exc: (_ for _ in ()).throw(exc),
+        heartbeat=lambda: None,
+        handle_profiling_step=lambda: None,
+        is_nonrecoverable=lambda _exc: False,
+        overlap_execution=False,
+        async_scheduling=False,
+        runner_verbose=False,
+        info=lambda *_args, **_kwargs: None,
+    )
+    loop.start()
+    try:
+        assert request_emitted.wait(timeout=5.0)
+        assert cleanup_started.wait(timeout=5.0)
+
+        wait_done = threading.Event()
+        wait_result: list[bool] = []
+
+        def _waiter():
+            wait_result.append(loop.wait_until_idle(timeout=5.0))
+            wait_done.set()
+
+        t = threading.Thread(target=_waiter, daemon=True)
+        t.start()
+
+        # Must remain blocked while trailing zero-token cleanup is still executing.
+        assert not wait_done.wait(timeout=0.05)
+        allow_cleanup_finish.set()
+        assert cleanup_finished.wait(timeout=5.0)
+        assert wait_done.wait(timeout=5.0)
+        assert wait_result == [True]
+    finally:
+        allow_cleanup_finish.set()
+        loop.request_stop()
+        loop.join(timeout=5.0)

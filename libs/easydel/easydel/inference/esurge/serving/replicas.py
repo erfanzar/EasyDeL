@@ -442,6 +442,7 @@ def spawn_front(plan: ReplicaPlan, token: str, index: int = 0) -> subprocess.Pop
     read_fd = _token_pipe(token)
     front = dataclasses.replace(plan, role="front", token_fd=read_fd, front_index=int(index))
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "ENABLE_DISTRIBUTED_INIT": "0"}
+    env.pop("JAX_PLATFORM_NAME", None)
     sys.stdout.flush()
     sys.stderr.flush()
     try:

@@ -488,6 +488,7 @@ def _place_recurrent_host_payload(
         from jax.experimental import multihost_utils
 
         values = multihost_utils.broadcast_one_to_all(values)
+        host_payloads_replicated = True
     if sharding is None:
         return values
     return put_host_payload(values, sharding, host_payloads_replicated=host_payloads_replicated)

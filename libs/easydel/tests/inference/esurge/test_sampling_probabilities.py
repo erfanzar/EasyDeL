@@ -288,3 +288,186 @@ def test_logprobs_zero_still_reports_the_sampled_token():
     np.testing.assert_array_equal(ids, [[1]])
     np.testing.assert_allclose(scores, [[-np.log(2.0)]], atol=2e-6)
     np.testing.assert_array_equal(ranks, [0])
+
+
+def test_batched_score_output_window_matches_per_row_reference_and_skips_penalties():
+    """Window-batched logprob scoring must match per-row scoring across mixed k, filters, and metrics."""
+    from types import SimpleNamespace
+
+    from easydel.inference.esurge.runners import model_runner
+    from easydel.inference.sampling_params import SamplingParams
+
+    rng = np.random.default_rng(7)
+    logits = jnp.asarray(rng.normal(size=(4, 16)), dtype=jnp.float32)
+    sampled = jnp.asarray([3, 7, 1, -1], dtype=jnp.int32)
+    history = np.zeros((4, 8), dtype=np.int32)
+
+    params_a = SamplingParams(temperature=0.8, top_k=5, top_p=1.0, min_p=0.0, logprobs=0)
+    params_b = SamplingParams(temperature=0.6, top_k=0, top_p=0.9, min_p=0.05, logprobs=3)
+    params_c = SamplingParams(temperature=0.0, logprobs=1)  # greedy point mass
+
+    req_a = SimpleNamespace(sampling_params=params_a)
+    req_b = SimpleNamespace(sampling_params=params_b)
+    req_c = SimpleNamespace(sampling_params=params_c)
+    window_entries = [
+        (0, "r0", req_a, 0, 4, True),
+        (1, "r1", req_b, 1, 5, True),
+        (2, "r2", req_c, 2, 3, True),
+        (3, "r3", req_a, 3, 2, False),  # partial prefill -> must be ignored
+    ]
+
+    runner = object.__new__(model_runner.eSurgeRunner)
+    runner.enable_sampler_metrics = True
+
+    batched_payloads, metric_scores = runner._score_output_window(
+        logits=logits,
+        sampled_tokens=sampled,
+        token_ids_window_cpu=history,
+        window_entries=window_entries,
+        requested_logprobs={"r0", "r1", "r2"},
+        sampling_constraints=None,
+        padded_num_reqs=4,
+    )
+    assert set(batched_payloads.keys()) == {"r0", "r1", "r2"}
+    batched_lp = model_runner._materialize_logprobs(
+        ["r0", "r1", "r2", "r3"],
+        [[3], [7], [1], []],
+        batched_payloads,
+        {"r0", "r1", "r2"},
+    )
+    assert batched_lp is not None
+
+    ref_payloads = {}
+    for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
+        if not is_valid:
+            continue
+        ref_payloads[rid] = runner._score_output_row(
+            logits=logits[row_pos : row_pos + 1],
+            sampled_tokens=sampled[row_pos : row_pos + 1],
+            history=history[row_pos],
+            seq_len=seq_len,
+            sampling_params=req_state.sampling_params,
+            sampling_constraints=None,
+            row_pos=row_pos,
+        )
+    ref_lp = model_runner._materialize_logprobs(
+        ["r0", "r1", "r2", "r3"],
+        [[3], [7], [1], []],
+        ref_payloads,
+        {"r0", "r1", "r2"},
+    )
+    assert ref_lp is not None
+    assert batched_lp.logprob_token_ids == ref_lp.logprob_token_ids
+    assert batched_lp.sampled_token_ranks == ref_lp.sampled_token_ranks
+    for got_scores, exp_scores in zip(batched_lp.logprobs, ref_lp.logprobs, strict=True):
+        np.testing.assert_allclose(got_scores, exp_scores, atol=1e-5)
+    metric_np = np.asarray(metric_scores)
+    np.testing.assert_allclose(metric_np[0], ref_lp.logprobs[0][0], atol=1e-5)
+    np.testing.assert_allclose(metric_np[1], ref_lp.logprobs[1][0], atol=1e-5)
+    np.testing.assert_allclose(metric_np[2], 0.0, atol=1e-6)
+    np.testing.assert_allclose(metric_np[3], 0.0, atol=1e-6)
+
+
+@pytest.mark.cpu_ok
+def test_score_output_window_caches_replicated_params_and_skips_redundant_assert_equal(monkeypatch):
+    """Steady-state decode scoring without penalties must broadcast/place once and hit device cache thereafter."""
+    from types import SimpleNamespace
+
+    from easydel.inference.esurge.runners import model_runner
+    from easydel.inference.sampling_params import SamplingParams
+    from jax.experimental import multihost_utils
+
+    mesh = object()
+
+    class _FakeSharding:
+        def __init__(self, m=mesh, spec=None):
+            del spec
+            self.mesh = m
+            self.device_set = frozenset({0})
+
+    class _FakeLogits:
+        def __init__(self, shape):
+            self.shape = shape
+            self.sharding = _FakeSharding(mesh)
+
+        def __getitem__(self, item):
+            raise AssertionError(f"Unexpected eager logits slice on exact bucket shape: {item!r}")
+
+    class _FakeTokens:
+        def __init__(self, shape):
+            self.shape = shape
+            self.sharding = _FakeSharding(mesh)
+
+        def __getitem__(self, item):
+            raise AssertionError(f"Unexpected eager tokens slice on exact bucket shape: {item!r}")
+
+    broadcast_calls = 0
+    put_calls: list[tuple[int, bool | None]] = []
+    score_calls = 0
+
+    def _fake_broadcast(vals):
+        nonlocal broadcast_calls
+        broadcast_calls += 1
+        return vals
+
+    def _fake_put(values, sharding, *, host_payloads_replicated=None):
+        del sharding
+        put_calls.append((len(values), host_payloads_replicated))
+        return tuple(np.asarray(v) for v in values)
+
+    def _fake_score(logits_w, tokens_w, *args, **kwargs):
+        nonlocal score_calls
+        del logits_w, tokens_w, args, kwargs
+        score_calls += 1
+        return (
+            np.zeros((4, 1), dtype=np.int32),
+            np.full((4, 1), -0.5, dtype=np.float32),
+            np.zeros((4,), dtype=np.int32),
+        )
+
+    monkeypatch.setattr(model_runner.jax.sharding, "NamedSharding", _FakeSharding)
+    monkeypatch.setattr(model_runner.jax.sharding, "PartitionSpec", lambda *a, **k: ())
+    monkeypatch.setattr(model_runner.jax, "copy_to_host_async", lambda a: a)
+    monkeypatch.setattr(model_runner, "host_payload_broadcast_needed", lambda rep=None: not bool(rep))
+    monkeypatch.setattr(model_runner, "put_host_payload", _fake_put)
+    monkeypatch.setattr(model_runner, "score_sampled_tokens", _fake_score)
+    monkeypatch.setattr(multihost_utils, "broadcast_one_to_all", _fake_broadcast)
+    fake_logits = _FakeLogits((4, 16))
+    fake_tokens = _FakeTokens((4,))
+
+    runner = object.__new__(model_runner.eSurgeRunner)
+    runner.enable_sampler_metrics = False
+    runner.executor_manager = SimpleNamespace(host_payloads_replicated=False)
+    params = SamplingParams(temperature=1.0, top_k=64, top_p=1.0, logprobs=0)
+    req = SimpleNamespace(sampling_params=params)
+    history = np.zeros((4, 8), dtype=np.int32)
+
+    # Step 1 (seq_len=10): 1 broadcast + 1 put_host_payload(..., host_payloads_replicated=True) -> zero assert_equal!
+    entries_step1 = [(0, "r0", req, 0, 10, True), (1, "r1", req, 1, 10, True)]
+    runner._score_output_window(
+        logits=fake_logits,
+        sampled_tokens=fake_tokens,
+        token_ids_window_cpu=history,
+        window_entries=entries_step1,
+        requested_logprobs={"r0", "r1"},
+        sampling_constraints=None,
+        padded_num_reqs=4,
+    )
+    assert broadcast_calls == 1
+    assert put_calls == [(9, True)]
+    assert score_calls == 1
+
+    # Step 2 (seq_len=11, penalties off): 100% cache hit -> ZERO broadcasts and ZERO puts!
+    entries_step2 = [(0, "r0", req, 0, 11, True), (1, "r1", req, 1, 11, True)]
+    runner._score_output_window(
+        logits=fake_logits,
+        sampled_tokens=fake_tokens,
+        token_ids_window_cpu=history,
+        window_entries=entries_step2,
+        requested_logprobs={"r0", "r1"},
+        sampling_constraints=None,
+        padded_num_reqs=4,
+    )
+    assert broadcast_calls == 1
+    assert put_calls == [(9, True)]
+    assert score_calls == 2

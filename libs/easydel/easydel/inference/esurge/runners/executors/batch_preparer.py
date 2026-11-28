@@ -453,6 +453,7 @@ class BatchMetadataPreparer:
             from jax.experimental import multihost_utils
 
             payload = multihost_utils.broadcast_one_to_all(payload)
+            replicated = True
         return put_host_payload(payload, self._empty_sharding, host_payloads_replicated=replicated)
 
     def _get_zero_dev(self, *, namespace: str, shape: tuple[int, ...], dtype: np.dtype) -> jax.Array:
@@ -481,7 +482,14 @@ class BatchMetadataPreparer:
             self._zero_dev_cache[key] = cached
         return cached
 
-    def _device_put_host_payload(self, host_payload: tuple) -> tuple:
+    def _device_put_host_payload(
+        self,
+        host_payload: tuple,
+        *,
+        page_table_index: int = _PAYLOAD_PAGE_TABLE_INDEX,
+        input_sharding_indices: tuple[int, ...] = (0, 1),
+        already_broadcast: bool = False,
+    ) -> tuple:
         """Transfer only host leaves to device, preserving already-device leaves.
 
         Iterates over the input tuple and partitions entries into existing
@@ -491,6 +499,11 @@ class BatchMetadataPreparer:
 
         Args:
             host_payload: Tuple of mixed host arrays and device arrays.
+            page_table_index: Payload index holding ``pages_tables`` (excluded
+                from content-hash caching because it uses explicit version
+                invalidation upstream).
+            input_sharding_indices: Payload indices that receive
+                ``self._input_sharding`` when SPMD DP is active.
 
         Returns:
             Tuple of the same length where each element is device-resident.
@@ -500,13 +513,14 @@ class BatchMetadataPreparer:
         put_values: list[object] = []
         put_shardings: list[jax.sharding.Sharding] = []
         pending_cache_keys: dict[int, tuple[bytes, tuple[int, ...], str]] = {}
+        use_spmd_dp = self._uses_spmd_dp()
         for idx, value in enumerate(host_payload):
             if isinstance(value, jax.Array):
                 outputs[idx] = value
                 continue
             arr = np.asarray(value)
             cache_entry = None
-            if idx != _PAYLOAD_PAGE_TABLE_INDEX and arr.nbytes <= _PAYLOAD_PUT_CACHE_LIMIT_BYTES:
+            if idx != page_table_index and arr.nbytes <= _PAYLOAD_PUT_CACHE_LIMIT_BYTES:
                 shape = tuple(int(dim) for dim in arr.shape)
                 dtype = str(arr.dtype)
                 key = arr.tobytes()
@@ -522,14 +536,15 @@ class BatchMetadataPreparer:
             # transfer or execution still reads it.
             put_values.append(arr.copy() if isinstance(value, np.ndarray) else value)
             put_shardings.append(
-                self._input_sharding if self._uses_spmd_dp() and idx in (0, 1) else self._empty_sharding
+                self._input_sharding if use_spmd_dp and idx in input_sharding_indices else self._empty_sharding
             )
 
         if put_values:
+            put_replicated = True if already_broadcast else getattr(self, "host_payloads_replicated", None)
             put_results = put_host_payload(
                 tuple(put_values),
                 tuple(put_shardings),
-                host_payloads_replicated=getattr(self, "host_payloads_replicated", None),
+                host_payloads_replicated=put_replicated,
             )
             for idx, value in zip(put_indices, put_results, strict=True):
                 outputs[idx] = value
@@ -782,6 +797,145 @@ class BatchMetadataPreparer:
             page_table=page_table_cpu[:rows, :64].copy(),
         )
 
+    def _prepare_cache_group_metadata(
+        self,
+        *,
+        parent_metadata: BatchMetadata,
+        reuse_parent_positions: bool,
+        num_tokens_static: int,
+        scheduled_full_cpu: np.ndarray,
+        active_mask_full_cpu: np.ndarray,
+        token_ids_cpu: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        temperature_cpu: np.ndarray,
+        top_p_cpu: np.ndarray,
+        top_k_cpu: np.ndarray,
+        min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
+        page_table_cpu: np.ndarray,
+        page_table_version: int | None,
+        padded_num_reqs_in: int,
+        window_row_indices_cpu: np.ndarray | None,
+        recurrent_slot_indices_cpu: np.ndarray | None,
+        spec_recurrent_commit_cpu: np.ndarray | None,
+    ) -> RaggedPagesMetadata:
+        """Prepare one cache group's :class:`RaggedPagesMetadata` with zero eager device slices.
+
+        Slices all fixed-shape metadata views on the host before a single
+        consolidated ``device_put`` and reuses already-resident parent leaves
+        (``position_ids_buf`` when progress is not rebased, ``spec_recurrent_commit``,
+        and ``dp_recurrent_state_indices``) instead of transferring redundant
+        copies or dispatching eager per-field TPU slices.
+        """
+        host_build_start = time.time()
+        host_payload, _padded_num_reqs, _num_requests, rows_to_copy = self._fill_step_inputs(
+            self._builder,
+            self._payload_layout,
+            num_tokens_static=num_tokens_static,
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            temperature_cpu=temperature_cpu,
+            top_p_cpu=top_p_cpu,
+            top_k_cpu=top_k_cpu,
+            min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
+            page_table_cpu=page_table_cpu,
+            page_table_version=page_table_version,
+            padded_num_reqs_in=padded_num_reqs_in,
+            window_row_indices_cpu=window_row_indices_cpu,
+            recurrent_slot_indices_cpu=recurrent_slot_indices_cpu,
+            spec_recurrent_commit_cpu=spec_recurrent_commit_cpu,
+        )
+        _, positions_cpu, packed_qsl_seqlens_cpu, _pages_tables_cpu, _tail, buffers = self._payload_layout
+        use_dp = self._uses_spmd_dp()
+        cap = min(int(self.metadata.get_max_num_seqs()), self.max_num_reqs)
+        pages_tables_entry = host_payload[_PAYLOAD_PAGE_TABLE_INDEX]
+        context_lens_cpu = buffers["dp_context_lens"].reshape(-1)[:cap] if use_dp else packed_qsl_seqlens_cpu[1, :cap]
+        query_start_loc_cpu = buffers["dp_query_start_loc"] if use_dp else packed_qsl_seqlens_cpu[0, : cap + 1]
+        num_seqs_cpu = buffers["packed_misc_i32"][:1]
+        request_distribution_cpu = buffers["dp_request_distribution"] if use_dp else buffers["packed_misc_i32"][2:5]
+
+        group_payload: list[object] = [
+            context_lens_cpu,
+            query_start_loc_cpu,
+            num_seqs_cpu,
+            request_distribution_cpu,
+            pages_tables_entry,
+        ]
+        input_sharding_indices: tuple[int, ...] = ()
+        positions_idx: int | None = None
+        if not reuse_parent_positions:
+            positions_idx = len(group_payload)
+            group_payload.append(positions_cpu[: int(num_tokens_static)])
+            if use_dp:
+                input_sharding_indices = (positions_idx,)
+        slot_mapping_idx: int | None = None
+        num_kv_update_idx: int | None = None
+        if self._use_slot_mapping:
+            slot_mapping_idx = len(group_payload)
+            group_payload.append(buffers["slot_mapping"])
+            num_kv_update_idx = len(group_payload)
+            group_payload.append(buffers["num_kv_update"])
+        group_host_payload = tuple(group_payload)
+        host_build_took = time.time() - host_build_start
+
+        device_put_start = time.time()
+        group_broadcast = False
+        if host_payload_broadcast_needed(self.host_payloads_replicated):
+            group_host_payload = self._broadcast_host_payload(group_host_payload)
+            group_broadcast = True
+        device_payload = self._device_put_host_payload(
+            group_host_payload,
+            page_table_index=4,
+            input_sharding_indices=input_sharding_indices,
+            already_broadcast=group_broadcast,
+        )
+        device_put_took = time.time() - device_put_start
+
+        context_lens_dev = device_payload[0]
+        query_start_loc_dev = device_payload[1]
+        num_seqs_dev = device_payload[2]
+        request_distribution_dev = device_payload[3]
+        pages_tables_dev = device_payload[4]
+        position_ids_dev = parent_metadata.position_ids_buf if positions_idx is None else device_payload[positions_idx]
+        slot_mapping_dev = None if slot_mapping_idx is None else device_payload[slot_mapping_idx]
+        num_kv_update_dev = None if num_kv_update_idx is None else device_payload[num_kv_update_idx]
+
+        if page_table_version is not None:
+            self._cached_pages_tables_dev = pages_tables_dev
+            self._cached_page_table_version = int(page_table_version)
+            self._cached_rows_to_copy = int(rows_to_copy)
+
+        self.last_prep_stats = {
+            "prep_host_time": float(host_build_took),
+            "prep_put_time": float(device_put_took),
+            "prep_extra_put_time": 0.0,
+        }
+
+        return RaggedPagesMetadata(
+            pages_tables=pages_tables_dev,
+            context_lens=context_lens_dev,
+            query_start_loc=query_start_loc_dev,
+            num_seqs=num_seqs_dev,
+            position_ids=position_ids_dev,
+            request_distribution=request_distribution_dev,
+            slot_mapping=slot_mapping_dev,
+            num_kv_update_slices=num_kv_update_dev,
+            spec_recurrent_commit=parent_metadata.spec_recurrent_commit if self._enable_spec_recurrent_commit else None,
+            recurrent_state_indices=(
+                parent_metadata.rank_recurrent_state_indices if (use_dp or self._plain_recurrent_slots) else None
+            ),
+            version=self.metadata.version,
+            page_size=self.metadata.page_size,
+            num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
+        )
+
     def _prepare_cache_groups(
         self,
         result: tuple,
@@ -801,6 +955,7 @@ class BatchMetadataPreparer:
         stats = dict(self.last_prep_stats)
         groups = []
         row_count = int(kwargs["token_ids_cpu"].shape[0])
+        base_group_kwargs = {k: v for k, v in kwargs.items() if k not in ("input_ids_buf", "position_ids_buf")}
         for index, (config, group) in enumerate(zip(self.cache_group_configs, cache_group_inputs, strict=True)):
             if group.page_table_cpu.ndim != 2 or group.page_table_cpu.shape[0] != row_count:
                 raise ValueError("Every group page table must align with the compact token window rows")
@@ -833,33 +988,22 @@ class BatchMetadataPreparer:
                 if prev_identity != identity:
                     child.invalidate_page_table_cache()
                     self._cache_group_preparers[index] = (identity, child)
-            group_kwargs = dict(kwargs, page_table_cpu=group.page_table_cpu, page_table_version=group.page_table_version)
-            if group.num_computed_tokens_cpu is not None:
+            group_kwargs = dict(
+                base_group_kwargs,
+                page_table_cpu=group.page_table_cpu,
+                page_table_version=group.page_table_version,
+            )
+            reuse_parent_positions = group.num_computed_tokens_cpu is None
+            if not reuse_parent_positions:
                 group_kwargs["num_computed_tokens_cpu"] = group.num_computed_tokens_cpu
-            prepared, *_ = child.prepare_batch_metadata(**group_kwargs)
+            group_meta = child._prepare_cache_group_metadata(
+                parent_metadata=metadata,
+                reuse_parent_positions=reuse_parent_positions,
+                **group_kwargs,
+            )
             for key, value in child.last_prep_stats.items():
                 stats[key] = stats.get(key, 0.0) + value
-            use_dp = child._uses_spmd_dp()
-            cap = min(int(config.get_max_num_seqs()), self.max_num_reqs)
-            groups.append(
-                RaggedPagesMetadata(
-                    pages_tables=prepared.pages_tables,
-                    context_lens=prepared.rank_context_lens[:cap] if use_dp else prepared.seq_lens[:cap],
-                    query_start_loc=prepared.rank_query_start_loc if use_dp else prepared.query_start_loc[: cap + 1],
-                    num_seqs=prepared.packed_misc_i32[:1],
-                    position_ids=prepared.position_ids_buf,
-                    request_distribution=prepared.rank_request_distribution,
-                    slot_mapping=prepared.slot_mapping,
-                    num_kv_update_slices=prepared.num_kv_update_slices,
-                    spec_recurrent_commit=prepared.spec_recurrent_commit,
-                    recurrent_state_indices=(
-                        prepared.rank_recurrent_state_indices if (use_dp or self._plain_recurrent_slots) else None
-                    ),
-                    version=config.version,
-                    page_size=config.page_size,
-                    num_slices_per_kv_cache_update_page=config.num_slices_per_kv_cache_update_page,
-                )
-            )
+            groups.append(group_meta)
         metadata = metadata.replace(cache_groups=tuple(groups), layer_to_cache_group=self.layer_to_cache_group)
         self.last_prep_stats = stats
         return (metadata, *rest)
@@ -1012,10 +1156,12 @@ class BatchMetadataPreparer:
         # process 0 so all hosts pass identical data to `device_put` with
         # replicated sharding. Skipped under the ZMQ step-replication plane,
         # where payloads are identical by construction (see host_sync).
+        broadcasted = False
         if host_payload_broadcast_needed(self.host_payloads_replicated):
             host_payload = self._broadcast_host_payload(host_payload)
+            broadcasted = True
 
-        device_payload = self._device_put_host_payload(host_payload)
+        device_payload = self._device_put_host_payload(host_payload, already_broadcast=broadcasted)
 
         payload_idx = 0
         input_ids_buf = device_payload[payload_idx]
@@ -1462,9 +1608,11 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
+        async_broadcast = False
         if host_payload_broadcast_needed(self.host_payloads_replicated):
             host_payload = self._broadcast_host_payload(host_payload)
-        self._pending_transfer = self._device_put_host_payload(host_payload)
+            async_broadcast = True
+        self._pending_transfer = self._device_put_host_payload(host_payload, already_broadcast=async_broadcast)
         device_put_took = time.time() - device_put_start
         self._pending_transfer_metadata = {
             "num_tokens_static": num_tokens_static,

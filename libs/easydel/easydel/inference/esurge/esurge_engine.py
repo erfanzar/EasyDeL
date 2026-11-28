@@ -4186,6 +4186,16 @@ class eSurge:
         if pbar:
             pbar.close()
 
+        # On multi-host SPMD meshes (no ZMQ leader/worker), drain any trailing zero-token
+        # cleanup step (e.g. clear_recurrent_slots on hybrid/SSM models) before returning so
+        # the background scheduler thread cannot launch a global TPU program concurrently with
+        # the caller's next multi-host collective (e.g. broadcast_one_to_all in RL rollouts).
+        if jax.process_count() > 1 and not getattr(self, "_distributed_mode", False):
+            engine_loop = getattr(self, "_engine_loop", None)
+            if engine_loop is not None and callable(getattr(engine_loop, "wait_until_idle", None)):
+                engine_loop.wait_until_idle(timeout=30.0)
+                self._raise_if_scheduler_failed()
+
         # Return outputs in prompt/request_ids order rather than completion
         # order: requests may finish out of order, but positional callers
         # (enumerate over prompts, benchmarks, RLHF rollouts) rely on the i-th

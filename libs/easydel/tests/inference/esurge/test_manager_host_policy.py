@@ -154,7 +154,8 @@ def test_late_policy_changes_prepared_tokens_and_sampling_without_affecting_othe
         if payload[0].ndim == 1:
             payload[0].fill(77)
             # Context lengths are refreshed per step, unlike version-cached page tables.
-            payload[2][1].fill(77)
+            if payload[2].ndim >= 2:
+                payload[2][1].fill(77)
         else:
             payload[1][0].fill(88)
         return tuple(payload)

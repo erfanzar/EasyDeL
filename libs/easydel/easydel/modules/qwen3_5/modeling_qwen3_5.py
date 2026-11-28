@@ -532,14 +532,19 @@ class Qwen3_5ForCausalLM(Qwen3_5MTPMixin, Qwen3NextForCausalLM):
         else:
             self.mtp = None
 
-    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
-        """Remap VLM-nested language_model keys when loading as text-only CausalLM, then init missing loop gates."""
+    def _remap_legacy_native_keys(self, state: dict, expected_leaves: dict) -> dict:
+        """Remap VLM-nested ``model.language_model.*`` keys onto ``model.*`` before fused-layout re-interleaving."""
         for key in list(state):
             if key in expected_leaves or len(key) < 3 or key[1:3] != ("model", "language_model"):
                 continue
             target = (key[0], "model", *key[3:])
             if target in expected_leaves and target not in state:
                 state[target] = state.pop(key)
+        return state
+
+    def _upgrade_legacy_native_state(self, state: dict, expected_leaves: dict) -> dict:
+        """Remap VLM-nested language_model keys when loading as text-only CausalLM, then init missing loop gates."""
+        state = self._remap_legacy_native_keys(state, expected_leaves)
         return super()._upgrade_legacy_native_state(state, expected_leaves)
 
     def forward(

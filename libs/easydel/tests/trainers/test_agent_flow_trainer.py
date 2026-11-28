@@ -1104,3 +1104,166 @@ def test_async_grpo_environment_only_counts_environment_reward_once(monkeypatch)
         group_reduction=trainer._group_reduction,
     )
     np.testing.assert_allclose(np.asarray(rewards), env_rewards, rtol=1e-6)
+
+
+def test_agent_flow_batches_active_episodes_per_turn_and_forwards_chat_template_kwargs():
+    """Lockstep rollout must batch all active episodes into one rollout() call per turn and forward chat_template_kwargs."""
+    seen_batch_sizes: list[int] = []
+    seen_template_kwargs: list[dict] = []
+
+    class _EffortTokenizer(_DummyTokenizer):
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            seen_template_kwargs.append(dict(kwargs))
+            effort = kwargs.get("reasoning_effort", "none")
+            return f"[effort={effort}]" + super().apply_chat_template(
+                messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt
+            )
+
+    inner = _stub_trainer(
+        GRPOTrainer,
+        SimpleNamespace(
+            num_generations=2,
+            scale_rewards="group",
+            async_mode=False,
+            max_prompt_length=48,
+            max_completion_length=96,
+            beta=0.0,
+            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "xhigh"},
+        ),
+    )
+    inner.processing_class = _EffortTokenizer()
+
+    def _batched_rollout(input_ids, attention_mask, **_kw):
+        bsz = int(input_ids.shape[0])
+        seen_batch_sizes.append(bsz)
+        # Emit "ab" (2 tokens) per row with deterministic logprobs.
+        comp = jnp.tile(jnp.asarray([[ord("a"), ord("b")]], dtype=jnp.int32), (bsz, 1))
+        cmask = jnp.ones((bsz, 2), dtype=jnp.int32)
+        lps = jnp.full((bsz, 2), -0.5, dtype=jnp.float32)
+        return SimpleNamespace(completion_ids=comp, completion_mask=cmask, sampling_per_token_logps=lps)
+
+    inner.rollout = _batched_rollout
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(
+            base_trainer_type="grpo",
+            max_turns=2,
+            group_size=2,
+            max_workers=4,
+            max_prompt_length=48,
+            max_completion_length=96,
+            per_turn_max_tokens=32,
+        ),
+        trainer=inner,
+        environment_factory=lambda **kw: _MultiTurnCountingEnv(prompt=kw.get("prompt", "hi"), target_turns=2),
+    )
+    out, _metrics = inner._preprocess_batch_input(SimpleNamespace(step=0), {"prompt": ["p0", "p1"]}, True)
+
+    # 2 prompts x group_size=2 = 4 episodes, 2 turns -> MUST issue exactly 2 batched rollout calls of size 4!
+    assert seen_batch_sizes == [4, 4]
+    if jax.process_index() == 0:
+        assert any(
+            kw.get("reasoning_effort") == "xhigh" and kw.get("enable_thinking") is True for kw in seen_template_kwargs
+        )
+    assert out["completion_ids"].shape[0] == 4
+    assert int(np.asarray(out["completion_mask"]).sum()) == 4 * 2 * 2
+
+
+def test_agent_flow_harness_environment_end_to_end_tito(tmp_path):
+    """AgentFlowTrainer must drive HarnessEnvironment via a micro-batching TITO gateway with parsed think+tool_calls."""
+    import sys
+
+    from easydel.environments.harnesses import HarnessEnvironment, HarnessPreset
+    from easydel.environments.runtime import ContainerConfig
+
+    # Minimal mock CLI harness that sends 2 OpenAI /v1/chat/completions requests, executes the tool_call, and exits.
+    cli_script = tmp_path / "mock_harness.py"
+    cli_script.write_text(
+        "import json, os, pathlib, sys, urllib.request\n"
+        "base = os.environ['OPENAI_BASE_URL'].rstrip('/')\n"
+        "key = os.environ['OPENAI_API_KEY']\n"
+        "msgs = [{'role': 'user', 'content': sys.argv[1]}]\n"
+        "tools = [{'type': 'function', 'function': {'name': 'write_ans', 'parameters': {'type': 'object'}}}]\n"
+        "def post(m):\n"
+        "    req = urllib.request.Request(\n"
+        "        f'{base}/chat/completions',\n"
+        "        data=json.dumps({'model': 'm', 'messages': m, 'tools': tools}).encode(),\n"
+        "        headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},\n"
+        "    )\n"
+        "    with urllib.request.urlopen(req, timeout=15) as r:\n"
+        "        return json.loads(r.read().decode())['choices'][0]['message']\n"
+        "m1 = post(msgs)\n"
+        "assert m1.get('reasoning_content') == 'plan fix'\n"
+        "tcs = m1.get('tool_calls') or []\n"
+        "assert len(tcs) == 1 and tcs[0]['function']['name'] == 'write_ans'\n"
+        "args = json.loads(tcs[0]['function']['arguments'])\n"
+        "pathlib.Path('answer.txt').write_text(str(args['val']))\n"
+        "msgs.append(m1)\n"
+        "msgs.append({'role': 'tool', 'tool_call_id': tcs[0]['id'], 'content': 'wrote answer.txt'})\n"
+        "m2 = post(msgs)\n"
+        "assert 'done' in (m2.get('content') or '')\n",
+        encoding="utf-8",
+    )
+
+    preset = HarnessPreset(
+        name="mock_agentflow_cli",
+        protocol="openai_chat",
+        argv_template=(sys.executable, str(cli_script), "{prompt}"),
+        env_template={"OPENAI_BASE_URL": "{base_url_v1}", "OPENAI_API_KEY": "{api_key}"},
+        requires_git=False,
+    )
+
+    turn_texts = [
+        "<think>plan fix</think><tool_call><function=write_ans><parameter=val>42</parameter></function></tool_call>",
+        "<think>verified</think>done",
+    ]
+    call_idx = {"n": 0}
+    inner = _stub_trainer(
+        GRPOTrainer,
+        SimpleNamespace(
+            num_generations=2,
+            scale_rewards="group",
+            async_mode=False,
+            max_prompt_length=128,
+            max_completion_length=256,
+            beta=0.0,
+        ),
+    )
+
+    def _rollout(input_ids, attention_mask, **_kw):
+        bsz = int(input_ids.shape[0])
+        txt = turn_texts[min(call_idx["n"], len(turn_texts) - 1)]
+        call_idx["n"] += 1
+        row_ids = [ord(c) for c in txt]
+        comp = jnp.tile(jnp.asarray([row_ids], dtype=jnp.int32), (bsz, 1))
+        cmask = jnp.ones((bsz, len(row_ids)), dtype=jnp.int32)
+        lps = jnp.full((bsz, len(row_ids)), -0.25, dtype=jnp.float32)
+        return SimpleNamespace(completion_ids=comp, completion_mask=cmask, sampling_per_token_logps=lps)
+
+    inner.rollout = _rollout
+    AgentFlowTrainer(
+        arguments=AgentFlowConfig(
+            base_trainer_type="grpo",
+            group_size=2,
+            max_workers=2,
+            max_prompt_length=128,
+            max_completion_length=256,
+            per_turn_max_tokens=128,
+        ),
+        trainer=inner,
+        environment_factory=lambda **kw: HarnessEnvironment(
+            prompt=kw.get("prompt", "write 42"),
+            harness=preset,
+            verify_script='test "$(cat answer.txt)" = "42"',
+            backend="local",
+            container_config=ContainerConfig(use_jail="off"),
+            harness_timeout=30.0,
+        ),
+    )
+    out, _metrics = inner._preprocess_batch_input(SimpleNamespace(step=0), {"prompt": ["solve it"]}, True)
+
+    np.testing.assert_allclose(np.asarray(out["environment_rewards"]), [1.0, 1.0])
+    # Both turns' action tokens must be masked ON while tool observations between them are masked OFF!
+    expected_action_toks = len(turn_texts[0]) + len(turn_texts[1])
+    assert list(np.asarray(out["completion_mask"]).sum(axis=1)) == [expected_action_toks, expected_action_toks]
+    assert np.all(np.asarray(out["completion_attention_mask"]).sum(axis=1) > expected_action_toks)
+    assert out["sampling_per_token_logps"].shape == out["completion_ids"].shape

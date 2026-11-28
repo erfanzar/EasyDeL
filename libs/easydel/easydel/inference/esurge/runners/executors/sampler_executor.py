@@ -1592,6 +1592,7 @@ class SamplerRuntime:
         replicated = getattr(self, "host_payloads_replicated", False)
         if host_payload_broadcast_needed(replicated):
             sampler_host_payload = multihost_utils.broadcast_one_to_all(sampler_host_payload)
+            replicated = True
         with jax.named_scope("easydel/esurge/sampler/place_metadata"):
             if device_put_equality_check_redundant(replicated):
                 packed_f32, packed_i32, packed_misc_i32 = put_host_payload(

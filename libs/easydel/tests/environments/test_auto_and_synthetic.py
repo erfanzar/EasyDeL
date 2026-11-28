@@ -230,3 +230,30 @@ def test_elarge_trainer_async_mode_and_environment_config():
     assert cfg["environment"] == "swe_repo"
     assert cfg["environment_backend"] == "kiri"
     assert cfg["environment_endpoints"] == ["http://127.0.0.1:2375"]
+
+
+@pytest.mark.cpu_ok
+def test_harness_environment_runs_setup_script_on_reset():
+    from easydel.environments import AutoEnvironment, ContainerConfig, HarnessEnvironment
+
+    env = AutoEnvironment.from_task(
+        {
+            "environment": "harness",
+            "harness": "xerxes",
+            "prompt": "inspect seeded artifact",
+            "files": {"seed.txt": "hello"},
+            "setup_script": "cp seed.txt derived.txt && echo '_ready' >> derived.txt",
+            "verify_script": "test -f derived.txt",
+        },
+        backend="local",
+        container_config=ContainerConfig(use_jail="off"),
+    )
+    assert isinstance(env, HarnessEnvironment)
+    try:
+        r0 = env.reset()
+        assert not r0.info.get("env_error"), r0.info
+        chk = env.session.exec(["/bin/sh", "-c", "cat derived.txt"], timeout=5.0)
+        assert chk.ok
+        assert "hello" in chk.stdout and "_ready" in chk.stdout
+    finally:
+        env.close()

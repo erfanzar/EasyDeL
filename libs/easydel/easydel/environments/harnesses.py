@@ -863,12 +863,15 @@ class HarnessTITOGateway:
 
             def _send_json(self, status: int, data: dict[str, tp.Any]) -> None:
                 encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(encoded)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
             def _send_sse(self, events: list[tuple[str | None, str]]) -> None:
                 chunks: list[bytes] = []
@@ -877,13 +880,16 @@ class HarnessTITOGateway:
                         chunks.append(f"event: {ev_name}\n".encode())
                     chunks.append(f"data: {data_str}\n\n".encode())
                 body = b"".join(chunks)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
         bind_host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
         if _is_ipv6_host(host):
@@ -1286,9 +1292,11 @@ class HarnessEnvironment(SandboxEnvironment):
         test_patch: str | None = None,
         fail_to_pass: collections.abc.Sequence[str] = (),
         pass_to_pass: collections.abc.Sequence[str] = (),
+        setup_script: str | None = None,
         verify_script: str | None = None,
         subagent_mode: SubagentTrainingMode = "root_only",
         harness_timeout: float = 300.0,
+        setup_timeout: float = 60.0,
         verify_timeout: float = 60.0,
         runtime: KiriRuntime | SandboxPool | None = None,
         backend: str = "kiri",
@@ -1317,9 +1325,11 @@ class HarnessEnvironment(SandboxEnvironment):
         self._test_patch = test_patch
         self._fail_to_pass = list(fail_to_pass)
         self._pass_to_pass = list(pass_to_pass)
+        self._setup_script = setup_script
         self._verify_script = verify_script
         self._subagent_mode: SubagentTrainingMode = subagent_mode
         self._harness_timeout = float(harness_timeout)
+        self._setup_timeout = float(setup_timeout)
         self._verify_timeout = float(verify_timeout)
         self._last_trajectories: list[OnlineRLTrajectory] = []
         self._reset_seed: int | None = None
@@ -1349,6 +1359,12 @@ class HarnessEnvironment(SandboxEnvironment):
                 session.write_files(self._cached_repo_files)
         if self._initial_files:
             session.write_files(self._initial_files)
+        if self._setup_script and self._setup_script.strip():
+            setup_res = session.exec(["/bin/sh", "-c", self._setup_script], timeout=self._setup_timeout)
+            if setup_res.infra_error:
+                return setup_res.infra_error
+            if not setup_res.ok:
+                return f"setup_script failed (rc={setup_res.returncode}): {setup_res.combined_output(512)}"
         if self._preset.requires_git or needs_base:
             git_check = session.exec(
                 ["/bin/sh", "-c", 'test "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)"'],

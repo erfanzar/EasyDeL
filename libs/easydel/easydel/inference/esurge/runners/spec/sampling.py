@@ -36,10 +36,12 @@ def summarize_logprobs(log_probs, sampled_tokens, *, num_logprobs: int):
     ``log_probs`` is the actual behavior distribution, not raw model logits.
     The sampled token is always included, including when ``num_logprobs=0``.
     """
-    sampled_tokens = sampled_tokens.reshape(-1).astype(jnp.int32)
+    sampled_tokens = jnp.maximum(sampled_tokens.reshape(-1).astype(jnp.int32), 0)
     sampled_scores = jnp.take_along_axis(log_probs, sampled_tokens[:, None], axis=-1)
     ranks = jnp.sum(log_probs > sampled_scores, axis=-1).astype(jnp.int32)
     k = min(max(0, int(num_logprobs)), int(log_probs.shape[-1]))
+    if k == 0:
+        return sampled_tokens[:, None], sampled_scores, ranks
     top_scores, top_ids = jax.lax.top_k(log_probs, k)
     return (
         jnp.concatenate((sampled_tokens[:, None], top_ids), axis=-1),
@@ -48,7 +50,10 @@ def summarize_logprobs(log_probs, sampled_tokens, *, num_logprobs: int):
     )
 
 
-@partial(jax.jit, static_argnames=("num_logprobs",))
+@partial(
+    jax.jit,
+    static_argnames=("num_logprobs", "apply_penalties", "apply_topk", "apply_topp", "apply_minp"),
+)
 def score_sampled_tokens(
     logits,
     sampled_tokens,
@@ -63,6 +68,10 @@ def score_sampled_tokens(
     repetition_penalty,
     *,
     num_logprobs: int,
+    apply_penalties: bool = True,
+    apply_topk: bool = True,
+    apply_topp: bool = True,
+    apply_minp: bool = True,
     sparse_constraints=None,
 ):
     """Score normal sampler output with its exact dtype, constraints, penalties and filters.
@@ -71,19 +80,26 @@ def score_sampled_tokens(
     sparse sampling constraints, history penalties, top-k, top-p, temperature,
     min-p. Greedy rows are a point mass, so their emitted token has behavior
     log probability zero. All probability reductions accumulate in float32.
+
+    The static boolean fastpath flags (``apply_penalties``, ``apply_topk``,
+    ``apply_topp``, ``apply_minp``) default to ``True`` for full generality and
+    may be set to ``False`` by callers that have verified on host that no row
+    in the batch activates the corresponding transform, avoiding unnecessary
+    full-vocabulary passes and large ``token_history`` transfers.
     """
     if sparse_constraints is not None:
         logits = apply_sparse_sampling_constraints(logits, *sparse_constraints)
-    active = jnp.ones((logits.shape[0],), dtype=jnp.bool_)
-    logits = apply_history_penalties(
-        logits,
-        token_history=token_history,
-        seq_lens=seq_lens,
-        active_mask=active,
-        presence_penalties=presence_penalty,
-        frequency_penalties=frequency_penalty,
-        repetition_penalties=repetition_penalty,
-    )
+    if apply_penalties:
+        active = jnp.ones((logits.shape[0],), dtype=jnp.bool_)
+        logits = apply_history_penalties(
+            logits,
+            token_history=token_history,
+            seq_lens=seq_lens,
+            active_mask=active,
+            presence_penalties=presence_penalty,
+            frequency_penalties=frequency_penalty,
+            repetition_penalties=repetition_penalty,
+        )
     temperature = temperature.astype(logits.dtype).reshape(-1, 1)
     top_p = top_p.astype(logits.dtype)
     min_p = min_p.astype(logits.dtype).reshape(-1, 1)
@@ -92,17 +108,21 @@ def score_sampled_tokens(
     if logits.dtype != jnp.bfloat16:
         logits = logits.astype(jnp.float32)
     min_val = -1e10
-    logits = jax.vmap(lambda row, k: jax.lax.cond(k > 0, lambda: topk_mask(row[None, :], k, min_val)[0], lambda: row))(
-        logits, top_k
-    )
-    logits = jax.vmap(lambda row, p: jax.lax.cond(p < 1.0, lambda: topp_mask(row[None, :], p, min_val)[0], lambda: row))(
-        logits, top_p
-    )
+    if apply_topk:
+        logits = jax.vmap(
+            lambda row, k: jax.lax.cond(k > 0, lambda: topk_mask(row[None, :], k, min_val)[0], lambda: row)
+        )(logits, top_k)
+    if apply_topp:
+        logits = jax.vmap(
+            lambda row, p: jax.lax.cond(p < 1.0, lambda: topp_mask(row[None, :], p, min_val)[0], lambda: row)
+        )(logits, top_p)
     logits = logits.astype(jnp.float32) / jnp.where(temperature <= 0, 1.0, temperature)
-    probs = jax.nn.softmax(logits, axis=-1)
-    logits = jnp.where(probs >= min_p * jnp.max(probs, axis=-1, keepdims=True), logits, min_val)
+    if apply_minp:
+        probs = jax.nn.softmax(logits, axis=-1)
+        logits = jnp.where(probs >= min_p * jnp.max(probs, axis=-1, keepdims=True), logits, min_val)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
+    safe_tokens = jnp.maximum(sampled_tokens.reshape(-1).astype(jnp.int32), 0)
     greedy = temperature <= 0
-    point_mass = jnp.where(jnp.arange(logits.shape[-1])[None, :] == sampled_tokens.reshape(-1, 1), 0.0, -jnp.inf)
+    point_mass = jnp.where(jnp.arange(logits.shape[-1])[None, :] == safe_tokens[:, None], 0.0, -jnp.inf)
     log_probs = jnp.where(greedy, point_mass, log_probs)
-    return summarize_logprobs(log_probs, sampled_tokens, num_logprobs=num_logprobs)
+    return summarize_logprobs(log_probs, safe_tokens, num_logprobs=num_logprobs)

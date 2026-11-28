@@ -22,7 +22,10 @@ import functools
 import inspect
 import json
 import math
+import queue
+import re
 import threading
+import time
 import typing as tp
 
 import jax
@@ -1394,6 +1397,38 @@ class AgentFlowTrainer:
                     return val
         return ""
 
+    def _resolve_chat_template_kwargs(self) -> dict[str, tp.Any]:
+        """Resolve optional ``chat_template_kwargs`` from inner or outer trainer arguments."""
+        inner_args = getattr(self.trainer, "arguments", None)
+        raw = getattr(inner_args, "chat_template_kwargs", None)
+        if not raw:
+            raw = getattr(self.arguments, "chat_template_kwargs", None)
+        return dict(raw) if isinstance(raw, collections.abc.Mapping) else {}
+
+    def _apply_chat_template(
+        self,
+        apply_fn: tp.Callable[..., tp.Any],
+        messages: list[dict[str, tp.Any]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        tools: list[dict[str, tp.Any]] | None = None,
+    ) -> tp.Any:
+        kwargs: dict[str, tp.Any] = {
+            "tokenize": tokenize,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        ct_kwargs = self._resolve_chat_template_kwargs()
+        if ct_kwargs:
+            kwargs.update(ct_kwargs)
+        try:
+            return apply_fn(messages, **kwargs)
+        except TypeError:
+            # Custom / stub tokenizers may not accept extra chat_template_kwargs or tools.
+            return apply_fn(messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt)
+
     def _generation_prompt_suffix(self) -> str | None:
         """Return the text the chat template emits after a user message's content (with generation prompt).
 
@@ -1408,7 +1443,12 @@ class AgentFlowTrainer:
         if callable(apply_fn):
             try:
                 rendered = str(
-                    apply_fn([{"role": "user", "content": _TEMPLATE_PROBE}], tokenize=False, add_generation_prompt=True)
+                    self._apply_chat_template(
+                        apply_fn,
+                        [{"role": "user", "content": _TEMPLATE_PROBE}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
                 )
                 pos = rendered.find(_TEMPLATE_PROBE)
                 if pos >= 0:
@@ -1434,7 +1474,8 @@ class AgentFlowTrainer:
         apply_fn = getattr(tok, "apply_chat_template", None)
         if callable(apply_fn):
             try:
-                formatted = apply_fn(
+                formatted = self._apply_chat_template(
+                    apply_fn,
                     [{"role": "user", "content": prompt}],
                     tokenize=False,
                     add_generation_prompt=True,
@@ -1456,7 +1497,9 @@ class AgentFlowTrainer:
         apply_fn = getattr(tok, "apply_chat_template", None)
         if callable(apply_fn):
             try:
-                return str(apply_fn(list(messages), tokenize=False, add_generation_prompt=True))
+                return str(
+                    self._apply_chat_template(apply_fn, list(messages), tokenize=False, add_generation_prompt=True)
+                )
             except Exception:
                 return plain
         return plain
@@ -1490,9 +1533,10 @@ class AgentFlowTrainer:
         if not callable(apply_fn) or not history or history[-1].get("role") != "assistant":
             return None
         try:
-            base = str(apply_fn(list(history), tokenize=False, add_generation_prompt=False))
+            base = str(self._apply_chat_template(apply_fn, list(history), tokenize=False, add_generation_prompt=False))
             full = str(
-                apply_fn(
+                self._apply_chat_template(
+                    apply_fn,
                     [*history, {"role": "user", "content": raw_obs}],
                     tokenize=False,
                     add_generation_prompt=True,
@@ -1509,7 +1553,8 @@ class AgentFlowTrainer:
         closing: str | None = None
         try:
             probed = str(
-                apply_fn(
+                self._apply_chat_template(
+                    apply_fn,
                     [*history[:-1], {"role": "assistant", "content": _TEMPLATE_PROBE}],
                     tokenize=False,
                     add_generation_prompt=False,
@@ -1546,7 +1591,8 @@ class AgentFlowTrainer:
         if callable(apply_fn):
             try:
                 rendered = str(
-                    apply_fn(
+                    self._apply_chat_template(
+                        apply_fn,
                         [{"role": "user", "content": raw_obs}],
                         tokenize=False,
                         add_generation_prompt=True,
@@ -1578,6 +1624,113 @@ class AgentFlowTrainer:
             return "".join(chr(max(32, min(126, int(i)))) for i in ids)
         return str(tok.decode(ids, skip_special_tokens=True))
 
+    def _resolve_turn_max_new_tokens(self, prompt_len: int) -> int | None:
+        """Compute per-turn ``max_new_tokens`` clamped to the trainer's static generation length bound."""
+        requested = self.arguments.per_turn_max_tokens
+        inner_args = getattr(self.trainer, "arguments", None)
+        if requested is None:
+            requested = getattr(inner_args, "max_completion_length", None) or self.arguments.max_completion_length
+        if requested is None:
+            return None
+        req_int = max(1, int(requested))
+        if inner_args is not None:
+            try:
+                from easydel.trainers._shared import esurge_generation
+
+                return esurge_generation.clamp_new_tokens_to_bound(
+                    inner_args,
+                    prompt_len=int(prompt_len),
+                    max_new_tokens=req_int,
+                )
+            except Exception:
+                pass
+        p_w, c_w = self._resolve_widths()
+        bound = p_w + c_w
+        if bound > 0 and prompt_len + req_int > bound:
+            return max(1, bound - int(prompt_len))
+        return req_int
+
+    def _default_generate_turns_batch(
+        self,
+        state: tp.Any,
+        prompts_ids: list[list[int]],
+        prompts_text: list[str],
+        turn_index: int,
+    ) -> list[tuple[list[int], str, list[float] | None]]:
+        """Generate one turn for a batch of active episodes in a single ``rollout()`` call."""
+        if not prompts_ids:
+            return []
+        if self._generate_turn_fn is not None:
+            return [
+                self._generate_turn_fn(state, p_ids, p_txt, turn_index)
+                for p_ids, p_txt in zip(prompts_ids, prompts_text, strict=True)
+            ]
+
+        rollout_fn = getattr(self.trainer, "rollout", None)
+        if not callable(rollout_fn):
+            raise RuntimeError(
+                "AgentFlowTrainer requires either a `generate_turn_fn` callback or an inner trainer with `rollout(...)`."
+            )
+
+        pad_id = self._resolve_pad_token_id()
+        p_w, c_w = self._resolve_widths()
+        total_bound = max(1, p_w + c_w)
+        # Keep every prompt row strictly shorter than the static generation bound so at least 1 token can be generated.
+        clipped_rows = [
+            row[-(total_bound - 1) :] if len(row) >= total_bound else (row if row else [pad_id]) for row in prompts_ids
+        ]
+        max_len = max(len(r) for r in clipped_rows)
+        batch_size = len(clipped_rows)
+        arr_np = np.full((batch_size, max_len), pad_id, dtype=np.int32)
+        mask_np = np.zeros((batch_size, max_len), dtype=np.int32)
+        for i, row in enumerate(clipped_rows):
+            n = len(row)
+            arr_np[i, :n] = row
+            mask_np[i, :n] = 1
+
+        overrides: dict[str, tp.Any] = {"num_return_sequences": 1}
+        if self.arguments.per_turn_max_tokens is not None or max_len > p_w:
+            clamped = self._resolve_turn_max_new_tokens(max_len)
+            if clamped is not None:
+                overrides["max_new_tokens"] = int(clamped)
+
+        arr = jnp.asarray(arr_np, dtype=jnp.int32)
+        mask = jnp.asarray(mask_np, dtype=jnp.int32)
+        with self._rollout_lock:
+            self._rollout_call_count += 1
+            results = rollout_fn(
+                input_ids=arr,
+                attention_mask=mask,
+                state=state,
+                apply_chat_template=False,
+                shard_inputs=False,
+                all_gather=False,
+                release_runtime_after_generation=False,
+                config_overrides=overrides,
+            )
+
+        c_all = _to_host_numpy(results.completion_ids).astype(np.int32, copy=False)
+        if getattr(results, "completion_mask", None) is not None:
+            m_all = _to_host_numpy(results.completion_mask).astype(np.int32, copy=False)
+        else:
+            m_all = (c_all != pad_id).astype(np.int32)
+        raw_lps = getattr(results, "sampling_per_token_logps", None)
+        if raw_lps is None:
+            raw_lps = getattr(results, "logprobs", None)
+        lp_all = _to_host_numpy(raw_lps).astype(np.float32, copy=False) if raw_lps is not None else None
+
+        outputs: list[tuple[list[int], str, list[float] | None]] = []
+        for i in range(batch_size):
+            c_row = c_all[i]
+            m_row = m_all[i]
+            kept = [int(t) for t, m in zip(c_row.tolist(), m_row.tolist(), strict=True) if m]
+            lp_list: list[float] | None = None
+            if lp_all is not None:
+                lp_row = lp_all[i]
+                lp_list = [float(x) for x, m in zip(lp_row.tolist(), m_row.tolist(), strict=True) if m]
+            outputs.append((kept, self._decode_ids(kept), lp_list))
+        return outputs
+
     def _default_generate_turn(
         self,
         state: tp.Any,
@@ -1587,46 +1740,7 @@ class AgentFlowTrainer:
     ) -> tuple[list[int], str, list[float] | None]:
         if self._generate_turn_fn is not None:
             return self._generate_turn_fn(state, prompt_ids, prompt_text, turn_index)
-
-        rollout_fn = getattr(self.trainer, "rollout", None)
-        if callable(rollout_fn):
-            arr = jnp.asarray([prompt_ids], dtype=jnp.int32)
-            mask = jnp.ones_like(arr, dtype=jnp.int32)
-            # Serialize rollout engine calls across worker threads while env I/O runs concurrently.
-            overrides: dict[str, tp.Any] = {"num_return_sequences": 1}
-            if self.arguments.per_turn_max_tokens is not None:
-                overrides["max_new_tokens"] = int(self.arguments.per_turn_max_tokens)
-            with self._rollout_lock:
-                self._rollout_call_count += 1
-                results = rollout_fn(
-                    input_ids=arr,
-                    attention_mask=mask,
-                    state=state,
-                    apply_chat_template=False,
-                    shard_inputs=False,
-                    all_gather=False,
-                    release_runtime_after_generation=False,
-                    config_overrides=overrides,
-                )
-            c_row = _to_host_numpy(results.completion_ids)[0].astype(np.int32, copy=False)
-            if getattr(results, "completion_mask", None) is not None:
-                m_row = _to_host_numpy(results.completion_mask)[0].astype(np.int32, copy=False)
-            else:
-                pad_id = self._resolve_pad_token_id()
-                m_row = (c_row != pad_id).astype(np.int32)
-            kept = [int(t) for t, m in zip(c_row.tolist(), m_row.tolist(), strict=True) if m]
-            lp_list: list[float] | None = None
-            raw_lps = getattr(results, "sampling_per_token_logps", None)
-            if raw_lps is None:
-                raw_lps = getattr(results, "logprobs", None)
-            if raw_lps is not None:
-                lp_row = _to_host_numpy(raw_lps)[0].astype(np.float32, copy=False)
-                lp_list = [float(x) for x, m in zip(lp_row.tolist(), m_row.tolist(), strict=True) if m]
-            return kept, self._decode_ids(kept), lp_list
-
-        raise RuntimeError(
-            "AgentFlowTrainer requires either a `generate_turn_fn` callback or an inner trainer with `rollout(...)`."
-        )
+        return self._default_generate_turns_batch(state, [prompt_ids], [prompt_text], turn_index)[0]
 
     def _instantiate_env(self, task: dict[str, tp.Any]) -> tp.Any:
         if not isinstance(task, dict):
@@ -2761,6 +2875,351 @@ class AgentFlowTrainer:
         except Exception as exc:
             logger.warning("AgentFlow Eyvan telemetry logging failed (%s): %s", type(exc).__name__, exc)
 
+    def _decode_ids_raw(self, ids: list[int]) -> str:
+        """Decode token IDs keeping structural special tokens (e.g. ``<think>``, ``<tool_call>``) intact."""
+        tok = getattr(self.trainer, "processing_class", None)
+        if tok is None:
+            return "".join(chr(max(32, min(126, int(i)))) for i in ids)
+        try:
+            text = str(tok.decode(ids, skip_special_tokens=False))
+        except TypeError:
+            text = str(tok.decode(ids))
+        eos = self._resolve_special_token_str("eos_token")
+        if eos and text.endswith(eos):
+            text = text[: -len(eos)]
+        return text
+
+    def _parse_harness_turn_output(
+        self,
+        raw_text: str,
+        token_ids: list[int],
+        logprobs: list[float] | None,
+    ) -> tp.Any:
+        """Convert raw model output into a :class:`GatewayTurnOutput` with parsed thinking and tool calls."""
+        from easydel.environments.harnesses import GatewayTurnOutput
+
+        reasoning_text: str | None = None
+        visible = raw_text
+        # Handle both explicit <think>...</think> and prompt-prefilled ... </think> (Qwen3.5/3.8 templates).
+        m_full = re.search(r"<think>(.*?)</think>", visible, flags=re.DOTALL)
+        if m_full is not None:
+            reasoning_text = m_full.group(1).strip()
+            visible = (visible[: m_full.start()] + visible[m_full.end() :]).strip()
+        elif "</think>" in visible:
+            head, tail = visible.split("</think>", 1)
+            reasoning_text = head.removeprefix("<think>").strip()
+            visible = tail.strip()
+
+        tool_calls: list[dict[str, tp.Any]] = []
+
+        def _parse_tc_block(block: str) -> dict[str, tp.Any] | None:
+            body = block.strip()
+            # 1) Qwen3.5/3.8 XML format: <function=name><parameter=k>v</parameter></function>
+            fn_m = re.search(r"<function=([^>\s]+)>(.*?)</function>", body, flags=re.DOTALL)
+            if fn_m is not None:
+                fn_name = fn_m.group(1).strip()
+                fn_body = fn_m.group(2)
+                args_dict: dict[str, tp.Any] = {}
+                for pm in re.finditer(r"<parameter=([^>\s]+)>(.*?)</parameter>", fn_body, flags=re.DOTALL):
+                    pkey = pm.group(1).strip()
+                    pval = pm.group(2).strip()
+                    try:
+                        args_dict[pkey] = json.loads(pval)
+                    except Exception:
+                        args_dict[pkey] = pval
+                return {
+                    "type": "function",
+                    "function": {"name": fn_name, "arguments": json.dumps(args_dict, ensure_ascii=False)},
+                }
+            # 2) Hermes / OpenAI JSON format: {"name": ..., "arguments": ...}
+            try:
+                obj = json.loads(body)
+                if isinstance(obj, dict) and "name" in obj:
+                    raw_args = obj.get("arguments", {})
+                    args_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
+                    return {"type": "function", "function": {"name": str(obj["name"]), "arguments": args_str}}
+            except Exception:
+                pass
+            return None
+
+        spans_to_remove: list[tuple[int, int]] = []
+        for tc_m in re.finditer(r"<tool_call>(.*?)</tool_call>", visible, flags=re.DOTALL):
+            parsed = _parse_tc_block(tc_m.group(1))
+            if parsed is not None:
+                tool_calls.append(parsed)
+                spans_to_remove.append((tc_m.start(), tc_m.end()))
+        if spans_to_remove:
+            chunks: list[str] = []
+            cur = 0
+            for s, e in spans_to_remove:
+                chunks.append(visible[cur:s])
+                cur = e
+            chunks.append(visible[cur:])
+            visible = "".join(chunks).strip()
+
+        return GatewayTurnOutput(
+            token_ids=token_ids,
+            text=visible,
+            reasoning_text=reasoning_text,
+            tool_calls=tool_calls or None,
+            logprobs=logprobs,
+            finish_reason="tool_calls" if tool_calls else "stop",
+        )
+
+    def _encode_harness_messages(
+        self,
+        messages: list[dict[str, tp.Any]],
+        tools: list[dict[str, tp.Any]] | None,
+    ) -> list[int]:
+        """Tokenize harness messages using the model's chat template without duplicating system preambles on deltas."""
+        tok = getattr(self.trainer, "processing_class", None)
+        apply_fn = getattr(tok, "apply_chat_template", None)
+        if not callable(apply_fn):
+            text = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
+            return self._encode_text(text)
+
+        # Initial prompt turn (tools passed, or messages starts with system/user conversation root).
+        if tools is not None or (messages and messages[0].get("role") == "system"):
+            rendered = str(
+                self._apply_chat_template(
+                    apply_fn,
+                    list(messages),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                )
+            )
+            return self._encode_text(rendered)
+
+        # Continuation delta (e.g. tool / user response messages): diff against a sentinel prefix so
+        # templates like Qwen3.8 never re-inject a default system block mid-trajectory.
+        prefix_msgs: list[dict[str, tp.Any]] = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": _TEMPLATE_PROBE},
+            {"role": "assistant", "content": _TEMPLATE_PROBE},
+        ]
+        try:
+            base = str(self._apply_chat_template(apply_fn, prefix_msgs, tokenize=False, add_generation_prompt=False))
+            full = str(
+                self._apply_chat_template(
+                    apply_fn,
+                    [*prefix_msgs, *messages],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+            if full.startswith(base):
+                return self._encode_text(full[len(base) :])
+        except Exception:
+            pass
+        rendered = str(self._apply_chat_template(apply_fn, list(messages), tokenize=False, add_generation_prompt=True))
+        return self._encode_text(rendered)
+
+    def _collect_harness_episodes_host0(
+        self,
+        envs: list[tp.Any],
+        jobs: list[tuple[int, int, dict[str, tp.Any]]],
+        workers: int,
+        gen_batch_cb: tp.Callable[
+            [list[list[int]], list[str], int],
+            list[tuple[list[int], str, list[float] | None]],
+        ],
+    ) -> list[AgentFlowEpisode]:
+        """Run concurrent ``HarnessEnvironment`` episodes through a micro-batching TITO HTTP gateway.
+
+        All active CLI harness processes run concurrently inside ``ThreadPoolExecutor``. Whenever
+        harnesses POST LLM turn requests to the intercepting :class:`HarnessTITOGateway`, their
+        context token lists are micro-batched on Host 0 and dispatched in a single batched SPMD
+        ``gen_batch_cb`` call across all TPU/GPU hosts.
+        """
+        from easydel.environments.harnesses import HarnessTITOGateway
+        from easydel.environments.runtime import ContainerSandboxSession
+
+        num_jobs = len(jobs)
+        pending_q: queue.Queue[tuple[list[int], concurrent.futures.Future[tp.Any]] | None] = queue.Queue()
+        active_lock = threading.Lock()
+        remaining_episodes = num_jobs
+        turn_counter = 0
+
+        def _gw_generate(
+            context_tokens: list[int],
+            _messages: list[dict[str, tp.Any]],
+            _tools: list[dict[str, tp.Any]] | None,
+        ) -> tp.Any:
+            fut: concurrent.futures.Future[tp.Any] = concurrent.futures.Future()
+            pending_q.put((list(context_tokens), fut))
+            return fut.result()
+
+        uses_container = any(
+            getattr(env, "_backend", "local") in {"kiri", "docker"}
+            or isinstance(getattr(env, "_session", None), ContainerSandboxSession)
+            for env in envs
+        )
+        bind_host = "0.0.0.0" if uses_container else "127.0.0.1"
+        adv_host: str | None = None
+        if uses_container:
+            import socket as _socket
+
+            try:
+                adv_host = _socket.gethostbyname(_socket.gethostname())
+            except Exception:
+                adv_host = "host.docker.internal"
+
+        gateway = HarnessTITOGateway(
+            generate_fn=_gw_generate,
+            encode_messages_fn=self._encode_harness_messages,
+            model_name=str(getattr(self.arguments, "model_name", None) or "easydel-rl-policy"),
+            host=bind_host,
+            advertise_host=adv_host,
+        ).start()
+
+        for env in envs:
+            if getattr(env, "_gateway", None) is None:
+                env._gateway = gateway
+
+        def _run_one(idx: int) -> AgentFlowEpisode:
+            nonlocal remaining_episodes
+            p_idx, grp_id, task = jobs[idx]
+            env = envs[idx]
+            try:
+                r0 = env.reset()
+                if r0.info.get("env_error"):
+                    return AgentFlowEpisode(
+                        prompt_index=p_idx,
+                        group_id=grp_id,
+                        prompt_token_ids=self._encode_text(str(task.get("prompt", ""))),
+                        completion_token_ids=[],
+                        action_mask=[],
+                        step_rewards=[0.0],
+                        episode_reward=0.0,
+                        turns=(),
+                        logprobs=[],
+                        env_error=True,
+                    )
+                step_res = env.step("")
+                trajs = list(getattr(env, "last_trajectories", ()))
+                env_err = bool(step_res.info.get("env_error")) or not trajs
+                if env_err:
+                    return AgentFlowEpisode(
+                        prompt_index=p_idx,
+                        group_id=grp_id,
+                        prompt_token_ids=self._encode_text(str(task.get("prompt", ""))),
+                        completion_token_ids=[],
+                        action_mask=[],
+                        step_rewards=[0.0],
+                        episode_reward=0.0,
+                        turns=(),
+                        logprobs=[],
+                        env_error=True,
+                    )
+                # Merge / pick the root TITO trajectory segment captured by HarnessTITOGateway.
+                traj = trajs[-1]
+                ids_all = [int(t) for t in np.asarray(traj.input_ids).tolist()]
+                amask_all = [int(bool(m)) for m in np.asarray(traj.action_mask).tolist()]
+                lps_all = (
+                    [float(x) for x in np.asarray(traj.behavior_logps).tolist()]
+                    if traj.behavior_logps is not None
+                    else None
+                )
+                first_act = next((i for i, m in enumerate(amask_all) if m), len(ids_all))
+                prompt_w, _ = self._resolve_widths()
+                prompt_ids = ids_all[:first_act]
+                prompt_clipped = len(prompt_ids) > prompt_w
+                if prompt_clipped:
+                    prompt_ids = prompt_ids[-prompt_w:]
+                comp_ids = ids_all[first_act:]
+                comp_amask = amask_all[first_act:]
+                comp_lps = lps_all[first_act:] if lps_all is not None else None
+                return AgentFlowEpisode(
+                    prompt_index=p_idx,
+                    group_id=grp_id,
+                    prompt_token_ids=prompt_ids,
+                    completion_token_ids=comp_ids,
+                    action_mask=comp_amask,
+                    step_rewards=[float(step_res.reward)],
+                    episode_reward=float(step_res.reward),
+                    turns=(),
+                    logprobs=comp_lps,
+                    env_error=False,
+                    prompt_clipped=prompt_clipped,
+                )
+            except Exception as exc:
+                logger.warning("Harness episode %d failed (%s): %s", idx, type(exc).__name__, exc)
+                return AgentFlowEpisode(
+                    prompt_index=p_idx,
+                    group_id=grp_id,
+                    prompt_token_ids=self._encode_text(str(task.get("prompt", ""))),
+                    completion_token_ids=[],
+                    action_mask=[],
+                    step_rewards=[0.0],
+                    episode_reward=0.0,
+                    turns=(),
+                    logprobs=[],
+                    env_error=True,
+                )
+            finally:
+                with active_lock:
+                    remaining_episodes -= 1
+                    if remaining_episodes <= 0:
+                        pending_q.put(None)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+                ep_futs = [pool.submit(_run_one, idx) for idx in range(num_jobs)]
+
+                # Micro-batching SPMD dispatch loop on Host 0's main thread.
+                while True:
+                    with active_lock:
+                        rem = remaining_episodes
+                    if rem <= 0 and pending_q.empty():
+                        break
+                    try:
+                        first = pending_q.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if first is None:
+                        continue
+
+                    batch_items = [first]
+                    # Coalesce concurrent harness HTTP turns arriving within the window so fast tool calls
+                    # (pytest/sqlite/workspace setup) join the same batched eSurge call; breaks immediately once
+                    # all active episodes have posted.
+                    coalesce_s = 2.0 if turn_counter == 0 else 1.0
+                    deadline = time.monotonic() + coalesce_s
+                    while True:
+                        with active_lock:
+                            target = remaining_episodes
+                        if len(batch_items) >= max(1, target):
+                            break
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            break
+                        try:
+                            nxt = pending_q.get(timeout=min(0.05, left))
+                            if nxt is not None:
+                                batch_items.append(nxt)
+                        except queue.Empty:
+                            continue
+
+                    ctx_ids_batch = [item[0] for item in batch_items]
+                    ctx_txt_batch = [self._decode_ids(ids) for ids in ctx_ids_batch]
+                    try:
+                        raw_outs = gen_batch_cb(ctx_ids_batch, ctx_txt_batch, turn_counter)
+                        turn_counter += 1
+                    except BaseException as exc:
+                        for _, fut in batch_items:
+                            if not fut.done():
+                                fut.set_exception(exc)
+                        raise
+                    for (_, fut), (tok_ids, _decoded_txt, lps) in zip(batch_items, raw_outs, strict=True):
+                        if not fut.done():
+                            raw_txt = self._decode_ids_raw(tok_ids)
+                            fut.set_result(self._parse_harness_turn_output(raw_txt, tok_ids, lps))
+
+                return [fut.result() for fut in ep_futs]
+        finally:
+            gateway.close()
+
     def _collect_episodes_multihost(
         self,
         state: tp.Any,
@@ -2770,9 +3229,9 @@ class AgentFlowTrainer:
         """Coordinate multi-host episode collection so all hosts enter SPMD ``rollout()`` in deterministic lockstep.
 
         Host 0 owns all environment instances (running ``env.reset()`` / ``env.step()`` concurrently when
-        ``workers > 1``) and broadcasts every turn prompt to worker hosts via ``broadcast_one_to_all`` so every
-        host invokes :meth:`_default_generate_turn` in the exact same order with identical token IDs. Completed
-        episodes are serialized and broadcast back to all hosts so every host builds identical training batches.
+        ``workers > 1``) and broadcasts batched turn prompts to worker hosts via ``broadcast_one_to_all`` so every
+        host invokes :meth:`_default_generate_turns_batch` in identical SPMD lockstep. Completed episodes are
+        serialized and broadcast back to all hosts so every host builds identical training batches.
         """
         from jax.experimental import multihost_utils
 
@@ -2781,11 +3240,19 @@ class AgentFlowTrainer:
 
         if jax.process_index() != 0:
             while True:
-                ctrl = _bcast(np.zeros((3,), dtype=np.int32))
-                op, length, turn_idx = int(ctrl[0]), int(ctrl[1]), int(ctrl[2])
+                ctrl = _bcast(np.zeros((4,), dtype=np.int32))
+                op, dim_a, dim_b, turn_idx = int(ctrl[0]), int(ctrl[1]), int(ctrl[2]), int(ctrl[3])
                 if op == 1:
-                    ids_list = _bcast(np.zeros((length,), dtype=np.int32)).tolist() if length > 0 else []
+                    ids_list = _bcast(np.zeros((dim_b,), dtype=np.int32)).tolist() if dim_b > 0 else []
                     self._default_generate_turn(state, ids_list, self._decode_ids(ids_list), turn_idx)
+                    multihost_utils.sync_global_devices(f"agent_flow_post_turn_{turn_idx}")
+                elif op == 2:
+                    ids_2d = _bcast(np.zeros((dim_a, dim_b), dtype=np.int32))
+                    lens_1d = _bcast(np.zeros((dim_a,), dtype=np.int32))
+                    batch_ids = [ids_2d[i, : int(lens_1d[i])].tolist() for i in range(dim_a)]
+                    batch_txts = [self._decode_ids(r) for r in batch_ids]
+                    self._default_generate_turns_batch(state, batch_ids, batch_txts, turn_idx)
+                    multihost_utils.sync_global_devices(f"agent_flow_post_turn_batch_{turn_idx}")
                 elif op == 0:
                     payload_len = int(_bcast(np.zeros((1,), dtype=np.int32))[0])
                     payload = _bcast(np.zeros((payload_len,), dtype=np.uint8)).tobytes() if payload_len > 0 else b"[]"
@@ -2809,33 +3276,67 @@ class AgentFlowTrainer:
             nonlocal workers_in_turn
             ids_np = np.asarray(p_ids, dtype=np.int32).reshape(-1)
             with self._rollout_lock:
-                _bcast(np.asarray([1, int(ids_np.size), int(t_idx)], dtype=np.int32))
+                _bcast(np.asarray([1, 1, int(ids_np.size), int(t_idx)], dtype=np.int32))
                 if ids_np.size > 0:
                     _bcast(ids_np)
                 workers_in_turn = True
                 result = self._default_generate_turn(state, ids_np.tolist(), p_txt, int(t_idx))
+                multihost_utils.sync_global_devices(f"agent_flow_post_turn_{int(t_idx)}")
                 workers_in_turn = False
                 return result
 
+        def _synced_generate_turns_batch(
+            batch_ids: list[list[int]],
+            batch_txts: list[str],
+            t_idx: int,
+        ) -> list[tuple[list[int], str, list[float] | None]]:
+            nonlocal workers_in_turn
+            if not batch_ids:
+                return []
+            pad_id = self._resolve_pad_token_id()
+            n_rows = len(batch_ids)
+            max_len = max(max(len(r), 1) for r in batch_ids)
+            ids_2d = np.full((n_rows, max_len), pad_id, dtype=np.int32)
+            lens_1d = np.zeros((n_rows,), dtype=np.int32)
+            for i, row in enumerate(batch_ids):
+                lens_1d[i] = len(row)
+                if row:
+                    ids_2d[i, : len(row)] = row
+            with self._rollout_lock:
+                _bcast(np.asarray([2, n_rows, max_len, int(t_idx)], dtype=np.int32))
+                _bcast(ids_2d)
+                _bcast(lens_1d)
+                workers_in_turn = True
+                results = self._default_generate_turns_batch(state, batch_ids, batch_txts, int(t_idx))
+                multihost_utils.sync_global_devices(f"agent_flow_post_turn_batch_{int(t_idx)}")
+                workers_in_turn = False
+                return results
+
+        use_batched = self._generate_turn_fn is None and callable(getattr(self.trainer, "rollout", None))
         try:
-            if self._episode_runner is not None or workers <= 1:
+            if self._episode_runner is not None:
                 episodes = [
                     self._run_episode(state, task, p_idx, grp_id, generate_turn_cb=_synced_generate_turn)
                     for p_idx, grp_id, task in jobs
                 ]
             else:
-                episodes = self._collect_episodes_lockstep_host0(jobs, workers, _synced_generate_turn)
+                episodes = self._collect_episodes_lockstep_host0(
+                    jobs,
+                    max(1, workers),
+                    _synced_generate_turn,
+                    gen_batch_cb=_synced_generate_turns_batch if use_batched else None,
+                )
         except BaseException as exc:
             if not workers_in_turn:
                 err_bytes = f"{type(exc).__name__}: {exc}".encode("utf-8", errors="replace")
-                _bcast(np.asarray([-1, 0, 0], dtype=np.int32))
+                _bcast(np.asarray([-1, 0, 0, 0], dtype=np.int32))
                 _bcast(np.asarray([len(err_bytes)], dtype=np.int32))
                 if err_bytes:
                     _bcast(np.frombuffer(err_bytes, dtype=np.uint8).copy())
             raise
 
         payload_bytes = _serialize_episodes(episodes)
-        _bcast(np.asarray([0, 0, 0], dtype=np.int32))
+        _bcast(np.asarray([0, 0, 0, 0], dtype=np.int32))
         _bcast(np.asarray([len(payload_bytes)], dtype=np.int32))
         if payload_bytes:
             _bcast(np.frombuffer(payload_bytes, dtype=np.uint8).copy())
@@ -2846,8 +3347,16 @@ class AgentFlowTrainer:
         jobs: list[tuple[int, int, dict[str, tp.Any]]],
         workers: int,
         gen_cb: tp.Callable[[list[int], str, int], tuple[list[int], str, list[float] | None]],
+        *,
+        gen_batch_cb: tp.Callable[
+            [list[list[int]], list[str], int],
+            list[tuple[list[int], str, list[float] | None]],
+        ]
+        | None = None,
     ) -> list[AgentFlowEpisode]:
-        """Run host-0 env I/O concurrently across ``workers`` while issuing generation calls in deterministic order."""
+        """Run host-0 env I/O concurrently across ``workers`` while batching model generation per turn."""
+        from easydel.environments.harnesses import HarnessEnvironment
+
         num_jobs = len(jobs)
         envs: list[tp.Any] = [None] * num_jobs
         eos_id_set = set(self._resolve_eos_token_ids())
@@ -2855,6 +3364,14 @@ class AgentFlowTrainer:
             # Instantiate synchronously so constructor errors propagate immediately, then reset concurrently.
             for idx, (_p_idx, _grp_id, task) in enumerate(jobs):
                 envs[idx] = self._instantiate_env(task)
+
+            if envs and all(isinstance(env, HarnessEnvironment) for env in envs):
+                batch_fn = gen_batch_cb or (
+                    lambda ids_b, txts_b, t_idx: [
+                        gen_cb(ids_i, txt_i, t_idx) for ids_i, txt_i in zip(ids_b, txts_b, strict=True)
+                    ]
+                )
+                return self._collect_harness_episodes_host0(envs, jobs, workers, batch_fn)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 reset_futs = {pool.submit(envs[idx].reset): idx for idx in range(num_jobs)}
@@ -2910,6 +3427,8 @@ class AgentFlowTrainer:
                     if not active_indices:
                         break
                     turn_actions: dict[int, tuple[list[int], str, list[float] | None, str]] = {}
+                    batch_ctx_ids: list[list[int]] = []
+                    batch_ctx_txts: list[str] = []
                     for idx in active_indices:
                         st = states[idx]
                         if self._context_manager is not None:
@@ -2921,8 +3440,19 @@ class AgentFlowTrainer:
                         else:
                             ctx_text = _default_context_manager(st["initial_prompt"], st["turns"], self.arguments)
                             ctx_ids = self._encode_text(ctx_text)
-                        act_ids, act_text, act_lps = gen_cb(ctx_ids, ctx_text, turn_idx)
-                        turn_actions[idx] = (act_ids, act_text, act_lps, ctx_text)
+                        batch_ctx_ids.append(ctx_ids)
+                        batch_ctx_txts.append(ctx_text)
+
+                    if gen_batch_cb is not None:
+                        batch_outs = gen_batch_cb(batch_ctx_ids, batch_ctx_txts, turn_idx)
+                        for idx, ctx_text, (act_ids, act_text, act_lps) in zip(
+                            active_indices, batch_ctx_txts, batch_outs, strict=True
+                        ):
+                            turn_actions[idx] = (act_ids, act_text, act_lps, ctx_text)
+                    else:
+                        for idx, ctx_ids, ctx_text in zip(active_indices, batch_ctx_ids, batch_ctx_txts, strict=True):
+                            act_ids, act_text, act_lps = gen_cb(ctx_ids, ctx_text, turn_idx)
+                            turn_actions[idx] = (act_ids, act_text, act_lps, ctx_text)
 
                     def _step_one(ep_idx: int, action_text: str) -> tuple[tp.Any | None, Exception | None]:
                         try:
@@ -3088,6 +3618,19 @@ class AgentFlowTrainer:
         try:
             if jax.process_count() > 1:
                 episodes = self._collect_episodes_multihost(state, jobs, workers)
+            elif (
+                self._episode_runner is None
+                and self._generate_turn_fn is None
+                and callable(getattr(self.trainer, "rollout", None))
+            ):
+                episodes = self._collect_episodes_lockstep_host0(
+                    jobs,
+                    max(1, workers),
+                    lambda p_ids, p_txt, t_idx: self._default_generate_turn(state, p_ids, p_txt, t_idx),
+                    gen_batch_cb=lambda b_ids, b_txts, t_idx: self._default_generate_turns_batch(
+                        state, b_ids, b_txts, t_idx
+                    ),
+                )
             elif workers == 1:
                 for idx, (p_idx, grp_id, task) in enumerate(jobs):
                     episodes[idx] = self._run_episode(state, task, p_idx, grp_id)

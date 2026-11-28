@@ -120,6 +120,7 @@ from ...stream_protocol import StreamEventFrame
 from ...typed_models import ResponseCompletedEvent, ResponsesFinalizationOptions, ResponsesOutputItem, ResponsesResponse
 from ..esurge_engine import RequestOutput, eSurge
 from ..metrics import get_metrics_collector, initialize_metrics
+from .anthropic_endpoints import AnthropicEndpointsMixin
 from .auth_endpoints import AuthEndpointsMixin
 
 logger = get_logger("eSurgeApiServer")
@@ -330,15 +331,17 @@ class eSurgeAdapter(InferenceEngineAdapter):
         return self.esurge.tokenizer
 
 
-class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
-    """eSurge-specific API server implementation with OpenAI compatibility.
+class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin, AnthropicEndpointsMixin):
+    """eSurge-specific API server implementation with OpenAI and Anthropic compatibility.
 
     Provides a FastAPI-based REST API server that exposes eSurge engines
-    through OpenAI-compatible endpoints. Supports multiple models, streaming,
-    function calling, and comprehensive monitoring.
+    through OpenAI-compatible and Anthropic Messages API-compatible endpoints.
+    Supports multiple models, streaming, extended thinking, function calling,
+    and comprehensive monitoring.
 
     Features:
-    - OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions)
+    - OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions, /v1/responses)
+    - Anthropic Messages API v1 compatibility (/v1/messages, /v1/messages/count_tokens)
     - Multi-model support with dynamic routing
     - Streaming responses with Server-Sent Events (SSE)
     - Function/tool calling support
@@ -3857,4 +3860,4 @@ class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
             ),
         ]
 
-        return base_endpoints + admin_endpoints
+        return base_endpoints + self._anthropic_endpoints() + admin_endpoints

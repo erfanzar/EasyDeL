@@ -242,10 +242,18 @@ def derive_spec_token_buckets(
     return buckets
 
 
+class _BatchedLogprobRow(typing.NamedTuple):
+    """Reference to one request's row inside a window-batched logprob summary."""
+
+    batch_arrays: tuple[typing.Any, typing.Any, typing.Any]
+    row_pos: int
+    num_logprobs: int
+
+
 def _materialize_logprobs(
     req_ids: list[str],
     sampled_token_ids: list[list[int]],
-    payloads: dict[str, tuple[typing.Any, typing.Any, typing.Any]],
+    payloads: dict[str, tuple[typing.Any, typing.Any, typing.Any] | _BatchedLogprobRow],
     requested: set[str],
 ) -> LogprobsLists | None:
     """Flatten per-request device summaries in emitted-position order.
@@ -256,6 +264,7 @@ def _materialize_logprobs(
     if not requested:
         return None
     ids_out, scores_out, ranks_out = [], [], []
+    resolved_batches: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for req_id, emitted in zip(req_ids, sampled_token_ids, strict=True):
         if req_id not in requested:
             ids_out.extend([] for _ in emitted)
@@ -266,7 +275,21 @@ def _materialize_logprobs(
             continue
         if req_id not in payloads:
             raise RuntimeError(f"Missing requested sampling probabilities for {req_id!r}.")
-        ids, scores, ranks = (np.asarray(array) for array in payloads[req_id])
+        entry = payloads[req_id]
+        if isinstance(entry, _BatchedLogprobRow):
+            key = id(entry.batch_arrays)
+            cached = resolved_batches.get(key)
+            if cached is None:
+                cached = tuple(np.asarray(array) for array in entry.batch_arrays)  # type: ignore[assignment]
+                resolved_batches[key] = cached
+            b_ids, b_scores, b_ranks = cached
+            cols = min(1 + int(entry.num_logprobs), int(b_ids.shape[-1]))
+            r = int(entry.row_pos)
+            ids = b_ids[r : r + 1, :cols]
+            scores = b_scores[r : r + 1, :cols]
+            ranks = b_ranks[r : r + 1]
+        else:
+            ids, scores, ranks = (np.asarray(array) for array in entry)
         if ids.shape[0] != len(emitted):
             raise RuntimeError(f"Sampling probability positions do not match emitted tokens for {req_id!r}.")
         for token, token_ids, values, rank in zip(emitted, ids, scores, ranks, strict=True):
@@ -1159,8 +1182,7 @@ class eSurgeRunner:
             configs.append(config)
         text_cfg = self.model.config.get_text_config()
         layer_count = int(
-            getattr(text_cfg, "num_cache_layers", None)
-            or getattr(text_cfg, "num_hidden_layers", len(layer_groups))
+            getattr(text_cfg, "num_cache_layers", None) or getattr(text_cfg, "num_hidden_layers", len(layer_groups))
         )
         if set(layer_groups) != set(range(layer_count)):
             raise ValueError("KV pool ownership must cover every model layer")
@@ -3301,9 +3323,222 @@ class eSurgeRunner:
             _place_host(np.asarray([params.presence_penalty], dtype=np.float32)),
             _place_host(np.asarray([params.repetition_penalty], dtype=np.float32)),
             num_logprobs=max(0, int(params.logprobs or 0)),
+            apply_penalties=bool(
+                params.frequency_penalty != 0.0 or params.presence_penalty != 0.0 or params.repetition_penalty != 1.0
+            ),
+            apply_topk=bool(params.top_k > 0),
+            apply_topp=bool(params.top_p < 1.0),
+            apply_minp=bool(params.min_p > 0.0),
             sparse_constraints=sparse_constraints,
         )
         return tuple(jax.copy_to_host_async(array) for array in arrays)
+
+    def _score_output_window(
+        self,
+        *,
+        logits,
+        sampled_tokens,
+        token_ids_window_cpu: np.ndarray,
+        window_entries: list[tuple[int, str, CachedRequestState | None, int | None, int | None, bool]],
+        requested_logprobs: set[str],
+        sampling_constraints: SamplingConstraints | None,
+        padded_num_reqs: int,
+    ) -> tuple[dict[str, _BatchedLogprobRow], typing.Any]:
+        """Vectorized behavior-policy scoring across an entire window in one XLA launch.
+
+        Replaces per-row ``_score_output_row`` dispatches (which issued ``9 * B``
+        ``device_put`` calls, ``B`` separate full-vocab log-softmax launches, and
+        ``3 * B`` host transfers per decode step) with a single padded bucket
+        dispatch over ``logits[:padded_num_reqs]`` and a single async host copy.
+        """
+        scored_rows: list[tuple[int, str, CachedRequestState, int, int]] = []
+        for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
+            if not is_valid or req_state is None or seq_len is None:
+                continue
+            if rid not in requested_logprobs and not self.enable_sampler_metrics:
+                continue
+            row_k = max(0, int(req_state.sampling_params.logprobs or 0))
+            scored_rows.append((int(row_pos), rid, req_state, int(seq_len), row_k))
+        if not scored_rows:
+            return {}, None
+
+        n_rows = int(padded_num_reqs)
+        logits_win = logits if int(logits.shape[0]) == n_rows else logits[:n_rows]
+        tokens_win = sampled_tokens if int(sampled_tokens.shape[0]) == n_rows else sampled_tokens[:n_rows]
+        logits_sharding = getattr(logits_win, "sharding", None)
+        tokens_sharding = getattr(tokens_win, "sharding", None)
+        logits_replicated = (
+            jax.sharding.NamedSharding(logits_sharding.mesh, jax.sharding.PartitionSpec())
+            if isinstance(logits_sharding, jax.sharding.NamedSharding)
+            else None
+        )
+        if (
+            logits_replicated is not None
+            and tokens_sharding is not None
+            and tokens_sharding.device_set != logits_sharding.device_set
+        ):
+            tokens_win = jax.device_put(tokens_win, logits_replicated)
+
+        seq_lens_np = np.zeros((n_rows,), dtype=np.int32)
+        temp_np = np.ones((n_rows,), dtype=np.float32)
+        top_p_np = np.ones((n_rows,), dtype=np.float32)
+        top_k_np = np.zeros((n_rows,), dtype=np.int32)
+        min_p_np = np.zeros((n_rows,), dtype=np.float32)
+        freq_np = np.zeros((n_rows,), dtype=np.float32)
+        pres_np = np.zeros((n_rows,), dtype=np.float32)
+        rep_np = np.ones((n_rows,), dtype=np.float32)
+        scored_mask_np = np.zeros((n_rows,), dtype=np.bool_)
+
+        max_k = 0
+        has_penalties = False
+        has_topk = False
+        has_topp = False
+        has_minp = False
+        for row_pos, _rid, req_state, seq_len, row_k in scored_rows:
+            params = req_state.sampling_params
+            seq_lens_np[row_pos] = seq_len
+            temp_np[row_pos] = float(params.temperature)
+            top_p_np[row_pos] = float(params.top_p)
+            top_k_np[row_pos] = int(params.top_k)
+            min_p_np[row_pos] = float(params.min_p)
+            freq_np[row_pos] = float(params.frequency_penalty)
+            pres_np[row_pos] = float(params.presence_penalty)
+            rep_np[row_pos] = float(params.repetition_penalty)
+            scored_mask_np[row_pos] = True
+            if row_k > max_k:
+                max_k = row_k
+            if params.frequency_penalty != 0.0 or params.presence_penalty != 0.0 or params.repetition_penalty != 1.0:
+                has_penalties = True
+            if params.top_k > 0:
+                has_topk = True
+            if params.top_p < 1.0:
+                has_topp = True
+            if params.min_p > 0.0:
+                has_minp = True
+
+        replicated = getattr(getattr(self, "executor_manager", None), "host_payloads_replicated", None)
+
+        def _place_host_tuple(host_values: tuple[np.ndarray, ...]) -> tuple[typing.Any, ...]:
+            if logits_replicated is None:
+                return host_values
+            placed_replicated = replicated
+            if host_payload_broadcast_needed(placed_replicated):
+                from jax.experimental import multihost_utils
+
+                host_values = multihost_utils.broadcast_one_to_all(host_values)
+                placed_replicated = True
+            return put_host_payload(host_values, logits_replicated, host_payloads_replicated=placed_replicated)
+
+        # When penalties are off, seq_lens and token_history are unused inside score_sampled_tokens.
+        # Keep seq_lens zeroed so steady-state decode steps hit the device-side parameter cache with
+        # zero H2D transfers and zero multi-host collectives.
+        if not has_penalties:
+            seq_lens_np.fill(0)
+            hist_src = np.zeros((n_rows, 1), dtype=np.int32)
+        else:
+            hist_src = np.asarray(token_ids_window_cpu[:n_rows], dtype=np.int32)
+            if hist_src.shape[0] < n_rows:
+                pad_rows = np.zeros((n_rows - hist_src.shape[0], hist_src.shape[1]), dtype=np.int32)
+                hist_src = np.concatenate([hist_src, pad_rows], axis=0)
+
+        param_cache = getattr(self, "_score_window_param_cache", None)
+        if param_cache is None:
+            param_cache = {}
+            self._score_window_param_cache = param_cache
+
+        host_params = (
+            hist_src,
+            seq_lens_np,
+            temp_np,
+            top_p_np,
+            top_k_np,
+            min_p_np,
+            freq_np,
+            pres_np,
+            rep_np,
+        )
+        cache_key = None
+        if not has_penalties and logits_replicated is not None:
+            cache_key = (
+                n_rows,
+                id(logits_sharding.mesh),
+                temp_np.tobytes(),
+                top_p_np.tobytes(),
+                top_k_np.tobytes(),
+                min_p_np.tobytes(),
+            )
+            placed_params = param_cache.get(cache_key)
+        else:
+            placed_params = None
+
+        if placed_params is None:
+            placed_params = _place_host_tuple(host_params)
+            if cache_key is not None:
+                if len(param_cache) >= 32:
+                    param_cache.clear()
+                param_cache[cache_key] = placed_params
+
+        (
+            hist_dev,
+            seq_lens_dev,
+            temp_dev,
+            top_p_dev,
+            top_k_dev,
+            min_p_dev,
+            freq_dev,
+            pres_dev,
+            rep_dev,
+        ) = placed_params
+
+        sparse_constraints = None
+        if sampling_constraints is not None:
+            compacted = compact_sampling_constraints(np.arange(n_rows, dtype=np.int64), sampling_constraints)
+            if compacted is not None:
+                sparse_constraints = _place_host_tuple(tuple(compacted))
+
+        arrays = score_sampled_tokens(
+            logits_win,
+            tokens_win,
+            hist_dev,
+            seq_lens_dev,
+            temp_dev,
+            top_p_dev,
+            top_k_dev,
+            min_p_dev,
+            freq_dev,
+            pres_dev,
+            rep_dev,
+            num_logprobs=max_k,
+            apply_penalties=has_penalties,
+            apply_topk=has_topk,
+            apply_topp=has_topp,
+            apply_minp=has_minp,
+            sparse_constraints=sparse_constraints,
+        )
+        host_arrays = tuple(jax.copy_to_host_async(array) for array in arrays)
+        window_payloads = {
+            rid: _BatchedLogprobRow(batch_arrays=host_arrays, row_pos=row_pos, num_logprobs=row_k)
+            for row_pos, rid, _req_state, _seq_len, row_k in scored_rows
+        }
+        window_metric_scores = None
+        if self.enable_sampler_metrics:
+            metric_cache = getattr(self, "_score_window_metric_mask_cache", None)
+            if metric_cache is None:
+                metric_cache = {}
+                self._score_window_metric_mask_cache = metric_cache
+            mkey = (n_rows, id(logits_sharding.mesh), scored_mask_np.tobytes()) if logits_replicated is not None else None
+            metric_mask = metric_cache.get(mkey) if mkey is not None else None
+            if metric_mask is None:
+                (metric_mask,) = _place_host_tuple((scored_mask_np,))
+                if mkey is not None:
+                    if len(metric_cache) >= 32:
+                        metric_cache.clear()
+                    metric_cache[mkey] = metric_mask
+            scores_col = arrays[1][:, 0].astype(jnp.float32)
+            if logits_replicated is not None and getattr(scores_col, "sharding", None) != logits_replicated:
+                scores_col = jax.device_put(scores_col, logits_replicated)
+            window_metric_scores = jnp.where(metric_mask, scores_col, jnp.float32(0.0))
+        return window_payloads, window_metric_scores
 
     def _sampling_processors_for_window(
         self,
@@ -3318,7 +3553,7 @@ class eSurgeRunner:
             The window rows' :class:`SamplingConstraints`, or ``None`` when no request in the window carries one.
             Tokens outside the vocabulary are dropped.
         """
-        vocab = self._resolved_vocab_size()
+        vocab: int | None = None
         bias: list[tuple[int, int, float]] = []
         restricted: list[int] = []
         allowed: list[tuple[int, int]] = []
@@ -3328,6 +3563,10 @@ class eSurgeRunner:
             if state is None:
                 continue
             params = state.sampling_params
+            if not (params.logit_bias or params.allowed_token_ids is not None or params.bad_words_token_ids):
+                continue
+            if vocab is None:
+                vocab = self._resolved_vocab_size()
             if params.logit_bias:
                 bias.extend(
                     (i, int(token), float(value))
@@ -4152,39 +4391,56 @@ class eSurgeRunner:
                     sync_finalize_entries.append((req_state, req_idx, seq_len))
 
             window_metric_scores = None
-            _logits_sharding = getattr(_logits, "sharding", None)
-            _metric_sharding = (
-                jax.sharding.NamedSharding(_logits_sharding.mesh, jax.sharding.PartitionSpec())
-                if isinstance(_logits_sharding, jax.sharding.NamedSharding)
-                else None
+            use_batched_scoring = (
+                "_score_output_row" not in self.__dict__
+                and type(self)._score_output_row is eSurgeRunner._score_output_row
             )
-            for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
-                if not is_valid or req_state is None:
-                    continue
-                if rid not in requested_logprobs and not self.enable_sampler_metrics:
-                    continue
-                payload = self._score_output_row(
-                    logits=_logits[row_pos : row_pos + 1],
-                    sampled_tokens=out_tokens_win[row_pos : row_pos + 1],
-                    history=token_ids_window_cpu[row_pos],
-                    seq_len=int(seq_len),
-                    sampling_params=req_state.sampling_params,
+            if use_batched_scoring:
+                window_payloads, window_metric_scores = self._score_output_window(
+                    logits=_logits,
+                    sampled_tokens=out_tokens_win,
+                    token_ids_window_cpu=token_ids_window_cpu,
+                    window_entries=window_entries,
+                    requested_logprobs=requested_logprobs,
                     sampling_constraints=sampling_constraints,
-                    row_pos=int(row_pos),
+                    padded_num_reqs=int(padded_num_reqs),
                 )
-                logprob_payloads[rid] = payload
-                if self.enable_sampler_metrics:
-                    if window_metric_scores is None:
-                        zeros = np.zeros((padded_num_reqs,), dtype=np.float32)
-                        window_metric_scores = (
-                            jax.device_put(zeros, _metric_sharding)
-                            if _metric_sharding is not None
-                            else jnp.zeros((padded_num_reqs,), dtype=jnp.float32)
-                        )
-                    score_val = payload[1][0, 0]
-                    if _metric_sharding is not None and getattr(score_val, "sharding", None) != _metric_sharding:
-                        score_val = jax.device_put(score_val, _metric_sharding)
-                    window_metric_scores = window_metric_scores.at[row_pos].set(score_val)
+                if window_payloads:
+                    logprob_payloads.update(window_payloads)
+            else:
+                _logits_sharding = getattr(_logits, "sharding", None)
+                _metric_sharding = (
+                    jax.sharding.NamedSharding(_logits_sharding.mesh, jax.sharding.PartitionSpec())
+                    if isinstance(_logits_sharding, jax.sharding.NamedSharding)
+                    else None
+                )
+                for row_pos, rid, req_state, _req_idx, seq_len, is_valid in window_entries:
+                    if not is_valid or req_state is None:
+                        continue
+                    if rid not in requested_logprobs and not self.enable_sampler_metrics:
+                        continue
+                    payload = self._score_output_row(
+                        logits=_logits[row_pos : row_pos + 1],
+                        sampled_tokens=out_tokens_win[row_pos : row_pos + 1],
+                        history=token_ids_window_cpu[row_pos],
+                        seq_len=int(seq_len),
+                        sampling_params=req_state.sampling_params,
+                        sampling_constraints=sampling_constraints,
+                        row_pos=int(row_pos),
+                    )
+                    logprob_payloads[rid] = payload
+                    if self.enable_sampler_metrics:
+                        if window_metric_scores is None:
+                            zeros = np.zeros((padded_num_reqs,), dtype=np.float32)
+                            window_metric_scores = (
+                                jax.device_put(zeros, _metric_sharding)
+                                if _metric_sharding is not None
+                                else jnp.zeros((padded_num_reqs,), dtype=jnp.float32)
+                            )
+                        score_val = payload[1][0, 0]
+                        if _metric_sharding is not None and getattr(score_val, "sharding", None) != _metric_sharding:
+                            score_val = jax.device_put(score_val, _metric_sharding)
+                        window_metric_scores = window_metric_scores.at[row_pos].set(score_val)
 
             if needs_async_output:
                 copy_enqueue_start = time.time()
@@ -4356,7 +4612,8 @@ class eSurgeRunner:
                     _pending_bv.append((int(_rp), len(_flat_indices), len(_idxs), _meta))
                     _flat_indices.extend(int(_x) for _x in _idxs)
                 _has_overlapped_bv = any(
-                    any(int(_t) < 0 for _t in _meta2.scheduled_draft_tokens) for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
+                    any(int(_t) < 0 for _t in _meta2.scheduled_draft_tokens)
+                    for (_rp2, _off2, _cnt2, _meta2) in _pending_bv
                 )
                 # A lone request takes this pre-pass too when no replay follows its verify (``_single_ok``): its rows
                 # then run the programs a multi-request step runs, instead of a per-request gather and an LM head
@@ -4403,7 +4660,10 @@ class eSurgeRunner:
                         and not self.spec_decode_recurrent_replay
                         and int(getattr(self.spec, "reject_backoff_steps", 0) or 0) <= 0
                         and self.spec_decode_debug_max_traces <= 0
-                        and (_has_overlapped_bv or int(_pad_window_k) == int(getattr(self.spec, "live_num_draft_tokens", 0)))
+                        and (
+                            _has_overlapped_bv
+                            or int(_pad_window_k) == int(getattr(self.spec, "live_num_draft_tokens", 0))
+                        )
                         and self.spec.can_draft_in_verify()
                         and all(
                             self.spec.can_batch_draft(self.requests.get(str(_meta2.request_id)))
@@ -4453,9 +4713,7 @@ class eSurgeRunner:
                     else:
                         # Exclude overlapped rows carrying `-1` draft placeholders from host-side argmax verify.
                         _host_bv = [
-                            entry
-                            for entry in _pending_bv
-                            if all(int(_t) >= 0 for _t in entry[3].scheduled_draft_tokens)
+                            entry for entry in _pending_bv if all(int(_t) >= 0 for _t in entry[3].scheduled_draft_tokens)
                         ]
                         if len(_host_bv) >= (1 if _single_ok else 2):
                             _project_start = time.time()
