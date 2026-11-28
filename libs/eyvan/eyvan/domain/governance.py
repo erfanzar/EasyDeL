@@ -246,9 +246,9 @@ def effective_can_borrow(rules: UserRules, tier: TeamTier) -> bool:
 
     * Explicit ``rules.can_borrow`` (``True`` or ``False``) always wins.
     * When ``None``: ``admin`` and ``trusted`` tiers may borrow idle capacity.
-    * A plain ``user`` with a positive ``guaranteed_tpu_units`` stays within
-      their own guarantee unless granted ``can_borrow=True`` or an explicit
-      ``max_tpu_units > guaranteed_tpu_units``.
+    * A plain ``user`` with an explicit ``guaranteed_tpu_units`` (including ``0``)
+      stays within their own guarantee unless granted ``can_borrow=True`` or an
+      explicit ``max_tpu_units > guaranteed_tpu_units``.
     * A plain ``user`` with no ``guaranteed_tpu_units`` (``None``) keeps the
       existing unrestricted borrowing behaviour (bounded only by ``max_tpu_units``).
     """
@@ -257,7 +257,7 @@ def effective_can_borrow(rules: UserRules, tier: TeamTier) -> bool:
         return rules.can_borrow
     if tier in {TeamTier.ADMIN, TeamTier.TRUSTED}:
         return True
-    if rules.guaranteed_tpu_units is not None and rules.guaranteed_tpu_units > 0:
+    if rules.guaranteed_tpu_units is not None and rules.guaranteed_tpu_units >= 0:
         return rules.max_tpu_units is not None and rules.max_tpu_units > rules.guaranteed_tpu_units
     return True
 
@@ -447,9 +447,7 @@ def plan_reclaim(
         )
     compat_pools: frozenset[str] | None = None
     if compatible_pool_ids is not None:
-        normalized_pools = frozenset(pool_id.strip() for pool_id in compatible_pool_ids if pool_id and pool_id.strip())
-        if normalized_pools:
-            compat_pools = normalized_pools
+        compat_pools = frozenset(pool_id.strip() for pool_id in compatible_pool_ids if pool_id and pool_id.strip())
     req_accel = (
         required_accelerator_type.strip().lower()
         if isinstance(required_accelerator_type, str) and required_accelerator_type.strip()

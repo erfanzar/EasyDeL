@@ -44,6 +44,7 @@ from eyvan.worker.agent.models import (
     MutationModel,
     NativeStageActionRequest,
     NativeWorkerHealth,
+    ReclaimNoticeRequest,
     WorkloadMutationRequest,
     WorkloadReference,
     WorkloadRequest,
@@ -319,6 +320,76 @@ class NativeRemoteExecutor:
             )
         )
         return WorkloadReference.model_validate(response.json()).remote_id
+
+    def notify_reclaim(
+        self,
+        remote_id: str,
+        *,
+        notice: tp.Mapping[str, JsonValue],
+        grace_s: int,
+        context: MutationContext,
+    ) -> None:
+        """Forward a graceful reclaim notice and signal to the remote native worker."""
+
+        raw_reason = notice.get("reason")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else "reclaim requested"
+        raw_requested_by = notice.get("requested_by")
+        requested_by = (
+            raw_requested_by.strip() if isinstance(raw_requested_by, str) and raw_requested_by.strip() else None
+        )
+        raw_deadline = notice.get("deadline_at")
+        deadline_at = raw_deadline.strip() if isinstance(raw_deadline, str) and raw_deadline.strip() else ""
+        raw_epoch = notice.get("deadline_epoch_s")
+        deadline_epoch_s = (
+            float(raw_epoch) if isinstance(raw_epoch, (int, float)) and not isinstance(raw_epoch, bool) else None
+        )
+        raw_policy = notice.get("policy")
+        policy: tp.Literal["requeue", "stop"] = "stop" if raw_policy == "stop" else "requeue"
+        raw_checkpoint_uri = notice.get("checkpoint_uri")
+        checkpoint_uri = (
+            raw_checkpoint_uri.strip() if isinstance(raw_checkpoint_uri, str) and raw_checkpoint_uri.strip() else None
+        )
+        raw_workload_id = notice.get("workload_id")
+        workload_id = raw_workload_id.strip() if isinstance(raw_workload_id, str) and raw_workload_id.strip() else None
+        payload = ReclaimNoticeRequest(
+            mutation=self._mutation(context),
+            reason=reason[:500],
+            requested_by=requested_by,
+            deadline_at=deadline_at,
+            deadline_epoch_s=deadline_epoch_s,
+            grace_seconds=max(int(grace_s), 1),
+            policy=policy,
+            checkpoint_uri=checkpoint_uri,
+            workload_id=workload_id,
+        )
+        response = self._request(
+            "POST",
+            f"/api/v1/workloads/{remote_id}/reclaim-notice",
+            json=model_json(payload),
+        )
+        if response.status_code in {404, 501}:
+            raise UnsupportedCapabilityError(
+                f"native worker {self.endpoint} does not support graceful reclaim notices: {response.text[:500]}"
+            )
+        self._raise_for_status(response)
+
+    def read_checkpoint_uri(self, remote_id: str) -> str | None:
+        """Read any checkpoint receipt URI acknowledged by the workload on the remote worker."""
+
+        try:
+            response = self._request("GET", f"/api/v1/workloads/{remote_id}/checkpoint-uri")
+        except httpx.HTTPError:
+            return None
+        if response.status_code in {404, 501} or response.status_code >= 400:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if not is_json_object(payload):
+            return None
+        uri = payload.get("checkpoint_uri")
+        return uri.strip() if isinstance(uri, str) and uri.strip() else None
 
     def logs(self, remote_id: str) -> str:
         return self._raise_for_status(self._request("GET", f"/api/v1/workloads/{remote_id}/logs")).text

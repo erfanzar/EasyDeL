@@ -596,11 +596,12 @@ def _read_cached(
 
 
 def _arm_cross_region_guard_if_configured(environment: tp.Mapping[str, str]) -> None:
-    """Arm the cross-region GCS guard when policy env vars are set and the guard is importable.
+    """Arm the cross-region GCS guard when policy env vars are set.
 
     Uses ``importlib.import_module`` rather than an explicit ``from eyvan...`` import so
     the flattened OCI callable runner (which stages only its declared sibling modules)
-    satisfies the stager import boundary and degrades cleanly if no guard module is present.
+    satisfies the stager import boundary. When ``EYVAN_CROSS_REGION_POLICY=ban`` and no
+    guard module can be imported, fails closed rather than running the callable unarmed.
     """
 
     policy = (environment.get("EYVAN_CROSS_REGION_POLICY") or "").strip().lower()
@@ -608,10 +609,12 @@ def _arm_cross_region_guard_if_configured(environment: tp.Mapping[str, str]) -> 
         return
     import importlib
 
+    last_import_error: ImportError | None = None
     for module_name in ("eyvan_region_guard", "eyvan.storage._region_guard"):
         try:
             guard_module = importlib.import_module(module_name)
-        except ImportError:
+        except ImportError as exc:
+            last_import_error = exc
             continue
         is_active = getattr(guard_module, "is_cross_region_guard_active", None)
         if callable(is_active) and is_active():
@@ -620,6 +623,19 @@ def _arm_cross_region_guard_if_configured(environment: tp.Mapping[str, str]) -> 
         if callable(arm):
             arm(environment)
             return
+
+    detail = f"cross-region runtime guard module is unavailable while policy is {policy!r}"
+    if last_import_error is not None:
+        detail = f"{detail}: {last_import_error}"
+    if policy == "ban":
+        sys.stderr.write(f"EYVAN_CROSS_REGION_TRANSFER_BANNED: {detail}\n")
+        sys.stderr.flush()
+        raw_kill = (environment.get("EYVAN_CROSS_REGION_KILL") or "").strip().lower()
+        if raw_kill in {"1", "true", "yes", "on"}:
+            os._exit(95)
+        raise RuntimeError(f"cross-region-transfer-banned: {detail}") from last_import_error
+    sys.stderr.write(f"eyvan cross-region guard warning: {detail}\n")
+    sys.stderr.flush()
 
 
 def execute_callable(

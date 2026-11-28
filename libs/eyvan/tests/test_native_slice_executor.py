@@ -352,6 +352,8 @@ def test_native_slice_aggregates_worker_statuses_and_fans_out_stop_and_logs() ->
     def first_worker(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/api/v1/workloads/slice-job":
             return httpx.Response(200, json={"remote_id": "slice-job", "status": states[0], "message": "rank zero"})
+        if request.method == "GET" and request.url.path == "/api/v1/workloads/slice-job/process-status":
+            return httpx.Response(200, json={"observed": True, "exit_status": 1})
         if request.method == "GET" and request.url.path == "/api/v1/workloads/slice-job/logs":
             return httpx.Response(200, text="rank zero log\n")
         assert request.method == "POST"
@@ -362,6 +364,8 @@ def test_native_slice_aggregates_worker_statuses_and_fans_out_stop_and_logs() ->
     def second_worker(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/api/v1/workloads/slice-job":
             return httpx.Response(200, json={"remote_id": "slice-job", "status": states[1], "message": "rank one"})
+        if request.method == "GET" and request.url.path == "/api/v1/workloads/slice-job/process-status":
+            return httpx.Response(200, json={"observed": True, "exit_status": 0})
         if request.method == "GET" and request.url.path == "/api/v1/workloads/slice-job/logs":
             return httpx.Response(200, text="rank one log\n")
         assert request.method == "POST"

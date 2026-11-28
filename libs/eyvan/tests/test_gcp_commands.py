@@ -469,10 +469,10 @@ def test_ssh_invalid_destination_refused(harness, destination):
     [
         # Script digests, not credentials.
         # pragma: allowlist nextline secret
-        ("eyvan", "624d99879b51881e4175ae9bb70e662e9802eb47be4586088d66e3fdc0297965"),
+        ("eyvan", "2b9fda65c148faee8e3a94cb9bdcde3aa57e1108858ba42f81b4d7b3ef2c41d9"),
         # Force-reinstall local wheels so same-version rebuilds replace installed bytes.
         # pragma: allowlist nextline secret
-        ("/tmp/eyvan-1.0-py3-none-any.whl", "4df6f8fb8d1aba3b51a1ebda36a69d72d6903e964d4c1d906c306f46f00f66d5"),
+        ("/tmp/eyvan-1.0-py3-none-any.whl", "083356c5956df7b544ac797ed24f03d099f2376a4c0db892ba4de503e0dfd72d"),
     ],
 )
 def test_bootstrap_default_bytes_match_pre_edit_capture(package, digest):

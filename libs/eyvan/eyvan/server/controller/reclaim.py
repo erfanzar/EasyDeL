@@ -135,7 +135,10 @@ class _ControllerReclaim:
             return
 
         grace_s = self._reclaim_grace_seconds(command, workload)
-        notice_delivered = await self._deliver_reclaim_notice(command, workload, members, grace_s=grace_s)
+        if grace_s > 0:
+            notice_delivered = await self._deliver_reclaim_notice(command, workload, members, grace_s=grace_s)
+        else:
+            notice_delivered = False
 
         if workload.state is WorkloadState.CHECKPOINTING:
             checkpoint_uri = await self._run_reclaim_checkpoint(command, workload, members)
@@ -143,7 +146,7 @@ class _ControllerReclaim:
 
         status, message, observed_uri = await self._reclaim_remote_status(workload, members)
         if status not in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
-            if notice_delivered:
+            if notice_delivered and grace_s > 0:
                 status, message, observed_uri, exited = await self._wait_for_graceful_reclaim_exit(
                     workload, members, timeout_s=grace_s
                 )
@@ -218,14 +221,16 @@ class _ControllerReclaim:
     # ------------------------------------------------------------ remote I/O
 
     def _reclaim_grace_seconds(self, command: OutboxRecord, workload: WorkloadRecord) -> int:
-        for key in ("reclaim_grace_seconds", "grace_period_seconds"):
-            raw = command.payload.get(key)
-            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
-                return raw
+        raw_reclaim = command.payload.get("reclaim_grace_seconds")
+        if isinstance(raw_reclaim, int) and not isinstance(raw_reclaim, bool) and raw_reclaim >= 0:
+            return raw_reclaim
+        raw_legacy = command.payload.get("grace_period_seconds")
+        if isinstance(raw_legacy, int) and not isinstance(raw_legacy, bool) and raw_legacy > 0:
+            return raw_legacy
         if workload.spec.checkpoint_grace_seconds > 0:
             return workload.spec.checkpoint_grace_seconds
         default_grace = self.settings.default_reclaim_grace_s
-        return default_grace if default_grace > 0 else 600
+        return default_grace if default_grace >= 0 else 600
 
     async def _deliver_reclaim_notice(
         self,
@@ -334,11 +339,18 @@ class _ControllerReclaim:
         *,
         timeout_s: int,
     ) -> tuple[ExecutionWorkloadStatus, str | None, str | None, bool]:
-        """Poll for a graceful checkpoint-and-exit until the reclaim grace deadline expires."""
+        """Poll for a graceful checkpoint-and-exit until the persisted reclaim deadline expires."""
 
         loop = asyncio.get_running_loop()
-        poll_s = 0.05 if timeout_s <= 5 else 1.0
-        deadline = loop.time() + max(timeout_s, 1)
+        if workload.reclaim_deadline_at is not None:
+            remaining_budget = max(0.0, (workload.reclaim_deadline_at - utcnow()).total_seconds())
+        else:
+            remaining_budget = float(max(timeout_s, 0))
+        if remaining_budget <= 0.0:
+            status, message, checkpoint_uri = await self._reclaim_remote_status(workload, members)
+            return status, message, checkpoint_uri, status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES
+        poll_s = 0.05 if remaining_budget <= 5.0 else 1.0
+        deadline = loop.time() + remaining_budget
         while True:
             status, message, checkpoint_uri = await self._reclaim_remote_status(workload, members)
             if status in _PREEMPTION_TERMINAL_WORKLOAD_STATUSES:
@@ -613,10 +625,11 @@ class _ControllerReclaim:
         lease = members[0][0]
         effective_checkpoint_uri = checkpoint_uri or workload.checkpoint_uri
         if outcome is _PreemptionVictimOutcome.SUCCEEDED:
-            await self._release_terminal(workload, lease, WorkloadState.SUCCEEDED, "workload.succeeded_during_reclaim")
             await self._clear_reclaim_markers(workload.id, expected_generation=workload.generation)
+            await self._release_terminal(workload, lease, WorkloadState.SUCCEEDED, "workload.succeeded_during_reclaim")
             return
         if outcome is _PreemptionVictimOutcome.FAILED:
+            await self._clear_reclaim_markers(workload.id, expected_generation=workload.generation)
             await self._release_terminal(
                 workload,
                 lease,
@@ -624,12 +637,16 @@ class _ControllerReclaim:
                 "workload.failed_during_reclaim",
                 failure_reason=message or "execution backend reported failure during reclaim",
             )
-            await self._clear_reclaim_markers(workload.id, expected_generation=workload.generation)
             return
         actor = str(command.payload.get("actor") or "an administrator")
         reason = str(command.payload.get("reason") or "no reason given")
         policy = str(command.payload.get("reclaim_policy") or workload.spec.reclaim_policy or "requeue")
         if policy == "stop":
+            await self._clear_reclaim_markers(
+                workload.id,
+                expected_generation=command.generation,
+                scheduling_reason=f"reclaimed by {actor}: {reason}; stopped with checkpoint preserved",
+            )
             await self.service.settle_terminal_workload(
                 self._principal,
                 workload.id,
@@ -640,12 +657,9 @@ class _ControllerReclaim:
                 expected_lease_id=lease.id,
                 expected_state=workload.state,
             )
-            await self._clear_reclaim_markers(
-                workload.id,
-                expected_generation=command.generation,
-                scheduling_reason=f"reclaimed by {actor}: {reason}; stopped with checkpoint preserved",
-            )
             return
+        is_governance_reclaim = bool(command.payload.get("governance_reclaim")) or actor.startswith("reclaim:")
+        await self._clear_reclaim_markers(workload.id, expected_generation=command.generation)
         resumed, _lease, _budget = await self.service.settle_preempted_workload(
             self._principal,
             workload.id,
@@ -656,9 +670,10 @@ class _ControllerReclaim:
             expected_lease_id=lease.id,
             expected_state=workload.state,
             require_preemption_owner=True,
-            provider_preempted=True,
+            provider_preempted=not is_governance_reclaim,
         )
-        await self._clear_reclaim_markers(resumed.id, expected_generation=resumed.generation)
+        if resumed.reclaim_deadline_at is not None or resumed.reclaim_requested_by is not None:
+            await self._clear_reclaim_markers(resumed.id, expected_generation=resumed.generation)
 
     async def _recover_stale_reclaim_command(self, command: OutboxRecord, *, diagnostic: str) -> None:
         """Handle an agent fence conflict the way cancel/checkpoint commands do.

@@ -37,6 +37,7 @@ from eyvan.capacity.drivers.base import (
     MutationContext,
     StaleMutationError,
 )
+from eyvan.storage import _region_guard
 from eyvan.storage._region_guard import (
     CROSS_REGION_TRANSFER_BANNED_EXIT_CODE,
     CROSS_REGION_TRANSFER_BANNED_MARKER,
@@ -53,6 +54,79 @@ _LOCAL_LOG_CURSOR = re.compile(r"^b(0|[1-9][0-9]*)$")
 _LOCAL_LOG_PAGE_MAX_BYTES = 8 * 1024 * 1024
 _CROSS_REGION_BAN_LOG_TAIL_BYTES = 64 * 1024
 _CROSS_REGION_BAN_DETAIL_LIMIT = 400
+_LOCAL_SITECUSTOMIZE_SOURCE = (
+    "# Copyright (C) 2026 Erfan Zare Chavoshi\n"
+    "# This file is part of Eyvan.\n"
+    "#\n"
+    "# SPDX-License-Identifier: AGPL-3.0-or-later\n"
+    "\n"
+    '"""Auto-arm Eyvan\'s cross-region GCS guard for native-local Python workloads."""\n'
+    "\n"
+    "from __future__ import annotations\n"
+    "\n"
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "_policy = (os.environ.get('EYVAN_CROSS_REGION_POLICY') or '').strip().lower()\n"
+    "if _policy in {'warn', 'ban'}:\n"
+    "    try:\n"
+    "        import eyvan_region_guard\n"
+    "    except Exception as _exc:\n"
+    "        if _policy == 'ban':\n"
+    "            sys.stderr.write(\n"
+    "                'EYVAN_CROSS_REGION_TRANSFER_BANNED: cross-region guard module unavailable: '\n"
+    "                f'{_exc}\\n'\n"
+    "            )\n"
+    "            sys.stderr.flush()\n"
+    "            if (os.environ.get('EYVAN_CROSS_REGION_KILL') or '').strip().lower() in {'1', 'true', 'yes', 'on'}:\n"
+    "                os._exit(95)\n"
+    "            raise\n"
+    "    else:\n"
+    "        eyvan_region_guard.arm_cross_region_guard_from_environment()\n"
+)
+
+
+def _stage_local_region_guard_site(directory: Path) -> Path:
+    """Stage stdlib-only ``eyvan_region_guard.py`` and ``sitecustomize.py`` for local workloads."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    guard_source = Path(_region_guard.__file__).resolve().read_bytes()
+    files = (
+        (directory / "eyvan_region_guard.py", guard_source),
+        (directory / "sitecustomize.py", _LOCAL_SITECUSTOMIZE_SOURCE.encode("utf-8")),
+    )
+    for destination, contents in files:
+        if destination.is_file():
+            try:
+                if destination.read_bytes() == contents:
+                    os.chmod(destination, 0o600)
+                    continue
+            except OSError:
+                pass
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=directory)
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                stream.write(contents)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+            raise
+    return directory
+
+
+def _prepend_pythonpath(environment: dict[str, str], support_dir: str) -> None:
+    existing = environment.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part] if existing else []
+    if support_dir not in parts:
+        environment["PYTHONPATH"] = os.pathsep.join([support_dir, *parts]) if parts else support_dir
 
 
 def _extract_cross_region_ban_detail(log_path: Path | None) -> str | None:
@@ -829,6 +903,10 @@ class LocalProcessExecutor:
         notice_path, receipt_path = self._notice_paths(remote_id)
         environment.setdefault(RECLAIM_NOTICE_PATH_ENV, str(notice_path))
         environment.setdefault(CHECKPOINT_RECEIPT_PATH_ENV, str(receipt_path))
+        policy = (environment.get("EYVAN_CROSS_REGION_POLICY") or "").strip().lower()
+        if policy in {"warn", "ban"}:
+            support_dir = _stage_local_region_guard_site(self.state_dir / "region-guard")
+            _prepend_pythonpath(environment, str(support_dir))
         with self._lock, ExitStack() as publication_locks:
             # Reject a generation that reuses an existing attempt ID before
             # advancing the logical high watermark. Otherwise a rejected

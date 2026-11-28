@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from eyvan._internal import plane_tls, workspace
+from eyvan.storage import _region_guard
 
 OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY = "/opt/eyvan-native/oci-callable-runner"
 """Read-only container path holding the staged callable runtime."""
@@ -23,20 +24,49 @@ OCI_CALLABLE_PROTOCOL_FILENAME = "callable_protocol.py"
 OCI_WORKSPACE_FILENAME = "workspace.py"
 OCI_HTTP_RETRY_FILENAME = "http_retry.py"
 OCI_PLANE_TLS_FILENAME = "plane_tls.py"
+OCI_REGION_GUARD_FILENAME = "eyvan_region_guard.py"
+OCI_SITECUSTOMIZE_FILENAME = "sitecustomize.py"
 """Shared protocol sources staged beside the OCI callable runner."""
 
 OCI_DEPENDENCY_ENTRY_FILENAME = "dependency_entry.py"
 OCI_WORKSPACE_ENTRY_FILENAME = "workspace_entry.py"
 """Per-job wrappers (``--with`` packages, ``--workspace`` trees) staged for images without Eyvan."""
 
+_OCI_SITECUSTOMIZE_SOURCE = (
+    "# Copyright (C) 2026 Erfan Zare Chavoshi\n"
+    "# This file is part of Eyvan.\n"
+    "#\n"
+    "# SPDX-License-Identifier: AGPL-3.0-or-later\n"
+    "\n"
+    '"""Auto-arm Eyvan\'s cross-region GCS guard for OCI workload Python processes."""\n'
+    "\n"
+    "from __future__ import annotations\n"
+    "\n"
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "_policy = (os.environ.get('EYVAN_CROSS_REGION_POLICY') or '').strip().lower()\n"
+    "if _policy in {'warn', 'ban'}:\n"
+    "    try:\n"
+    "        import eyvan_region_guard\n"
+    "    except Exception as _exc:\n"
+    "        if _policy == 'ban':\n"
+    "            sys.stderr.write(\n"
+    "                'EYVAN_CROSS_REGION_TRANSFER_BANNED: cross-region guard module unavailable in OCI runtime: '\n"
+    "                f'{_exc}\\n'\n"
+    "            )\n"
+    "            sys.stderr.flush()\n"
+    "            if (os.environ.get('EYVAN_CROSS_REGION_KILL') or '').strip().lower() in {'1', 'true', 'yes', 'on'}:\n"
+    "                os._exit(95)\n"
+    "            raise\n"
+    "    else:\n"
+    "        eyvan_region_guard.arm_cross_region_guard_from_environment()\n"
+)
 
-def _stage_file(source: Path, destination: Path) -> None:
-    """Atomically copy one immutable runtime source file into the state directory."""
 
-    try:
-        contents = source.read_bytes()
-    except OSError as exc:
-        raise RuntimeError(f"could not read OCI callable runtime source {source}: {exc}") from exc
+def _stage_bytes(contents: bytes, destination: Path) -> None:
+    """Atomically write immutable runtime bytes into the staged directory."""
+
     try:
         if destination.is_file() and destination.read_bytes() == contents:
             destination.chmod(0o644)
@@ -63,6 +93,16 @@ def _stage_file(source: Path, destination: Path) -> None:
             os.close(descriptor)
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _stage_file(source: Path, destination: Path) -> None:
+    """Atomically copy one immutable runtime source file into the state directory."""
+
+    try:
+        contents = source.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"could not read OCI callable runtime source {source}: {exc}") from exc
+    _stage_bytes(contents, destination)
 
 
 def stage_oci_callable_runner(directory: str | os.PathLike[str]) -> Path:
@@ -106,6 +146,10 @@ def stage_oci_callable_runner(directory: str | os.PathLike[str]) -> Path:
     # And the control-plane CA trust, so a containerized callable verifies a
     # head's private CA exactly as a native one does. Stdlib-only by design.
     _stage_file(Path(plane_tls.__file__).resolve(), destination_directory / OCI_PLANE_TLS_FILENAME)
+    # Stage the stdlib-only cross-region GCS guard and a lightweight sitecustomize
+    # hook beside the runner so both callable and command OCI workloads arm it.
+    _stage_file(Path(_region_guard.__file__).resolve(), destination_directory / OCI_REGION_GUARD_FILENAME)
+    _stage_bytes(_OCI_SITECUSTOMIZE_SOURCE.encode("utf-8"), destination_directory / OCI_SITECUSTOMIZE_FILENAME)
     # The command-job wrappers. The controller launches them as
     # ``python -I -m eyvan.worker.runtime.<wrapper>``, which an image without
     # Eyvan cannot import; the Docker executor rewrites them to these copies.
@@ -122,6 +166,8 @@ __all__ = (
     "OCI_DEPENDENCY_ENTRY_FILENAME",
     "OCI_HTTP_RETRY_FILENAME",
     "OCI_PLANE_TLS_FILENAME",
+    "OCI_REGION_GUARD_FILENAME",
+    "OCI_SITECUSTOMIZE_FILENAME",
     "OCI_WORKSPACE_ENTRY_FILENAME",
     "stage_oci_callable_runner",
 )

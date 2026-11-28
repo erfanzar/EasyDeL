@@ -63,6 +63,7 @@ from eyvan.worker.agent.models import (
     MutationConflictCode,
     NativeStageActionRequest,
     NativeWorkerHealth,
+    ReclaimNoticeRequest,
     WorkloadMutationRequest,
     WorkloadReference,
     WorkloadRequest,
@@ -91,7 +92,9 @@ _STAGE_VERDICTS: dict[AssetStageVerdict, CellStageVerdict] = {
 }
 
 
-def _context(request: WorkloadRequest | WorkloadMutationRequest | CheckpointRequest) -> MutationContext:
+def _context(
+    request: WorkloadRequest | WorkloadMutationRequest | CheckpointRequest | ReclaimNoticeRequest,
+) -> MutationContext:
     return MutationContext(**request.mutation.model_dump())
 
 
@@ -478,6 +481,49 @@ def create_native_worker_app(
             context=_context(body),
         )
         return WorkloadReference(remote_id=checkpoint_id)
+
+    @app.post("/api/v1/workloads/{remote_id}/reclaim-notice", dependencies=[Depends(authenticate)])
+    def reclaim_notice(remote_id: str, body: ReclaimNoticeRequest) -> ExecutionWorkloadReport:
+        """Deliver an atomic reclaim notice file and graceful signal to one local workload."""
+
+        notifier = getattr(executor, "notify_reclaim", None)
+        if not callable(notifier):
+            raise HTTPException(
+                status_code=501,
+                detail=f"execution backend {type(executor).__name__} does not support graceful reclaim notices",
+            )
+        notice_payload: JsonObject = {
+            "reason": body.reason,
+            "requested_by": body.requested_by,
+            "deadline_at": body.deadline_at,
+            "deadline_epoch_s": body.deadline_epoch_s,
+            "grace_seconds": body.grace_seconds,
+            "policy": body.policy,
+            "checkpoint_uri": body.checkpoint_uri,
+            "workload_id": body.workload_id,
+        }
+        notifier(
+            remote_id,
+            notice=notice_payload,
+            grace_s=body.grace_seconds,
+            context=_context(body),
+        )
+        return executor.status(remote_id)
+
+    @app.get(
+        "/api/v1/workloads/{remote_id}/checkpoint-uri",
+        dependencies=[Depends(authenticate)],
+        response_model=None,
+    )
+    def checkpoint_uri(remote_id: str) -> JsonObject:
+        """Return any checkpoint receipt URI acknowledged by the workload on this host."""
+
+        reader = getattr(executor, "read_checkpoint_uri", None)
+        if not callable(reader):
+            return {"remote_id": remote_id, "checkpoint_uri": None}
+        uri = reader(remote_id)
+        cleaned = uri.strip() if isinstance(uri, str) and uri.strip() else None
+        return {"remote_id": remote_id, "checkpoint_uri": cleaned}
 
     @app.get(
         "/api/v1/workloads/{remote_id}/logs",

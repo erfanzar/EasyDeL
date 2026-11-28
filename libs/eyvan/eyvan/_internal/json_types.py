@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import math
 import typing as tp
-from typing import Any, TypeGuard
 
 from pydantic import BaseModel
 
 JsonScalar: tp.TypeAlias = str | int | float | bool | None
 JsonValue: tp.TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: tp.TypeAlias = dict[str, JsonValue]
+
+if tp.TYPE_CHECKING:
+
+    class _NarrowedJsonObject(dict[str, tp.Any]):
+        def get(self, key: str, default: tp.Any = None) -> tp.Any: ...
 
 
 def is_json_value(value: object) -> tp.TypeGuard[JsonValue]:
@@ -32,7 +36,7 @@ def is_json_value(value: object) -> tp.TypeGuard[JsonValue]:
     return False
 
 
-def is_json_object(value: object) -> bool | TypeGuard[str | int | float | bool | None | list[Any] | dict[str, Any]]:
+def is_json_object(value: object) -> tp.TypeGuard[_NarrowedJsonObject]:
     """Return whether a decoded value is a JSON object."""
 
     return isinstance(value, dict) and is_json_value(value)

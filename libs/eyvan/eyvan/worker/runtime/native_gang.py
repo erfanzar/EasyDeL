@@ -389,6 +389,8 @@ def _reported_exit_status(detail: JsonObject) -> int | None:
     if detail.get("observed") is not True:
         return None
     status = detail.get("exec_main_status")
+    if status is None:
+        status = detail.get("exit_code")
     return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
@@ -548,6 +550,7 @@ class NativeGangExecutor:
         """Copy one JSON workload spec and add its rank-local environment."""
 
         payload: JsonObject = copy.deepcopy(dict(spec))
+        raw_member_regions = payload.pop("member_regions", None)
         raw_environment = payload.get("environment")
         if raw_environment is None:
             source_environment: JsonObject = {}
@@ -565,6 +568,10 @@ class NativeGangExecutor:
             for key, value in environment.items()
             if key == "EYVAN_HOST_REGION" or key.startswith("EYVAN_CROSS_REGION_")
         }
+        if isinstance(raw_member_regions, dict):
+            member_region = raw_member_regions.get(worker.cell_id)
+            if isinstance(member_region, str) and member_region.strip() and member_region.strip().lower() != "local":
+                cross_region_environment["EYVAN_HOST_REGION"] = member_region.strip()
         environment = without_distributed_topology_overrides(environment)
         environment.update(cross_region_environment)
         if self.gpu_plan is not None:
@@ -776,14 +783,6 @@ class NativeGangExecutor:
             if CROSS_REGION_TRANSFER_BANNED_MARKER in worker.observation.message
             or CROSS_REGION_TRANSFER_BANNED_REASON in worker.observation.message.lower()
         ]
-        if not self.initialization.fatal:
-            if not marker_ranks:
-                return None
-            return cross_region_ban_failure_reason(
-                banned_ranks=marker_ranks,
-                marker_detail=self._cross_region_marker_detail(remote_id, marker_ranks, workers),
-            )
-
         banned_ranks: list[int] = list(marker_ranks)
         deadline_ranks: list[int] = []
         error_ranks: list[int] = []
@@ -796,6 +795,8 @@ class NativeGangExecutor:
             if exit_status == CROSS_REGION_TRANSFER_BANNED_EXIT_CODE:
                 banned_ranks.append(rank)
                 continue
+            if not self.initialization.fatal:
+                continue
             outcome = gang_initialization_outcome(exit_status)
             if outcome == "deadline":
                 deadline_ranks.append(rank)
@@ -806,13 +807,49 @@ class NativeGangExecutor:
                 banned_ranks=banned_ranks,
                 marker_detail=self._cross_region_marker_detail(remote_id, banned_ranks, workers),
             )
-        if not deadline_ranks and not error_ranks:
+        if not self.initialization.fatal or (not deadline_ranks and not error_ranks):
             return None
         return gang_formation_failure_reason(
             deadline_s=self.initialization.initialization_timeout_s,
             deadline_ranks=deadline_ranks,
             error_ranks=error_ranks,
         )
+
+    def notify_reclaim(
+        self,
+        remote_id: str,
+        *,
+        notice: tp.Mapping[str, JsonValue],
+        grace_s: int,
+    ) -> None:
+        """Deliver a graceful reclaim notice to every gang worker using its cell fence."""
+
+        first_error: BaseException | None = None
+        for worker in self._workers:
+            try:
+                worker.executor.notify_reclaim(
+                    remote_id,
+                    notice=notice,
+                    grace_s=grace_s,
+                    context=worker.context,
+                )
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def read_checkpoint_uri(self, remote_id: str) -> str | None:
+        """Return the first acknowledged checkpoint receipt URI across gang ranks."""
+
+        for worker in self._workers:
+            try:
+                uri = worker.executor.read_checkpoint_uri(remote_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                continue
+            if isinstance(uri, str) and uri.strip():
+                return uri.strip()
+        return None
 
     def stop(self, remote_id: str) -> None:
         """Stop every gang rank using its original cell-scoped fence."""

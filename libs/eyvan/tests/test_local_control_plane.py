@@ -264,6 +264,14 @@ def test_losing_a_startup_race_does_not_take_the_winners_record(tmp_path) -> Non
     assert stopped == [_Loser.pid], "the losing process must be stopped, not the verified winner"
 
 
+def _free_local_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def test_stop_ends_a_plane_this_supervisor_started(tmp_path) -> None:
     """``ensure`` without a ``stop`` is how a suite leaks a plane onto a port.
 
@@ -285,7 +293,7 @@ def test_stop_ends_a_plane_this_supervisor_started(tmp_path) -> None:
         read_owner_only_record,
     )
 
-    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8099")
+    endpoint = ControlPlaneEndpoint(f"http://127.0.0.1:{_free_local_port()}")
     paths = LocalDaemonPaths(tmp_path / "eyvan")
     supervisor = LocalDaemonSupervisor(paths=paths)
     started = supervisor.ensure(endpoint)
@@ -326,7 +334,7 @@ def test_identity_resolved_before_the_plane_picks_up_the_credential_it_mints(tmp
     from eyvan.server.local.daemon import LocalDaemonPaths, LocalDaemonState, LocalDaemonSupervisor
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    endpoint = ControlPlaneEndpoint("http://127.0.0.1:8099")
+    endpoint = ControlPlaneEndpoint(f"http://127.0.0.1:{_free_local_port()}")
     supervisor = LocalDaemonSupervisor(paths=LocalDaemonPaths(tmp_path / "eyvan"))
     # The role the CLI itself uses on a loopback plane: the default operator
     # role has no organization scope and is refused before authorization.

@@ -218,8 +218,25 @@ with TestClient(app) as client:
     response = client.post("/api/v1/cells/cell/reconcile", headers=headers, json={"mutation": {
         "idempotency_key": "k", "generation": 1, "fencing_token": "f", "correlation_id": "workload-process"}})
     assert response.status_code == 200, response.text
-span, = exporter.get_finished_spans()
-print(json.dumps({"trace": span.context.trace_id, "parent": span.parent.span_id, "remote": span.parent.is_remote}))
+spans = exporter.get_finished_spans()
+span = next(item for item in spans if item.name == "child.provider")
+remote_root = next(
+    (
+        item
+        for item in spans
+        if item.context.trace_id == span.context.trace_id and item.parent is not None and item.parent.is_remote
+    ),
+    span,
+)
+print(
+    json.dumps(
+        {
+            "trace": span.context.trace_id,
+            "parent": remote_root.parent.span_id if remote_root.parent is not None else None,
+            "remote": remote_root.parent.is_remote if remote_root.parent is not None else False,
+        }
+    )
+)
 provider.shutdown()
 """
     result = subprocess.run(

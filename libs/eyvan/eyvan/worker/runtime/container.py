@@ -33,6 +33,7 @@ from eyvan.records import (
     native_container_mount_targets_overlap,
 )
 from eyvan.secrets import redact_secret_material
+from eyvan.worker.runtime._multihost_site import CROSS_REGION_TRANSFER_BANNED_EXIT_CODE
 from eyvan.worker.runtime.oci_callable_stager import (
     OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY,
     OCI_CALLABLE_RUNNER_FILENAME,
@@ -52,6 +53,7 @@ from eyvan.worker.runtime.systemd_transient import (
     _load_json,
     _record_lock_path,
     _record_secret_bearing,
+    _with_cross_region_pythonpath,
     _write_environment_file,
 )
 
@@ -423,6 +425,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
             name: value for name, value in self._base_environment.items() if name not in _HOST_ONLY_BASE_ENVIRONMENT
         }
         launch_environment.update(environment)
+        _with_cross_region_pythonpath(launch_environment, OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY)
         launch_environment["HOME"] = self._container_workload_directory
         launch_environment["EYVAN_CONTAINER_RUNTIME"] = "1"
         return launch_environment
@@ -668,6 +671,7 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         if state is None:
             return ExecutionWorkloadStatus.INDETERMINATE, state_error
         stop_requested = self._record_boolean(record, "stop_requested")
+        reclaim_notified = record.get("reclaim_notified") is True
         if state.name in {"created", "restarting"}:
             return ExecutionWorkloadStatus.PENDING, f"native OCI container is {state.name}"
         if state.name in {"running", "paused"}:
@@ -681,6 +685,10 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
                 return ExecutionWorkloadStatus.INDETERMINATE, "Docker inspection State has no integer ExitCode"
             if stop_requested:
                 return ExecutionWorkloadStatus.STOPPED, "native OCI container stopped by Eyvan"
+            if state.exit_code == CROSS_REGION_TRANSFER_BANNED_EXIT_CODE:
+                return self._cross_region_banned(record)
+            if reclaim_notified:
+                return ExecutionWorkloadStatus.STOPPED, "native OCI container exited after graceful reclaim notice"
             if state.exit_code == 0:
                 return ExecutionWorkloadStatus.SUCCEEDED, "native OCI container completed successfully"
             return ExecutionWorkloadStatus.FAILED, (
@@ -689,6 +697,8 @@ class DockerContainerExecutor(SystemdTransientServiceExecutor):
         if state.name == "dead":
             if stop_requested:
                 return ExecutionWorkloadStatus.STOPPED, "native OCI container stopped by Eyvan"
+            if reclaim_notified:
+                return ExecutionWorkloadStatus.STOPPED, "native OCI container exited after graceful reclaim notice"
             return ExecutionWorkloadStatus.FAILED, (
                 f"native OCI container is dead{': ' + state.error if state.error else ''}"
             )

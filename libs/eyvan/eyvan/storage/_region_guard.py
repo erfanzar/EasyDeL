@@ -69,11 +69,35 @@ _MAX_METADATA_RESPONSE_BYTES = 256 * 1024
 _ZONE_RE = re.compile(r"^([a-z]+-[a-z]+[0-9]+)-[a-z][a-z0-9]*$")
 _REGION_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]+$")
 _BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
-_GCS_URI_RE = re.compile(r"gs://([a-z0-9][a-z0-9._-]{1,61}[a-z0-9])(?:/[^\s'\"`,;)\]}<>|&]*)?", re.IGNORECASE)
+_GCS_URI_RE = re.compile(r"(?:gs|gcs)://([a-z0-9][a-z0-9._-]{1,61}[a-z0-9])(?:/[^\s'\"`,;)\]}<>|&]*)?", re.IGNORECASE)
+_GCS_HTTP_URL_RE = re.compile(
+    r"https?://(?:"
+    r"(?:[a-z0-9][a-z0-9._-]{0,127}\.)?(?:storage|www|storage-download)\.googleapis\.com|"
+    r"[a-z]+-[a-z]+[0-9]+-storage\.googleapis\.com|"
+    r"storage\.cloud\.google\.com"
+    r")[^\s'\"`,;)\]}<>|&]*",
+    re.IGNORECASE,
+)
 _GCS_JSON_API_BUCKET_RE = re.compile(r"^/(?:(?:upload|download)/)?storage/v\d+/b/([^/?#]+)(?:/|$)")
+_GCS_REGIONAL_HOST_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]+-storage\.googleapis\.com$")
 
-_GCS_PATH_HOSTS = frozenset({"storage.googleapis.com", "storage.cloud.google.com"})
-_GCS_API_HOSTS = frozenset({"storage.googleapis.com", "www.googleapis.com", "storage.cloud.google.com"})
+_GCS_PATH_HOSTS = frozenset(
+    {
+        "storage.googleapis.com",
+        "storage.cloud.google.com",
+        "mtls.storage.googleapis.com",
+        "storage-download.googleapis.com",
+    }
+)
+_GCS_API_HOSTS = frozenset(
+    {
+        "storage.googleapis.com",
+        "www.googleapis.com",
+        "storage.cloud.google.com",
+        "mtls.storage.googleapis.com",
+        "storage-download.googleapis.com",
+    }
+)
 _GCS_RESERVED_FIRST_SEGMENTS = frozenset(
     {"storage", "upload", "download", "batch", "b", "o", "favicon.ico", "robots.txt"}
 )
@@ -82,7 +106,7 @@ _PREDEFINED_DUAL_REGIONS: dict[str, frozenset[str]] = {
     "nam4": frozenset({"us-central1", "us-east1"}),
     "eur4": frozenset({"europe-north1", "europe-west4"}),
     "eur5": frozenset({"europe-west1", "europe-west2"}),
-    "eur7": frozenset({"europe-west3", "europe-west6"}),
+    "eur7": frozenset({"europe-west1", "europe-west4"}),
     "eur8": frozenset({"europe-west3", "europe-west6"}),
     "asia1": frozenset({"asia-northeast1", "asia-northeast2"}),
 }
@@ -541,14 +565,38 @@ def resolve_bucket_location(
 
 
 def extract_gcs_uris(text: str) -> tuple[str, ...]:
-    """Extract all unique ``gs://<bucket>[/path]`` URIs from ``text`` in appearance order."""
+    """Extract all unique GCS URIs and GCS HTTP URLs from ``text`` in appearance order.
 
-    if not isinstance(text, str) or "gs://" not in text.lower():
+    Recognizes ``gs://<bucket>[/path]``, ``gcs://<bucket>[/path]``, and HTTPS/HTTP
+    GCS endpoints (``storage.googleapis.com``, ``<bucket>.storage.googleapis.com``,
+    ``storage.cloud.google.com``, ``mtls.storage.googleapis.com``,
+    ``<region>-storage.googleapis.com``, ``storage-download.googleapis.com``, and
+    ``www.googleapis.com/storage/...``).
+    """
+
+    if not isinstance(text, str) or not text:
         return ()
+    lower = text.lower()
+    has_scheme_uri = "gs://" in lower or "gcs://" in lower
+    has_http_uri = "googleapis.com" in lower or "storage.cloud.google.com" in lower
+    if not has_scheme_uri and not has_http_uri:
+        return ()
+
+    positioned: list[tuple[int, str]] = []
+    if has_scheme_uri:
+        for match in _GCS_URI_RE.finditer(text):
+            uri = match.group(0).rstrip(".:")
+            positioned.append((match.start(), uri))
+    if has_http_uri:
+        for match in _GCS_HTTP_URL_RE.finditer(text):
+            uri = match.group(0).rstrip(".:")
+            if extract_bucket_from_gcs_http_url(uri) is not None:
+                positioned.append((match.start(), uri))
+
+    positioned.sort(key=lambda item: item[0])
     found: list[str] = []
     seen: set[str] = set()
-    for match in _GCS_URI_RE.finditer(text):
-        uri = match.group(0).rstrip(".:")
+    for _pos, uri in positioned:
         if uri not in seen:
             seen.add(uri)
             found.append(uri)
@@ -556,7 +604,7 @@ def extract_gcs_uris(text: str) -> tuple[str, ...]:
 
 
 def extract_bucket_from_gcs_uri(uri: str) -> str | None:
-    """Return the validated lowercase bucket name from a ``gs://`` URI, or ``None``."""
+    """Return the validated lowercase bucket name from a ``gs://`` or ``gcs://`` URI, or ``None``."""
 
     if not isinstance(uri, str):
         return None
@@ -564,7 +612,7 @@ def extract_bucket_from_gcs_uri(uri: str) -> str | None:
     if not cleaned:
         return None
     parsed = urllib.parse.urlsplit(cleaned)
-    if parsed.scheme.lower() != "gs":
+    if parsed.scheme.lower() not in {"gs", "gcs"}:
         return None
     if parsed.username or parsed.password or ":" in parsed.netloc:
         return None
@@ -635,13 +683,14 @@ def extract_bucket_from_gcs_http_url(url: str, host: str | None = None) -> str |
     path = parsed.path or ""
     query = parsed.query or ""
 
-    if effective_host.endswith(".storage.googleapis.com"):
+    if effective_host not in _GCS_API_HOSTS and effective_host.endswith(".storage.googleapis.com"):
         subdomain = effective_host[: -len(".storage.googleapis.com")]
         if _BUCKET_NAME_RE.fullmatch(subdomain):
             return subdomain
         return None
 
-    if effective_host not in _GCS_API_HOSTS:
+    is_regional_host = bool(_GCS_REGIONAL_HOST_RE.fullmatch(effective_host))
+    if effective_host not in _GCS_API_HOSTS and not is_regional_host:
         return None
 
     if _is_bypassed() and _is_bucket_location_metadata_query(path, query):
@@ -652,7 +701,7 @@ def extract_bucket_from_gcs_http_url(url: str, host: str | None = None) -> str |
         candidate = urllib.parse.unquote(api_match.group(1)).strip().lower()
         return candidate if _BUCKET_NAME_RE.fullmatch(candidate) else None
 
-    if effective_host in _GCS_PATH_HOSTS:
+    if effective_host in _GCS_PATH_HOSTS or is_regional_host:
         segments = [seg for seg in path.split("/") if seg]
         if segments:
             first = urllib.parse.unquote(segments[0]).strip().lower()
@@ -996,15 +1045,143 @@ def _extract_gcsfs_uris(method_name: str, args: tuple[tp.Any, ...], kwargs: Mapp
     return _collect_gcsfs_uris(target)
 
 
-def _extract_subprocess_gcs_uris(args: tp.Any, executable: tp.Any = None) -> tuple[str, tuple[str, ...]]:
-    """Inspect a ``subprocess.Popen`` command for ``gcloud storage`` / ``gsutil`` GCS URIs."""
+_RCLONE_GCS_REMOTE_RE = re.compile(
+    r"(?:^|[\s'\"])(?::gcs|gcs):([a-z0-9][a-z0-9._-]{1,61}[a-z0-9])(?:/[^\s'\"`,;)\]}<>|&]*)?",
+    re.IGNORECASE,
+)
 
-    if isinstance(args, str):
-        if "gs://" in args.lower() and ("gsutil" in args or ("gcloud" in args and "storage" in args)):
-            return "subprocess.shell", extract_gcs_uris(args)
+
+def _decode_subprocess_token(item: tp.Any) -> str | None:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, (bytes, bytearray)):
+        try:
+            return os.fsdecode(bytes(item))
+        except Exception:
+            return bytes(item).decode("utf-8", errors="replace")
+    if isinstance(item, os.PathLike):
+        fspath = os.fspath(item)
+        if isinstance(fspath, str):
+            return fspath
+        if isinstance(fspath, bytes):
+            return os.fsdecode(fspath)
+    return None
+
+
+def _extract_rclone_gcs_uris(text: str) -> tuple[str, ...]:
+    found = list(extract_gcs_uris(text))
+    seen = set(found)
+    for match in _RCLONE_GCS_REMOTE_RE.finditer(text):
+        bucket = match.group(1).lower()
+        uri = f"gs://{bucket}"
+        if uri not in seen:
+            seen.add(uri)
+            found.append(uri)
+    return tuple(found)
+
+
+def _extract_shell_gcs_uris(script: str) -> tuple[str, ...]:
+    lower = script.lower()
+    has_gcs_tool = (
+        "gsutil" in lower
+        or ("gcloud" in lower and "storage" in lower)
+        or "curl" in lower
+        or "wget" in lower
+        or "rclone" in lower
+    )
+    if not has_gcs_tool:
+        return ()
+    if "rclone" in lower:
+        return _extract_rclone_gcs_uris(script)
+    return extract_gcs_uris(script)
+
+
+def _unwrap_command_tokens(tokens: list[str]) -> list[str]:
+    """Strip common command wrappers (``env``, ``timeout``, ``nice``, ``nohup``, ``stdbuf``, ``time``)."""
+
+    remaining = list(tokens)
+    for _ in range(8):
+        if not remaining:
+            break
+        prog = os.path.basename(remaining[0]).lower()
+        if prog == "env":
+            idx = 1
+            while idx < len(remaining):
+                tok = remaining[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}:
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                if "=" in tok and not tok.startswith("="):
+                    idx += 1
+                    continue
+                break
+            if idx >= len(remaining):
+                break
+            remaining = remaining[idx:]
+            continue
+        if prog == "timeout":
+            idx = 1
+            while idx < len(remaining):
+                tok = remaining[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in {"-k", "--kill-after", "-s", "--signal"}:
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                # Positional duration argument.
+                idx += 1
+                break
+            if idx >= len(remaining):
+                break
+            remaining = remaining[idx:]
+            continue
+        if prog in {"nice", "nohup", "stdbuf", "time"}:
+            idx = 1
+            while idx < len(remaining):
+                tok = remaining[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if prog == "nice" and tok in {"-n", "--adjustment"}:
+                    idx += 2
+                    continue
+                if prog == "stdbuf" and tok in {"-i", "-o", "-e", "--input", "--output", "--error"}:
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                break
+            if idx >= len(remaining):
+                break
+            remaining = remaining[idx:]
+            continue
+        break
+    return remaining
+
+
+def _extract_subprocess_gcs_uris(args: tp.Any, executable: tp.Any = None) -> tuple[str, tuple[str, ...]]:
+    """Inspect a ``subprocess.Popen`` command for GCS transfer tools and URIs."""
+
+    if isinstance(args, (str, bytes, bytearray)):
+        script = _decode_subprocess_token(args)
+        if script:
+            uris = _extract_shell_gcs_uris(script)
+            if uris:
+                return "subprocess.shell", uris
         return "", ()
 
-    if isinstance(args, (bytes, bytearray, os.PathLike)):
+    if isinstance(args, os.PathLike):
         return "", ()
 
     if not isinstance(args, (list, tuple)) or not args:
@@ -1012,36 +1189,52 @@ def _extract_subprocess_gcs_uris(args: tp.Any, executable: tp.Any = None) -> tup
 
     tokens: list[str] = []
     for item in args:
-        if isinstance(item, str):
-            tokens.append(item)
-        elif isinstance(item, os.PathLike):
-            fspath = os.fspath(item)
-            if isinstance(fspath, str):
-                tokens.append(fspath)
+        decoded = _decode_subprocess_token(item)
+        if decoded is not None:
+            tokens.append(decoded)
 
     if not tokens:
         return "", ()
 
-    exec_name = os.fspath(executable) if isinstance(executable, (str, os.PathLike)) else tokens[0]
-    prog = os.path.basename(str(exec_name)).lower()
+    exec_decoded = _decode_subprocess_token(executable)
+    if exec_decoded is not None:
+        effective_tokens = [exec_decoded, *tokens[1:]]
+    else:
+        effective_tokens = tokens
+
+    unwrapped = _unwrap_command_tokens(effective_tokens)
+    if not unwrapped:
+        return "", ()
+
+    prog = os.path.basename(unwrapped[0]).lower()
     if prog in {"gsutil", "gsutil.py"}:
-        joined = " ".join(tokens[1:])
+        joined = " ".join(unwrapped[1:])
         return "subprocess.gsutil", extract_gcs_uris(joined)
     if prog in {"gcloud", "gcloud.py"}:
-        head = [tok.lower() for tok in tokens[1:5]]
-        if "storage" in head:
-            joined = " ".join(tokens[1:])
+        if any(tok.lower() == "storage" for tok in unwrapped[1:]):
+            joined = " ".join(unwrapped[1:])
             return "subprocess.gcloud", extract_gcs_uris(joined)
         return "", ()
+    if prog in {"curl", "wget"}:
+        joined = " ".join(unwrapped[1:])
+        uris = extract_gcs_uris(joined)
+        if uris:
+            return f"subprocess.{prog}", uris
+        return "", ()
+    if prog == "rclone":
+        joined = " ".join(unwrapped[1:])
+        uris = _extract_rclone_gcs_uris(joined)
+        if uris:
+            return "subprocess.rclone", uris
+        return "", ()
     if prog in _SHELL_EXECUTABLES:
-        for idx, tok in enumerate(tokens[1:], start=1):
+        for idx, tok in enumerate(unwrapped[1:], start=1):
             if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
-                if idx + 1 < len(tokens):
-                    script = tokens[idx + 1]
-                    if "gs://" in script.lower() and (
-                        "gsutil" in script or ("gcloud" in script and "storage" in script)
-                    ):
-                        return f"subprocess.{prog}", extract_gcs_uris(script)
+                if idx + 1 < len(unwrapped):
+                    script = unwrapped[idx + 1]
+                    uris = _extract_shell_gcs_uris(script)
+                    if uris:
+                        return f"subprocess.{prog}", uris
                 break
     return "", ()
 
@@ -1264,19 +1457,51 @@ def _install_hooks_locked() -> None:
             **kwargs: tp.Any,
         ) -> tp.Any:
             config = _ACTIVE_GUARD
+            checked_bucket: str | None = None
             if config is not None and not _is_bypassed():
                 headers_arg = kwargs.get("headers") if "headers" in kwargs else (args[1] if len(args) >= 2 else None)
+                conn_host = getattr(self, "host", None)
+                header_host = _header_get_ci(headers_arg, "Host") if isinstance(headers_arg, Mapping) else None
+                effective_host = conn_host
+                bucket = extract_bucket_from_gcs_http_url(url, host=conn_host)
+                if bucket is None and header_host:
+                    bucket = extract_bucket_from_gcs_http_url(url, host=header_host)
+                    if bucket is not None:
+                        effective_host = header_host
+                if bucket is not None and not _is_bucket_checked_in_frame(bucket):
+                    scheme = "https" if isinstance(self, http.client.HTTPSConnection) else "http"
+                    full_uri = url if url.startswith(("http://", "https://")) else f"{scheme}://{effective_host}{url}"
+                    _enforce_uri_with_config(full_uri, operation=f"http.{str(method).lower()}", config=config)
+                    checked_bucket = bucket
+            if checked_bucket is None:
+                return orig_http_request(self, method, url, *args, **kwargs)
+            with _mark_bucket_checked(checked_bucket):
+                return orig_http_request(self, method, url, *args, **kwargs)
+
+        http.client.HTTPConnection.request = _guarded_http_request  # type: ignore[method-assign]
+
+    if "http_putrequest" not in _STDLIB_ORIGINALS:
+        orig_http_putrequest = http.client.HTTPConnection.putrequest
+        _STDLIB_ORIGINALS["http_putrequest"] = orig_http_putrequest
+
+        def _guarded_http_putrequest(
+            self: http.client.HTTPConnection,
+            method: str,
+            url: str,
+            *args: tp.Any,
+            **kwargs: tp.Any,
+        ) -> tp.Any:
+            config = _ACTIVE_GUARD
+            if config is not None and not _is_bypassed():
                 host = getattr(self, "host", None)
-                if not host and isinstance(headers_arg, Mapping):
-                    host = _header_get_ci(headers_arg, "Host")
                 bucket = extract_bucket_from_gcs_http_url(url, host=host)
                 if bucket is not None and not _is_bucket_checked_in_frame(bucket):
                     scheme = "https" if isinstance(self, http.client.HTTPSConnection) else "http"
                     full_uri = url if url.startswith(("http://", "https://")) else f"{scheme}://{host}{url}"
                     _enforce_uri_with_config(full_uri, operation=f"http.{str(method).lower()}", config=config)
-            return orig_http_request(self, method, url, *args, **kwargs)
+            return orig_http_putrequest(self, method, url, *args, **kwargs)
 
-        http.client.HTTPConnection.request = _guarded_http_request  # type: ignore[method-assign]
+        http.client.HTTPConnection.putrequest = _guarded_http_putrequest  # type: ignore[method-assign]
 
     if "popen_init" not in _STDLIB_ORIGINALS:
         orig_popen_init = subprocess.Popen.__init__
@@ -1317,6 +1542,8 @@ def _uninstall_hooks_locked() -> None:
         urllib.request.OpenerDirector.open = _STDLIB_ORIGINALS.pop("urllib_open")  # type: ignore[method-assign]
     if "http_request" in _STDLIB_ORIGINALS:
         http.client.HTTPConnection.request = _STDLIB_ORIGINALS.pop("http_request")  # type: ignore[method-assign]
+    if "http_putrequest" in _STDLIB_ORIGINALS:
+        http.client.HTTPConnection.putrequest = _STDLIB_ORIGINALS.pop("http_putrequest")  # type: ignore[method-assign]
     if "popen_init" in _STDLIB_ORIGINALS:
         subprocess.Popen.__init__ = _STDLIB_ORIGINALS.pop("popen_init")  # type: ignore[method-assign]
 

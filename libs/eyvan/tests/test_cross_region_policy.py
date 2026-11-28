@@ -1279,3 +1279,370 @@ async def test_pre_dispatch_scans_all_declared_uri_surfaces_and_exempts_local_ce
     assert CROSS_REGION_KILL_ENV not in rendered_env
     assert HOST_REGION_ENV not in rendered_env
     assert rendered_env["KEEP_ME"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_bans_https_and_gcs_uris_off_transaction_and_sets_gang_member_regions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from eyvan.capacity.drivers.base import MutationContext
+    from eyvan.worker.runtime.native_gang import NativeGangExecutor, NativeGangMember
+
+    class _TxTrackingRepository(InMemoryRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.in_transaction = False
+
+        @asynccontextmanager
+        async def transaction(self):
+            self.in_transaction = True
+            try:
+                async with super().transaction() as tx:
+                    yield tx
+            finally:
+                self.in_transaction = False
+
+    repository = _TxTrackingRepository()
+    service = ControlPlaneService(repository, scheduler=CoreSchedulingService())
+    agent = _RecordingAgent()
+    observed_in_tx: list[bool] = []
+
+    def tracking_resolver(bucket: str) -> BucketLocation | None:
+        observed_in_tx.append(repository.in_transaction)
+        return _bucket_resolver(bucket)
+
+    controller = EyvanController(
+        repository,
+        service,
+        agent_factory=lambda _cell: agent,  # type: ignore[arg-type,return-value]
+        location_resolver=tracking_resolver,
+    )
+    await _seed_cell(repository, _tpu_cell("cell-eu", region="europe-west4"))
+    await service.put_policy(
+        ADMIN,
+        PolicyRecord(
+            org_id="acme",
+            project_id="research",
+            cross_region_transfer_policy=CrossRegionTransferPolicy.BAN,
+            updated_by="admin",
+        ),
+        idempotency_key="pol-ban-https",
+    )
+
+    https_wl, _ = await service.submit_workload(
+        ADMIN,
+        org_id="acme",
+        project_id="research",
+        spec=_command_spec(
+            "https-cross-region",
+            command="curl -s https://storage.googleapis.com/example-us-bucket/model.bin",
+        ),
+        idempotency_key="wl-https-1",
+    )
+    await controller.reconcile_once()
+    await controller.dispatch_outbox_once()
+    failed = await service.get_workload(ADMIN, https_wl.id)
+    assert failed.state is WorkloadState.FAILED
+    assert CROSS_REGION_TRANSFER_BANNED_REASON in (failed.failure_reason or "")
+    assert observed_in_tx and all(not in_tx for in_tx in observed_in_tx)
+    assert agent.submissions == []
+
+    # Default resolver path passes an instantiated token provider (callable returning str|None).
+    token_calls: list[object] = []
+
+    class _FakeTokenProvider:
+        def __call__(self) -> str:
+            return "ya29.fake-token"
+
+    monkeypatch.setattr(
+        "eyvan.server.controller.workload_commands.default_gcp_token_provider",
+        lambda: _FakeTokenProvider(),
+    )
+
+    def _fake_resolve(bucket: str, *, token_provider=None, **kwargs):
+        del kwargs
+        token_calls.append(token_provider() if callable(token_provider) else None)
+        return _bucket_resolver(bucket)
+
+    monkeypatch.setattr("eyvan.server.controller.workload_commands.resolve_bucket_location", _fake_resolve)
+    controller.location_resolver = None
+    gcs_wl, _ = await service.submit_workload(
+        ADMIN,
+        org_id="acme",
+        project_id="research",
+        spec=_command_spec("gcs-scheme-ban", command="python train.py --data gcs://example-us-bucket/data"),
+        idempotency_key="wl-gcs-1",
+    )
+    await controller.reconcile_once()
+    await controller.dispatch_outbox_once()
+    assert (await service.get_workload(ADMIN, gcs_wl.id)).state is WorkloadState.FAILED
+    assert token_calls == ["ya29.fake-token"]
+
+    # Gang dispatch propagates per-cell regions so each cell receives its own EYVAN_HOST_REGION.
+    gang_repo = _TxTrackingRepository()
+    gang_service = ControlPlaneService(gang_repo, scheduler=CoreSchedulingService())
+    gang_agent = _RecordingAgent()
+    gang_in_tx: list[bool] = []
+
+    def gang_resolver(bucket: str) -> BucketLocation | None:
+        gang_in_tx.append(gang_repo.in_transaction)
+        return BucketLocation(bucket, "us", "multi-region")
+
+    gang_controller = EyvanController(
+        gang_repo,
+        gang_service,
+        agent_factory=lambda _cell: gang_agent,  # type: ignore[arg-type,return-value]
+        location_resolver=gang_resolver,
+    )
+    await _seed_cell(gang_repo, _tpu_cell("cell-a", region="us-central1"))
+    await _seed_cell(gang_repo, _tpu_cell("cell-b", region="us-east5"))
+    await gang_service.put_policy(
+        ADMIN,
+        PolicyRecord(
+            org_id="acme",
+            project_id="research",
+            cross_region_transfer_policy=CrossRegionTransferPolicy.BAN,
+            cross_region_allow_multiregion=True,
+            updated_by="admin",
+        ),
+        idempotency_key="pol-gang-ban",
+    )
+    await gang_service.submit_workload(
+        ADMIN,
+        org_id="acme",
+        project_id="research",
+        spec=WorkloadDefinition(
+            name="multi-region-gang",
+            execution=CommandExecution(command="python train.py --data gs://us-multi-bucket/data"),
+            gang={"replicas": 1, "per_replica": {"tpu": 8}},
+            cell_group_count=2,
+            required_executor="eyvan-native",
+        ),
+        idempotency_key="wl-gang-regions",
+    )
+    await gang_controller.reconcile_once()
+    await gang_controller.dispatch_outbox_once()
+    assert gang_in_tx and all(not in_tx for in_tx in gang_in_tx)
+    assert len(gang_agent.gang_submissions) == 1
+    gang_spec = gang_agent.gang_submissions[0][1].spec
+    assert gang_spec["member_regions"] == {"cell-a": "us-central1", "cell-b": "us-east5"}
+
+    # NativeGangExecutor applies each cell's own region as EYVAN_HOST_REGION and strips member_regions.
+    submitted_by_host: dict[str, dict[str, tp.Any]] = {}
+
+    def _gang_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        submitted_by_host[request.url.host] = body["spec"]
+        return httpx.Response(200, json={"remote_id": body["spec"]["submission_id"]})
+
+    clients = [
+        httpx.Client(base_url="http://10.20.0.1:8100", transport=httpx.MockTransport(_gang_handler)),
+        httpx.Client(base_url="http://10.20.0.2:8100", transport=httpx.MockTransport(_gang_handler)),
+    ]
+    try:
+        gang_exec = NativeGangExecutor(
+            (
+                NativeGangMember(
+                    cell_id="cell-a",
+                    endpoints=("http://10.20.0.1:8100",),
+                    secret="sec-a",
+                    context=MutationContext(idempotency_key="k-a", generation=1, fencing_token="f-a"),
+                ),
+                NativeGangMember(
+                    cell_id="cell-b",
+                    endpoints=("http://10.20.0.2:8100",),
+                    secret="sec-b",
+                    context=MutationContext(idempotency_key="k-b", generation=1, fencing_token="f-b"),
+                ),
+            ),
+            clients=clients,
+        )
+        gang_exec.submit(gang_spec)
+    finally:
+        for client in clients:
+            client.close()
+    assert submitted_by_host["10.20.0.1"]["environment"][HOST_REGION_ENV] == "us-central1"
+    assert submitted_by_host["10.20.0.2"]["environment"][HOST_REGION_ENV] == "us-east5"
+    assert "member_regions" not in submitted_by_host["10.20.0.1"]
+    assert "member_regions" not in submitted_by_host["10.20.0.2"]
+
+
+def test_systemd_and_oci_arm_pythonpath_and_preserve_secret_exit_95(tmp_path: Path) -> None:
+    import subprocess
+
+    from eyvan.capacity.drivers.base import MutationContext
+    from eyvan.records import NativeContainerConfig
+    from eyvan.worker.runtime.container import DockerContainerExecutor
+    from eyvan.worker.runtime.oci_callable_stager import OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY
+    from eyvan.worker.runtime.systemd_transient import (
+        _MULTIHOST_SITE_PATH,
+        SystemdTransientServiceExecutor,
+        _load_json,
+    )
+
+    state_props: dict[str, str] = {
+        "LoadState": "loaded",
+        "ActiveState": "failed",
+        "SubState": "failed",
+        "Result": "exit-code",
+        "ExecMainStatus": "95",
+        "ExecMainCode": "1",
+    }
+
+    def runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ("systemctl", "show"):
+            stdout = "\n".join(f"{k}={v}" for k, v in state_props.items()) + "\n"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    executor = SystemdTransientServiceExecutor(
+        tmp_path / "systemd-state",
+        command_runner=runner,
+        boot_id_reader=lambda: "boot-1",
+        failure_journal_reader=lambda _unit: "EYVAN_CROSS_REGION_TRANSFER_BANNED: secret=SUPER_SECRET_VALUE",
+    )
+    remote_id = executor.submit(
+        {
+            "entrypoint": "python train.py",
+            "submission_id": "secret-ban-unit",
+            "environment": {
+                CROSS_REGION_POLICY_ENV: "ban",
+                HOST_REGION_ENV: "europe-west4",
+                "PYTHONPATH": "/workspace",
+            },
+            "gang": {"replicas": 1, "per_replica": {"tpu": 8}},
+            "metadata": {"eyvan_workload_id": "secret-ban-unit"},
+        },
+        MutationContext(idempotency_key="sub-secret-ban", generation=1, fencing_token="f-1"),
+    )
+    env_file = executor._environment_file_path(remote_id)
+    env_text = env_file.read_text(encoding="utf-8")
+    assert f"PYTHONPATH={_MULTIHOST_SITE_PATH}:/workspace" in env_text
+
+    # Mark record secret-bearing and verify exit-95 preserves canonical prefix without leaking journal detail.
+    rec_path = executor._record_path(remote_id)
+    rec = _load_json(rec_path)
+    assert rec is not None
+    rec["secret_bearing"] = True
+    rec_path.write_text(json.dumps(rec), encoding="utf-8")
+
+    obs = executor.status(remote_id)
+    assert obs.status is ExecutionWorkloadStatus.FAILED
+    assert obs.message.startswith(f"{CROSS_REGION_TRANSFER_BANNED_REASON}:")
+    assert "SUPER_SECRET_VALUE" not in obs.message
+    assert "redacted" in obs.message
+    # Persisted record retains the non-secret exit-95 prefix across reloads too.
+    assert executor.status(remote_id).message == obs.message
+
+    # DockerContainerExecutor prepends OCI staged dir to PYTHONPATH under warn/ban and classifies exit 95.
+    container_state = {
+        "Id": "a" * 64,
+        "State": {"Status": "exited", "ExitCode": 95, "Error": ""},
+    }
+
+    def docker_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ("docker", "version"):
+            return subprocess.CompletedProcess(command, 0, "27.0.0\n", "")
+        if command[:3] == ("docker", "container", "inspect"):
+            return subprocess.CompletedProcess(command, 0, json.dumps(container_state), "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    docker_exec = DockerContainerExecutor(
+        tmp_path / "docker-state",
+        container=NativeContainerConfig(image="python:3.12"),
+        workload_directory=tmp_path / "workload",
+        multihost_directory=tmp_path / "multihost",
+        command_runner=docker_runner,
+        boot_id_reader=lambda: "boot-1",
+        verify_docker=False,
+    )
+    container_env = docker_exec._container_environment({CROSS_REGION_POLICY_ENV: "ban", HOST_REGION_ENV: "europe-west4"})
+    assert container_env["PYTHONPATH"] == OCI_CALLABLE_RUNNER_CONTAINER_DIRECTORY
+    status_res = docker_exec._runtime_status(
+        {
+            "remote_id": "oci-exit-95",
+            "container_name": "eyvan-oci-exit-95",
+            "unit_name": "eyvan-oci-exit-95.service",
+            "stop_requested": False,
+        }
+    )
+    assert status_res is not None
+    assert status_res[0] is ExecutionWorkloadStatus.FAILED
+    assert status_res[1].startswith(f"{CROSS_REGION_TRANSFER_BANNED_REASON}:")
+
+
+def test_slice_and_gang_detect_exit_95_even_when_initialization_fatal_is_false() -> None:
+    from eyvan.capacity.drivers.base import MutationContext
+    from eyvan.worker.runtime._multihost_site import GangInitializationPolicy
+    from eyvan.worker.runtime.native_gang import NativeGangExecutor, NativeGangMember
+    from eyvan.worker.runtime.native_slice import NativeSliceExecutor
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/process-status"):
+            return httpx.Response(200, json={"observed": True, "exec_main_status": 95})
+        if request.url.path.endswith("/logs"):
+            return httpx.Response(
+                200,
+                text=f"{CROSS_REGION_TRANSFER_BANNED_MARKER} host_region=europe-west4 bucket=remote-us\n",
+            )
+        return httpx.Response(
+            200,
+            json={
+                "remote_id": "wl-nonfatal-95",
+                "status": "FAILED",
+                "message": "systemd service failed with result exit-code",
+            },
+        )
+
+    non_fatal = GangInitializationPolicy(fatal=False)
+    slice_clients = [
+        httpx.Client(base_url="http://10.30.0.1:8100", transport=httpx.MockTransport(handler)),
+        httpx.Client(base_url="http://10.30.0.2:8100", transport=httpx.MockTransport(handler)),
+    ]
+    try:
+        slice_exec = NativeSliceExecutor(
+            ("http://10.30.0.1:8100", "http://10.30.0.2:8100"),
+            secret="sec",
+            clients=slice_clients,
+            initialization=non_fatal,
+        )
+        slice_report = slice_exec.status("wl-nonfatal-95")
+        assert slice_report["status"] is ExecutionWorkloadStatus.FAILED
+        assert CROSS_REGION_TRANSFER_BANNED_REASON in slice_report["message"]
+        assert "bucket=remote-us" in slice_report["message"]
+    finally:
+        for client in slice_clients:
+            client.close()
+
+    gang_clients = [
+        httpx.Client(base_url="http://10.31.0.1:8100", transport=httpx.MockTransport(handler)),
+        httpx.Client(base_url="http://10.31.0.2:8100", transport=httpx.MockTransport(handler)),
+    ]
+    try:
+        gang_exec = NativeGangExecutor(
+            (
+                NativeGangMember(
+                    cell_id="cell-1",
+                    endpoints=("http://10.31.0.1:8100",),
+                    secret="sec-1",
+                    context=MutationContext(idempotency_key="k1", generation=1, fencing_token="f1"),
+                ),
+                NativeGangMember(
+                    cell_id="cell-2",
+                    endpoints=("http://10.31.0.2:8100",),
+                    secret="sec-2",
+                    context=MutationContext(idempotency_key="k2", generation=1, fencing_token="f2"),
+                ),
+            ),
+            clients=gang_clients,
+            initialization=non_fatal,
+        )
+        gang_report = gang_exec.status("wl-nonfatal-95")
+        assert gang_report["status"] is ExecutionWorkloadStatus.FAILED
+        assert CROSS_REGION_TRANSFER_BANNED_REASON in gang_report["message"]
+        assert "bucket=remote-us" in gang_report["message"]
+    finally:
+        for client in gang_clients:
+            client.close()

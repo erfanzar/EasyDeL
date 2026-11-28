@@ -411,9 +411,40 @@ class _ControllerScheduling:
                     or owner.guaranteed_tpu_units <= 0
                 ):
                     continue
-                # If a reclaim requested by this owner is already in flight, reuse its
-                # deadline on the waiting workload instead of issuing a second reclaim.
-                active_for_owner = [
+                pinned_pools = targeted_pool_ids(workload.spec)
+                pools = await transaction.list_capacity_pools()
+                compatible_pool_ids: tuple[str, ...] | None = None
+                required_accel: str | None = None
+                allowed_accels: set[str] = set()
+                if pinned_pools:
+                    compatible_pool_ids = pinned_pools
+                elif workload.spec.accelerator_type or workload.spec.allowed_accelerator_types:
+                    allowed_accels = (
+                        {workload.spec.accelerator_type.strip().lower()}
+                        if workload.spec.accelerator_type
+                        else {item.strip().lower() for item in workload.spec.allowed_accelerator_types if item.strip()}
+                    )
+                    matching_pools = tuple(
+                        pool.id
+                        for pool in pools
+                        if pool.enabled
+                        and pool.accelerator_type is not None
+                        and pool.accelerator_type.strip().lower() in allowed_accels
+                        and (workload.spec.region is None or pool.region == workload.spec.region)
+                    )
+                    if matching_pools:
+                        compatible_pool_ids = matching_pools
+                    elif workload.spec.accelerator_type:
+                        required_accel = workload.spec.accelerator_type
+                    else:
+                        # Non-empty allowed_accelerator_types with zero matching enabled pools:
+                        # abort cleanly rather than falling back to unconstrained reclaim.
+                        continue
+
+                # If a reclaim requested by this owner is already in flight on compatible
+                # capacity, reuse its deadline on the waiting workload instead of issuing
+                # a second reclaim (without blocking unrelated pools/accelerators).
+                raw_active_for_owner = [
                     candidate
                     for candidate in await transaction.list_workloads()
                     if candidate.state in {WorkloadState.CHECKPOINTING, WorkloadState.CANCELLING}
@@ -421,6 +452,43 @@ class _ControllerScheduling:
                     and candidate.reclaim_deadline_at is not None
                     and candidate.reclaim_deadline_at > now
                 ]
+                active_for_owner: list[WorkloadRecord] = []
+                if raw_active_for_owner:
+                    leases_by_id = {lease.id: lease for lease in await transaction.list_leases()}
+                    cells_by_id = {cell.id: cell for cell in await transaction.list_cells()}
+                    compat_pool_set = set(compatible_pool_ids) if compatible_pool_ids is not None else None
+                    req_accel_norm = required_accel.strip().lower() if required_accel else None
+                    for candidate in raw_active_for_owner:
+                        cand_lease_ids = candidate.lease_ids or (
+                            (candidate.lease_id,) if candidate.lease_id is not None else ()
+                        )
+                        cand_pools: set[str] = set()
+                        cand_accels: set[str] = set()
+                        for lid in cand_lease_ids:
+                            lease = leases_by_id.get(lid)
+                            if lease is None:
+                                continue
+                            cell = cells_by_id.get(lease.cell_id)
+                            if cell is None:
+                                continue
+                            if cell.pool_id:
+                                cand_pools.add(cell.pool_id)
+                            if cell.accelerator_type:
+                                cand_accels.add(cell.accelerator_type.strip().lower())
+                        if not cand_pools:
+                            cand_pools.update(targeted_pool_ids(candidate.spec))
+                        if not cand_accels and candidate.spec.accelerator_type:
+                            cand_accels.add(candidate.spec.accelerator_type.strip().lower())
+                        if compat_pool_set is not None:
+                            matches = bool(cand_pools & compat_pool_set)
+                        elif req_accel_norm is not None:
+                            matches = req_accel_norm in cand_accels
+                        elif allowed_accels:
+                            matches = bool(cand_accels & allowed_accels)
+                        else:
+                            matches = True
+                        if matches:
+                            active_for_owner.append(candidate)
                 if active_for_owner:
                     deadline_at = max(
                         candidate.reclaim_deadline_at
@@ -446,30 +514,6 @@ class _ControllerScheduling:
                     )
                     reclaimed_waiting.add(workload.id)
                     continue
-                pinned_pools = targeted_pool_ids(workload.spec)
-                pools = await transaction.list_capacity_pools()
-                compatible_pool_ids: tuple[str, ...] | None = None
-                required_accel: str | None = None
-                if pinned_pools:
-                    compatible_pool_ids = pinned_pools
-                elif workload.spec.accelerator_type or workload.spec.allowed_accelerator_types:
-                    allowed_accels = (
-                        {workload.spec.accelerator_type.strip().lower()}
-                        if workload.spec.accelerator_type
-                        else {item.strip().lower() for item in workload.spec.allowed_accelerator_types if item.strip()}
-                    )
-                    matching_pools = tuple(
-                        pool.id
-                        for pool in pools
-                        if pool.enabled
-                        and pool.accelerator_type is not None
-                        and pool.accelerator_type.strip().lower() in allowed_accels
-                        and (workload.spec.region is None or pool.region == workload.spec.region)
-                    )
-                    if matching_pools:
-                        compatible_pool_ids = matching_pools
-                    else:
-                        required_accel = workload.spec.accelerator_type
 
             owner_principal = Principal(subject=workload.created_by)
             plan = await self.service.plan_reclaim_for(
@@ -485,19 +529,33 @@ class _ControllerScheduling:
                 subject=f"reclaim:{workload.created_by}",
                 grants=(RoleGrant(role=Role.FLEET_ADMIN),),
             )
-            reclaimed_victims: list[WorkloadRecord] = []
-            for victim_id in plan.victims:
-                async with self.repository.transaction() as tx:
+            victim_records: list[WorkloadRecord] = []
+            async with self.repository.transaction() as tx:
+                for victim_id in plan.victims:
                     victim_record = await tx.get_workload(victim_id)
-                if victim_record is None or victim_record.state is not WorkloadState.RUNNING:
-                    continue
-                victim_grace = victim_record.spec.checkpoint_grace_seconds or self.settings.default_reclaim_grace_s
-                victim_grace = victim_grace if victim_grace > 0 else 600
+                    if victim_record is None or victim_record.state is not WorkloadState.RUNNING:
+                        victim_records = []
+                        break
+                    victim_records.append(victim_record)
+            if not victim_records:
+                continue
+
+            reclaimed_victims: list[WorkloadRecord] = []
+            for victim_record in victim_records:
+                if victim_record.spec.checkpoint_grace_seconds > 0:
+                    victim_grace = victim_record.spec.checkpoint_grace_seconds
+                else:
+                    victim_grace = (
+                        self.settings.default_reclaim_grace_s if self.settings.default_reclaim_grace_s >= 0 else 600
+                    )
                 try:
                     updated_victim, _replayed = await self.service.reclaim_workload(
                         actor,
-                        victim_id,
-                        idempotency_key=f"auto-reclaim:{workload.id}:{workload.generation}:{victim_id}",
+                        victim_record.id,
+                        idempotency_key=(
+                            f"auto-reclaim:{workload.id}:{workload.generation}"
+                            f":{victim_record.id}:{victim_record.generation}"
+                        ),
                         reason=f"reclaiming borrowed capacity for {workload.created_by} (workload {workload.id})"[:500],
                         grace_seconds=victim_grace,
                         requested_by=workload.created_by,

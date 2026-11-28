@@ -174,7 +174,10 @@ def test_region_guard_is_pure_stdlib_and_execs_unregistered() -> None:
         ("us-east1", BucketLocation("example-nam4", "nam4", "dual-region"), True, True),
         ("us-central2", BucketLocation("example-nam4", "nam4", "dual-region"), True, False),
         ("europe-west1", BucketLocation("example-eur5", "eur5", "dual-region"), True, True),
-        ("europe-west3", BucketLocation("example-eur7", "eur7", "dual-region"), True, True),
+        ("europe-west1", BucketLocation("example-eur7", "eur7", "dual-region"), True, True),
+        ("europe-west4", BucketLocation("example-eur7", "eur7", "dual-region"), True, True),
+        ("europe-west3", BucketLocation("example-eur7", "eur7", "dual-region"), True, False),
+        ("europe-west3", BucketLocation("example-eur8", "eur8", "dual-region"), True, True),
         ("europe-west6", BucketLocation("example-eur8", "eur8", "dual-region"), True, True),
         ("asia-northeast1", BucketLocation("example-asia1", "asia1", "dual-region"), True, True),
         # Custom dual-regions with explicit data_locations
@@ -1115,3 +1118,201 @@ def test_local_process_executor_surfaces_cross_region_ban_from_exit_95(tmp_path:
     assert recovered.message.startswith(f"{CROSS_REGION_TRANSFER_BANNED_REASON}:")
     assert "bucket=example-us-bucket" in recovered.message
     assert "operation=tensorstore.open" in recovered.message
+
+
+def test_extract_gcs_uris_and_regional_mtls_hosts() -> None:
+    text = (
+        "gs://bucket-gs/a gcs://bucket-gcs/b "
+        "https://storage.googleapis.com/bucket-path/obj "
+        "https://bucket-sub.storage.googleapis.com/obj "
+        "https://storage.cloud.google.com/bucket-cloud/obj "
+        "https://mtls.storage.googleapis.com/storage/v1/b/bucket-mtls/o/item "
+        "https://us-central1-storage.googleapis.com/bucket-regional/obj "
+        "https://storage-download.googleapis.com/bucket-dl/obj "
+        "https://storage.googleapis.com/favicon.ico "
+        "https://example.com/not-gcs"
+    )
+    uris = extract_gcs_uris(text)
+    assert uris == (
+        "gs://bucket-gs/a",
+        "gcs://bucket-gcs/b",
+        "https://storage.googleapis.com/bucket-path/obj",
+        "https://bucket-sub.storage.googleapis.com/obj",
+        "https://storage.cloud.google.com/bucket-cloud/obj",
+        "https://mtls.storage.googleapis.com/storage/v1/b/bucket-mtls/o/item",
+        "https://us-central1-storage.googleapis.com/bucket-regional/obj",
+        "https://storage-download.googleapis.com/bucket-dl/obj",
+    )
+    assert extract_bucket_from_gcs_uri("gcs://bucket-gcs/b") == "bucket-gcs"
+    assert (
+        extract_bucket_from_gcs_http_url("https://mtls.storage.googleapis.com/storage/v1/b/bucket-mtls/o/item")
+        == "bucket-mtls"
+    )
+    assert extract_bucket_from_gcs_http_url("https://mtls.storage.googleapis.com/bucket-mtls/item") == "bucket-mtls"
+    assert extract_bucket_from_gcs_http_url("https://europe-west4-storage.googleapis.com/bucket-eu/obj") == "bucket-eu"
+    assert extract_bucket_from_gcs_http_url("https://storage-download.googleapis.com/bucket-dl/obj") == "bucket-dl"
+
+
+def test_http_putrequest_and_proxy_host_header_enforcement() -> None:
+    def resolver(bucket: str) -> BucketLocation | None:
+        if bucket == "remote-us-bucket":
+            return BucketLocation(bucket, "us-central1", "region")
+        return None
+
+    with cross_region_guard(host_region="europe-west4", mode="ban", location_resolver=resolver):
+        conn = http.client.HTTPSConnection("storage.googleapis.com")
+        with pytest.raises(CrossRegionTransferError) as exc_info:
+            conn.putrequest("GET", "/remote-us-bucket/model.bin")
+        assert exc_info.value.result.bucket == "remote-us-bucket"
+
+        proxy_conn = http.client.HTTPConnection("proxy.internal", 8080)
+        with pytest.raises(CrossRegionTransferError) as proxy_exc:
+            proxy_conn.request(
+                "GET",
+                "/remote-us-bucket/model.bin",
+                headers={"Host": "storage.googleapis.com"},
+            )
+        assert proxy_exc.value.result.bucket == "remote-us-bucket"
+
+        mtls_conn = http.client.HTTPSConnection("mtls.storage.googleapis.com")
+        with pytest.raises(CrossRegionTransferError) as mtls_exc:
+            mtls_conn.putrequest("GET", "/storage/v1/b/remote-us-bucket/o/item")
+        assert mtls_exc.value.result.bucket == "remote-us-bucket"
+
+
+def test_subprocess_guard_covers_bytes_wrappers_flags_and_http_tools() -> None:
+    def resolver(bucket: str) -> BucketLocation | None:
+        if bucket == "remote-us-bucket":
+            return BucketLocation(bucket, "us-central1", "region")
+        return None
+
+    commands: list[tp.Any] = [
+        [b"gsutil", b"cp", b"gs://remote-us-bucket/ckpt", b"."],
+        ["env", "FOO=1", "-u", "BAR", "gsutil", "cp", "gcs://remote-us-bucket/ckpt", "."],
+        ["timeout", "-k", "5", "30", "curl", "-sS", "https://storage.googleapis.com/remote-us-bucket/file"],
+        ["wget", "https://remote-us-bucket.storage.googleapis.com/file"],
+        ["rclone", "copy", ":gcs:remote-us-bucket/ckpt", "/tmp/out"],
+        [
+            "gcloud",
+            "--project",
+            "p",
+            "--account",
+            "a@b.com",
+            "--configuration",
+            "default",
+            "--quiet",
+            "storage",
+            "cp",
+            "gs://remote-us-bucket/ckpt",
+            ".",
+        ],
+        b"curl -fsSL https://storage.cloud.google.com/remote-us-bucket/file",
+    ]
+    with cross_region_guard(host_region="europe-west4", mode="ban", location_resolver=resolver):
+        for cmd in commands:
+            with pytest.raises(CrossRegionTransferError) as exc_info:
+                subprocess.Popen(cmd, shell=isinstance(cmd, (str, bytes)))
+            assert exc_info.value.result.bucket == "remote-us-bucket"
+
+
+def test_local_process_executor_arms_region_guard_without_caller_pythonpath(tmp_path: Path) -> None:
+    from eyvan.capacity.drivers.base import ExecutionWorkloadStatus, MutationContext
+    from eyvan.worker.runtime.local_process import LocalProcessExecutor
+
+    child_code = (
+        "import eyvan_region_guard as guard\n"
+        "assert guard.is_cross_region_guard_active(), 'guard should be auto-armed by sitecustomize'\n"
+        "guard.prime_bucket_location_cache(guard.BucketLocation('example-us-bucket', 'us-central2', 'region'))\n"
+        "guard.enforce_gcs_access('gs://example-us-bucket/ckpt', operation='test.read')\n"
+    )
+    executor = LocalProcessExecutor(tmp_path / "state")
+    remote_id = executor.submit(
+        {
+            "entrypoint": shlex.join((sys.executable, "-c", child_code)),
+            "submission_id": "auto-armed-local-ban",
+            "environment": {
+                CROSS_REGION_POLICY_ENV: "ban",
+                HOST_REGION_ENV: "europe-west4",
+                CROSS_REGION_KILL_ENV: "1",
+            },
+            "gang": {"replicas": 1, "per_replica": {"cpu": 1}, "required_topology": {}},
+            "metadata": {"eyvan_workload_id": "auto-armed-local-ban"},
+        },
+        MutationContext(idempotency_key="submit-auto-arm-1", generation=1, fencing_token="fence-1"),
+    )
+
+    deadline = time.monotonic() + 10.0
+    observation = executor.status(remote_id)
+    while time.monotonic() < deadline and observation.status not in {
+        ExecutionWorkloadStatus.FAILED,
+        ExecutionWorkloadStatus.SUCCEEDED,
+    }:
+        time.sleep(0.05)
+        observation = executor.status(remote_id)
+
+    assert observation.status is ExecutionWorkloadStatus.FAILED
+    assert observation.message.startswith(f"{CROSS_REGION_TRANSFER_BANNED_REASON}:")
+    assert "bucket=example-us-bucket" in observation.message
+
+
+def test_oci_stager_stages_region_guard_and_callable_protocol_fails_closed_under_ban(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    from eyvan.worker.runtime import callable_protocol
+    from eyvan.worker.runtime.oci_callable_stager import (
+        OCI_REGION_GUARD_FILENAME,
+        OCI_SITECUSTOMIZE_FILENAME,
+        stage_oci_callable_runner,
+    )
+
+    staged_dir = tmp_path / "oci-runner"
+    stage_oci_callable_runner(staged_dir)
+    assert (staged_dir / OCI_REGION_GUARD_FILENAME).is_file()
+    assert (staged_dir / OCI_SITECUSTOMIZE_FILENAME).is_file()
+
+    def _missing_import(name: str, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        if name in {"eyvan_region_guard", "eyvan.storage._region_guard"}:
+            raise ImportError(f"simulated missing {name}")
+        raise AssertionError(f"unexpected import {name}")
+
+    monkeypatch.setattr(importlib, "import_module", _missing_import)
+    with pytest.raises(RuntimeError, match=CROSS_REGION_TRANSFER_BANNED_REASON):
+        callable_protocol._arm_cross_region_guard_if_configured(
+            {
+                CROSS_REGION_POLICY_ENV: "ban",
+                HOST_REGION_ENV: "europe-west4",
+                CROSS_REGION_KILL_ENV: "0",
+            }
+        )
+
+
+def test_off_main_thread_preemption_uninstall_preserves_saved_handlers() -> None:
+    import signal
+    import threading
+
+    from eyvan.worker.runtime import preemption
+
+    preemption.uninstall_preemption_handler()
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    try:
+        preemption.install_preemption_handler()
+        assert signal.SIGTERM in preemption._installed_signals
+        assert signal.SIGTERM in preemption._previous_handlers
+
+        worker_thread = threading.Thread(target=preemption.uninstall_preemption_handler)
+        worker_thread.start()
+        worker_thread.join()
+
+        # Off-main-thread uninstall must not drop saved signal handler restoration state.
+        assert signal.SIGTERM in preemption._installed_signals
+        assert signal.SIGTERM in preemption._previous_handlers
+
+        preemption.uninstall_preemption_handler()
+        assert signal.getsignal(signal.SIGTERM) == original_sigterm
+        assert not preemption._installed_signals
+        assert not preemption._previous_handlers
+    finally:
+        preemption.uninstall_preemption_handler()
+        signal.signal(signal.SIGTERM, original_sigterm)

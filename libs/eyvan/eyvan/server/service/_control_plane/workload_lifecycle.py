@@ -231,13 +231,20 @@ class WorkloadLifecycleMixin:
             raise InputError("reclaim reason must not be empty")
         if len(reason) > 500:
             raise InputError("reclaim reason must be at most 500 characters")
-        if grace_seconds is not None and (isinstance(grace_seconds, bool) or grace_seconds <= 0):
-            raise InputError("reclaim grace_seconds must be a positive integer")
+        if grace_seconds is not None and (isinstance(grace_seconds, bool) or grace_seconds < 0):
+            raise InputError("reclaim grace_seconds must be a non-negative integer")
         async with self.repository.transaction() as tx:
             await self._lock_settlement(tx, workload_id)
             workload = await self._require_workload(tx, workload_id)
             scope = _scope(workload.org_id, workload.project_id)
-            fingerprint = _fingerprint({"workload_id": workload_id, "reason": reason})
+            fingerprint = _fingerprint(
+                {
+                    "workload_id": workload_id,
+                    "reason": reason,
+                    "grace_seconds": grace_seconds,
+                    "requested_by": requested_by,
+                }
+            )
             existing = await self._idempotent_resource(tx, scope, "workload.reclaim", key, fingerprint)
             if existing is not None:
                 return workload, True
@@ -268,8 +275,11 @@ class WorkloadLifecycleMixin:
             elif spec.checkpoint_grace_seconds > 0:
                 effective_grace_s = spec.checkpoint_grace_seconds
             else:
-                effective_grace_s = default_grace if default_grace > 0 else 600
+                effective_grace_s = default_grace if default_grace >= 0 else 600
             deadline_at = now + timedelta(seconds=effective_grace_s)
+            is_governance_reclaim = bool(
+                (isinstance(requested_by, str) and requested_by.strip()) or principal.subject.startswith("reclaim:")
+            )
             requester = (
                 requested_by.strip()
                 if isinstance(requested_by, str) and requested_by.strip()
@@ -326,6 +336,7 @@ class WorkloadLifecycleMixin:
                     "reclaim_deadline_epoch_s": deadline_at.timestamp(),
                     "reclaim_policy": spec.reclaim_policy,
                     "requested_by": requester,
+                    "governance_reclaim": is_governance_reclaim,
                     "reason": reason,
                     "actor": principal.subject,
                 },

@@ -397,6 +397,8 @@ def _reported_exit_status(detail: JsonObject) -> int | None:
     if detail.get("observed") is not True:
         return None
     status = detail.get("exec_main_status")
+    if status is None:
+        status = detail.get("exit_code")
     return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
@@ -1239,18 +1241,10 @@ class NativeSliceExecutor:
             if CROSS_REGION_TRANSFER_BANNED_MARKER in worker.observation.message
             or CROSS_REGION_TRANSFER_BANNED_REASON in worker.observation.message.lower()
         ]
-        if not self.initialization.fatal:
-            if not marker_ranks:
-                return None
-            return cross_region_ban_failure_reason(
-                banned_ranks=marker_ranks,
-                marker_detail=self._cross_region_marker_detail(remote_id, marker_ranks, workers),
-            )
-
         banned_ranks: list[int] = list(marker_ranks)
         deadline_ranks: list[int] = []
         error_ranks: list[int] = []
-        for rank, worker in enumerate(self._workers):
+        for rank, worker in self._targets(remote_id):
             try:
                 detail = worker.process_status(remote_id)
             except (httpx.HTTPError, RuntimeError, ValueError):
@@ -1258,6 +1252,8 @@ class NativeSliceExecutor:
             exit_status = _reported_exit_status(detail)
             if exit_status == CROSS_REGION_TRANSFER_BANNED_EXIT_CODE:
                 banned_ranks.append(rank)
+                continue
+            if not self.initialization.fatal:
                 continue
             outcome = gang_initialization_outcome(exit_status)
             if outcome == "deadline":
@@ -1269,13 +1265,45 @@ class NativeSliceExecutor:
                 banned_ranks=banned_ranks,
                 marker_detail=self._cross_region_marker_detail(remote_id, banned_ranks, workers),
             )
-        if not deadline_ranks and not error_ranks:
+        if not self.initialization.fatal or (not deadline_ranks and not error_ranks):
             return None
         return gang_formation_failure_reason(
             deadline_s=self.initialization.initialization_timeout_s,
             deadline_ranks=deadline_ranks,
             error_ranks=error_ranks,
         )
+
+    def notify_reclaim(
+        self,
+        remote_id: str,
+        *,
+        notice: tp.Mapping[str, JsonValue],
+        grace_s: int,
+        context: MutationContext,
+    ) -> None:
+        """Deliver a graceful reclaim notice to every targeted slice host, preserving the first error."""
+
+        first_error: BaseException | None = None
+        for _rank, worker in self._targets(remote_id):
+            try:
+                worker.notify_reclaim(remote_id, notice=notice, grace_s=grace_s, context=context)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def read_checkpoint_uri(self, remote_id: str) -> str | None:
+        """Return the first acknowledged checkpoint receipt URI across targeted slice hosts."""
+
+        for _rank, worker in self._targets(remote_id):
+            try:
+                uri = worker.read_checkpoint_uri(remote_id)
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                continue
+            if isinstance(uri, str) and uri.strip():
+                return uri.strip()
+        return None
 
     def stop(self, remote_id: str, context: MutationContext) -> None:
         """Stop the workload on every host, preserving the first failure."""

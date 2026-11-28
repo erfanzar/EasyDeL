@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import shlex
 import typing as tp
@@ -48,6 +49,7 @@ from eyvan.server.controller._support import (
 )
 from eyvan.server.service.errors import ConflictError
 from eyvan.server.service.state import ACTIVE_LEASE_STATES, TERMINAL_WORKLOAD_STATES
+from eyvan.storage._gcp import default_gcp_token_provider
 from eyvan.storage._region_guard import (
     CROSS_REGION_ALLOW_MULTIREGION_ENV,
     CROSS_REGION_ALLOWED_BUCKETS_ENV,
@@ -917,6 +919,15 @@ class _ControllerWorkloadCommands:
                     found.append(uri)
         return tuple(found)
 
+    def _needs_cross_region_check(self, workload: WorkloadRecord, cells: tp.Sequence[CellRecord]) -> bool:
+        """Return whether a BAN-mode dispatch has both a cloud cell region and declared GCS URIs."""
+
+        has_cloud_region = any(
+            isinstance(cell.region, str) and cell.region.strip() and cell.region.strip().lower() != "local"
+            for cell in cells
+        )
+        return has_cloud_region and bool(self._workload_gcs_uris(workload))
+
     def _refuse_cross_region_transfer(
         self,
         workload: WorkloadRecord,
@@ -926,7 +937,7 @@ class _ControllerWorkloadCommands:
         allowed_buckets: tp.Sequence[str],
         allow_multiregion: bool,
     ) -> None:
-        """Refuse dispatch when ``effective_policy`` is BAN and any declared ``gs://`` URI is cross-region."""
+        """Refuse dispatch when ``effective_policy`` is BAN and any declared GCS URI is cross-region."""
 
         if effective_policy is not CrossRegionTransferPolicy.BAN:
             return
@@ -942,7 +953,10 @@ class _ControllerWorkloadCommands:
         uris = self._workload_gcs_uris(workload)
         if not uris:
             return
-        resolver = getattr(self, "location_resolver", None) or resolve_bucket_location
+        resolver = getattr(self, "location_resolver", None)
+        if resolver is None:
+            token_provider = default_gcp_token_provider()
+            resolver = functools.partial(resolve_bucket_location, token_provider=token_provider)
         for region in cloud_regions:
             for uri in uris:
                 result = check_gcs_uri_locality(
@@ -1415,84 +1429,123 @@ class _ControllerWorkloadCommands:
     ) -> tuple[WorkloadRecord, LeaseRecord, CellRecord, WorkloadRequest, WorkloadDispatchReservation] | None:
         """Validate and reserve one single-cell submit in one short transaction."""
 
-        async with self.repository.transaction() as transaction:
-            workload = await transaction.get_workload(command.aggregate_id)
-            lease = await transaction.get_lease(str(command.payload["lease_id"]))
-            cell = await transaction.get_cell(str(command.payload["cell_id"]))
-            if workload is None or lease is None or cell is None:
-                raise StaleOutboxCommand("dispatch command references a missing workload, lease, or cell")
-            current_command = await self._owned_dispatch_command(transaction, command)
-            self._validate_workload_command(command, workload, lease, cell)
-            if self._dispatch_is_already_finalized(workload, (lease,), command.id):
-                return None
-            if workload.state is WorkloadState.CANCELLING:
-                prior = workload.dispatch_reservation
-                if prior is None or prior.outbox_id != command.id:
-                    raise StaleOutboxCommand("cancelled workload has no possibly-started dispatch to recover")
-            elif workload.state is not WorkloadState.LEASED:
-                raise StaleOutboxCommand(f"workload is {workload.state.value}, not leased")
-            if lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED}:
-                raise StaleOutboxCommand(f"lease is {lease.state.value}, not pending")
-            if cell.state is not CellState.READY:
-                raise RuntimeError(f"cell {cell.id!r} is {cell.state.value}, not ready for dispatch")
-            if lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells:
-                raise RuntimeError(f"cell {cell.id!r} quarantine recovery was not proven before dispatch")
+        checked_key: tuple[CrossRegionTransferPolicy, tuple[str, ...], bool, tuple[str, ...]] | None = None
+        for _attempt in range(2):
+            pending_check: (
+                tuple[
+                    WorkloadRecord,
+                    tuple[CellRecord, ...],
+                    CrossRegionTransferPolicy,
+                    tuple[str, ...],
+                    bool,
+                    tuple[CrossRegionTransferPolicy, tuple[str, ...], bool, tuple[str, ...]],
+                ]
+                | None
+            ) = None
+            async with self.repository.transaction() as transaction:
+                workload = await transaction.get_workload(command.aggregate_id)
+                lease = await transaction.get_lease(str(command.payload["lease_id"]))
+                cell = await transaction.get_cell(str(command.payload["cell_id"]))
+                if workload is None or lease is None or cell is None:
+                    raise StaleOutboxCommand("dispatch command references a missing workload, lease, or cell")
+                current_command = await self._owned_dispatch_command(transaction, command)
+                self._validate_workload_command(command, workload, lease, cell)
+                if self._dispatch_is_already_finalized(workload, (lease,), command.id):
+                    return None
+                if workload.state is WorkloadState.CANCELLING:
+                    prior = workload.dispatch_reservation
+                    if prior is None or prior.outbox_id != command.id:
+                        raise StaleOutboxCommand("cancelled workload has no possibly-started dispatch to recover")
+                elif workload.state is not WorkloadState.LEASED:
+                    raise StaleOutboxCommand(f"workload is {workload.state.value}, not leased")
+                if lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED}:
+                    raise StaleOutboxCommand(f"lease is {lease.state.value}, not pending")
+                if cell.state is not CellState.READY:
+                    raise RuntimeError(f"cell {cell.id!r} is {cell.state.value}, not ready for dispatch")
+                if lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells:
+                    raise RuntimeError(f"cell {cell.id!r} quarantine recovery was not proven before dispatch")
 
-            await self.service._require_no_asset_eviction(transaction, workload, cell)
-            self._refuse_unreachable_callback(workload, cell)
-            policy = await transaction.get_policy(workload.org_id, workload.project_id)
-            effective_policy, allowed_buckets, allow_multiregion = self._resolve_cross_region_policy(policy, workload)
-            await self._check_cross_region_transfer(
-                workload,
-                cells=(cell,),
-                effective_policy=effective_policy,
-                allowed_buckets=allowed_buckets,
-                allow_multiregion=allow_multiregion,
-            )
-            reservation = self._new_dispatch_reservation(current_command, workload, (lease.id,))
-            reserved = await self._persist_dispatch_reservation(
-                transaction,
-                command,
-                current_command,
-                workload,
-                reservation,
-            )
-            await self._persist_attempt_topology(transaction, reserved, (cell,))
-            entrypoint, environment = self._render_execution(
-                reserved,
-                runtime_environment=cell.runtime.env,
-                cell_provider=cell.provider,
-                cell_region=cell.region,
-                cross_region_policy=effective_policy,
-                cross_region_allowed_buckets=allowed_buckets,
-                cross_region_allow_multiregion=allow_multiregion,
-            )
-            submission_id = f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}"
-            if lease.tpu_chips:
-                submission_id, chip_environment = _chip_share_dispatch(submission_id, lease.tpu_chips, cell)
-                # Last, so a job cannot point its share at a neighbour's chips.
-                environment.update(chip_environment)
-            request = WorkloadRequest(
-                mutation=self._mutation(command, lease.fencing_token),
-                spec={
-                    "entrypoint": entrypoint,
-                    "submission_id": submission_id,
-                    "environment": environment,
-                    "backend_options": reserved.spec.backend_options,
-                    "gang": {
-                        **reserved.spec.gang.model_dump(mode="json"),
-                        "placement_strategy": "PACK",
-                    },
-                    "metadata": {
-                        **reserved.spec.metadata,
-                        "eyvan_workload_id": reserved.id,
-                        "eyvan_org_id": reserved.org_id,
-                        "eyvan_project_id": reserved.project_id,
-                        "eyvan_lease_id": lease.id,
-                    },
-                },
-            )
-            return reserved, lease, cell, request, reservation
+                await self.service._require_no_asset_eviction(transaction, workload, cell)
+                self._refuse_unreachable_callback(workload, cell)
+                policy = await transaction.get_policy(workload.org_id, workload.project_id)
+                effective_policy, allowed_buckets, allow_multiregion = self._resolve_cross_region_policy(
+                    policy, workload
+                )
+                check_key = (
+                    effective_policy,
+                    tuple(allowed_buckets),
+                    allow_multiregion,
+                    (cell.region,),
+                )
+                if (
+                    effective_policy is CrossRegionTransferPolicy.BAN
+                    and check_key != checked_key
+                    and self._needs_cross_region_check(workload, (cell,))
+                ):
+                    pending_check = (
+                        workload,
+                        (cell,),
+                        effective_policy,
+                        tuple(allowed_buckets),
+                        allow_multiregion,
+                        check_key,
+                    )
+                else:
+                    reservation = self._new_dispatch_reservation(current_command, workload, (lease.id,))
+                    reserved = await self._persist_dispatch_reservation(
+                        transaction,
+                        command,
+                        current_command,
+                        workload,
+                        reservation,
+                    )
+                    await self._persist_attempt_topology(transaction, reserved, (cell,))
+                    entrypoint, environment = self._render_execution(
+                        reserved,
+                        runtime_environment=cell.runtime.env,
+                        cell_provider=cell.provider,
+                        cell_region=cell.region,
+                        cross_region_policy=effective_policy,
+                        cross_region_allowed_buckets=allowed_buckets,
+                        cross_region_allow_multiregion=allow_multiregion,
+                    )
+                    submission_id = f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}"
+                    if lease.tpu_chips:
+                        submission_id, chip_environment = _chip_share_dispatch(submission_id, lease.tpu_chips, cell)
+                        # Last, so a job cannot point its share at a neighbour's chips.
+                        environment.update(chip_environment)
+                    request = WorkloadRequest(
+                        mutation=self._mutation(command, lease.fencing_token),
+                        spec={
+                            "entrypoint": entrypoint,
+                            "submission_id": submission_id,
+                            "environment": environment,
+                            "backend_options": reserved.spec.backend_options,
+                            "gang": {
+                                **reserved.spec.gang.model_dump(mode="json"),
+                                "placement_strategy": "PACK",
+                            },
+                            "metadata": {
+                                **reserved.spec.metadata,
+                                "eyvan_workload_id": reserved.id,
+                                "eyvan_org_id": reserved.org_id,
+                                "eyvan_project_id": reserved.project_id,
+                                "eyvan_lease_id": lease.id,
+                            },
+                        },
+                    )
+                    return reserved, lease, cell, request, reservation
+            if pending_check is not None:
+                p_workload, p_cells, p_policy, p_allowed, p_multi, p_key = pending_check
+                await self._check_cross_region_transfer(
+                    p_workload,
+                    cells=p_cells,
+                    effective_policy=p_policy,
+                    allowed_buckets=p_allowed,
+                    allow_multiregion=p_multi,
+                )
+                checked_key = p_key
+        raise RuntimeError("cross-region policy changed concurrently during single-cell dispatch")
 
     async def _prepare_gang_dispatch(
         self,
@@ -1514,131 +1567,178 @@ class _ControllerWorkloadCommands:
     ):
         """Validate and reserve an all-or-nothing native gang submit."""
 
-        async with self.repository.transaction() as transaction:
-            workload = await transaction.get_workload(command.aggregate_id)
-            leases = tuple([await transaction.get_lease(lease_id) for lease_id in lease_ids])
-            members = tuple(lease for lease in leases if lease is not None)
-            if workload is None or len(members) != len(leases):
-                raise StaleOutboxCommand("gang dispatch command references a missing workload or lease")
-            current_command = await self._owned_dispatch_command(transaction, command)
-            if self._dispatch_is_already_finalized(workload, members, command.id):
-                return None
-            if workload.state is WorkloadState.CANCELLING:
-                prior = workload.dispatch_reservation
-                if prior is None or prior.outbox_id != command.id:
-                    raise StaleOutboxCommand("cancelled workload has no possibly-started gang dispatch to recover")
-            elif workload.state is not WorkloadState.LEASED:
-                raise StaleOutboxCommand(f"workload is {workload.state.value}, not leased")
-            if workload.lease_ids != lease_ids or workload.lease_id != lease_ids[0]:
-                raise StaleOutboxCommand("gang dispatch command no longer owns the workload lease group")
-            if any(lease.workload_id != workload.id or lease.generation != command.generation for lease in members):
-                raise StaleOutboxCommand("gang dispatch members no longer own the workload generation")
-            if any(lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED} for lease in members):
-                raise StaleOutboxCommand("gang dispatch lease is not pending")
-            cells = tuple([await transaction.get_cell(lease.cell_id) for lease in members])
-            concrete_cells = tuple(cell for cell in cells if cell is not None)
-            if len(concrete_cells) != len(cells):
-                raise StaleOutboxCommand("gang dispatch references a missing execution cell")
-            if any(cell.state is not CellState.READY for cell in concrete_cells):
-                bad = next(cell for cell in concrete_cells if cell.state is not CellState.READY)
-                raise RuntimeError(f"cell {bad.id!r} is {bad.state.value}, not ready for gang dispatch")
-            if any(
-                lease.cell_generation != cell.generation for lease, cell in zip(members, concrete_cells, strict=True)
-            ):
-                raise StaleOutboxCommand("gang dispatch cell generation changed after placement")
-            if any(
-                lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells
-                for lease, cell in zip(members, concrete_cells, strict=True)
-            ):
-                raise RuntimeError("gang dispatch quarantine recovery was not proven for every member")
-            for cell in concrete_cells:
-                await self.service._require_no_asset_eviction(transaction, workload, cell)
-            if workload.spec.required_executor != "eyvan-native":
-                raise RuntimeError("multi-cell pod groups currently require the eyvan-native executor")
-            endpoints = {cell.endpoint for cell in concrete_cells}
-            if None in endpoints or len(endpoints) != 1:
-                raise RuntimeError("native pod group cells must use the same trusted cell-agent endpoint")
+        checked_key: tuple[CrossRegionTransferPolicy, tuple[str, ...], bool, tuple[str, ...]] | None = None
+        for _attempt in range(2):
+            pending_check: (
+                tuple[
+                    WorkloadRecord,
+                    tuple[CellRecord, ...],
+                    CrossRegionTransferPolicy,
+                    tuple[str, ...],
+                    bool,
+                    tuple[CrossRegionTransferPolicy, tuple[str, ...], bool, tuple[str, ...]],
+                ]
+                | None
+            ) = None
+            async with self.repository.transaction() as transaction:
+                workload = await transaction.get_workload(command.aggregate_id)
+                leases = tuple([await transaction.get_lease(lease_id) for lease_id in lease_ids])
+                members = tuple(lease for lease in leases if lease is not None)
+                if workload is None or len(members) != len(leases):
+                    raise StaleOutboxCommand("gang dispatch command references a missing workload or lease")
+                current_command = await self._owned_dispatch_command(transaction, command)
+                if self._dispatch_is_already_finalized(workload, members, command.id):
+                    return None
+                if workload.state is WorkloadState.CANCELLING:
+                    prior = workload.dispatch_reservation
+                    if prior is None or prior.outbox_id != command.id:
+                        raise StaleOutboxCommand("cancelled workload has no possibly-started gang dispatch to recover")
+                elif workload.state is not WorkloadState.LEASED:
+                    raise StaleOutboxCommand(f"workload is {workload.state.value}, not leased")
+                if workload.lease_ids != lease_ids or workload.lease_id != lease_ids[0]:
+                    raise StaleOutboxCommand("gang dispatch command no longer owns the workload lease group")
+                if any(lease.workload_id != workload.id or lease.generation != command.generation for lease in members):
+                    raise StaleOutboxCommand("gang dispatch members no longer own the workload generation")
+                if any(lease.state not in {LeaseState.PENDING, LeaseState.QUARANTINED} for lease in members):
+                    raise StaleOutboxCommand("gang dispatch lease is not pending")
+                cells = tuple([await transaction.get_cell(lease.cell_id) for lease in members])
+                concrete_cells = tuple(cell for cell in cells if cell is not None)
+                if len(concrete_cells) != len(cells):
+                    raise StaleOutboxCommand("gang dispatch references a missing execution cell")
+                if any(cell.state is not CellState.READY for cell in concrete_cells):
+                    bad = next(cell for cell in concrete_cells if cell.state is not CellState.READY)
+                    raise RuntimeError(f"cell {bad.id!r} is {bad.state.value}, not ready for gang dispatch")
+                if any(
+                    lease.cell_generation != cell.generation for lease, cell in zip(members, concrete_cells, strict=True)
+                ):
+                    raise StaleOutboxCommand("gang dispatch cell generation changed after placement")
+                if any(
+                    lease.state is LeaseState.QUARANTINED and cell.id not in recovered_cells
+                    for lease, cell in zip(members, concrete_cells, strict=True)
+                ):
+                    raise RuntimeError("gang dispatch quarantine recovery was not proven for every member")
+                for cell in concrete_cells:
+                    await self.service._require_no_asset_eviction(transaction, workload, cell)
+                if workload.spec.required_executor != "eyvan-native":
+                    raise RuntimeError("multi-cell pod groups currently require the eyvan-native executor")
+                endpoints = {cell.endpoint for cell in concrete_cells}
+                if None in endpoints or len(endpoints) != 1:
+                    raise RuntimeError("native pod group cells must use the same trusted cell-agent endpoint")
 
-            leader_lease = members[0]
-            leader_cell = concrete_cells[0]
-            self._refuse_unreachable_callback(workload, leader_cell)
-            # One definition of "the coordinator", used by the rendezvous refusal
-            # below and by the request built further down. Two derivations of the
-            # same rule is how a check ends up guarding a different cell from the
-            # one that is dispatched.
-            paired = tuple(sorted(zip(members, concrete_cells, strict=True), key=lambda item: item[0].cell_id))
-            coordinator_lease, coordinator_cell = paired[0]
-            # Before anything is reserved or written, and before the agent is
-            # contacted: a colliding environment must never be emitted, and a
-            # refusal after the reservation would leave a dispatch marker for a
-            # launch that never happened.
-            await self._refuse_shared_gang_rendezvous(transaction, workload, coordinator_cell)
-            policy = await transaction.get_policy(workload.org_id, workload.project_id)
-            effective_policy, allowed_buckets, allow_multiregion = self._resolve_cross_region_policy(policy, workload)
-            await self._check_cross_region_transfer(
-                workload,
-                cells=concrete_cells,
-                effective_policy=effective_policy,
-                allowed_buckets=allowed_buckets,
-                allow_multiregion=allow_multiregion,
-            )
-            reservation = self._new_dispatch_reservation(current_command, workload, lease_ids)
-            reserved = await self._persist_dispatch_reservation(
-                transaction,
-                command,
-                current_command,
-                workload,
-                reservation,
-            )
-            await self._persist_attempt_topology(transaction, reserved, concrete_cells)
-            entrypoint, environment = self._render_execution(
-                reserved,
-                runtime_environment=leader_cell.runtime.env,
-                cell_provider=leader_cell.provider,
-                cell_region=leader_cell.region,
-                cross_region_policy=effective_policy,
-                cross_region_allowed_buckets=allowed_buckets,
-                cross_region_allow_multiregion=allow_multiregion,
-            )
-            spec = {
-                "entrypoint": entrypoint,
-                "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",
-                "environment": environment,
-                "backend_options": reserved.spec.backend_options,
-                # One gang-wide JAX world unless this is an elastic pack, whose
-                # member cells are separate provider islands and must each run
-                # their own world.
-                "placement": reserved.spec.placement.value,
-                "gang": {
-                    **reserved.spec.gang.model_dump(mode="json"),
-                    "placement_strategy": "PACK",
-                },
-                "metadata": {
-                    **reserved.spec.metadata,
-                    "eyvan_workload_id": reserved.id,
-                    "eyvan_org_id": reserved.org_id,
-                    "eyvan_project_id": reserved.project_id,
-                    "eyvan_lease_id": leader_lease.id,
-                    "eyvan_lease_ids": ",".join(lease.id for lease in members),
-                },
-            }
-            request = GangWorkloadRequest(
-                members=tuple(
-                    GangWorkloadMember(
-                        cell_id=lease.cell_id,
-                        agent_endpoint=self._required_agent_endpoint(cell),
-                        mutation=MutationModel(
-                            idempotency_key=f"{command.idempotency_key}:{lease.id}",
-                            generation=lease.generation,
-                            fencing_token=lease.fencing_token,
-                            correlation_id=command.correlation_id,
-                        ),
+                leader_lease = members[0]
+                leader_cell = concrete_cells[0]
+                self._refuse_unreachable_callback(workload, leader_cell)
+                # One definition of "the coordinator", used by the rendezvous refusal
+                # below and by the request built further down. Two derivations of the
+                # same rule is how a check ends up guarding a different cell from the
+                # one that is dispatched.
+                paired = tuple(sorted(zip(members, concrete_cells, strict=True), key=lambda item: item[0].cell_id))
+                coordinator_lease, coordinator_cell = paired[0]
+                # Before anything is reserved or written, and before the agent is
+                # contacted: a colliding environment must never be emitted, and a
+                # refusal after the reservation would leave a dispatch marker for a
+                # launch that never happened.
+                await self._refuse_shared_gang_rendezvous(transaction, workload, coordinator_cell)
+                policy = await transaction.get_policy(workload.org_id, workload.project_id)
+                effective_policy, allowed_buckets, allow_multiregion = self._resolve_cross_region_policy(
+                    policy, workload
+                )
+                check_key = (
+                    effective_policy,
+                    tuple(allowed_buckets),
+                    allow_multiregion,
+                    tuple(cell.region for cell in concrete_cells),
+                )
+                if (
+                    effective_policy is CrossRegionTransferPolicy.BAN
+                    and check_key != checked_key
+                    and self._needs_cross_region_check(workload, concrete_cells)
+                ):
+                    pending_check = (
+                        workload,
+                        concrete_cells,
+                        effective_policy,
+                        tuple(allowed_buckets),
+                        allow_multiregion,
+                        check_key,
                     )
-                    for lease, cell in paired
-                ),
-                spec=spec,
-            )
-            return reserved, members, concrete_cells, coordinator_lease, coordinator_cell, request, reservation
+                else:
+                    reservation = self._new_dispatch_reservation(current_command, workload, lease_ids)
+                    reserved = await self._persist_dispatch_reservation(
+                        transaction,
+                        command,
+                        current_command,
+                        workload,
+                        reservation,
+                    )
+                    await self._persist_attempt_topology(transaction, reserved, concrete_cells)
+                    entrypoint, environment = self._render_execution(
+                        reserved,
+                        runtime_environment=leader_cell.runtime.env,
+                        cell_provider=leader_cell.provider,
+                        cell_region=leader_cell.region,
+                        cross_region_policy=effective_policy,
+                        cross_region_allowed_buckets=allowed_buckets,
+                        cross_region_allow_multiregion=allow_multiregion,
+                    )
+                    member_regions = {
+                        cell.id: cell.region.strip()
+                        for _lease, cell in paired
+                        if isinstance(cell.region, str)
+                        and cell.region.strip()
+                        and cell.region.strip().lower() != "local"
+                    }
+                    spec = {
+                        "entrypoint": entrypoint,
+                        "submission_id": f"{reserved.id}-a{reserved.attempt}-g{reserved.generation}",
+                        "environment": environment,
+                        **({"member_regions": member_regions} if member_regions else {}),
+                        "backend_options": reserved.spec.backend_options,
+                        # One gang-wide JAX world unless this is an elastic pack, whose
+                        # member cells are separate provider islands and must each run
+                        # their own world.
+                        "placement": reserved.spec.placement.value,
+                        "gang": {
+                            **reserved.spec.gang.model_dump(mode="json"),
+                            "placement_strategy": "PACK",
+                        },
+                        "metadata": {
+                            **reserved.spec.metadata,
+                            "eyvan_workload_id": reserved.id,
+                            "eyvan_org_id": reserved.org_id,
+                            "eyvan_project_id": reserved.project_id,
+                            "eyvan_lease_id": leader_lease.id,
+                            "eyvan_lease_ids": ",".join(lease.id for lease in members),
+                        },
+                    }
+                    request = GangWorkloadRequest(
+                        members=tuple(
+                            GangWorkloadMember(
+                                cell_id=lease.cell_id,
+                                agent_endpoint=self._required_agent_endpoint(cell),
+                                mutation=MutationModel(
+                                    idempotency_key=f"{command.idempotency_key}:{lease.id}",
+                                    generation=lease.generation,
+                                    fencing_token=lease.fencing_token,
+                                    correlation_id=command.correlation_id,
+                                ),
+                            )
+                            for lease, cell in paired
+                        ),
+                        spec=spec,
+                    )
+                    return reserved, members, concrete_cells, coordinator_lease, coordinator_cell, request, reservation
+            if pending_check is not None:
+                p_workload, p_cells, p_policy, p_allowed, p_multi, p_key = pending_check
+                await self._check_cross_region_transfer(
+                    p_workload,
+                    cells=p_cells,
+                    effective_policy=p_policy,
+                    allowed_buckets=p_allowed,
+                    allow_multiregion=p_multi,
+                )
+                checked_key = p_key
+        raise RuntimeError("cross-region policy changed concurrently during gang dispatch")
 
     @staticmethod
     def _require_no_prior_dispatch_admission(command: OutboxRecord) -> None:

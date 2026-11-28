@@ -45,6 +45,7 @@ _GUARANTEE_USAGE_STATES = frozenset(
     {
         WorkloadState.ADMITTED,
         WorkloadState.LEASED,
+        WorkloadState.DISPATCHING,
         WorkloadState.RUNNING,
         WorkloadState.CHECKPOINTING,
         WorkloadState.CANCELLING,
@@ -105,6 +106,9 @@ class SchedulingMixin:
                 pending: list[WorkloadRecord] = []
                 in_use_tpu: dict[str, int] = {}
                 for workload in workloads:
+                    if workload.coordination_kind is not None:
+                        non_pending.append(workload)
+                        continue
                     if workload.state is WorkloadState.PENDING and workload.schedulable:
                         pending.append(workload)
                     else:

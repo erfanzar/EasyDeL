@@ -368,8 +368,8 @@ def uninstall_preemption_handler() -> None:
                     signal.signal(signum, previous)
                 except (OSError, ValueError):
                     pass
-        _installed_signals.clear()
-        _previous_handlers.clear()
+            _installed_signals.clear()
+            _previous_handlers.clear()
         _callbacks.clear()
         _signal_notice = None
 

@@ -93,6 +93,40 @@ _DEFINITIVE_ACTIVE_STATES = frozenset({"failed", "inactive"})
 #: reported as ``1`` by ``systemctl show`` and ``exited`` by test doubles).
 _EXITED_EXEC_MAIN_CODES = frozenset({"1", "exited"})
 
+#: Standard host support directory staged by ``native_bootstrap.py`` holding
+#: ``sitecustomize.py`` and ``eyvan_region_guard.py``.
+_MULTIHOST_SITE_PATH = "/opt/eyvan-native/multihost"
+
+#: Non-secret structured diagnostic preserved for exit-95 cross-region transfer
+#: bans on secret-bearing workloads so the controller settles terminally without
+#: leaking workload output.
+_SECRET_CROSS_REGION_BAN_MESSAGE = (
+    f"{CROSS_REGION_TRANSFER_BANNED_REASON}: workload exited with code "
+    f"{CROSS_REGION_TRANSFER_BANNED_EXIT_CODE} (details redacted because secret mounts are active)"
+)
+
+
+def _secret_safe_message(message: str, *, suppress_diagnostics: bool) -> str:
+    """Redact workload diagnostics while preserving the non-secret exit-95 ban prefix."""
+
+    if not suppress_diagnostics:
+        return redact_secret_material(message)
+    if message.lower().startswith(f"{CROSS_REGION_TRANSFER_BANNED_REASON}:"):
+        return _SECRET_CROSS_REGION_BAN_MESSAGE
+    return _OUTPUT_SUPPRESSED
+
+
+def _with_cross_region_pythonpath(environment: dict[str, str], support_dir: str) -> None:
+    """Prepend ``support_dir`` to ``PYTHONPATH`` when cross-region enforcement is active."""
+
+    policy = (environment.get("EYVAN_CROSS_REGION_POLICY") or "").strip().lower()
+    if policy not in {"warn", "ban"}:
+        return
+    existing = environment.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part] if existing else []
+    if support_dir not in parts:
+        environment["PYTHONPATH"] = os.pathsep.join([support_dir, *parts]) if parts else support_dir
+
 
 def _is_definitive_unloadable_unit(properties: tp.Mapping[str, str]) -> bool:
     """Return whether an unloadable unit still reports a definitive outcome.
@@ -296,7 +330,7 @@ def _sanitize_durable_value(
     if isinstance(value, list):
         return [_sanitize_durable_value(item, field=field, suppress_diagnostics=suppress_diagnostics) for item in value]
     if isinstance(value, str) and field in _DURABLE_DIAGNOSTIC_FIELDS:
-        return _OUTPUT_SUPPRESSED if suppress_diagnostics else redact_secret_material(value)
+        return _secret_safe_message(value, suppress_diagnostics=suppress_diagnostics)
     return value
 
 
@@ -635,7 +669,7 @@ def _persisted_message(remote_id: str, record: tp.Mapping[str, JsonValue]) -> st
         raise _InvalidDurableRecord(f"systemd execution {remote_id!r} has no persisted message") from exc
     if not isinstance(message, str):
         raise _InvalidDurableRecord(f"systemd execution {remote_id!r} has a non-string persisted message")
-    return _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else redact_secret_material(message)
+    return _secret_safe_message(message, suppress_diagnostics=_record_secret_bearing(record))
 
 
 def _persisted_remote_id(expected_remote_id: str, record: tp.Mapping[str, JsonValue]) -> None:
@@ -1367,6 +1401,7 @@ class SystemdTransientServiceExecutor:
         result = properties.get("Result", "").lower()
         main_status = properties.get("ExecMainStatus", "")
         stop_requested = self._record_boolean(record, "stop_requested")
+        reclaim_notified = record.get("reclaim_notified") is True
 
         if active == "activating":
             return ExecutionWorkloadStatus.PENDING, "systemd service is starting"
@@ -1384,6 +1419,11 @@ class SystemdTransientServiceExecutor:
                     # empty value is positive completion evidence rather than
                     # an unreadable cgroup.
                     if not control_group:
+                        if reclaim_notified:
+                            return (
+                                ExecutionWorkloadStatus.STOPPED,
+                                "systemd service exited after graceful reclaim notice",
+                            )
                         return ExecutionWorkloadStatus.SUCCEEDED, "systemd service completed successfully"
                     try:
                         cgroup_has_processes = self._cgroup_processes_reader(control_group)
@@ -1393,6 +1433,8 @@ class SystemdTransientServiceExecutor:
                         return ExecutionWorkloadStatus.RUNNING, "systemd service still has workload cgroup processes"
                     if cgroup_has_processes is not False:
                         return ExecutionWorkloadStatus.INDETERMINATE, _RECOVERABLE_CGROUP_INDETERMINATE
+                if reclaim_notified:
+                    return ExecutionWorkloadStatus.STOPPED, "systemd service exited after graceful reclaim notice"
                 return ExecutionWorkloadStatus.SUCCEEDED, "systemd service completed successfully"
             return ExecutionWorkloadStatus.RUNNING, "systemd service is running"
         if active == "deactivating":
@@ -1402,6 +1444,8 @@ class SystemdTransientServiceExecutor:
                 return ExecutionWorkloadStatus.STOPPED, "systemd service stopped by Eyvan"
             if main_status.strip() == str(CROSS_REGION_TRANSFER_BANNED_EXIT_CODE):
                 return self._cross_region_banned(record)
+            if reclaim_notified:
+                return ExecutionWorkloadStatus.STOPPED, "systemd service exited after graceful reclaim notice"
             if result in {"", "success"} and main_status in {"", "0"}:
                 return self._failed(record, "systemd service became inactive before Eyvan observed completion")
             return self._failed(record, f"systemd service exited with result {result or 'unknown'}")
@@ -1410,6 +1454,8 @@ class SystemdTransientServiceExecutor:
                 return ExecutionWorkloadStatus.STOPPED, "systemd service stopped by Eyvan"
             if main_status.strip() == str(CROSS_REGION_TRANSFER_BANNED_EXIT_CODE):
                 return self._cross_region_banned(record)
+            if reclaim_notified:
+                return ExecutionWorkloadStatus.STOPPED, "systemd service exited after graceful reclaim notice"
             return self._failed(record, f"systemd service failed with result {result or 'unknown'}")
         return ExecutionWorkloadStatus.INDETERMINATE, (
             f"systemd service reported unexpected ActiveState={active or 'missing'}"
@@ -1418,6 +1464,8 @@ class SystemdTransientServiceExecutor:
     def _cross_region_banned(self, record: tp.Mapping[str, JsonValue]) -> tuple[ExecutionWorkloadStatus, str]:
         """Format a canonical exit-95 cross-region transfer ban diagnostic from unit logs."""
 
+        if _record_secret_bearing(record):
+            return ExecutionWorkloadStatus.FAILED, _SECRET_CROSS_REGION_BAN_MESSAGE
         unit_name = record.get("unit_name")
         tail = self._failure_journal_reader(unit_name) if isinstance(unit_name, str) and unit_name else None
         detail = extract_cross_region_ban_marker(tail)
@@ -1740,6 +1788,7 @@ class SystemdTransientServiceExecutor:
         if not isinstance(remote_id, str) or not remote_id:
             raise RuntimeError("systemd execution record has no remote ID")
         launch_environment = self._resolved_launch_environment({**self._base_environment, **_environment(spec)})
+        _with_cross_region_pythonpath(launch_environment, _MULTIHOST_SITE_PATH)
         notice_path, receipt_path, _mode = self._notice_file_paths(remote_id)
         launch_environment.setdefault(RECLAIM_NOTICE_PATH_ENV, str(notice_path))
         launch_environment.setdefault(CHECKPOINT_RECEIPT_PATH_ENV, str(receipt_path))
@@ -2132,14 +2181,15 @@ class SystemdTransientServiceExecutor:
                 runtime_observation = self._runtime_status(record)
                 if runtime_observation is not None:
                     status, message = runtime_observation
-                    if _record_secret_bearing(record):
-                        message = _OUTPUT_SUPPRESSED
-                    else:
-                        message = redact_secret_material(message)
+                    message = _secret_safe_message(message, suppress_diagnostics=_record_secret_bearing(record))
                     if status is ExecutionWorkloadStatus.INDETERMINATE:
                         self._mark_indeterminate(record, message)
                     else:
                         self._set_status(record, status, message)
+                        if status in _TERMINAL_STATES and not record.get("checkpoint_uri"):
+                            receipt_uri = self.read_checkpoint_uri(remote_id)
+                            if receipt_uri:
+                                record["checkpoint_uri"] = receipt_uri
                     environment_consumed = status is ExecutionWorkloadStatus.RUNNING or status in _TERMINAL_STATES
                     self._secure_terminal_collection(
                         record_path,
@@ -2170,12 +2220,15 @@ class SystemdTransientServiceExecutor:
                     self._mark_indeterminate(record, message)
                 else:
                     status, message = self._status_from_properties(record, properties)
-                    if _record_secret_bearing(record):
-                        message = _OUTPUT_SUPPRESSED
+                    message = _secret_safe_message(message, suppress_diagnostics=_record_secret_bearing(record))
                     if status is ExecutionWorkloadStatus.INDETERMINATE:
                         self._mark_indeterminate(record, message)
                     else:
                         self._set_status(record, status, message)
+                        if status in _TERMINAL_STATES and not record.get("checkpoint_uri"):
+                            receipt_uri = self.read_checkpoint_uri(remote_id)
+                            if receipt_uri:
+                                record["checkpoint_uri"] = receipt_uri
                     environment_consumed = status is ExecutionWorkloadStatus.RUNNING or status in _TERMINAL_STATES
             except _InvalidDurableRecord as exc:
                 message = _OUTPUT_SUPPRESSED if _record_secret_bearing(record) else f"invalid durable record: {exc}"
@@ -2376,8 +2429,13 @@ class SystemdTransientServiceExecutor:
         self._run(("systemctl", "kill", "--signal=SIGUSR1", "--kill-who=all", unit_name))
 
     def read_checkpoint_uri(self, remote_id: str) -> str | None:
-        """Return any checkpoint URI written to this run's checkpoint receipt file."""
+        """Return any checkpoint URI persisted on the record or written to its receipt file."""
 
+        record = _load_json(self._record_path(remote_id))
+        if record is not None:
+            stored = record.get("checkpoint_uri")
+            if isinstance(stored, str) and stored.strip():
+                return stored.strip()
         _notice_path, receipt_path, _mode = self._notice_file_paths(remote_id)
         receipt = read_checkpoint_receipt(receipt_path)
         if receipt is None:
