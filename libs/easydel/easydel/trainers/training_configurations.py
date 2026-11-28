@@ -1205,17 +1205,36 @@ def _effective_eyvan_rank(env: tp.Mapping[str, str] | None = None) -> int:
         return 0
 
 
-def _resolve_eyvan_rank_environment() -> dict[str, str] | None:
-    """Return an environment copy carrying ``JAX_PROCESS_ID`` for nonzero JAX ranks when unset.
+def _resolve_eyvan_rank_environment(*, log_all_workers: bool = False) -> dict[str, str] | None:
+    """Return an environment copy aligning Eyvan's tracking rank with ``jax.process_index()``.
 
-    Never mutates ``os.environ``. Returns ``None`` when an explicit Eyvan/JAX rank env var is
-    already present (non-empty) or when the current process is rank 0.
+    Never mutates ``os.environ``. When neither ``EYVAN_DISTRIBUTED_PROCESS_ID`` nor
+    ``JAX_PROCESS_ID`` is set, injects ``JAX_PROCESS_ID`` for nonzero JAX ranks. When an
+    explicit Eyvan/JAX rank env var is set on a multi-host cluster (``jax.process_count() > 1``
+    or ``EYVAN_JAX_CLUSTER_DETECTION=gcetpu``) and ``log_all_workers=False``, aligns the sole
+    ``jax.process_index() == 0`` logger host to rank ``0`` so GCE TPU torus-coordinate rank-0
+    hosts (which need not be VM ordinal ``w-0``) do not become silent no-op writers under
+    ``eyvan.track.start(ranks="zero")``.
     """
-    if os.environ.get("EYVAN_DISTRIBUTED_PROCESS_ID", "").strip() or os.environ.get("JAX_PROCESS_ID", "").strip():
-        return None
     try:
         proc_idx = int(jax.process_index())
     except Exception:
+        return None
+    has_explicit_rank = bool(
+        os.environ.get("EYVAN_DISTRIBUTED_PROCESS_ID", "").strip() or os.environ.get("JAX_PROCESS_ID", "").strip()
+    )
+    if has_explicit_rank:
+        if not log_all_workers and proc_idx == 0:
+            is_gcetpu = os.environ.get("EYVAN_JAX_CLUSTER_DETECTION", "").strip().lower() == "gcetpu"
+            try:
+                is_multihost = int(jax.process_count()) > 1
+            except Exception:
+                is_multihost = False
+            if is_gcetpu or is_multihost:
+                env = dict(os.environ)
+                env["EYVAN_DISTRIBUTED_PROCESS_ID"] = "0"
+                env["JAX_PROCESS_ID"] = "0"
+                return env
         return None
     if proc_idx <= 0:
         return None
@@ -4014,8 +4033,9 @@ class TrainingArguments:
             if not np.isfinite(flush_interval_s) or flush_interval_s <= 0:
                 flush_interval_s = 5.0
 
-            ranks = "all" if getattr(self, "log_all_workers", False) else "zero"
-            environment = _resolve_eyvan_rank_environment()
+            log_all_workers = bool(getattr(self, "log_all_workers", False))
+            ranks = "all" if log_all_workers else "zero"
+            environment = _resolve_eyvan_rank_environment(log_all_workers=log_all_workers)
             effective_rank = _effective_eyvan_rank(environment)
             will_write = ranks == "all" or effective_rank == 0
             try:

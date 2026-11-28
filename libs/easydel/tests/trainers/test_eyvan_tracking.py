@@ -398,6 +398,23 @@ def test_eyvan_run_name_fallback_and_multihost_ranks(monkeypatch, tmp_path):
     assert run_r1.active is True
     args_rank1_all.close_eyvan_track()
 
+    # On multi-host GCE TPU pods (gcetpu), jax.process_index()==0 can reside on a non-zero VM ordinal
+    # (e.g. w-1 carrying EYVAN_DISTRIBUTED_PROCESS_ID="1"). The sole can_log_metrics host must still
+    # start an active rank-0 Eyvan tracking run without mutating os.environ.
+    monkeypatch.setattr(tc.jax, "process_index", lambda: 0)
+    monkeypatch.setattr(tc.jax, "process_count", lambda: 16)
+    monkeypatch.setenv("EYVAN_DISTRIBUTED_PROCESS_ID", "1")
+    monkeypatch.setenv("EYVAN_JAX_CLUSTER_DETECTION", "gcetpu")
+    args_gcetpu_rank0 = _make_args(use_eyvan_track=True, eyvan_track_uri=str(store_dir), log_all_workers=False)
+    assert args_gcetpu_rank0.eyvan_tracking_enabled is True
+    run_gcetpu = args_gcetpu_rank0.get_eyvan_track()
+    assert run_gcetpu is not None
+    assert run_gcetpu.rank == 0
+    assert run_gcetpu.active is True
+    assert run_gcetpu.episodes_active is True
+    assert os.environ["EYVAN_DISTRIBUTED_PROCESS_ID"] == "1"
+    args_gcetpu_rank0.close_eyvan_track()
+
 
 def test_eyvan_bfloat16_scalar_complex_dtypes_and_special_table_cells(tmp_path):
     # ml_dtypes.bfloat16 scalar (np.generic, not np.floating) extracts cleanly; complex is rejected
