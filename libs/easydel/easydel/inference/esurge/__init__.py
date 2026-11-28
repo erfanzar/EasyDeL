@@ -125,10 +125,13 @@ from .metrics import (
     log_metrics_summary,
 )
 from .monitoring import (
+    EYVAN_TRACK_AVAILABLE,
+    EyvanMetricsExporter,
     PrometheusMetrics,
     RichConsoleMonitor,
     eSurgeMonitoringServer,
     start_console_monitor,
+    start_eyvan_tracking,
     start_monitoring_server,
     stop_monitoring,
 )
@@ -149,6 +152,7 @@ from .scheduler import (
 from .server import eSurgeApiServer
 
 __all__ = (
+    "EYVAN_TRACK_AVAILABLE",
     "AttentionSpec",
     "CacheCoordinator",
     "CacheCoordinatorNoPrefixCache",
@@ -164,6 +168,7 @@ __all__ = (
     "CompletionOutput",
     "EngineRequest",
     "EngineRequestStatus",
+    "EyvanMetricsExporter",
     "FCFSRequestQueue",
     "FullAttentionManager",
     "FullAttentionSpec",
@@ -217,6 +222,7 @@ __all__ = (
     "make_config_fingerprint",
     "resolve_service_hosts",
     "start_console_monitor",
+    "start_eyvan_tracking",
     "start_monitoring_server",
     "stop_monitoring",
 )

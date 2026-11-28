@@ -1,6 +1,6 @@
 ---
 name: release-workspace
-description: Release or publish one of the six EasyDeL uv workspace packages. Use for version bumps, dry-run releases, publish tags, standalone repo subtree mirror sync, package dependency pins, surgecore Rust/maturin releases, or pre-push release hygiene for easydel, spectrax, ejkernel, eformer, eray, or surgecore.
+description: Release or publish one of the seven EasyDeL uv workspace packages. Use for version bumps, dry-run releases, publish tags, standalone repo subtree mirror sync, package dependency pins, surgecore Rust/maturin releases, eyvan dashboard wheel staging, or pre-push release hygiene for easydel, spectrax, ejkernel, eformer, eray, surgecore, or eyvan.
 ---
 
 # Skill: Release A Workspace Package
@@ -20,48 +20,53 @@ explicit steps: `scripts/release.sh` (local bump + commit) and `scripts/publish.
 Never hand-edit package versions, `Cargo.toml`/`Cargo.lock` crate versions, or sibling dependency pins:
 
 ```bash
-scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore> <new-version> --dry-run
-scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore> <new-version>
+scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore|eyvan> <new-version> --dry-run
+scripts/release.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore|eyvan> <new-version>
 ```
 
 Operational invariants of `scripts/release.sh`:
 
 - **Clean tree required**: fails if `git status --porcelain` is non-empty (commit or stash first).
-- Maps `spectrax` to PyPI distribution `spectrax-lib` (the other 5 match their lib name).
+- Maps `spectrax` to PyPI distribution `spectrax-lib` (the other 6 match their lib name).
 - On sibling releases (`!= easydel`), syncs exact `==` pins in `libs/easydel/pyproject.toml` while preserving
   environment markers (e.g. `; sys_platform == 'linux'`).
 - On `easydel` releases, refreshes `libs/easydel/README.md` from root `README.md`.
 - On Rust crates (`libs/surgecore/Cargo.toml`), bumps `[package] version` in `Cargo.toml` and the crate's own entry in
   `Cargo.lock` via `sed` (no `cargo` required for the bump).
+- On `eyvan`, also bumps `libs/eyvan/dashboard/package.json` (`package-lock.json`) and
+  `libs/eyvan/deploy/helm/eyvan/Chart.yaml`.
 - Runs `uv lock`, stages release files, and creates a local commit `release: <dist> v<version>` — nothing leaves the
   machine.
 
-## Publish Order And `surgecore` Wheels
+## Publish Order, `surgecore` Wheels, And `eyvan` Dashboard
 
 - **Mandatory publish order**: `libs/easydel/pyproject.toml` pins exact sibling versions (`eformer==`, `ejkernel==`,
-  `eray==`, `spectrax-lib==`, `surgecore==`). Any bumped sibling MUST be published and available on PyPI **before**
-  publishing an `easydel` release that pins it.
+  `eray==`, `eyvan==`, `spectrax-lib==`, `surgecore==`). Any bumped sibling MUST be published and available on PyPI
+  **before** publishing an `easydel` release that pins it.
 - **`surgecore` CI pipeline** (`.github/workflows/publish.yaml`): pushing `surgecore-v*` skips the Python `uv build`
   job and runs `surgecore-wheels` (maturin `manylinux_2_28` for `x86_64` and `aarch64` plus macOS `arm64`, `abi3-py311`
   covering Python 3.11–3.13), `surgecore-sdist`, and `surgecore-publish`.
+- **`eyvan` CI pipeline** (`.github/workflows/publish.yaml`): pushing `eyvan-v*` runs `eyvan-publish`, which builds
+  `libs/eyvan/dashboard`, stages it into `eyvan/_dashboard` via `libs/eyvan/scripts/stage_dashboard.py`, builds the
+  wheel/sdist with `uv build --package eyvan`, verifies the staged UI with `--check`, and publishes to PyPI.
 
 ## Publish Rule (Explicit User Approval Required)
 
 Only publish when the user explicitly asks:
 
 ```bash
-scripts/publish.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore> --dry-run
-scripts/publish.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore>
+scripts/publish.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore|eyvan> --dry-run
+scripts/publish.sh <easydel|spectrax|ejkernel|eformer|eray|surgecore|eyvan>
 ```
 
 - Creates `<lib>-v<version>` and pushes **only the tag** to `origin` (triggers `.github/workflows/publish.yaml` via
   PyPI trusted publishing or `PYPI_API_TOKEN`). Push the git branch separately with `git push`. Do not invent manual
   tags.
 
-## Mirror Sync (All 5 Standalone Mirrors)
+## Mirror Sync (All 6 Standalone Mirrors)
 
 Mirrors: `spectrax` (`erfanzar/Spectrax`), `ejkernel` (`erfanzar/ejkernel`), `eformer` (`erfanzar/eformer`), `eray`
-(`erfanzar/eray`), and `surgecore` (`erfanzar/esurgecore`).
+(`erfanzar/eray`), `surgecore` (`erfanzar/esurgecore`), and `eyvan` (`erfanzar/eyvan`).
 
 ```bash
 DRY_RUN=1 scripts/subtree-sync.sh auto   # preview mirror updates

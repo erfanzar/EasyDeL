@@ -41,8 +41,8 @@ Verified script facts (`scripts/tpu_setup.sh`):
 - Installs a minimal stable Rust toolchain via `rustup` when `cargo` is missing so `libs/surgecore` builds through
   maturin (log: `/tmp/easydel-rustup.log`).
 - Runs `uv sync --all-packages --active --inexact --extra tpu --extra torch --extra lm-eval --extra profile --group dev`
-  installing all 6 workspace packages (`easydel`, `eformer`, `ejkernel`, `spectrax-lib`, `eray`, `surgecore`) and
-  verifies profile/dev tools (`xprof`, `tb-nightly`, `xprof-nightly`, `ruff`, `pytest`, `pre-commit`, `basedpyright`,
+  installing all 7 workspace packages (`easydel`, `eformer`, `ejkernel`, `spectrax-lib`, `eray`, `surgecore`, `eyvan`)
+  and verifies profile/dev tools (`xprof`, `tb-nightly`, `xprof-nightly`, `ruff`, `pytest`, `pre-commit`, `basedpyright`,
   `import-linter`).
 - Configures Ray on TPU hosts using `${REMOTE_VENV_PATH}/bin/ray` (log: `/tmp/easydel-ray-start.log`).
 - Its health check sets `ENABLE_DISTRIBUTED_INIT=0` before importing JAX.

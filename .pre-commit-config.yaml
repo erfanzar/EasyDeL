@@ -13,9 +13,9 @@ repos:
       - id: end-of-file-fixer
         stages: [pre-commit]
       - id: check-yaml
-        # The launcher template is YAML-after-substitution ({{NAME}} etc.),
+        # Launcher templates and Helm charts use template syntax ({{...}}),
         # not valid YAML as checked in.
-        exclude: ^libs/eray/eray/provision/templates/
+        exclude: ^(?:libs/eray/eray/provision/templates/|libs/eyvan/deploy/helm/eyvan/templates/)
         stages: [pre-commit]
       - id: check-json
         stages: [pre-commit]
@@ -33,6 +33,8 @@ repos:
       - id: check-merge-conflict
         stages: [pre-commit]
       - id: detect-private-key
+        # Synthetic PEM header fixtures asserting workspace bundling refuses SSH keys.
+        exclude: ^libs/eyvan/tests/test_workspace\.py$
         stages: [pre-commit]
       - id: mixed-line-ending
         stages: [pre-commit]
@@ -168,6 +170,15 @@ repos:
         types: [python]
         files: ^libs/surgecore/
         stages: [pre-commit]
+      - id: ruff-eyvan
+        name: ruff lint+fix (libs/eyvan)
+        description: Lints and auto-fixes libs/eyvan with its own ruff config
+        entry: ruff check --fix --config libs/eyvan/pyproject.toml --config 'lint.isort.known-first-party=["eyvan","tests"]'
+        language: python
+        additional_dependencies: ["ruff==0.15.16"]
+        types: [python]
+        files: ^libs/eyvan/
+        stages: [pre-commit]
       - id: cargo-fmt-surgecore
         name: cargo fmt --check (libs/surgecore)
         description: Checks that the Rust sources of libs/surgecore are rustfmt-clean (needs cargo on PATH)
@@ -224,9 +235,17 @@ repos:
         files: ^libs/surgecore/pyproject\.toml$
         pass_filenames: false
         stages: [pre-push]
+      - id: uv-lock-eyvan
+        name: uv.lock fresh for libs/eyvan
+        description: Pushing changes to libs/eyvan/pyproject.toml requires a refreshed workspace uv.lock
+        entry: uv lock --check
+        language: system
+        files: ^libs/eyvan/pyproject\.toml$
+        pass_filenames: false
+        stages: [pre-push]
       - id: subtree-mirror-sync
         name: Push libs/* updates to standalone mirrors
-        description: Pushes spectrax/ejkernel/eformer/eray/surgecore subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
+        description: Pushes spectrax/ejkernel/eformer/eray/surgecore/eyvan subtrees to their mirror repos when they changed (SUBTREE_SYNC_SKIP=1 to bypass)
         entry: scripts/subtree-sync.sh auto
         language: system
         pass_filenames: false

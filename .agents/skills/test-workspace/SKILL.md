@@ -1,6 +1,6 @@
 ---
 name: test-workspace
-description: Select and run correct EasyDeL workspace checks. Use for affected-package test planning, accelerator (TPU/GPU) test env setup, the conftest guard that refuses computation tests on CPU (cpu_ok marker), import-layering checks, pre-commit behavior, hardware-bound test selection, Rust surgecore checks, and rejecting weak tests across libs/easydel, libs/spectrax, libs/ejkernel, libs/eformer, libs/eray, and libs/surgecore.
+description: Select and run correct EasyDeL workspace checks. Use for affected-package test planning, accelerator (TPU/GPU) test env setup, the conftest guard that refuses computation tests on CPU (cpu_ok marker), import-layering checks, pre-commit behavior, hardware-bound test selection, Rust surgecore checks, and rejecting weak tests across libs/easydel, libs/spectrax, libs/ejkernel, libs/eformer, libs/eray, libs/surgecore, and libs/eyvan.
 ---
 
 # Skill: Test The EasyDeL Workspace
@@ -39,8 +39,8 @@ runtime; `env -u XLA_FLAGS` drops stray host-device flags from the shell.
 
 ## CPU Trio (Non-Computation Tests Only)
 
-Tests that perform zero array computation (`eray`, `surgecore`, tool/reasoning parsers, config/CLI/YAML parsing, data
-text transforms, loggers, paths, `@pytest.mark.cpu_ok`) may run on CPU:
+Tests that perform zero array computation (`eray`, `surgecore`, `eyvan`, tool/reasoning parsers, config/CLI/YAML
+parsing, data text transforms, loggers, paths, `@pytest.mark.cpu_ok`) may run on CPU:
 
 ```bash
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu \
@@ -74,7 +74,9 @@ uv run pre-commit run --all-files
 ```
 
 - `lint-imports` enforces `[tool.importlinter]` in `pyproject.toml`: only `easydel` may import `spectrax`, `ejkernel`,
-  `eformer`, `eray`, and `surgecore`; the 5 sibling packages stay independent of `easydel` and of each other.
+  `eformer`, `eray`, `surgecore`, and `eyvan`; the 6 companion packages stay independent of `easydel` and of each
+  other. Inside `libs/eyvan`, `(cd libs/eyvan && uv run --no-sync lint-imports)` checks eyvan's internal control-plane
+  contracts.
 - `uv lock --check` (also enforced in pre-push hooks and `.github/workflows/uv-lock-checkup.yaml`) verifies `uv.lock`
   matches all `libs/*/pyproject.toml` files.
 - Pre-commit caveats:
@@ -116,6 +118,10 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 (cd libs/surgecore && cargo test --locked --no-default-features)
 uv build --package surgecore --wheel
 ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu uv run pytest libs/surgecore/tests
+
+# eyvan (control plane, no array compute — fast CPU smoke; full suite needs dashboard build + PostgreSQL)
+(cd libs/eyvan && uv run --no-sync lint-imports)
+(cd libs/eyvan && uv run --package eyvan --extra dev pytest tests -m fast -q)
 ```
 
 Run accelerator suites one at a time on TPU (`libtpu` lock). Pallas TPU tests under

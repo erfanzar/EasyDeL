@@ -12,10 +12,10 @@ symbols against the live tree and flag any doc discrepancies you discover.
 
 ## Required Sections (in Order)
 
-1. **Workspace packages and layering**: the six uv-workspace packages (`easydel`, `spectrax`, `ejkernel`, `eformer`,
-   `eray`, `surgecore`) plus the standalone `libs/esurge-dashboard` Rust crate, a one-line job for each, and the
-   layering contract (only `easydel` imports sibling packages; foundation libs and `surgecore` never import `easydel` or
-   each other) and why it exists.
+1. **Workspace packages and layering**: the seven uv-workspace packages (`easydel`, `spectrax`, `ejkernel`, `eformer`,
+   `eray`, `surgecore`, `eyvan`) plus the standalone `libs/esurge-dashboard` Rust crate, a one-line job for each, and the
+   layering contract (only `easydel` imports sibling packages; companion libs never import `easydel` or each other) and
+   why it exists.
 2. **Core end-to-end flows** (one short paragraph each with concrete class/module names):
    - **Model loading & forward**: `AutoEasyDeLModelForCausalLM`, HF conversion + fused layouts, `UnifiedAttention` →
      `FlexibleAttentionModule` → `OperationRegistry.create` → `ejkernel`.

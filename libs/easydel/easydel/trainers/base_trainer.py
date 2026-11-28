@@ -47,6 +47,7 @@ import os
 import pprint
 import sys
 import time
+import types
 import typing as tp
 from abc import abstractmethod
 from datetime import datetime
@@ -114,7 +115,14 @@ from .trainer_protocol import (
     TrainerConfigureModelOutput,
     TrainerOutput,
 )
-from .training_configurations import MetricsType, TrainingArguments
+from .training_configurations import (
+    MetricsType,
+    TrainingArguments,
+    _close_eyvan_run,
+    _normalize_eyvan_meta_value,
+    _sanitize_eyvan_key,
+    _to_eyvan_scalar,
+)
 from .training_utils import (
     GENERATION_MODEL_INPUT_KEYS,
     compact_generation_model_kwargs,
@@ -554,25 +562,21 @@ class BaseTrainer(BaseTrainerProtocol):
         self._preemption_checkpoint_path = None
         self._last_saved_checkpoint: tuple[int, str] | None = None
         self._tpu_preemption_sync_available = None
+        self._eyvan_reclaim_multihost_sync_available = None
+        self._eyvan_reclaim_notice = None
+        self._eyvan_resumed_from_checkpoint = None
 
         self._resumed_from_checkpoint = False
-        if self.arguments.resume_if_possible:
-            checkpoint_path = None
-            discovery_failed = False
-            try:
-                from spectrax.serialization import find_latest_checkpoint
-
-                checkpoint_path = find_latest_checkpoint(str(self.arguments._get_save_directory(create=False)))
-            except Exception as e:
-                # Nothing was found, so nothing can be overwritten: starting fresh is safe.
-                discovery_failed = True
-                checkpoint_path = None
-                logger.warning(f"Checkpoint discovery failed: {e}. Starting fresh training.")
+        checkpoint_path, resumed_from_eyvan, discovery_failed = self._discover_resume_checkpoint_path()
+        if self.arguments.resume_if_possible or resumed_from_eyvan:
             if checkpoint_path is None:
                 if not discovery_failed:
                     logger.info("No checkpoints found. Starting fresh training.")
             else:
-                logger.info(f"Found latest checkpoint: {checkpoint_path}")
+                if resumed_from_eyvan:
+                    logger.info(f"Resuming from Eyvan reclaimed checkpoint: {checkpoint_path}")
+                else:
+                    logger.info(f"Found latest checkpoint: {checkpoint_path}")
                 # A discovered but unloadable checkpoint (partial write, corruption) must not
                 # silently restart training: later saves would overwrite the real progress.
                 try:
@@ -605,6 +609,8 @@ class BaseTrainer(BaseTrainerProtocol):
                     ) from e
                 model_state = resumed_state
                 self._resumed_from_checkpoint = True
+                if resumed_from_eyvan:
+                    self._eyvan_resumed_from_checkpoint = str(checkpoint_path)
                 try:
                     self._maybe_remove_loaded_checkpoint(checkpoint_path)
                 except Exception as e:
@@ -2677,6 +2683,13 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         self.timer = getattr(self, "timer", None)
         self.wandb_runtime = getattr(self, "wandb_runtime", None)
+        self.eyvan_run = getattr(self, "eyvan_run", None)
+        self._eyvan_wall_start_t = getattr(self, "_eyvan_wall_start_t", time.monotonic())
+        self._eyvan_tokens_seen = float(getattr(self, "_eyvan_tokens_seen", 0.0))
+        self._eyvan_rollout_steps = int(getattr(self, "_eyvan_rollout_steps", 0))
+        self._eyvan_finish_status = getattr(self, "_eyvan_finish_status", None)
+        self._eyvan_checkpoints_saved = int(getattr(self, "_eyvan_checkpoints_saved", 0))
+        self._last_eval_summary_metrics = getattr(self, "_last_eval_summary_metrics", None)
         self.dataloader_train = getattr(self, "dataloader_train", None)
         self.dataloader_eval = getattr(self, "dataloader_eval", None)
         self.max_training_steps = getattr(self, "max_training_steps", None)
@@ -2713,6 +2726,9 @@ class BaseTrainer(BaseTrainerProtocol):
         self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
         self._preemption_checkpoint_path = getattr(self, "_preemption_checkpoint_path", None)
         self._tpu_preemption_sync_available = getattr(self, "_tpu_preemption_sync_available", None)
+        self._eyvan_reclaim_multihost_sync_available = getattr(self, "_eyvan_reclaim_multihost_sync_available", None)
+        self._eyvan_reclaim_notice = getattr(self, "_eyvan_reclaim_notice", None)
+        self._eyvan_resumed_from_checkpoint = getattr(self, "_eyvan_resumed_from_checkpoint", None)
 
         self._model = getattr(self, "_model", None)
         self.config = getattr(self, "config", None)
@@ -2842,49 +2858,85 @@ class BaseTrainer(BaseTrainerProtocol):
                 self._close_iterator(iterator)
             bucket_iters.clear()
 
-    def _teardown_resources(self) -> None:
-        """Release trainer-owned host and device resources (TensorBoard, Rich, iterators, eSurge, tables)."""
-        self._close_rich_progress_bar()
-        self._close_bucket_iterators()
+    def _teardown_resources(self, *, status: str | None = None) -> None:
+        """Release trainer-owned host and device resources (TensorBoard, Eyvan, Rich, iterators, eSurge, tables)."""
+        try:
+            self._close_rich_progress_bar()
+            self._close_bucket_iterators()
 
-        args = getattr(self, "arguments", None)
-        if args is not None:
-            close_tb = getattr(args, "close_tensorboard", None)
-            if callable(close_tb):
+            resolved_status = status or getattr(self, "_eyvan_finish_status", None) or "finished"
+            self._eyvan_finish_status = None
+
+            args = getattr(self, "arguments", None)
+            if args is not None:
+                close_tb = getattr(args, "close_tensorboard", None)
+                if callable(close_tb):
+                    try:
+                        close_tb()
+                    except Exception as exc:  # pragma: no cover - best-effort cleanup
+                        log_debug_maybe(f"Failed to close TensorBoard SummaryWriter: {exc}")
+                close_eyvan = getattr(args, "close_eyvan_track", None)
+                if callable(close_eyvan):
+                    try:
+                        close_eyvan(status=resolved_status)
+                    except TypeError:
+                        try:
+                            close_eyvan()
+                        except Exception as exc:  # pragma: no cover - best-effort cleanup
+                            log_debug_maybe(f"Failed to close Eyvan tracking run: {exc}")
+                    except Exception as exc:  # pragma: no cover - best-effort cleanup
+                        log_debug_maybe(f"Failed to close Eyvan tracking run: {exc}")
+
+            eyvan_run = self.__dict__.get("_eyvan_run")
+            if eyvan_run is not None:
+                self.eyvan_run = None
+                _close_eyvan_run(eyvan_run, status=resolved_status)
+
+            release_fn = getattr(self, "release_generation_runtime", None)
+            if callable(release_fn):
                 try:
-                    close_tb()
+                    release_fn(clear_esurge_compiled_cache=True)
                 except Exception as exc:  # pragma: no cover - best-effort cleanup
-                    log_debug_maybe(f"Failed to close TensorBoard SummaryWriter: {exc}")
+                    log_debug_maybe(f"Failed to release generation runtime during teardown: {exc}")
 
-        release_fn = getattr(self, "release_generation_runtime", None)
-        if callable(release_fn):
-            try:
-                release_fn(clear_esurge_compiled_cache=True)
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                log_debug_maybe(f"Failed to release generation runtime during teardown: {exc}")
+            for attr in ("preview_log_table", "benchmark_log_table", "training_generation_log_table"):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+                for suffix in ("_increments", "_rows"):
+                    counter_attr = f"_{attr}{suffix}"
+                    if hasattr(self, counter_attr):
+                        setattr(self, counter_attr, 0)
+        finally:
+            self._uninstall_eyvan_preemption_handler()
 
-        for attr in ("preview_log_table", "benchmark_log_table", "training_generation_log_table"):
-            if hasattr(self, attr):
-                setattr(self, attr, None)
-            for suffix in ("_increments", "_rows"):
-                counter_attr = f"_{attr}{suffix}"
-                if hasattr(self, counter_attr):
-                    setattr(self, counter_attr, 0)
-
-    def finish(self=None):
+    def finish(self=None, *, status: str | None = None):
         """Clean up trainer resources and finish any active logging sessions.
 
         Can be invoked either on a trainer instance (``self.finish()``) or
         directly on the class (``BaseTrainer.finish()``). Safe to call even
         when optional loggers are not initialized.
         """
-        if self is not None:
-            self._teardown_resources()
-        if wandb is not None:
-            try:
-                wandb.finish()
-            except Exception:
-                ...
+        try:
+            if self is not None:
+                if status is not None:
+                    self._eyvan_finish_status = status
+                self._teardown_resources()
+            if wandb is not None:
+                try:
+                    wandb.finish()
+                except Exception:
+                    ...
+        finally:
+            uninstall_fn = getattr(self, "_uninstall_eyvan_preemption_handler", None) if self is not None else None
+            if callable(uninstall_fn):
+                uninstall_fn()
+            else:
+                try:
+                    from easydel.utils.eyvan_helpers import uninstall_preemption_handler
+
+                    uninstall_preemption_handler()
+                except Exception as exc:  # pragma: no cover - best-effort cleanup
+                    log_debug_maybe(f"Failed to uninstall Eyvan preemption handler: {exc}")
 
     def on_step_start(
         self,
@@ -3689,10 +3741,7 @@ class BaseTrainer(BaseTrainerProtocol):
             leaves, treedef = jax.tree_util.tree_flatten(tree)
         except Exception:
             return None
-        leaf_meta = tuple(
-            (getattr(leaf, "shape", None), getattr(leaf, "dtype", None))
-            for leaf in leaves
-        )
+        leaf_meta = tuple((getattr(leaf, "shape", None), getattr(leaf, "dtype", None)) for leaf in leaves)
         return treedef, leaf_meta
 
     def _share_esurge_cache_scope_if_compatible(
@@ -4116,9 +4165,7 @@ class BaseTrainer(BaseTrainerProtocol):
         sampling_params = copy.copy(sampling_params)
         if generate_kwargs:
             _direct_overrides = {
-                k: v
-                for k, v in generate_kwargs.items()
-                if v is not None and k not in {"use_tqdm", "stream"}
+                k: v for k, v in generate_kwargs.items() if v is not None and k not in {"use_tqdm", "stream"}
             }
             if _direct_overrides and hasattr(esurge_generation, "apply_sampling_overrides"):
                 sampling_params = esurge_generation.apply_sampling_overrides(
@@ -4914,8 +4961,8 @@ class BaseTrainer(BaseTrainerProtocol):
             """Log and store completed preview generation results.
 
             Saves records to ``self.latest_generation_samples``, optionally
-            logs them to Weights & Biases, and prints completions when
-            ``generation_preview_print`` is enabled.
+            logs them to Weights & Biases and/or Eyvan, and prints completions
+            when ``generation_preview_print`` is enabled.
 
             Args:
                 records: List of dicts, each containing ``prompt``,
@@ -4925,34 +4972,14 @@ class BaseTrainer(BaseTrainerProtocol):
                 return
             self.latest_generation_samples = records
 
-            if (
-                wandb is not None
-                and getattr(args, "use_wandb", False)
-                and args.can_log_metrics
-                and args.generation_log_to_wandb
-            ):
-                incoming_rows = sum(len(record["completions"]) for record in records)
-                table = self._get_or_rotate_wandb_table(
-                    "preview_log_table",
-                    columns=["step", "prompt", "completion_id", "completion", "reasoning", "tool_calls"],
-                    incoming_rows=incoming_rows,
+            log_preview_results = getattr(self, "_log_preview_results", None)
+            if callable(log_preview_results):
+                log_preview_results(
+                    step=step,
+                    records=records,
+                    no_reasoning_message=no_reasoning_message,
+                    no_tools_message=no_tools_message,
                 )
-                for record in records:
-                    prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
-                    reasoning = record.get("reasoning", [])
-                    tool_calls = record.get("tool_calls", [])
-                    for idx, completion in enumerate(record["completions"]):
-                        reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
-                        tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
-                        table.add_data(
-                            step,
-                            prompt_repr,
-                            idx,
-                            completion,
-                            reasoning_entry,
-                            tool_calls_entry,
-                        )
-                wandb.log({"preview_generations": table}, step=step)
             if args.generation_preview_print:
                 for record in records:
                     prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
@@ -5214,6 +5241,282 @@ class BaseTrainer(BaseTrainerProtocol):
 
     _WANDB_TABLE_MAX_ROWS: tp.ClassVar[int] = 1024
     _WANDB_TABLE_MAX_INCREMENTS: tp.ClassVar[int] = 50
+    _EYVAN_TABLE_MAX_ROWS: tp.ClassVar[int] = 1000
+    _EYVAN_TABLE_MAX_COLUMNS: tp.ClassVar[int] = 64
+
+    def _bind_eyvan_context(self) -> None:
+        """Attach lightweight trainer/model/environment metadata to ``self.arguments`` for Eyvan auto-config.
+
+        Pure host metadata only: never creates files, spawns threads, or rebuilds
+        ``EasyDeLState.model`` from ``GraphDef`` when ``self._model`` or
+        ``self.config`` is already available.
+        """
+        args = getattr(self, "arguments", None)
+        bind_fn = getattr(args, "_bind_eyvan_runtime_context", None) if args is not None else None
+        if not callable(bind_fn):
+            return
+        model = getattr(self, "_model", None)
+        if model is None:
+            cfg = getattr(self, "config", None)
+            if cfg is not None:
+                model = types.SimpleNamespace(config=cfg)
+            else:
+                model_state = getattr(self, "model_state", None)
+                if model_state is not None:
+                    model = getattr(model_state, "model", None)
+        env_name = getattr(self, "_eyvan_env_name", None)
+        try:
+            bind_fn(trainer=self, model=model, env_name=env_name)
+        except Exception:
+            pass
+
+    @property
+    def eyvan_run(self):
+        """Return the active Eyvan tracking run, reflecting lazy initialization on ``self.arguments``."""
+        run = self.__dict__.get("_eyvan_run")
+        if run is not None and not getattr(run, "finished", False):
+            return run
+        args = getattr(self, "arguments", None)
+        if args is not None and hasattr(args, "__dict__"):
+            cached = args.__dict__.get("_eyvan_track_run")
+            if cached is not None and not getattr(cached, "finished", False):
+                self.__dict__["_eyvan_run"] = cached
+                return cached
+        return run
+
+    @eyvan_run.setter
+    def eyvan_run(self, value) -> None:
+        self.__dict__["_eyvan_run"] = value
+
+    def _has_active_eyvan_run(self):
+        """Return an already-initialized live Eyvan run without triggering lazy startup."""
+        run = self.eyvan_run
+        if run is not None and not getattr(run, "finished", False):
+            return run
+        return None
+
+    def _ensure_eyvan_run(self):
+        """Lazily initialize and return the active Eyvan tracking run when tracking is enabled."""
+        args = getattr(self, "arguments", None)
+        if args is None or not getattr(args, "can_log_metrics", False):
+            return None
+        existing = self._has_active_eyvan_run()
+        if existing is not None:
+            return existing
+        if getattr(args, "eyvan_tracking_enabled", False):
+            self._bind_eyvan_context()
+            get_run = getattr(args, "get_eyvan_track", None)
+            if callable(get_run):
+                run = get_run()
+                if run is not None and not getattr(run, "finished", False):
+                    self.eyvan_run = run
+                    return run
+        return None
+
+    def _get_active_eyvan_run(self):
+        """Return the active Eyvan tracking run for this trainer, initializing lazily when enabled."""
+        return self._ensure_eyvan_run()
+
+    def _record_eyvan_summary_payload(self, payload: tp.Mapping[str, tp.Any]) -> None:
+        """Write sanitized summary key/value pairs to an already-active Eyvan run without raising."""
+        if not payload:
+            return
+        run = self._has_active_eyvan_run()
+        if run is None or not hasattr(run, "summary"):
+            return
+        try:
+            sanitized: dict[str, tp.Any] = {}
+            for key, value in payload.items():
+                if value is None:
+                    continue
+                norm = _normalize_eyvan_meta_value(value)
+                if norm is None:
+                    continue
+                if isinstance(norm, float) and not np.isfinite(norm):
+                    continue
+                sanitized[_sanitize_eyvan_key(key)] = norm
+            if sanitized:
+                run.summary(**sanitized)
+        except Exception as exc:
+            log_debug_maybe(f"Failed to record Eyvan summary metadata: {exc}")
+
+    def _record_eyvan_checkpoint(
+        self,
+        checkpoint_path: str,
+        step: int,
+        *,
+        is_temporary: bool = False,
+    ) -> None:
+        """Record checkpoint save metadata onto the active Eyvan run summary."""
+        if not checkpoint_path:
+            return
+        args = getattr(self, "arguments", None)
+        if args is None or not getattr(args, "can_log_metrics", False):
+            return
+        self._eyvan_checkpoints_saved = int(getattr(self, "_eyvan_checkpoints_saved", 0)) + 1
+        summary_data: dict[str, tp.Any] = {
+            "last_checkpoint_path": str(checkpoint_path),
+            "last_checkpoint_step": max(int(step), 0),
+            "checkpoints_saved": self._eyvan_checkpoints_saved,
+        }
+        if not is_temporary:
+            summary_data["checkpoint_path"] = str(checkpoint_path)
+        self._record_eyvan_summary_payload(summary_data)
+
+    def _record_eyvan_eval_summary(self, eval_metrics: tp.Mapping[str, tp.Any]) -> None:
+        """Cache and forward finite scalar evaluation summary metrics to the active Eyvan run."""
+        if not isinstance(eval_metrics, tp.Mapping):
+            return
+        finite_eval: dict[str, float] = {}
+        for key, value in eval_metrics.items():
+            if value is None:
+                continue
+            ok, scalar = _to_eyvan_scalar(value)
+            if ok and np.isfinite(scalar):
+                finite_eval[str(key)] = float(scalar)
+        if not finite_eval:
+            return
+        self._last_eval_summary_metrics = dict(finite_eval)
+        self._record_eyvan_summary_payload(finite_eval)
+
+    def _record_eyvan_final_summary(
+        self,
+        *,
+        output: tp.Any = None,
+        final_eval_metrics: tp.Mapping[str, tp.Any] | None = None,
+        run_exception: BaseException | None = None,
+    ) -> None:
+        """Record terminal step, checkpoint, throughput, and eval summary metadata before closing."""
+        if self._has_active_eyvan_run() is None:
+            return
+        summary_data: dict[str, tp.Any] = {}
+        if output is not None:
+            state = getattr(output, "state", None)
+            if state is not None:
+                raw_step = getattr(state, "step", None)
+                if raw_step is not None:
+                    try:
+                        ok_step, step_val = _to_eyvan_scalar(raw_step)
+                        if ok_step and np.isfinite(step_val):
+                            summary_data["final_step"] = max(int(step_val), 0)
+                    except Exception:
+                        pass
+            ckpt_path = getattr(output, "checkpoint_path", None)
+            if isinstance(ckpt_path, str) and ckpt_path.strip() and ckpt_path.strip() != "SAVING_SKIPPED":
+                summary_data["checkpoint_path"] = ckpt_path.strip()
+        tokens_seen = float(getattr(self, "_eyvan_tokens_seen", 0.0))
+        if np.isfinite(tokens_seen) and tokens_seen > 0.0:
+            summary_data["total_tokens_seen"] = tokens_seen
+        wall_start = getattr(self, "_eyvan_wall_start_t", None)
+        if wall_start is not None:
+            summary_data["wall_time_s"] = max(0.0, float(time.monotonic() - wall_start))
+        if run_exception is not None:
+            summary_data["stop_reason"] = type(run_exception).__name__
+        eval_source = final_eval_metrics or getattr(self, "_last_eval_summary_metrics", None)
+        if isinstance(eval_source, tp.Mapping):
+            for key, value in eval_source.items():
+                if value is None:
+                    continue
+                ok, scalar = _to_eyvan_scalar(value)
+                if ok and np.isfinite(scalar):
+                    summary_data[str(key)] = float(scalar)
+        if summary_data:
+            self._record_eyvan_summary_payload(summary_data)
+
+    def _log_table_to_eyvan(
+        self,
+        key: str,
+        columns: list[str],
+        rows: list[list[tp.Any] | tuple[tp.Any, ...]],
+        *,
+        step: int,
+    ) -> None:
+        """Record a bounded table snapshot on the active Eyvan run without raising."""
+        if not rows or not columns:
+            return
+        eyvan_run = self._get_active_eyvan_run()
+        if eyvan_run is None:
+            return
+        bounded_columns = [str(col)[:128] for col in columns[: self._EYVAN_TABLE_MAX_COLUMNS]]
+        col_count = len(bounded_columns)
+        bounded_rows: list[list[tp.Any]] = []
+        for row in rows[: self._EYVAN_TABLE_MAX_ROWS]:
+            sanitized_row: list[tp.Any] = []
+            for cell in list(row)[:col_count]:
+                if cell is None or isinstance(cell, bool | int | float | str):
+                    sanitized_row.append(cell)
+                elif isinstance(cell, np.generic):
+                    if cell.dtype == jnp.bfloat16:
+                        sanitized_row.append(float(cell))
+                    else:
+                        item = cell.item()
+                        if isinstance(item, bool | int | float | str):
+                            sanitized_row.append(item)
+                        else:
+                            sanitized_row.append(self._wandb_stringify_generation_value(item))
+                else:
+                    sanitized_row.append(self._wandb_stringify_generation_value(cell))
+            bounded_rows.append(sanitized_row)
+        try:
+            eyvan_run.table(
+                key,
+                bounded_rows,
+                columns=bounded_columns,
+                step=max(int(step), 0),
+            )
+        except Exception as exc:
+            log_debug_maybe(f"Failed to log table {key!r} to Eyvan: {exc}")
+
+    def _log_preview_results(
+        self,
+        *,
+        step: int,
+        records: list[dict[str, tp.Any]],
+        no_reasoning_message: str = "No reasoning content ...",
+        no_tools_message: str = "No tools were called ...",
+    ) -> None:
+        """Log preview generation records to Weights & Biases and/or Eyvan tables."""
+        args = getattr(self, "arguments", None)
+        if args is None or not records or not getattr(args, "can_log_metrics", False):
+            return
+        log_wandb = (
+            wandb is not None and getattr(args, "use_wandb", False) and getattr(args, "generation_log_to_wandb", True)
+        )
+        eyvan_run = self._get_active_eyvan_run()
+        if not log_wandb and eyvan_run is None:
+            return
+        columns = ["step", "prompt", "completion_id", "completion", "reasoning", "tool_calls"]
+        rows: list[tuple[tp.Any, ...]] = []
+        for record in records:
+            prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+            reasoning = record.get("reasoning", [])
+            tool_calls = record.get("tool_calls", [])
+            for idx, completion in enumerate(record["completions"]):
+                reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
+                tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
+                rows.append(
+                    (
+                        step,
+                        prompt_repr,
+                        idx,
+                        completion,
+                        reasoning_entry,
+                        tool_calls_entry,
+                    )
+                )
+        if not rows:
+            return
+        if log_wandb:
+            table = self._get_or_rotate_wandb_table(
+                "preview_log_table",
+                columns=columns,
+                incoming_rows=len(rows),
+            )
+            for row in rows:
+                table.add_data(*row)
+            wandb.log({"preview_generations": table}, step=step)
+        if eyvan_run is not None:
+            self._log_table_to_eyvan("preview_generations", columns, rows, step=step)
 
     def _get_or_rotate_wandb_table(
         self,
@@ -5259,10 +5562,14 @@ class BaseTrainer(BaseTrainerProtocol):
         step: int,
         benchmark_results: dict[str, dict[str, tp.Any]],
     ) -> None:
-        """Log benchmark summaries to W&B as a bounded incremental table."""
+        """Log benchmark summaries to W&B and/or Eyvan as bounded tables."""
 
         args = self.arguments
-        if args is None or wandb is None or not getattr(args, "use_wandb", False) or not args.can_log_metrics:
+        if args is None or not args.can_log_metrics:
+            return
+        log_wandb = wandb is not None and getattr(args, "use_wandb", False)
+        eyvan_run = self._get_active_eyvan_run()
+        if not log_wandb and eyvan_run is None:
             return
 
         pending_rows: list[tuple[int, str, str, str, float]] = []
@@ -5284,14 +5591,18 @@ class BaseTrainer(BaseTrainerProtocol):
                     pending_rows.append((step, benchmark_name, str(task_name), str(metric_name), numeric_value))
 
         if pending_rows:
-            table = self._get_or_rotate_wandb_table(
-                "benchmark_log_table",
-                columns=["step", "benchmark", "task", "metric", "value"],
-                incoming_rows=len(pending_rows),
-            )
-            for row in pending_rows:
-                table.add_data(*row)
-            wandb.log({"benchmark_results": table}, step=step)
+            columns = ["step", "benchmark", "task", "metric", "value"]
+            if log_wandb:
+                table = self._get_or_rotate_wandb_table(
+                    "benchmark_log_table",
+                    columns=columns,
+                    incoming_rows=len(pending_rows),
+                )
+                for row in pending_rows:
+                    table.add_data(*row)
+                wandb.log({"benchmark_results": table}, step=step)
+            if eyvan_run is not None:
+                self._log_table_to_eyvan("benchmark_results", columns, pending_rows, step=step)
 
     @staticmethod
     def _wandb_stringify_generation_value(value: tp.Any) -> str | None:
@@ -5320,21 +5631,28 @@ class BaseTrainer(BaseTrainerProtocol):
         tool_calls: list[tp.Any] | tuple[tp.Any, ...] | None = None,
         source: str = "policy",
     ) -> None:
-        """Log rollout generations used for training to an incremental W&B table."""
+        """Log rollout generations used for training to W&B and/or Eyvan tables."""
         args = self.arguments
-        if (
-            args is None
-            or wandb is None
-            or not getattr(args, "use_wandb", False)
-            or not args.can_log_metrics
-            or not args.log_training_generations_to_wandb
-        ):
+        if args is None or not getattr(args, "can_log_metrics", False):
+            return
+        log_wandb = (
+            wandb is not None
+            and getattr(args, "use_wandb", False)
+            and getattr(args, "log_training_generations_to_wandb", True)
+        )
+        eyvan_run = self._get_active_eyvan_run()
+        if not log_wandb and eyvan_run is None:
             return
 
         if hasattr(prompts, "shape"):
-            prompt_ids = np.asarray(jax.device_get(prompts))
+            prompt_ids = np.asarray(jax.device_get(prompts) if isinstance(prompts, jax.Array) else prompts)
             prompt_attention_mask = (
-                None if prompt_mask is None else np.asarray(jax.device_get(prompt_mask), dtype=np.int32)
+                None
+                if prompt_mask is None
+                else np.asarray(
+                    jax.device_get(prompt_mask) if isinstance(prompt_mask, jax.Array) else prompt_mask,
+                    dtype=np.int32,
+                )
             )
             prompt_rows = self._decode_prompt_batch(
                 self.processing_class,
@@ -5352,9 +5670,16 @@ class BaseTrainer(BaseTrainerProtocol):
         if completions is None:
             if completion_ids is None:
                 return
-            host_completion_ids = np.asarray(jax.device_get(completion_ids))
+            host_completion_ids = np.asarray(
+                jax.device_get(completion_ids) if isinstance(completion_ids, jax.Array) else completion_ids
+            )
             host_completion_mask = (
-                None if completion_mask is None else np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                None
+                if completion_mask is None
+                else np.asarray(
+                    jax.device_get(completion_mask) if isinstance(completion_mask, jax.Array) else completion_mask,
+                    dtype=np.int32,
+                )
             )
             completion_rows = self._decode_prompt_batch(
                 self.processing_class,
@@ -5371,9 +5696,16 @@ class BaseTrainer(BaseTrainerProtocol):
                 self._wandb_stringify_generation_value(completion) or "<completion>" for completion in completions
             ]
         if not completion_rows and completion_ids is not None:
-            host_completion_ids = np.asarray(jax.device_get(completion_ids))
+            host_completion_ids = np.asarray(
+                jax.device_get(completion_ids) if isinstance(completion_ids, jax.Array) else completion_ids
+            )
             host_completion_mask = (
-                None if completion_mask is None else np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                None
+                if completion_mask is None
+                else np.asarray(
+                    jax.device_get(completion_mask) if isinstance(completion_mask, jax.Array) else completion_mask,
+                    dtype=np.int32,
+                )
             )
             completion_rows = self._decode_prompt_batch(
                 self.processing_class,
@@ -5386,44 +5718,59 @@ class BaseTrainer(BaseTrainerProtocol):
 
         if completion_lengths is None and completion_mask is not None:
             completion_lengths = jnp.sum(jnp.asarray(completion_mask), axis=-1)
-        length_rows = None if completion_lengths is None else np.asarray(jax.device_get(completion_lengths)).reshape(-1)
+        length_rows = (
+            None
+            if completion_lengths is None
+            else np.asarray(
+                jax.device_get(completion_lengths) if isinstance(completion_lengths, jax.Array) else completion_lengths
+            ).reshape(-1)
+        )
 
-        cur_step = int(jax.device_get(state.step))
+        raw_step = getattr(state, "step", 0)
+        cur_step = int(jax.device_get(raw_step) if isinstance(raw_step, jax.Array) else raw_step)
         reasoning = list(reasoning or [])
         tool_calls = list(tool_calls or [])
         paired_rows = list(zip(prompt_rows, completion_rows, strict=False))
-        table = self._get_or_rotate_wandb_table(
-            "training_generation_log_table",
-            columns=[
-                "step",
-                "source",
-                "sample_idx",
-                "prompt",
-                "completion",
-                "completion_length",
-                "generation_time",
-                "reasoning",
-                "tool_calls",
-            ],
-            incoming_rows=len(paired_rows),
-        )
-
+        columns = [
+            "step",
+            "source",
+            "sample_idx",
+            "prompt",
+            "completion",
+            "completion_length",
+            "generation_time",
+            "reasoning",
+            "tool_calls",
+        ]
+        table_rows: list[tuple[tp.Any, ...]] = []
         for idx, (prompt, completion) in enumerate(paired_rows):
             reason = reasoning[idx] if idx < len(reasoning) else None
             tools = tool_calls[idx] if idx < len(tool_calls) else None
             completion_length = None if length_rows is None or idx >= len(length_rows) else float(length_rows[idx])
-            table.add_data(
-                cur_step,
-                source,
-                idx,
-                prompt,
-                completion,
-                completion_length,
-                generation_time,
-                self._wandb_stringify_generation_value(reason),
-                self._wandb_stringify_generation_value(tools),
+            table_rows.append(
+                (
+                    cur_step,
+                    source,
+                    idx,
+                    prompt,
+                    completion,
+                    completion_length,
+                    generation_time,
+                    self._wandb_stringify_generation_value(reason),
+                    self._wandb_stringify_generation_value(tools),
+                )
             )
-        wandb.log({"training_generations": table}, step=cur_step)
+        if log_wandb:
+            table = self._get_or_rotate_wandb_table(
+                "training_generation_log_table",
+                columns=columns,
+                incoming_rows=len(table_rows),
+            )
+            for row in table_rows:
+                table.add_data(*row)
+            wandb.log({"training_generations": table}, step=cur_step)
+        if eyvan_run is not None and table_rows:
+            self._log_table_to_eyvan("training_generations", columns, table_rows, step=cur_step)
 
     def _all_gather(self, arr: jax.Array | np.ndarray) -> jax.Array:
         """Gather array from all devices to a single replicated array.
@@ -5480,6 +5827,7 @@ class BaseTrainer(BaseTrainerProtocol):
             ("configure_dataloaders", self._configure_dataloaders),
             ("configure_model", self._configure_model),
             ("configure_state", self._configure_state),
+            ("bind_eyvan_context", self._bind_eyvan_context),
             ("configure_buckets", self._configure_buckets),
             ("configure_eval_config_override", self._configure_eval_config_override),
             ("configure_functions", self._configure_functions),
@@ -5502,6 +5850,10 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         if getattr(self.arguments, "use_wandb", False):
             self.wandb_runtime = self.arguments.get_wandb_init()
+
+    def _initialize_eyvan_track(self):
+        """Explicitly initialize Eyvan experiment tracking (normally deferred until ``train()`` / first log)."""
+        return self._ensure_eyvan_run()
 
     def _initialize_timer(self):
         """Initialize the timer for performance monitoring.
@@ -5536,6 +5888,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 dataset_configurations = self.configure_dataloaders()
                 self.dataloader_train = dataset_configurations.dataloader_train
                 self.max_training_steps = dataset_configurations.max_training_steps
+                if self.max_training_steps is not None and getattr(self, "arguments", None) is not None:
+                    self.arguments.__dict__["_eyvan_total_steps"] = int(self.max_training_steps)
                 self.dataloader_eval = dataset_configurations.dataloader_eval
                 self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
         self.timer.log("configure dataloaders")
@@ -6354,7 +6708,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 else:
                     yield batch
 
-    def _create_grain_dataloader_for_dataset(self, dataset: Dataset | IterableDataset, is_train: bool) -> grain.DataLoader:
+    def _create_grain_dataloader_for_dataset(
+        self, dataset: Dataset | IterableDataset, is_train: bool
+    ) -> grain.DataLoader:
         """Create a Grain DataLoader from a Hugging Face Dataset."""
         if is_train:
             batch_size = self.training_batch_size
@@ -6973,11 +7329,15 @@ class BaseTrainer(BaseTrainerProtocol):
         )
         if saved_directory[0] is not None:
             meta = checkpointer_metadata[0] if isinstance(checkpointer_metadata[0], dict) else {}
+            is_temp_ckpt = bool(meta.get("is_temporary", False))
             # A temporary (time-policy) checkpoint is pruned later, so it must not stand in for the final save.
-            self._last_saved_checkpoint = None if meta.get("is_temporary", False) else (int(step), saved_directory[0])
+            self._last_saved_checkpoint = None if is_temp_ckpt else (int(step), saved_directory[0])
             _restore_checkpoint_metadata(saved_directory[0])
             self._cleanup_old_checkpoints()
             self._sync_checkpointer_after_callback_save(step=step)
+            record_eyvan_checkpoint = getattr(self, "_record_eyvan_checkpoint", None)
+            if callable(record_eyvan_checkpoint):
+                record_eyvan_checkpoint(saved_directory[0], step=step, is_temporary=is_temp_ckpt)
             self._dispatch_callbacks("on_save", state, checkpoint_path=saved_directory[0], step=step)
         return saved_directory[0]
 
@@ -7046,7 +7406,10 @@ class BaseTrainer(BaseTrainerProtocol):
             - Sorts by modification time to determine which are oldest
             - Queues deletion asynchronously (non-blocking)
         """
-        save_dir = ePath(self.arguments._get_save_directory())
+        raw_save_dir = self.arguments._get_save_directory()
+        if raw_save_dir is None:
+            return
+        save_dir = ePath(raw_save_dir)
         if is_remote_path(save_dir) and jax.process_index() != 0:
             return
 
@@ -7463,11 +7826,17 @@ class BaseTrainer(BaseTrainerProtocol):
         """Hook called at the start of training.
 
         Notes:
-            Sets up static metrics and records training start time.
+            Sets up static metrics, records training start time, installs the
+            graceful Eyvan preemption signal handler, and lazily starts Eyvan
+            experiment tracking when enabled.
         """
         self._train_end_callbacks_dispatched = False
+        self._eyvan_finish_status = None
+        self._last_eval_summary_metrics = None
+        self._install_eyvan_preemption_handler()
         self._setup_static_metrics()
         self._training_time_start = time.time()
+        self._ensure_eyvan_run()
 
     def start_evaluation_hook(self):
         """Hook called at the start of evaluation.
@@ -7768,7 +8137,7 @@ class BaseTrainer(BaseTrainerProtocol):
         if self._preemption_checkpoint_path is not None:
             checkpoint_path = str(self._preemption_checkpoint_path)
             filename = str(self._preemption_checkpoint_path)
-        elif self.arguments.do_last_save:
+        elif self.arguments.do_last_save and not isinstance(run_exception, EasyDeLPreemptionSignal):
             current_step = int(jax.device_get(state.step))
             last_saved = getattr(self, "_last_saved_checkpoint", None)
             if last_saved is not None and last_saved[0] == current_step:
@@ -7994,6 +8363,404 @@ class BaseTrainer(BaseTrainerProtocol):
             self._preemption_checkpoint_path = saved_path
         return saved_path
 
+    def _install_eyvan_preemption_handler(self) -> None:
+        """Install Eyvan's idempotent ``SIGUSR1``/``SIGTERM`` graceful preemption handler without raising."""
+        try:
+            from easydel.utils.eyvan_helpers import install_preemption_handler
+
+            install_preemption_handler()
+        except Exception as exc:
+            log_debug_maybe(f"Failed to install Eyvan preemption handler: {exc}")
+
+    def _uninstall_eyvan_preemption_handler(self) -> None:
+        """Uninstall Eyvan's graceful preemption signal handler and clear live signal notices without raising."""
+        try:
+            from easydel.utils.eyvan_helpers import uninstall_preemption_handler
+
+            uninstall_preemption_handler()
+        except Exception as exc:
+            log_debug_maybe(f"Failed to uninstall Eyvan preemption handler: {exc}")
+
+    @staticmethod
+    def _resolve_eyvan_resume_checkpoint_uri() -> str | None:
+        """Return an explicit Eyvan reclaimed-attempt resume checkpoint URI, or ``None``."""
+        try:
+            from easydel.utils.eyvan_helpers import resume_checkpoint_uri
+
+            uri = resume_checkpoint_uri()
+        except Exception as exc:
+            log_debug_maybe(f"Failed to resolve Eyvan resume checkpoint URI: {exc}")
+            return None
+        if isinstance(uri, str):
+            cleaned = uri.strip()
+            return cleaned or None
+        return None
+
+    def _discover_resume_checkpoint_path(self) -> tuple[str | None, bool, bool]:
+        """Resolve the checkpoint path to resume from during trainer initialization.
+
+        Prioritizes an explicit Eyvan reclaim resume handoff URI (from
+        :func:`easydel.utils.eyvan_helpers.resume_checkpoint_uri`) before falling
+        back to discovering the latest checkpoint under ``arguments.save_directory``.
+
+        Returns:
+            A 3-tuple ``(checkpoint_path, resumed_from_eyvan, discovery_failed)``.
+        """
+        eyvan_resume_uri = self._resolve_eyvan_resume_checkpoint_uri()
+        if eyvan_resume_uri is not None:
+            resolved_uri = eyvan_resume_uri
+            try:
+                from spectrax.serialization import find_latest_checkpoint
+
+                latest_child = find_latest_checkpoint(eyvan_resume_uri)
+                if isinstance(latest_child, str) and latest_child.strip():
+                    resolved_uri = latest_child.strip()
+            except Exception:
+                # Concrete checkpoint directories (e.g. ``.../run-42``) or remote URIs
+                # are passed directly to ``EasyDeLState.load_state``.
+                pass
+            return resolved_uri, True, False
+
+        if not getattr(self.arguments, "resume_if_possible", False):
+            return None, False, False
+
+        try:
+            from spectrax.serialization import find_latest_checkpoint
+
+            save_dir = self.arguments._get_save_directory(create=False)
+            if save_dir is None:
+                return None, False, False
+            return find_latest_checkpoint(str(save_dir)), False, False
+        except Exception as exc:
+            # Nothing was found, so nothing can be overwritten: starting fresh is safe.
+            logger.warning(f"Checkpoint discovery failed: {exc}. Starting fresh training.")
+            return None, False, True
+
+    @staticmethod
+    def _can_use_multihost_collectives() -> bool:
+        """Return ``True`` when the active JAX backend supports multi-host collectives safely."""
+        try:
+            return jax.default_backend() != "cpu"
+        except Exception:
+            return False
+
+    def _coordinate_eyvan_reclaim_notice_multihost(self, *, step: int, local_notice: tp.Any) -> tp.Any:
+        """Synchronize an Eyvan reclaim decision and notice payload across all JAX hosts.
+
+        Prevents rank skew at step boundaries so every host in a multi-host gang
+        stops on the exact same step and receives the same ``checkpoint_uri`` /
+        reclaim metadata even if the notice file arrived a few milliseconds late
+        on peer hosts.
+        """
+        from easydel.utils.eyvan_helpers import _parse_preemption_notice_payload, _serialize_preemption_notice
+
+        try:
+            from jax.experimental import multihost_utils
+
+            local_flag = np.asarray(1 if local_notice is not None else 0, dtype=np.int32)
+            flags = np.asarray(multihost_utils.process_allgather(local_flag))
+            if not bool(np.any(flags != 0)):
+                return None
+
+            source_rank = int(np.flatnonzero(flags != 0)[0])
+            is_source = int(jax.process_index()) == source_rank
+            if is_source and local_notice is not None:
+                encoded = json.dumps(_serialize_preemption_notice(local_notice), sort_keys=True).encode("utf-8")
+            else:
+                encoded = b""
+            length_arr = np.asarray(len(encoded), dtype=np.int64)
+            synced_len = int(np.asarray(multihost_utils.broadcast_one_to_all(length_arr, is_source=is_source)))
+            if synced_len > 0:
+                buf = np.zeros((synced_len,), dtype=np.uint8)
+                if is_source and encoded:
+                    buf[:] = np.frombuffer(encoded, dtype=np.uint8)
+                synced_buf = np.asarray(
+                    multihost_utils.broadcast_one_to_all(buf, is_source=is_source),
+                    dtype=np.uint8,
+                )
+                if local_notice is not None:
+                    return local_notice
+                decoded = json.loads(synced_buf.tobytes().decode("utf-8"))
+                if isinstance(decoded, dict):
+                    return _parse_preemption_notice_payload(decoded)
+            return local_notice or _parse_preemption_notice_payload({"reason": "reclaim"})
+        except Exception as exc:
+            self._eyvan_reclaim_multihost_sync_available = False
+            logger.warning_once(
+                f"Eyvan multi-host reclaim coordination unavailable at step {step} "
+                f"({type(exc).__name__}: {exc}); falling back to host-local notice checks."
+            )
+            return local_notice
+
+    def _should_save_eyvan_reclaim_checkpoint(self, step: int) -> tp.Any:
+        """Return an active Eyvan :class:`PreemptionNotice` when this step must checkpoint and exit.
+
+        Performs an O(1) host-only check on single-host runs with zero XLA
+        compilation. On multi-host Eyvan accelerator gangs (``jax.process_count() > 1``),
+        coordinates across all processes to prevent step-boundary rank skew without
+        affecting CPU tests or non-Eyvan multi-host jobs.
+        """
+        from easydel.utils.eyvan_helpers import preemption_notice
+
+        try:
+            local_notice = preemption_notice()
+        except Exception as exc:
+            log_debug_maybe(f"Failed to read Eyvan preemption notice at step {step}: {exc}")
+            local_notice = None
+
+        if jax.process_count() <= 1:
+            return local_notice
+
+        if not self._can_use_multihost_collectives():
+            return local_notice
+
+        if getattr(self, "_eyvan_reclaim_multihost_sync_available", None) is False:
+            return local_notice
+
+        eyvan_managed = bool(os.environ.get("EYVAN_RECLAIM_NOTICE_PATH") or os.environ.get("EYVAN_WORKLOAD_ID"))
+        if not eyvan_managed:
+            return local_notice
+
+        return self._coordinate_eyvan_reclaim_notice_multihost(step=step, local_notice=local_notice)
+
+    def _resolve_eyvan_reclaim_checkpoint_target(self, notice: tp.Any) -> tuple[str | None, bool]:
+        """Resolve ``(target_directory, is_override)`` for an Eyvan graceful reclaim checkpoint.
+
+        Prefers ``arguments.save_directory`` when configured and durable (remote
+        URI or configured local directory when the notice carries no override URI).
+        Falls back cleanly to ``notice.checkpoint_uri`` or
+        ``arguments.resolve_eyvan_storage_path("checkpoints", run_name)`` without
+        raising when storage resolution is unavailable.
+        """
+        raw_save_dir = getattr(self.arguments, "save_directory", None)
+        save_dir = str(raw_save_dir).strip() if isinstance(raw_save_dir, str | os.PathLike) else ""
+        if not save_dir:
+            save_dir = None
+
+        raw_notice_uri = getattr(notice, "checkpoint_uri", None)
+        notice_uri = raw_notice_uri.strip() if isinstance(raw_notice_uri, str) and raw_notice_uri.strip() else None
+
+        # Durable remote save_directory configured by the caller always wins.
+        if save_dir is not None and is_remote_path(save_dir):
+            return save_dir, False
+
+        # Non-durable or unset save_directory defers to an explicit notice URI when provided.
+        if notice_uri is not None:
+            return notice_uri, True
+
+        # Local save_directory configured with no notice URI override: use normal trainer save path.
+        if save_dir is not None:
+            return save_dir, False
+
+        # Best-effort fallback to Eyvan's regional GCS checkpoint bucket.
+        resolver = getattr(self.arguments, "resolve_eyvan_storage_path", None)
+        if callable(resolver):
+            run_name = None
+            resolve_run_name = getattr(self.arguments, "resolve_eyvan_run_name", None)
+            if callable(resolve_run_name):
+                try:
+                    run_name = resolve_run_name(trainer=self, model=getattr(self, "_model", None))
+                except Exception:
+                    run_name = None
+            if not run_name:
+                raw_name = getattr(self.arguments, "model_name", None) or "easydel-reclaim"
+                run_name = str(raw_name).strip().replace("/", "-") or "easydel-reclaim"
+            try:
+                resolved = resolver("checkpoints", run_name)
+                if isinstance(resolved, str) and resolved.strip():
+                    return resolved.strip(), True
+            except Exception as exc:
+                log_debug_maybe(f"Best-effort Eyvan storage fallback unavailable for reclaim checkpoint: {exc}")
+
+        return None, False
+
+    def _save_eyvan_reclaim_checkpoint(
+        self,
+        *,
+        state: EasyDeLState,
+        step: int,
+        notice: tp.Any,
+    ) -> str | None:
+        """Save a forced coordinated checkpoint for an active Eyvan reclaim notice."""
+        target_dir, is_override = self._resolve_eyvan_reclaim_checkpoint_target(notice)
+        if target_dir is None:
+            logger.warning(
+                f"Eyvan reclaim active at step {int(step)}, but no save_directory, notice.checkpoint_uri, "
+                "or Eyvan storage bucket is available; skipping checkpoint save."
+            )
+            return None
+
+        use_sync = jax.process_count() > 1 and self._can_use_multihost_collectives()
+        sync_prefix = f"eyvan-reclaim-save-{int(step)}"
+        if use_sync:
+            try:
+                from jax.experimental import multihost_utils
+
+                multihost_utils.sync_global_devices(sync_prefix + "-start")
+            except Exception as exc:
+                log_debug_maybe(f"Eyvan reclaim pre-save device sync skipped: {exc}")
+
+        merge_lora = bool(
+            getattr(
+                self.arguments,
+                "merge_lora_before_tpu_preemption_save",
+                getattr(self.arguments, "merge_lora_before_save", False),
+            )
+        )
+        prev_checkpointer = getattr(self, "checkpointer", None)
+        swapped_checkpointer = False
+        resolved_target = target_dir
+        if is_override and "://" not in resolved_target and not resolved_target.startswith(("/", "~")):
+            resolved_target = os.path.abspath(resolved_target)
+
+        saved_path: str | None = None
+        try:
+            if is_override:
+                try:
+                    from spectrax.serialization import Checkpointer
+
+                    self.checkpointer = Checkpointer(
+                        base_path=resolved_target,
+                        save_interval=None,
+                        step_policies=[],
+                    )
+                    swapped_checkpointer = True
+                except Exception as exc:
+                    log_debug_maybe(f"Failed to construct override Checkpointer for {resolved_target}: {exc}")
+            elif prev_checkpointer is None:
+                create_ckpt = getattr(self, "_create_checkpointer", None)
+                if callable(create_ckpt):
+                    try:
+                        self.checkpointer = create_ckpt()
+                        swapped_checkpointer = True
+                    except Exception as exc:
+                        log_debug_maybe(f"Failed to lazily construct Checkpointer during reclaim save: {exc}")
+
+            if getattr(self, "checkpointer", None) is not None or not is_override:
+                try:
+                    saved_path = self._save_checkpoint_for_step(
+                        state=state,
+                        step=int(step),
+                        force=True,
+                        merge_lora_before_save=merge_lora,
+                    )
+                except Exception as exc:
+                    if not is_override:
+                        raise
+                    log_debug_maybe(
+                        f"Checkpointer reclaim save to {resolved_target} failed ({exc}); "
+                        "falling back to direct _save_state."
+                    )
+                    direct_dir = str(ePath(resolved_target) / f"run-{int(step)}")
+                    saved_path = self._save_state(
+                        state=state,
+                        save_directory=direct_dir,
+                        merge_lora_before_save=merge_lora,
+                    )
+                    self._save_data_lane_state(saved_path, int(step))
+                    self._record_eyvan_checkpoint(saved_path, step=int(step), is_temporary=False)
+            else:
+                direct_dir = str(ePath(resolved_target) / f"run-{int(step)}")
+                saved_path = self._save_state(
+                    state=state,
+                    save_directory=direct_dir,
+                    merge_lora_before_save=merge_lora,
+                )
+                self._save_data_lane_state(saved_path, int(step))
+                self._record_eyvan_checkpoint(saved_path, step=int(step), is_temporary=False)
+        finally:
+            if swapped_checkpointer:
+                self.checkpointer = prev_checkpointer
+
+        if use_sync:
+            try:
+                from jax.experimental import multihost_utils
+
+                multihost_utils.sync_global_devices(sync_prefix + "-done")
+            except Exception as exc:
+                log_debug_maybe(f"Eyvan reclaim post-save device sync skipped: {exc}")
+
+        if saved_path is not None:
+            saved_path_str = str(saved_path)
+            if "://" not in saved_path_str and os.path.dirname(saved_path_str) == "":
+                base = resolved_target if is_override else self.arguments._get_save_directory(create=False)
+                if base is not None:
+                    saved_path_str = str(ePath(base) / saved_path_str)
+            saved_path = saved_path_str
+            self._preemption_checkpoint_path = saved_path
+        return saved_path
+
+    def _handle_eyvan_reclaim_preemption(
+        self,
+        *,
+        state: EasyDeLState,
+        step: int,
+        notice: tp.Any,
+    ) -> EasyDeLPreemptionSignal:
+        """Log, checkpoint, acknowledge, flush Eyvan tracking, and return a preemption signal."""
+        from easydel.utils.eyvan_helpers import acknowledge_checkpoint
+
+        self._eyvan_reclaim_notice = notice
+        requested_by = getattr(notice, "requested_by", None) or "unknown"
+        reason = getattr(notice, "reason", None) or "reclaim"
+        policy = getattr(notice, "policy", None) or "requeue"
+        try:
+            remaining_s = max(0.0, float(getattr(notice, "remaining_seconds", 0.0)))
+        except Exception:
+            remaining_s = 0.0
+
+        if jax.process_index() == 0 or getattr(self.arguments, "log_all_workers", False):
+            logger.warning(
+                f"Eyvan reclaim notice active at step {int(step)} "
+                f"(requested_by={requested_by}, reason={reason}, "
+                f"remaining_seconds={remaining_s:.1f}s, policy={policy}). "
+                "Saving coordinated checkpoint and exiting gracefully."
+            )
+
+        saved_path: str | None = None
+        save_error: Exception | None = None
+        try:
+            saved_path = self._save_eyvan_reclaim_checkpoint(state=state, step=int(step), notice=notice)
+        except Exception as exc:
+            save_error = exc
+            logger.error(f"Failed to save Eyvan reclaim checkpoint at step {int(step)}: {exc}")
+
+        if saved_path is not None:
+            try:
+                acknowledge_checkpoint(saved_path, step=int(step))
+            except Exception as exc:
+                logger.warning(f"Failed to acknowledge Eyvan reclaim checkpoint {saved_path}: {exc}")
+
+        reclaim_summary: dict[str, tp.Any] = {
+            "reclaim_step": int(step),
+            "reclaimed_by": str(requested_by),
+            "reclaim_reason": str(reason),
+            "reclaim_policy": str(policy),
+        }
+        if saved_path is not None:
+            reclaim_summary["reclaim_checkpoint"] = str(saved_path)
+        elif save_error is not None:
+            reclaim_summary["reclaim_checkpoint_error"] = f"{type(save_error).__name__}: {save_error}"
+
+        self._eyvan_finish_status = "aborted"
+        self._record_eyvan_summary_payload(reclaim_summary)
+        active_run = self._has_active_eyvan_run()
+        if active_run is not None and hasattr(active_run, "flush"):
+            try:
+                active_run.flush()
+            except Exception as exc:
+                log_debug_maybe(f"Failed to flush Eyvan run on reclaim exit: {exc}")
+
+        if saved_path is not None:
+            return EasyDeLPreemptionSignal(
+                f"Eyvan reclaim checkpoint saved at step {int(step)} "
+                f"(requested_by={requested_by}, reason={reason}, policy={policy}, path={saved_path})"
+            )
+        return EasyDeLPreemptionSignal(
+            f"Eyvan reclaim requested at step {int(step)} "
+            f"(requested_by={requested_by}, reason={reason}, policy={policy})"
+        )
+
     def create_progress_bar(
         self,
         total: int,
@@ -8071,6 +8838,77 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         return self.arguments.log_watchers(state=state, step=step)
 
+    def _build_eyvan_axes(
+        self,
+        metrics: MetricsType,
+        *,
+        mode: str = "train",
+        axes: tp.Mapping[str, float | int] | None = None,
+    ) -> dict[str, float | int]:
+        """Compute automatic ``wall_s`` and cumulative ``tokens`` axes merged with caller ``axes``."""
+        wall_start = getattr(self, "_eyvan_wall_start_t", None)
+        if wall_start is None:
+            wall_start = time.monotonic()
+            self._eyvan_wall_start_t = wall_start
+        tokens_seen = float(getattr(self, "_eyvan_tokens_seen", 0.0))
+        saw_token_metric = False
+
+        if mode == "train" and isinstance(metrics, tp.Mapping):
+            token_updated = False
+            for cum_key in ("train/tokens_seen", "tokens_seen"):
+                if cum_key in metrics and metrics[cum_key] is not None:
+                    ok, val = _to_eyvan_scalar(metrics[cum_key])
+                    if ok and np.isfinite(val) and val >= 0.0:
+                        tokens_seen = max(tokens_seen, float(val))
+                        self._eyvan_tokens_seen = tokens_seen
+                        saw_token_metric = True
+                        token_updated = True
+                        break
+            if not token_updated:
+                for step_key in (
+                    "tokens_per_step",
+                    "train/tokens_per_step",
+                    "agent_flow/action_tokens",
+                    "train/agent_flow/action_tokens",
+                    "num_items_in_batch",
+                    "train/num_items_in_batch",
+                ):
+                    if step_key in metrics and metrics[step_key] is not None:
+                        ok, val = _to_eyvan_scalar(metrics[step_key])
+                        if ok and np.isfinite(val) and val >= 0.0:
+                            tokens_seen += float(val)
+                            self._eyvan_tokens_seen = tokens_seen
+                            saw_token_metric = True
+                            token_updated = True
+                            break
+            if not token_updated:
+                for fallback_cum_key in ("train/visited_tokens", "visited_tokens"):
+                    if fallback_cum_key in metrics and metrics[fallback_cum_key] is not None:
+                        ok, val = _to_eyvan_scalar(metrics[fallback_cum_key])
+                        if ok and np.isfinite(val) and val >= 0.0:
+                            tokens_seen = max(tokens_seen, float(val))
+                            self._eyvan_tokens_seen = tokens_seen
+                            saw_token_metric = True
+                            token_updated = True
+                            break
+            if (
+                not token_updated
+                and "performance/total_tokens" in metrics
+                and metrics["performance/total_tokens"] is not None
+            ):
+                ok, val = _to_eyvan_scalar(metrics["performance/total_tokens"])
+                if ok and np.isfinite(val) and val >= 0.0:
+                    tokens_seen += float(val)
+                    self._eyvan_tokens_seen = tokens_seen
+                    saw_token_metric = True
+
+        merged_axes: dict[str, float | int] = {"wall_s": max(0.0, float(time.monotonic() - wall_start))}
+        if saw_token_metric or tokens_seen > 0.0:
+            merged_axes["tokens"] = tokens_seen
+        if axes is not None:
+            merged_axes.update(axes)
+        return merged_axes
+
     def log_metrics(
         self,
         metrics: MetricsType,
@@ -8081,11 +8919,12 @@ class BaseTrainer(BaseTrainerProtocol):
         update_progress: bool = True,
         log_to_backends: bool = True,
         force_report: bool = False,
+        axes: tp.Mapping[str, float | int] | None = None,
     ):
         """Log metrics to configured backends and update the progress bar.
 
         Metrics are logged at intervals defined by log_steps (for progress bar)
-        and report_steps (for W&B/TensorBoard). Gradient-norm metrics are
+        and report_steps (for W&B/TensorBoard/Eyvan). Gradient-norm metrics are
         filtered from the progress bar display.
 
         Args:
@@ -8096,8 +8935,11 @@ class BaseTrainer(BaseTrainerProtocol):
             update_progress: Whether to update the local progress bar.
             log_to_backends: Whether to forward metrics to external trackers.
             force_report: Whether to bypass ``report_steps`` gating.
+            axes: Optional extra x-axis values merged on top of automatic
+                ``wall_s`` and cumulative ``tokens`` axes for Eyvan tracking.
         """
 
+        merged_axes = self._build_eyvan_axes(metrics, mode=mode, axes=axes)
         log_steps = getattr(self.arguments, "log_steps", 1)
         report_steps = getattr(self.arguments, "report_steps", 1)
         if update_progress and log_steps and log_steps > 0 and step % log_steps == 0:
@@ -8112,4 +8954,6 @@ class BaseTrainer(BaseTrainerProtocol):
             update_size = 0 if step == 0 else log_steps
             pbar.update(update_size)
         if log_to_backends and (force_report or (report_steps and report_steps > 0 and step % report_steps == 0)):
-            self.arguments.log_metrics(metrics=metrics, step=step)
+            if getattr(self.arguments, "eyvan_tracking_enabled", False):
+                self._ensure_eyvan_run()
+            self.arguments.log_metrics(metrics=metrics, step=step, axes=merged_axes)

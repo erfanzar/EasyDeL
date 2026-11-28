@@ -1,0 +1,38 @@
+# Apply this file before the migration Job. Secrets are deliberately external:
+# provision `eyvan-secrets` and `eyvan-agent-secrets` in this namespace before
+# starting the migration; docs/install.md lists every required key.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eyvan-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eyvan-platform
+  namespace: eyvan-system
+data:
+  platform.yaml: |
+    version: 1
+    agents:
+      default:
+        endpoint: http://eyvan-cell-agent.eyvan-system.svc.cluster.local:8090
+---
+# Replace PROJECT_ID before applying these examples, or remove the annotations
+# when the target cluster does not use GKE Workload Identity. The control plane
+# needs its own identity for the configured GCS artifact store.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+  annotations:
+    iam.gke.io/gcp-service-account: eyvan-control-plane@PROJECT_ID.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eyvan-cell-agent
+  namespace: eyvan-system
+  annotations:
+    iam.gke.io/gcp-service-account: eyvan-cell-agent@PROJECT_ID.iam.gserviceaccount.com

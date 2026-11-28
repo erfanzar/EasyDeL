@@ -1,0 +1,103 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: eyvan-control-plane
+  namespace: {{ include "eyvan.namespace" . }}
+spec:
+  # The control plane is what releases capacity. While it is down every cell in
+  # the fleet keeps billing and nothing reclaims them, so a drain must never
+  # take the last replica.
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: eyvan-control-plane
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eyvan-control-plane
+  namespace: {{ include "eyvan.namespace" . }}
+spec:
+  podSelector:
+    matchLabels:
+      app: eyvan-control-plane
+  policyTypes: [Ingress]
+  ingress:
+    # Same-namespace clients need the explicit pod grant. Cross-namespace
+    # workers must match both the exact worker namespace and the same pod label;
+    # NetworkPolicyPeer fields are ANDed, while separate peers are ORed.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.apiClientLabel }}: "true"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "eyvan.workerNamespace" . | quote }}
+          podSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.apiClientLabel }}: "true"
+        {{- if and .Values.cellAgent.enabled (eq (include "eyvan.capacityBackend" .) "kubernetes") (ne .Values.networkPolicy.apiClientLabel "eyvan.dev/api-client") }}
+        # Generated Kubernetes workers always carry this canonical label. Keep
+        # their exact-namespace grant independent of the external-client label.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "eyvan.workerNamespace" . | quote }}
+          podSelector:
+            matchLabels:
+              eyvan.dev/api-client: "true"
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    # `/metrics` and the API share TCP 8080, so NetworkPolicy cannot distinguish
+    # their paths. The separate selector narrows socket access; the required
+    # metrics bearer and API authentication remain the authorization boundary.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.metricsScraperLabel }}: "true"
+        - namespaceSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.metricsScraperLabel }}: "true"
+          podSelector:
+            matchLabels:
+              {{ .Values.networkPolicy.metricsScraperLabel }}: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
+{{- if .Values.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: eyvan-control-plane
+  namespace: {{ include "eyvan.namespace" . }}
+  labels:
+    {{- include "eyvan.controlPlaneLabels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: eyvan-control-plane
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scheme: {{ ternary "https" "http" (ne .Values.controlPlane.tls.existingSecret "") }}
+      {{- if .Values.controlPlane.tls.existingSecret }}
+      tlsConfig:
+        ca:
+          secret:
+            name: {{ required "serviceMonitor.tls.caSecretName is required when the monitored listener uses TLS" (.Values.serviceMonitor.tls.caSecretName | trim) | quote }}
+            key: {{ required "serviceMonitor.tls.caSecretKey is required when the monitored listener uses TLS" (.Values.serviceMonitor.tls.caSecretKey | trim) | quote }}
+        serverName: {{ required "serviceMonitor.tls.serverName is required when the monitored listener uses TLS" (.Values.serviceMonitor.tls.serverName | trim) | quote }}
+      {{- end }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .Values.existingSecret }}
+          key: metrics-token
+{{- end }}

@@ -20,14 +20,15 @@ adds the repository knowledge you review against.
    - Focused pytest on an accelerator:
      - TPU: `env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu`
      - GPU: `env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`
-     - Use the CPU trio ONLY for pure-Python/Rust non-computation tests (`eray`, `surgecore`, parsers, configs,
+     - Use the CPU trio ONLY for pure-Python/Rust non-computation tests (`eray`, `surgecore`, `eyvan`, parsers, configs,
        `@pytest.mark.cpu_ok`). Without an accelerator, state that tests were not run and report computation claims as
        **unverified on hardware**.
 
 ## What to flag (grounded in this repo)
 
-- **Layering violations**: foundation libs (`spectrax`, `ejkernel`, `eformer`, `eray`, `surgecore`) importing `easydel`
-  or each other (enforced by `[tool.importlinter]` in `pyproject.toml`).
+- **Layering violations**: companion libs (`spectrax`, `ejkernel`, `eformer`, `eray`, `surgecore`, `eyvan`) importing
+  `easydel` or each other (enforced by `[tool.importlinter]` in `pyproject.toml`, plus `libs/eyvan/.importlinter` for
+  eyvan internals).
 - **New `os.environ` knobs**: Golden Rule forbids introducing new env vars; new toggles must go through config
   dataclasses, `ContextVar` scopes, or explicit setter APIs.
 - **Registry bypasses**: models not using `register_config`/`register_module` (or `_auto_register`); trainers missing

@@ -18,7 +18,7 @@ env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NA
   uv run pytest <path>
 ```
 
-The CPU trio is ONLY for pure-Python tests that do no array computation (`eray`, `surgecore` Python tests,
+The CPU trio is ONLY for pure-Python tests that do no array computation (`eray`, `surgecore`, `eyvan` Python tests,
 tool/reasoning parsers, config/CLI/YAML parsing, data text transforms, loggers, paths, docs, `@pytest.mark.cpu_ok`):
 
 ```bash
@@ -36,11 +36,12 @@ cargo test --locked --no-default-features          # or PYO3_PYTHON=<py3.11-3.13
 uv run pytest libs/surgecore/tests
 ```
 
-**How the CPU guard works**: 4 of the 6 workspace libs (`easydel`, `spectrax`, `eformer`, `ejkernel`) enforce the
+**How the CPU guard works**: 4 of the 7 workspace libs (`easydel`, `spectrax`, `eformer`, `ejkernel`) enforce the
 accelerator policy in their `conftest.py` via regex array-library import scanning (`_ARRAY_LIBRARY_IMPORT`),
 `@pytest.mark.cpu_ok`, and runtime `jax.monitoring` compile trapping (`_cpu_compile_guard`) — there is NO filename
-allow-list. `eray` (pure orchestration) and `surgecore` (Rust/Python host core, no `conftest.py`) run on CPU. A CPU
-run of a computation test is never validation — with no accelerator, report the change as **unverified on hardware**.
+allow-list. `eray` (pure orchestration), `surgecore` (Rust/Python host core, no `conftest.py`), and `eyvan` (control
+plane, no JAX compute) run on CPU. A CPU run of a computation test is never validation — with no accelerator, report
+the change as **unverified on hardware**.
 TPU hosts hold a single libtpu process lock: run one accelerator test process at a time.
 
 `ejkernel` tests live in `libs/ejkernel/test/` (singular). `libs/ejkernel/test/conftest.py` automatically ignores
@@ -63,6 +64,7 @@ are absent; `_pallas/tpu` requires a real TPU. `easydel` marks slow tests with `
 | eformer                 | `libs/eformer/tests/{escale,mpric,ops,optimizers,serialization,pytree,paths}/`                                                                                                                                                                                       |
 | eray                    | `libs/eray/tests/` (CPU trio — Ray/pod orchestration, no array compute)                                                                                                                                                                                              |
 | surgecore               | `libs/surgecore/tests/` (Python integration/golden/parity tests) + Rust unit tests (`cargo test --locked`)                                                                                                                                                           |
+| eyvan                   | `libs/eyvan/tests/` (CPU control plane tests: `(cd libs/eyvan && uv run --package eyvan --extra dev pytest tests -m fast -q)`)                                                                                                                                      |
 
 ## Authoring conventions (from `libs/easydel/tests/modules/conftest.py`)
 

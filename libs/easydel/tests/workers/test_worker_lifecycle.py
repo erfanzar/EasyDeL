@@ -14,11 +14,16 @@
 
 """Subprocess / lifecycle regression tests for the worker managers and clients (no array computation)."""
 
+import gc
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
+import weakref
 
 import pytest
 from easydel.workers.esurge.auth import AuthWorkerManager
@@ -171,3 +176,242 @@ def test_startup_timeout_flag_rejects_non_positive_values(monkeypatch, tmp_path,
     assert expected_deadline <= clock[0] < expected_deadline + 0.1
     assert process.terminated
     assert manager.tokenizer_endpoint is None
+
+
+def _save_tiny_fast_tokenizer(directory: pathlib.Path) -> str:
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    tok_obj = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]"))
+    tok_obj.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=tok_obj, unk_token="[UNK]")
+    tokenizer.save_pretrained(directory)
+    return str(directory)
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_until(predicate, *, timeout: float = 10.0, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def test_pipeline_worker_manager_real_shutdown_reaps_and_restarts(short_dir, tmp_path):
+    tok_dir = _save_tiny_fast_tokenizer(tmp_path / "tok")
+    manager = WorkerManager(
+        tok_dir,
+        tokenizer_kwargs={"local_files_only": True},
+        startup_timeout=60.0,
+        ipc_dir=str(short_dir),
+    )
+    try:
+        tok_client, detok_client = manager.start(detokenizer_max_states=8, tokenizer_endpoint=None)
+        proc = manager._tokenizer_process
+        endpoint = manager.tokenizer_endpoint
+        assert proc is not None and proc.poll() is None
+        assert endpoint is not None and endpoint.startswith("ipc://")
+        sock_path = endpoint[len("ipc://") :]
+        assert os.path.exists(sock_path)
+        assert manager.is_running is True
+        assert tok_client.tokenize("req-1", "hello world") == [1, 2]
+        assert detok_client is not None
+
+        pid = proc.pid
+        manager.shutdown()
+        assert manager.is_running is False
+        assert manager.tokenizer_endpoint is None
+        assert manager._tokenizer_process is None
+        assert proc.poll() is not None
+        assert not _pid_exists(pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        assert not os.path.exists(sock_path)
+        # Idempotent second shutdown.
+        manager.shutdown()
+
+        # Restart after shutdown spawns a fresh worker and serves normally.
+        tok_client2, _ = manager.start(detokenizer_max_states=8, tokenizer_endpoint=None)
+        proc2 = manager._tokenizer_process
+        endpoint2 = manager.tokenizer_endpoint
+        assert proc2 is not None and proc2.poll() is None
+        assert proc2.pid != pid
+        assert tok_client2.tokenize("req-2", "world") == [2]
+        manager.shutdown()
+        assert not _pid_exists(proc2.pid)
+        assert endpoint2 is not None and not os.path.exists(endpoint2[len("ipc://") :])
+
+        # Attach mode after an owned run must NOT retain ownership or unlink the foreign socket.
+        foreign_sock = short_dir / "foreign_tokenizer.sock"
+        foreign_sock.write_text("")
+        manager.start(detokenizer_max_states=8, tokenizer_endpoint=f"ipc://{foreign_sock}")
+        assert manager._tokenizer_owned is False
+        manager.shutdown()
+        assert foreign_sock.exists()
+    finally:
+        manager.shutdown()
+
+
+def test_pipeline_worker_manager_sigkill_reap_and_detokenizer_failure_isolation(short_dir, monkeypatch):
+    # Stubborn child ignores SIGTERM; shutdown() must escalate to SIGKILL and reap it even if detokenizer fails.
+    stubborn = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "sys.stdout.write('ready\\n'); sys.stdout.flush(); time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert stubborn.stdout is not None
+    assert stubborn.stdout.readline().strip() == "ready"
+    stubborn.stdout.close()
+
+    sock_file = short_dir / "stubborn_tokenizer.sock"
+    sock_file.write_text("")
+    endpoint = f"ipc://{sock_file}"
+
+    real_wait = stubborn.wait
+    calls = {"n": 0}
+
+    def fast_timeout_wait(timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1 and timeout is not None:
+            raise subprocess.TimeoutExpired(cmd="stubborn", timeout=timeout)
+        return real_wait(timeout=timeout)
+
+    monkeypatch.setattr(stubborn, "wait", fast_timeout_wait)
+
+    class _FailingDetokenizer:
+        def shutdown(self):
+            raise RuntimeError("detokenizer boom")
+
+    class _ClosingClient:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            raise TimeoutError("worker wedged")
+
+        def close(self):
+            pass
+
+    manager = WorkerManager("dummy-tokenizer", ipc_dir=str(short_dir))
+    manager._tokenizer_process = stubborn
+    manager._tokenizer_owned = True
+    manager._tokenizer_endpoint = endpoint
+    manager._detokenizer_client = _FailingDetokenizer()
+    client = _ClosingClient()
+    manager._tokenizer_client = client
+    pid = stubborn.pid
+
+    manager.shutdown()
+
+    assert client.shutdown_calls == 1
+    assert manager._tokenizer_process is None
+    assert manager.tokenizer_endpoint is None
+    assert manager.is_running is False
+    assert stubborn.returncode is not None
+    assert not _pid_exists(pid)
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+    assert not sock_file.exists()
+
+
+def test_pipeline_worker_manager_finalizer_reaps_abandoned_subprocess(short_dir):
+    sock_file = short_dir / "abandoned.sock"
+    sock_file.write_text("")
+    endpoint = f"ipc://{sock_file}"
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    pid = proc.pid
+    manager = WorkerManager("dummy-tokenizer", ipc_dir=str(short_dir))
+    manager._tokenizer_process = proc
+    manager._tokenizer_owned = True
+    manager._tokenizer_endpoint = endpoint
+    from easydel.workers.esurge.pipeline.worker_manager import _cleanup_owned_worker
+
+    manager._process_finalizer = weakref.finalize(manager, _cleanup_owned_worker, proc, endpoint)
+    ref = weakref.ref(manager)
+
+    del manager
+    gc.collect()
+
+    assert ref() is None
+    assert proc.poll() is not None
+    assert not _pid_exists(pid)
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+    assert not sock_file.exists()
+
+
+def test_tokenizer_worker_exits_when_parent_is_sigkilled(short_dir, tmp_path):
+    """Owned tokenizer subprocess must self-exit and unlink its IPC socket if its parent dies via SIGKILL."""
+    from easydel.workers.esurge.pipeline import worker_main
+
+    tok_dir = _save_tiny_fast_tokenizer(tmp_path / "tok_orphan")
+    sock_path = short_dir / "orphan_parent.sock"
+    endpoint = f"ipc://{sock_path}"
+    launcher = (
+        "import os, subprocess, sys, time\n"
+        f"cmd = [sys.executable, {str(pathlib.Path(worker_main.__file__))!r}, 'tokenizer', "
+        f"'--endpoint', {endpoint!r}, '--tokenizer-path', {tok_dir!r}, "
+        "'--tokenizer-kwargs', '{\"local_files_only\": true}', '--parent-pid', str(os.getpid())]\n"
+        "child = subprocess.Popen(cmd)\n"
+        "deadline = time.monotonic() + 45.0\n"
+        f"while time.monotonic() < deadline and not os.path.exists({str(sock_path)!r}):\n"
+        "    assert child.poll() is None, f'worker exited early: {child.returncode}'\n"
+        "    time.sleep(0.05)\n"
+        f"assert os.path.exists({str(sock_path)!r}), 'worker did not bind in time'\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", launcher],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    worker_pid: int | None = None
+    try:
+        assert parent.stdout is not None
+        line = parent.stdout.readline().strip()
+        assert line.isdigit(), (
+            f"expected child pid, got {line!r}, stderr={parent.stderr.read() if parent.stderr else ''}"
+        )
+        worker_pid = int(line)
+        assert _pid_exists(worker_pid)
+        assert sock_path.exists()
+
+        # Hard-kill the intermediate parent so neither terminate() nor atexit runs in it.
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5.0)
+
+        assert _wait_until(lambda: not _pid_exists(worker_pid), timeout=10.0), (
+            f"tokenizer worker pid={worker_pid} remained orphaned after parent SIGKILL"
+        )
+        assert _wait_until(lambda: not sock_path.exists(), timeout=5.0)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        if worker_pid is not None and _pid_exists(worker_pid):
+            try:
+                os.kill(worker_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

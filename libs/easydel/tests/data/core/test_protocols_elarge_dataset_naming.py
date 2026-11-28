@@ -44,7 +44,7 @@ class _TinySource(ShardedDataSource[dict]):
 
 def test_extract_dataset_name_skips_generic_train_glob_segment():
     assert (
-        _extract_dataset_name({"data_files": "gs://uscentral1stuff/data/qwen35-toolcalling/data/train-*.parquet"})
+        _extract_dataset_name({"data_files": "gs://example-data-bucket/data/qwen35-toolcalling/data/train-*.parquet"})
         == "qwen35-toolcalling"
     )
 

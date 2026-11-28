@@ -1,0 +1,12 @@
+{
+  "1000": {
+    "snapshot": 25,
+    "schedule": 75,
+    "elastic_pack": 75
+  },
+  "10000": {
+    "snapshot": 300,
+    "schedule": 900,
+    "elastic_pack": 750
+  }
+}

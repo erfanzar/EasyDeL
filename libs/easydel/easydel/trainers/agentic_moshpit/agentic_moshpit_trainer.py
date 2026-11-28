@@ -35,6 +35,7 @@ JAX-native architecture.
 
 from __future__ import annotations
 
+import math
 import pickle
 import typing as tp
 
@@ -62,10 +63,32 @@ from .._shared.esurge_generation import (
     generation_length_bound,
     resolve_sampling,
 )
+from ..agent_flow_trainer.agent_flow_trainer import (
+    _EYVAN_MAX_COMPLETION_GROUPS_PER_STEP,
+    _EYVAN_MAX_GROUP_RESPONSES,
+    _EYVAN_MAX_OBS_PREVIEW_CHARS,
+    _EYVAN_MAX_ROLLOUT_STEPS,
+    _EYVAN_MAX_ROLLOUTS_PER_STEP,
+    _EYVAN_MAX_TEXT_CHARS,
+    _clip_eyvan_text,
+    _compute_icepop_active_ratios,
+    _compute_per_episode_kl_numpy,
+    _encode_action_labels,
+    _extract_nonneg_step,
+    _eyvan_log_completions,
+    _eyvan_log_episode,
+    _eyvan_log_histogram,
+    _eyvan_log_rollout,
+    _resolve_eyvan_env_name,
+    _select_rollout_sample_indices,
+    _to_host_numpy,
+    _to_host_numpy_local_only,
+)
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..metrics import _host_mean_float, _host_scalar_float
 from ..prompt_utils import apply_chat_template
 from ..reward_protocol import RewardProtocol
+from ..training_configurations import _resolve_eyvan_run_name, _sanitize_eyvan_key
 from ..training_utils import (
     normalize_generation_model_kwargs,
     slice_prompt_aligned_model_kwargs,
@@ -271,6 +294,19 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         self.env_factory = env_factory
         self._rollout_step = 0
         self._eval_rollout_step = 0
+        self._eyvan_total_turns = 0
+        self._eyvan_total_action_tokens = 0
+        self._eyvan_env_name = _resolve_eyvan_env_name(env_factory, fallback="agentic_moshpit")
+        eyvan_tag_env = _resolve_eyvan_env_name(env_factory, fallback="") or None
+        bind_eyvan = getattr(arguments, "_bind_eyvan_runtime_context", None)
+        if callable(bind_eyvan):
+            bind_eyvan(
+                trainer=self,
+                model=_model,
+                env_name=eyvan_tag_env,
+                extra_trainer_tags=("agentic_moshpit",),
+            )
+        _resolve_eyvan_run_name(arguments, model=_model, trainer=self, trainer_slug="agentic_moshpit")
 
         self._tools: list[Tool] = []
         if tools:
@@ -750,9 +786,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                     num_groups=self.arguments.num_env_groups,
                 )
             except BaseException as exc:
-                self._broadcast_object_from_host0(
-                    {"op": "error", "type": type(exc).__name__, "message": str(exc)}
-                )
+                self._broadcast_object_from_host0({"op": "error", "type": type(exc).__name__, "message": str(exc)})
                 raise
             finally:
                 self._detach_rollout_generation(configured_envs, generate_fn)
@@ -1255,6 +1289,8 @@ class AgenticMoshPitTrainer(GRPOTrainer):
 
         total_time = total_time_fn()
 
+        comp_mask_np = np.asarray(collated["completion_mask"], dtype=np.int32)
+        comp_lengths_np = np.sum(comp_mask_np > 0, axis=-1).astype(np.int64)
         completion_length = jnp.sum(completion_mask, -1)
         avg_steps = float(np.mean([t.num_steps for t in trajectories])) if trajectories else 0.0
         if env_rewards_np.size and group_size > 0 and env_rewards_np.size % group_size == 0:
@@ -1262,6 +1298,22 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             frac_reward_zero_std = float(np.mean(np.isclose(per_group_std, 0.0).astype(np.float32)))
         else:
             frac_reward_zero_std = 0.0
+
+        finite_rewards_np = env_rewards_np[np.isfinite(env_rewards_np)]
+        pass_rate = float(np.mean(finite_rewards_np > 0.0)) if finite_rewards_np.size else 0.0
+        max_comp_len = int(getattr(self.arguments, "max_completion_length", 0) or 0)
+        traj_truncated: list[bool] = []
+        for traj in trajectories:
+            if traj.response_mask.size == 0:
+                first_resp_idx = len(traj.input_ids)
+            else:
+                first_resp_idx = int(np.argmax(traj.response_mask))
+                if traj.response_mask[first_resp_idx] == 0:
+                    first_resp_idx = len(traj.input_ids)
+            raw_comp_len = max(0, len(traj.input_ids) - first_resp_idx)
+            is_trunc = bool(traj.info.get("truncated", False) or (max_comp_len > 0 and raw_comp_len > max_comp_len))
+            traj_truncated.append(is_trunc)
+        truncation_rate = float(np.mean(traj_truncated)) if traj_truncated else 0.0
 
         metrics_dict: dict[str, float | int | str] = {
             "reward_mean": float(np.nanmean(env_rewards_np)) if env_rewards_np.size else 0.0,
@@ -1273,14 +1325,43 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             "preprocessing_time": total_time,
             "avg_episode_steps": avg_steps,
             "frac_reward_zero_std": frac_reward_zero_std,
+            "rl/pass_rate": pass_rate,
+            "rl/truncation_rate": truncation_rate,
+            "rl/zero_var_group_frac": frac_reward_zero_std,
         }
         if aux_reward_breakdown:
             metrics_dict["aux_reward_mean"] = float(np.nanmean(aux_rewards))
             for name, values in aux_reward_breakdown.items():
                 metrics_dict[f"aux_reward/{name}"] = float(np.nanmean(values))
 
+        icepop_active_ratios: np.ndarray | None = None
+        if importance_sampling_ratio is not None:
+            is_ratio_np = _to_host_numpy(importance_sampling_ratio)
+            icepop_active_ratios, ratio_mean, ratio_max, masked_frac = _compute_icepop_active_ratios(
+                is_ratio_np,
+                comp_mask_np,
+            )
+            metrics_dict["rl/icepop_ratio_mean"] = ratio_mean
+            metrics_dict["rl/icepop_ratio_max"] = ratio_max
+            metrics_dict["rl/icepop_masked_frac"] = masked_frac
+
         if is_train:
             self._log_trajectories_to_wandb(trajectories, state)
+
+        self._log_trajectories_to_eyvan(
+            trajectories=trajectories,
+            state=state,
+            is_train=is_train,
+            env_rewards_np=env_rewards_np,
+            advantages=advantages,
+            comp_mask_np=comp_mask_np,
+            comp_lengths_np=comp_lengths_np,
+            traj_truncated=traj_truncated,
+            aux_reward_breakdown=aux_reward_breakdown,
+            policy_logps=old_per_token_logps if old_per_token_logps is not None else rollout_logps,
+            ref_logps=ref_per_token_logps if self.ref_state is not None else None,
+            icepop_active_ratios=icepop_active_ratios,
+        )
 
         model_batch: dict[str, jax.Array] = {
             "prompt_ids": prompt_ids,
@@ -1372,6 +1453,329 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             data=rows,
         )
         wandb.log({"trajectories": table}, step=cur_step)
+
+    def _log_trajectories_to_eyvan(
+        self,
+        *,
+        trajectories: list,
+        state: EasyDeLState,
+        is_train: bool,
+        env_rewards_np: np.ndarray,
+        advantages: tp.Any,
+        comp_mask_np: np.ndarray,
+        comp_lengths_np: np.ndarray,
+        traj_truncated: list[bool],
+        aux_reward_breakdown: dict[str, np.ndarray] | None = None,
+        policy_logps: tp.Any = None,
+        ref_logps: tp.Any = None,
+        icepop_active_ratios: np.ndarray | None = None,
+    ) -> None:
+        """Emit native Eyvan episodes, rollouts, grouped completions, and histograms for AgenticMoshPit."""
+        if not trajectories:
+            return
+        total_turns_before = int(getattr(self, "_eyvan_total_turns", 0))
+        total_action_before = int(getattr(self, "_eyvan_total_action_tokens", 0))
+        args = getattr(self, "arguments", None)
+        if args is None or not bool(getattr(args, "eyvan_tracking_enabled", False)):
+            if is_train:
+                self._eyvan_total_turns = total_turns_before + sum(max(0, int(t.num_steps)) for t in trajectories)
+                self._eyvan_total_action_tokens = total_action_before + int(np.sum(comp_lengths_np))
+            return
+        if hasattr(args, "__dict__") and "_eyvan_runtime_context" not in args.__dict__:
+            bind_ctx = getattr(self, "_bind_eyvan_context", None)
+            if callable(bind_ctx):
+                bind_ctx()
+
+        try:
+            fallback_step = (
+                int(getattr(self, "_rollout_step", 0)) if is_train else int(getattr(self, "_eval_rollout_step", 0))
+            )
+            cur_step = _extract_nonneg_step(state, fallback=max(0, fallback_step - 1))
+            raw_pv = getattr(self, "_async_rollout_policy_version", None)
+            if raw_pv is None and state is not None:
+                raw_pv = getattr(state, "policy_step", None)
+            policy_version = max(0, int(raw_pv)) if raw_pv is not None else cur_step
+            kind = "train" if is_train else "eval"
+            default_env_name = getattr(self, "_eyvan_env_name", None) or _resolve_eyvan_env_name(
+                getattr(self, "env_factory", None),
+                fallback="agentic_moshpit",
+            )
+
+            # Extract advantages locally (handles both 1D episode-level and 2D token-level advantages).
+            adv_host = _to_host_numpy_local_only(advantages)
+            if adv_host is None:
+                ep_advantages = np.zeros((len(trajectories),), dtype=np.float32)
+                adv_hist_values = ep_advantages
+            elif adv_host.ndim == 2 and adv_host.shape == comp_mask_np.shape:
+                ep_adv_list: list[float] = []
+                for idx in range(len(trajectories)):
+                    row_mask = comp_mask_np[idx] > 0
+                    if np.any(row_mask):
+                        vals = adv_host[idx][row_mask]
+                        finite = vals[np.isfinite(vals)]
+                        ep_adv_list.append(float(np.mean(finite)) if finite.size else 0.0)
+                    else:
+                        ep_adv_list.append(0.0)
+                ep_advantages = np.asarray(ep_adv_list, dtype=np.float32)
+                active_adv = adv_host[comp_mask_np > 0]
+                adv_hist_values = active_adv if active_adv.size > 0 else ep_advantages
+            else:
+                ep_advantages = adv_host.reshape(-1)[: len(trajectories)].astype(np.float32, copy=False)
+                adv_hist_values = ep_advantages
+
+            # 1. Record every trajectory as an Eyvan episode.
+            cum_turns = total_turns_before
+            cum_action_tokens = total_action_before
+            for idx, traj in enumerate(trajectories):
+                ep_steps = max(0, int(traj.num_steps))
+                ep_act_tokens = max(0, int(comp_lengths_np[idx])) if idx < comp_lengths_np.size else 0
+                if is_train:
+                    cum_turns += ep_steps
+                    cum_action_tokens += ep_act_tokens
+                ep_reward = float(traj.episode_reward)
+                ep_success = bool(math.isfinite(ep_reward) and ep_reward > 0.0)
+                finite_step_r = [float(r) for r in traj.step_rewards if math.isfinite(float(r))]
+                mean_turn_reward = float(sum(finite_step_r) / len(finite_step_r)) if finite_step_r else 0.0
+                traj_env = traj.info.get("env") if isinstance(traj.info, dict) else None
+                env_name = (
+                    str(traj_env).strip()[:128] if isinstance(traj_env, str) and traj_env.strip() else default_env_name
+                )
+                extra: dict[str, float] = {
+                    "action_tokens": float(ep_act_tokens),
+                    "truncated": 1.0 if traj_truncated[idx] else 0.0,
+                    "mean_turn_reward": mean_turn_reward,
+                }
+                if isinstance(traj.info, dict):
+                    for extra_k in ("env_reward", "aux_reward"):
+                        if extra_k in traj.info:
+                            try:
+                                val = float(traj.info[extra_k])
+                                if math.isfinite(val):
+                                    extra[extra_k] = val
+                            except (TypeError, ValueError):
+                                pass
+                _eyvan_log_episode(
+                    args,
+                    ret=ep_reward,
+                    length=ep_steps,
+                    success=ep_success,
+                    kind=kind,
+                    env=env_name,
+                    policy_version=policy_version,
+                    learner_version=cur_step,
+                    step=cur_step,
+                    axes={"env_turns": float(cum_turns), "action_tokens": float(cum_action_tokens)},
+                    extra=extra,
+                )
+            if is_train:
+                self._eyvan_total_turns = cum_turns
+                self._eyvan_total_action_tokens = cum_action_tokens
+            batch_axes = {"env_turns": float(cum_turns), "action_tokens": float(cum_action_tokens)}
+
+            # 2. Sample up to 8 trajectories as Eyvan rollouts (best, worst, then remaining; skip 0-step).
+            eligible_indices = [
+                idx
+                for idx, traj in enumerate(trajectories)
+                if any(t.is_response for t in traj.turns) or len(traj.step_rewards) > 0
+            ]
+            rollout_indices = _select_rollout_sample_indices(
+                [float(t.episode_reward) for t in trajectories],
+                eligible_indices,
+                cap=_EYVAN_MAX_ROLLOUTS_PER_STEP,
+            )
+            for idx in rollout_indices:
+                traj = trajectories[idx]
+                resp_turns = [t for t in traj.turns if t.is_response]
+                n_steps = min(max(len(resp_turns), len(traj.step_rewards)), _EYVAN_MAX_ROLLOUT_STEPS)
+                if n_steps <= 0:
+                    continue
+                rewards_track: list[float | None] = []
+                act_tokens_track: list[float | None] = []
+                terminated_track: list[float | None] = []
+                truncated_track: list[float | None] = []
+                mean_lp_track: list[float | None] = []
+                has_any_lp = False
+                raw_actions: list[str] = []
+                for step_i in range(n_steps):
+                    if step_i < len(traj.step_rewards):
+                        r_val = float(traj.step_rewards[step_i])
+                    elif step_i < len(resp_turns):
+                        r_val = float(resp_turns[step_i].reward)
+                    else:
+                        r_val = 0.0
+                    rewards_track.append(r_val)
+                    if step_i < len(resp_turns):
+                        rt = resp_turns[step_i]
+                        tok_count = float(len(rt.token_ids)) if rt.token_ids is not None else float(len(rt.content))
+                        act_tokens_track.append(tok_count)
+                        label_src = rt.visible_content if rt.visible_content is not None else rt.content
+                        raw_actions.append(label_src)
+                        if rt.sampling_logps is not None and len(rt.sampling_logps) > 0:
+                            has_any_lp = True
+                            mean_lp_track.append(float(np.mean(np.asarray(rt.sampling_logps, dtype=np.float64))))
+                        else:
+                            mean_lp_track.append(None)
+                    else:
+                        act_tokens_track.append(0.0)
+                        raw_actions.append(f"turn_{step_i}")
+                        mean_lp_track.append(None)
+                    is_last = step_i == (n_steps - 1)
+                    truncated_track.append(1.0 if (is_last and traj_truncated[idx]) else 0.0)
+                    terminated_track.append(1.0 if (is_last and not traj_truncated[idx]) else 0.0)
+                tracks: dict[str, list[float | None]] = {
+                    "reward": rewards_track,
+                    "action_tokens": act_tokens_track,
+                    "terminated": terminated_track,
+                    "truncated": truncated_track,
+                }
+                if has_any_lp:
+                    tracks["mean_logprob"] = mean_lp_track
+                action_ids, action_names = _encode_action_labels(raw_actions)
+                traj_env = traj.info.get("env") if isinstance(traj.info, dict) else None
+                env_name = (
+                    str(traj_env).strip()[:128] if isinstance(traj_env, str) and traj_env.strip() else default_env_name
+                )
+                _eyvan_log_rollout(
+                    args,
+                    tracks=tracks,
+                    actions=action_ids,
+                    action_names=action_names,
+                    episode_id=f"s{cur_step}-e{idx}",
+                    env=env_name,
+                    kind=kind,
+                    policy_version=policy_version,
+                    step=cur_step,
+                    axes=batch_axes,
+                )
+
+            # 3. Compute optional per-trajectory KL locally (never invoking cross-host collectives).
+            per_ep_kl: list[float | None] | None = None
+            if ref_logps is not None and policy_logps is not None:
+                ref_np = _to_host_numpy_local_only(ref_logps)
+                pol_np = _to_host_numpy_local_only(policy_logps)
+                if (
+                    ref_np is not None
+                    and pol_np is not None
+                    and ref_np.shape == comp_mask_np.shape
+                    and pol_np.shape == comp_mask_np.shape
+                ):
+                    kl_estimator = str(getattr(args, "kl_estimator", "k3") or "k3")
+                    per_ep_kl = _compute_per_episode_kl_numpy(pol_np, ref_np, comp_mask_np, kl_estimator=kl_estimator)
+
+            # 4. Log up to 8 grouped multi-turn completions.
+            eff_group_size = max(1, int(getattr(args, "group_size", 1) or 1))
+            weight_by_name: dict[str, float] = {}
+            if aux_reward_breakdown:
+                names_seq = getattr(self, "reward_func_names", None) or []
+                weights_host = _to_host_numpy_local_only(getattr(self, "reward_weights", None))
+                for w_idx, r_name in enumerate(names_seq):
+                    if weights_host is not None and w_idx < weights_host.size:
+                        weight_by_name[str(r_name)] = float(weights_host.reshape(-1)[w_idx])
+                    else:
+                        weight_by_name[str(r_name)] = 1.0
+
+            for g_idx, start in enumerate(range(0, len(trajectories), eff_group_size)):
+                if g_idx >= _EYVAN_MAX_COMPLETION_GROUPS_PER_STEP:
+                    break
+                grp_indices = list(range(start, min(start + eff_group_size, len(trajectories))))[
+                    :_EYVAN_MAX_GROUP_RESPONSES
+                ]
+                if not grp_indices:
+                    continue
+                first_traj = trajectories[grp_indices[0]]
+                first_resp_pos = next(
+                    (ti for ti, t in enumerate(first_traj.turns) if t.is_response), len(first_traj.turns)
+                )
+                init_turns = first_traj.turns[:first_resp_pos]
+                if init_turns:
+                    prompt_text = "\n".join(f"[{t.role}] {t.content}" for t in init_turns)
+                elif isinstance(first_traj.info, dict) and first_traj.info.get("question"):
+                    prompt_text = str(first_traj.info["question"])
+                else:
+                    prompt_text = ""
+
+                responses: list[str] = []
+                for idx in grp_indices:
+                    traj = trajectories[idx]
+                    resp_start = next((ti for ti, t in enumerate(traj.turns) if t.is_response), 0)
+                    parts: list[str] = []
+                    for turn in traj.turns[resp_start:]:
+                        content = turn.visible_content if turn.visible_content is not None else turn.content
+                        if not turn.is_response and len(content) > _EYVAN_MAX_OBS_PREVIEW_CHARS:
+                            content = content[: _EYVAN_MAX_OBS_PREVIEW_CHARS - 3] + "..."
+                        parts.append(f"[{turn.role}] {content}")
+                    responses.append(
+                        _clip_eyvan_text(
+                            "\n".join(parts) if parts else "[empty trajectory]", limit=_EYVAN_MAX_TEXT_CHARS
+                        )
+                    )
+
+                if aux_reward_breakdown:
+                    grp_rewards: tp.Any = {
+                        "env": [
+                            float(trajectories[i].info.get("env_reward", trajectories[i].episode_reward))
+                            if isinstance(trajectories[i].info, dict)
+                            else float(trajectories[i].episode_reward)
+                            for i in grp_indices
+                        ],
+                    }
+                    for r_name, r_vals in aux_reward_breakdown.items():
+                        w = weight_by_name.get(str(r_name), 1.0)
+                        skey = _sanitize_eyvan_key(f"aux/{r_name}")
+                        grp_rewards[skey] = [float(np.nan_to_num(r_vals[i])) * w for i in grp_indices]
+                else:
+                    grp_rewards = [float(trajectories[i].episode_reward) for i in grp_indices]
+
+                grp_adv = [float(ep_advantages[i]) for i in grp_indices]
+                grp_tokens = [max(0, int(comp_lengths_np[i])) for i in grp_indices]
+                grp_trunc = [bool(traj_truncated[i]) for i in grp_indices]
+                grp_kl = (
+                    [per_ep_kl[i] for i in grp_indices]
+                    if per_ep_kl is not None and any(per_ep_kl[i] is not None for i in grp_indices)
+                    else None
+                )
+                group_prefix = f"s{cur_step}" if is_train else f"eval-s{cur_step}"
+                _eyvan_log_completions(
+                    args,
+                    prompt=prompt_text,
+                    responses=responses,
+                    rewards=grp_rewards,
+                    advantages=grp_adv,
+                    group=f"{group_prefix}-g{g_idx}",
+                    tokens=grp_tokens,
+                    kl=grp_kl,
+                    truncated=grp_trunc,
+                    policy_version=policy_version,
+                    step=cur_step,
+                )
+
+            # 5. Log RL distributions.
+            _eyvan_log_histogram(args, "rl/reward_dist", env_rewards_np, step=cur_step, axes=batch_axes)
+            _eyvan_log_histogram(args, "rl/advantage_dist", adv_hist_values, step=cur_step, axes=batch_axes)
+            _eyvan_log_histogram(
+                args,
+                "rl/episode_turns_dist",
+                np.asarray([float(t.num_steps) for t in trajectories], dtype=np.float32),
+                step=cur_step,
+                axes=batch_axes,
+            )
+            _eyvan_log_histogram(
+                args,
+                "rl/completion_length_dist",
+                comp_lengths_np.astype(np.float32),
+                step=cur_step,
+                axes=batch_axes,
+            )
+            if icepop_active_ratios is not None and icepop_active_ratios.size > 0:
+                _eyvan_log_histogram(
+                    args,
+                    "rl/icepop_ratio_dist",
+                    icepop_active_ratios,
+                    step=cur_step,
+                    axes=batch_axes,
+                )
+        except Exception as exc:
+            logger.warning("AgenticMoshPit Eyvan telemetry logging failed (%s): %s", type(exc).__name__, exc)
 
     def create_tfds_collect_function(
         self,

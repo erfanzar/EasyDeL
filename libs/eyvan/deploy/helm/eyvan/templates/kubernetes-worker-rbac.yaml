@@ -1,0 +1,39 @@
+{{- if and .Values.cellAgent.enabled (eq (include "eyvan.capacityBackend" .) "kubernetes") }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eyvan-cell-agent-capacity
+  namespace: {{ include "eyvan.workerNamespace" . }}
+  labels:
+    {{- include "eyvan.cellAgentLabels" . | nindent 4 }}
+rules:
+  # The driver creates, observes, and foreground-deletes one Indexed Job per cell.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  # Pod and event reads expose placement/startup failures without granting exec,
+  # logs, mutation, or access to unrelated cluster-scoped resources.
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  # Stable worker DNS and a per-incarnation credential are namespaced objects.
+  - apiGroups: [""]
+    resources: ["services", "secrets"]
+    verbs: ["create", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eyvan-cell-agent-capacity
+  namespace: {{ include "eyvan.workerNamespace" . }}
+  labels:
+    {{- include "eyvan.cellAgentLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: eyvan-cell-agent
+    namespace: {{ include "eyvan.namespace" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eyvan-cell-agent-capacity
+{{- end }}

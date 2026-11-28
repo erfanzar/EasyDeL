@@ -68,6 +68,7 @@ notebooks/
 docs/
 *.md
 !README.md
+!libs/*/README.md
 mkdocs.yml
 .readthedocs.yml
 

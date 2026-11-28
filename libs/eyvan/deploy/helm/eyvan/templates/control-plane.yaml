@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eyvan-control-plane
+  namespace: {{ include "eyvan.namespace" . }}
+  labels:
+    {{- include "eyvan.controlPlaneLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controlPlane.replicas }}
+  selector:
+    matchLabels:
+      app: eyvan-control-plane
+  template:
+    metadata:
+      annotations:
+        checksum/platform-config: {{ include (print $.Template.BasePath "/platform-config.yaml") . | sha256sum }}
+      labels:
+        {{- include "eyvan.controlPlaneLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: eyvan-control-plane
+      # The control plane holds a database URL, an artifact signing key and an
+      # agent shared secret. Root inside that container is root over all three,
+      # and the process needs none of it.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: eyvan
+          image: {{ include "eyvan.controlPlaneImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: EYVAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: database-url
+            - name: EYVAN_ARTIFACT_TOKEN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: artifact-token-key
+            - name: EYVAN_AGENT_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: agent-shared-secret
+            - name: EYVAN_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: metrics-token
+            # The server refuses a network bind without TLS material or an
+            # explicit opt-in. Neither default is set: the rendered Deployment
+            # then refuses to start, which is the chart's fail-closed posture.
+            {{- if .Values.controlPlane.tls.existingSecret }}
+            - name: EYVAN_TLS_CERT_FILE
+              value: /etc/eyvan/tls/tls.crt
+            - name: EYVAN_TLS_KEY_FILE
+              value: /etc/eyvan/tls/tls.key
+            {{- else if .Values.controlPlane.insecurePlaintextBind }}
+            - name: EYVAN_INSECURE_PLAINTEXT_BIND
+              value: "1"
+            {{- end }}
+            - name: EYVAN_REPOSITORY_BACKEND
+              value: {{ .Values.controlPlane.repositoryBackend | quote }}
+            - name: EYVAN_AUTO_CREATE_SCHEMA
+              value: {{ .Values.controlPlane.autoCreateSchema | quote }}
+            - name: EYVAN_PUBLIC_URL
+              value: {{ .Values.controlPlane.publicUrl | quote }}
+            - name: EYVAN_ARTIFACT_STORE_URI
+              value: {{ .Values.controlPlane.artifactStoreUri | quote }}
+            - name: EYVAN_TRUSTED_CALLABLE_PROJECTS
+              value: {{ .Values.controlPlane.trustedCallableProjects | quote }}
+            - name: EYVAN_OIDC_ISSUER
+              value: {{ .Values.controlPlane.oidc.issuer | quote }}
+            - name: EYVAN_OIDC_AUDIENCE
+              value: {{ .Values.controlPlane.oidc.audience | quote }}
+            - name: EYVAN_OIDC_DASHBOARD_CLIENT_ID
+              value: {{ .Values.controlPlane.oidc.dashboardClientId | quote }}
+          volumeMounts:
+            - name: platform-config
+              mountPath: /etc/eyvan/platform.yaml
+              subPath: platform.yaml
+              readOnly: true
+            # readOnlyRootFilesystem leaves no writable /tmp, and a volume that
+            # vanishes with the pod keeps a compromise from persisting.
+            {{- if .Values.controlPlane.tls.existingSecret }}
+            - name: tls
+              mountPath: /etc/eyvan/tls
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+          # Readiness asks "can this replica serve", so it checks the database.
+          # Liveness asks "should this replica be restarted", so it must not: a
+          # liveness probe on a shared database restarts every replica at once
+          # when that database blips, then prevents recovery by stampeding
+          # reconnections.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+              scheme: {{ ternary "HTTPS" "HTTP" (ne .Values.controlPlane.tls.existingSecret "") }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              scheme: {{ ternary "HTTPS" "HTTP" (ne .Values.controlPlane.tls.existingSecret "") }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+      volumes:
+        - name: platform-config
+          configMap:
+            name: eyvan-platform
+        {{- if .Values.controlPlane.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.controlPlane.tls.existingSecret }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eyvan-control-plane
+  namespace: {{ include "eyvan.namespace" . }}
+  labels:
+    {{- include "eyvan.controlPlaneLabels" . | nindent 4 }}
+spec:
+  selector:
+    app: eyvan-control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

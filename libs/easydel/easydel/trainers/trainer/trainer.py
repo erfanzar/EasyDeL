@@ -896,8 +896,7 @@ class Trainer(BaseTrainer):
                         if step_skipped:
                             consecutive_skipped_steps += 1
                             logger.warning(
-                                "Skipping non-finite optimizer update at step %d "
-                                "(consecutive skipped updates: %d/%d).",
+                                "Skipping non-finite optimizer update at step %d (consecutive skipped updates: %d/%d).",
                                 current_step,
                                 consecutive_skipped_steps,
                                 max_consecutive_skips,
@@ -990,6 +989,20 @@ class Trainer(BaseTrainer):
                                 )
                             self._save_tpu_preemption_checkpoint(state=state, step=current_step)
                             return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), close_prefetcher()
+                        check_eyvan_reclaim = getattr(self, "_should_save_eyvan_reclaim_checkpoint", None)
+                        if callable(check_eyvan_reclaim):
+                            eyvan_notice = check_eyvan_reclaim(current_step)
+                            if eyvan_notice is not None:
+                                handle_reclaim = getattr(self, "_handle_eyvan_reclaim_preemption", None)
+                                if callable(handle_reclaim):
+                                    reclaim_signal = handle_reclaim(
+                                        state=state,
+                                        step=current_step,
+                                        notice=eyvan_notice,
+                                    )
+                                else:
+                                    reclaim_signal = EasyDeLPreemptionSignal("Eyvan reclaim requested")
+                                return state, reclaim_signal, close_prefetcher()
                         with capture_time() as weight_distribution_time:
                             self.log_weight_distribution(state=state, step=current_step)
                         with capture_time() as watchers_time:
@@ -1036,11 +1049,9 @@ class Trainer(BaseTrainer):
                                 "train_step.profiler_block.begin", epoch=epoch, current_step=current_step
                             )
                             state, metrics = jax.block_until_ready((state, metrics))
-                            self._runtime_trace(
-                                "train_step.profiler_block.end", epoch=epoch, current_step=current_step
-                            )
+                            self._runtime_trace("train_step.profiler_block.end", epoch=epoch, current_step=current_step)
                         self._runtime_trace("train_step.host_metrics.end", epoch=epoch, current_step=current_step)
-                    except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as exc:
+                    except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
                         self._runtime_trace(
                             "train_step.host_metrics.interrupt",
                             epoch=epoch,
@@ -1202,6 +1213,9 @@ class Trainer(BaseTrainer):
                     update_progress=False,
                     force_report=True,
                 )
+                record_eval_summary = getattr(self, "_record_eyvan_eval_summary", None)
+                if callable(record_eval_summary):
+                    record_eval_summary(summary_eval_metrics)
         finally:
             BaseTrainer._close_iterator(eval_iter)
 
@@ -1429,6 +1443,7 @@ class Trainer(BaseTrainer):
             KeyboardInterrupt,
             EasyDeLTimerError,
             EasyDeLBreakRequest,
+            EasyDeLPreemptionSignal,
             TypeError,
         ) as run_exception:
             self._runtime_trace(
@@ -1473,7 +1488,8 @@ class Trainer(BaseTrainer):
         Finalizes the training process and prepares the output.
 
         If evaluation is enabled, this method runs an additional evaluation pass before finishing.
-        It then calls the finish method to perform any cleanup and returns the final output.
+        It then records final Eyvan summary metadata, sets the terminal run status, calls the
+        finish method to perform any cleanup, and returns the final output.
 
         Args:
             output: The output object containing the final state and metrics.
@@ -1482,11 +1498,35 @@ class Trainer(BaseTrainer):
         Returns:
             The final output object.
         """
+        eval_exception: BaseException | None = None
+        last_eval_step_metrics = None
         try:
             if run_exception is None and self.arguments.do_eval:
-                for _ in self.eval(output.state):
-                    ...
+                for eval_step_metrics in self.eval(output.state):
+                    if isinstance(eval_step_metrics, dict):
+                        last_eval_step_metrics = eval_step_metrics
+        except BaseException as exc:
+            eval_exception = exc
+            self._eyvan_finish_status = "aborted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            raise
         finally:
+            if eval_exception is None:
+                if run_exception is None:
+                    self._eyvan_finish_status = "finished"
+                elif isinstance(
+                    run_exception,
+                    (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal),
+                ):
+                    self._eyvan_finish_status = "aborted"
+                else:
+                    self._eyvan_finish_status = "failed"
+            record_final_summary = getattr(self, "_record_eyvan_final_summary", None)
+            if callable(record_final_summary):
+                record_final_summary(
+                    output=output,
+                    final_eval_metrics=getattr(self, "_last_eval_summary_metrics", None) or last_eval_step_metrics,
+                    run_exception=eval_exception or run_exception,
+                )
             self.finish()
         return output
 
@@ -1527,9 +1567,14 @@ class Trainer(BaseTrainer):
         """
         self._runtime_trace("train.begin")
         finalized = False
+        caught_exc: BaseException | None = None
         try:
+            install_preemption = getattr(self, "_install_eyvan_preemption_handler", None)
+            if callable(install_preemption):
+                install_preemption()
             self._runtime_trace("train.start_training_hook.begin")
             self.start_training_hook()
+            self._ensure_eyvan_run()
             self._runtime_trace("train.start_training_hook.end")
             metrics_tracker = MetricsTracker()
             step_metrics = StepMetrics(self.arguments)
@@ -1552,11 +1597,22 @@ class Trainer(BaseTrainer):
             self._runtime_trace("train.end")
             return output
         except BaseException as exc:
+            caught_exc = exc
+            self._eyvan_finish_status = "aborted" if isinstance(exc, KeyboardInterrupt) else "failed"
             self._runtime_trace("train.exception", exc_type=type(exc).__name__, exc=str(exc))
             raise
         finally:
-            if not finalized:
-                self.finish()
+            try:
+                if not finalized:
+                    if caught_exc is not None:
+                        record_final_summary = getattr(self, "_record_eyvan_final_summary", None)
+                        if callable(record_final_summary):
+                            record_final_summary(output=None, run_exception=caught_exc)
+                    self.finish()
+            finally:
+                uninstall_preemption = getattr(self, "_uninstall_eyvan_preemption_handler", None)
+                if callable(uninstall_preemption):
+                    uninstall_preemption()
 
     def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """

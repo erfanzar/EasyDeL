@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-_USCENTRAL1STUFF_TESTS_ENV = "SPECTRAX_RUN_USCENTRAL1STUFF_TESTS"
+_GCS_TESTS_ENV = "SPECTRAX_RUN_GCS_TESTS"
+_GCS_BUCKET_ENV = "SPECTRAX_TEST_GCS_BUCKET"
+_DEFAULT_GCS_BUCKET = "gs://example-bucket"
 
 
 def _env_truthy(name: str) -> bool:
@@ -24,10 +26,15 @@ def _env_truthy(name: str) -> bool:
 
 
 @pytest.fixture
-def gcs_auth_ino():
-    """Skip tests that need authenticated access to gs://uscentral1stuff."""
-    if not _env_truthy(_USCENTRAL1STUFF_TESTS_ENV):
-        pytest.skip(f"requires authenticated access to gs://uscentral1stuff; set {_USCENTRAL1STUFF_TESTS_ENV}=1 to run")
+def gcs_auth_ino() -> str:
+    """Skip GCS integration tests unless explicitly enabled, returning the GCS base path."""
+    if not _env_truthy(_GCS_TESTS_ENV):
+        pytest.skip(
+            f"requires authenticated GCS access; set {_GCS_TESTS_ENV}=1 "
+            f"(and optionally {_GCS_BUCKET_ENV}=gs://your-bucket) to run"
+        )
+    bucket = os.environ.get(_GCS_BUCKET_ENV, _DEFAULT_GCS_BUCKET).rstrip("/")
+    return f"{bucket}/spx-save-tmp"
 
 
 @pytest.fixture

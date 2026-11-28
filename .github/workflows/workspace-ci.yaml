@@ -2,8 +2,8 @@ name: Workspace CI
 
 # Affected-only verification: each push/PR runs (a) the import-layering
 # contract and (b) a fast functional smoke for every workspace package whose
-# files changed (a foundation-lib or surgecore change also smokes easydel, which sits on
-# top of the foundation libraries and imports surgecore), and (c) cargo fmt/clippy/test, a wheel
+# files changed (a companion-lib change also smokes easydel, which sits on
+# top of the companion libraries and depends on them), and (c) cargo fmt/clippy/test, a wheel
 # build and the CPU tests of libs/surgecore when it changed. The deep per-package test suites are too large/hardware-
 # bound for per-PR CI and run locally / on dedicated runners — see WORKSPACE.md.
 
@@ -28,6 +28,7 @@ jobs:
       eray: ${{ steps.filter.outputs.eray }}
       easydel: ${{ steps.filter.outputs.easydel }}
       surgecore: ${{ steps.filter.outputs.surgecore }}
+      eyvan: ${{ steps.filter.outputs.eyvan }}
       root: ${{ steps.filter.outputs.root }}
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +58,7 @@ jobs:
             eray: ['libs/eray/**']
             easydel: ['libs/easydel/**']
             surgecore: ['libs/surgecore/**']
+            eyvan: ['libs/eyvan/**']
             root: ['pyproject.toml', 'uv.lock']
 
   import-contract:
@@ -94,13 +96,15 @@ jobs:
             module: easydel
           - lib: surgecore
             module: surgecore._native
+          - lib: eyvan
+            module: eyvan
     steps:
       - name: Skip if unaffected
         id: gate
         run: |
           AFFECTED="${{ needs.changes.outputs[matrix.lib] }}"
           ROOT="${{ needs.changes.outputs.root }}"
-          # easydel sits on top of the foundation libs and imports surgecore: any lib change affects it
+          # easydel sits on top of the companion libs and pins them: any companion-lib change affects it
           ANYLIB="false"
           if [ "${{ matrix.lib }}" = "easydel" ]; then
             [ "${{ needs.changes.outputs.spectrax }}" = "true" ] && ANYLIB=true
@@ -108,6 +112,7 @@ jobs:
             [ "${{ needs.changes.outputs.eformer }}" = "true" ] && ANYLIB=true
             [ "${{ needs.changes.outputs.eray }}" = "true" ] && ANYLIB=true
             [ "${{ needs.changes.outputs.surgecore }}" = "true" ] && ANYLIB=true
+            [ "${{ needs.changes.outputs.eyvan }}" = "true" ] && ANYLIB=true
           fi
           if [ "$AFFECTED" = "true" ] || [ "$ROOT" = "true" ] || [ "$ANYLIB" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -156,6 +161,13 @@ jobs:
           assert float(out.loss) > 0, "degenerate loss"
           print("easydel smoke OK, loss:", round(float(out.loss), 4))
           PY
+
+      - name: Functional smoke (eyvan CLI + internal import contracts)
+        if: steps.gate.outputs.run == 'true' && matrix.lib == 'eyvan'
+        run: |
+          uv run eyvan --help >/dev/null
+          uv run eyvan-server --help >/dev/null
+          (cd libs/eyvan && uv run --no-sync lint-imports)
 
   # libs/surgecore is a Rust crate (a PyO3 extension, abi3-py311, built by maturin): check its formatting and lints,
   # run the crate's tests, build its wheel, then run its CPU-only Python tests against the synced workspace.

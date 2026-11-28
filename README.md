@@ -16,7 +16,7 @@
 
 # EasyDeL
 
-EasyDeL is an open-source JAX framework for training, post-training, and serving large language, multimodal, and speech models on TPU pods and GPU clusters. It is built on [SpectraX](https://github.com/erfanzar/Spectrax) (no Flax dependency), uses [eJKernel](https://github.com/erfanzar/ejkernel) for TPU Pallas and GPU Triton/CUDA kernels, and pairs Python model definitions with a native Rust host runtime ([surgecore](https://github.com/erfanzar/esurgecore)) for serving.
+EasyDeL is an open-source JAX framework for training, post-training, and serving large language, multimodal, and speech models on TPU pods and GPU clusters. It is built on [SpectraX](https://github.com/erfanzar/Spectrax) (no Flax dependency), uses [eJKernel](https://github.com/erfanzar/ejkernel) for TPU Pallas and GPU Triton/CUDA kernels, pairs Python model definitions with a native Rust host runtime ([surgecore](https://github.com/erfanzar/esurgecore)) for serving, and ships with [Eyvan](https://github.com/erfanzar/eyvan) for policy-aware TPU/GPU fleet scheduling, job execution, and experiment tracking.
 
 ## Contents
 
@@ -37,7 +37,7 @@ EasyDeL is an open-source JAX framework for training, post-training, and serving
 
 ## Workspace Stack
 
-This repository is a `uv` workspace monorepo. Each sibling library is developed here, kept independent of `easydel` (enforced by `lint-imports`), mirrored to its own repository, and released independently on PyPI. See [WORKSPACE.md](https://github.com/erfanzar/EasyDeL/blob/main/WORKSPACE.md) for layout and development details.
+This repository is a `uv` workspace monorepo. Installing `easydel` automatically installs all six companion packages (`spectrax-lib`, `ejkernel`, `eformer`, `eray`, `surgecore`, and `eyvan`). Each sibling library is developed here, kept independent of `easydel` (enforced by `lint-imports`), mirrored to its own repository, and released independently on PyPI. See [WORKSPACE.md](https://github.com/erfanzar/EasyDeL/blob/main/WORKSPACE.md) for layout and development details.
 
 | Package | Path | PyPI | Role |
 | --- | --- | --- | --- |
@@ -47,6 +47,7 @@ This repository is a `uv` workspace monorepo. Each sibling library is developed 
 | **eFormer** | `libs/eformer` | `eformer` | `escale` sharding meshes, optimizers, TensorStore checkpointing, implicit quantized arrays |
 | **eRay** | `libs/eray` | `eray` | Ray pod/slice orchestration, `eray tpu job` / `sync` CLI, GCE helpers |
 | **surgecore** | `libs/surgecore` | `surgecore` | Rust (PyO3) host runtime for eSurge: step builder, KV-cache core, scheduler, detokenizer |
+| **Eyvan** | `libs/eyvan` | `eyvan` | Policy-aware fleet capacity plane: scheduler, worker runtime, experiment tracking, web dashboard |
 | **esurge-dashboard** | `libs/esurge-dashboard` | — | Standalone Rust/Axum live serving workbench and metrics dashboard |
 
 ## Installation
@@ -54,7 +55,7 @@ This repository is a `uv` workspace monorepo. Each sibling library is developed 
 Python 3.11–3.13 is required.
 
 ```bash
-# Base install
+# Base install (automatically installs spectrax-lib, ejkernel, eformer, eray, surgecore, and eyvan)
 uv pip install easydel
 
 # TPU (JAX TPU + Pallas kernels)
@@ -294,6 +295,7 @@ Runtime attention mechanisms can be switched via `model.update_module(attn_mecha
 
 - **Documentation:** [easydel.readthedocs.io](https://easydel.readthedocs.io/en/latest/)
 - **Workspace Guide:** [WORKSPACE.md](https://github.com/erfanzar/EasyDeL/blob/main/WORKSPACE.md)
+- **Eyvan Fleet Plane:** [libs/eyvan/README.md](https://github.com/erfanzar/EasyDeL/blob/main/libs/eyvan/README.md)
 - **Serving Guide:** [docs/esurge_serving.md](https://github.com/erfanzar/EasyDeL/blob/main/libs/easydel/docs/esurge_serving.md)
 - **Environment Variables:** [docs/environment_variables.md](https://github.com/erfanzar/EasyDeL/blob/main/libs/easydel/docs/environment_variables.md)
 - **RL Environments & AgentFlow:** [environments.md](https://github.com/erfanzar/EasyDeL/blob/main/libs/easydel/docs/trainers/environments.md), [agent_flow.md](https://github.com/erfanzar/EasyDeL/blob/main/libs/easydel/docs/trainers/agent_flow.md)
@@ -303,7 +305,7 @@ Runtime attention mechanisms can be switched via `model.update_module(attn_mecha
 
 ## Citation and License
 
-EasyDeL is released under the Apache License 2.0 (see [LICENSE](https://github.com/erfanzar/EasyDeL/blob/main/LICENSE)). Note that `spectrax-lib` is licensed under AGPL-3.0-or-later.
+EasyDeL is released under the Apache License 2.0 (see [LICENSE](https://github.com/erfanzar/EasyDeL/blob/main/LICENSE)). Note that `spectrax-lib` and `eyvan` are licensed under AGPL-3.0-or-later.
 
 ```bibtex
 @misc{Zare Chavoshi_2023,

@@ -1,0 +1,106 @@
+# Apply deploy/prerequisites.yaml first. Deploy one agent in each network/project
+# boundary and replace the placeholder values for the target fleet. Production
+# ingress should enforce mTLS.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eyvan-cell-agent
+  namespace: eyvan-system
+spec:
+  # A one-replica RollingUpdate still overlaps old and new fleet owners. Recreate
+  # stops the old owner before the replacement starts against the same GCS object.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: eyvan-cell-agent
+  template:
+    metadata:
+      labels:
+        app: eyvan-cell-agent
+    spec:
+      serviceAccountName: eyvan-cell-agent
+      containers:
+        - name: agent
+          # Built from Dockerfile.agent, not the control-plane Dockerfile.
+          # Replace the marker with the registry-reported digest after publishing.
+          image: REGISTRY/eyvan-agent@sha256:REPLACE_WITH_PUBLISHED_DIGEST
+          command: ["eyvan-agent"]
+          args: ["--host", "0.0.0.0", "--port", "8090"]
+          ports:
+            - name: http
+              containerPort: 8090
+          env:
+            - name: EYVAN_AGENT_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-agent-secrets
+                  key: shared-secret
+            - name: EYVAN_NATIVE_WORKER_ROOT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-agent-secrets
+                  key: native-worker-root-secret
+            - name: EYVAN_FLEET_STATE_URI
+              value: gs://replace-with-state-bucket/eyvan/fleet-state.json
+            - name: EYVAN_CAPACITY_BACKEND
+              # Routes each desired cell to Compute Engine or Cloud TPU.
+              value: gcp
+            - name: EYVAN_EXECUTION_BACKEND
+              # Direct Eyvan worker daemon on each provisioned Compute VM.
+              value: eyvan-native
+            - name: EYVAN_NATIVE_WORKER_PACKAGE
+              # A pinned Eyvan wheel reachable by each worker VM.
+              value: gs://replace-with-artifact-bucket/eyvan/eyvan-0.1.0-py3-none-any.whl
+            - name: EYVAN_NATIVE_WORKER_PACKAGE_SHA256
+              value: REPLACE_WITH_64_LOWERCASE_HEX_SHA256
+            - name: EYVAN_NATIVE_WORKER_PACKAGE_GENERATION
+              # Pin the immutable GCS object generation reported after upload.
+              value: "REPLACE_WITH_GCS_GENERATION"
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE
+              # Required for private-google-access workers: a zip of all dependency wheels.
+              value: gs://replace-with-artifact-bucket/eyvan/eyvan-wheelhouse.zip
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE_SHA256
+              value: REPLACE_WITH_64_LOWERCASE_HEX_SHA256
+            - name: EYVAN_NATIVE_WORKER_WHEELHOUSE_GENERATION
+              value: "REPLACE_WITH_GCS_GENERATION"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          # The agent had readiness and no liveness, so a wedged agent stayed
+          # out of the Service and stayed running -- and a cell whose agent
+          # never answers is capacity the control plane cannot observe, cannot
+          # release, and keeps paying for. The failure threshold is generous
+          # because the agent makes long provider calls and a restart mid-call
+          # loses the fence it was holding.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eyvan-cell-agent
+  namespace: eyvan-system
+spec:
+  selector:
+    app: eyvan-cell-agent
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http

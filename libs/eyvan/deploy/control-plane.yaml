@@ -1,0 +1,227 @@
+# Apply only after deploy/prerequisites.yaml exists and
+# deploy/migration-job.yaml has completed successfully.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: eyvan-control-plane
+  template:
+    metadata:
+      labels:
+        app: eyvan-control-plane
+    spec:
+      serviceAccountName: eyvan-control-plane
+      # The control plane holds a database URL, an artifact signing key and an
+      # agent shared secret. Root inside that container is root over every one
+      # of them, and it needs none of it: the process binds an unprivileged
+      # port and writes nothing outside /tmp.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: eyvan
+          # Qualification requires the registry-reported digest for the exact
+          # image built from Dockerfile; this marker is intentionally not a fake digest.
+          image: REGISTRY/eyvan-control-plane@sha256:REPLACE_WITH_PUBLISHED_DIGEST
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: platform-config
+              mountPath: /etc/eyvan/platform.yaml
+              subPath: platform.yaml
+              readOnly: true
+            # readOnlyRootFilesystem leaves no writable /tmp, and Python needs
+            # one for anything that spools to disk. An emptyDir rather than
+            # relaxing the root filesystem: the point is that a compromise
+            # cannot persist, and a tmpfs that vanishes with the pod keeps that.
+            - name: tmp
+              mountPath: /tmp
+          env:
+            # The server refuses a network bind without TLS material or this
+            # explicit opt-in. This manifest predates that policy and terminates
+            # nothing today, so the opt-in keeps it startable -- as a reviewed
+            # decision rather than an accident. To serve TLS instead: add
+            # EYVAN_TLS_CERT_FILE/EYVAN_TLS_KEY_FILE from a mounted secret and
+            # delete this variable.
+            - name: EYVAN_INSECURE_PLAINTEXT_BIND
+              value: "1"
+            - name: EYVAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: database-url
+            - name: EYVAN_REPOSITORY_BACKEND
+              value: postgres
+            - name: EYVAN_AUTO_CREATE_SCHEMA
+              value: "false"
+            - name: EYVAN_CONTROLLER_ENABLED
+              value: "true"
+            - name: EYVAN_OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: oidc-issuer
+            - name: EYVAN_OIDC_AUDIENCE
+              value: eyvan
+            # Public browser OAuth client identifier; this is configuration, not a secret.
+            - name: EYVAN_OIDC_DASHBOARD_CLIENT_ID
+              value: eyvan-dashboard
+            - name: EYVAN_DEV_AUTH_ENABLED
+              value: "false"
+            - name: EYVAN_PUBLIC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: public-url
+            - name: EYVAN_ARTIFACT_STORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: artifact-store-uri
+            - name: EYVAN_ARTIFACT_TOKEN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: artifact-token-key
+            - name: EYVAN_TRUSTED_CALLABLE_PROJECTS
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: trusted-callable-projects
+            - name: EYVAN_AGENT_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: agent-shared-secret
+            - name: EYVAN_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: eyvan-secrets
+                  key: metrics-token
+          # Readiness asks "can this replica serve", so it checks the database.
+          # Liveness asks "should this replica be restarted", so it must not:
+          # a liveness probe that depends on a shared database restarts every
+          # replica at once when that database blips, and then prevents recovery
+          # by stampeding reconnections.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: platform-config
+          configMap:
+            name: eyvan-platform
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+spec:
+  # One, not a percentage. With replicas: 2 a 50% budget rounds to one anyway,
+  # and stating the absolute number keeps the guarantee if someone scales to 3:
+  # what matters is that a drain never takes the last replica, not that it
+  # takes a fixed fraction.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: eyvan-control-plane
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+spec:
+  podSelector:
+    matchLabels:
+      app: eyvan-control-plane
+  policyTypes: [Ingress]
+  ingress:
+    # Deliberately not a blanket allow on 8080. `/metrics` exports
+    # `eyvan_project_spend_usd` labeled by (org, project) -- every tenant's
+    # spend -- and it is authenticated by the required scrape token. This
+    # defense-in-depth layer limits which workloads can present that credential.
+    #
+    # Anything that must reach the API says so with a label. That is more
+    # friction than allowing the namespace, and the friction is the feature: an
+    # unlabelled workload reaching the control plane by accident is how a
+    # cluster-wide compromise becomes a fleet-wide one.
+    - from:
+        # Same-namespace clients need this pod label only.
+        - podSelector:
+            matchLabels:
+              eyvan.dev/api-client: "true"
+        # Cross-namespace clients require the label on both namespace and pod.
+        # These fields are one peer (AND), not two peers (OR).
+        - namespaceSelector:
+            matchLabels:
+              eyvan.dev/api-client: "true"
+          podSelector:
+            matchLabels:
+              eyvan.dev/api-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    # `/metrics` and the API share TCP 8080, so NetworkPolicy cannot separate
+    # paths. Selectors narrow socket access; their distinct application
+    # credentials remain the authorization boundary.
+    - from:
+        - podSelector:
+            matchLabels:
+              eyvan.dev/metrics-scraper: "true"
+        - namespaceSelector:
+            matchLabels:
+              eyvan.dev/metrics-scraper: "true"
+          podSelector:
+            matchLabels:
+              eyvan.dev/metrics-scraper: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eyvan-control-plane
+  namespace: eyvan-system
+spec:
+  selector:
+    app: eyvan-control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

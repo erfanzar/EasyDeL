@@ -1,0 +1,74 @@
+# Prometheus alert rules for an Eyvan control plane.
+#
+# Every metric name and label value below was verified against
+# eyvan/_internal/observability.py and the settlement/export path on
+# 2026-09-07. Thresholds are starting points for a small research fleet —
+# adjust per deployment, and confirm the `job` label matches your scrape
+# config. The plane serves /metrics on its metrics port (token-protected;
+# see docs/operate.md).
+
+groups:
+  - name: eyvan.control-plane
+    rules:
+      - alert: EyvanControlPlaneDown
+        expr: up{job="eyvan-control-plane"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Eyvan control plane is down"
+          description: "The control plane has been unreachable for 2 minutes. Scheduling, settlement, and webhook delivery are all paused."
+
+      - alert: EyvanInvariantViolations
+        # The plane publishes every durability invariant at zero precisely so
+        # this alert exists before the first break, and returns to zero when
+        # the violation clears. Nonzero means durable state has drifted
+        # (stuck outbox command, lease pointing at a gone cell, ...).
+        expr: eyvan_invariant_violations > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Durability invariant {{ $labels.invariant }} is violated"
+          description: "Invariant violations persist for a minute. Run `eyvan capacity invariants` for the detail; do not restart the plane to clear it."
+
+      - alert: EyvanCellsUnavailable
+        # Accelerator capacity sitting in provider-error state. The common
+        # IAM cause (and its fix) is docs/provider-gcp-iam.md; the cell's
+        # provider failure reason names the exact error.
+        expr: eyvan_capacity_accelerators{state="unavailable"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} accelerator(s) unavailable (class {{ $labels.capacity_class }}, type {{ $labels.accelerator_type }})"
+          description: "Capacity has been in unavailable state for 10 minutes."
+
+      - alert: EyvanWorkloadsStuckPending
+        expr: eyvan_workloads{state="pending"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} workload(s) pending for over 30 minutes"
+          description: "Workloads are admitted but unplaced: insufficient capacity, budget, or quota. The scheduler's infeasibility reasons name which."
+
+      - alert: EyvanApiErrorRate
+        # result="error" is the exception path; ordinary 4xx/5xx responses are
+        # labeled with their status code instead.
+        expr: sum(rate(eyvan_api_requests_total{result="error"}[10m])) by (operation) > 0.02
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained API errors on {{ $labels.operation }}"
+          description: "The exception-path error rate has been elevated for 15 minutes."
+
+      - alert: EyvanSchedulerDecisionSlow
+        expr: histogram_quantile(0.99, sum(rate(eyvan_scheduler_decision_seconds_bucket[10m])) by (le)) > 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 scheduler decision above 1s"
+          description: "Global scheduling decisions are degrading; check snapshot size growth."

@@ -45,8 +45,31 @@ import zmq  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 
-def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
-    """Serve prompt tokenization until ``shutdown`` arrives."""
+def _is_parent_alive(parent_pid: int) -> bool:
+    """Return whether ``parent_pid`` is still this worker's live parent process."""
+    if parent_pid <= 0 or os.getppid() != parent_pid:
+        return False
+    try:
+        os.kill(parent_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _tokenizer_worker(
+    endpoint: str,
+    tokenizer_path: str,
+    tokenizer_kwargs: dict,
+    *,
+    parent_pid: int | None = None,
+    parent_poll_interval_ms: int = 1000,
+) -> None:
+    """Serve prompt tokenization until ``shutdown`` arrives or the owning parent exits."""
+    if parent_pid is not None and not _is_parent_alive(parent_pid):
+        return
+
     from easydel.utils import flags
 
     if "trust_remote_code" not in tokenizer_kwargs:
@@ -57,6 +80,11 @@ def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict
     socket.bind(endpoint)
     try:
         while True:
+            if parent_pid is not None:
+                if not _is_parent_alive(parent_pid):
+                    break
+                if not socket.poll(parent_poll_interval_ms):
+                    continue
             message = socket.recv_pyobj()
             try:
                 cmd = message.get("cmd")
@@ -84,6 +112,11 @@ def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict
     finally:
         socket.close(0)
         ctx.term()
+        if parent_pid is not None and endpoint.startswith("ipc://"):
+            try:
+                os.unlink(endpoint[len("ipc://") :])
+            except OSError:
+                pass
 
 
 def main() -> None:
@@ -93,11 +126,12 @@ def main() -> None:
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--tokenizer-path", required=True)
     parser.add_argument("--tokenizer-kwargs", required=True)
+    parser.add_argument("--parent-pid", type=int, default=None)
     args = parser.parse_args()
 
     _configure_worker_environment()
     tokenizer_kwargs = json.loads(args.tokenizer_kwargs) if args.tokenizer_kwargs else {}
-    _tokenizer_worker(args.endpoint, args.tokenizer_path, tokenizer_kwargs)
+    _tokenizer_worker(args.endpoint, args.tokenizer_path, tokenizer_kwargs, parent_pid=args.parent_pid)
 
 
 if __name__ == "__main__":

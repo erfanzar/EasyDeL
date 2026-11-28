@@ -43,6 +43,28 @@ eopod run pip uninstall torch-xla -y -q
 eopod run pip install -U "easydel[tpu,torch,podutils]"
 ```
 
+## Using EasyDeL with Eyvan
+
+Installing `easydel` automatically installs `eyvan` (alongside `spectrax-lib`, `ejkernel`, `eformer`, `eray`, and `surgecore`), giving you the `eyvan` CLI (`eyvan`, `eyvan-server`, `eyvan-agent`, `eyvan-tracker`) and Python SDK for scheduling EasyDeL jobs onto TPU, GPU, or CPU fleets with spot-preemption retries and built-in experiment tracking (`eyvan.track`):
+
+```python
+from eyvan import EasyDeLSetup, TpuConfig, execute, init
+from eyvan.records import CapacityClass
+
+init(fleet="research-us-central1-a")
+
+
+@execute(
+    TpuConfig(type="v5p-16", pods=1, capacity_class=CapacityClass.SPOT),
+    setup=EasyDeLSetup(branch="main", accelerator="tpu"),
+)
+def train():
+    import easydel as ed
+    ...
+```
+
+See `libs/eyvan/README.md` and `libs/eyvan/docs/` for control-plane bring-up (`eyvan up`, `eyvan head up`, `eyvan team up`), proofs, and fleet operations.
+
 ## Using EasyDeL with Ray
 
 EasyDeL supports distributed execution with Ray, particularly for multi-host and multi-slice TPU environments. For GPUs, manual configuration is required, but TPUs can leverage `eformer`, an EasyDeL utility for cluster management.

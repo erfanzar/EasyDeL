@@ -84,7 +84,8 @@ class TokenizerWorkerClient:
 
     def close(self) -> None:
         """Close the local REQ socket without stopping an externally managed worker."""
-        self._socket.close(0)
+        with self._lock:
+            self._socket.close(0)
 
     def tokenize(self, request_id: str, prompt: str) -> list[int]:
         """Encode one text prompt into a flat token-id list."""
@@ -114,11 +115,16 @@ class TokenizerWorkerClient:
         """Acknowledge a drain; prompt tokenization is stateless."""
         self._request({"cmd": "drain"})
 
-    def shutdown(self) -> None:
-        """Send ``shutdown`` and always release the local socket."""
-        try:
-            self._request({"cmd": "shutdown"})
-        except Exception:
-            pass
-        finally:
-            self.close()
+    def shutdown(self, *, timeout: float = 5.0) -> None:
+        """Send ``shutdown`` with a bounded timeout and always release the local socket."""
+        with self._lock:
+            try:
+                timeout_ms = min(self._request_timeout_ms, max(1, int(timeout * 1000)))
+                self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+                self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+                self._socket.send_pyobj({"cmd": "shutdown"})
+                self._socket.recv_pyobj()
+            except Exception:
+                pass
+            finally:
+                self.close()

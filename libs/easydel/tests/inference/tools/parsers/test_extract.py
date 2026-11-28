@@ -276,7 +276,7 @@ def test_hermes_does_not_parse_qwen_xml_but_qwen3xml_does(dummy_tokenizer):
     request = _make_request()
     output = (
         "<tool_call><function=read>"
-        "<parameter=filePath>/Users/erfan/Documents/Projects/Calute/README.md</parameter>"
+        "<parameter=filePath>/Users/operator/workspace/demo/README.md</parameter>"
         "<parameter=offset>1</parameter>"
         "</function></tool_call>"
     )
@@ -291,7 +291,7 @@ def test_hermes_does_not_parse_qwen_xml_but_qwen3xml_does(dummy_tokenizer):
     assert qwen_extracted.tools_called is True
     assert qwen_extracted.tool_calls[0].function.name == "read"
     assert json.loads(qwen_extracted.tool_calls[0].function.arguments) == {
-        "filePath": "/Users/erfan/Documents/Projects/Calute/README.md",
+        "filePath": "/Users/operator/workspace/demo/README.md",
         "offset": "1",
     }
 

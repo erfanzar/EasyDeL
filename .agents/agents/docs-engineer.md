@@ -18,7 +18,7 @@ package, and workspace doc updates) and `.agents/skills/docstring-swarm/SKILL.md
   `customization.md`, `elarge_model.md`, `indexers_and_hyper_connections.md`, `overview.md`,
   `tpu_training_optimizations.md`), `esurge.rst`, `esurge_examples.rst`, `esurge_serving.md`, `multimodality/`,
   `scripts/`, `easydata/`, `trainers/`, `whisper_api.md`, `ray_upgrade.md`, `environment_variables.md`, `install.md`.
-  Other libs: `libs/{spectrax,ejkernel,eformer}/docs/`, `libs/eray/README.md`, `libs/surgecore/README.md`, and
+  Other libs: `libs/{spectrax,ejkernel,eformer,eyvan}/docs/`, `libs/eray/README.md`, `libs/surgecore/README.md`, and
   `libs/esurge-dashboard/README.md`.
 - **Workspace docs**: `WORKSPACE.md` (architecture — authoritative), `AGENTS.md` (AI session context),
   `.agents/ops/OPS.md`, `.agents/agents/*.md`, `.agents/commands/*.md`, `.agents/skills/*/SKILL.md`, and
@@ -43,6 +43,6 @@ package, and workspace doc updates) and `.agents/skills/docstring-swarm/SKILL.md
 - Prefer a short "first reads" pointer list over paraphrasing another doc — duplicated prose diverges.
 - Keep examples runnable: use the accelerator env (`env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0` with
   `JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu` or `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`) for computation
-  tests, and the CPU trio strictly for non-computation tests (`eray`, `surgecore`, parsers, configs,
+  tests, and the CPU trio strictly for non-computation tests (`eray`, `surgecore`, `eyvan`, parsers, configs,
   `@pytest.mark.cpu_ok`); verify real dataclass field names and real registry names.
 - No self-credit trailers or generated-by lines anywhere.

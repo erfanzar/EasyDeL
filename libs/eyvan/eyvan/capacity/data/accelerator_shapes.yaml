@@ -1,0 +1,393 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of Eyvan.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Accelerator shapes Eyvan knows the dimensions of.
+#
+# Before this file, shape knowledge lived in three places that could disagree:
+# a compute-TPU dict, a queued-slice dict, and an autoscale policy that derived
+# a chip count from the type suffix and then hardcoded `cpu: 32` for every TPU
+# ever made. Operators made up the difference by hand-writing `resources:` into
+# every fleet YAML.
+#
+# Two version levels, and they mean different things:
+#   catalog_version -- the schema. A build that does not understand it refuses
+#                      to load, rather than silently ignoring fields it cannot
+#                      read.
+#   revision        -- the contents. Bump whenever a source or resource value
+#                      changes so reviews can identify the exact value set.
+#
+# `hosts` and `chips_per_host` are OPTIONAL for a TPU shape and present only
+# where this repository can ground them. For v5p they follow from
+# `ct5p-hightpu-4t`, the machine type already encoded in `fleet_config`: four
+# chips per host. For generations where nothing here establishes a host count,
+# the fields are omitted rather than guessed -- a wrong host count would make
+# Eyvan reject a correctly-provisioned slice, which is worse than not checking.
+#
+# They are MANDATORY for a GPU shape, which is one VM: `hosts: 1` and
+# `chips_per_host` equal to `chips`. Per-rank device visibility is derived from
+# that number, and a rank cannot be handed an exact device list from a device
+# count nobody recorded.
+#
+# GPU rows are keyed by MACHINE TYPE, not by GPU model. The model fixes none of
+# the numbers admission needs -- `g2-standard-4` and `g2-standard-96` carry the
+# same L4 and differ by 24x in vCPU and 8x in attached devices -- and no pool in
+# this repository puts a machine type in `accelerator_type`, so adding these
+# rows cannot change what an existing pool means. `gpu_model` records which
+# accelerator is attached, using the provider's own accelerator name.
+#
+# NOTHING BELOW IS HARDWARE-QUALIFIED FOR GPU. No GPU has ever executed an Eyvan
+# workload. A GPU row is a reviewable transcription of a published machine
+# shape, not evidence that a run on that shape works.
+#
+# CPU and RAM are mandatory because both participate in admission. Values below
+# are per TPU VM, not totals across a multi-host slice. Google labels the RAM
+# column "GB" in these TPU VM tables; Eyvan retains Google's published machine
+# shape number in its historical `memory_gib` admission unit, consistently with
+# the other GCP machine profiles in this repository. Every entry records the
+# exact provider page/version reviewed so future edits do not become guesses.
+
+catalog_version: 3
+revision: "2026-09-24.1"
+
+# Multi-host slice rules, and why they are not more hand-written rows.
+#
+# GCP offers 93 v5p types in us-east5-a. This file named two of them, so Eyvan
+# refused 91 slice sizes an operator had quota for -- and the refusal read
+# "Eyvan cannot derive a typed queued-resource worker shape", which sounds like
+# a provider limitation and is not one. A table of individually transcribed
+# rows can only ever end that way: every size Google adds is a size Eyvan
+# rejects until somebody notices.
+#
+# A multi-host slice is not new hardware. It is N of one VM wired together, and
+# that VM is the thing whose CPU and memory admission needs. So a generation
+# states its per-VM shape once and every multi-host size follows by division.
+# NO NUMBER BELOW IS NEW: each is the value already transcribed in the explicit
+# row for that generation, from the same page and version.
+#
+# `min_chips` is where the rule starts, and it is never 1. Small slices are the
+# case where a host is *subdivided* -- a fraction of a VM, with resources this
+# repository has no source for -- so they stay explicit rows or stay refused.
+# Deriving them would be inventing numbers, which is the failure this whole
+# file exists to prevent.
+#
+# An explicit row always wins. It carries what a rule cannot: image families,
+# machine types, and the deliberate exclusions (v5p-8 is compiled as an
+# integrated Compute Engine TPU VM, not a queued resource).
+
+generation_rules:
+  - generation: v5p
+    kind: tpu
+    quota_units_per_chip: 2
+    # Every multi-host v5p slice is built from ct5p-hightpu-4t, the machine type
+    # already encoded in fleet_config and in the v5p-16/v5p-32 rows below.
+    min_chips: 8
+    chips_per_host: 4
+    host_cpu: 208
+    host_memory_gib: 448
+    capacity_backend: gcp-tpu
+    machine_type: ct5p-hightpu-4t
+    # The v5p-16 and v5p-32 rows below state `hosts` outright, so the division
+    # is the endpoint count Eyvan may check and not just a resource claim.
+    establishes_hosts: true
+    source_url: https://cloud.google.com/tpu/docs/v5p
+    source_version: "Last updated 2026-08-04 UTC"
+
+  - generation: v6e
+    kind: tpu
+    quota_units_per_chip: 1
+    # From the v6e-16 row: multi-host v6e "is composed of documented four-chip
+    # VMs; these are per-VM resources". v6e-8 and smaller are single-VM shapes
+    # with a different host, so the rule starts above them.
+    min_chips: 16
+    chips_per_host: 4
+    host_cpu: 180
+    host_memory_gib: 720
+    capacity_backend: gcp-tpu
+    # Left off deliberately, exactly as the v6e-16 row leaves `hosts` off:
+    # Google's table distinguishes physical hosts from VMs and no receipt here
+    # establishes v6e's endpoint count. The four-chip figure sizes the VM's
+    # resources; it is not a count Eyvan may hold a provisioned slice to.
+    establishes_hosts: false
+    source_url: https://cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-08-04 UTC"
+
+  - generation: v5litepod
+    kind: tpu
+    # v5e is sold as "v5litepod" and its suffix counts chips.
+    quota_units_per_chip: 1
+    # Google's v5e table: every training slice from v5litepod-16 up is built
+    # from ct5lp-hightpu-4t VMs (4 chips, 112 vCPU, 192 GB); those are per-VM
+    # resources. v5litepod-1/-4/-8 use other single-VM machine types and are
+    # explicit rows.
+    min_chips: 16
+    chips_per_host: 4
+    host_cpu: 112
+    host_memory_gib: 192
+    capacity_backend: gcp-tpu
+    machine_type: ct5lp-hightpu-4t
+    # Left off for the reason v6e leaves it off: the published host column
+    # counts physical hosts, which do not divide evenly into four-chip VMs at
+    # every size, and no receipt here establishes v5e's endpoint count.
+    establishes_hosts: false
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - generation: tpu7x
+    kind: tpu
+    # The suffix counts chips, not TensorCores. v4 and v5p are the exception,
+    # not the rule, and the seventh generation went back to counting chips.
+    quota_units_per_chip: 1
+    # "All TPU7x slices use full-host, 4-chip VMs", so the rule starts at one
+    # whole VM and the published topology table divides exactly: 2x2x1 is 4
+    # chips on 1 host, 8x8x16 is 1024 chips on 256.
+    min_chips: 4
+    chips_per_host: 4
+    host_cpu: 224
+    host_memory_gib: 960
+    capacity_backend: gcp-tpu
+    machine_type: tpu7x-standard-4t
+    establishes_hosts: true
+    source_url: https://docs.cloud.google.com/tpu/docs/tpu7x
+    source_version: "Retrieved 2026-08-18"
+
+shapes:
+  - accelerator_type: v5p-8
+    kind: tpu
+    generation: v5p
+    chips: 4
+    quota_units: 8
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 208
+    host_memory_gib: 448
+    capacity_backend: gcp-compute
+    source_url: https://cloud.google.com/tpu/docs/v5p
+    source_version: "Last updated 2026-08-04 UTC"
+    machine_type: ct5p-hightpu-4t
+    tpu_type: ct5p
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    # Compiled as an integrated Compute Engine TPU VM, so it is deliberately
+    # excluded from queued-resource autoscaling.
+    multislice_capable: false
+
+  - accelerator_type: v5p-16
+    kind: tpu
+    generation: v5p
+    chips: 8
+    quota_units: 16
+    hosts: 2
+    chips_per_host: 4
+    host_cpu: 208
+    host_memory_gib: 448
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    source_url: https://cloud.google.com/tpu/docs/v5p
+    source_version: "Last updated 2026-08-04 UTC"
+
+  - accelerator_type: v5p-32
+    kind: tpu
+    generation: v5p
+    chips: 16
+    quota_units: 32
+    hosts: 4
+    chips_per_host: 4
+    host_cpu: 208
+    host_memory_gib: 448
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    source_url: https://cloud.google.com/tpu/docs/v5p
+    source_version: "Last updated 2026-08-04 UTC"
+
+  - accelerator_type: v6e-8
+    kind: tpu
+    generation: v6e
+    chips: 8
+    quota_units: 8
+    # v6e-8 is the documented full-host, eight-chip inference VM.
+    host_cpu: 360
+    host_memory_gib: 1440
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    source_url: https://cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-08-04 UTC"
+
+  - accelerator_type: v6e-16
+    kind: tpu
+    generation: v6e
+    chips: 16
+    quota_units: 16
+    # hosts/chips_per_host deliberately absent: Google's table distinguishes
+    # physical hosts from VMs, while Eyvan checks provider endpoint count. No
+    # repository hardware receipt establishes that endpoint count for v6e-16,
+    # so inventing it would make Eyvan refuse a correctly provisioned slice.
+    # v6e-16 is composed of documented four-chip VMs; these are per-VM
+    # resources, not a physical-host or whole-slice total.
+    host_cpu: 180
+    host_memory_gib: 720
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    source_url: https://cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-08-04 UTC"
+
+  # Single-VM v6e and v5e shapes. Each row is one VM of the machine type
+  # named, from Google's VM-type tables (retrieved 2026-09-24). v6e-4 is one
+  # ct6e-standard-4t "half-host" VM; v6e-1 and the v5e rows are the documented
+  # single-VM serving shapes.
+  - accelerator_type: v6e-1
+    kind: tpu
+    generation: v6e
+    chips: 1
+    quota_units: 1
+    hosts: 1
+    chips_per_host: 1
+    host_cpu: 44
+    host_memory_gib: 176
+    capacity_backend: gcp-tpu
+    multislice_capable: false
+    machine_type: ct6e-standard-1t
+    tpu_type: ct6e
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v6e-4
+    kind: tpu
+    generation: v6e
+    chips: 4
+    quota_units: 4
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 180
+    host_memory_gib: 720
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    machine_type: ct6e-standard-4t
+    tpu_type: ct6e
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v6e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v5litepod-1
+    kind: tpu
+    generation: v5litepod
+    chips: 1
+    quota_units: 1
+    hosts: 1
+    chips_per_host: 1
+    host_cpu: 24
+    host_memory_gib: 48
+    capacity_backend: gcp-tpu
+    multislice_capable: false
+    machine_type: ct5lp-hightpu-1t
+    tpu_type: ct5lp
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v5litepod-4
+    kind: tpu
+    generation: v5litepod
+    chips: 4
+    quota_units: 4
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 112
+    host_memory_gib: 192
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    machine_type: ct5lp-hightpu-4t
+    tpu_type: ct5lp
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  - accelerator_type: v5litepod-8
+    kind: tpu
+    generation: v5litepod
+    chips: 8
+    quota_units: 8
+    hosts: 1
+    chips_per_host: 8
+    host_cpu: 224
+    host_memory_gib: 384
+    capacity_backend: gcp-tpu
+    multislice_capable: true
+    machine_type: ct5lp-hightpu-8t
+    tpu_type: ct5lp
+    image_family: ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e
+    image_project: ubuntu-os-accelerator-images
+    source_url: https://docs.cloud.google.com/tpu/docs/v5e
+    source_version: "Last updated 2026-09-18 UTC"
+
+  # ---------------------------------------------------------------- GPU hosts
+  #
+  # vCPU, instance memory and GPU count are the published machine-shape table on
+  # the accelerator-optimized machine families page. The `gpu_model` values are
+  # the provider's own accelerator names from the GPU machine types page
+  # (https://cloud.google.com/compute/docs/gpus, "Last updated 2026-08-05 UTC"),
+  # which maps A3 High -> nvidia-h100-80gb, A2 Standard -> nvidia-tesla-a100 and
+  # G2 -> nvidia-l4.
+  #
+  # Google labels the memory column "GB"; as with the TPU rows above, Eyvan
+  # retains the published number in its historical `memory_gib` admission unit
+  # so one shape is not measured two ways. G2 memory is the DEFAULT instance
+  # memory; that family also accepts a custom range, and a pool that uses one
+  # states it as an explicit positive override.
+  #
+  # Three families rather than one so the single-GPU and multi-GPU host cases
+  # are both described by shipped data rather than by a test fixture.
+
+  - accelerator_type: a3-highgpu-8g
+    kind: gpu
+    generation: a3-high
+    chips: 8
+    quota_units: 8
+    hosts: 1
+    chips_per_host: 8
+    host_cpu: 208
+    host_memory_gib: 1872
+    capacity_backend: gcp-compute
+    multislice_capable: false
+    gpu_model: nvidia-h100-80gb
+    machine_type: a3-highgpu-8g
+    source_url: https://cloud.google.com/compute/docs/accelerator-optimized-machines
+    source_version: "Last updated 2026-08-07 UTC"
+
+  - accelerator_type: a2-highgpu-1g
+    kind: gpu
+    generation: a2-standard
+    chips: 1
+    quota_units: 1
+    hosts: 1
+    chips_per_host: 1
+    host_cpu: 12
+    host_memory_gib: 85
+    capacity_backend: gcp-compute
+    multislice_capable: false
+    gpu_model: nvidia-tesla-a100
+    machine_type: a2-highgpu-1g
+    source_url: https://cloud.google.com/compute/docs/accelerator-optimized-machines
+    source_version: "Last updated 2026-08-07 UTC"
+
+  - accelerator_type: g2-standard-48
+    kind: gpu
+    generation: g2
+    chips: 4
+    quota_units: 4
+    hosts: 1
+    chips_per_host: 4
+    host_cpu: 48
+    host_memory_gib: 192
+    capacity_backend: gcp-compute
+    multislice_capable: false
+    gpu_model: nvidia-l4
+    machine_type: g2-standard-48
+    source_url: https://cloud.google.com/compute/docs/accelerator-optimized-machines
+    source_version: "Last updated 2026-08-07 UTC"

@@ -7,9 +7,9 @@ this file.
 ## What this repo is
 
 A uv-workspace monorepo containing the EasyDeL stack: a JAX-native framework for training, fine-tuning, and serving
-LLMs/VLMs at scale on TPU/GPU, plus the five companion libraries it is built on (four Python foundation libraries and
-the native Rust `surgecore` crate), alongside the standalone `libs/esurge-dashboard` Rust binary crate. **This monorepo
-is the source of truth**; `libs/spectrax`, `libs/ejkernel`, `libs/eformer`, `libs/eray`, and `libs/surgecore` are
+LLMs/VLMs at scale on TPU/GPU, plus the six companion libraries alongside it (five Python libraries and the native Rust
+`surgecore` crate) and the standalone `libs/esurge-dashboard` Rust binary crate. **This monorepo is the source of
+truth**; `libs/spectrax`, `libs/ejkernel`, `libs/eformer`, `libs/eray`, `libs/surgecore`, and `libs/eyvan` are
 subtree-mirrored to standalone read-only repos on push.
 
 | package   | path             | one line                                                                                                                        |
@@ -20,6 +20,7 @@ subtree-mirrored to standalone read-only repos on push.
 | eformer   | `libs/eformer`   | scale infrastructure: optimizers, mixed precision, implicit quantized arrays, `ePath`, standalone escale/serialization          |
 | eray      | `libs/eray`      | Ray orchestration and GCP provisioning for TPU/GPU pods: pools, resumable execution, swarms, CLI                                |
 | surgecore | `libs/surgecore` | EasyDeL's native Rust library (PyO3, maturin) for eSurge's host path; imported only by easydel; mirror erfanzar/esurgecore      |
+| eyvan     | `libs/eyvan`     | policy-aware fleet capacity plane (scheduler, worker runtime, experiment tracking, React dashboard); mirror erfanzar/eyvan      |
 
 `libs/esurge-dashboard` is a standalone Rust/Axum server-rendered monitoring binary (`publish = false`, not a uv
 workspace member) that reads eSurge's `GET /metrics`.
@@ -34,8 +35,9 @@ Non-trivial work starts from `.agents/skills/run-research/SKILL.md` and layers a
 
 These apply to every agent and every session, without exception.
 
-1. **Layering contract (CI-enforced):** only `easydel` may import spectrax / ejkernel / eformer / eray / surgecore.
-   Foundation libs and surgecore never import easydel or each other. Check with `uv run lint-imports`.
+1. **Layering contract (CI-enforced):** only `easydel` may import spectrax / ejkernel / eformer / eray / surgecore /
+   eyvan. Companion libs never import easydel or each other. Check with `uv run lint-imports` (and
+   `(cd libs/eyvan && uv run --no-sync lint-imports)` for eyvan's internal control-plane boundaries).
 2. **`uv sync`, never bare pip.** Workspace packages resolve editable from
    `libs/`. `uv pip install -e .` pulls siblings from PyPI instead — wrong for development.
 3. **Never hand-edit version pins.** `scripts/release.sh <lib> <version>`
@@ -45,11 +47,11 @@ These apply to every agent and every session, without exception.
    attention, MoE, kernels, losses, optimizers, trainers, caches, eSurge, spectrax transforms/runtime, eformer escale /
    mpric / ops) must run on TPU (or GPU where that is the target hardware). CPU is allowed only for tests that do no
    array computation (config/CLI parsing, tool/reasoning parsers, data text transforms, loggers, paths, `eray`,
-   `surgecore`). A CPU run of a computation test is not validation and must never be reported as such; with no
+   `surgecore`, `eyvan`). A CPU run of a computation test is not validation and must never be reported as such; with no
    accelerator available, report the change as **unverified on hardware**. The four JAX-library test suites (`easydel`,
    `spectrax`, `eformer`, `ejkernel`) enforce this in `conftest.py` via an array-library import regex
-   (`_ARRAY_LIBRARY_IMPORT`), runtime XLA compile trapping (`_cpu_compile_guard`), and `@pytest.mark.cpu_ok` (`eray`
-   and `surgecore` do no JAX computation and run on CPU).
+   (`_ARRAY_LIBRARY_IMPORT`), runtime XLA compile trapping (`_cpu_compile_guard`), and `@pytest.mark.cpu_ok` (`eray`,
+   `surgecore`, and `eyvan` do no JAX computation and run on CPU).
 5. **Don't bypass registries.** Models go through `register_config`/
    `register_module`, trainers through `Registry.register("trainer", ...)`, attention through `OperationRegistry`,
    kernels through ejkernel's `kernel_registry`. No side registries, no direct-class special cases.
@@ -88,8 +90,8 @@ env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NA
 ```
 
 The CPU trio (`ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8`) is only
-for tests that do no array computation, e.g. `libs/eray/tests`, `libs/surgecore/tests`, parser and config tests, and
-tests marked `@pytest.mark.cpu_ok`.
+for tests that do no array computation, e.g. `libs/eray/tests`, `libs/surgecore/tests`, `libs/eyvan/tests`, parser and
+config tests, and tests marked `@pytest.mark.cpu_ok`.
 
 Standard targets:
 
@@ -103,6 +105,7 @@ uv run python scripts/check_agents_integrity.py       # verify .agents/ + AGENTS
 <accel> uv run pytest libs/ejkernel/test               # ejkernel (note: test/, not tests/)
 <trio>  uv run pytest libs/eray/tests                  # eray: orchestration, no array compute
 <trio>  uv run pytest libs/surgecore/tests             # surgecore: Rust/Python host core, cpu_ok
+(cd libs/eyvan && uv run --package eyvan --extra dev pytest tests -m fast -q)  # eyvan: control plane, no array compute
 uv run python scripts/format_and_generate_docs.py --libs easydel --fix   # format + regenerate API docs
 ```
 

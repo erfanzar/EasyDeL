@@ -13,7 +13,7 @@ bad-node recovery runbooks in `.agents/ops/OPS.md`.
 - `WORKSPACE.md` and `.agents/ops/OPS.md`
 - `scripts/tpu_setup.sh`
 - Root `pyproject.toml`
-- `libs/{easydel,spectrax,ejkernel,eformer,eray,surgecore}/pyproject.toml`
+- `libs/{easydel,spectrax,ejkernel,eformer,eray,surgecore,eyvan}/pyproject.toml`
 - `libs/surgecore/Cargo.toml`
 
 ## Setup Entry Point
@@ -33,9 +33,9 @@ Key behaviors of `scripts/tpu_setup.sh`:
   edits and is on a different commit, the script refuses to switch refs instead of clobbering work.
 - **Rust / `surgecore` bootstrap**: `libs/surgecore` is a PyO3/maturin Rust crate built from source by `uv sync`. If
   `cargo` is absent on a host, the script installs a minimal stable toolchain via `rustup` into `~/.cargo/bin`.
-- Installs all 6 workspace packages editable via
+- Installs all 7 workspace packages editable via
   `uv sync --all-packages --active --inexact --extra tpu --extra torch --extra lm-eval --extra profile --group dev`,
-  verifies all 6 packages plus profile/dev tools (`xprof`, `tb-nightly`, `xprof-nightly`, `ruff`, `pytest`,
+  verifies all 7 packages plus profile/dev tools (`xprof`, `tb-nightly`, `xprof-nightly`, `ruff`, `pytest`,
   `pre-commit`, `basedpyright`, `import-linter`) on worker 0, installs `ray[default]==2.54.0`, configures Ray head and
   workers, and runs a Ray + JAX `eray` health check.
 - **Input env vars honored**: `EASYDEL_REPO_URL`, `EASYDEL_SRC_DIR`, `EOPOD_COMMAND_TIMEOUT` (1800),
@@ -48,7 +48,7 @@ Key behaviors of `scripts/tpu_setup.sh`:
    - Clone / dirty-checkout errors: `/tmp/easydel-clone.log`
    - Rustup / `cargo` / maturin `surgecore` build failures: `/tmp/easydel-rustup.log`
    - Ray stop / start failures: `/tmp/easydel-ray-stop.log`, `/tmp/easydel-ray-start.log`
-2. Verify all 6 workspace packages resolve editably from `$EASYDEL_SRC_DIR/libs/` (snippet below).
+2. Verify all 7 workspace packages resolve editably from `$EASYDEL_SRC_DIR/libs/` (snippet below).
 3. Check whether `libtpu` is held by another process.
 4. Check whether a single TPU VM in the slice is unhealthy or failing accelerator init.
 5. Only recreate/delete TPU VMs or wipe shared state after explicit user approval.
@@ -86,6 +86,7 @@ for dist, mod_name in [
     ("spectrax-lib", "spectrax"),
     ("eray", "eray"),
     ("surgecore", "surgecore"),
+    ("eyvan", "eyvan"),
     ("jax", "jax"),
 ]:
     mod = importlib.import_module(mod_name)

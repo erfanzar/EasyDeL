@@ -23,8 +23,7 @@ Implement the requested feature or approved plan in the EasyDeL monorepo followi
 3. **Implement cleanly**:
    - Make the smallest complete change matching surrounding style (`import typing as tp`, `from jax import numpy as jnp`,
      `import spectrax as spx`, ruff line length 121, Google docstrings).
-   - Respect layering (`easydel` only imports sibling packages; foundation libs and `surgecore` never import `easydel`
-     or each other).
+   - Respect layering (`easydel` only imports sibling packages; companion libs never import `easydel` or each other).
    - Never bypass registries, never hand-edit generated `docs/api_docs/**`, and never hand-edit version pins (use
      `scripts/release.sh`).
    - Respect repo-wide runtime contracts: **no new `os.environ` knobs** (wire settings through config dataclasses,
@@ -35,7 +34,7 @@ Implement the requested feature or approved plan in the EasyDeL monorepo followi
      `.agents/skills/test-workspace/SKILL.md`.
    - Run JAX computation tests on an accelerator (TPU shown; for GPU use
      `JAX_PLATFORMS=cuda,cpu JAX_PLATFORM_NAME=gpu`). Use CPU only for pure-Python/Rust non-computation tests
-     (`libs/eray/tests`, `libs/surgecore/tests`, parsers, configs, `@pytest.mark.cpu_ok`):
+     (`libs/eray/tests`, `libs/surgecore/tests`, `libs/eyvan/tests`, parsers, configs, `@pytest.mark.cpu_ok`):
 
      ```bash
      env -u XLA_FLAGS ENABLE_DISTRIBUTED_INIT=0 JAX_PLATFORMS=tpu,cpu JAX_PLATFORM_NAME=tpu \

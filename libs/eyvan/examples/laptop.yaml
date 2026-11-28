@@ -1,0 +1,34 @@
+# The smallest fleet that runs: one CPU pool on this machine.
+#
+# `eyvan up examples/laptop.yaml` applies it and, on a loopback URL, starts and
+# supervises the control plane for you. Do not start `eyvan-server` first --
+# `up` refuses a plane it cannot prove it owns, because adopting a process it
+# did not supervise is how two control planes end up sharing one database.
+#
+# The local capacity backend claims no CPU, memory, container or accelerator
+# isolation. It exists so the control plane, scheduler, leases and execution
+# path can be exercised without a cloud account. It is not a way to run
+# training work.
+version: 1
+name: laptop
+
+provider:
+  type: local
+  region: local
+
+executor: native-local
+capacity_class: on_demand
+
+pools:
+  cpu:
+    kind: cpu
+    capacity_backend: local
+    # Required for every pool, and free-form here: nothing provisions a machine
+    # on this path, so the name is a label rather than a provider shape.
+    machine_type: laptop
+    resources:
+      cpu: 2
+      memory_gib: 4
+    min_workers: 1
+    max_workers: 2
+    agent_endpoint: http://127.0.0.1:8091

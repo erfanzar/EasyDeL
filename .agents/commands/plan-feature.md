@@ -13,9 +13,9 @@ with `git grep` / `rg` or by opening the file (never guess paths; `rg` may not b
 
 ## Planning Constraints
 
-- **Package ownership & layering**: place general mechanisms in the appropriate Python foundation library (`spectrax`,
-  `ejkernel`, `eformer`, `eray`), eSurge host-path/UI Rust logic in `libs/surgecore` or `libs/esurge-dashboard`, and
-  LLM composition in `easydel`. Only `easydel` may import sibling workspace packages.
+- **Package ownership & layering**: place general mechanisms in the appropriate Python companion library (`spectrax`,
+  `ejkernel`, `eformer`, `eray`, `eyvan`), eSurge host-path/UI Rust logic in `libs/surgecore` or
+  `libs/esurge-dashboard`, and LLM composition in `easydel`. Only `easydel` may import sibling workspace packages.
 - **Extension points & skills**: land on existing registries, mixins, or config surfaces; name the governing skill from
   `.agents/skills/README.md` for each step. Whenever adding a hardware kernel consumed by EasyDeL, pair
   `add-ejkernel-kernel` (mandatory `Platform.XLA`, `Backend.ANY` fallback) with `port-ejkernel-to-easydel-operation`

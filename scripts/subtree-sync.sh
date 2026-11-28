@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sync the libs/* subtrees with their standalone mirror repositories.
 #
-#   scripts/subtree-sync.sh push [lib...]   # monorepo -> mirrors (default: all five)
+#   scripts/subtree-sync.sh push [lib...]   # monorepo -> mirrors (default: all six)
 #   scripts/subtree-sync.sh pull [lib...]   # mirrors -> monorepo (squashed: 2 commits per lib)
 #   scripts/subtree-sync.sh auto [lib...]   # push only the libs whose mirror is out of date
 #                                           # (used by the pre-push git hook; DRY_RUN=1 to
@@ -26,6 +26,7 @@ declare -A REPOS=(
     [eformer]="https://github.com/erfanzar/eformer"
     [eray]="https://github.com/erfanzar/eray"
     [surgecore]="https://github.com/erfanzar/esurgecore"
+    [eyvan]="https://github.com/erfanzar/eyvan"
 )
 
 MONO_SYNC_PREFIX="${MONO_SYNC_PREFIX:-easydel(mono-sync): }"
@@ -33,7 +34,7 @@ MONO_SYNC_PREFIX="${MONO_SYNC_PREFIX:-easydel(mono-sync): }"
 cmd="${1:-push}"
 shift || true
 libs=("$@")
-[ ${#libs[@]} -eq 0 ] && libs=(spectrax ejkernel eformer eray surgecore)
+[ ${#libs[@]} -eq 0 ] && libs=(spectrax ejkernel eformer eray surgecore eyvan)
 
 if [ "$cmd" = "auto" ]; then
     # bypass requested

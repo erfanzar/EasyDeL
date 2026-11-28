@@ -1674,6 +1674,7 @@ class eLargeModel:
 
         cfg: dict[str, Any] = {}
         for key in (
+            "model_name",
             "learning_rate",
             "max_training_steps",
             "save_directory",
@@ -1683,10 +1684,18 @@ class eLargeModel:
             "total_batch_size",
             "gradient_accumulation_steps",
             "num_generations",
+            "use_eyvan_track",
+            "eyvan_track_uri",
+            "eyvan_track_project",
+            "eyvan_track_name",
+            "eyvan_track_group",
+            "eyvan_track_tags",
+            "eyvan_track_flush_interval_s",
+            "eyvan_report_progress",
         ):
             value = getattr(training_args, key, None)
             if value is not None:
-                cfg[key] = value
+                cfg[key] = list(value) if isinstance(value, list) else value
         normalized = normalize_trainer_config(dict(raw_trainer_cfg))
         for key in raw_trainer_cfg:
             if key not in wrapper_only and key in normalized:
@@ -1714,11 +1723,7 @@ class eLargeModel:
                 eff_comp = cfg.get("max_new_tokens")
                 if eff_comp is None:
                     eff_comp = cfg.get("max_completion_length")
-                if (
-                    eff_comp is None
-                    and "max_new_tokens" in params
-                    and isinstance(params["max_new_tokens"].default, int)
-                ):
+                if eff_comp is None and "max_new_tokens" in params and isinstance(params["max_new_tokens"].default, int):
                     eff_comp = params["max_new_tokens"].default
                 if eff_prompt is not None and eff_comp is not None:
                     needed = int(eff_prompt) + int(eff_comp)
@@ -2370,6 +2375,34 @@ class eLargeModel:
         """
         raw_config = self._config.get("trainer", {})
         return normalize_trainer_config(raw_config)
+
+    @staticmethod
+    def resolve_eyvan_storage_path(
+        *parts: str,
+        region: str | None = None,
+        zone: str | None = None,
+        create: bool | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Resolve a regional Eyvan GCS storage path (``gs://eyvan_<region>/...``).
+
+        Ergonomic helper for pointing eLarge checkpoints, pretokenized datasets,
+        or eval outputs at the co-located regional TPU GCS bucket.
+
+        Args:
+            *parts: Relative path segments appended under the regional bucket.
+            region: Explicit GCP region (auto-detected when omitted).
+            zone: Explicit GCP zone (implies its parent region).
+            create: Consent-by-default bucket creation policy.
+            **kwargs: Extra keyword arguments forwarded to
+                :func:`easydel.utils.eyvan_helpers.storage_path`.
+
+        Returns:
+            Canonical ``gs://`` URI string.
+        """
+        from easydel.utils.eyvan_helpers import storage_path
+
+        return storage_path(*parts, region=region, zone=zone, create=create, **kwargs)
 
     def train(
         self,

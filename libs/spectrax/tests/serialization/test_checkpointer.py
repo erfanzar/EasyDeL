@@ -342,7 +342,7 @@ class TestCheckpointer:
         import uuid
 
         run_id = str(uuid.uuid4())[:8]
-        gcs_base = f"gs://uscentral1stuff/spx-save-tmp/test-checkpointer-{run_id}"
+        gcs_base = f"{gcs_auth_ino}/test-checkpointer-{run_id}"
 
         cp = Checkpointer(
             base_path=gcs_base,

@@ -1365,6 +1365,17 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
         preprocessing_time = preprocessing_time_fn()
 
         token_count = jnp.maximum(jnp.sum(completion_mask), 1.0)
+        scores_np = np.asarray(jax.device_get(scores), dtype=np.float32).reshape(-1)
+        finite_scores = scores_np[np.isfinite(scores_np)]
+        rl_pass_rate = float(np.mean(finite_scores > 0.0)) if finite_scores.size > 0 else 0.0
+        raw_completion_mask = (
+            self._make_attn_mask(completion_ids) if self.arguments.mask_truncated_completions else completion_mask
+        )
+        truncated_flags = self._compute_ppo_truncated_flags(
+            completion_ids=completion_ids,
+            raw_completion_mask=raw_completion_mask,
+        )
+        rl_truncation_rate = float(np.mean(truncated_flags)) if truncated_flags else 0.0
         metrics_dict: dict[str, float | int | str] = {
             "score_mean": _host_scalar_float(jnp.nanmean(scores)),
             "reward_mean": _host_scalar_float(jnp.sum(rewards) / token_count),
@@ -1375,6 +1386,8 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
             "ref_logps_time": ref_logps_time,
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
+            "rl/pass_rate": rl_pass_rate,
+            "rl/truncation_rate": rl_truncation_rate,
         }
         if self.arguments.length_adaptive_gae:
             metrics_dict["policy_gae_lambda_mean"] = _host_scalar_float(jnp.mean(policy_lambdas))
@@ -1382,6 +1395,22 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
             metrics_dict["positive_fraction"] = _host_scalar_float(jnp.mean(vapo_batch["positive_mask"]))
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
+        cur_step = int(jax.device_get(state.step))
+        if getattr(self.arguments, "eyvan_tracking_enabled", False):
+            self._log_eyvan_ppo_rl_metrics(
+                cur_step=cur_step,
+                prompts=completion_prompts,
+                completions=completions_text,
+                scores=scores,
+                rewards_per_func=rewards_per_func,
+                reward_weights=self.reward_weights,
+                advantages=advantages,
+                kl=kl,
+                old_values=old_values,
+                completion_mask=completion_mask,
+                truncated_flags=truncated_flags,
+                generation_factor=generation_factor,
+            )
         self._log_training_generations_to_wandb(
             state=state,
             prompts=completion_prompts,
@@ -1406,3 +1435,158 @@ class PPOTrainer(AsyncRolloutMixin, Trainer):
             },
             metrics_dict,
         )
+
+    def _compute_ppo_truncated_flags(
+        self,
+        *,
+        completion_ids: jax.Array | np.ndarray,
+        raw_completion_mask: jax.Array | np.ndarray,
+    ) -> list[bool]:
+        """Return per-completion truncation flags (length >= max_completion_length without EOS)."""
+        comp_ids_np = np.asarray(jax.device_get(completion_ids))
+        raw_mask_np = np.asarray(jax.device_get(raw_completion_mask), dtype=np.float32) > 0
+        if comp_ids_np.ndim != 2 or comp_ids_np.shape[0] == 0:
+            return []
+        max_comp_len = int(getattr(self.arguments, "max_completion_length", None) or comp_ids_np.shape[1])
+        eos_raw = getattr(self, "_eos_token_id", None)
+        if eos_raw is None:
+            proc = getattr(self, "processing_class", None)
+            eos_raw = getattr(proc, "eos_token_id", None)
+        eos_arr = (
+            np.asarray(jax.device_get(eos_raw), dtype=np.int64).reshape(-1)
+            if eos_raw is not None
+            else np.asarray([], dtype=np.int64)
+        )
+        raw_lengths = raw_mask_np.sum(axis=-1)
+        flags: list[bool] = []
+        for idx in range(comp_ids_np.shape[0]):
+            active_tokens = comp_ids_np[idx][raw_mask_np[idx]]
+            has_eos = (
+                bool(np.any(np.isin(active_tokens, eos_arr))) if eos_arr.size > 0 and active_tokens.size > 0 else False
+            )
+            flags.append(bool(int(raw_lengths[idx]) >= max_comp_len and not has_eos))
+        return flags
+
+    def _log_eyvan_ppo_rl_metrics(
+        self,
+        *,
+        cur_step: int,
+        prompts: tp.Sequence[object],
+        completions: tp.Sequence[object],
+        scores: jax.Array | np.ndarray,
+        rewards_per_func: jax.Array | np.ndarray,
+        advantages: jax.Array | np.ndarray,
+        kl: jax.Array | np.ndarray,
+        old_values: jax.Array | np.ndarray,
+        completion_mask: jax.Array | np.ndarray,
+        truncated_flags: tp.Sequence[bool],
+        reward_weights: jax.Array | np.ndarray | None = None,
+        generation_factor: int = 1,
+        max_groups: int = 8,
+    ) -> None:
+        """Emit PPO completion groups and RL distributions to Eyvan tracking."""
+        args = getattr(self, "arguments", None)
+        if args is None or not getattr(args, "eyvan_tracking_enabled", False):
+            return
+        policy_version = getattr(self, "_async_rollout_policy_version", None)
+        if policy_version is None:
+            policy_version = cur_step
+
+        scores_np = np.asarray(jax.device_get(scores), dtype=np.float32).reshape(-1)
+        rewards_pf_np = np.asarray(jax.device_get(rewards_per_func), dtype=np.float32)
+        adv_np = np.asarray(jax.device_get(advantages), dtype=np.float32)
+        kl_np = np.asarray(jax.device_get(kl), dtype=np.float32)
+        val_np = np.asarray(jax.device_get(old_values), dtype=np.float32)
+        mask_np = np.asarray(jax.device_get(completion_mask), dtype=np.float32)
+        active_bool = mask_np > 0
+        comp_len_np = mask_np.sum(axis=-1)
+        denom = np.maximum(comp_len_np, 1.0)
+
+        seq_adv_np = (adv_np * mask_np).sum(axis=-1) / denom if adv_np.ndim == 2 else adv_np.reshape(-1)
+        seq_kl_np = (kl_np * mask_np).sum(axis=-1) / denom if kl_np.ndim == 2 else kl_np.reshape(-1)
+
+        group_size = max(int(generation_factor), 1)
+        num_rows = int(scores_np.shape[0])
+        comp_list = list(completions)
+        prompt_list = list(prompts)
+        usable_rows = min(num_rows, len(comp_list))
+        num_groups = min(usable_rows // group_size, max(int(max_groups), 0))
+
+        reward_names: list[str] = []
+        seen_names: set[str] = set()
+        raw_names = list(getattr(self, "reward_func_names", ()))
+        num_cols = int(rewards_pf_np.shape[1]) if rewards_pf_np.ndim == 2 else 0
+        for col_idx in range(num_cols):
+            base_name = raw_names[col_idx] if col_idx < len(raw_names) else f"reward_{col_idx}"
+            name = base_name
+            if name in seen_names:
+                name = f"{base_name}_{col_idx}"
+            seen_names.add(name)
+            reward_names.append(name)
+
+        weights_np: np.ndarray | None = None
+        if num_cols > 0:
+            raw_weights = reward_weights if reward_weights is not None else getattr(self, "reward_weights", None)
+            if raw_weights is not None:
+                weights_np = np.asarray(jax.device_get(raw_weights), dtype=np.float32).reshape(-1)
+                if weights_np.shape[0] != num_cols:
+                    weights_np = None
+            if weights_np is None:
+                weights_np = np.ones((num_cols,), dtype=np.float32)
+
+        stringify = getattr(self, "_wandb_stringify_generation_value", str)
+        for group_idx in range(num_groups):
+            start = group_idx * group_size
+            end = start + group_size
+            if start < len(prompt_list):
+                raw_prompt = prompt_list[start]
+            elif group_idx < len(prompt_list):
+                raw_prompt = prompt_list[group_idx]
+            else:
+                raw_prompt = ""
+            prompt_text = stringify(raw_prompt) or "<prompt>"
+            responses = [stringify(item) for item in comp_list[start:end]]
+            group_scores = scores_np[start:end]
+            group_rewards: tp.Any = group_scores
+            if reward_names and weights_np is not None:
+                weighted_slice = rewards_pf_np[start:end, :num_cols] * weights_np[None, :]
+                finite_scores = np.isfinite(group_scores)
+                sanitized_slice = np.where(
+                    finite_scores[:, None],
+                    np.where(np.isnan(weighted_slice), 0.0, weighted_slice),
+                    np.nan,
+                )
+                comp_sums = np.sum(sanitized_slice, axis=1)
+                totals_match = bool(
+                    np.array_equal(np.isfinite(comp_sums), finite_scores)
+                    and (
+                        not np.any(finite_scores)
+                        or np.allclose(comp_sums[finite_scores], group_scores[finite_scores], rtol=1e-4, atol=1e-5)
+                    )
+                )
+                if totals_match:
+                    group_rewards = {name: sanitized_slice[:, col_idx] for col_idx, name in enumerate(reward_names)}
+            group_trunc = list(truncated_flags[start:end]) if len(truncated_flags) >= end else None
+            args.log_eyvan_completions(
+                prompt_text,
+                responses,
+                rewards=group_rewards,
+                advantages=seq_adv_np[start:end],
+                group=f"s{cur_step}-g{group_idx}",
+                tokens=comp_len_np[start:end],
+                kl=seq_kl_np[start:end],
+                truncated=group_trunc,
+                policy_version=policy_version,
+                step=cur_step,
+            )
+
+        args.log_eyvan_histogram("rl/score_dist", scores_np, step=cur_step)
+        active_adv = adv_np[active_bool] if adv_np.shape == active_bool.shape and active_bool.any() else seq_adv_np
+        args.log_eyvan_histogram("rl/advantage_dist", active_adv, step=cur_step)
+        active_kl = kl_np[active_bool] if kl_np.shape == active_bool.shape and active_bool.any() else seq_kl_np
+        args.log_eyvan_histogram("rl/kl_dist", active_kl, step=cur_step)
+        active_val = (
+            val_np[active_bool] if val_np.shape == active_bool.shape and active_bool.any() else val_np.reshape(-1)
+        )
+        args.log_eyvan_histogram("rl/value_dist", active_val, step=cur_step)
+        args.log_eyvan_histogram("rl/completion_length_dist", comp_len_np, step=cur_step)

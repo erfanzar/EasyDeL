@@ -360,8 +360,7 @@ def _compute_rewards_and_advantages(
     """
     if scale_rewards not in ("batch", "batch_advantage", "group", "none"):
         raise ValueError(
-            f"Invalid value for scale_rewards: {scale_rewards}. "
-            "Must be 'batch', 'batch_advantage', 'group', or 'none'."
+            f"Invalid value for scale_rewards: {scale_rewards}. Must be 'batch', 'batch_advantage', 'group', or 'none'."
         )
     advantage_estimator = getattr(arguments, "advantage_estimator", "group_mean")
     policy = getattr(arguments, "discard_unscorable_groups", None)
@@ -1622,12 +1621,12 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
         self._completion_hub_dir = None
         self._cleanup_completion_hub_resources(scheduler, staging)
 
-    def finish(self) -> None:
+    def finish(self, *, status: str | None = None) -> None:
         """Release GRPO Hub completion logging resources before base trainer teardown."""
         try:
             self.close_completion_hub_logging()
         finally:
-            super().finish()
+            super().finish(status=status)
 
     def _prune_completion_hub_staging(self, *, max_staged_files: int = 32) -> None:
         """Prune uploaded and excess staging parquets inside the remote Hub staging tempdir."""
@@ -2442,12 +2441,7 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
         """Return whether training preprocessing should snapshot ``old_per_token_logps``."""
         return bool(
             is_train
-            and (
-                self._generation_reuse_span() > 1
-                or needs_dppo
-                or needs_esurge_correction
-                or needs_off_policy_mask
-            )
+            and (self._generation_reuse_span() > 1 or needs_dppo or needs_esurge_correction or needs_off_policy_mask)
         )
 
     def _call_compute_refmodel_logps(
@@ -2681,6 +2675,15 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
         attempts = 1
         max_attempts = int(self.arguments.dynamic_sampling_max_attempts)
         while zero.any() and attempts < max_attempts:
+            check_eyvan_reclaim = getattr(self, "_should_save_eyvan_reclaim_checkpoint", None)
+            if callable(check_eyvan_reclaim):
+                raw_step = getattr(state, "step", 0)
+                try:
+                    cur_step = int(jax.device_get(raw_step))
+                except Exception:
+                    cur_step = int(raw_step) if isinstance(raw_step, (int, np.integer)) else 0
+                if check_eyvan_reclaim(cur_step) is not None:
+                    break
             candidate = self._generate_and_score_batch(state, batch, True)
             attempts += 1
             metrics["generation_time"] = float(metrics.get("generation_time", 0.0)) + float(
@@ -2726,6 +2729,10 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             metrics["reward_mean"] = _host_mean_float(jnp.nanmean(rewards, -1))
             metrics["reward_std"] = _host_scalar_float(jnp.nanmean(std_rewards))
             metrics["frac_reward_zero_std"] = _host_mean_float(is_std_zero.astype(jnp.float32))
+            rewards_resampled_np = np.asarray(jax.device_get(rewards), dtype=np.float32).reshape(-1)
+            finite_resampled = rewards_resampled_np[np.isfinite(rewards_resampled_np)]
+            metrics["rl/pass_rate"] = float(np.mean(finite_resampled > 0.0)) if finite_resampled.size > 0 else 0.0
+            metrics["rl/zero_var_group_frac"] = float(metrics["frac_reward_zero_std"])
             if discard_columns is not None:
                 discarded_rows = _unscorable_group_rows(rewards_per_func, generation_factor, discard_columns)
                 discarded_groups = discarded_rows.reshape(-1, max(int(generation_factor), 1))[:, 0]
@@ -3238,6 +3245,28 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             grouped_comp_time = grouped_comp_time_fn()
         preprocessing_time = preprocessing_time_fn()
         completion_length = jnp.sum(completion_mask, -1)
+        cur_step = int(jax.device_get(state.step))
+        effective_prompts = completion_prompts
+        effective_completions = clean_completions_text
+        effective_finish_reasons = finish_reason_records
+        if selected_indices is not None:
+            host_selected = np.asarray(jax.device_get(selected_indices), dtype=np.int64).reshape(-1).tolist()
+            if len(effective_completions) > 0 and max(host_selected, default=-1) < len(effective_completions):
+                effective_completions = [effective_completions[idx] for idx in host_selected]
+            if len(effective_prompts) > 0 and max(host_selected, default=-1) < len(effective_prompts):
+                effective_prompts = [effective_prompts[idx] for idx in host_selected]
+            if len(effective_finish_reasons) > 0 and max(host_selected, default=-1) < len(effective_finish_reasons):
+                effective_finish_reasons = [effective_finish_reasons[idx] for idx in host_selected]
+
+        rl_health_metrics, truncated_flags, active_is_ratios = self._compute_grpo_rl_health_metrics(
+            rewards=rewards,
+            is_std_zero=is_std_zero,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            completion_attention_mask=completion_attention_mask,
+            finish_reasons=effective_finish_reasons,
+            importance_sampling_ratio=importance_sampling_ratio,
+        )
         metrics_dict: dict[str, float | int | str] = {
             "reward_mean": _host_mean_float(jnp.nanmean(rewards, -1)),
             "reward_std": _host_scalar_float(jnp.nanmean(std_rewards)),
@@ -3250,6 +3279,7 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
             "frac_reward_zero_std": _host_mean_float(is_std_zero.astype(jnp.float32)),
+            **rl_health_metrics,
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, i]))
@@ -3257,11 +3287,30 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             metrics_dict["environment_reward"] = _host_scalar_float(jnp.nanmean(rewards_per_func[:, -1]))
         if difficulty_weights is not None:
             metrics_dict["difficulty_weight_mean"] = _host_mean_float(difficulty_weights)
+        if getattr(self.arguments, "eyvan_tracking_enabled", False):
+            self._log_eyvan_grpo_rl_metrics(
+                cur_step=cur_step,
+                prompts=effective_prompts,
+                completions=effective_completions,
+                rewards=rewards,
+                rewards_per_func=rewards_per_func,
+                reward_weights=reward_weights,
+                advantages=advantages,
+                completion_length=completion_length,
+                completion_mask=completion_mask,
+                ref_per_token_logps=ref_per_token_logps if self.ref_state is not None else None,
+                old_per_token_logps=old_per_token_logps,
+                rollout_logps=rollout_logps,
+                truncated_flags=truncated_flags,
+                generation_factor=generation_factor,
+                has_environment_feedback=environment_feedback is not None,
+                active_is_ratios=active_is_ratios,
+            )
         self._maybe_log_grpo_completions(
             prompts=completion_prompts,
             completions=clean_completions_text,
             completion_lengths=log_completion_length,
-            step=int(jax.device_get(state.step)),
+            step=cur_step,
         )
         self._log_training_generations_to_wandb(
             state=state,
@@ -3313,6 +3362,218 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
             metrics_dict["toggle/budget_constrained"] = int(toggle_constrained)
         return _ScoredRollout(model_batch, metrics_dict, rewards_per_func, reward_weights)
 
+    def _compute_grpo_rl_health_metrics(
+        self,
+        *,
+        rewards: jax.Array | np.ndarray,
+        is_std_zero: jax.Array | np.ndarray,
+        completion_ids: jax.Array | np.ndarray,
+        completion_mask: jax.Array | np.ndarray,
+        completion_attention_mask: jax.Array | np.ndarray | None = None,
+        finish_reasons: tp.Sequence[object] | None = None,
+        importance_sampling_ratio: jax.Array | np.ndarray | None = None,
+    ) -> tuple[dict[str, float], list[bool], np.ndarray | None]:
+        """Compute unified GRPO RL health and IcePop masking diagnostics on host arrays."""
+        rewards_np = np.asarray(jax.device_get(rewards), dtype=np.float32).reshape(-1)
+        finite_rewards = rewards_np[np.isfinite(rewards_np)]
+        pass_rate = float(np.mean(finite_rewards > 0.0)) if finite_rewards.size > 0 else 0.0
+
+        zero_std_np = np.asarray(jax.device_get(is_std_zero), dtype=np.float32).reshape(-1)
+        zero_var_group_frac = float(np.mean(zero_std_np)) if zero_std_np.size > 0 else 0.0
+
+        comp_ids_np = np.asarray(jax.device_get(completion_ids))
+        raw_mask_source = completion_attention_mask if completion_attention_mask is not None else completion_mask
+        raw_mask_np = np.asarray(jax.device_get(raw_mask_source), dtype=np.float32) > 0
+        max_comp_len = int(getattr(self.arguments, "max_completion_length", None) or comp_ids_np.shape[-1])
+        eos_raw = getattr(self, "_eos_token_id", None)
+        if eos_raw is None:
+            proc = getattr(self, "processing_class", None)
+            eos_raw = getattr(proc, "eos_token_id", None)
+        eos_arr = (
+            np.asarray(jax.device_get(eos_raw), dtype=np.int64).reshape(-1)
+            if eos_raw is not None
+            else np.asarray([], dtype=np.int64)
+        )
+        raw_lengths = raw_mask_np.sum(axis=-1)
+        finish_list = list(finish_reasons) if finish_reasons is not None else []
+        truncated_flags: list[bool] = []
+        for idx in range(comp_ids_np.shape[0]):
+            active_tokens = comp_ids_np[idx][raw_mask_np[idx]]
+            has_eos = (
+                bool(np.any(np.isin(active_tokens, eos_arr))) if eos_arr.size > 0 and active_tokens.size > 0 else False
+            )
+            is_trunc = bool(int(raw_lengths[idx]) >= max_comp_len and not has_eos)
+            if idx < len(finish_list) and finish_list[idx] == "length":
+                is_trunc = True
+            truncated_flags.append(is_trunc)
+        truncation_rate = float(np.mean(truncated_flags)) if truncated_flags else 0.0
+
+        health: dict[str, float] = {
+            "rl/pass_rate": pass_rate,
+            "rl/truncation_rate": truncation_rate,
+            "rl/zero_var_group_frac": zero_var_group_frac,
+        }
+
+        active_is_ratios: np.ndarray | None = None
+        if importance_sampling_ratio is not None:
+            comp_mask_bool = np.asarray(jax.device_get(completion_mask), dtype=np.float32) > 0
+            ratio_np = np.asarray(jax.device_get(importance_sampling_ratio), dtype=np.float32)
+            if ratio_np.ndim == 1 and comp_mask_bool.ndim == 2 and ratio_np.shape[0] == comp_mask_bool.shape[0]:
+                ratio_np = ratio_np[:, None]
+            if ratio_np.shape != comp_mask_bool.shape:
+                ratio_np = np.broadcast_to(ratio_np, comp_mask_bool.shape)
+            active_vals = ratio_np[comp_mask_bool]
+            finite_active = active_vals[np.isfinite(active_vals)]
+            active_is_ratios = finite_active
+            if finite_active.size > 0:
+                health["rl/icepop_ratio_mean"] = float(np.mean(finite_active))
+                health["rl/icepop_ratio_max"] = float(np.max(finite_active))
+                health["rl/icepop_masked_frac"] = float(np.mean(finite_active == 0.0))
+            else:
+                health["rl/icepop_ratio_mean"] = 0.0
+                health["rl/icepop_ratio_max"] = 0.0
+                health["rl/icepop_masked_frac"] = 0.0
+
+        return health, truncated_flags, active_is_ratios
+
+    def _log_eyvan_grpo_rl_metrics(
+        self,
+        *,
+        cur_step: int,
+        prompts: tp.Sequence[object],
+        completions: tp.Sequence[object],
+        rewards: jax.Array | np.ndarray,
+        rewards_per_func: jax.Array | np.ndarray,
+        advantages: jax.Array | np.ndarray,
+        completion_length: jax.Array | np.ndarray,
+        completion_mask: jax.Array | np.ndarray,
+        reward_weights: jax.Array | np.ndarray | None = None,
+        ref_per_token_logps: jax.Array | np.ndarray | None = None,
+        old_per_token_logps: jax.Array | np.ndarray | None = None,
+        rollout_logps: jax.Array | np.ndarray | None = None,
+        truncated_flags: tp.Sequence[bool] = (),
+        generation_factor: int = 1,
+        has_environment_feedback: bool = False,
+        active_is_ratios: np.ndarray | None = None,
+        max_groups: int = 8,
+    ) -> None:
+        """Emit GRPO completion groups and RL distributions to Eyvan tracking."""
+        args = getattr(self, "arguments", None)
+        if args is None or not getattr(args, "eyvan_tracking_enabled", False):
+            return
+        policy_version = getattr(self, "_async_rollout_policy_version", None)
+        if policy_version is None:
+            policy_version = cur_step
+
+        rewards_np = np.asarray(jax.device_get(rewards), dtype=np.float32).reshape(-1)
+        rewards_pf_np = np.asarray(jax.device_get(rewards_per_func), dtype=np.float32)
+        adv_np = np.asarray(jax.device_get(advantages), dtype=np.float32).reshape(-1)
+        comp_len_np = np.asarray(jax.device_get(completion_length), dtype=np.float32).reshape(-1)
+        comp_mask_np = np.asarray(jax.device_get(completion_mask), dtype=np.float32)
+
+        per_comp_kl: np.ndarray | None = None
+        policy_logps = old_per_token_logps if old_per_token_logps is not None else rollout_logps
+        if ref_per_token_logps is not None and policy_logps is not None:
+            ref_np = np.asarray(jax.device_get(ref_per_token_logps), dtype=np.float32)
+            pol_np = np.asarray(jax.device_get(policy_logps), dtype=np.float32)
+            if ref_np.shape == pol_np.shape == comp_mask_np.shape:
+                logr = ref_np - pol_np
+                if getattr(self, "kl_estimator", "k3") == "k1":
+                    token_kl = -logr
+                else:
+                    safe_logr = np.clip(logr, -20.0, 20.0)
+                    token_kl = np.exp(safe_logr) - 1.0 - logr
+                denom = np.maximum(comp_mask_np.sum(axis=-1), 1.0)
+                per_comp_kl = (token_kl * comp_mask_np).sum(axis=-1) / denom
+
+        group_size = max(int(generation_factor), 1)
+        num_rows = int(rewards_np.shape[0])
+        comp_list = list(completions)
+        prompt_list = list(prompts)
+        usable_rows = min(num_rows, len(comp_list))
+        num_groups = min(usable_rows // group_size, max(int(max_groups), 0))
+
+        raw_names = list(getattr(self, "reward_func_names", ()))
+        if has_environment_feedback:
+            raw_names.append("environment")
+        num_cols = int(rewards_pf_np.shape[1]) if rewards_pf_np.ndim == 2 else 0
+        reward_names: list[str] = []
+        seen_names: set[str] = set()
+        for col_idx in range(num_cols):
+            base_name = raw_names[col_idx] if col_idx < len(raw_names) else f"reward_{col_idx}"
+            name = base_name
+            if name in seen_names:
+                name = f"{base_name}_{col_idx}"
+            seen_names.add(name)
+            reward_names.append(name)
+
+        weights_np: np.ndarray | None = None
+        if num_cols > 0:
+            raw_weights = reward_weights if reward_weights is not None else getattr(self, "reward_weights", None)
+            if raw_weights is not None:
+                weights_np = np.asarray(jax.device_get(raw_weights), dtype=np.float32).reshape(-1)
+                if has_environment_feedback and weights_np.shape[0] == num_cols - 1:
+                    weights_np = np.concatenate([weights_np, np.ones((1,), dtype=np.float32)])
+                if weights_np.shape[0] != num_cols:
+                    weights_np = None
+            if weights_np is None:
+                weights_np = np.ones((num_cols,), dtype=np.float32)
+
+        stringify = getattr(self, "_wandb_stringify_generation_value", str)
+        for group_idx in range(num_groups):
+            start = group_idx * group_size
+            end = start + group_size
+            if start < len(prompt_list):
+                raw_prompt = prompt_list[start]
+            elif group_idx < len(prompt_list):
+                raw_prompt = prompt_list[group_idx]
+            else:
+                raw_prompt = ""
+            prompt_text = stringify(raw_prompt) or "<prompt>"
+            responses = [stringify(item) for item in comp_list[start:end]]
+            group_totals = rewards_np[start:end]
+            group_rewards: tp.Any = group_totals
+            if reward_names and weights_np is not None:
+                weighted_slice = rewards_pf_np[start:end, :num_cols] * weights_np[None, :]
+                finite_totals = np.isfinite(group_totals)
+                sanitized_slice = np.where(
+                    finite_totals[:, None],
+                    np.where(np.isnan(weighted_slice), 0.0, weighted_slice),
+                    np.nan,
+                )
+                comp_sums = np.sum(sanitized_slice, axis=1)
+                totals_match = bool(
+                    np.array_equal(np.isfinite(comp_sums), finite_totals)
+                    and (
+                        not np.any(finite_totals)
+                        or np.allclose(comp_sums[finite_totals], group_totals[finite_totals], rtol=1e-4, atol=1e-5)
+                    )
+                )
+                if totals_match:
+                    group_rewards = {name: sanitized_slice[:, col_idx] for col_idx, name in enumerate(reward_names)}
+            group_kl = per_comp_kl[start:end] if per_comp_kl is not None else None
+            group_trunc = list(truncated_flags[start:end]) if len(truncated_flags) >= end else None
+            args.log_eyvan_completions(
+                prompt_text,
+                responses,
+                rewards=group_rewards,
+                advantages=adv_np[start:end],
+                group=f"s{cur_step}-g{group_idx}",
+                tokens=comp_len_np[start:end],
+                kl=group_kl,
+                truncated=group_trunc,
+                policy_version=policy_version,
+                step=cur_step,
+            )
+
+        args.log_eyvan_histogram("rl/reward_dist", rewards_np, step=cur_step)
+        args.log_eyvan_histogram("rl/advantage_dist", adv_np, step=cur_step)
+        args.log_eyvan_histogram("rl/completion_length_dist", comp_len_np, step=cur_step)
+        if per_comp_kl is not None:
+            args.log_eyvan_histogram("rl/kl_dist", per_comp_kl, step=cur_step)
+        if active_is_ratios is not None and active_is_ratios.size > 0:
+            args.log_eyvan_histogram("rl/icepop_ratio_dist", active_is_ratios, step=cur_step)
+
     def on_step_end(
         self,
         state: EasyDeLState,
@@ -3359,4 +3620,12 @@ class GRPOTrainer(AsyncRolloutMixin, Trainer):
                     alpha=self.arguments.ref_model_mixup_alpha,
                 )
             )
+        if bool(getattr(self.arguments, "async_mode", False)):
+            check_eyvan_reclaim = getattr(self, "_should_save_eyvan_reclaim_checkpoint", None)
+            if callable(check_eyvan_reclaim):
+                eyvan_notice = check_eyvan_reclaim(step)
+                if eyvan_notice is not None:
+                    handle_reclaim = getattr(self, "_handle_eyvan_reclaim_preemption", None)
+                    if callable(handle_reclaim):
+                        raise handle_reclaim(state=state, step=step, notice=eyvan_notice)
         return state, metrics

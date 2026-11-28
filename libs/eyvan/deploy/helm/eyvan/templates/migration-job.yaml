@@ -1,0 +1,46 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eyvan-schema-migration
+  namespace: {{ include "eyvan.namespace" . }}
+  annotations:
+    # The ordering nobody should have to arrange by hand. A control plane that
+    # starts against a schema it does not recognize refuses to serve -- which is
+    # the correct behaviour and a confusing first impression.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  template:
+    spec:
+      # Hooks run before chart ServiceAccounts. The namespace's default account
+      # already exists and the migration needs no Kubernetes API credential.
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: {{ include "eyvan.controlPlaneImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["eyvan-migrate"]
+{{- if .Values.migration.maintenanceAcknowledged }}
+          args: ["--maintenance-acknowledged"]
+{{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: EYVAN_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: database-url
+{{- end }}

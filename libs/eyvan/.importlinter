@@ -1,0 +1,70 @@
+[importlinter]
+root_package = eyvan
+
+[importlinter:contract:control-plane-facade]
+name = Implementations must not import the public facade
+type = forbidden
+source_modules =
+    eyvan.server.service._control_plane
+forbidden_modules =
+    eyvan.server.service.control_plane
+
+[importlinter:contract:control-plane-subsystems]
+name = Transactional subsystems remain independent
+type = independence
+modules =
+    eyvan.server.service._control_plane.accounts
+    eyvan.server.service._control_plane.artifact_admission
+    eyvan.server.service._control_plane.artifact_collection
+    eyvan.server.service._control_plane.artifact_inventory
+    eyvan.server.service._control_plane.artifact_io
+    eyvan.server.service._control_plane.artifact_recovery
+    eyvan.server.service._control_plane.assistant_conversations
+    eyvan.server.service._control_plane.assistant_providers
+    eyvan.server.service._control_plane.audit
+    eyvan.server.service._control_plane.callable_submission
+    eyvan.server.service._control_plane.cells
+    eyvan.server.service._control_plane.child_submission
+    eyvan.server.service._control_plane.estimates
+    eyvan.server.service._control_plane.events
+    eyvan.server.service._control_plane.expansion
+    eyvan.server.service._control_plane.federation
+    eyvan.server.service._control_plane.fleets
+    eyvan.server.service._control_plane.governance
+    eyvan.server.service._control_plane.lease_settlement
+    eyvan.server.service._control_plane.leases
+    eyvan.server.service._control_plane.policies
+    eyvan.server.service._control_plane.reporting
+    eyvan.server.service._control_plane.research
+    eyvan.server.service._control_plane.scheduling
+    eyvan.server.service._control_plane.services
+    eyvan.server.service._control_plane.submission
+    eyvan.server.service._control_plane.team_requests
+    eyvan.server.service._control_plane.tenancy
+    eyvan.server.service._control_plane.transactions
+    eyvan.server.service._control_plane.webhooks
+    eyvan.server.service._control_plane.workload_lifecycle
+    eyvan.server.service._control_plane.workload_settlement
+    eyvan.server.service._control_plane.workload_storage
+
+[importlinter:contract:service-transport-boundary]
+name = Application services cannot depend on API transport or controller loops
+type = forbidden
+source_modules =
+    eyvan.server.service
+forbidden_modules =
+    eyvan.server.api
+    eyvan.server.controller
+
+[importlinter:contract:domain-boundary]
+name = Domain decisions cannot depend on server, capacity, or SDK layers
+type = forbidden
+source_modules =
+    eyvan.domain
+forbidden_modules =
+    eyvan.server
+    eyvan.capacity
+    eyvan.sdk
+ignore_imports =
+    eyvan.records -> eyvan.capacity
+    eyvan.records -> eyvan.capacity.drivers.base
