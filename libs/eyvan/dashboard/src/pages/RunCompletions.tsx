@@ -291,7 +291,11 @@ export function RunCompletions({
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted)
-          setResult({ query, error: reason instanceof Error ? reason : new Error("Unable to load completions") });
+          setResult((prev) =>
+            prev?.query === query && prev.list && prev.stats
+              ? prev
+              : { query, error: reason instanceof Error ? reason : new Error("Unable to load completions") },
+          );
       });
     return () => controller.abort();
   }, [run.run_id, step, sort, offset, query, loadCompletions, loadCompletionStats, revision]);
@@ -321,10 +325,14 @@ export function RunCompletions({
         })
         .catch((reason: unknown) => {
           if (!controller.signal.aborted)
-            setDetail({
-              query: detailQuery,
-              error: reason instanceof Error ? reason : new Error("Unable to load completion group"),
-            });
+            setDetail((prev) =>
+              prev?.query === detailQuery && prev.data
+                ? prev
+                : {
+                    query: detailQuery,
+                    error: reason instanceof Error ? reason : new Error("Unable to load completion group"),
+                  },
+            );
         });
     return () => controller.abort();
   }, [run.run_id, id, detailQuery, loadCompletion, revision]);

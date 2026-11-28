@@ -45,7 +45,11 @@ export function RunHistogram({
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted)
-          setResult({ query, error: reason instanceof Error ? reason : new Error("Unable to load histograms") });
+          setResult((prev) =>
+            prev?.query === query && prev.data
+              ? prev
+              : { query, error: reason instanceof Error ? reason : new Error("Unable to load histograms") },
+          );
       });
     return () => controller.abort();
   }, [runId, metricKey, x, query, loadHistograms, revision]);

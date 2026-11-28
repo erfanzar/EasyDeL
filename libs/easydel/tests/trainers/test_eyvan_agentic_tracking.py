@@ -915,3 +915,69 @@ def test_agent_flow_and_agentic_moshpit_lazy_init_before_log_metrics_and_status_
     assert mp_detail["status"] == "finished"
     assert mp_detail["episodes"] == {"train": 1, "eval": 0}
     assert mp_detail["rollouts"] == 1
+
+
+def test_agent_flow_tito_turn_reconstruction_transcript_and_factory_env_name():
+    from easydel.environments import AutoEnvironment
+    from easydel.trainers.agent_flow_trainer.agent_flow_trainer import (
+        AgentFlowEpisode,
+        _format_agent_flow_transcript,
+        _reconstruct_turns_from_tito,
+        _resolve_eyvan_env_name,
+    )
+
+    tok = _CharTokenizer()
+    decode = tok.decode
+    prompt_ids = tok.encode("Fix bug")
+    act0 = tok.encode("run pytest")
+    obs0 = tok.encode("1 failed")
+    act1 = tok.encode("patch line 3")
+    comp_ids = act0 + obs0 + act1
+    comp_mask = [1] * len(act0) + [0] * len(obs0) + [1] * len(act1)
+    comp_lps = [-0.2] * len(act0) + [0.0] * len(obs0) + [-0.1] * len(act1)
+
+    turns = _reconstruct_turns_from_tito(
+        prompt_ids=prompt_ids,
+        comp_ids=comp_ids,
+        comp_amask=comp_mask,
+        comp_lps=comp_lps,
+        final_reward=1.0,
+        decode_ids=decode,
+        truncated=False,
+    )
+    assert len(turns) == 2
+    assert turns[0].action_text == "run pytest"
+    assert turns[0].observation_text == "1 failed"
+    assert turns[0].reward == 0.0
+    assert turns[0].terminated is False
+    assert turns[0].logprobs == pytest.approx([-0.2] * len(act0))
+    assert turns[1].action_text == "patch line 3"
+    assert turns[1].observation_text == ""
+    assert turns[1].reward == 1.0
+    assert turns[1].terminated is True
+    assert turns[1].logprobs == pytest.approx([-0.1] * len(act1))
+
+    # Even if an episode reaches transcript formatting without pre-populated turns,
+    # decoding completion_token_ids produces the multi-turn transcript rather than "[empty episode]".
+    ep_no_turns = AgentFlowEpisode(
+        prompt_index=0,
+        group_id=0,
+        prompt_token_ids=prompt_ids,
+        completion_token_ids=comp_ids,
+        action_mask=comp_mask,
+        step_rewards=[1.0],
+        episode_reward=1.0,
+        turns=(),
+        logprobs=comp_lps,
+        env_error=False,
+    )
+    transcript = _format_agent_flow_transcript(ep_no_turns, decode_ids=decode)
+    assert transcript != "[empty episode]"
+    assert "run pytest" in transcript
+    assert "1 failed" in transcript
+    assert "patch line 3" in transcript
+
+    # AutoEnvironment.as_factory should expose a meaningful env label rather than "_factory".
+    factory = AutoEnvironment.as_factory("harness", harness="qwen_code")
+    assert _resolve_eyvan_env_name(factory) == "harness:qwen_code"
+    assert _resolve_eyvan_env_name(lambda: None, fallback="harness") == "harness"

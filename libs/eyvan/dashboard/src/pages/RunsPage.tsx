@@ -159,7 +159,7 @@ export function RunsPage({
   const [visibilityFilter, setVisibilityFilter] = useState("all");
   const [groupFilter, setGroupFilter] = useState("all");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  useVisibilityPolling(() => setRevision((value) => value + 1), 5000);
+  useVisibilityPolling(() => setRevision((value) => value + 1), 10_000);
 
   useEffect(() => {
     const controller = new AbortController();

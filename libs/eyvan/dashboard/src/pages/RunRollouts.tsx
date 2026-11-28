@@ -351,7 +351,11 @@ export function RunRollouts({
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted)
-          setList({ query, error: reason instanceof Error ? reason : new Error("Unable to load rollouts") });
+          setList((prev) =>
+            prev?.query === query && prev.data
+              ? prev
+              : { query, error: reason instanceof Error ? reason : new Error("Unable to load rollouts") },
+          );
       });
     return () => controller.abort();
   }, [run.run_id, kind, offset, query, loadRollouts, revision]);
@@ -370,10 +374,14 @@ export function RunRollouts({
         })
         .catch((reason: unknown) => {
           if (!controller.signal.aborted)
-            setDetail({
-              query: detailQuery,
-              error: reason instanceof Error ? reason : new Error("Unable to load rollout"),
-            });
+            setDetail((prev) =>
+              prev?.query === detailQuery && prev.data
+                ? prev
+                : {
+                    query: detailQuery,
+                    error: reason instanceof Error ? reason : new Error("Unable to load rollout"),
+                  },
+            );
         });
     return () => controller.abort();
   }, [run.run_id, id, detailQuery, loadRollout, revision]);

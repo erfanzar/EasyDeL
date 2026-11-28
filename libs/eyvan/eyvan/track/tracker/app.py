@@ -19,6 +19,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.gzip import GZipMiddleware
 
 from eyvan.track._format import validate_run_id
 from eyvan.track._store import TrackingStore
@@ -71,6 +72,7 @@ def create_tracker_app(
                 await task
 
     app = FastAPI(title="Eyvan tracker", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.middleware("http")
     async def attach_run_access_headers(request: Request, call_next: tp.Any) -> tp.Any:

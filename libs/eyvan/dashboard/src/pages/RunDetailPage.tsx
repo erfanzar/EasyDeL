@@ -189,6 +189,9 @@ export function RunDetailPage({
   const [error, setError] = useState<{ runId: string; error: Error } | null>(null);
   const [seriesError, setSeriesError] = useState<{ scopeKey: string; error: Error } | null>(null);
   const [revision, setRevision] = useState(0);
+  const [manualRevision, setManualRevision] = useState(0);
+  const [dataRevision, setDataRevision] = useState(0);
+  const lastRunFingerprintRef = useRef<string | null>(null);
   const [x, setX] = useState("step");
   const [smoothing, setSmoothing] = useState(0);
   const [metricSearch, setMetricSearch] = useState("");
@@ -199,13 +202,16 @@ export function RunDetailPage({
   const [visibleLimits, setVisibleLimits] = useState<Record<string, number>>({});
 
   const activeRun = run?.run_id === runId ? run : null;
+  const activeRunRef = useRef<RunDetail | null>(activeRun);
+  activeRunRef.current = activeRun;
   const isTerminal = activeRun ? isTerminalRunStatus(activeRun.status) : false;
 
-  // Stop 5-second auto-polling once a run reaches a terminal status.
-  useVisibilityPolling(() => setRevision((value) => value + 1), 5000, !isTerminal);
+  // Stop 10-second auto-polling once a run reaches a terminal status.
+  useVisibilityPolling(() => setRevision((value) => value + 1), 10_000, !isTerminal);
 
   // Reset per-run view state when switching runs.
   useEffect(() => {
+    lastRunFingerprintRef.current = null;
     setExpandedOverrides({});
     setSearchExpandedOverrides({});
     setActiveSubgroups({});
@@ -226,6 +232,25 @@ export function RunDetailPage({
     loadRun(runId, controller.signal)
       .then((value) => {
         if (!controller.signal.aborted) {
+          const nextFp = JSON.stringify([
+            value.run_id,
+            value.status,
+            value.last_step,
+            value.stats?.records ?? 0,
+            value.attempts,
+            value.completion_groups ?? 0,
+            value.rollouts ?? 0,
+            value.episodes?.train ?? 0,
+            value.episodes?.eval ?? 0,
+            value.keys.length,
+            value.hist_keys?.length ?? 0,
+            value.table_keys?.length ?? 0,
+            value.media_keys?.length ?? 0,
+          ]);
+          if (lastRunFingerprintRef.current !== null && lastRunFingerprintRef.current !== nextFp) {
+            setDataRevision((rev) => rev + 1);
+          }
+          lastRunFingerprintRef.current = nextFp;
           setRun(value);
           if (!sharedWithDirtyRef.current) {
             setSharedWithInput((value.shared_with ?? []).join(", "));
@@ -234,7 +259,7 @@ export function RunDetailPage({
         }
       })
       .catch((reason: unknown) => {
-        if (!controller.signal.aborted)
+        if (!controller.signal.aborted && activeRunRef.current?.run_id !== runId)
           setError({ runId, error: reason instanceof Error ? reason : new Error("Unable to load run") });
       });
     return () => controller.abort();
@@ -309,7 +334,7 @@ export function RunDetailPage({
   ]);
 
   const scopeKey = JSON.stringify([runId, x]);
-  const effectiveRevision = revision + refreshRevision;
+  const effectiveRevision = dataRevision + manualRevision + refreshRevision;
   const visibleKeysSignature = visibleChartKeys.join("\n");
 
   const [seriesCache, setSeriesCache] = useState<SeriesCache>(() => ({
@@ -394,6 +419,7 @@ export function RunDetailPage({
 
   const retry = () => {
     setSeriesError(null);
+    setManualRevision((value) => value + 1);
     setRevision((value) => value + 1);
   };
 

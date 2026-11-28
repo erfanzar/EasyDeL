@@ -1456,3 +1456,49 @@ describe("EyvanApiClient loopback credential refusals", () => {
     expect(store.getItem("eyvan.local.credential")).toBe("held-value");
   });
 });
+
+describe("EyvanApiClient tracking read budget and clean URLs", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("gives proxied tracking reads a 15s budget separate from DB reads", async () => {
+    const seen: number[] = [];
+    const original = globalThis.setTimeout;
+    vi.stubGlobal("setTimeout", ((fn: () => void, ms?: number) => {
+      if (typeof ms === "number") seen.push(ms);
+      return original(fn, ms);
+    }) as typeof globalThis.setTimeout);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ groups: [], steps: [], total: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    const client = new EyvanApiClient("/api/v1", false);
+
+    await client.listRunCompletions("run-1", {}, { orgId: "default", projectId: "proj" });
+
+    expect(seen).toContain(15_000);
+  });
+
+  it("omits empty query separator before org_id/project_id on trackingRead", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "comp-1", responses: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new EyvanApiClient("/api/v1", false);
+
+    await client.getRunCompletion("run-1", "comp-1", { orgId: "default", projectId: "proj" });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("/api/v1/tracking/runs/run-1/completions/comp-1?org_id=default&project_id=proj");
+    expect(url).not.toContain("?&");
+  });
+});

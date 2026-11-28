@@ -114,7 +114,11 @@ export function RunMedia({
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted)
-          setResult({ query, error: reason instanceof Error ? reason : new Error("Unable to load media") });
+          setResult((prev) =>
+            prev?.query === query && prev.media
+              ? prev
+              : { query, error: reason instanceof Error ? reason : new Error("Unable to load media") },
+          );
       });
     return () => controller.abort();
   }, [run.run_id, offset, query, loadMedia, loadTable, revision]);
@@ -136,10 +140,14 @@ export function RunMedia({
         })
         .catch((reason: unknown) => {
           if (!controller.signal.aborted)
-            setTable({
-              query: tableQuery,
-              error: reason instanceof Error ? reason : new Error("Unable to load table"),
-            });
+            setTable((prev) =>
+              prev?.query === tableQuery && prev.data
+                ? prev
+                : {
+                    query: tableQuery,
+                    error: reason instanceof Error ? reason : new Error("Unable to load table"),
+                  },
+            );
         });
     return () => controller.abort();
   }, [run.run_id, key, step, tableQuery, loadTable, revision]);

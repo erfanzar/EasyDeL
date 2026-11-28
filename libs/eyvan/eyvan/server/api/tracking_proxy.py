@@ -512,6 +512,22 @@ async def authorize_run_access(
     return None
 
 
+def _shared_tracking_client(app: FastAPI) -> httpx.AsyncClient:
+    """Return a lazily initialized pooled HTTP client for loopback/upstream tracker calls."""
+
+    existing = getattr(app.state, "tracking_http_client", None)
+    if isinstance(existing, httpx.AsyncClient) and not existing.is_closed:
+        return existing
+    pooled = httpx.AsyncClient(
+        timeout=30.0,
+        trust_env=False,
+        follow_redirects=False,
+        limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+    )
+    app.state.tracking_http_client = pooled
+    return pooled
+
+
 async def tracker_get_json(
     app: FastAPI,
     settings: EyvanSettings,
@@ -531,10 +547,13 @@ async def tracker_get_json(
             response = await client.get(target, params=list(params), headers=headers)
         else:
             selected_transport = getattr(app.state, "tracking_transport", transport)
-            async with httpx.AsyncClient(
-                transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
-            ) as owned_client:
-                response = await owned_client.get(target, params=list(params), headers=headers)
+            if selected_transport is None:
+                response = await _shared_tracking_client(app).get(target, params=list(params), headers=headers)
+            else:
+                async with httpx.AsyncClient(
+                    transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
+                ) as owned_client:
+                    response = await owned_client.get(target, params=list(params), headers=headers)
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=502,
@@ -675,9 +694,15 @@ def register_tracking_routes(
             and not admin
         )
         try:
-            async with httpx.AsyncClient(
-                transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
-            ) as client:
+            if selected_transport is None:
+                client = _shared_tracking_client(request.app)
+                owns_client = False
+            else:
+                client = httpx.AsyncClient(
+                    transport=selected_transport, timeout=30.0, trust_env=False, follow_redirects=False
+                )
+                owns_client = True
+            try:
                 target = f"{url.rstrip('/')}{request.url.path}"
                 if not blob:
                     response = await client.get(target, params=params, headers=headers)
@@ -761,6 +786,9 @@ def register_tracking_routes(
                         allow_non_json_media_mock=True,
                     )
                 return blob_response
+            finally:
+                if owns_client:
+                    await client.aclose()
         except httpx.TimeoutException:
             raise HTTPException(
                 status_code=502,

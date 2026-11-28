@@ -32,6 +32,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_l
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from starlette.middleware.gzip import GZipMiddleware
 
 from eyvan._internal.build_identity import build_identity
 from eyvan._internal.client_version import CLIENT_VERSION_HEADER, is_client_supported, stale_client_message
@@ -846,6 +847,10 @@ def create_app(
                 _done, unfinished = await asyncio.wait(pending, timeout=ASSISTANT_SAVE_DRAIN_S)
                 if unfinished:
                     logger.warning("%d assistant save(s) did not finish before shutdown", len(unfinished))
+            tracking_client = getattr(_app.state, "tracking_http_client", None)
+            if tracking_client is not None:
+                await tracking_client.aclose()
+                _app.state.tracking_http_client = None
             await controller.close()
             collaboration_store.close()
             await repository.close()
@@ -853,6 +858,7 @@ def create_app(
                 await engine.dispose()
 
     app = FastAPI(title="Eyvan Fleet API", version="1.0.0", lifespan=lifespan)
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.state.service = service
     dashboard_sessions = DashboardSessionStore(
         session_ttl_s=settings.dashboard_session_ttl_s,

@@ -179,7 +179,10 @@ def _clip_eyvan_text(text: tp.Any, limit: int = _EYVAN_MAX_TEXT_CHARS) -> str:
 def _resolve_eyvan_env_name(spec: tp.Any, fallback: str = "agent_flow") -> str:
     """Resolve a clean 1..128 character Eyvan environment name from ``spec``."""
     candidate: str | None = None
-    if isinstance(spec, str):
+    explicit = getattr(spec, "environment_name", None)
+    if isinstance(explicit, str) and explicit.strip():
+        candidate = explicit.strip()
+    elif isinstance(spec, str):
         candidate = spec.strip()
     elif isinstance(spec, collections.abc.Mapping):
         raw = spec.get("name") or spec.get("type")
@@ -190,11 +193,11 @@ def _resolve_eyvan_env_name(spec: tp.Any, fallback: str = "agent_flow") -> str:
     elif isinstance(spec, functools.partial):
         func = spec.func
         name = getattr(func, "__name__", None)
-        if isinstance(name, str) and name and name != "<lambda>":
+        if isinstance(name, str) and name and name != "<lambda>" and not name.startswith("_"):
             candidate = name
     elif callable(spec):
         name = getattr(spec, "__name__", None)
-        if isinstance(name, str) and name and name != "<lambda>":
+        if isinstance(name, str) and name and name != "<lambda>" and not name.startswith("_"):
             candidate = name
     elif spec is not None:
         cls_name = type(spec).__name__
@@ -587,14 +590,103 @@ def _encode_action_labels(raw_texts: tp.Sequence[str]) -> tuple[list[int], list[
     return action_ids, action_names
 
 
+def _reconstruct_turns_from_tito(
+    *,
+    prompt_ids: tp.Sequence[int],
+    comp_ids: tp.Sequence[int],
+    comp_amask: tp.Sequence[int],
+    comp_lps: tp.Sequence[float] | None,
+    final_reward: float,
+    decode_ids: tp.Callable[[tp.Sequence[int]], str],
+    truncated: bool = False,
+) -> tuple[AgentFlowTurn, ...]:
+    """Reconstruct multi-turn :class:`AgentFlowTurn` records from a TITO token/action-mask trajectory.
+
+    In harness TITO mode, assistant generations correspond to contiguous spans where ``action_mask == 1``
+    and tool/environment observations correspond to the intervening spans where ``action_mask == 0``.
+    Reconstructing turns preserves exact token/mask/logprob alignment while enabling rich multi-turn
+    transcripts, episode turn lengths, and per-turn rollout telemetry.
+    """
+    n = min(len(comp_ids), len(comp_amask))
+    if n <= 0:
+        return ()
+
+    segments: list[tuple[list[int], list[float] | None, list[int]]] = []
+    i = 0
+    while i < n:
+        if not comp_amask[i]:
+            i += 1
+            continue
+        act_start = i
+        while i < n and comp_amask[i]:
+            i += 1
+        act_end = i
+        obs_start = i
+        while i < n and not comp_amask[i]:
+            i += 1
+        obs_end = i
+        act_ids = [int(t) for t in comp_ids[act_start:act_end]]
+        obs_ids = [int(t) for t in comp_ids[obs_start:obs_end]]
+        turn_lps = [float(x) for x in comp_lps[act_start:act_end]] if comp_lps is not None else None
+        segments.append((act_ids, turn_lps, obs_ids))
+
+    if not segments:
+        return ()
+
+    initial_prompt_text = decode_ids(prompt_ids) if prompt_ids else ""
+    last_idx = len(segments) - 1
+    turns: list[AgentFlowTurn] = []
+    for turn_idx, (act_ids, turn_lps, obs_ids) in enumerate(segments):
+        is_last = turn_idx == last_idx
+        turns.append(
+            AgentFlowTurn(
+                turn_index=turn_idx,
+                prompt_text=initial_prompt_text if turn_idx == 0 else "",
+                action_text=decode_ids(act_ids),
+                action_token_ids=act_ids,
+                observation_text=decode_ids(obs_ids) if obs_ids else "",
+                observation_token_ids=obs_ids,
+                reward=float(final_reward) if is_last else 0.0,
+                terminated=bool(is_last and not truncated),
+                truncated=bool(is_last and truncated),
+                logprobs=turn_lps,
+            )
+        )
+    return tuple(turns)
+
+
 def _format_agent_flow_transcript(
     ep: AgentFlowEpisode,
     *,
+    decode_ids: tp.Callable[[tp.Sequence[int]], str] | None = None,
     max_obs_chars: int = _EYVAN_MAX_OBS_PREVIEW_CHARS,
     max_total_chars: int = _EYVAN_MAX_TEXT_CHARS,
 ) -> str:
     """Format a multi-turn :class:`AgentFlowEpisode` as a compact completion transcript."""
     if not ep.turns:
+        if ep.completion_token_ids and callable(decode_ids):
+            reconstructed = _reconstruct_turns_from_tito(
+                prompt_ids=ep.prompt_token_ids,
+                comp_ids=ep.completion_token_ids,
+                comp_amask=ep.action_mask if len(ep.action_mask) == len(ep.completion_token_ids) else [1] * len(ep.completion_token_ids),
+                comp_lps=ep.logprobs,
+                final_reward=ep.episode_reward,
+                decode_ids=decode_ids,
+            )
+            if reconstructed:
+                parts_fb: list[str] = []
+                for turn in reconstructed:
+                    segment = f"[Turn {turn.turn_index} | r={float(turn.reward):.4g}]\nAction: {turn.action_text}"
+                    if turn.observation_text:
+                        obs = turn.observation_text
+                        if len(obs) > max_obs_chars:
+                            obs = obs[: max_obs_chars - 3] + "..."
+                        segment += f"\nObservation: {obs}"
+                    parts_fb.append(segment)
+                return _clip_eyvan_text("\n\n".join(parts_fb), limit=max_total_chars)
+            decoded = decode_ids(ep.completion_token_ids)
+            if decoded:
+                return _clip_eyvan_text(decoded, limit=max_total_chars)
         return "[env_error: no turns]" if ep.env_error else "[empty episode]"
     parts: list[str] = []
     for turn in ep.turns:
@@ -957,8 +1049,11 @@ class AgentFlowTrainer:
         self._eyvan_total_action_tokens: int = 0
 
         self._env_spec = environment_factory or environment or self.arguments.environment
-        self._eyvan_env_name = _resolve_eyvan_env_name(self._env_spec, fallback="agent_flow")
-        self._eyvan_tag_env_name = _resolve_eyvan_env_name(self._env_spec, fallback="") or None
+        resolved_env_fallback = _resolve_eyvan_env_name(self.arguments.environment, fallback="agent_flow")
+        self._eyvan_env_name = _resolve_eyvan_env_name(self._env_spec, fallback=resolved_env_fallback)
+        self._eyvan_tag_env_name = _resolve_eyvan_env_name(self._env_spec, fallback="") or (
+            resolved_env_fallback if resolved_env_fallback != "agent_flow" else None
+        )
 
         if trainer is not None:
             if isinstance(trainer, _unsupported_base_trainer_classes()):
@@ -2822,7 +2917,9 @@ class AgentFlowTrainer:
                     prompt_text = first_ep.turns[0].prompt_text
                 else:
                     prompt_text = ""
-                responses = [_format_agent_flow_transcript(episodes[i]) for i in grp_indices]
+                responses = [
+                    _format_agent_flow_transcript(episodes[i], decode_ids=self._decode_ids) for i in grp_indices
+                ]
                 grp_rewards = [float(episodes[i].episode_reward) for i in grp_indices]
                 grp_adv = [float(advantages_np[i]) for i in grp_indices]
                 grp_tokens = [ep_action_tokens[i] for i in grp_indices]
@@ -3130,15 +3227,24 @@ class AgentFlowTrainer:
                 comp_ids = ids_all[first_act:]
                 comp_amask = amask_all[first_act:]
                 comp_lps = lps_all[first_act:] if lps_all is not None else None
+                turns = _reconstruct_turns_from_tito(
+                    prompt_ids=prompt_ids,
+                    comp_ids=comp_ids,
+                    comp_amask=comp_amask,
+                    comp_lps=comp_lps,
+                    final_reward=float(step_res.reward),
+                    decode_ids=self._decode_ids,
+                    truncated=bool(getattr(step_res, "truncated", False)),
+                )
                 return AgentFlowEpisode(
                     prompt_index=p_idx,
                     group_id=grp_id,
                     prompt_token_ids=prompt_ids,
                     completion_token_ids=comp_ids,
                     action_mask=comp_amask,
-                    step_rewards=[float(step_res.reward)],
+                    step_rewards=[float(t.reward) for t in turns] if turns else [float(step_res.reward)],
                     episode_reward=float(step_res.reward),
-                    turns=(),
+                    turns=turns,
                     logprobs=comp_lps,
                     env_error=False,
                     prompt_clipped=prompt_clipped,

@@ -267,6 +267,16 @@ class AutoEnvironment:
                 )
             return cls.from_name(environment, **base_defaults)
 
+        if isinstance(environment, str):
+            env_label = environment.strip()
+            if env_label == "harness" and isinstance(defaults.get("harness"), str) and defaults["harness"].strip():
+                env_label = f"harness:{defaults['harness'].strip()}"
+        elif isinstance(environment, collections.abc.Mapping):
+            raw_label = environment.get("name") or environment.get("type")
+            env_label = str(raw_label).strip() if raw_label else "auto"
+        else:
+            env_label = getattr(environment, "name", None) or type(environment).__name__
+        _factory.environment_name = env_label  # type: ignore[attr-defined]
         return _factory
 
 

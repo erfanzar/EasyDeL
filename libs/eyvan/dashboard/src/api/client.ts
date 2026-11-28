@@ -792,6 +792,12 @@ const MEDIA_TRANSFER_TIMEOUT_MS = 120_000;
 const WORKER_FORWARDED_TIMEOUT_MS = 5_000;
 
 /**
+ * Budget for single-run rich tracking queries proxied through the control plane to
+ * the upstream run tracker (completions, episodes, rollouts, series, histograms, tables).
+ */
+const TRACKING_READ_TIMEOUT_MS = 15_000;
+
+/**
  * Budget for a read the control plane answers by calling the cloud provider.
  *
  * Provider quota discovery lists accelerator types in every quota zone a
@@ -1434,7 +1440,9 @@ export class EyvanApiClient {
     const query = new URLSearchParams();
     if (options.status) query.set("status", options.status);
     if (options.limit !== undefined) query.set("limit", String(options.limit));
-    const result = await this.request<{ runs: RunSummary[] }>(this.scope(`/tracking/runs?${query}`, immutableScope), {
+    const qs = query.toString();
+    const target = qs ? `/tracking/runs?${qs}` : "/tracking/runs";
+    const result = await this.request<{ runs: RunSummary[] }>(this.scope(target, immutableScope), {
       signal,
     });
     return result.runs;
@@ -1447,9 +1455,11 @@ export class EyvanApiClient {
       if (!run) throw new ApiError("Run not found", 404);
       return { ...run, org_id: immutableScope.orgId, project_id: immutableScope.projectId };
     }
-    return this.request<RunDetail>(this.scope(`/tracking/runs/${encodeURIComponent(runId)}`, immutableScope), {
-      signal,
-    });
+    return this.request<RunDetail>(
+      this.scope(`/tracking/runs/${encodeURIComponent(runId)}`, immutableScope),
+      { signal },
+      TRACKING_READ_TIMEOUT_MS,
+    );
   }
 
   /**
@@ -1464,7 +1474,9 @@ export class EyvanApiClient {
   ): Promise<T> {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(options)) if (value !== undefined) query.set(key, String(value));
-    return this.request<T>(this.scope(`${path}?${query}`, this.scopeSnapshot(scope)), { signal });
+    const qs = query.toString();
+    const target = qs ? `${path}?${qs}` : path;
+    return this.request<T>(this.scope(target, this.scopeSnapshot(scope)), { signal }, TRACKING_READ_TIMEOUT_MS);
   }
 
   private demoRun(runId: string): RunDetail {
